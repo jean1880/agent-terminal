@@ -1,0 +1,25 @@
+[package]
+name = "gemini-terminal"
+version = "0.1.0"
+edition = "2021"
+authors = ["jdesroches"]
+description = "A standalone GTK4 terminal application for Gemini AI"
+
+[dependencies]
+gtk = { version = "0.9", package = "gtk4" }
+vte = { version = "0.10", package = "vte4" }
+glib = "0.20"
+gdk = { version = "0.9", package = "gdk4" }
+
+[package.metadata.deb]
+maintainer = "jdesroches"
+copyright = "2026, jdesroches"
+license-file = ["LICENSE", "0"]
+depends = "$auto, libvte-2.91-gtk4-0"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/gemini-terminal", "usr/bin/gemini-terminal", "755"],
+    ["/home/jdesroches/.local/share/applications/gemini-terminal.desktop", "usr/share/applications/gemini-terminal.desktop", "644"],
+    ["/home/jdesroches/.local/share/icons/gemini_logo.png", "usr/share/icons/gemini_logo.png", "644"],
+]
