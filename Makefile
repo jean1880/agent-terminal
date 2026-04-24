@@ -2,9 +2,10 @@
 
 APP_NAME = gemini-terminal
 BINARY = target/release/$(APP_NAME)
-DESKTOP_FILE = gemini-terminal.desktop
-ICON_FILE = /home/jdesroches/.local/share/icons/gemini_logo.png
+DESKTOP_FILE = assets/gemini-terminal.desktop
+ICON_FILE = assets/gemini_logo.png
 LOCAL_DESKTOP = /home/jdesroches/.local/share/applications/gemini-terminal.desktop
+LOCAL_ICON = /home/jdesroches/.local/share/icons/gemini_logo.png
 
 .PHONY: all build clean install package deps help
 
@@ -36,9 +37,14 @@ install: build
 	@echo "Installing binary to ~/.local/bin..."
 	mkdir -p ~/.local/bin
 	cp $(BINARY) ~/.local/bin/$(APP_NAME)
+	@echo "Installing icon to ~/.local/share/icons..."
+	mkdir -p ~/.local/share/icons
+	cp $(ICON_FILE) $(LOCAL_ICON)
 	@echo "Updating desktop entry..."
-	# We use the existing desktop file but ensure it points to the local bin
+	mkdir -p ~/.local/share/applications
+	cp $(DESKTOP_FILE) $(LOCAL_DESKTOP)
 	sed -i 's|Exec=.*|Exec=/home/jdesroches/.local/bin/$(APP_NAME)|' $(LOCAL_DESKTOP)
+	sed -i 's|Icon=.*|Icon=$(LOCAL_ICON)|' $(LOCAL_DESKTOP)
 	@echo "Done! You can now launch Gemini Terminal from your menu."
 
 clean:

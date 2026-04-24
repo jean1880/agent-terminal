@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Gemini Terminal
+Comment=Robust Rust-based Gemini AI Terminal
+Exec=/home/jdesroches/.local/bin/gemini-terminal
+StartupWMClass=com.jdesroches.GeminiTerminal
+Icon=/home/jdesroches/.local/share/icons/gemini_logo.png
+Terminal=false
+Categories=Development;TerminalEmulator;
+Keywords=gemini;ai;terminal;chat;
