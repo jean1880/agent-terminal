@@ -3,7 +3,7 @@
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
-use gtk4::{HeaderBar, Label, ScrolledWindow};
+use gtk4::{Align, Box, Button, HeaderBar, Label, Orientation, ScrolledWindow};
 use std::env;
 use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
@@ -31,12 +31,27 @@ impl WindowImpl for GeminiWindow {}
 impl ApplicationWindowImpl for GeminiWindow {}
 
 impl GeminiWindow {
-    /// Initializes the user interface, terminal, and keybindings.
+    /// Initializes the user interface, switching between terminal and welcome screen.
     fn setup_ui(&self) {
         let obj = self.obj();
 
         obj.set_default_width(950);
         obj.set_default_height(650);
+
+        let is_available = self.is_gemini_available();
+
+        // Start Gemini Button in Header
+        let start_button = Button::builder()
+            .label("Start Gemini")
+            .css_classes(["suggested-action"])
+            .visible(is_available)
+            .build();
+
+        let obj_clone = obj.clone();
+        start_button.connect_clicked(move |_| {
+            let imp = obj_clone.imp();
+            imp.setup_terminal_ui();
+        });
 
         // Modern HeaderBar
         let header = HeaderBar::builder()
@@ -44,8 +59,56 @@ impl GeminiWindow {
             .show_title_buttons(true)
             .build();
 
+        header.pack_start(&start_button);
         obj.set_titlebar(Some(&header));
 
+        if is_available {
+            self.setup_terminal_ui();
+        } else {
+            self.setup_welcome_ui();
+        }
+    }
+
+    /// Checks if the gemini binary is available in the PATH or common locations.
+    fn is_gemini_available(&self) -> bool {
+        // 1. Try which
+        if std::process::Command::new("which")
+            .arg("gemini")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        // 2. Try common absolute paths
+        let home = env::var("HOME").unwrap_or_default();
+        let paths = [
+            "/usr/bin/gemini",
+            "/usr/local/bin/gemini",
+            &format!("{}/.local/bin/gemini", home),
+            &format!("{}/.npm-global/bin/gemini", home),
+            &format!("{}/bin/gemini", home),
+        ];
+
+        for path in paths {
+            if !path.is_empty() && std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+
+        // 3. Try shell command -v as a last resort
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        std::process::Command::new(shell)
+            .args(["-ic", "command -v gemini"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Sets up the terminal interface.
+    fn setup_terminal_ui(&self) {
+        let obj = self.obj();
         let terminal = Terminal::new();
 
         // Gemini Theme Colors
@@ -96,19 +159,19 @@ impl GeminiWindow {
         });
         terminal.add_controller(key_controller);
 
+        // Close window when the terminal child exits (e.g., user exits gemini)
+        let obj_clone = obj.clone();
+        terminal.connect_child_exited(move |_, _| {
+            obj_clone.close();
+        });
+
         // Dynamic Shell Detection
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
 
-        // Check if gemini command exists
-        let gemini_exists = std::process::Command::new("which")
-            .arg("gemini")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let command = get_startup_command(true);
 
-        let command = get_startup_command(gemini_exists);
-
+        let obj_clone = obj.clone();
         terminal.spawn_async(
             PtyFlags::DEFAULT,
             Some(&home_dir),
@@ -120,10 +183,19 @@ impl GeminiWindow {
             None::<&gtk4::gio::Cancellable>,
             move |result| {
                 if let Err(err) = result {
-                    eprintln!("Error spawning terminal: {}", err);
+                    let dialog = gtk4::MessageDialog::builder()
+                        .transient_for(&obj_clone)
+                        .message_type(gtk4::MessageType::Error)
+                        .buttons(gtk4::ButtonsType::Ok)
+                        .text("Terminal Error")
+                        .secondary_text(format!("Error spawning terminal: {}", err))
+                        .build();
+                    dialog.connect_response(|dialog, _| dialog.close());
+                    dialog.present();
                 }
             },
         );
+
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
@@ -133,17 +205,85 @@ impl GeminiWindow {
 
         obj.set_child(Some(&scrolled));
     }
+
+    /// Sets up the welcome screen with installation instructions.
+    fn setup_welcome_ui(&self) {
+        let obj = self.obj();
+        let available = self.is_gemini_available();
+
+        let container = Box::builder()
+            .orientation(Orientation::Vertical)
+            .valign(Align::Center)
+            .halign(Align::Center)
+            .spacing(20)
+            .margin_top(40)
+            .margin_bottom(40)
+            .margin_start(40)
+            .margin_end(40)
+            .build();
+
+        let title = Label::builder()
+            .label("Welcome to Gemini Terminal")
+            .css_classes(["title-1"])
+            .build();
+
+        let subtitle = Label::builder()
+            .label("The Gemini CLI was not detected on your system.")
+            .css_classes(["subtitle"])
+            .build();
+
+        let instructions = Label::builder()
+            .label("To get started, please install the Gemini CLI using npm:")
+            .margin_top(10)
+            .build();
+
+        let command_label = Label::builder()
+            .label("npm install -g @google/gemini-cli")
+            .selectable(true)
+            .css_classes(["command-text"])
+            .build();
+
+        let config_instructions = Label::builder()
+            .label("After installation, configure it by running:")
+            .margin_top(10)
+            .build();
+
+        let config_command = Label::builder()
+            .label("gemini configure")
+            .selectable(true)
+            .css_classes(["command-text"])
+            .build();
+
+        let refresh_button = Button::builder()
+            .label(if available { "Start Gemini" } else { "I've installed it, let's go!" })
+            .margin_top(20)
+            .css_classes(["suggested-action"])
+            .build();
+
+        let obj_clone = obj.clone();
+        refresh_button.connect_clicked(move |_| {
+            let imp = obj_clone.imp();
+            imp.setup_ui();
+        });
+
+        container.append(&title);
+        container.append(&subtitle);
+        container.append(&instructions);
+        container.append(&command_label);
+        container.append(&config_instructions);
+        container.append(&config_command);
+        container.append(&refresh_button);
+
+        obj.set_child(Some(&container));
+    }
 }
 
 /// Determines the startup command based on whether the gemini binary exists.
 fn get_startup_command(has_gemini: bool) -> Vec<&'static str> {
     if has_gemini {
-        vec!["-ic", "gemini; exec $SHELL"]
+        vec!["-ic", "gemini"]
     } else {
-        vec![
-            "-ic",
-            "echo '⚠️  Gemini CLI not found in PATH.'; echo ''; echo 'To install it, run:'; echo '  npm install -g @google/gemini-cli'; echo ''; exec $SHELL",
-        ]
+        vec!["-ic", "exec $SHELL"]
     }
 }
 
@@ -155,13 +295,13 @@ mod tests {
     fn test_startup_command_gemini_exists() {
         let cmd = get_startup_command(true);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].contains("gemini; exec $SHELL"));
+        assert!(cmd[1].contains("gemini"));
     }
 
     #[test]
     fn test_startup_command_gemini_missing() {
         let cmd = get_startup_command(false);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].contains("npm install -g @google/gemini-cli"));
+        assert!(cmd[1].contains("exec $SHELL"));
     }
 }
