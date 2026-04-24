@@ -1,0 +1,46 @@
+# Makefile for Gemini Terminal
+
+APP_NAME = gemini-terminal
+BINARY = target/release/$(APP_NAME)
+DESKTOP_FILE = gemini-terminal.desktop
+ICON_FILE = /home/jdesroches/.local/share/icons/gemini_logo.png
+LOCAL_DESKTOP = /home/jdesroches/.local/share/applications/gemini-terminal.desktop
+
+.PHONY: all build clean install package deps help
+
+all: build
+
+help:
+	@echo "Usage:"
+	@echo "  make deps      - Install system dependencies (requires sudo)"
+	@echo "  make build     - Build the release binary"
+	@echo "  make install   - Install binary and desktop entry locally"
+	@echo "  make package   - Generate a .deb package using cargo-deb"
+	@echo "  make clean     - Remove build artifacts"
+
+deps:
+	@echo "Installing system dependencies..."
+	sudo apt update && sudo apt install -y libvte-2.91-gtk4-dev libgtk-4-dev
+
+build:
+	@echo "Building $(APP_NAME) in release mode..."
+	cargo build --release
+
+package:
+	@echo "Checking for cargo-deb..."
+	@command -v cargo-deb >/dev/null 2>&1 || (echo "Installing cargo-deb..." && cargo install cargo-deb)
+	@echo "Generating Debian package..."
+	cargo deb
+
+install: build
+	@echo "Installing binary to ~/.local/bin..."
+	mkdir -p ~/.local/bin
+	cp $(BINARY) ~/.local/bin/$(APP_NAME)
+	@echo "Updating desktop entry..."
+	# We use the existing desktop file but ensure it points to the local bin
+	sed -i 's|Exec=.*|Exec=/home/jdesroches/.local/bin/$(APP_NAME)|' $(LOCAL_DESKTOP)
+	@echo "Done! You can now launch Gemini Terminal from your menu."
+
+clean:
+	@echo "Cleaning project..."
+	cargo clean
