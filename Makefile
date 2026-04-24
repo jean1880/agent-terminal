@@ -4,8 +4,9 @@ APP_NAME = gemini-terminal
 BINARY = target/release/$(APP_NAME)
 DESKTOP_FILE = assets/gemini-terminal.desktop
 ICON_FILE = assets/gemini_logo.png
-LOCAL_DESKTOP = /home/jdesroches/.local/share/applications/gemini-terminal.desktop
-LOCAL_ICON = /home/jdesroches/.local/share/icons/gemini_logo.png
+LOCAL_BIN = $(HOME)/.local/bin
+LOCAL_DESKTOP = $(HOME)/.local/share/applications/gemini-terminal.desktop
+LOCAL_ICON = $(HOME)/.local/share/icons/gemini_logo.png
 
 .PHONY: all build clean install package deps help
 
@@ -34,17 +35,17 @@ package:
 	cargo deb
 
 install: build
-	@echo "Installing binary to ~/.local/bin..."
-	mkdir -p ~/.local/bin
-	cp $(BINARY) ~/.local/bin/$(APP_NAME)
-	@echo "Installing icon to ~/.local/share/icons..."
-	mkdir -p ~/.local/share/icons
+	@echo "Installing binary to $(LOCAL_BIN)..."
+	mkdir -p $(LOCAL_BIN)
+	cp $(BINARY) $(LOCAL_BIN)/$(APP_NAME)
+	@echo "Installing icon to $(HOME)/.local/share/icons..."
+	mkdir -p $(HOME)/.local/share/icons
 	cp $(ICON_FILE) $(LOCAL_ICON)
 	@echo "Updating desktop entry..."
-	mkdir -p ~/.local/share/applications
+	mkdir -p $(HOME)/.local/share/applications
 	cp $(DESKTOP_FILE) $(LOCAL_DESKTOP)
-	sed -i 's|Exec=.*|Exec=/home/jdesroches/.local/bin/$(APP_NAME)|' $(LOCAL_DESKTOP)
-	sed -i 's|Icon=.*|Icon=$(LOCAL_ICON)|' $(LOCAL_DESKTOP)
+	sed -i 's|^Exec=.*|Exec=$(LOCAL_BIN)/$(APP_NAME)|' $(LOCAL_DESKTOP)
+	sed -i 's|^Icon=.*|Icon=$(LOCAL_ICON)|' $(LOCAL_DESKTOP)
 	@echo "Done! You can now launch Gemini Terminal from your menu."
 
 clean:
