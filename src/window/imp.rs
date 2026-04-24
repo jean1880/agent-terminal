@@ -8,9 +8,14 @@ use std::env;
 use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 
+use std::cell::RefCell;
+
 /// Internal state for the GeminiWindow.
 #[derive(Default)]
-pub struct GeminiWindow {}
+pub struct GeminiWindow {
+    pub terminal: RefCell<Option<Terminal>>,
+    pub header: RefCell<Option<HeaderBar>>,
+}
 
 #[glib::object_subclass]
 impl ObjectSubclass for GeminiWindow {
@@ -38,31 +43,16 @@ impl GeminiWindow {
         obj.set_default_width(950);
         obj.set_default_height(650);
 
-        let is_available = self.is_gemini_available();
-
-        // Start Gemini Button in Header
-        let start_button = Button::builder()
-            .label("Start Gemini")
-            .css_classes(["suggested-action"])
-            .visible(is_available)
-            .build();
-
-        let obj_clone = obj.clone();
-        start_button.connect_clicked(move |_| {
-            let imp = obj_clone.imp();
-            imp.setup_terminal_ui();
-        });
-
         // Modern HeaderBar
         let header = HeaderBar::builder()
             .title_widget(&Label::new(Some("Gemini Terminal")))
             .show_title_buttons(true)
             .build();
 
-        header.pack_start(&start_button);
         obj.set_titlebar(Some(&header));
+        *self.header.borrow_mut() = Some(header);
 
-        if is_available {
+        if self.is_gemini_available() {
             self.setup_terminal_ui();
         } else {
             self.setup_welcome_ui();
@@ -110,6 +100,38 @@ impl GeminiWindow {
     fn setup_terminal_ui(&self) {
         let obj = self.obj();
         let terminal = Terminal::new();
+        *self.terminal.borrow_mut() = Some(terminal.clone());
+
+        // Update Header with terminal-specific buttons
+        if let Some(header) = self.header.borrow().as_ref() {
+            // Remove any existing children
+            while let Some(child) = header.first_child() {
+                header.remove(&child);
+            }
+
+            let clear_button = Button::builder()
+                .icon_name("edit-clear-all-symbolic")
+                .tooltip_text("Clear Terminal")
+                .build();
+
+            let term_clone = terminal.clone();
+            clear_button.connect_clicked(move |_| {
+                term_clone.reset(true, true);
+            });
+
+            let copy_button = Button::builder()
+                .icon_name("edit-copy-symbolic")
+                .tooltip_text("Copy Selection")
+                .build();
+
+            let term_clone = terminal.clone();
+            copy_button.connect_clicked(move |_| {
+                term_clone.copy_clipboard_format(Format::Text);
+            });
+
+            header.pack_start(&clear_button);
+            header.pack_start(&copy_button);
+        }
 
         // Gemini Theme Colors
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
@@ -210,6 +232,13 @@ impl GeminiWindow {
     fn setup_welcome_ui(&self) {
         let obj = self.obj();
         let available = self.is_gemini_available();
+
+        // Update Header for welcome screen
+        if let Some(header) = self.header.borrow().as_ref() {
+            while let Some(child) = header.first_child() {
+                header.remove(&child);
+            }
+        }
 
         let container = Box::builder()
             .orientation(Orientation::Vertical)
