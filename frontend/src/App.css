@@ -1,0 +1,17 @@
+/* Custom scrollbar for a better look */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #2d244a;
+  border-radius: 10px;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}

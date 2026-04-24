@@ -1,63 +1,29 @@
-# Makefile for Gemini Terminal
+# Build and installation configuration
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share
+APPID = com.google.gemini-terminal
 
-APP_NAME = gemini-terminal
-BINARY = target/release/$(APP_NAME)
-DESKTOP_FILE = assets/gemini-terminal.desktop
-ICON_FILE = assets/gemini_logo.png
-LOCAL_BIN = $(HOME)/.local/bin
-LOCAL_DESKTOP = $(HOME)/.local/share/applications/gemini-terminal.desktop
-LOCAL_ICON = $(HOME)/.local/share/icons/gemini_logo.png
+all: build-frontend build-backend
 
-.PHONY: all build clean install uninstall package deps help
+build-frontend:
+	cd frontend && npm run build
 
-all: build
-
-help:
-	@echo "Usage:"
-	@echo "  make deps      - Install system dependencies (requires sudo)"
-	@echo "  make build     - Build the release binary"
-	@echo "  make install   - Install binary and desktop entry locally"
-	@echo "  make uninstall - Remove local installation and assets"
-	@echo "  make package   - Generate a .deb package using cargo-deb"
-	@echo "  make clean     - Remove build artifacts"
-
-deps:
-	@echo "Installing system dependencies..."
-	sudo apt update && sudo apt install -y libvte-2.91-gtk4-dev libgtk-4-dev
-
-build:
-	@echo "Building $(APP_NAME) in release mode..."
+build-backend:
 	cargo build --release
 
-package:
-	@echo "Checking for cargo-deb..."
-	@command -v cargo-deb >/dev/null 2>&1 || (echo "Installing cargo-deb..." && cargo install cargo-deb)
-	@echo "Generating Debian package..."
-	cargo deb
-
-install: build
-	@echo "Installing binary to $(LOCAL_BIN)..."
-	mkdir -p $(LOCAL_BIN)
-	cp $(BINARY) $(LOCAL_BIN)/$(APP_NAME)
-	@echo "Installing icon to $(HOME)/.local/share/icons..."
-	mkdir -p $(HOME)/.local/share/icons
-	cp $(ICON_FILE) $(LOCAL_ICON)
-	@echo "Updating desktop entry..."
-	mkdir -p $(HOME)/.local/share/applications
-	cp $(DESKTOP_FILE) $(LOCAL_DESKTOP)
-	sed -i 's|^Exec=.*|Exec=$(LOCAL_BIN)/$(APP_NAME)|' $(LOCAL_DESKTOP)
-	sed -i 's|^Icon=.*|Icon=$(LOCAL_ICON)|' $(LOCAL_DESKTOP)
-	@echo "Done! You can now launch Gemini Terminal from your menu."
+install:
+	install -D -m 755 target/release/gemini-terminal $(DESTDIR)$(BINDIR)/gemini-terminal
+	install -D -m 644 assets/gemini-terminal.desktop $(DESTDIR)$(DATADIR)/applications/$(APPID).desktop
+	install -D -m 644 assets/gemini_logo.png $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/$(APPID).png
 
 uninstall:
-	@echo "Uninstalling $(APP_NAME) from $(LOCAL_BIN)..."
-	rm -f $(LOCAL_BIN)/$(APP_NAME)
-	@echo "Removing icon from $(HOME)/.local/share/icons..."
-	rm -f $(LOCAL_ICON)
-	@echo "Removing desktop entry..."
-	rm -f $(LOCAL_DESKTOP)
-	@echo "Uninstall complete."
+	rm -f $(DESTDIR)$(BINDIR)/gemini-terminal
+	rm -f $(DESTDIR)$(DATADIR)/applications/$(APPID).desktop
+	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/$(APPID).png
 
 clean:
-	@echo "Cleaning project..."
 	cargo clean
+	rm -rf frontend/dist
+
+.PHONY: all build-frontend build-backend install uninstall clean
