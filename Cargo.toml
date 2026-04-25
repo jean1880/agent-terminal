@@ -1,6 +1,7 @@
 [package]
 name = "gemini-terminal"
-version = "0.3.0"
+version = "0.3.2"
+
 edition = "2021"
 authors = ["jdesroches"]
 description = "A standalone GTK4 terminal application for Gemini AI"

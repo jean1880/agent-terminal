@@ -75,30 +75,34 @@ impl GeminiWindow {
         content.append(&status_page);
         obj.set_content(Some(&content));
 
-        // Perform detection in a background thread to avoid blocking the UI thread
-        std::thread::spawn(glib::clone!(@weak obj, @weak content => move || {
-            let has_gemini = check_gemini_binary(
-                env::var("PATH").ok(),
-                env::var("HOME").ok(),
-                env::var("SHELL").ok()
-            );
+        // Use a channel to communicate the detection result back to the main thread
+        let (sender, receiver) = glib::MainContext::channel::<bool>(glib::Priority::default());
 
-            glib::idle_add_local(move || {
-                let imp = obj.imp();
-                
-                // Remove the status page
-                content.remove(&status_page);
+        receiver.attach(None, glib::clone!(@weak obj, @weak content => @default-return glib::ControlFlow::Break, move |has_gemini| {
+            let imp = obj.imp();
+            
+            // Remove the status page
+            content.remove(&status_page);
 
-                if has_gemini {
-                    info!("Gemini CLI detected, setting up terminal UI");
-                    imp.setup_terminal_ui(&content);
-                } else {
-                    warn!("Gemini CLI not detected, setting up welcome UI");
-                    imp.setup_welcome_ui(&content);
-                }
-                glib::ControlFlow::Break
-            });
+            if has_gemini {
+                info!("Gemini CLI detected, setting up terminal UI");
+                imp.setup_terminal_ui(&content);
+            } else {
+                warn!("Gemini CLI not detected, setting up welcome UI");
+                imp.setup_welcome_ui(&content);
+            }
+            glib::ControlFlow::Break
         }));
+
+        // Perform detection in a background thread
+        let path = env::var("PATH").ok();
+        let home = env::var("HOME").ok();
+        let shell = env::var("SHELL").ok();
+
+        std::thread::spawn(move || {
+            let res = check_gemini_binary(path, home, shell);
+            let _ = sender.send(res);
+        });
     }
 
     /// Sets up the terminal interface.
@@ -258,12 +262,18 @@ impl GeminiWindow {
 
         // Inherit the current user environment
         let env_vars = glib::environ();
+        let env_strs: Vec<String> = env_vars.iter()
+            .map(|os| os.to_string_lossy().to_string())
+            .collect();
+        let env_ptrs: Vec<&str> = env_strs.iter()
+            .map(|s| s.as_str())
+            .collect();
 
         terminal.spawn_async(
             PtyFlags::DEFAULT,
             Some(&home_dir),
             &[&shell, command[0], command[1]],
-            &env_vars,
+            &env_ptrs,
             glib::SpawnFlags::DEFAULT,
             || {},
             -1,

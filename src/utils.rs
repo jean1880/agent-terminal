@@ -1,6 +1,5 @@
 //! Utility functions for Gemini Terminal.
 
-use std::env;
 use tracing::{info, warn, debug};
 
 /// Standalone detection logic that can run on a background thread.
