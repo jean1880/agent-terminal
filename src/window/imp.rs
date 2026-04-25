@@ -1,9 +1,10 @@
 //! Private implementation details of the GeminiWindow.
 
+use adw::prelude::*;
+use adw::subclass::prelude::*;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::subclass::prelude::*;
-use gtk4::{Align, Box, Button, HeaderBar, Image, Label, Orientation, ScrolledWindow, Stack};
+use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
 use std::env;
 use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
@@ -18,7 +19,7 @@ const LOGO_SVG: &str = include_str!("../../assets/gemini_logo.svg");
 #[derive(Default)]
 pub struct GeminiWindow {
     pub terminal: RefCell<Option<Terminal>>,
-    pub header: RefCell<Option<HeaderBar>>,
+    pub header: RefCell<Option<adw::HeaderBar>>,
     pub loading_stack: RefCell<Option<Stack>>,
 }
 
@@ -26,7 +27,7 @@ pub struct GeminiWindow {
 impl ObjectSubclass for GeminiWindow {
     const NAME: &'static str = "GeminiWindow";
     type Type = super::GeminiWindow;
-    type ParentType = gtk4::ApplicationWindow;
+    type ParentType = adw::ApplicationWindow;
 }
 
 impl ObjectImpl for GeminiWindow {
@@ -39,6 +40,7 @@ impl ObjectImpl for GeminiWindow {
 impl WidgetImpl for GeminiWindow {}
 impl WindowImpl for GeminiWindow {}
 impl ApplicationWindowImpl for GeminiWindow {}
+impl AdwApplicationWindowImpl for GeminiWindow {}
 
 impl GeminiWindow {
     /// Initializes the user interface, switching between terminal and welcome screen.
@@ -49,21 +51,26 @@ impl GeminiWindow {
         obj.set_default_width(950);
         obj.set_default_height(650);
 
-        // Modern HeaderBar
-        let header = HeaderBar::builder()
-            .title_widget(&Label::new(Some("Gemini Terminal")))
-            .show_title_buttons(true)
+        let content = Box::builder()
+            .orientation(Orientation::Vertical)
             .build();
 
-        obj.set_titlebar(Some(&header));
+        // Modern AdwHeaderBar
+        let header = adw::HeaderBar::builder()
+            .title_widget(&adw::WindowTitle::new("Gemini Terminal", ""))
+            .build();
+
+        content.append(&header);
         *self.header.borrow_mut() = Some(header);
+
+        obj.set_content(Some(&content));
 
         if self.is_gemini_available() {
             info!("Gemini CLI detected, setting up terminal UI");
-            self.setup_terminal_ui();
+            self.setup_terminal_ui(&content);
         } else {
             warn!("Gemini CLI not detected, setting up welcome UI");
-            self.setup_welcome_ui();
+            self.setup_welcome_ui(&content);
         }
     }
 
@@ -126,7 +133,7 @@ impl GeminiWindow {
     }
 
     /// Sets up the terminal interface.
-    fn setup_terminal_ui(&self) {
+    fn setup_terminal_ui(&self, container: &Box) {
         let obj = self.obj();
         debug!("Initializing terminal UI");
         let terminal = Terminal::new();
@@ -136,6 +143,7 @@ impl GeminiWindow {
         let stack = Stack::builder()
             .transition_type(gtk4::StackTransitionType::Crossfade)
             .transition_duration(500)
+            .vexpand(true)
             .build();
         *self.loading_stack.borrow_mut() = Some(stack.clone());
 
@@ -203,7 +211,7 @@ impl GeminiWindow {
         stack.add_named(&scrolled, Some("terminal"));
         stack.set_visible_child_name("loading");
 
-        obj.set_child(Some(&stack));
+        container.append(&stack);
 
         // Gemini Theme Colors
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
@@ -318,61 +326,20 @@ impl GeminiWindow {
         );
     }
 
-    /// Sets up the welcome screen with installation instructions.
-    fn setup_welcome_ui(&self) {
+    /// Sets up the welcome screen using AdwStatusPage.
+    fn setup_welcome_ui(&self, container: &Box) {
         let obj = self.obj();
-        let _available = self.is_gemini_available();
-
-        let container = Box::builder()
-            .orientation(Orientation::Vertical)
-            .valign(Align::Center)
-            .halign(Align::Center)
-            .spacing(20)
-            .margin_top(40)
-            .margin_bottom(40)
-            .margin_start(40)
-            .margin_end(40)
-            .build();
-
-        let title = Label::builder()
-            .label("Welcome to Gemini Terminal")
-            .css_classes(["title-1"])
-            .build();
-
-        let subtitle = Label::builder()
-            .label("The Gemini CLI was not detected on your system.")
-            .css_classes(["subtitle"])
-            .build();
-
-        let detection_info = Label::builder()
-            .label("We checked your PATH and interactive shell environment (-ic).")
-            .css_classes(["subtitle"])
-            .build();
-
-        let instructions = Label::builder()
-            .label("To get started, please install the Gemini CLI using npm:")
-            .margin_top(10)
-            .build();
-
-        let command_label = Label::builder()
-            .label("npm install -g @google/gemini-cli")
-            .selectable(true)
-            .css_classes(["command-text"])
-            .build();
-
-        let config_instructions = Label::builder()
-            .label("After installation, configure it by running:")
-            .margin_top(10)
-            .build();
-
-        let config_command = Label::builder()
-            .label("gemini configure")
-            .selectable(true)
-            .css_classes(["command-text"])
+        
+        let status_page = adw::StatusPage::builder()
+            .title("Welcome to Gemini Terminal")
+            .description("The Gemini CLI was not detected on your system. We checked your PATH and interactive shell environment (-ic).\n\nTo get started, please install it using npm:\nnpm install -g @google/gemini-cli\n\nThen configure it:\ngemini configure")
+            .icon_name("utilities-terminal-symbolic")
+            .vexpand(true)
             .build();
 
         let refresh_button = Button::builder()
             .label("Check for Gemini again")
+            .halign(Align::Center)
             .margin_top(20)
             .css_classes(["suggested-action"])
             .build();
@@ -383,16 +350,8 @@ impl GeminiWindow {
             imp.setup_ui();
         });
 
-        container.append(&title);
-        container.append(&subtitle);
-        container.append(&detection_info);
-        container.append(&instructions);
-        container.append(&command_label);
-        container.append(&config_instructions);
-        container.append(&config_command);
-        container.append(&refresh_button);
-
-        obj.set_child(Some(&container));
+        status_page.set_child(Some(&refresh_button));
+        container.append(&status_page);
     }
 }
 

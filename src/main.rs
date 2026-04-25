@@ -4,7 +4,7 @@
 //! for interacting with Gemini AI.
 
 use gtk4::prelude::*;
-use gtk4::{gdk, glib, Application, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
+use gtk4::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 use tracing::{info, debug};
 use tracing_subscriber::EnvFilter;
 
@@ -19,8 +19,8 @@ fn main() -> glib::ExitCode {
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
-    info!("Starting Gemini Terminal...");
-    let app = Application::builder().application_id(APP_ID).build();
+    info!("Starting Gemini Terminal (v0.2.0)...");
+    let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
         debug!("Application startup: loading CSS");
@@ -46,11 +46,16 @@ fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
         "
+        @define-color accent_color #8e75ff;
+        @define-color accent_bg_color #8e75ff;
+        @define-color window_bg_color #181425;
+        @define-color headerbar_bg_color #120f1d;
+
         window {
-            background-color: #181425;
+            background-color: @window_bg_color;
         }
         headerbar {
-            background-color: #120f1d;
+            background-color: @headerbar_bg_color;
             color: #c8c8ff;
             border-bottom: 1px solid #2d2444;
         }
@@ -63,7 +68,7 @@ fn load_css() {
         .title-1 {
             font-size: 24pt;
             font-weight: bold;
-            color: #8e75ff;
+            color: @accent_color;
         }
         .subtitle {
             font-size: 14pt;
@@ -78,7 +83,7 @@ fn load_css() {
             border: 1px solid #2d2444;
         }
         button.suggested-action {
-            background-color: #8e75ff;
+            background-color: @accent_bg_color;
             color: #ffffff;
             font-weight: bold;
             padding: 8px 20px;
@@ -93,7 +98,7 @@ fn load_css() {
             100% { transform: rotate(360deg); }
         }
         .loading-container {
-            background-color: #181425;
+            background-color: @window_bg_color;
         }
         .loading-icon {
             animation: rotate 1.8s infinite cubic-bezier(0.4, 0.0, 0.2, 1);
@@ -102,7 +107,7 @@ fn load_css() {
         .loading-text {
             font-size: 16pt;
             font-weight: bold;
-            color: #8e75ff;
+            color: @accent_color;
         }
         .loading-subtext {
             font-size: 10pt;
