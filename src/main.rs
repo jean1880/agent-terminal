@@ -5,6 +5,8 @@
 
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, Application, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
+use tracing::{info, debug};
+use tracing_subscriber::EnvFilter;
 
 mod window;
 use window::GeminiWindow;
@@ -13,18 +15,30 @@ const APP_ID: &str = "com.jdesroches.GeminiTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .init();
+
+    info!("Starting Gemini Terminal...");
     let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
+        debug!("Application startup: loading CSS");
         load_css();
     });
 
     app.connect_activate(|app| {
+        info!("Application activated: creating window");
         let window = GeminiWindow::new(app);
+        info!("Window created, presenting...");
         window.present();
+        info!("Window presented");
     });
 
-    app.run()
+    info!("Running application loop...");
+    let exit_code = app.run();
+    info!("Application loop exited with code: {:?}", exit_code);
+    exit_code
 }
 
 /// Loads global application styles.
@@ -72,6 +86,28 @@ fn load_css() {
         }
         button.suggested-action:hover {
             background-color: #7a61e0;
+        }
+        @keyframes rotate {
+            0% { transform: rotate(0deg); }
+            25% { transform: rotate(45deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .loading-container {
+            background-color: #181425;
+        }
+        .loading-icon {
+            animation: rotate 1.8s infinite cubic-bezier(0.4, 0.0, 0.2, 1);
+            margin-bottom: 32px;
+        }
+        .loading-text {
+            font-size: 16pt;
+            font-weight: bold;
+            color: #8e75ff;
+        }
+        .loading-subtext {
+            font-size: 10pt;
+            color: #a0a0ff;
+            margin-top: 8px;
         }
     ",
     );

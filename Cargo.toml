@@ -11,6 +11,8 @@ vte4 = "0.7"
 glib = "0.19"
 gio = "0.19"
 gdk4 = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.deb]
 maintainer = "jdesroches"

@@ -3,10 +3,10 @@
 APP_NAME = gemini-terminal
 BINARY = target/release/$(APP_NAME)
 DESKTOP_FILE = assets/gemini-terminal.desktop
-ICON_FILE = assets/gemini_logo.png
+ICON_FILE = assets/gemini_logo.svg
 LOCAL_BIN = $(HOME)/.local/bin
 LOCAL_DESKTOP = $(HOME)/.local/share/applications/gemini-terminal.desktop
-LOCAL_ICON = $(HOME)/.local/share/icons/gemini_logo.png
+LOCAL_ICON = $(HOME)/.local/share/icons/gemini_logo.svg
 
 .PHONY: all build clean install uninstall package deps help
 
