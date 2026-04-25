@@ -73,30 +73,29 @@ impl GeminiWindow {
         content.append(&status_page);
         obj.set_content(Some(&content));
 
-        // Perform detection in a background thread
+        // Use spawn_local to handle UI state without leaving the main thread
         let path = env::var("PATH").ok();
         let home = env::var("HOME").ok();
         let shell = env::var("SHELL").ok();
 
-        std::thread::spawn(glib::clone!(@weak obj, @weak content => move || {
-            let has_gemini = check_gemini_binary(path, home, shell);
+        glib::MainContext::default().spawn_local(glib::clone!(@weak obj, @weak content => async move {
+            // Give the UI one frame to render the "Initializing" screen
+            glib::timeout_future(std::time::Duration::from_millis(10)).await;
             
-            // Dispatch back to the main thread safely
-            glib::idle_add(glib::clone!(@weak obj, @weak content => @default-return glib::ControlFlow::Break, move || {
-                let imp = obj.imp();
-                
-                // Remove the status page
-                content.remove(&status_page);
+            // Perform the detection. We do this here as it's the simplest way
+            // to keep obj/content on the main thread.
+            let has_gemini = check_gemini_binary(path, home, shell);
 
-                if has_gemini {
-                    info!("Gemini CLI detected, setting up terminal UI");
-                    imp.setup_terminal_ui(&content);
-                } else {
-                    warn!("Gemini CLI not detected, setting up welcome UI");
-                    imp.setup_welcome_ui(&content);
-                }
-                glib::ControlFlow::Break
-            }));
+            let imp = obj.imp();
+            content.remove(&status_page);
+
+            if has_gemini {
+                info!("Gemini CLI detected, setting up terminal UI");
+                imp.setup_terminal_ui(&content);
+            } else {
+                warn!("Gemini CLI not detected, setting up welcome UI");
+                imp.setup_welcome_ui(&content);
+            }
         }));
     }
 
