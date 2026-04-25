@@ -149,18 +149,31 @@ impl GeminiWindow {
             .build();
 
         // Logo with rotation (SVG)
-        let loader = gtk4::gdk_pixbuf::PixbufLoader::with_type("svg").unwrap();
-        loader.set_size(128, 128); // Higher quality render
-        loader.write(LOGO_SVG.as_bytes()).unwrap();
-        loader.close().unwrap();
-        let pixbuf = loader.pixbuf().unwrap();
-        let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
-        
-        let logo_image = Image::builder()
-            .pixel_size(96)
-            .css_classes(["loading-icon"])
-            .build();
-        logo_image.set_paintable(Some(&texture));
+        let logo_image = if let Ok(loader) = gtk4::gdk_pixbuf::PixbufLoader::with_type("svg") {
+            loader.set_size(128, 128);
+            let load_result = loader.write(LOGO_SVG.as_bytes())
+                .and_then(|_| loader.close())
+                .and_then(|_| loader.pixbuf().ok_or(glib::Error::new(gtk4::gio::IOErrorEnum::Failed, "Failed to get pixbuf")));
+
+            match load_result {
+                Ok(pixbuf) => {
+                    let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+                    let img = Image::builder()
+                        .pixel_size(96)
+                        .css_classes(["loading-icon"])
+                        .build();
+                    img.set_paintable(Some(&texture));
+                    Some(img)
+                }
+                Err(e) => {
+                    error!("Failed to load embedded Gemini logo: {}", e);
+                    None
+                }
+            }
+        } else {
+            error!("SVG PixbufLoader not available");
+            None
+        };
 
         let loading_label = Label::builder()
             .label("Gemini is thinking...")
@@ -172,7 +185,9 @@ impl GeminiWindow {
             .css_classes(["loading-subtext"])
             .build();
 
-        loading_box.append(&logo_image);
+        if let Some(img) = logo_image {
+            loading_box.append(&img);
+        }
         loading_box.append(&loading_label);
         loading_box.append(&loading_sub);
 
@@ -329,6 +344,11 @@ impl GeminiWindow {
             .css_classes(["subtitle"])
             .build();
 
+        let detection_info = Label::builder()
+            .label("We checked your PATH and interactive shell environment (-ic).")
+            .css_classes(["subtitle"])
+            .build();
+
         let instructions = Label::builder()
             .label("To get started, please install the Gemini CLI using npm:")
             .margin_top(10)
@@ -365,6 +385,7 @@ impl GeminiWindow {
 
         container.append(&title);
         container.append(&subtitle);
+        container.append(&detection_info);
         container.append(&instructions);
         container.append(&command_label);
         container.append(&config_instructions);

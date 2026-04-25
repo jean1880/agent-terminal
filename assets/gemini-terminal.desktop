@@ -7,5 +7,6 @@ Exec=gemini-terminal
 StartupWMClass=com.jdesroches.GeminiTerminal
 Icon=gemini_logo
 Terminal=false
+StartupNotify=true
 Categories=Development;TerminalEmulator;
 Keywords=gemini;ai;terminal;chat;
