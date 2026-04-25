@@ -63,73 +63,37 @@ impl GeminiWindow {
         content.append(&header);
         *self.header.borrow_mut() = Some(header);
 
+        // Show a temporary "Detecting" state
+        let status_page = adw::StatusPage::builder()
+            .title("Initializing...")
+            .description("Checking for Gemini CLI environment...")
+            .icon_name("view-refresh-symbolic")
+            .vexpand(true)
+            .build();
+        
+        content.append(&status_page);
         obj.set_content(Some(&content));
 
-        if self.is_gemini_available() {
-            info!("Gemini CLI detected, setting up terminal UI");
-            self.setup_terminal_ui(&content);
-        } else {
-            warn!("Gemini CLI not detected, setting up welcome UI");
-            self.setup_welcome_ui(&content);
-        }
-    }
+        // Perform detection in a background thread to avoid blocking the UI thread
+        std::thread::spawn(glib::clone!(@weak obj, @weak content => move || {
+            let has_gemini = check_gemini_binary();
 
-    /// Checks if the gemini binary is available in the PATH or common locations.
-    fn is_gemini_available(&self) -> bool {
-        let current_path = env::var("PATH").unwrap_or_default();
-        info!("Detection PATH: {}", current_path);
-        debug!("Checking for gemini binary...");
+            glib::idle_add_local(move || {
+                let imp = obj.imp();
+                
+                // Remove the status page
+                content.remove(&status_page);
 
-        // 1. Try which
-        debug!("Step 1: Trying 'which gemini'");
-        match std::process::Command::new("which").arg("gemini").output() {
-            Ok(output) => {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    info!("Gemini found via 'which' at: {}", path);
-                    return true;
+                if has_gemini {
+                    info!("Gemini CLI detected, setting up terminal UI");
+                    imp.setup_terminal_ui(&content);
                 } else {
-                    warn!("'which gemini' failed with status: {}", output.status);
+                    warn!("Gemini CLI not detected, setting up welcome UI");
+                    imp.setup_welcome_ui(&content);
                 }
-            }
-            Err(e) => error!("Failed to execute 'which': {}", e),
-        }
-
-        // 2. Try common absolute paths
-        debug!("Step 2: Trying common absolute paths");
-        let home = env::var("HOME").unwrap_or_default();
-        let paths = [
-            "/usr/bin/gemini",
-            "/usr/local/bin/gemini",
-            &format!("{}/.local/bin/gemini", home),
-            &format!("{}/.npm-global/bin/gemini", home),
-            &format!("{}/bin/gemini", home),
-        ];
-
-        for path in paths {
-            if !path.is_empty() && std::path::Path::new(path).exists() {
-                debug!("Gemini found at absolute path: {}", path);
-                return true;
-            }
-        }
-
-        // 3. Try shell command -v (interactive)
-        debug!("Step 3: Trying shell command -v gemini");
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        // Use -i (interactive) to ensure NVM/rbenv are loaded
-        if let Ok(output) = std::process::Command::new(&shell)
-            .args(["-ic", "command -v gemini"])
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info!("Gemini found via shell -ic at: {}", path);
-                return true;
-            }
-        }
-
-        warn!("Gemini binary not found after all checks.");
-        false
+                glib::ControlFlow::Break
+            });
+        }));
     }
 
     /// Sets up the terminal interface.
@@ -229,50 +193,48 @@ impl GeminiWindow {
 
         // Keyboard Shortcuts (Copy/Paste/Zoom)
         let key_controller = gtk4::EventControllerKey::new();
-        let term_clone = terminal.clone();
-        key_controller.connect_key_pressed(move |_ctrl, key, _code, state| {
+        key_controller.connect_key_pressed(glib::clone!(@weak terminal => @default-return glib::Propagation::Proceed, move |_ctrl, key, _code, state| {
             let is_ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
             let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
 
             match key {
                 gtk4::gdk::Key::C | gtk4::gdk::Key::c if is_ctrl && is_shift => {
                     debug!("Hotkey: Copy");
-                    term_clone.copy_clipboard_format(Format::Text);
+                    terminal.copy_clipboard_format(Format::Text);
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::V | gtk4::gdk::Key::v if is_ctrl && is_shift => {
                     debug!("Hotkey: Paste");
-                    term_clone.paste_clipboard();
+                    terminal.paste_clipboard();
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::plus | gtk4::gdk::Key::equal if is_ctrl => {
-                    let scale = term_clone.font_scale();
+                    let scale = terminal.font_scale();
                     debug!("Hotkey: Zoom In (new scale: {})", scale + 0.1);
-                    term_clone.set_font_scale(scale + 0.1);
+                    terminal.set_font_scale(scale + 0.1);
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::minus if is_ctrl => {
-                    let scale = term_clone.font_scale();
+                    let scale = terminal.font_scale();
                     debug!("Hotkey: Zoom Out (new scale: {})", (scale - 0.1).max(0.1));
-                    term_clone.set_font_scale((scale - 0.1).max(0.1));
+                    terminal.set_font_scale((scale - 0.1).max(0.1));
                     glib::Propagation::Stop
                 }
                 k if k.to_unicode() == Some('0') && is_ctrl => {
                     debug!("Hotkey: Zoom Reset");
-                    term_clone.set_font_scale(1.0);
+                    terminal.set_font_scale(1.0);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
             }
-        });
+        }));
         terminal.add_controller(key_controller);
 
         // Close window when the terminal child exits (e.g., user exits gemini)
-        let obj_clone = obj.clone();
-        terminal.connect_child_exited(move |_, status| {
+        terminal.connect_child_exited(glib::clone!(@weak obj => move |_, status| {
             info!("Terminal child exited with status: {}", status);
-            obj_clone.close();
-        });
+            obj.close();
+        }));
 
         // Dynamic Shell Detection
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -281,38 +243,36 @@ impl GeminiWindow {
         let command = get_startup_command(true);
         info!("Spawning terminal with shell: {}, command: {:?}", shell, command);
 
-        let obj_clone = obj.clone();
-        let stack_clone = stack.clone();
-        
         // Connect to contents-changed to detect when the command actually starts printing
-        terminal.connect_contents_changed(move |_| {
-            if stack_clone.visible_child_name().as_deref() == Some("loading") {
+        terminal.connect_contents_changed(glib::clone!(@weak stack => move |_| {
+            if stack.visible_child_name().as_deref() == Some("loading") {
                 debug!("Terminal content detected, switching from loading screen");
-                stack_clone.set_visible_child_name("terminal");
+                stack.set_visible_child_name("terminal");
             }
-        });
+        }));
 
-        let stack_for_spawn = stack.clone();
+        // Inherit the current user environment
+        let env_vars = glib::environ();
+
         terminal.spawn_async(
             PtyFlags::DEFAULT,
             Some(&home_dir),
             &[&shell, command[0], command[1]],
-            &[],
+            &env_vars,
             glib::SpawnFlags::DEFAULT,
             || {},
             -1,
             None::<&gtk4::gio::Cancellable>,
-            move |result| {
+            glib::clone!(@weak obj, @weak stack => move |result| {
                 match result {
                     Ok(_) => {
                         info!("Terminal process spawned, waiting for content...");
-                        // We no longer switch here; we wait for contents_changed
                     }
                     Err(err) => {
                         error!("Error spawning terminal: {}", err);
-                        stack_for_spawn.set_visible_child_name("terminal"); // Show terminal anyway so error is visible
+                        stack.set_visible_child_name("terminal"); // Show terminal anyway so error is visible
                         let dialog = gtk4::MessageDialog::builder()
-                            .transient_for(&obj_clone)
+                            .transient_for(&obj)
                             .message_type(gtk4::MessageType::Error)
                             .buttons(gtk4::ButtonsType::Ok)
                             .text("Terminal Error")
@@ -322,7 +282,7 @@ impl GeminiWindow {
                         dialog.present();
                     }
                 }
-            },
+            }),
         );
     }
 
@@ -344,15 +304,68 @@ impl GeminiWindow {
             .css_classes(["suggested-action"])
             .build();
 
-        let obj_clone = obj.clone();
-        refresh_button.connect_clicked(move |_| {
-            let imp = obj_clone.imp();
+        refresh_button.connect_clicked(glib::clone!(@weak obj => move |_| {
+            let imp = obj.imp();
             imp.setup_ui();
-        });
+        }));
 
         status_page.set_child(Some(&refresh_button));
         container.append(&status_page);
     }
+}
+
+/// Standalone detection logic that can run on a background thread.
+fn check_gemini_binary() -> bool {
+    let current_path = env::var("PATH").unwrap_or_default();
+    debug!("Detection PATH: {}", current_path);
+
+    // 1. Try which
+    debug!("Step 1: Trying 'which gemini'");
+    match std::process::Command::new("which").arg("gemini").output() {
+        Ok(output) => {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                info!("Gemini found via 'which' at: {}", path);
+                return true;
+            }
+        }
+        Err(_) => {}
+    }
+
+    // 2. Try common absolute paths
+    debug!("Step 2: Trying common absolute paths");
+    let home = env::var("HOME").unwrap_or_default();
+    let paths = [
+        "/usr/bin/gemini",
+        "/usr/local/bin/gemini",
+        &format!("{}/.local/bin/gemini", home),
+        &format!("{}/.npm-global/bin/gemini", home),
+        &format!("{}/bin/gemini", home),
+    ];
+
+    for path in paths {
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            debug!("Gemini found at absolute path: {}", path);
+            return true;
+        }
+    }
+
+    // 3. Try shell command -v (interactive)
+    debug!("Step 3: Trying shell command -v gemini");
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    if let Ok(output) = std::process::Command::new(&shell)
+        .args(["-ic", "command -v gemini"])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            info!("Gemini found via shell -ic at: {}", path);
+            return true;
+        }
+    }
+
+    warn!("Gemini binary not found after all checks.");
+    false
 }
 
 /// Determines the startup command based on whether the gemini binary exists.
