@@ -69,16 +69,23 @@ impl GeminiWindow {
 
     /// Checks if the gemini binary is available in the PATH or common locations.
     fn is_gemini_available(&self) -> bool {
+        let current_path = env::var("PATH").unwrap_or_default();
+        info!("Detection PATH: {}", current_path);
         debug!("Checking for gemini binary...");
 
         // 1. Try which
         debug!("Step 1: Trying 'which gemini'");
-        if let Ok(output) = std::process::Command::new("which").arg("gemini").output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                debug!("Gemini found via 'which' at: {}", path);
-                return true;
+        match std::process::Command::new("which").arg("gemini").output() {
+            Ok(output) => {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    info!("Gemini found via 'which' at: {}", path);
+                    return true;
+                } else {
+                    warn!("'which gemini' failed with status: {}", output.status);
+                }
             }
+            Err(e) => error!("Failed to execute 'which': {}", e),
         }
 
         // 2. Try common absolute paths
@@ -99,17 +106,17 @@ impl GeminiWindow {
             }
         }
 
-        // 3. Try shell command -v (non-interactive)
+        // 3. Try shell command -v (interactive)
         debug!("Step 3: Trying shell command -v gemini");
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        // Use -l (login) instead of -i (interactive) to load profiles without hanging on input
+        // Use -i (interactive) to ensure NVM/rbenv are loaded
         if let Ok(output) = std::process::Command::new(&shell)
-            .args(["-lc", "command -v gemini"])
+            .args(["-ic", "command -v gemini"])
             .output()
         {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                debug!("Gemini found via shell -lc at: {}", path);
+                info!("Gemini found via shell -ic at: {}", path);
                 return true;
             }
         }
@@ -182,21 +189,6 @@ impl GeminiWindow {
         stack.set_visible_child_name("loading");
 
         obj.set_child(Some(&stack));
-
-        // Update Header with terminal-specific buttons
-        if let Some(header) = self.header.borrow().as_ref() {
-            debug!("Clearing header bar");
-            // Remove any existing children
-            let mut count = 0;
-            while let Some(child) = header.first_child() {
-                count += 1;
-                if count > 100 {
-                    error!("Infinite loop detected while clearing HeaderBar!");
-                    break;
-                }
-                header.remove(&child);
-            }
-        }
 
         // Gemini Theme Colors
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
@@ -283,7 +275,7 @@ impl GeminiWindow {
             Some(&home_dir),
             &[&shell, command[0], command[1]],
             &[],
-            glib::SpawnFlags::DO_NOT_REAP_CHILD,
+            glib::SpawnFlags::DEFAULT,
             || {},
             -1,
             None::<&gtk4::gio::Cancellable>,
@@ -314,20 +306,7 @@ impl GeminiWindow {
     /// Sets up the welcome screen with installation instructions.
     fn setup_welcome_ui(&self) {
         let obj = self.obj();
-        let available = self.is_gemini_available();
-
-        // Update Header for welcome screen
-        if let Some(header) = self.header.borrow().as_ref() {
-            let mut count = 0;
-            while let Some(child) = header.first_child() {
-                count += 1;
-                if count > 100 {
-                    error!("Infinite loop detected while clearing HeaderBar in welcome UI!");
-                    break;
-                }
-                header.remove(&child);
-            }
-        }
+        let _available = self.is_gemini_available();
 
         let container = Box::builder()
             .orientation(Orientation::Vertical)
@@ -373,7 +352,7 @@ impl GeminiWindow {
             .build();
 
         let refresh_button = Button::builder()
-            .label(if available { "Start Gemini" } else { "I've installed it, let's go!" })
+            .label("Check for Gemini again")
             .margin_top(20)
             .css_classes(["suggested-action"])
             .build();
