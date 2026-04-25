@@ -3,8 +3,6 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
-use gtk4::prelude::*;
-use gtk4::subclass::prelude::*;
 use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
 use std::env;
 use vte4::prelude::*;
@@ -75,34 +73,31 @@ impl GeminiWindow {
         content.append(&status_page);
         obj.set_content(Some(&content));
 
-        // Use a channel to communicate the detection result back to the main thread
-        let (sender, receiver) = glib::MainContext::channel::<bool>(glib::Priority::default());
-
-        receiver.attach(None, glib::clone!(@weak obj, @weak content => @default-return glib::ControlFlow::Break, move |has_gemini| {
-            let imp = obj.imp();
-            
-            // Remove the status page
-            content.remove(&status_page);
-
-            if has_gemini {
-                info!("Gemini CLI detected, setting up terminal UI");
-                imp.setup_terminal_ui(&content);
-            } else {
-                warn!("Gemini CLI not detected, setting up welcome UI");
-                imp.setup_welcome_ui(&content);
-            }
-            glib::ControlFlow::Break
-        }));
-
         // Perform detection in a background thread
         let path = env::var("PATH").ok();
         let home = env::var("HOME").ok();
         let shell = env::var("SHELL").ok();
 
-        std::thread::spawn(move || {
-            let res = check_gemini_binary(path, home, shell);
-            let _ = sender.send(res);
-        });
+        std::thread::spawn(glib::clone!(@weak obj, @weak content => move || {
+            let has_gemini = check_gemini_binary(path, home, shell);
+            
+            // Dispatch back to the main thread safely
+            glib::idle_add(glib::clone!(@weak obj, @weak content => @default-return glib::ControlFlow::Break, move || {
+                let imp = obj.imp();
+                
+                // Remove the status page
+                content.remove(&status_page);
+
+                if has_gemini {
+                    info!("Gemini CLI detected, setting up terminal UI");
+                    imp.setup_terminal_ui(&content);
+                } else {
+                    warn!("Gemini CLI not detected, setting up welcome UI");
+                    imp.setup_welcome_ui(&content);
+                }
+                glib::ControlFlow::Break
+            }));
+        }));
     }
 
     /// Sets up the terminal interface.
