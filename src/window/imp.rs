@@ -4,13 +4,14 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
 use gtk4::prelude::*;
+use gtk4::subclass::prelude::*;
 use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
 use std::env;
 use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 use tracing::{info, warn, error, debug};
-
 use std::cell::RefCell;
+use crate::utils::{check_gemini_binary, get_startup_command};
 
 /// Static logo SVG for standalone binary.
 const LOGO_SVG: &str = include_str!("../../assets/gemini_logo.svg");
@@ -76,7 +77,11 @@ impl GeminiWindow {
 
         // Perform detection in a background thread to avoid blocking the UI thread
         std::thread::spawn(glib::clone!(@weak obj, @weak content => move || {
-            let has_gemini = check_gemini_binary();
+            let has_gemini = check_gemini_binary(
+                env::var("PATH").ok(),
+                env::var("HOME").ok(),
+                env::var("SHELL").ok()
+            );
 
             glib::idle_add_local(move || {
                 let imp = obj.imp();
@@ -314,84 +319,23 @@ impl GeminiWindow {
     }
 }
 
-/// Standalone detection logic that can run on a background thread.
-fn check_gemini_binary() -> bool {
-    let current_path = env::var("PATH").unwrap_or_default();
-    debug!("Detection PATH: {}", current_path);
-
-    // 1. Try which
-    debug!("Step 1: Trying 'which gemini'");
-    match std::process::Command::new("which").arg("gemini").output() {
-        Ok(output) => {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info!("Gemini found via 'which' at: {}", path);
-                return true;
-            }
-        }
-        Err(_) => {}
-    }
-
-    // 2. Try common absolute paths
-    debug!("Step 2: Trying common absolute paths");
-    let home = env::var("HOME").unwrap_or_default();
-    let paths = [
-        "/usr/bin/gemini",
-        "/usr/local/bin/gemini",
-        &format!("{}/.local/bin/gemini", home),
-        &format!("{}/.npm-global/bin/gemini", home),
-        &format!("{}/bin/gemini", home),
-    ];
-
-    for path in paths {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            debug!("Gemini found at absolute path: {}", path);
-            return true;
-        }
-    }
-
-    // 3. Try shell command -v (interactive)
-    debug!("Step 3: Trying shell command -v gemini");
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    if let Ok(output) = std::process::Command::new(&shell)
-        .args(["-ic", "command -v gemini"])
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            info!("Gemini found via shell -ic at: {}", path);
-            return true;
-        }
-    }
-
-    warn!("Gemini binary not found after all checks.");
-    false
-}
-
-/// Determines the startup command based on whether the gemini binary exists.
-fn get_startup_command(has_gemini: bool) -> Vec<&'static str> {
-    if has_gemini {
-        vec!["-ic", "gemini"]
-    } else {
-        vec!["-ic", "exec $SHELL"]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adw::prelude::*;
 
-    #[test]
-    fn test_startup_command_gemini_exists() {
-        let cmd = get_startup_command(true);
-        assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].contains("gemini"));
+    fn init_gtk() {
+        if !gtk4::is_initialized_main_thread() {
+            gtk4::test_init();
+        }
     }
 
     #[test]
-    fn test_startup_command_gemini_missing() {
-        let cmd = get_startup_command(false);
-        assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].contains("exec $SHELL"));
+    fn test_window_initialization() {
+        init_gtk();
+        let app = adw::Application::builder().application_id("org.test.Window").build();
+        let window = GeminiWindow::new(&app);
+        
+        assert_eq!(window.title(), Some("Gemini Terminal".into()));
     }
 }

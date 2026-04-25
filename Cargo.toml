@@ -1,6 +1,6 @@
 [package]
 name = "gemini-terminal"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["jdesroches"]
 description = "A standalone GTK4 terminal application for Gemini AI"
@@ -11,9 +11,12 @@ vte4 = "0.7"
 glib = "0.19"
 gio = "0.19"
 gdk4 = "0.8"
-libadwaita = "0.6"
+adw = { package = "libadwaita", version = "0.6" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [package.metadata.deb]
 maintainer = "jdesroches"

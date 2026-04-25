@@ -9,6 +9,7 @@ use tracing::{info, debug};
 use tracing_subscriber::EnvFilter;
 
 mod window;
+mod utils;
 use window::GeminiWindow;
 
 const APP_ID: &str = "com.jdesroches.GeminiTerminal";
