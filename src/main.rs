@@ -23,9 +23,16 @@ fn main() -> glib::ExitCode {
     info!("Starting Gemini Terminal (v0.2.0)...");
     let app = adw::Application::builder().application_id(APP_ID).build();
 
-    app.connect_startup(|_| {
+    app.connect_startup(|app| {
         debug!("Application startup: loading CSS");
         load_css();
+
+        // Add "New Window" action
+        let new_window_action = gtk4::gio::SimpleAction::new("new-window", None);
+        new_window_action.connect_activate(glib::clone!(@weak app => move |_, _| {
+            app.activate();
+        }));
+        app.add_action(&new_window_action);
     });
 
     app.connect_activate(|app| {

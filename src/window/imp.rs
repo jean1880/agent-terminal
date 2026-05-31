@@ -240,8 +240,12 @@ impl GeminiWindow {
 
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
-        menu.append(Some("Copy"), Some("win.copy"));
-        menu.append(Some("Paste"), Some("win.paste"));
+        menu.append(Some("New Window"), Some("app.new-window"));
+        
+        let section = gtk4::gio::Menu::new();
+        section.append(Some("Copy"), Some("win.copy"));
+        section.append(Some("Paste"), Some("win.paste"));
+        menu.append_section(None, &section);
 
         let popover = gtk4::PopoverMenu::builder()
             .menu_model(&menu)

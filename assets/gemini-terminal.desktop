@@ -10,3 +10,8 @@ Terminal=false
 StartupNotify=true
 Categories=Development;TerminalEmulator;
 Keywords=gemini;ai;terminal;chat;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=gemini-terminal
