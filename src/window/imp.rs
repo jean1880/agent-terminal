@@ -19,6 +19,7 @@ const LOGO_SVG: &str = include_str!("../../assets/gemini_logo.svg");
 pub struct GeminiWindow {
     pub terminal: RefCell<Option<Terminal>>,
     pub header: RefCell<Option<adw::HeaderBar>>,
+    pub window_title: RefCell<Option<adw::WindowTitle>>,
     pub loading_stack: RefCell<Option<Stack>>,
 }
 
@@ -33,6 +34,7 @@ impl ObjectImpl for GeminiWindow {
     fn constructed(&self) {
         self.parent_constructed();
         self.setup_ui();
+        self.setup_actions();
     }
 }
 
@@ -42,6 +44,35 @@ impl ApplicationWindowImpl for GeminiWindow {}
 impl AdwApplicationWindowImpl for GeminiWindow {}
 
 impl GeminiWindow {
+    /// Sets up GAction handlers for context menu items.
+    fn setup_actions(&self) {
+        let obj = self.obj();
+        
+        // Copy Action
+        let copy_action = gtk4::gio::SimpleAction::new("copy", None);
+        copy_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
+            let imp = obj.imp();
+            let terminal_borrow = imp.terminal.borrow();
+            if let Some(terminal) = terminal_borrow.as_ref() {
+                debug!("Action: Copy");
+                terminal.copy_clipboard_format(Format::Text);
+            }
+        }));
+        obj.add_action(&copy_action);
+
+        // Paste Action
+        let paste_action = gtk4::gio::SimpleAction::new("paste", None);
+        paste_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
+            let imp = obj.imp();
+            let terminal_borrow = imp.terminal.borrow();
+            if let Some(terminal) = terminal_borrow.as_ref() {
+                debug!("Action: Paste");
+                terminal.paste_clipboard();
+            }
+        }));
+        obj.add_action(&paste_action);
+    }
+
     /// Initializes the user interface, switching between terminal and welcome screen.
     fn setup_ui(&self) {
         let obj = self.obj();
@@ -55,12 +86,14 @@ impl GeminiWindow {
             .build();
 
         // Modern AdwHeaderBar
+        let window_title = adw::WindowTitle::new("Gemini Terminal", "");
         let header = adw::HeaderBar::builder()
-            .title_widget(&adw::WindowTitle::new("Gemini Terminal", ""))
+            .title_widget(&window_title)
             .build();
 
         content.append(&header);
         *self.header.borrow_mut() = Some(header);
+        *self.window_title.borrow_mut() = Some(window_title);
 
         // Show a temporary "Detecting" state
         let status_page = adw::StatusPage::builder()
@@ -192,7 +225,39 @@ impl GeminiWindow {
         terminal.set_cursor_shape(CursorShape::Block);
         terminal.set_scrollback_lines(10000);
         terminal.set_enable_sixel(true);
-        info!("Terminal configured, setting up hotkeys");
+        info!("Terminal configured, setting up controllers and signals");
+
+        // Window Title Handling (Session Info)
+        terminal.connect_window_title_changed(glib::clone!(@weak obj => move |terminal| {
+            let title = terminal.window_title();
+            debug!("Terminal window title changed: {:?}", title);
+            let imp = obj.imp();
+            let window_title_borrow = imp.window_title.borrow();
+            if let Some(window_title) = window_title_borrow.as_ref() {
+                window_title.set_subtitle(title.as_deref().unwrap_or(""));
+            }
+        }));
+
+        // Context Menu (Right Click)
+        let menu = gtk4::gio::Menu::new();
+        menu.append(Some("Copy"), Some("win.copy"));
+        menu.append(Some("Paste"), Some("win.paste"));
+
+        let popover = gtk4::PopoverMenu::builder()
+            .menu_model(&menu)
+            .has_arrow(false)
+            .build();
+        popover.set_parent(&terminal);
+
+        let click_gesture = gtk4::GestureClick::new();
+        click_gesture.set_button(3); // Right click
+        click_gesture.connect_pressed(glib::clone!(@weak popover => move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popover.set_pointing_to(Some(&rect));
+            popover.popup();
+        }));
+        terminal.add_controller(click_gesture);
 
         // Keyboard Shortcuts (Copy/Paste/Zoom)
         let key_controller = gtk4::EventControllerKey::new();
