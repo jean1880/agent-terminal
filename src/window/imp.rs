@@ -220,13 +220,42 @@ impl AntigravityWindow {
 
         container.append(&stack);
 
-        // Terminal Theme Colors (Keeping the "Antigravity" dark theme as it's visually pleasing)
+        // Terminal Theme Colors (Antigravity Theme)
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
         let fg_color = gtk4::gdk::RGBA::parse("rgb(200,200,255)").unwrap_or(gtk4::gdk::RGBA::WHITE);
         let bold_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
+        let cursor_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
 
-        terminal.set_colors(Some(&fg_color), Some(&bg_color), &[]);
+        // Harmonious pastel 16-color ANSI palette
+        let c1 = gtk4::gdk::RGBA::parse("rgb(255,107,107)").unwrap(); // Red (pastel red)
+        let c2 = gtk4::gdk::RGBA::parse("rgb(78,232,176)").unwrap(); // Green (mint green)
+        let c3 = gtk4::gdk::RGBA::parse("rgb(255,224,102)").unwrap(); // Yellow (warm yellow)
+        let c4 = gtk4::gdk::RGBA::parse("rgb(116,192,252)").unwrap(); // Blue (sky blue)
+        let c5 = bold_color; // Magenta (accent violet)
+        let c6 = gtk4::gdk::RGBA::parse("rgb(102,217,232)").unwrap(); // Cyan (pastel cyan)
+
+        let b0 = gtk4::gdk::RGBA::parse("rgb(34,28,51)").unwrap(); // Bright Black (slightly lighter)
+        let b1 = gtk4::gdk::RGBA::parse("rgb(255,135,135)").unwrap(); // Bright Red
+        let b2 = gtk4::gdk::RGBA::parse("rgb(99,241,195)").unwrap(); // Bright Green
+        let b3 = gtk4::gdk::RGBA::parse("rgb(255,236,153)").unwrap(); // Bright Yellow
+        let b4 = gtk4::gdk::RGBA::parse("rgb(165,216,255)").unwrap(); // Bright Blue
+        let b5 = gtk4::gdk::RGBA::parse("rgb(208,191,255)").unwrap(); // Bright Magenta
+        let b6 = gtk4::gdk::RGBA::parse("rgb(154,230,242)").unwrap(); // Bright Cyan
+        let b7 = gtk4::gdk::RGBA::parse("rgb(230,230,255)").unwrap(); // Bright White
+
+        let palette = [
+            &bg_color, &c1, &c2, &c3, &c4, &c5, &c6, &fg_color, &b0, &b1, &b2, &b3, &b4, &b5, &b6,
+            &b7,
+        ];
+
+        terminal.set_colors(Some(&fg_color), Some(&bg_color), &palette);
         terminal.set_color_bold(Some(&bold_color));
+        terminal.set_color_cursor(Some(&cursor_color));
+
+        // High-quality developer monospace font
+        let font_desc =
+            gtk4::pango::FontDescription::from_string("JetBrains Mono, Fira Code, Monospace 11");
+        terminal.set_font(Some(&font_desc));
 
         terminal.set_cursor_blink_mode(CursorBlinkMode::On);
         terminal.set_cursor_shape(CursorShape::Block);
