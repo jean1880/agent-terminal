@@ -225,6 +225,9 @@ impl AntigravityWindow {
         let fg_color = gtk4::gdk::RGBA::parse("rgb(200,200,255)").unwrap_or(gtk4::gdk::RGBA::WHITE);
         let bold_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
         let cursor_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
+        let normal_black = gtk4::gdk::RGBA::parse("rgb(45,40,62)").unwrap(); // Visible dark grey-violet
+        let highlight_bg = gtk4::gdk::RGBA::parse("rgb(68,58,94)").unwrap(); // Medium purple for selection
+        let highlight_fg = gtk4::gdk::RGBA::parse("rgb(230,230,255)").unwrap(); // Bright selection text
 
         // Harmonious pastel 16-color ANSI palette
         let c1 = gtk4::gdk::RGBA::parse("rgb(255,107,107)").unwrap(); // Red (pastel red)
@@ -234,7 +237,7 @@ impl AntigravityWindow {
         let c5 = bold_color; // Magenta (accent violet)
         let c6 = gtk4::gdk::RGBA::parse("rgb(102,217,232)").unwrap(); // Cyan (pastel cyan)
 
-        let b0 = gtk4::gdk::RGBA::parse("rgb(34,28,51)").unwrap(); // Bright Black (slightly lighter)
+        let b0 = gtk4::gdk::RGBA::parse("rgb(138,130,154)").unwrap(); // Bright Black (lavender-grey for comments/details)
         let b1 = gtk4::gdk::RGBA::parse("rgb(255,135,135)").unwrap(); // Bright Red
         let b2 = gtk4::gdk::RGBA::parse("rgb(99,241,195)").unwrap(); // Bright Green
         let b3 = gtk4::gdk::RGBA::parse("rgb(255,236,153)").unwrap(); // Bright Yellow
@@ -244,13 +247,29 @@ impl AntigravityWindow {
         let b7 = gtk4::gdk::RGBA::parse("rgb(230,230,255)").unwrap(); // Bright White
 
         let palette = [
-            &bg_color, &c1, &c2, &c3, &c4, &c5, &c6, &fg_color, &b0, &b1, &b2, &b3, &b4, &b5, &b6,
+            &normal_black,
+            &c1,
+            &c2,
+            &c3,
+            &c4,
+            &c5,
+            &c6,
+            &fg_color,
+            &b0,
+            &b1,
+            &b2,
+            &b3,
+            &b4,
+            &b5,
+            &b6,
             &b7,
         ];
 
         terminal.set_colors(Some(&fg_color), Some(&bg_color), &palette);
         terminal.set_color_bold(Some(&bold_color));
         terminal.set_color_cursor(Some(&cursor_color));
+        terminal.set_color_highlight(Some(&highlight_bg));
+        terminal.set_color_highlight_foreground(Some(&highlight_fg));
 
         // High-quality developer monospace font
         let font_desc =
