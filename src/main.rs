@@ -57,8 +57,8 @@ fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
         "
-        @define-color accent_color #8e75ff;
-        @define-color accent_bg_color #8e75ff;
+        @define-color accent_color #b49bff;
+        @define-color accent_bg_color #b49bff;
         @define-color window_bg_color #181425;
         @define-color headerbar_bg_color #120f1d;
 
@@ -95,13 +95,22 @@ fn load_css() {
         }
         button.suggested-action {
             background-color: @accent_bg_color;
-            color: #ffffff;
+            color: #181425;
             font-weight: bold;
             padding: 8px 20px;
             border-radius: 6px;
         }
         button.suggested-action:hover {
-            background-color: #7a5fff;
+            background-color: #9d80ff;
+        }
+        .loading-text {
+            font-size: 16pt;
+            font-weight: bold;
+            color: #c8c8ff;
+        }
+        .loading-subtext {
+            font-size: 11pt;
+            color: #a0a0ff;
         }
         ",
     );

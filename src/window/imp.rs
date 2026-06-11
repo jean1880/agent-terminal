@@ -223,21 +223,21 @@ impl AntigravityWindow {
         // Terminal Theme Colors (Antigravity Theme)
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
         let fg_color = gtk4::gdk::RGBA::parse("rgb(200,200,255)").unwrap_or(gtk4::gdk::RGBA::WHITE);
-        let bold_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
-        let cursor_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
+        let bold_color = gtk4::gdk::RGBA::parse("rgb(180,155,255)").unwrap_or(fg_color);
+        let cursor_color = gtk4::gdk::RGBA::parse("rgb(180,155,255)").unwrap_or(fg_color);
         let normal_black = gtk4::gdk::RGBA::parse("rgb(45,40,62)").unwrap(); // Visible dark grey-violet
         let highlight_bg = gtk4::gdk::RGBA::parse("rgb(68,58,94)").unwrap(); // Medium purple for selection
         let highlight_fg = gtk4::gdk::RGBA::parse("rgb(230,230,255)").unwrap(); // Bright selection text
 
         // Harmonious pastel 16-color ANSI palette
-        let c1 = gtk4::gdk::RGBA::parse("rgb(255,107,107)").unwrap(); // Red (pastel red)
+        let c1 = gtk4::gdk::RGBA::parse("rgb(255,120,120)").unwrap(); // Red (pastel red, adjusted for contrast)
         let c2 = gtk4::gdk::RGBA::parse("rgb(78,232,176)").unwrap(); // Green (mint green)
         let c3 = gtk4::gdk::RGBA::parse("rgb(255,224,102)").unwrap(); // Yellow (warm yellow)
         let c4 = gtk4::gdk::RGBA::parse("rgb(116,192,252)").unwrap(); // Blue (sky blue)
         let c5 = bold_color; // Magenta (accent violet)
         let c6 = gtk4::gdk::RGBA::parse("rgb(102,217,232)").unwrap(); // Cyan (pastel cyan)
 
-        let b0 = gtk4::gdk::RGBA::parse("rgb(138,130,154)").unwrap(); // Bright Black (lavender-grey for comments/details)
+        let b0 = gtk4::gdk::RGBA::parse("rgb(170,162,185)").unwrap(); // Bright Black (lavender-grey for comments/details, adjusted for contrast)
         let b1 = gtk4::gdk::RGBA::parse("rgb(255,135,135)").unwrap(); // Bright Red
         let b2 = gtk4::gdk::RGBA::parse("rgb(99,241,195)").unwrap(); // Bright Green
         let b3 = gtk4::gdk::RGBA::parse("rgb(255,236,153)").unwrap(); // Bright Yellow
