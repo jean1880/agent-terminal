@@ -1,12 +1,12 @@
-# Gemini Terminal: Developer Guidelines
+# Antigravity Terminal: Developer Guidelines
 
-Welcome to the Gemini Terminal codebase. This document outlines the architectural mandates, security standards, and development workflows for this project.
+Welcome to the Antigravity Terminal codebase. This document outlines the architectural mandates, security standards, and development workflows for this project.
 
 ## 🏗️ Architectural Mandates
 
 - **Standalone Philosophy**: This application must remain a single, standalone binary. All assets (SVG, icons) are embedded via `include_str!` or `include_bytes!`. Do NOT introduce external runtime dependencies.
 - **Native GTK4/Libadwaita**: The application is a native Rust binary using the Libadwaita framework for a modern, adaptive GNOME experience.
-- **PTY Bridge**: Core terminal interactions are handled via `vte4`, bridging the UI with the local Gemini CLI.
+- **PTY Bridge**: Core terminal interactions are handled via `vte4`, bridging the UI with the local Antigravity CLI.
 - **PTY Isolation**: Terminal interactions inherit the user interactive environment (`-ic`) and full system environment variables to maintain tool accessibility (nvm, aliases, etc.).
 
 ## 🔒 Security & Robustness
@@ -30,5 +30,5 @@ Welcome to the Gemini Terminal codebase. This document outlines the architectura
 ## 🤖 AI Contribution Rules
 
 - Always prioritize the **Standalone Philosophy**.
-- When adding UI elements, verify they match the "Gemini Theme" (Background: `#181425`, Foreground: `#c8c8ff`).
+- When adding UI elements, verify they match the "Antigravity Theme" (Background: `#181425`, Foreground: `#c8c8ff`).
 - If you modify the startup logic, you MUST update and run the corresponding unit tests.

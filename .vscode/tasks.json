@@ -2,9 +2,9 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Start Gemini CLI",
+            "label": "Start Antigravity CLI",
             "type": "shell",
-            "command": "gemini",
+            "command": "agy",
             "runOptions": {
                 "runOn": "folderOpen"
             },

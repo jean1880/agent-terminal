@@ -1,6 +1,6 @@
-# Skill: Gemini Terminal Architect
+# Skill: Antigravity Terminal Architect
 
-Specialized guidance for maintaining and extending the `gemini-terminal` application.
+Specialized guidance for maintaining and extending the `antigravity-terminal` application.
 
 ## 🎯 Expertise
 - **GTK4/Rust (glib-rs)**: Expert in the GObject subclassing pattern and signal handling.
@@ -26,4 +26,4 @@ When modifying how the terminal launches or interacts with the shell:
 ## 📏 Standards
 - **Naming**: Use `CamelCase` for structs/types and `snake_case` for methods/variables.
 - **Safety**: Prefer safe wrappers over `unsafe` blocks. If `unsafe` is necessary (rare in this project), document the invariants clearly.
-- **Visuals**: Maintain the "Gemini Theme". Interactive elements should have subtle hover/active states consistent with the current UI.
+- **Visuals**: Maintain the "Antigravity Theme". Interactive elements should have subtle hover/active states consistent with the current UI.

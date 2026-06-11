@@ -1,72 +1,93 @@
-//! Utility functions for Gemini Terminal.
+//! Utility functions for Antigravity Terminal.
 
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 /// Standalone detection logic that can run on a background thread.
 /// Takes environment parameters for testability.
-pub fn check_gemini_binary(
+pub fn detect_cli_binary(
+    path_env: Option<String>,
+    home_env: Option<String>,
+    shell_env: Option<String>,
+) -> Option<String> {
+    // 1. Try to find agy first (the new standard)
+    if check_binary_exists("agy", path_env.clone(), home_env.clone(), shell_env.clone()) {
+        return Some("agy".to_string());
+    }
+    // 2. Try to find gemini (for backward compatibility / user preference)
+    if check_binary_exists("gemini", path_env, home_env, shell_env) {
+        return Some("gemini".to_string());
+    }
+    None
+}
+
+/// Helper function to check if a specific binary exists.
+fn check_binary_exists(
+    name: &str,
     path_env: Option<String>,
     home_env: Option<String>,
     shell_env: Option<String>,
 ) -> bool {
     let current_path = path_env.unwrap_or_default();
-    debug!("Detection PATH: {}", current_path);
+    let home = home_env.unwrap_or_default();
+    debug!("Detection PATH for {}: {}", name, current_path);
 
     // 1. Try which
-    debug!("Step 1: Trying 'which gemini'");
-    match std::process::Command::new("which").arg("gemini").output() {
-        Ok(output) => {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info!("Gemini found via 'which' at: {}", path);
-                return true;
-            }
+    debug!("Step 1: Trying 'which {}'", name);
+    let mut cmd = std::process::Command::new("which");
+    cmd.arg(name);
+    if !current_path.is_empty() {
+        cmd.env("PATH", &current_path);
+    }
+    if let Ok(output) = cmd.output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            info!("{} found via 'which' at: {}", name, path);
+            return true;
         }
-        Err(_) => {}
     }
 
     // 2. Try common absolute paths
-    debug!("Step 2: Trying common absolute paths");
-    let home = home_env.unwrap_or_default();
+    debug!("Step 2: Trying common absolute paths for {}", name);
     let paths = [
-        "/usr/bin/gemini".to_string(),
-        "/usr/local/bin/gemini".to_string(),
-        format!("{}/.local/bin/gemini", home),
-        format!("{}/.npm-global/bin/gemini", home),
-        format!("{}/bin/gemini", home),
+        format!("/usr/bin/{}", name),
+        format!("/usr/local/bin/{}", name),
+        format!("{}/.local/bin/{}", home, name),
+        format!("{}/.npm-global/bin/{}", home, name),
+        format!("{}/bin/{}", home, name),
     ];
 
     for path in paths {
         if !path.is_empty() && std::path::Path::new(&path).exists() {
-            debug!("Gemini found at absolute path: {}", path);
+            debug!("{} found at absolute path: {}", name, path);
             return true;
         }
     }
 
     // 3. Try shell command -v (interactive)
-    debug!("Step 3: Trying shell command -v gemini");
+    debug!("Step 3: Trying shell command -v {}", name);
     let shell = shell_env.unwrap_or_else(|| "/bin/sh".to_string());
-    if let Ok(output) = std::process::Command::new(&shell)
-        .args(["-ic", "command -v gemini"])
-        .output()
-    {
+    let mut shell_cmd = std::process::Command::new(&shell);
+    shell_cmd.args(["-ic", &format!("command -v {}", name)]);
+    if !current_path.is_empty() {
+        shell_cmd.env("PATH", &current_path);
+    }
+    if let Ok(output) = shell_cmd.output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            info!("Gemini found via shell -ic at: {}", path);
+            info!("{} found via shell -ic at: {}", name, path);
             return true;
         }
     }
 
-    warn!("Gemini binary not found after all checks.");
+    warn!("{} binary not found after all checks.", name);
     false
 }
 
-/// Determines the startup command based on whether the gemini binary exists.
-pub fn get_startup_command(has_gemini: bool) -> Vec<&'static str> {
-    if has_gemini {
-        vec!["-ic", "gemini"]
-    } else {
-        vec!["-ic", "exec $SHELL"]
+/// Determines the startup command based on whether the agy binary exists.
+pub fn get_startup_command(binary: Option<&str>) -> Vec<String> {
+    match binary {
+        Some(name) => vec!["-ic".to_string(), name.to_string()],
+        None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
     }
 }
 
@@ -77,47 +98,73 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_startup_command_gemini_exists() {
-        let cmd = get_startup_command(true);
+    fn test_startup_command_agy_exists() {
+        let cmd = get_startup_command(Some("agy"));
         assert_eq!(cmd[0], "-ic");
-        assert_eq!(cmd[1], "gemini");
+        assert_eq!(cmd[1], "agy");
     }
 
     #[test]
-    fn test_startup_command_gemini_missing() {
-        let cmd = get_startup_command(false);
+    fn test_startup_command_agy_missing() {
+        let cmd = get_startup_command(None);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec $SHELL");
+    }
+
+    #[test]
+    fn test_check_agy_absolute_path() {
+        let dir = tempdir().unwrap();
+        let home_path = dir.path().to_str().unwrap().to_string();
+
+        let local_bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let agy_path = local_bin.join("agy");
+        File::create(&agy_path).unwrap();
+
+        // Should find it in Phase 2
+        assert_eq!(
+            detect_cli_binary(
+                Some("/non/existent/path".to_string()),
+                Some(home_path),
+                Some("/bin/sh".to_string())
+            ),
+            Some("agy".to_string())
+        );
     }
 
     #[test]
     fn test_check_gemini_absolute_path() {
         let dir = tempdir().unwrap();
         let home_path = dir.path().to_str().unwrap().to_string();
-        
+
         let local_bin = dir.path().join(".local/bin");
         std::fs::create_dir_all(&local_bin).unwrap();
         let gemini_path = local_bin.join("gemini");
         File::create(&gemini_path).unwrap();
 
         // Should find it in Phase 2
-        assert!(check_gemini_binary(
-            Some("".to_string()),
-            Some(home_path),
-            Some("/bin/sh".to_string())
-        ));
+        assert_eq!(
+            detect_cli_binary(
+                Some("/non/existent/path".to_string()),
+                Some(home_path),
+                Some("/bin/sh".to_string())
+            ),
+            Some("gemini".to_string())
+        );
     }
 
     #[test]
-    fn test_check_gemini_missing() {
+    fn test_check_agy_missing() {
         let dir = tempdir().unwrap();
         let home_path = dir.path().to_str().unwrap().to_string();
-        
-        // No binary anywhere
-        assert!(!check_gemini_binary(
-            Some("".to_string()),
+
+        // No binary anywhere, and empty PATH
+        // We use a non-existent path for PATH to ensure 'which' and 'shell -ic' fail
+        assert!(detect_cli_binary(
+            Some("/non/existent/path".to_string()),
             Some(home_path),
             Some("/bin/sh".to_string())
-        ));
+        )
+        .is_none());
     }
 }

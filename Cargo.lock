@@ -12,6 +12,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "antigravity-terminal"
+version = "0.3.5"
+dependencies = [
+ "gdk4",
+ "gio",
+ "glib",
+ "gtk4",
+ "libadwaita",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "vte4",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -224,21 +239,6 @@ dependencies = [
  "pango-sys",
  "pkg-config",
  "system-deps",
-]
-
-[[package]]
-name = "gemini-terminal"
-version = "0.3.5"
-dependencies = [
- "gdk4",
- "gio",
- "glib",
- "gtk4",
- "libadwaita",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "vte4",
 ]
 
 [[package]]

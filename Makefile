@@ -1,12 +1,12 @@
-# Makefile for Gemini Terminal
+# Makefile for Antigravity Terminal
 
-APP_NAME = gemini-terminal
+APP_NAME = antigravity-terminal
 BINARY = target/release/$(APP_NAME)
-DESKTOP_FILE = assets/gemini-terminal.desktop
-ICON_FILE = assets/gemini_logo.svg
+DESKTOP_FILE = assets/antigravity-terminal.desktop
+ICON_FILE = assets/antigravity_logo.svg
 LOCAL_BIN = $(HOME)/.local/bin
-LOCAL_DESKTOP = $(HOME)/.local/share/applications/gemini-terminal.desktop
-LOCAL_ICON = $(HOME)/.local/share/icons/gemini_logo.svg
+LOCAL_DESKTOP = $(HOME)/.local/share/applications/antigravity-terminal.desktop
+LOCAL_ICON = $(HOME)/.local/share/icons/antigravity_logo.svg
 
 .PHONY: all build clean install uninstall package deps help
 
@@ -47,7 +47,7 @@ install: build
 	cp $(DESKTOP_FILE) $(LOCAL_DESKTOP)
 	sed -i 's|^Exec=.*|Exec=$(LOCAL_BIN)/$(APP_NAME)|' $(LOCAL_DESKTOP)
 	sed -i 's|^Icon=.*|Icon=$(LOCAL_ICON)|' $(LOCAL_DESKTOP)
-	@echo "Done! You can now launch Gemini Terminal from your menu."
+	@echo "Done! You can now launch Antigravity Terminal from your menu."
 
 uninstall:
 	@echo "Uninstalling $(APP_NAME) from $(LOCAL_BIN)..."

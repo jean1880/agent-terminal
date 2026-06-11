@@ -1,10 +1,10 @@
 [package]
-name = "gemini-terminal"
+name = "antigravity-terminal"
 version = "0.3.5"
 
 edition = "2021"
 authors = ["jdesroches"]
-description = "A standalone GTK4 terminal application for Gemini AI"
+description = "A standalone GTK4 terminal application for Antigravity AI"
 
 [dependencies]
 gtk4 = "0.8"
@@ -27,7 +27,7 @@ depends = "$auto, libvte-2.91-gtk4-0, libadwaita-1-0"
 section = "utils"
 priority = "optional"
 assets = [
-    ["target/release/gemini-terminal", "usr/bin/gemini-terminal", "755"],
-    ["assets/gemini-terminal.desktop", "usr/share/applications/gemini-terminal.desktop", "644"],
-    ["assets/gemini_logo.svg", "usr/share/icons/gemini_logo.svg", "644"],
+    ["target/release/antigravity-terminal", "usr/bin/antigravity-terminal", "755"],
+    ["assets/antigravity-terminal.desktop", "usr/share/applications/antigravity-terminal.desktop", "644"],
+    ["assets/antigravity_logo.svg", "usr/share/icons/antigravity_logo.svg", "644"],
 ]

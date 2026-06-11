@@ -1,22 +1,22 @@
-//! Private implementation details of the GeminiWindow.
+//! Private implementation details of the AntigravityWindow.
 
+use crate::utils::{detect_cli_binary, get_startup_command};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
 use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
+use std::cell::RefCell;
 use std::env;
+use tracing::{debug, error, info, warn};
 use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
-use tracing::{info, warn, error, debug};
-use std::cell::RefCell;
-use crate::utils::{check_gemini_binary, get_startup_command};
 
 /// Static logo SVG for standalone binary.
-const LOGO_SVG: &str = include_str!("../../assets/gemini_logo.svg");
+const LOGO_SVG: &str = include_str!("../../assets/antigravity_logo.svg");
 
-/// Internal state for the GeminiWindow.
+/// Internal state for the AntigravityWindow.
 #[derive(Default)]
-pub struct GeminiWindow {
+pub struct AntigravityWindow {
     pub terminal: RefCell<Option<Terminal>>,
     pub header: RefCell<Option<adw::HeaderBar>>,
     pub window_title: RefCell<Option<adw::WindowTitle>>,
@@ -24,13 +24,13 @@ pub struct GeminiWindow {
 }
 
 #[glib::object_subclass]
-impl ObjectSubclass for GeminiWindow {
-    const NAME: &'static str = "GeminiWindow";
-    type Type = super::GeminiWindow;
+impl ObjectSubclass for AntigravityWindow {
+    const NAME: &'static str = "AntigravityWindow";
+    type Type = super::AntigravityWindow;
     type ParentType = adw::ApplicationWindow;
 }
 
-impl ObjectImpl for GeminiWindow {
+impl ObjectImpl for AntigravityWindow {
     fn constructed(&self) {
         self.parent_constructed();
         self.setup_ui();
@@ -38,16 +38,16 @@ impl ObjectImpl for GeminiWindow {
     }
 }
 
-impl WidgetImpl for GeminiWindow {}
-impl WindowImpl for GeminiWindow {}
-impl ApplicationWindowImpl for GeminiWindow {}
-impl AdwApplicationWindowImpl for GeminiWindow {}
+impl WidgetImpl for AntigravityWindow {}
+impl WindowImpl for AntigravityWindow {}
+impl ApplicationWindowImpl for AntigravityWindow {}
+impl AdwApplicationWindowImpl for AntigravityWindow {}
 
-impl GeminiWindow {
+impl AntigravityWindow {
     /// Sets up GAction handlers for context menu items.
     fn setup_actions(&self) {
         let obj = self.obj();
-        
+
         // Copy Action
         let copy_action = gtk4::gio::SimpleAction::new("copy", None);
         copy_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
@@ -76,17 +76,16 @@ impl GeminiWindow {
     /// Initializes the user interface, switching between terminal and welcome screen.
     fn setup_ui(&self) {
         let obj = self.obj();
-        debug!("Setting up UI for GeminiWindow");
+        debug!("Setting up UI for Antigravity Terminal");
 
         obj.set_default_width(950);
         obj.set_default_height(650);
+        obj.set_title(Some("Antigravity Terminal"));
 
-        let content = Box::builder()
-            .orientation(Orientation::Vertical)
-            .build();
+        let content = Box::builder().orientation(Orientation::Vertical).build();
 
         // Modern AdwHeaderBar
-        let window_title = adw::WindowTitle::new("Gemini Terminal", "");
+        let window_title = adw::WindowTitle::new("Antigravity Terminal", "");
         let header = adw::HeaderBar::builder()
             .title_widget(&window_title)
             .build();
@@ -98,11 +97,11 @@ impl GeminiWindow {
         // Show a temporary "Detecting" state
         let status_page = adw::StatusPage::builder()
             .title("Initializing...")
-            .description("Checking for Gemini CLI environment...")
+            .description("Checking for Antigravity CLI environment...")
             .icon_name("view-refresh-symbolic")
             .vexpand(true)
             .build();
-        
+
         content.append(&status_page);
         obj.set_content(Some(&content));
 
@@ -111,29 +110,31 @@ impl GeminiWindow {
         let home = env::var("HOME").ok();
         let shell = env::var("SHELL").ok();
 
-        glib::MainContext::default().spawn_local(glib::clone!(@weak obj, @weak content => async move {
-            // Give the UI one frame to render the "Initializing" screen
-            glib::timeout_future(std::time::Duration::from_millis(10)).await;
-            
-            // Perform the detection. We do this here as it's the simplest way
-            // to keep obj/content on the main thread.
-            let has_gemini = check_gemini_binary(path, home, shell);
+        glib::MainContext::default().spawn_local(
+            glib::clone!(@weak obj, @weak content => async move {
+                // Give the UI one frame to render the "Initializing" screen
+                glib::timeout_future(std::time::Duration::from_millis(10)).await;
 
-            let imp = obj.imp();
-            content.remove(&status_page);
+                // Perform the detection. We do this here as it's the simplest way
+                // to keep obj/content on the main thread.
+                let detected = detect_cli_binary(path, home, shell);
 
-            if has_gemini {
-                info!("Gemini CLI detected, setting up terminal UI");
-                imp.setup_terminal_ui(&content);
-            } else {
-                warn!("Gemini CLI not detected, setting up welcome UI");
-                imp.setup_welcome_ui(&content);
-            }
-        }));
+                let imp = obj.imp();
+                content.remove(&status_page);
+
+                if let Some(ref binary) = detected {
+                    info!("CLI binary '{}' detected, setting up terminal UI", binary);
+                    imp.setup_terminal_ui(&content, Some(binary));
+                } else {
+                    warn!("No compatible CLI detected, setting up welcome UI");
+                    imp.setup_welcome_ui(&content);
+                }
+            }),
+        );
     }
 
     /// Sets up the terminal interface.
-    fn setup_terminal_ui(&self, container: &Box) {
+    fn setup_terminal_ui(&self, container: &Box, cli_binary: Option<&str>) {
         let obj = self.obj();
         debug!("Initializing terminal UI");
         let terminal = Terminal::new();
@@ -159,9 +160,15 @@ impl GeminiWindow {
         // Logo with rotation (SVG)
         let logo_image = if let Ok(loader) = gtk4::gdk_pixbuf::PixbufLoader::with_type("svg") {
             loader.set_size(128, 128);
-            let load_result = loader.write(LOGO_SVG.as_bytes())
+            let load_result = loader
+                .write(LOGO_SVG.as_bytes())
                 .and_then(|_| loader.close())
-                .and_then(|_| loader.pixbuf().ok_or(glib::Error::new(gtk4::gio::IOErrorEnum::Failed, "Failed to get pixbuf")));
+                .and_then(|_| {
+                    loader.pixbuf().ok_or(glib::Error::new(
+                        gtk4::gio::IOErrorEnum::Failed,
+                        "Failed to get pixbuf",
+                    ))
+                });
 
             match load_result {
                 Ok(pixbuf) => {
@@ -174,7 +181,7 @@ impl GeminiWindow {
                     Some(img)
                 }
                 Err(e) => {
-                    error!("Failed to load embedded Gemini logo: {}", e);
+                    error!("Failed to load embedded logo: {}", e);
                     None
                 }
             }
@@ -184,7 +191,7 @@ impl GeminiWindow {
         };
 
         let loading_label = Label::builder()
-            .label("Gemini is thinking...")
+            .label("Antigravity is calculating...")
             .css_classes(["loading-text"])
             .build();
 
@@ -213,7 +220,7 @@ impl GeminiWindow {
 
         container.append(&stack);
 
-        // Gemini Theme Colors
+        // Terminal Theme Colors (Keeping the "Antigravity" dark theme as it's visually pleasing)
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
         let fg_color = gtk4::gdk::RGBA::parse("rgb(200,200,255)").unwrap_or(gtk4::gdk::RGBA::WHITE);
         let bold_color = gtk4::gdk::RGBA::parse("rgb(142,117,255)").unwrap_or(fg_color);
@@ -233,15 +240,24 @@ impl GeminiWindow {
             debug!("Terminal window title changed: {:?}", title);
             let imp = obj.imp();
             let window_title_borrow = imp.window_title.borrow();
+
             if let Some(window_title) = window_title_borrow.as_ref() {
-                window_title.set_subtitle(title.as_deref().unwrap_or(""));
+                let session_info = title.as_deref().unwrap_or("");
+                window_title.set_subtitle(session_info);
+
+                // Also update the main GtkWindow title so GNOME Shell sees it
+                if !session_info.is_empty() {
+                    obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+                } else {
+                    obj.set_title(Some("Antigravity Terminal"));
+                }
             }
         }));
 
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Window"), Some("app.new-window"));
-        
+
         let section = gtk4::gio::Menu::new();
         section.append(Some("Copy"), Some("win.copy"));
         section.append(Some("Paste"), Some("win.paste"));
@@ -302,7 +318,7 @@ impl GeminiWindow {
         }));
         terminal.add_controller(key_controller);
 
-        // Close window when the terminal child exits (e.g., user exits gemini)
+        // Close window when the terminal child exits (e.g., user exits agy)
         terminal.connect_child_exited(glib::clone!(@weak obj => move |_, status| {
             info!("Terminal child exited with status: {}", status);
             obj.close();
@@ -312,8 +328,11 @@ impl GeminiWindow {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
 
-        let command = get_startup_command(true);
-        info!("Spawning terminal with shell: {}, command: {:?}", shell, command);
+        let command = get_startup_command(cli_binary);
+        info!(
+            "Spawning terminal with shell: {}, command: {:?}",
+            shell, command
+        );
 
         // Connect to contents-changed to detect when the command actually starts printing
         terminal.connect_contents_changed(glib::clone!(@weak stack => move |_| {
@@ -325,17 +344,16 @@ impl GeminiWindow {
 
         // Inherit the current user environment
         let env_vars = glib::environ();
-        let env_strs: Vec<String> = env_vars.iter()
+        let env_strs: Vec<String> = env_vars
+            .iter()
             .map(|os| os.to_string_lossy().to_string())
             .collect();
-        let env_ptrs: Vec<&str> = env_strs.iter()
-            .map(|s| s.as_str())
-            .collect();
+        let env_ptrs: Vec<&str> = env_strs.iter().map(|s| s.as_str()).collect();
 
         terminal.spawn_async(
             PtyFlags::DEFAULT,
             Some(&home_dir),
-            &[&shell, command[0], command[1]],
+            &[&shell, &command[0], &command[1]],
             &env_ptrs,
             glib::SpawnFlags::DEFAULT,
             || {},
@@ -367,16 +385,16 @@ impl GeminiWindow {
     /// Sets up the welcome screen using AdwStatusPage.
     fn setup_welcome_ui(&self, container: &Box) {
         let obj = self.obj();
-        
+
         let status_page = adw::StatusPage::builder()
-            .title("Welcome to Gemini Terminal")
-            .description("The Gemini CLI was not detected on your system. We checked your PATH and interactive shell environment (-ic).\n\nTo get started, please install it using npm:\nnpm install -g @google/gemini-cli\n\nThen configure it:\ngemini configure")
+            .title("Welcome to Antigravity Terminal")
+            .description("The Antigravity CLI was not detected on your system. We checked your PATH and interactive shell environment (-ic).\n\nTo get started, please install it using the official script:\ncurl -fsSL https://antigravity.google/cli/install.sh | bash\n\nThen launch it:\nagy")
             .icon_name("utilities-terminal-symbolic")
             .vexpand(true)
             .build();
 
         let refresh_button = Button::builder()
-            .label("Check for Gemini again")
+            .label("Check for agy again")
             .halign(Align::Center)
             .margin_top(20)
             .css_classes(["suggested-action"])
@@ -395,20 +413,21 @@ impl GeminiWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adw::prelude::*;
 
     fn init_gtk() {
         if !gtk4::is_initialized_main_thread() {
-            gtk4::test_init();
+            gtk4::init().expect("GTK init failed");
         }
     }
 
     #[test]
     fn test_window_initialization() {
         init_gtk();
-        let app = adw::Application::builder().application_id("org.test.Window").build();
-        let window = GeminiWindow::new(&app);
-        
-        assert_eq!(window.title(), Some("Gemini Terminal".into()));
+        let app = adw::Application::builder()
+            .application_id("org.test.Window")
+            .build();
+        let window = super::super::AntigravityWindow::new(&app);
+
+        assert_eq!(window.title(), Some("Antigravity Terminal".into()));
     }
 }

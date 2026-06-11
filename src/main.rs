@@ -1,18 +1,18 @@
-//! Gemini Terminal
+//! Antigravity Terminal
 //!
 //! A standalone GTK4 terminal application specifically themed and configured
-//! for interacting with Gemini AI.
+//! for interacting with Antigravity AI.
 
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
-use tracing::{info, debug};
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-mod window;
 mod utils;
-use window::GeminiWindow;
+mod window;
+use window::AntigravityWindow;
 
-const APP_ID: &str = "com.jdesroches.GeminiTerminal";
+const APP_ID: &str = "com.jdesroches.AntigravityTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
@@ -20,7 +20,10 @@ fn main() -> glib::ExitCode {
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
-    info!("Starting Gemini Terminal (v0.2.0)...");
+    info!(
+        "Starting Antigravity Terminal (v{})...",
+        env!("CARGO_PKG_VERSION")
+    );
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|app| {
@@ -37,7 +40,7 @@ fn main() -> glib::ExitCode {
 
     app.connect_activate(|app| {
         info!("Application activated: creating window");
-        let window = GeminiWindow::new(app);
+        let window = AntigravityWindow::new(app);
         info!("Window created, presenting...");
         window.present();
         info!("Window presented");
@@ -98,38 +101,13 @@ fn load_css() {
             border-radius: 6px;
         }
         button.suggested-action:hover {
-            background-color: #7a61e0;
+            background-color: #7a5fff;
         }
-        @keyframes rotate {
-            0% { transform: rotate(0deg); }
-            25% { transform: rotate(45deg); }
-            100% { transform: rotate(360deg); }
-        }
-        .loading-container {
-            background-color: @window_bg_color;
-        }
-        .loading-icon {
-            animation: rotate 1.8s infinite cubic-bezier(0.4, 0.0, 0.2, 1);
-            margin-bottom: 32px;
-        }
-        .loading-text {
-            font-size: 16pt;
-            font-weight: bold;
-            color: @accent_color;
-        }
-        .loading-subtext {
-            font-size: 10pt;
-            color: #a0a0ff;
-            margin-top: 8px;
-        }
-    ",
+        ",
     );
-
-    if let Some(display) = gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
+    gtk4::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("Could not connect to a display."),
+        &provider,
+        STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 }
