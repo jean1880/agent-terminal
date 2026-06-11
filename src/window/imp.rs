@@ -280,6 +280,7 @@ impl AntigravityWindow {
         terminal.set_cursor_shape(CursorShape::Block);
         terminal.set_scrollback_lines(10000);
         terminal.set_enable_sixel(true);
+        terminal.set_allow_hyperlink(true);
         info!("Terminal configured, setting up controllers and signals");
 
         // Window Title Handling (Session Info)
@@ -326,6 +327,23 @@ impl AntigravityWindow {
             popover.popup();
         }));
         terminal.add_controller(click_gesture);
+
+        // Hyperlink Click Handler (Ctrl + Left Click)
+        let link_click_gesture = gtk4::GestureClick::new();
+        link_click_gesture.set_button(1); // Left click
+        link_click_gesture.connect_pressed(glib::clone!(@weak terminal => move |gesture, _, _x, _y| {
+            if let Some(event) = gesture.current_event() {
+                let modifiers = event.modifier_state();
+                if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                    if let Some(uri) = terminal.hyperlink_hover_uri() {
+                        gesture.set_state(gtk4::EventSequenceState::Claimed);
+                        debug!("Opening hyperlink: {}", uri);
+                        gtk4::show_uri(None::<&gtk4::Window>, &uri, 0);
+                    }
+                }
+            }
+        }));
+        terminal.add_controller(link_click_gesture);
 
         // Keyboard Shortcuts (Copy/Paste/Zoom)
         let key_controller = gtk4::EventControllerKey::new();
