@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 mod utils;
 mod window;
+pub mod config;
 use window::AntigravityWindow;
 
 const APP_ID: &str = "com.jdesroches.AntigravityTerminal";

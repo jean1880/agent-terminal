@@ -84,9 +84,18 @@ fn check_binary_exists(
 }
 
 /// Determines the startup command based on whether the agy binary exists.
-pub fn get_startup_command(binary: Option<&str>) -> Vec<String> {
+pub fn get_startup_command(binary: Option<&str>, config: &crate::config::TerminalConfig) -> Vec<String> {
+    let mut script_cmd = String::new();
+    let script_path = config.startup_script.replace("~", &std::env::var("HOME").unwrap_or_default());
+    if !script_path.is_empty() {
+        script_cmd = format!("if [ -f \"{0}\" ]; then source \"{0}\"; fi; ", script_path);
+    }
+
     match binary {
-        Some(name) => vec!["-ic".to_string(), name.to_string()],
+        Some(name) => vec![
+            "-ic".to_string(),
+            format!("{}{} ", script_cmd, name),
+        ],
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
     }
 }
@@ -99,14 +108,16 @@ mod tests {
 
     #[test]
     fn test_startup_command_agy_exists() {
-        let cmd = get_startup_command(Some("agy"));
+        let config = crate::config::TerminalConfig::default();
+        let cmd = get_startup_command(Some("agy"), &config);
         assert_eq!(cmd[0], "-ic");
-        assert_eq!(cmd[1], "agy");
+        assert!(cmd[1].ends_with("agy "));
     }
 
     #[test]
     fn test_startup_command_agy_missing() {
-        let cmd = get_startup_command(None);
+        let config = crate::config::TerminalConfig::default();
+        let cmd = get_startup_command(None, &config);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec $SHELL");
     }

@@ -21,6 +21,7 @@ pub struct AntigravityWindow {
     pub header: RefCell<Option<adw::HeaderBar>>,
     pub window_title: RefCell<Option<adw::WindowTitle>>,
     pub loading_stack: RefCell<Option<Stack>>,
+    pub config: RefCell<crate::config::TerminalConfig>,
 }
 
 #[glib::object_subclass]
@@ -33,6 +34,7 @@ impl ObjectSubclass for AntigravityWindow {
 impl ObjectImpl for AntigravityWindow {
     fn constructed(&self) {
         self.parent_constructed();
+        *self.config.borrow_mut() = crate::config::TerminalConfig::load();
         self.setup_ui();
         self.setup_actions();
     }
@@ -89,6 +91,16 @@ impl AntigravityWindow {
         let header = adw::HeaderBar::builder()
             .title_widget(&window_title)
             .build();
+
+        let settings_btn = gtk4::Button::builder()
+            .icon_name("document-properties-symbolic")
+            .tooltip_text("Settings")
+            .build();
+        settings_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
+            let imp = obj.imp();
+            imp.show_preferences();
+        }));
+        header.pack_end(&settings_btn);
 
         content.append(&header);
         *self.header.borrow_mut() = Some(header);
@@ -278,7 +290,13 @@ impl AntigravityWindow {
 
         terminal.set_cursor_blink_mode(CursorBlinkMode::On);
         terminal.set_cursor_shape(CursorShape::Block);
-        terminal.set_scrollback_lines(10000);
+        
+        let scrollback = self.config.borrow().scrollback_lines;
+        terminal.set_scrollback_lines(scrollback as i64);
+        
+        let font_scale = self.config.borrow().font_scale;
+        terminal.set_font_scale(font_scale);
+        
         terminal.set_enable_sixel(true);
         terminal.set_allow_hyperlink(true);
         info!("Terminal configured, setting up controllers and signals");
@@ -372,6 +390,7 @@ impl AntigravityWindow {
                     let scale = terminal.font_scale();
                     debug!("Hotkey: Zoom Out (new scale: {})", (scale - 0.1).max(0.1));
                     terminal.set_font_scale((scale - 0.1).max(0.1));
+                    // Optional: save scale to config?
                     glib::Propagation::Stop
                 }
                 k if k.to_unicode() == Some('0') && is_ctrl => {
@@ -394,7 +413,8 @@ impl AntigravityWindow {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
 
-        let command = get_startup_command(cli_binary);
+        let config = self.config.borrow().clone();
+        let command = get_startup_command(cli_binary, &config);
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
             shell, command
@@ -473,6 +493,65 @@ impl AntigravityWindow {
 
         status_page.set_child(Some(&refresh_button));
         container.append(&status_page);
+    }
+
+    fn show_preferences(&self) {
+        let obj = self.obj();
+        let config = self.config.borrow().clone();
+
+        let window = adw::PreferencesWindow::builder()
+            .transient_for(obj.upcast_ref::<gtk4::Window>())
+            .modal(true)
+            .search_enabled(false)
+            .title("Settings")
+            .build();
+
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::new();
+        group.set_title("Terminal Preferences");
+
+        let startup_script_entry = gtk4::Entry::builder()
+            .text(&config.startup_script)
+            .hexpand(true)
+            .valign(gtk4::Align::Center)
+            .build();
+            
+        let startup_script_row = adw::ActionRow::builder()
+            .title("Startup Script Path")
+            .build();
+        startup_script_row.add_suffix(&startup_script_entry);
+
+        let scroll_adj = gtk4::Adjustment::new(config.scrollback_lines as f64, 100.0, 100000.0, 100.0, 1000.0, 0.0);
+        let scroll_spin = gtk4::SpinButton::builder()
+            .adjustment(&scroll_adj)
+            .valign(gtk4::Align::Center)
+            .build();
+            
+        let scrollback_row = adw::ActionRow::builder()
+            .title("Scrollback Lines")
+            .build();
+        scrollback_row.add_suffix(&scroll_spin);
+
+        group.add(&startup_script_row);
+        group.add(&scrollback_row);
+        page.add(&group);
+        window.add(&page);
+
+        window.connect_close_request(glib::clone!(@weak obj => @default-return glib::Propagation::Proceed, move |_win| {
+            let imp = obj.imp();
+            let mut current_config = imp.config.borrow_mut();
+            current_config.startup_script = startup_script_entry.text().to_string();
+            current_config.scrollback_lines = scroll_spin.value() as u32;
+            current_config.save();
+            
+            // To apply dynamically, we'd adjust terminal here. Scrollback can be updated:
+            if let Some(term) = imp.terminal.borrow().as_ref() {
+                term.set_scrollback_lines(current_config.scrollback_lines as i64);
+            }
+            glib::Propagation::Proceed
+        }));
+
+        window.present();
     }
 }
 
