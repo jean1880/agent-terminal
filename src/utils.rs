@@ -92,10 +92,17 @@ pub fn get_startup_command(binary: Option<&str>, config: &crate::config::Termina
     }
 
     match binary {
-        Some(name) => vec![
-            "-ic".to_string(),
-            format!("{}{} --include-directories ~/git", script_cmd, name),
-        ],
+        Some(name) => {
+            let dir_flag = if name == "agy" {
+                "--add-dir"
+            } else {
+                "--include-directories"
+            };
+            vec![
+                "-ic".to_string(),
+                format!("{}{} {} ~/git", script_cmd, name, dir_flag),
+            ]
+        }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
     }
 }
@@ -111,7 +118,15 @@ mod tests {
         let config = crate::config::TerminalConfig::default();
         let cmd = get_startup_command(Some("agy"), &config);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].ends_with("agy --include-directories ~/git"));
+        assert!(cmd[1].ends_with("agy --add-dir ~/git"));
+    }
+
+    #[test]
+    fn test_startup_command_gemini_exists() {
+        let config = crate::config::TerminalConfig::default();
+        let cmd = get_startup_command(Some("gemini"), &config);
+        assert_eq!(cmd[0], "-ic");
+        assert!(cmd[1].ends_with("gemini --include-directories ~/git"));
     }
 
     #[test]
