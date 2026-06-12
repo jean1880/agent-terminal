@@ -94,7 +94,7 @@ pub fn get_startup_command(binary: Option<&str>, config: &crate::config::Termina
     match binary {
         Some(name) => vec![
             "-ic".to_string(),
-            format!("{}{} ", script_cmd, name),
+            format!("{}{} --include-directories ~/git", script_cmd, name),
         ],
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
     }
@@ -111,7 +111,7 @@ mod tests {
         let config = crate::config::TerminalConfig::default();
         let cmd = get_startup_command(Some("agy"), &config);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].ends_with("agy "));
+        assert!(cmd[1].ends_with("agy --include-directories ~/git"));
     }
 
     #[test]

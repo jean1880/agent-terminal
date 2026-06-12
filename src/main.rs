@@ -113,6 +113,12 @@ fn load_css() {
             font-size: 11pt;
             color: #a0a0ff;
         }
+        .warning-indicator {
+            color: #ff7878;
+        }
+        .success-indicator {
+            color: #4ee8b0;
+        }
         ",
     );
     gtk4::style_context_add_provider_for_display(

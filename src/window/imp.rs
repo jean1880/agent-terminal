@@ -75,6 +75,18 @@ impl AntigravityWindow {
         obj.add_action(&paste_action);
     }
 
+    /// Checks the system for Ansible configuration drift by reading the drift report.
+    fn get_drift_status() -> (bool, u32) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let path = std::path::PathBuf::from(home).join("scripts/rag_indexer/drift_report.txt");
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines = content.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+            (lines > 0, lines)
+        } else {
+            (false, 0)
+        }
+    }
+
     /// Initializes the user interface, switching between terminal and welcome screen.
     fn setup_ui(&self) {
         let obj = self.obj();
@@ -101,6 +113,69 @@ impl AntigravityWindow {
             imp.show_preferences();
         }));
         header.pack_end(&settings_btn);
+
+        // Health Indicator
+        let (has_drift, drift_lines) = Self::get_drift_status();
+        let health_btn = gtk4::Button::builder()
+            .icon_name(if has_drift { "dialog-warning-symbolic" } else { "security-high-symbolic" })
+            .tooltip_text(if has_drift { format!("Warning: {} configuration drift(s) detected", drift_lines) } else { "System configuration fully synchronized".to_string() })
+            .build();
+        
+        if has_drift {
+            health_btn.add_css_class("warning-indicator");
+        } else {
+            health_btn.add_css_class("success-indicator");
+        }
+        
+        health_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            let path = std::path::PathBuf::from(&home).join("scripts/rag_indexer/drift_report.txt");
+            let mut drift_detected = false;
+            let mut content = String::new();
+            
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                if c.lines().filter(|l| !l.trim().is_empty()).count() > 0 {
+                    drift_detected = true;
+                    content = c;
+                }
+            }
+
+            if drift_detected {
+                let dialog = gtk4::MessageDialog::builder()
+                    .transient_for(&obj)
+                    .message_type(gtk4::MessageType::Warning)
+                    .text("Configuration Drift Detected")
+                    .secondary_text(&format!("The following drifts were detected:\n\n{}", content))
+                    .build();
+                
+                dialog.add_button("Close", gtk4::ResponseType::Cancel);
+                dialog.add_button("Debug Issue", gtk4::ResponseType::Yes);
+                
+                dialog.connect_response(glib::clone!(@weak obj => move |dialog: &gtk4::MessageDialog, response: gtk4::ResponseType| {
+                    if response == gtk4::ResponseType::Yes {
+                        let imp = obj.imp();
+                        if let Some(terminal) = imp.terminal.borrow().as_ref() {
+                            let prompt = format!("Can you help me debug and fix this ansible drift issue? Here is the drift report:\n\n{}\n", content);
+                            terminal.feed_child(prompt.as_bytes());
+                        }
+                    }
+                    dialog.close();
+                }));
+                dialog.present();
+            } else {
+                let dialog = gtk4::MessageDialog::builder()
+                    .transient_for(&obj)
+                    .message_type(gtk4::MessageType::Info)
+                    .buttons(gtk4::ButtonsType::Ok)
+                    .text("System Health")
+                    .secondary_text("System configuration is fully synchronized. No configuration drift detected.")
+                    .build();
+                dialog.connect_response(|dialog: &gtk4::MessageDialog, _| dialog.close());
+                dialog.present();
+            }
+        }));
+        
+        header.pack_end(&health_btn);
 
         content.append(&header);
         *self.header.borrow_mut() = Some(header);
