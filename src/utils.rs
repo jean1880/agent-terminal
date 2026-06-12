@@ -5,19 +5,49 @@ use tracing::{debug, info, warn};
 /// Standalone detection logic that can run on a background thread.
 /// Takes environment parameters for testability.
 pub fn detect_cli_binary(
+    selected_client: crate::config::CliClient,
     path_env: Option<String>,
     home_env: Option<String>,
     shell_env: Option<String>,
 ) -> Option<String> {
-    // 1. Try to find agy first (the new standard)
-    if check_binary_exists("agy", path_env.clone(), home_env.clone(), shell_env.clone()) {
-        return Some("agy".to_string());
+    match selected_client {
+        crate::config::CliClient::Auto => {
+            // 1. Try to find agy first (the new standard)
+            if check_binary_exists("agy", path_env.clone(), home_env.clone(), shell_env.clone()) {
+                return Some("agy".to_string());
+            }
+            // 2. Try to find gemini (for backward compatibility / user preference)
+            if check_binary_exists("gemini", path_env.clone(), home_env.clone(), shell_env.clone()) {
+                return Some("gemini".to_string());
+            }
+            // 3. Try to find claude
+            if check_binary_exists("claude", path_env, home_env, shell_env) {
+                return Some("claude".to_string());
+            }
+            None
+        }
+        crate::config::CliClient::Gemini => {
+            if check_binary_exists("gemini", path_env, home_env, shell_env) {
+                Some("gemini".to_string())
+            } else {
+                None
+            }
+        }
+        crate::config::CliClient::Agy => {
+            if check_binary_exists("agy", path_env, home_env, shell_env) {
+                Some("agy".to_string())
+            } else {
+                None
+            }
+        }
+        crate::config::CliClient::Claude => {
+            if check_binary_exists("claude", path_env, home_env, shell_env) {
+                Some("claude".to_string())
+            } else {
+                None
+            }
+        }
     }
-    // 2. Try to find gemini (for backward compatibility / user preference)
-    if check_binary_exists("gemini", path_env, home_env, shell_env) {
-        return Some("gemini".to_string());
-    }
-    None
 }
 
 /// Helper function to check if a specific binary exists.
@@ -93,7 +123,7 @@ pub fn get_startup_command(binary: Option<&str>, config: &crate::config::Termina
 
     match binary {
         Some(name) => {
-            let dir_flag = if name == "agy" {
+            let dir_flag = if name == "agy" || name == "claude" {
                 "--add-dir"
             } else {
                 "--include-directories"
@@ -150,6 +180,7 @@ mod tests {
         // Should find it in Phase 2
         assert_eq!(
             detect_cli_binary(
+                crate::config::CliClient::Auto,
                 Some("/non/existent/path".to_string()),
                 Some(home_path),
                 Some("/bin/sh".to_string())
@@ -171,6 +202,7 @@ mod tests {
         // Should find it in Phase 2
         assert_eq!(
             detect_cli_binary(
+                crate::config::CliClient::Auto,
                 Some("/non/existent/path".to_string()),
                 Some(home_path),
                 Some("/bin/sh".to_string())
@@ -187,10 +219,50 @@ mod tests {
         // No binary anywhere, and empty PATH
         // We use a non-existent path for PATH to ensure 'which' and 'shell -ic' fail
         assert!(detect_cli_binary(
+            crate::config::CliClient::Auto,
             Some("/non/existent/path".to_string()),
             Some(home_path),
             Some("/bin/sh".to_string())
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_check_explicit_selections() {
+        let dir = tempdir().unwrap();
+        let home_path = dir.path().to_str().unwrap().to_string();
+
+        let local_bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let agy_path = local_bin.join("agy");
+        File::create(&agy_path).unwrap();
+
+        // When Gemini is explicitly selected but missing
+        assert_eq!(
+            detect_cli_binary(
+                crate::config::CliClient::Gemini,
+                Some("/non/existent/path".to_string()),
+                Some(home_path.clone()),
+                Some("/bin/sh".to_string())
+            ),
+            None
+        );
+
+        // When Agy is explicitly selected and present
+        assert_eq!(
+            detect_cli_binary(
+                crate::config::CliClient::Agy,
+                Some("/non/existent/path".to_string()),
+                Some(home_path.clone()),
+                Some("/bin/sh".to_string())
+            ),
+            Some("agy".to_string())
+        );
+
+        // Test Claude startup command format
+        let config = crate::config::TerminalConfig::default();
+        let cmd = get_startup_command(Some("claude"), &config);
+        assert_eq!(cmd[0], "-ic");
+        assert!(cmd[1].ends_with("claude --add-dir ~/git"));
     }
 }

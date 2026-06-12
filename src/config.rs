@@ -2,11 +2,39 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CliClient {
+    Auto,
+    Gemini,
+    Agy,
+    Claude,
+}
+
+impl Default for CliClient {
+    fn default() -> Self {
+        CliClient::Auto
+    }
+}
+
+impl std::fmt::Display for CliClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliClient::Auto => write!(f, "Auto-detect"),
+            CliClient::Gemini => write!(f, "Gemini"),
+            CliClient::Agy => write!(f, "Agy"),
+            CliClient::Claude => write!(f, "Claude"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalConfig {
     pub startup_script: String,
     pub scrollback_lines: u32,
     pub font_scale: f64,
+    #[serde(default)]
+    pub cli_client: CliClient,
 }
 
 impl Default for TerminalConfig {
@@ -15,6 +43,7 @@ impl Default for TerminalConfig {
             startup_script: "~/.config/antigravity-terminal/startup.sh".to_string(),
             scrollback_lines: 10000,
             font_scale: 1.0,
+            cli_client: CliClient::default(),
         }
     }
 }

@@ -22,6 +22,7 @@ pub struct AntigravityWindow {
     pub window_title: RefCell<Option<adw::WindowTitle>>,
     pub loading_stack: RefCell<Option<Stack>>,
     pub config: RefCell<crate::config::TerminalConfig>,
+    pub pending_restart: RefCell<bool>,
 }
 
 #[glib::object_subclass]
@@ -204,9 +205,10 @@ impl AntigravityWindow {
 
                 // Perform the detection. We do this here as it's the simplest way
                 // to keep obj/content on the main thread.
-                let detected = detect_cli_binary(path, home, shell);
-
                 let imp = obj.imp();
+                let selected_client = imp.config.borrow().cli_client;
+                let detected = detect_cli_binary(selected_client, path, home, shell);
+
                 content.remove(&status_page);
 
                 if let Some(ref binary) = detected {
@@ -440,7 +442,7 @@ impl AntigravityWindow {
 
         // Keyboard Shortcuts (Copy/Paste/Zoom)
         let key_controller = gtk4::EventControllerKey::new();
-        key_controller.connect_key_pressed(glib::clone!(@weak terminal => @default-return glib::Propagation::Proceed, move |_ctrl, key, _code, state| {
+        key_controller.connect_key_pressed(glib::clone!(@weak terminal, @weak obj => @default-return glib::Propagation::Proceed, move |_ctrl, key, _code, state| {
             let is_ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
             let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
 
@@ -456,21 +458,32 @@ impl AntigravityWindow {
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::plus | gtk4::gdk::Key::equal if is_ctrl => {
-                    let scale = terminal.font_scale();
-                    debug!("Hotkey: Zoom In (new scale: {})", scale + 0.1);
-                    terminal.set_font_scale(scale + 0.1);
+                    let new_scale = terminal.font_scale() + 0.1;
+                    debug!("Hotkey: Zoom In (new scale: {})", new_scale);
+                    terminal.set_font_scale(new_scale);
+                    let imp = obj.imp();
+                    let mut config = imp.config.borrow_mut();
+                    config.font_scale = new_scale;
+                    config.save();
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::minus if is_ctrl => {
-                    let scale = terminal.font_scale();
-                    debug!("Hotkey: Zoom Out (new scale: {})", (scale - 0.1).max(0.1));
-                    terminal.set_font_scale((scale - 0.1).max(0.1));
-                    // Optional: save scale to config?
+                    let new_scale = (terminal.font_scale() - 0.1).max(0.1);
+                    debug!("Hotkey: Zoom Out (new scale: {})", new_scale);
+                    terminal.set_font_scale(new_scale);
+                    let imp = obj.imp();
+                    let mut config = imp.config.borrow_mut();
+                    config.font_scale = new_scale;
+                    config.save();
                     glib::Propagation::Stop
                 }
                 k if k.to_unicode() == Some('0') && is_ctrl => {
                     debug!("Hotkey: Zoom Reset");
                     terminal.set_font_scale(1.0);
+                    let imp = obj.imp();
+                    let mut config = imp.config.borrow_mut();
+                    config.font_scale = 1.0;
+                    config.save();
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -478,10 +491,17 @@ impl AntigravityWindow {
         }));
         terminal.add_controller(key_controller);
 
-        // Close window when the terminal child exits (e.g., user exits agy)
+        // Respawn with new client if switching, otherwise close the window.
         terminal.connect_child_exited(glib::clone!(@weak obj => move |_, status| {
             info!("Terminal child exited with status: {}", status);
-            obj.close();
+            let imp = obj.imp();
+            let restart = *imp.pending_restart.borrow();
+            if restart {
+                *imp.pending_restart.borrow_mut() = false;
+                imp.setup_ui();
+            } else {
+                obj.close();
+            }
         }));
 
         // Dynamic Shell Detection
@@ -607,22 +627,80 @@ impl AntigravityWindow {
             .build();
         scrollback_row.add_suffix(&scroll_spin);
 
+        let client_model = gtk4::StringList::new(&[
+            "Auto-detect",
+            "Gemini",
+            "Agy",
+            "Claude",
+        ]);
+
+        let selected_index = match config.cli_client {
+            crate::config::CliClient::Auto => 0,
+            crate::config::CliClient::Gemini => 1,
+            crate::config::CliClient::Agy => 2,
+            crate::config::CliClient::Claude => 3,
+        };
+
+        let font_scale_adj = gtk4::Adjustment::new(config.font_scale, 0.5, 3.0, 0.1, 0.5, 0.0);
+        let font_scale_spin = gtk4::SpinButton::builder()
+            .adjustment(&font_scale_adj)
+            .digits(1)
+            .valign(gtk4::Align::Center)
+            .build();
+
+        let font_scale_row = adw::ActionRow::builder()
+            .title("Font Scale")
+            .build();
+        font_scale_row.add_suffix(&font_scale_spin);
+
+        let cli_client_row = adw::ComboRow::builder()
+            .title("Active CLI Client")
+            .model(&client_model)
+            .selected(selected_index)
+            .build();
+
         group.add(&startup_script_row);
         group.add(&scrollback_row);
+        group.add(&font_scale_row);
+        group.add(&cli_client_row);
         page.add(&group);
         window.add(&page);
 
-        window.connect_close_request(glib::clone!(@weak obj => @default-return glib::Propagation::Proceed, move |_win| {
+        window.connect_close_request(glib::clone!(@weak obj, @weak cli_client_row => @default-return glib::Propagation::Proceed, move |_win| {
             let imp = obj.imp();
-            let mut current_config = imp.config.borrow_mut();
-            current_config.startup_script = startup_script_entry.text().to_string();
-            current_config.scrollback_lines = scroll_spin.value() as u32;
-            current_config.save();
-            
-            // To apply dynamically, we'd adjust terminal here. Scrollback can be updated:
-            if let Some(term) = imp.terminal.borrow().as_ref() {
-                term.set_scrollback_lines(current_config.scrollback_lines as i64);
+            let previous_client = imp.config.borrow().cli_client;
+
+            let selected_client = match cli_client_row.selected() {
+                0 => crate::config::CliClient::Auto,
+                1 => crate::config::CliClient::Gemini,
+                2 => crate::config::CliClient::Agy,
+                3 => crate::config::CliClient::Claude,
+                _ => crate::config::CliClient::Auto,
+            };
+
+            {
+                let mut current_config = imp.config.borrow_mut();
+                current_config.startup_script = startup_script_entry.text().to_string();
+                current_config.scrollback_lines = scroll_spin.value() as u32;
+                current_config.font_scale = font_scale_spin.value();
+                current_config.cli_client = selected_client;
+                current_config.save();
             }
+
+            if let Some(term) = imp.terminal.borrow().as_ref() {
+                let config = imp.config.borrow();
+                term.set_scrollback_lines(config.scrollback_lines as i64);
+                term.set_font_scale(config.font_scale);
+            }
+
+            if selected_client != previous_client {
+                info!("CLI client changed to {:?}, restarting terminal session", selected_client);
+                *imp.pending_restart.borrow_mut() = true;
+                if let Some(term) = imp.terminal.borrow().as_ref() {
+                    term.feed_child(b"exit\n");
+                }
+            }
+
             glib::Propagation::Proceed
         }));
 
