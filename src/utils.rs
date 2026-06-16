@@ -13,7 +13,12 @@ pub fn detect_cli_binary(
     match selected_client {
         crate::config::CliClient::Auto => {
             // 1. Try to find claude first (preferred default)
-            if check_binary_exists("claude", path_env.clone(), home_env.clone(), shell_env.clone()) {
+            if check_binary_exists(
+                "claude",
+                path_env.clone(),
+                home_env.clone(),
+                shell_env.clone(),
+            ) {
                 return Some("claude".to_string());
             }
             // 2. Try to find agy (the new standard)
@@ -113,8 +118,32 @@ fn check_binary_exists(
     false
 }
 
+/// Resolves the working directory to use, handling ~ expansion and fallback to home.
+pub fn resolve_working_directory(starting_dir: &str, home_dir: &str) -> String {
+    let mut work_dir = starting_dir.trim().to_string();
+    if work_dir.is_empty() {
+        home_dir.to_string()
+    } else {
+        if work_dir.starts_with('~') {
+            work_dir = work_dir.replacen('~', home_dir, 1);
+        }
+        if std::path::Path::new(&work_dir).exists() {
+            work_dir
+        } else {
+            warn!(
+                "Configured starting directory '{}' does not exist, falling back to home directory",
+                work_dir
+            );
+            home_dir.to_string()
+        }
+    }
+}
+
 /// Determines the startup command for the detected CLI binary.
-pub fn get_startup_command(binary: Option<&str>, _config: &crate::config::TerminalConfig) -> Vec<String> {
+pub fn get_startup_command(
+    binary: Option<&str>,
+    _config: &crate::config::TerminalConfig,
+) -> Vec<String> {
     match binary {
         Some(name) => {
             // `exec` is critical: it replaces the wrapping interactive shell with the
@@ -128,10 +157,7 @@ pub fn get_startup_command(binary: Option<&str>, _config: &crate::config::Termin
             // initial terminal handshake. The working directory (set to $HOME in
             // setup_terminal_ui) provides the workspace as a native, trust-persisted
             // project, so no --add-dir flag is needed either.
-            vec![
-                "-ic".to_string(),
-                format!("exec {}", name),
-            ]
+            vec!["-ic".to_string(), format!("exec {}", name)]
         }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
     }
@@ -142,6 +168,42 @@ mod tests {
     use super::*;
     use std::fs::File;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_resolve_working_directory() {
+        let dir = tempdir().unwrap();
+        let home_dir = dir.path().to_str().unwrap().to_string();
+
+        // Test empty starting directory (defaults to home_dir)
+        assert_eq!(resolve_working_directory("", &home_dir), home_dir);
+        assert_eq!(resolve_working_directory("  ", &home_dir), home_dir);
+
+        // Test non-existent starting directory (defaults to home_dir)
+        assert_eq!(
+            resolve_working_directory("/non/existent/path", &home_dir),
+            home_dir
+        );
+
+        // Test ~ expansion to home_dir
+        assert_eq!(resolve_working_directory("~", &home_dir), home_dir);
+
+        // Create a subfolder inside home_dir
+        let sub_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub_dir_str = sub_dir.to_str().unwrap();
+
+        // Test existing absolute starting directory
+        assert_eq!(
+            resolve_working_directory(sub_dir_str, &home_dir),
+            sub_dir_str
+        );
+
+        // Test existing starting directory starting with ~
+        assert_eq!(
+            resolve_working_directory("~/projects", &home_dir),
+            sub_dir_str
+        );
+    }
 
     #[test]
     fn test_startup_command_agy_exists() {

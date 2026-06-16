@@ -1,6 +1,6 @@
 //! Private implementation details of the AntigravityWindow.
 
-use crate::utils::{detect_cli_binary, get_startup_command};
+use crate::utils::{detect_cli_binary, get_startup_command, resolve_working_directory};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
@@ -118,22 +118,30 @@ impl AntigravityWindow {
         // Health Indicator
         let (has_drift, drift_lines) = Self::get_drift_status();
         let health_btn = gtk4::Button::builder()
-            .icon_name(if has_drift { "dialog-warning-symbolic" } else { "security-high-symbolic" })
-            .tooltip_text(if has_drift { format!("Warning: {} configuration drift(s) detected", drift_lines) } else { "System configuration fully synchronized".to_string() })
+            .icon_name(if has_drift {
+                "dialog-warning-symbolic"
+            } else {
+                "security-high-symbolic"
+            })
+            .tooltip_text(if has_drift {
+                format!("Warning: {} configuration drift(s) detected", drift_lines)
+            } else {
+                "System configuration fully synchronized".to_string()
+            })
             .build();
-        
+
         if has_drift {
             health_btn.add_css_class("warning-indicator");
         } else {
             health_btn.add_css_class("success-indicator");
         }
-        
+
         health_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
             let path = std::path::PathBuf::from(&home).join("scripts/rag_indexer/drift_report.txt");
             let mut drift_detected = false;
             let mut content = String::new();
-            
+
             if let Ok(c) = std::fs::read_to_string(&path) {
                 if c.lines().filter(|l| !l.trim().is_empty()).count() > 0 {
                     drift_detected = true;
@@ -146,12 +154,12 @@ impl AntigravityWindow {
                     .transient_for(&obj)
                     .message_type(gtk4::MessageType::Warning)
                     .text("Configuration Drift Detected")
-                    .secondary_text(&format!("The following drifts were detected:\n\n{}", content))
+                    .secondary_text(format!("The following drifts were detected:\n\n{}", content))
                     .build();
-                
+
                 dialog.add_button("Close", gtk4::ResponseType::Cancel);
                 dialog.add_button("Debug Issue", gtk4::ResponseType::Yes);
-                
+
                 dialog.connect_response(glib::clone!(@weak obj => move |dialog: &gtk4::MessageDialog, response: gtk4::ResponseType| {
                     if response == gtk4::ResponseType::Yes {
                         let imp = obj.imp();
@@ -175,7 +183,7 @@ impl AntigravityWindow {
                 dialog.present();
             }
         }));
-        
+
         header.pack_end(&health_btn);
 
         content.append(&header);
@@ -367,13 +375,13 @@ impl AntigravityWindow {
 
         terminal.set_cursor_blink_mode(CursorBlinkMode::On);
         terminal.set_cursor_shape(CursorShape::Block);
-        
+
         let scrollback = self.config.borrow().scrollback_lines;
         terminal.set_scrollback_lines(scrollback as i64);
-        
+
         let font_scale = self.config.borrow().font_scale;
         terminal.set_font_scale(font_scale);
-        
+
         terminal.set_enable_sixel(true);
         terminal.set_allow_hyperlink(true);
         info!("Terminal configured, setting up controllers and signals");
@@ -426,18 +434,20 @@ impl AntigravityWindow {
         // Hyperlink Click Handler (Ctrl + Left Click)
         let link_click_gesture = gtk4::GestureClick::new();
         link_click_gesture.set_button(1); // Left click
-        link_click_gesture.connect_pressed(glib::clone!(@weak terminal => move |gesture, _, _x, _y| {
-            if let Some(event) = gesture.current_event() {
-                let modifiers = event.modifier_state();
-                if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                    if let Some(uri) = terminal.hyperlink_hover_uri() {
-                        gesture.set_state(gtk4::EventSequenceState::Claimed);
-                        debug!("Opening hyperlink: {}", uri);
-                        gtk4::show_uri(None::<&gtk4::Window>, &uri, 0);
+        link_click_gesture.connect_pressed(
+            glib::clone!(@weak terminal => move |gesture, _, _x, _y| {
+                if let Some(event) = gesture.current_event() {
+                    let modifiers = event.modifier_state();
+                    if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                        if let Some(uri) = terminal.hyperlink_hover_uri() {
+                            gesture.set_state(gtk4::EventSequenceState::Claimed);
+                            debug!("Opening hyperlink: {}", uri);
+                            gtk4::show_uri(None::<&gtk4::Window>, &uri, 0);
+                        }
                     }
                 }
-            }
-        }));
+            }),
+        );
         terminal.add_controller(link_click_gesture);
 
         // Keyboard Shortcuts (Copy/Paste/Zoom)
@@ -508,10 +518,11 @@ impl AntigravityWindow {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
 
-        // Launch the CLI from $HOME, not the git workspace.
-        let work_dir = home_dir.clone();
-
         let config = self.config.borrow().clone();
+
+        // Launch the CLI from configured starting directory, falling back to $HOME.
+        let work_dir = resolve_working_directory(&config.starting_directory, &home_dir);
+
         let command = get_startup_command(cli_binary, &config);
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
@@ -621,29 +632,41 @@ impl AntigravityWindow {
             .hexpand(true)
             .valign(gtk4::Align::Center)
             .build();
-            
+
         let startup_script_row = adw::ActionRow::builder()
             .title("Startup Script Path")
             .build();
         startup_script_row.add_suffix(&startup_script_entry);
 
-        let scroll_adj = gtk4::Adjustment::new(config.scrollback_lines as f64, 100.0, 100000.0, 100.0, 1000.0, 0.0);
+        let starting_directory_entry = gtk4::Entry::builder()
+            .text(&config.starting_directory)
+            .hexpand(true)
+            .valign(gtk4::Align::Center)
+            .placeholder_text("Leave blank to default to Home directory")
+            .build();
+
+        let starting_directory_row = adw::ActionRow::builder()
+            .title("Starting Directory")
+            .build();
+        starting_directory_row.add_suffix(&starting_directory_entry);
+
+        let scroll_adj = gtk4::Adjustment::new(
+            config.scrollback_lines as f64,
+            100.0,
+            100000.0,
+            100.0,
+            1000.0,
+            0.0,
+        );
         let scroll_spin = gtk4::SpinButton::builder()
             .adjustment(&scroll_adj)
             .valign(gtk4::Align::Center)
             .build();
-            
-        let scrollback_row = adw::ActionRow::builder()
-            .title("Scrollback Lines")
-            .build();
+
+        let scrollback_row = adw::ActionRow::builder().title("Scrollback Lines").build();
         scrollback_row.add_suffix(&scroll_spin);
 
-        let client_model = gtk4::StringList::new(&[
-            "Auto-detect",
-            "Gemini",
-            "Agy",
-            "Claude",
-        ]);
+        let client_model = gtk4::StringList::new(&["Auto-detect", "Gemini", "Agy", "Claude"]);
 
         let selected_index = match config.cli_client {
             crate::config::CliClient::Auto => 0,
@@ -659,9 +682,7 @@ impl AntigravityWindow {
             .valign(gtk4::Align::Center)
             .build();
 
-        let font_scale_row = adw::ActionRow::builder()
-            .title("Font Scale")
-            .build();
+        let font_scale_row = adw::ActionRow::builder().title("Font Scale").build();
         font_scale_row.add_suffix(&font_scale_spin);
 
         let cli_client_row = adw::ComboRow::builder()
@@ -671,49 +692,64 @@ impl AntigravityWindow {
             .build();
 
         group.add(&startup_script_row);
+        group.add(&starting_directory_row);
         group.add(&scrollback_row);
         group.add(&font_scale_row);
         group.add(&cli_client_row);
         page.add(&group);
         window.add(&page);
 
-        window.connect_close_request(glib::clone!(@weak obj, @weak cli_client_row => @default-return glib::Propagation::Proceed, move |_win| {
-            let imp = obj.imp();
-            let previous_client = imp.config.borrow().cli_client;
+        window.connect_close_request(glib::clone!(
+            @weak obj,
+            @weak cli_client_row,
+            @weak startup_script_entry,
+            @weak starting_directory_entry,
+            @weak scroll_spin,
+            @weak font_scale_spin => @default-return glib::Propagation::Proceed, move |_win| {
+                let imp = obj.imp();
+                let previous_client = imp.config.borrow().cli_client;
+                let previous_dir = imp.config.borrow().starting_directory.clone();
 
-            let selected_client = match cli_client_row.selected() {
-                0 => crate::config::CliClient::Auto,
-                1 => crate::config::CliClient::Gemini,
-                2 => crate::config::CliClient::Agy,
-                3 => crate::config::CliClient::Claude,
-                _ => crate::config::CliClient::Auto,
-            };
+                let selected_client = match cli_client_row.selected() {
+                    0 => crate::config::CliClient::Auto,
+                    1 => crate::config::CliClient::Gemini,
+                    2 => crate::config::CliClient::Agy,
+                    3 => crate::config::CliClient::Claude,
+                    _ => crate::config::CliClient::Auto,
+                };
 
-            {
-                let mut current_config = imp.config.borrow_mut();
-                current_config.startup_script = startup_script_entry.text().to_string();
-                current_config.scrollback_lines = scroll_spin.value() as u32;
-                current_config.font_scale = font_scale_spin.value();
-                current_config.cli_client = selected_client;
-                current_config.save();
-            }
-
-            if let Some(term) = imp.terminal.borrow().as_ref() {
-                let config = imp.config.borrow();
-                term.set_scrollback_lines(config.scrollback_lines as i64);
-                term.set_font_scale(config.font_scale);
-            }
-
-            if selected_client != previous_client {
-                info!("CLI client changed to {:?}, restarting terminal session", selected_client);
-                *imp.pending_restart.borrow_mut() = true;
-                if let Some(term) = imp.terminal.borrow().as_ref() {
-                    term.feed_child(b"exit\n");
+                let mut dir_changed = false;
+                {
+                    let mut current_config = imp.config.borrow_mut();
+                    current_config.startup_script = startup_script_entry.text().to_string();
+                    let new_dir = starting_directory_entry.text().to_string();
+                    if new_dir != previous_dir {
+                        dir_changed = true;
+                        current_config.starting_directory = new_dir;
+                    }
+                    current_config.scrollback_lines = scroll_spin.value() as u32;
+                    current_config.font_scale = font_scale_spin.value();
+                    current_config.cli_client = selected_client;
+                    current_config.save();
                 }
-            }
 
-            glib::Propagation::Proceed
-        }));
+                if let Some(term) = imp.terminal.borrow().as_ref() {
+                    let config = imp.config.borrow();
+                    term.set_scrollback_lines(config.scrollback_lines as i64);
+                    term.set_font_scale(config.font_scale);
+                }
+
+                if selected_client != previous_client || dir_changed {
+                    info!("CLI client or starting directory changed, restarting terminal session");
+                    *imp.pending_restart.borrow_mut() = true;
+                    if let Some(term) = imp.terminal.borrow().as_ref() {
+                        term.feed_child(b"exit\n");
+                    }
+                }
+
+                glib::Propagation::Proceed
+            }
+        ));
 
         window.present();
     }

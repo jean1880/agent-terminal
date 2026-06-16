@@ -8,9 +8,9 @@ use gtk4::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
+pub mod config;
 mod utils;
 mod window;
-pub mod config;
 use window::AntigravityWindow;
 
 const APP_ID: &str = "com.jdesroches.AntigravityTerminal";

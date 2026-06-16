@@ -2,19 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CliClient {
+    #[default]
     Auto,
     Gemini,
     Agy,
     Claude,
-}
-
-impl Default for CliClient {
-    fn default() -> Self {
-        CliClient::Auto
-    }
 }
 
 impl std::fmt::Display for CliClient {
@@ -35,6 +30,8 @@ pub struct TerminalConfig {
     pub font_scale: f64,
     #[serde(default)]
     pub cli_client: CliClient,
+    #[serde(default)]
+    pub starting_directory: String,
 }
 
 impl Default for TerminalConfig {
@@ -44,6 +41,7 @@ impl Default for TerminalConfig {
             scrollback_lines: 10000,
             font_scale: 1.0,
             cli_client: CliClient::default(),
+            starting_directory: String::new(),
         }
     }
 }
@@ -51,7 +49,9 @@ impl Default for TerminalConfig {
 impl TerminalConfig {
     pub fn config_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let dir = PathBuf::from(home).join(".config").join("antigravity-terminal");
+        let dir = PathBuf::from(home)
+            .join(".config")
+            .join("antigravity-terminal");
         if !dir.exists() {
             let _ = fs::create_dir_all(&dir);
         }
