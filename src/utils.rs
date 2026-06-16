@@ -12,17 +12,17 @@ pub fn detect_cli_binary(
 ) -> Option<String> {
     match selected_client {
         crate::config::CliClient::Auto => {
-            // 1. Try to find agy first (the new standard)
+            // 1. Try to find claude first (preferred default)
+            if check_binary_exists("claude", path_env.clone(), home_env.clone(), shell_env.clone()) {
+                return Some("claude".to_string());
+            }
+            // 2. Try to find agy (the new standard)
             if check_binary_exists("agy", path_env.clone(), home_env.clone(), shell_env.clone()) {
                 return Some("agy".to_string());
             }
-            // 2. Try to find gemini (for backward compatibility / user preference)
-            if check_binary_exists("gemini", path_env.clone(), home_env.clone(), shell_env.clone()) {
+            // 3. Try to find gemini (for backward compatibility / user preference)
+            if check_binary_exists("gemini", path_env, home_env, shell_env) {
                 return Some("gemini".to_string());
-            }
-            // 3. Try to find claude
-            if check_binary_exists("claude", path_env, home_env, shell_env) {
-                return Some("claude".to_string());
             }
             None
         }
@@ -113,24 +113,24 @@ fn check_binary_exists(
     false
 }
 
-/// Determines the startup command based on whether the agy binary exists.
-pub fn get_startup_command(binary: Option<&str>, config: &crate::config::TerminalConfig) -> Vec<String> {
-    let mut script_cmd = String::new();
-    let script_path = config.startup_script.replace("~", &std::env::var("HOME").unwrap_or_default());
-    if !script_path.is_empty() {
-        script_cmd = format!("if [ -f \"{0}\" ]; then source \"{0}\"; fi; ", script_path);
-    }
-
+/// Determines the startup command for the detected CLI binary.
+pub fn get_startup_command(binary: Option<&str>, _config: &crate::config::TerminalConfig) -> Vec<String> {
     match binary {
         Some(name) => {
-            let dir_flag = if name == "agy" || name == "claude" {
-                "--add-dir"
-            } else {
-                "--include-directories"
-            };
+            // `exec` is critical: it replaces the wrapping interactive shell with the
+            // CLI so the CLI directly owns the controlling terminal (session leader).
+            // Without it, `zsh -ic "claude"` runs claude as a *child job* of the shell,
+            // and Claude Code comes up degraded — no status line, CLAUDE.md not loaded,
+            // settings/folder-trust not persisted.
+            //
+            // We intentionally do NOT source a startup script here: emitting banner /
+            // `clear` output into the TTY immediately before exec disrupts Claude's
+            // initial terminal handshake. The working directory (set to $HOME in
+            // setup_terminal_ui) provides the workspace as a native, trust-persisted
+            // project, so no --add-dir flag is needed either.
             vec![
                 "-ic".to_string(),
-                format!("{}{} {} ~/git", script_cmd, name, dir_flag),
+                format!("exec {}", name),
             ]
         }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
@@ -148,7 +148,9 @@ mod tests {
         let config = crate::config::TerminalConfig::default();
         let cmd = get_startup_command(Some("agy"), &config);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].ends_with("agy --add-dir ~/git"));
+        // exec so the CLI owns the TTY; no --add-dir (workspace = spawn cwd $HOME).
+        assert!(cmd[1].ends_with("exec agy"));
+        assert!(!cmd[1].contains("--add-dir"));
     }
 
     #[test]
@@ -156,7 +158,8 @@ mod tests {
         let config = crate::config::TerminalConfig::default();
         let cmd = get_startup_command(Some("gemini"), &config);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].ends_with("gemini --include-directories ~/git"));
+        assert!(cmd[1].ends_with("exec gemini"));
+        assert!(!cmd[1].contains("--include-directories"));
     }
 
     #[test]
@@ -259,10 +262,14 @@ mod tests {
             Some("agy".to_string())
         );
 
-        // Test Claude startup command format
+        // Test Claude startup command format — `exec claude`, no --add-dir.
+        // exec lets claude own the TTY (status line / CLAUDE.md / trust all work);
+        // the workspace comes from the spawn cwd ($HOME), not an --add-dir flag
+        // (which would re-prompt for folder access on every launch).
         let config = crate::config::TerminalConfig::default();
         let cmd = get_startup_command(Some("claude"), &config);
         assert_eq!(cmd[0], "-ic");
-        assert!(cmd[1].ends_with("claude --add-dir ~/git"));
+        assert!(cmd[1].ends_with("exec claude"));
+        assert!(!cmd[1].contains("--add-dir"));
     }
 }

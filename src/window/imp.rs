@@ -508,6 +508,9 @@ impl AntigravityWindow {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
 
+        // Launch the CLI from $HOME, not the git workspace.
+        let work_dir = home_dir.clone();
+
         let config = self.config.borrow().clone();
         let command = get_startup_command(cli_binary, &config);
         info!(
@@ -523,17 +526,25 @@ impl AntigravityWindow {
             }
         }));
 
-        // Inherit the current user environment
-        let env_vars = glib::environ();
-        let env_strs: Vec<String> = env_vars
+        // Inherit the current user environment, then guarantee terminal
+        // capability vars so Claude Code renders its full TUI (status line, etc.).
+        // When launched from the desktop menu the GUI process has no TERM/COLORTERM,
+        // which makes Claude fall back to a degraded renderer that drops the status line.
+        let mut env_strs: Vec<String> = glib::environ()
             .iter()
             .map(|os| os.to_string_lossy().to_string())
             .collect();
+        if !env_strs.iter().any(|s| s.starts_with("TERM=")) {
+            env_strs.push("TERM=xterm-256color".to_string());
+        }
+        if !env_strs.iter().any(|s| s.starts_with("COLORTERM=")) {
+            env_strs.push("COLORTERM=truecolor".to_string());
+        }
         let env_ptrs: Vec<&str> = env_strs.iter().map(|s| s.as_str()).collect();
 
         terminal.spawn_async(
             PtyFlags::DEFAULT,
-            Some(&home_dir),
+            Some(&work_dir),
             &[&shell, &command[0], &command[1]],
             &env_ptrs,
             glib::SpawnFlags::DEFAULT,
