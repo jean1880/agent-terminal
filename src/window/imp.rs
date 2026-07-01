@@ -156,7 +156,12 @@ impl AntigravityWindow {
         let home = env::var("HOME").ok();
         let shell = env::var("SHELL").ok();
         let selected_client = self.config.borrow().cli_client;
-        detect_cli_binary(selected_client, path, home, shell)
+        detect_cli_binary(
+            selected_client,
+            path.as_deref(),
+            home.as_deref(),
+            shell.as_deref(),
+        )
     }
 
     /// Sets up GAction handlers for context menu items.
@@ -338,7 +343,12 @@ impl AntigravityWindow {
                 // to keep obj/content on the main thread.
                 let imp = obj.imp();
                 let selected_client = imp.config.borrow().cli_client;
-                let detected = detect_cli_binary(selected_client, path, home, shell);
+                let detected = detect_cli_binary(
+                    selected_client,
+                    path.as_deref(),
+                    home.as_deref(),
+                    shell.as_deref(),
+                );
                 *imp.detected_binary.borrow_mut() = detected.clone();
 
                 content.remove(&status_page);
