@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tracing::warn;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -23,6 +24,48 @@ impl std::fmt::Display for CliClient {
     }
 }
 
+/// The terminal color scheme.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemeChoice {
+    #[default]
+    Antigravity,
+    Dracula,
+    Nord,
+    GruvboxDark,
+    SolarizedDark,
+    OneDark,
+    Monokai,
+}
+
+impl std::fmt::Display for ThemeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ThemeChoice::Antigravity => "Antigravity",
+            ThemeChoice::Dracula => "Dracula",
+            ThemeChoice::Nord => "Nord",
+            ThemeChoice::GruvboxDark => "Gruvbox Dark",
+            ThemeChoice::SolarizedDark => "Solarized Dark",
+            ThemeChoice::OneDark => "One Dark",
+            ThemeChoice::Monokai => "Monokai",
+        };
+        f.write_str(name)
+    }
+}
+
+impl ThemeChoice {
+    /// All choices in display order; the index matches the settings dropdown.
+    pub const ALL: [ThemeChoice; 7] = [
+        ThemeChoice::Antigravity,
+        ThemeChoice::Dracula,
+        ThemeChoice::Nord,
+        ThemeChoice::GruvboxDark,
+        ThemeChoice::SolarizedDark,
+        ThemeChoice::OneDark,
+        ThemeChoice::Monokai,
+    ];
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalConfig {
     pub startup_script: String,
@@ -32,6 +75,8 @@ pub struct TerminalConfig {
     pub cli_client: CliClient,
     #[serde(default)]
     pub starting_directory: String,
+    #[serde(default)]
+    pub theme: ThemeChoice,
 }
 
 impl Default for TerminalConfig {
@@ -42,6 +87,7 @@ impl Default for TerminalConfig {
             font_scale: 1.0,
             cli_client: CliClient::default(),
             starting_directory: String::new(),
+            theme: ThemeChoice::default(),
         }
     }
 }
@@ -63,21 +109,104 @@ impl TerminalConfig {
     }
 
     pub fn load() -> Self {
-        let path = Self::config_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&content) {
-                    return config;
-                }
+        Self::load_from(&Self::config_path())
+    }
+
+    /// Loads a config from an explicit path, falling back to defaults. A missing
+    /// file is expected (first run); a present-but-invalid file is logged so the
+    /// user knows their settings were ignored rather than silently discarded.
+    fn load_from(path: &Path) -> Self {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                warn!(
+                    "Failed to read config at {}: {}; using defaults",
+                    path.display(),
+                    e
+                );
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(config) => config,
+            Err(e) => {
+                warn!(
+                    "Failed to parse config at {}: {}; using defaults",
+                    path.display(),
+                    e
+                );
+                Self::default()
             }
         }
-        Self::default()
     }
 
     pub fn save(&self) {
-        let path = Self::config_path();
-        if let Ok(content) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, content);
+        self.save_to(&Self::config_path());
+    }
+
+    /// Serializes and writes the config to an explicit path, logging on failure.
+    fn save_to(&self, path: &Path) {
+        match serde_json::to_string_pretty(self) {
+            Ok(content) => {
+                if let Err(e) = fs::write(path, content) {
+                    warn!("Failed to write config to {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => warn!("Failed to serialize config: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = TerminalConfig {
+            startup_script: "/tmp/startup.sh".to_string(),
+            scrollback_lines: 500,
+            font_scale: 1.5,
+            cli_client: CliClient::Claude,
+            starting_directory: "/tmp/project".to_string(),
+            theme: ThemeChoice::Dracula,
+        };
+        cfg.save_to(&path);
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.startup_script, cfg.startup_script);
+        assert_eq!(loaded.scrollback_lines, cfg.scrollback_lines);
+        assert_eq!(loaded.font_scale, cfg.font_scale);
+        assert_eq!(loaded.cli_client, cfg.cli_client);
+        assert_eq!(loaded.starting_directory, cfg.starting_directory);
+        assert_eq!(loaded.theme, cfg.theme);
+    }
+
+    #[test]
+    fn missing_file_yields_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        assert_eq!(
+            TerminalConfig::load_from(&path).cli_client,
+            CliClient::default()
+        );
+    }
+
+    #[test]
+    fn malformed_file_yields_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"{ not valid json ]")
+            .unwrap();
+        assert_eq!(
+            TerminalConfig::load_from(&path).scrollback_lines,
+            TerminalConfig::default().scrollback_lines
+        );
     }
 }

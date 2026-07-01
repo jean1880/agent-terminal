@@ -5,10 +5,13 @@
 
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
+use std::io::IsTerminal;
 use tracing::{debug, info};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter};
 
 pub mod config;
+mod theme;
 mod utils;
 mod window;
 use window::AntigravityWindow;
@@ -17,9 +20,7 @@ const APP_ID: &str = "com.jdesroches.AntigravityTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .init();
+    init_logging();
 
     info!(
         "Starting Antigravity Terminal (v{})...",
@@ -37,6 +38,10 @@ fn main() -> glib::ExitCode {
             app.activate();
         }));
         app.add_action(&new_window_action);
+
+        // Bind Ctrl+Shift+T to the per-window "new tab" action. Using an app
+        // accelerator means it is caught before VTE sees the key press.
+        app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>T"]);
     });
 
     app.connect_activate(|app| {
@@ -51,6 +56,57 @@ fn main() -> glib::ExitCode {
     let exit_code = app.run();
     info!("Application loop exited with code: {:?}", exit_code);
     exit_code
+}
+
+/// Initializes logging.
+///
+/// Prefers the systemd journal so a desktop-launched session is discoverable
+/// with `journalctl --user -t antigravity-terminal -b`, and falls back to
+/// stderr (used by `make start-local`) when the journal is unavailable. Level
+/// defaults to `info` and is overridable via `RUST_LOG`. Also installs a panic
+/// hook so a crash lands in the log instead of vanishing with the process.
+fn init_logging() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Send everything to the journal for desktop-launched sessions. Option<Layer>
+    // is itself a no-op Layer, so a missing journal just drops this layer.
+    let journald_layer = tracing_journald::layer()
+        .map(|layer| layer.with_syslog_identifier("antigravity-terminal".to_string()))
+        .map_err(|err| eprintln!("journald unavailable ({err}); relying on stderr"))
+        .ok();
+
+    // Also log to the terminal when one is attached (e.g. `make start-local`).
+    let stderr_layer = std::io::stderr()
+        .is_terminal()
+        .then(|| fmt::layer().with_writer(std::io::stderr));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(journald_layer)
+        .with(stderr_layer)
+        .init();
+
+    install_panic_hook();
+}
+
+/// Routes panics through `tracing` (so they reach the journal) before running
+/// the default hook, which still prints the message and any backtrace.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        tracing::error!(panic.location = %location, "panic: {}", message);
+        default_hook(info);
+    }));
 }
 
 /// Loads global application styles.

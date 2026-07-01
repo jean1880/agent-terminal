@@ -1,10 +1,16 @@
 [package]
 name = "antigravity-terminal"
-version = "0.3.5"
+version = "1.0.0"
 
 edition = "2021"
 authors = ["jdesroches"]
 description = "A standalone GTK4 terminal application for Antigravity AI"
+
+[features]
+# The homelab Ansible-drift indicator in the header. On by default; build with
+# --no-default-features for a generic terminal without the homelab integration.
+default = ["homelab-drift"]
+homelab-drift = []
 
 [dependencies]
 gtk4 = "0.8"
@@ -15,11 +21,17 @@ gdk4 = "0.8"
 adw = { package = "libadwaita", version = "0.6" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
 
 [package.metadata.deb]
 maintainer = "jdesroches"

@@ -6,23 +6,18 @@ use tracing::{debug, info, warn};
 /// Takes environment parameters for testability.
 pub fn detect_cli_binary(
     selected_client: crate::config::CliClient,
-    path_env: Option<String>,
-    home_env: Option<String>,
-    shell_env: Option<String>,
+    path_env: Option<&str>,
+    home_env: Option<&str>,
+    shell_env: Option<&str>,
 ) -> Option<String> {
     match selected_client {
         crate::config::CliClient::Auto => {
             // 1. Try to find claude first (preferred default)
-            if check_binary_exists(
-                "claude",
-                path_env.clone(),
-                home_env.clone(),
-                shell_env.clone(),
-            ) {
+            if check_binary_exists("claude", path_env, home_env, shell_env) {
                 return Some("claude".to_string());
             }
             // 2. Try to find agy (the new standard)
-            if check_binary_exists("agy", path_env.clone(), home_env.clone(), shell_env.clone()) {
+            if check_binary_exists("agy", path_env, home_env, shell_env) {
                 return Some("agy".to_string());
             }
             // 3. Try to find gemini (for backward compatibility / user preference)
@@ -58,9 +53,9 @@ pub fn detect_cli_binary(
 /// Helper function to check if a specific binary exists.
 fn check_binary_exists(
     name: &str,
-    path_env: Option<String>,
-    home_env: Option<String>,
-    shell_env: Option<String>,
+    path_env: Option<&str>,
+    home_env: Option<&str>,
+    shell_env: Option<&str>,
 ) -> bool {
     let current_path = path_env.unwrap_or_default();
     let home = home_env.unwrap_or_default();
@@ -71,7 +66,7 @@ fn check_binary_exists(
     let mut cmd = std::process::Command::new("which");
     cmd.arg(name);
     if !current_path.is_empty() {
-        cmd.env("PATH", &current_path);
+        cmd.env("PATH", current_path);
     }
     if let Ok(output) = cmd.output() {
         if output.status.success() {
@@ -100,11 +95,11 @@ fn check_binary_exists(
 
     // 3. Try shell command -v (interactive)
     debug!("Step 3: Trying shell command -v {}", name);
-    let shell = shell_env.unwrap_or_else(|| "/bin/sh".to_string());
-    let mut shell_cmd = std::process::Command::new(&shell);
+    let shell = shell_env.unwrap_or("/bin/sh");
+    let mut shell_cmd = std::process::Command::new(shell);
     shell_cmd.args(["-ic", &format!("command -v {}", name)]);
     if !current_path.is_empty() {
-        shell_cmd.env("PATH", &current_path);
+        shell_cmd.env("PATH", current_path);
     }
     if let Ok(output) = shell_cmd.output() {
         if output.status.success() {
@@ -246,9 +241,9 @@ mod tests {
         assert_eq!(
             detect_cli_binary(
                 crate::config::CliClient::Auto,
-                Some("/non/existent/path".to_string()),
-                Some(home_path),
-                Some("/bin/sh".to_string())
+                Some("/non/existent/path"),
+                Some(home_path.as_str()),
+                Some("/bin/sh")
             ),
             Some("agy".to_string())
         );
@@ -268,9 +263,9 @@ mod tests {
         assert_eq!(
             detect_cli_binary(
                 crate::config::CliClient::Auto,
-                Some("/non/existent/path".to_string()),
-                Some(home_path),
-                Some("/bin/sh".to_string())
+                Some("/non/existent/path"),
+                Some(home_path.as_str()),
+                Some("/bin/sh")
             ),
             Some("gemini".to_string())
         );
@@ -285,9 +280,9 @@ mod tests {
         // We use a non-existent path for PATH to ensure 'which' and 'shell -ic' fail
         assert!(detect_cli_binary(
             crate::config::CliClient::Auto,
-            Some("/non/existent/path".to_string()),
-            Some(home_path),
-            Some("/bin/sh".to_string())
+            Some("/non/existent/path"),
+            Some(home_path.as_str()),
+            Some("/bin/sh")
         )
         .is_none());
     }
@@ -306,9 +301,9 @@ mod tests {
         assert_eq!(
             detect_cli_binary(
                 crate::config::CliClient::Gemini,
-                Some("/non/existent/path".to_string()),
-                Some(home_path.clone()),
-                Some("/bin/sh".to_string())
+                Some("/non/existent/path"),
+                Some(home_path.as_str()),
+                Some("/bin/sh")
             ),
             None
         );
@@ -317,9 +312,9 @@ mod tests {
         assert_eq!(
             detect_cli_binary(
                 crate::config::CliClient::Agy,
-                Some("/non/existent/path".to_string()),
-                Some(home_path.clone()),
-                Some("/bin/sh".to_string())
+                Some("/non/existent/path"),
+                Some(home_path.as_str()),
+                Some("/bin/sh")
             ),
             Some("agy".to_string())
         );
