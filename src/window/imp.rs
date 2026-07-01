@@ -25,6 +25,67 @@ struct TabState {
     dir: String,
 }
 
+/// Builds the centered logo + text shown while a session is starting.
+fn build_loading_box() -> Box {
+    let loading_box = Box::builder()
+        .orientation(Orientation::Vertical)
+        .valign(Align::Center)
+        .halign(Align::Center)
+        .spacing(10)
+        .css_classes(["loading-container"])
+        .build();
+
+    // Logo (embedded SVG)
+    let logo_image = if let Ok(loader) = gtk4::gdk_pixbuf::PixbufLoader::with_type("svg") {
+        loader.set_size(128, 128);
+        let load_result = loader
+            .write(LOGO_SVG.as_bytes())
+            .and_then(|()| loader.close())
+            .and_then(|()| {
+                loader.pixbuf().ok_or(glib::Error::new(
+                    gtk4::gio::IOErrorEnum::Failed,
+                    "Failed to get pixbuf",
+                ))
+            });
+
+        match load_result {
+            Ok(pixbuf) => {
+                let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+                let img = Image::builder()
+                    .pixel_size(96)
+                    .css_classes(["loading-icon"])
+                    .build();
+                img.set_paintable(Some(&texture));
+                Some(img)
+            }
+            Err(e) => {
+                error!("Failed to load embedded logo: {}", e);
+                None
+            }
+        }
+    } else {
+        error!("SVG PixbufLoader not available");
+        None
+    };
+
+    let loading_label = Label::builder()
+        .label("Antigravity is calculating...")
+        .css_classes(["loading-text"])
+        .build();
+
+    let loading_sub = Label::builder()
+        .label("Spawning secure terminal session")
+        .css_classes(["loading-subtext"])
+        .build();
+
+    if let Some(img) = logo_image {
+        loading_box.append(&img);
+    }
+    loading_box.append(&loading_label);
+    loading_box.append(&loading_sub);
+    loading_box
+}
+
 /// Internal state for the AntigravityWindow.
 #[derive(Default)]
 pub struct AntigravityWindow {
@@ -436,7 +497,6 @@ impl AntigravityWindow {
     /// `dir_override` roots the tab in a specific directory; when `None` the
     /// configured starting directory (falling back to `$HOME`) is used.
     fn add_terminal_tab(&self, cli_binary: Option<&str>, dir_override: Option<&str>) {
-        let obj = self.obj();
         debug!("Adding terminal tab");
         let terminal = Terminal::new();
 
@@ -447,63 +507,7 @@ impl AntigravityWindow {
             .vexpand(true)
             .build();
 
-        // Loading Screen
-        let loading_box = Box::builder()
-            .orientation(Orientation::Vertical)
-            .valign(Align::Center)
-            .halign(Align::Center)
-            .spacing(10)
-            .css_classes(["loading-container"])
-            .build();
-
-        // Logo with rotation (SVG)
-        let logo_image = if let Ok(loader) = gtk4::gdk_pixbuf::PixbufLoader::with_type("svg") {
-            loader.set_size(128, 128);
-            let load_result = loader
-                .write(LOGO_SVG.as_bytes())
-                .and_then(|_| loader.close())
-                .and_then(|_| {
-                    loader.pixbuf().ok_or(glib::Error::new(
-                        gtk4::gio::IOErrorEnum::Failed,
-                        "Failed to get pixbuf",
-                    ))
-                });
-
-            match load_result {
-                Ok(pixbuf) => {
-                    let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
-                    let img = Image::builder()
-                        .pixel_size(96)
-                        .css_classes(["loading-icon"])
-                        .build();
-                    img.set_paintable(Some(&texture));
-                    Some(img)
-                }
-                Err(e) => {
-                    error!("Failed to load embedded logo: {}", e);
-                    None
-                }
-            }
-        } else {
-            error!("SVG PixbufLoader not available");
-            None
-        };
-
-        let loading_label = Label::builder()
-            .label("Antigravity is calculating...")
-            .css_classes(["loading-text"])
-            .build();
-
-        let loading_sub = Label::builder()
-            .label("Spawning secure terminal session")
-            .css_classes(["loading-subtext"])
-            .build();
-
-        if let Some(img) = logo_image {
-            loading_box.append(&img);
-        }
-        loading_box.append(&loading_label);
-        loading_box.append(&loading_sub);
+        let loading_box = build_loading_box();
 
         // Terminal Container
         let scrolled = ScrolledWindow::builder()
@@ -529,8 +533,30 @@ impl AntigravityWindow {
         page.set_title("Terminal");
         tab_view.set_selected_page(&page);
 
-        // Terminal Theme Colors (Antigravity Theme, built once and shared).
-        Theme::apply(&terminal);
+        self.configure_terminal(&terminal);
+        self.wire_tab_signals(&terminal, &page);
+        self.wire_input_controllers(&terminal);
+
+        // Launch the CLI from the override (per-tab dir) or configured starting
+        // directory, falling back to $HOME. Record it so "new tab in same
+        // directory" can reuse this tab's root.
+        let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let requested_dir = dir_override
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.borrow().starting_directory.clone());
+        let work_dir = resolve_working_directory(&requested_dir, &home_dir);
+        self.tabs.borrow_mut().push(TabState {
+            page: page.clone(),
+            terminal: terminal.clone(),
+            dir: work_dir.clone(),
+        });
+
+        self.spawn_session(&terminal, &stack, cli_binary, &work_dir);
+    }
+
+    /// Applies theme, font, cursor, scrollback, and capability settings.
+    fn configure_terminal(&self, terminal: &Terminal) {
+        Theme::apply(terminal);
 
         // High-quality developer monospace font
         let font_desc =
@@ -540,24 +566,26 @@ impl AntigravityWindow {
         terminal.set_cursor_blink_mode(CursorBlinkMode::On);
         terminal.set_cursor_shape(CursorShape::Block);
 
-        let scrollback = self.config.borrow().scrollback_lines;
-        terminal.set_scrollback_lines(scrollback as i64);
-
-        let font_scale = self.config.borrow().font_scale;
-        terminal.set_font_scale(font_scale);
+        let config = self.config.borrow();
+        terminal.set_scrollback_lines(i64::from(config.scrollback_lines));
+        terminal.set_font_scale(config.font_scale);
 
         terminal.set_enable_sixel(true);
         terminal.set_allow_hyperlink(true);
         info!("Terminal configured, setting up controllers and signals");
+    }
 
-        // Window Title Handling (Session Info)
+    /// Wires the terminal's title and exit signals to the tab and window.
+    fn wire_tab_signals(&self, terminal: &Terminal, page: &adw::TabPage) {
+        let obj = self.obj();
+
+        // Terminal title drives the tab label and (when active) the window title.
         terminal.connect_window_title_changed(
             glib::clone!(@weak obj, @weak page => move |terminal| {
                 let title = terminal.window_title();
                 debug!("Terminal window title changed: {:?}", title);
                 let session_info = title.as_deref().unwrap_or("");
 
-                // Label the tab itself.
                 page.set_title(if session_info.is_empty() {
                     "Terminal"
                 } else {
@@ -579,16 +607,28 @@ impl AntigravityWindow {
 
                 if let Some(window_title) = imp.window_title.borrow().as_ref() {
                     window_title.set_subtitle(session_info);
-
-                    // Also update the main GtkWindow title so GNOME Shell sees it
-                    if !session_info.is_empty() {
-                        obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
-                    } else {
+                    if session_info.is_empty() {
                         obj.set_title(Some("Antigravity Terminal"));
+                    } else {
+                        obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
                     }
                 };
             }),
         );
+
+        // Close this tab when its session ends. Closing the last tab closes the
+        // window (see the n-pages handler).
+        terminal.connect_child_exited(glib::clone!(@weak obj, @weak page => move |_, status| {
+            info!("Terminal child exited with status: {}", status);
+            if let Some(tab_view) = obj.imp().tab_view.borrow().as_ref() {
+                tab_view.close_page(&page);
+            };
+        }));
+    }
+
+    /// Attaches the right-click menu, ctrl-click hyperlink, and key shortcuts.
+    fn wire_input_controllers(&self, terminal: &Terminal) {
+        let obj = self.obj();
 
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
@@ -605,7 +645,7 @@ impl AntigravityWindow {
             .menu_model(&menu)
             .has_arrow(false)
             .build();
-        popover.set_parent(&terminal);
+        popover.set_parent(terminal);
 
         let click_gesture = gtk4::GestureClick::new();
         click_gesture.set_button(3); // Right click
@@ -654,74 +694,50 @@ impl AntigravityWindow {
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::plus | gtk4::gdk::Key::equal if is_ctrl => {
-                    let new_scale = terminal.font_scale() + 0.1;
-                    debug!("Hotkey: Zoom In (new scale: {})", new_scale);
-                    terminal.set_font_scale(new_scale);
-                    let imp = obj.imp();
-                    let mut config = imp.config.borrow_mut();
-                    config.font_scale = new_scale;
-                    config.save();
+                    obj.imp().set_font_scale(terminal.font_scale() + 0.1);
                     glib::Propagation::Stop
                 }
                 gtk4::gdk::Key::minus if is_ctrl => {
-                    let new_scale = (terminal.font_scale() - 0.1).max(0.1);
-                    debug!("Hotkey: Zoom Out (new scale: {})", new_scale);
-                    terminal.set_font_scale(new_scale);
-                    let imp = obj.imp();
-                    let mut config = imp.config.borrow_mut();
-                    config.font_scale = new_scale;
-                    config.save();
+                    obj.imp().set_font_scale((terminal.font_scale() - 0.1).max(0.1));
                     glib::Propagation::Stop
                 }
                 k if k.to_unicode() == Some('0') && is_ctrl => {
-                    debug!("Hotkey: Zoom Reset");
-                    terminal.set_font_scale(1.0);
-                    let imp = obj.imp();
-                    let mut config = imp.config.borrow_mut();
-                    config.font_scale = 1.0;
-                    config.save();
+                    obj.imp().set_font_scale(1.0);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
             }
         }));
         terminal.add_controller(key_controller);
+    }
 
-        // Close this tab when its session ends. Closing the last tab closes the
-        // window (see the n-pages handler).
-        terminal.connect_child_exited(glib::clone!(@weak obj, @weak page => move |_, status| {
-            info!("Terminal child exited with status: {}", status);
-            if let Some(tab_view) = obj.imp().tab_view.borrow().as_ref() {
-                tab_view.close_page(&page);
-            };
-        }));
+    /// Sets the font scale on all tabs and persists it.
+    fn set_font_scale(&self, scale: f64) {
+        debug!("Setting font scale: {}", scale);
+        self.for_each_terminal(|term| term.set_font_scale(scale));
+        let mut config = self.config.borrow_mut();
+        config.font_scale = scale;
+        config.save();
+    }
 
-        // Dynamic Shell Detection
+    /// Spawns the shell/CLI in the terminal and reveals it once output appears.
+    fn spawn_session(
+        &self,
+        terminal: &Terminal,
+        stack: &Stack,
+        cli_binary: Option<&str>,
+        work_dir: &str,
+    ) {
+        let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-
         let config = self.config.borrow().clone();
-
-        // Launch the CLI from the override (per-tab dir) or configured starting
-        // directory, falling back to $HOME. Record it so "new tab in same
-        // directory" can reuse this tab's root.
-        let requested_dir = dir_override
-            .map(str::to_string)
-            .unwrap_or_else(|| config.starting_directory.clone());
-        let work_dir = resolve_working_directory(&requested_dir, &home_dir);
-        self.tabs.borrow_mut().push(TabState {
-            page: page.clone(),
-            terminal: terminal.clone(),
-            dir: work_dir.clone(),
-        });
-
         let command = get_startup_command(cli_binary, &config);
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
             shell, command
         );
 
-        // Connect to contents-changed to detect when the command actually starts printing
+        // Switch off the loading screen as soon as the command prints anything.
         terminal.connect_contents_changed(glib::clone!(@weak stack => move |_| {
             if stack.visible_child_name().as_deref() == Some("loading") {
                 debug!("Terminal content detected, switching from loading screen");
@@ -743,11 +759,11 @@ impl AntigravityWindow {
         if !env_strs.iter().any(|s| s.starts_with("COLORTERM=")) {
             env_strs.push("COLORTERM=truecolor".to_string());
         }
-        let env_ptrs: Vec<&str> = env_strs.iter().map(|s| s.as_str()).collect();
+        let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
 
         terminal.spawn_async(
             PtyFlags::DEFAULT,
-            Some(&work_dir),
+            Some(work_dir),
             &[&shell, &command[0], &command[1]],
             &env_ptrs,
             glib::SpawnFlags::DEFAULT,
@@ -756,9 +772,7 @@ impl AntigravityWindow {
             None::<&gtk4::gio::Cancellable>,
             glib::clone!(@weak obj, @weak stack => move |result| {
                 match result {
-                    Ok(_) => {
-                        info!("Terminal process spawned, waiting for content...");
-                    }
+                    Ok(_) => info!("Terminal process spawned, waiting for content..."),
                     Err(err) => {
                         error!("Error spawning terminal: {}", err);
                         stack.set_visible_child_name("terminal"); // Show terminal anyway so error is visible
