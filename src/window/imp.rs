@@ -14,16 +14,24 @@ use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 /// Static logo SVG for standalone binary.
 const LOGO_SVG: &str = include_str!("../../assets/antigravity_logo.svg");
 
+/// Per-tab state, tracked explicitly so terminal/directory lookups never depend
+/// on walking the tab's widget hierarchy. `dir` is the directory the tab was
+/// launched in — a running Claude/agy session cannot re-root itself, so it stays
+/// valid for the tab's whole lifetime and drives "new tab in same directory".
+struct TabState {
+    page: adw::TabPage,
+    terminal: Terminal,
+    dir: String,
+}
+
 /// Internal state for the AntigravityWindow.
 #[derive(Default)]
 pub struct AntigravityWindow {
     pub header: RefCell<Option<adw::HeaderBar>>,
     pub window_title: RefCell<Option<adw::WindowTitle>>,
     pub tab_view: RefCell<Option<adw::TabView>>,
-    /// The resolved working directory each open tab was launched in. Claude/agy
-    /// cannot re-root a running session, so a tab's launch dir stays valid for
-    /// its whole lifetime and drives "new tab in same directory".
-    pub tab_dirs: RefCell<Vec<(adw::TabPage, String)>>,
+    /// One entry per open tab. Pruned when a page is detached.
+    tabs: RefCell<Vec<TabState>>,
     pub config: RefCell<crate::config::TerminalConfig>,
     pub pending_restart: RefCell<bool>,
     /// The CLI binary resolved at startup, cached so opening a new tab does not
@@ -54,44 +62,31 @@ impl ApplicationWindowImpl for AntigravityWindow {}
 impl AdwApplicationWindowImpl for AntigravityWindow {}
 
 impl AntigravityWindow {
-    /// Extracts the VTE terminal embedded in a tab page's widget tree.
-    fn terminal_from_page(page: &adw::TabPage) -> Option<Terminal> {
-        let stack = page.child().downcast::<Stack>().ok()?;
-        let scrolled = stack
-            .child_by_name("terminal")?
-            .downcast::<ScrolledWindow>()
-            .ok()?;
-        scrolled.child()?.downcast::<Terminal>().ok()
-    }
-
     /// Returns the terminal of the currently selected tab, if any.
     fn current_terminal(&self) -> Option<Terminal> {
-        let tab_view = self.tab_view.borrow();
-        let tab_view = tab_view.as_ref()?;
-        let page = tab_view.selected_page()?;
-        Self::terminal_from_page(&page)
+        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|t| t.page == page)
+            .map(|t| t.terminal.clone())
     }
 
     /// Applies a closure to every open tab's terminal.
     fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
-        if let Some(tab_view) = self.tab_view.borrow().as_ref() {
-            for i in 0..tab_view.n_pages() {
-                let page = tab_view.nth_page(i);
-                if let Some(terminal) = Self::terminal_from_page(&page) {
-                    f(&terminal);
-                }
-            }
+        for tab in self.tabs.borrow().iter() {
+            f(&tab.terminal);
         }
     }
 
     /// The launch directory of the currently selected tab, if tracked.
     fn current_dir(&self) -> Option<String> {
-        let tab_view = self.tab_view.borrow();
-        let page = tab_view.as_ref()?.selected_page()?;
-        let dirs = self.tab_dirs.borrow();
-        dirs.iter()
-            .find(|(p, _)| p == &page)
-            .map(|(_, dir)| dir.clone())
+        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|t| t.page == page)
+            .map(|t| t.dir.clone())
     }
 
     /// Detects the CLI binary for the currently configured client.
@@ -355,9 +350,9 @@ impl AntigravityWindow {
             }),
         );
 
-        // Forget a tab's tracked directory when it is removed.
+        // Forget a tab's tracked state when it is removed.
         tab_view.connect_page_detached(glib::clone!(@weak obj => move |_, page, _| {
-            obj.imp().tab_dirs.borrow_mut().retain(|(p, _)| p != page);
+            obj.imp().tabs.borrow_mut().retain(|t| &t.page != page);
         }));
 
         // Keep the header title in sync with the active tab.
@@ -751,9 +746,11 @@ impl AntigravityWindow {
             .map(str::to_string)
             .unwrap_or_else(|| config.starting_directory.clone());
         let work_dir = resolve_working_directory(&requested_dir, &home_dir);
-        self.tab_dirs
-            .borrow_mut()
-            .push((page.clone(), work_dir.clone()));
+        self.tabs.borrow_mut().push(TabState {
+            page: page.clone(),
+            terminal: terminal.clone(),
+            dir: work_dir.clone(),
+        });
 
         let command = get_startup_command(cli_binary, &config);
         info!(
