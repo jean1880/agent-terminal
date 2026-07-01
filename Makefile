@@ -8,7 +8,7 @@ LOCAL_BIN = $(HOME)/.local/bin
 LOCAL_DESKTOP = $(HOME)/.local/share/applications/antigravity-terminal.desktop
 LOCAL_ICON = $(HOME)/.local/share/icons/antigravity_logo.svg
 
-.PHONY: all build clean install uninstall package deps help
+.PHONY: all build start-local clean install uninstall package deps help
 
 all: build
 
@@ -16,6 +16,7 @@ help:
 	@echo "Usage:"
 	@echo "  make deps      - Install system dependencies (requires sudo)"
 	@echo "  make build     - Build the release binary"
+	@echo "  make start-local - Build and run the app locally (debug)"
 	@echo "  make install   - Install binary and desktop entry locally"
 	@echo "  make uninstall - Remove local installation and assets"
 	@echo "  make package   - Generate a .deb package using cargo-deb"
@@ -28,6 +29,10 @@ deps:
 build:
 	@echo "Building $(APP_NAME) in release mode..."
 	cargo build --release
+
+start-local:
+	@echo "Building and running $(APP_NAME) locally..."
+	cargo run
 
 package:
 	@echo "Checking for cargo-deb..."
