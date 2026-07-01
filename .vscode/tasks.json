@@ -2,9 +2,9 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Start Antigravity CLI",
+            "label": "Start Claude CLI",
             "type": "shell",
-            "command": "agy",
+            "command": "claude",
             "runOptions": {
                 "runOn": "folderOpen"
             },
