@@ -26,6 +26,10 @@ pub struct AntigravityWindow {
     pub tab_dirs: RefCell<Vec<(adw::TabPage, String)>>,
     pub config: RefCell<crate::config::TerminalConfig>,
     pub pending_restart: RefCell<bool>,
+    /// The CLI binary resolved at startup, cached so opening a new tab does not
+    /// re-run detection (which may block on an interactive shell) on the UI
+    /// thread. Refreshed when the configured client changes.
+    pub detected_binary: RefCell<Option<String>>,
 }
 
 #[glib::object_subclass]
@@ -279,6 +283,7 @@ impl AntigravityWindow {
                 let imp = obj.imp();
                 let selected_client = imp.config.borrow().cli_client;
                 let detected = detect_cli_binary(selected_client, path, home, shell);
+                *imp.detected_binary.borrow_mut() = detected.clone();
 
                 content.remove(&status_page);
 
@@ -378,7 +383,7 @@ impl AntigravityWindow {
     /// Opens a new tab rooted in the current tab's directory (fast path).
     fn new_tab(&self) {
         let dir = self.current_dir();
-        let detected = self.detect_current_client();
+        let detected = self.detected_binary.borrow().clone();
         self.add_terminal_tab(detected.as_deref(), dir.as_deref());
     }
 
@@ -405,7 +410,7 @@ impl AntigravityWindow {
                 if let Some(path) = dialog.file().and_then(|f| f.path()) {
                     let imp = obj.imp();
                     let dir = path.to_string_lossy().to_string();
-                    let detected = imp.detect_current_client();
+                    let detected = imp.detected_binary.borrow().clone();
                     imp.add_terminal_tab(detected.as_deref(), Some(&dir));
                 }
             }
@@ -968,6 +973,11 @@ impl AntigravityWindow {
                     term.set_scrollback_lines(scrollback);
                     term.set_font_scale(font_scale);
                 });
+
+                if selected_client != previous_client {
+                    // Re-resolve the binary so new tabs and the restart use it.
+                    *imp.detected_binary.borrow_mut() = imp.detect_current_client();
+                }
 
                 if selected_client != previous_client || dir_changed {
                     info!("CLI client or starting directory changed, restarting terminal session");
