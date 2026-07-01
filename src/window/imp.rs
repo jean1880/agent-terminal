@@ -556,7 +556,7 @@ impl AntigravityWindow {
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
     fn configure_terminal(&self, terminal: &Terminal) {
-        Theme::apply(terminal);
+        Theme::apply(terminal, self.config.borrow().theme);
 
         // High-quality developer monospace font
         let font_desc =
@@ -897,17 +897,35 @@ impl AntigravityWindow {
             .selected(selected_index)
             .build();
 
+        let theme_names: Vec<String> = crate::config::ThemeChoice::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let theme_name_refs: Vec<&str> = theme_names.iter().map(String::as_str).collect();
+        let theme_model = gtk4::StringList::new(&theme_name_refs);
+        let theme_index = crate::config::ThemeChoice::ALL
+            .iter()
+            .position(|t| *t == config.theme)
+            .unwrap_or(0) as u32;
+        let theme_row = adw::ComboRow::builder()
+            .title("Terminal Theme")
+            .model(&theme_model)
+            .selected(theme_index)
+            .build();
+
         group.add(&startup_script_row);
         group.add(&starting_directory_row);
         group.add(&scrollback_row);
         group.add(&font_scale_row);
         group.add(&cli_client_row);
+        group.add(&theme_row);
         page.add(&group);
         window.add(&page);
 
         window.connect_close_request(glib::clone!(
             @weak obj,
             @weak cli_client_row,
+            @weak theme_row,
             @weak startup_script_entry,
             @weak starting_directory_entry,
             @weak scroll_spin,
@@ -923,6 +941,10 @@ impl AntigravityWindow {
                     3 => crate::config::CliClient::Claude,
                     _ => crate::config::CliClient::Auto,
                 };
+                let selected_theme = crate::config::ThemeChoice::ALL
+                    .get(theme_row.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
 
                 let mut dir_changed = false;
                 {
@@ -936,6 +958,7 @@ impl AntigravityWindow {
                     current_config.scrollback_lines = scroll_spin.value() as u32;
                     current_config.font_scale = font_scale_spin.value();
                     current_config.cli_client = selected_client;
+                    current_config.theme = selected_theme;
                     current_config.save();
                 }
 
@@ -947,6 +970,9 @@ impl AntigravityWindow {
                     term.set_scrollback_lines(scrollback);
                     term.set_font_scale(font_scale);
                 });
+
+                // Themes apply live to every open tab; no restart needed.
+                imp.for_each_terminal(|term| Theme::apply(term, selected_theme));
 
                 if selected_client != previous_client {
                     // Re-resolve the binary so new tabs and the restart use it.

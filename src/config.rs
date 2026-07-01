@@ -24,6 +24,48 @@ impl std::fmt::Display for CliClient {
     }
 }
 
+/// The terminal color scheme.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemeChoice {
+    #[default]
+    Antigravity,
+    Dracula,
+    Nord,
+    GruvboxDark,
+    SolarizedDark,
+    OneDark,
+    Monokai,
+}
+
+impl std::fmt::Display for ThemeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ThemeChoice::Antigravity => "Antigravity",
+            ThemeChoice::Dracula => "Dracula",
+            ThemeChoice::Nord => "Nord",
+            ThemeChoice::GruvboxDark => "Gruvbox Dark",
+            ThemeChoice::SolarizedDark => "Solarized Dark",
+            ThemeChoice::OneDark => "One Dark",
+            ThemeChoice::Monokai => "Monokai",
+        };
+        f.write_str(name)
+    }
+}
+
+impl ThemeChoice {
+    /// All choices in display order; the index matches the settings dropdown.
+    pub const ALL: [ThemeChoice; 7] = [
+        ThemeChoice::Antigravity,
+        ThemeChoice::Dracula,
+        ThemeChoice::Nord,
+        ThemeChoice::GruvboxDark,
+        ThemeChoice::SolarizedDark,
+        ThemeChoice::OneDark,
+        ThemeChoice::Monokai,
+    ];
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TerminalConfig {
     pub startup_script: String,
@@ -33,6 +75,8 @@ pub struct TerminalConfig {
     pub cli_client: CliClient,
     #[serde(default)]
     pub starting_directory: String,
+    #[serde(default)]
+    pub theme: ThemeChoice,
 }
 
 impl Default for TerminalConfig {
@@ -43,6 +87,7 @@ impl Default for TerminalConfig {
             font_scale: 1.0,
             cli_client: CliClient::default(),
             starting_directory: String::new(),
+            theme: ThemeChoice::default(),
         }
     }
 }
@@ -128,6 +173,7 @@ mod tests {
             font_scale: 1.5,
             cli_client: CliClient::Claude,
             starting_directory: "/tmp/project".to_string(),
+            theme: ThemeChoice::Dracula,
         };
         cfg.save_to(&path);
 
@@ -137,6 +183,7 @@ mod tests {
         assert_eq!(loaded.font_scale, cfg.font_scale);
         assert_eq!(loaded.cli_client, cfg.cli_client);
         assert_eq!(loaded.starting_directory, cfg.starting_directory);
+        assert_eq!(loaded.theme, cfg.theme);
     }
 
     #[test]

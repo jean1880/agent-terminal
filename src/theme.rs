@@ -1,16 +1,13 @@
-//! The Antigravity terminal color theme.
+//! Terminal color schemes.
 //!
-//! Built once per thread (GTK runs single-threaded) and reused for every tab,
-//! using the infallible [`RGBA::new`] rather than parsing color strings at
-//! runtime — so applying the theme can never panic and costs nothing per tab.
+//! Each [`Theme`] is built from infallible [`RGBA::new`] values (no runtime
+//! string parsing, so applying a theme can never panic). Themes are cheap to
+//! build, so one is constructed on demand each time it is applied to a tab.
 
+use crate::config::ThemeChoice;
 use gtk4::gdk::RGBA;
 use vte4::prelude::*;
 use vte4::Terminal;
-
-thread_local! {
-    static ANTIGRAVITY: Theme = Theme::build();
-}
 
 /// Converts 8-bit sRGB components to a fully opaque [`RGBA`].
 fn rgb(r: u8, g: u8, b: u8) -> RGBA {
@@ -19,6 +16,15 @@ fn rgb(r: u8, g: u8, b: u8) -> RGBA {
         f32::from(g) / 255.0,
         f32::from(b) / 255.0,
         1.0,
+    )
+}
+
+/// Converts a `0xRRGGBB` hex color to a fully opaque [`RGBA`].
+fn hex(color: u32) -> RGBA {
+    rgb(
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
     )
 }
 
@@ -35,17 +41,96 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Applies the shared Antigravity theme to a terminal.
-    pub fn apply(terminal: &Terminal) {
-        ANTIGRAVITY.with(|theme| theme.apply_to(terminal));
+    /// Builds the requested theme and applies it to a terminal.
+    pub fn apply(terminal: &Terminal, choice: ThemeChoice) {
+        Self::for_choice(choice).apply_to(terminal);
     }
 
-    fn build() -> Self {
+    fn for_choice(choice: ThemeChoice) -> Self {
+        match choice {
+            ThemeChoice::Antigravity => Self::antigravity(),
+            ThemeChoice::Dracula => Self::scheme(
+                0x282a36,
+                0xf8f8f2,
+                0xf8f8f2,
+                0x44475a,
+                [
+                    0x21222c, 0xff5555, 0x50fa7b, 0xf1fa8c, 0xbd93f9, 0xff79c6, 0x8be9fd, 0xf8f8f2,
+                    0x6272a4, 0xff6e6e, 0x69ff94, 0xffffa5, 0xd6acff, 0xff92df, 0xa4ffff, 0xffffff,
+                ],
+            ),
+            ThemeChoice::Nord => Self::scheme(
+                0x2e3440,
+                0xd8dee9,
+                0xd8dee9,
+                0x434c5e,
+                [
+                    0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
+                    0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
+                ],
+            ),
+            ThemeChoice::GruvboxDark => Self::scheme(
+                0x282828,
+                0xebdbb2,
+                0xebdbb2,
+                0x504945,
+                [
+                    0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
+                    0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+                ],
+            ),
+            ThemeChoice::SolarizedDark => Self::scheme(
+                0x002b36,
+                0x839496,
+                0x93a1a1,
+                0x073642,
+                [
+                    0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+                    0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+                ],
+            ),
+            ThemeChoice::OneDark => Self::scheme(
+                0x282c34,
+                0xabb2bf,
+                0x528bff,
+                0x3e4451,
+                [
+                    0x282c34, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf,
+                    0x5c6370, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
+                ],
+            ),
+            ThemeChoice::Monokai => Self::scheme(
+                0x272822,
+                0xf8f8f2,
+                0xf8f8f0,
+                0x49483e,
+                [
+                    0x272822, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf8f8f2,
+                    0x75715e, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf9f8f5,
+                ],
+            ),
+        }
+    }
+
+    /// Builds a theme from hex colors. `bold` and the selection foreground both
+    /// use `fg`, which suits the standard schemes below.
+    fn scheme(bg: u32, fg: u32, cursor: u32, selection: u32, palette: [u32; 16]) -> Self {
+        Self {
+            foreground: hex(fg),
+            background: hex(bg),
+            bold: hex(fg),
+            cursor: hex(cursor),
+            highlight_bg: hex(selection),
+            highlight_fg: hex(fg),
+            palette: palette.map(hex),
+        }
+    }
+
+    /// The hand-tuned Antigravity brand theme (the default).
+    fn antigravity() -> Self {
         let foreground = rgb(200, 200, 255);
         let bold = rgb(180, 155, 255); // accent violet, reused for cursor + magenta
 
-        // Harmonious pastel 16-color ANSI palette. Index 5 (magenta) reuses the
-        // accent violet; index 7 (white) reuses the foreground.
         let palette = [
             rgb(45, 40, 62),    // 0  black (dark grey-violet)
             rgb(255, 120, 120), // 1  red
