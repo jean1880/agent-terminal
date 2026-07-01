@@ -1,5 +1,6 @@
 //! Private implementation details of the AntigravityWindow.
 
+use crate::theme::Theme;
 use crate::utils::{detect_cli_binary, get_startup_command, resolve_working_directory};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -528,56 +529,8 @@ impl AntigravityWindow {
         page.set_title("Terminal");
         tab_view.set_selected_page(&page);
 
-        // Terminal Theme Colors (Antigravity Theme)
-        let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
-        let fg_color = gtk4::gdk::RGBA::parse("rgb(200,200,255)").unwrap_or(gtk4::gdk::RGBA::WHITE);
-        let bold_color = gtk4::gdk::RGBA::parse("rgb(180,155,255)").unwrap_or(fg_color);
-        let cursor_color = gtk4::gdk::RGBA::parse("rgb(180,155,255)").unwrap_or(fg_color);
-        let normal_black = gtk4::gdk::RGBA::parse("rgb(45,40,62)").unwrap(); // Visible dark grey-violet
-        let highlight_bg = gtk4::gdk::RGBA::parse("rgb(68,58,94)").unwrap(); // Medium purple for selection
-        let highlight_fg = gtk4::gdk::RGBA::parse("rgb(230,230,255)").unwrap(); // Bright selection text
-
-        // Harmonious pastel 16-color ANSI palette
-        let c1 = gtk4::gdk::RGBA::parse("rgb(255,120,120)").unwrap(); // Red (pastel red, adjusted for contrast)
-        let c2 = gtk4::gdk::RGBA::parse("rgb(78,232,176)").unwrap(); // Green (mint green)
-        let c3 = gtk4::gdk::RGBA::parse("rgb(255,224,102)").unwrap(); // Yellow (warm yellow)
-        let c4 = gtk4::gdk::RGBA::parse("rgb(116,192,252)").unwrap(); // Blue (sky blue)
-        let c5 = bold_color; // Magenta (accent violet)
-        let c6 = gtk4::gdk::RGBA::parse("rgb(102,217,232)").unwrap(); // Cyan (pastel cyan)
-
-        let b0 = gtk4::gdk::RGBA::parse("rgb(170,162,185)").unwrap(); // Bright Black (lavender-grey for comments/details, adjusted for contrast)
-        let b1 = gtk4::gdk::RGBA::parse("rgb(255,135,135)").unwrap(); // Bright Red
-        let b2 = gtk4::gdk::RGBA::parse("rgb(99,241,195)").unwrap(); // Bright Green
-        let b3 = gtk4::gdk::RGBA::parse("rgb(255,236,153)").unwrap(); // Bright Yellow
-        let b4 = gtk4::gdk::RGBA::parse("rgb(165,216,255)").unwrap(); // Bright Blue
-        let b5 = gtk4::gdk::RGBA::parse("rgb(208,191,255)").unwrap(); // Bright Magenta
-        let b6 = gtk4::gdk::RGBA::parse("rgb(154,230,242)").unwrap(); // Bright Cyan
-        let b7 = gtk4::gdk::RGBA::parse("rgb(230,230,255)").unwrap(); // Bright White
-
-        let palette = [
-            &normal_black,
-            &c1,
-            &c2,
-            &c3,
-            &c4,
-            &c5,
-            &c6,
-            &fg_color,
-            &b0,
-            &b1,
-            &b2,
-            &b3,
-            &b4,
-            &b5,
-            &b6,
-            &b7,
-        ];
-
-        terminal.set_colors(Some(&fg_color), Some(&bg_color), &palette);
-        terminal.set_color_bold(Some(&bold_color));
-        terminal.set_color_cursor(Some(&cursor_color));
-        terminal.set_color_highlight(Some(&highlight_bg));
-        terminal.set_color_highlight_foreground(Some(&highlight_fg));
+        // Terminal Theme Colors (Antigravity Theme, built once and shared).
+        Theme::apply(&terminal);
 
         // High-quality developer monospace font
         let font_desc =

@@ -9,6 +9,7 @@ use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 pub mod config;
+mod theme;
 mod utils;
 mod window;
 use window::AntigravityWindow;
