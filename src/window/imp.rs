@@ -206,45 +206,29 @@ impl AntigravityWindow {
     }
 
     /// Checks the system for Ansible configuration drift by reading the drift report.
+    #[cfg(feature = "homelab-drift")]
     fn get_drift_status() -> (bool, u32) {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let path = std::path::PathBuf::from(home).join("scripts/rag_indexer/drift_report.txt");
         if let Ok(content) = std::fs::read_to_string(path) {
-            let lines = content.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+            let lines = u32::try_from(content.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0);
             (lines > 0, lines)
         } else {
             (false, 0)
         }
     }
 
-    /// Initializes the user interface, switching between terminal and welcome screen.
-    fn setup_ui(&self) {
+    /// Adds the homelab Ansible-drift indicator to the header. Compiled out
+    /// unless the `homelab-drift` feature (on by default) is enabled.
+    #[cfg(not(feature = "homelab-drift"))]
+    fn add_health_indicator(&self, _header: &adw::HeaderBar) {}
+
+    /// Adds a header button reflecting Ansible configuration drift; clicking it
+    /// shows the drift report and offers to hand it to the CLI for debugging.
+    #[cfg(feature = "homelab-drift")]
+    fn add_health_indicator(&self, header: &adw::HeaderBar) {
         let obj = self.obj();
-        debug!("Setting up UI for Antigravity Terminal");
-
-        obj.set_default_width(950);
-        obj.set_default_height(650);
-        obj.set_title(Some("Antigravity Terminal"));
-
-        let content = Box::builder().orientation(Orientation::Vertical).build();
-
-        // Modern AdwHeaderBar
-        let window_title = adw::WindowTitle::new("Antigravity Terminal", "");
-        let header = adw::HeaderBar::builder()
-            .title_widget(&window_title)
-            .build();
-
-        let settings_btn = gtk4::Button::builder()
-            .icon_name("document-properties-symbolic")
-            .tooltip_text("Settings")
-            .build();
-        settings_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
-            let imp = obj.imp();
-            imp.show_preferences();
-        }));
-        header.pack_end(&settings_btn);
-
-        // Health Indicator
         let (has_drift, drift_lines) = Self::get_drift_status();
         let health_btn = gtk4::Button::builder()
             .icon_name(if has_drift {
@@ -259,11 +243,11 @@ impl AntigravityWindow {
             })
             .build();
 
-        if has_drift {
-            health_btn.add_css_class("warning-indicator");
+        health_btn.add_css_class(if has_drift {
+            "warning-indicator"
         } else {
-            health_btn.add_css_class("success-indicator");
-        }
+            "success-indicator"
+        });
 
         health_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
@@ -313,6 +297,37 @@ impl AntigravityWindow {
         }));
 
         header.pack_end(&health_btn);
+    }
+
+    /// Initializes the user interface, switching between terminal and welcome screen.
+    fn setup_ui(&self) {
+        let obj = self.obj();
+        debug!("Setting up UI for Antigravity Terminal");
+
+        obj.set_default_width(950);
+        obj.set_default_height(650);
+        obj.set_title(Some("Antigravity Terminal"));
+
+        let content = Box::builder().orientation(Orientation::Vertical).build();
+
+        // Modern AdwHeaderBar
+        let window_title = adw::WindowTitle::new("Antigravity Terminal", "");
+        let header = adw::HeaderBar::builder()
+            .title_widget(&window_title)
+            .build();
+
+        let settings_btn = gtk4::Button::builder()
+            .icon_name("document-properties-symbolic")
+            .tooltip_text("Settings")
+            .build();
+        settings_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
+            let imp = obj.imp();
+            imp.show_preferences();
+        }));
+        header.pack_end(&settings_btn);
+
+        // Homelab-specific Ansible drift indicator (feature-gated).
+        self.add_health_indicator(&header);
 
         content.append(&header);
         *self.header.borrow_mut() = Some(header);

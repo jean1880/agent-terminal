@@ -6,6 +6,12 @@ edition = "2021"
 authors = ["jdesroches"]
 description = "A standalone GTK4 terminal application for Antigravity AI"
 
+[features]
+# The homelab Ansible-drift indicator in the header. On by default; build with
+# --no-default-features for a generic terminal without the homelab integration.
+default = ["homelab-drift"]
+homelab-drift = []
+
 [dependencies]
 gtk4 = "0.8"
 vte4 = "0.7"
