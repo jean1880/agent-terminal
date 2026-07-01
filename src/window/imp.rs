@@ -33,7 +33,6 @@ pub struct AntigravityWindow {
     /// One entry per open tab. Pruned when a page is detached.
     tabs: RefCell<Vec<TabState>>,
     pub config: RefCell<crate::config::TerminalConfig>,
-    pub pending_restart: RefCell<bool>,
     /// The CLI binary resolved at startup, cached so opening a new tab does not
     /// re-run detection (which may block on an interactive shell) on the UI
     /// thread. Refreshed when the configured client changes.
@@ -382,6 +381,24 @@ impl AntigravityWindow {
         self.add_terminal_tab(detected.as_deref(), dir.as_deref());
     }
 
+    /// Replaces the active tab with a fresh session using the current config
+    /// (client + starting directory). A running TUI client ignores a piped
+    /// "exit", so we open a replacement tab and close the old page directly.
+    /// Opening before closing keeps the window from dropping to zero tabs.
+    fn restart_current_tab(&self) {
+        let Some(tab_view) = self.tab_view.borrow().clone() else {
+            return;
+        };
+        let old_page = tab_view.selected_page();
+        let detected = self.detected_binary.borrow().clone();
+        // Root the replacement in the configured starting directory (which may
+        // have just changed); add_terminal_tab falls back to $HOME.
+        self.add_terminal_tab(detected.as_deref(), None);
+        if let Some(page) = old_page {
+            tab_view.close_page(&page);
+        }
+    }
+
     /// Prompts for a folder, then opens a new tab rooted there.
     fn new_tab_in_folder(&self) {
         let obj = self.obj();
@@ -717,18 +734,11 @@ impl AntigravityWindow {
         }));
         terminal.add_controller(key_controller);
 
-        // Close this tab when its session ends. If a client switch is pending,
-        // open a fresh tab with the new client before removing the old one so
-        // the window never drops to zero tabs.
+        // Close this tab when its session ends. Closing the last tab closes the
+        // window (see the n-pages handler).
         terminal.connect_child_exited(glib::clone!(@weak obj, @weak page => move |_, status| {
             info!("Terminal child exited with status: {}", status);
-            let imp = obj.imp();
-            let restart = *imp.pending_restart.borrow();
-            if restart {
-                *imp.pending_restart.borrow_mut() = false;
-                imp.new_tab();
-            }
-            if let Some(tab_view) = imp.tab_view.borrow().as_ref() {
+            if let Some(tab_view) = obj.imp().tab_view.borrow().as_ref() {
                 tab_view.close_page(&page);
             };
         }));
@@ -978,10 +988,7 @@ impl AntigravityWindow {
 
                 if selected_client != previous_client || dir_changed {
                     info!("CLI client or starting directory changed, restarting terminal session");
-                    *imp.pending_restart.borrow_mut() = true;
-                    if let Some(term) = imp.current_terminal() {
-                        term.feed_child(b"exit\n");
-                    }
+                    imp.restart_current_tab();
                 }
 
                 glib::Propagation::Proceed
