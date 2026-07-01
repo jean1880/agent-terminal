@@ -37,6 +37,10 @@ fn main() -> glib::ExitCode {
             app.activate();
         }));
         app.add_action(&new_window_action);
+
+        // Bind Ctrl+Shift+T to the per-window "new tab" action. Using an app
+        // accelerator means it is caught before VTE sees the key press.
+        app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>T"]);
     });
 
     app.connect_activate(|app| {

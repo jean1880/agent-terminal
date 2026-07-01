@@ -17,10 +17,13 @@ const LOGO_SVG: &str = include_str!("../../assets/antigravity_logo.svg");
 /// Internal state for the AntigravityWindow.
 #[derive(Default)]
 pub struct AntigravityWindow {
-    pub terminal: RefCell<Option<Terminal>>,
     pub header: RefCell<Option<adw::HeaderBar>>,
     pub window_title: RefCell<Option<adw::WindowTitle>>,
-    pub loading_stack: RefCell<Option<Stack>>,
+    pub tab_view: RefCell<Option<adw::TabView>>,
+    /// The resolved working directory each open tab was launched in. Claude/agy
+    /// cannot re-root a running session, so a tab's launch dir stays valid for
+    /// its whole lifetime and drives "new tab in same directory".
+    pub tab_dirs: RefCell<Vec<(adw::TabPage, String)>>,
     pub config: RefCell<crate::config::TerminalConfig>,
     pub pending_restart: RefCell<bool>,
 }
@@ -47,6 +50,55 @@ impl ApplicationWindowImpl for AntigravityWindow {}
 impl AdwApplicationWindowImpl for AntigravityWindow {}
 
 impl AntigravityWindow {
+    /// Extracts the VTE terminal embedded in a tab page's widget tree.
+    fn terminal_from_page(page: &adw::TabPage) -> Option<Terminal> {
+        let stack = page.child().downcast::<Stack>().ok()?;
+        let scrolled = stack
+            .child_by_name("terminal")?
+            .downcast::<ScrolledWindow>()
+            .ok()?;
+        scrolled.child()?.downcast::<Terminal>().ok()
+    }
+
+    /// Returns the terminal of the currently selected tab, if any.
+    fn current_terminal(&self) -> Option<Terminal> {
+        let tab_view = self.tab_view.borrow();
+        let tab_view = tab_view.as_ref()?;
+        let page = tab_view.selected_page()?;
+        Self::terminal_from_page(&page)
+    }
+
+    /// Applies a closure to every open tab's terminal.
+    fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
+        if let Some(tab_view) = self.tab_view.borrow().as_ref() {
+            for i in 0..tab_view.n_pages() {
+                let page = tab_view.nth_page(i);
+                if let Some(terminal) = Self::terminal_from_page(&page) {
+                    f(&terminal);
+                }
+            }
+        }
+    }
+
+    /// The launch directory of the currently selected tab, if tracked.
+    fn current_dir(&self) -> Option<String> {
+        let tab_view = self.tab_view.borrow();
+        let page = tab_view.as_ref()?.selected_page()?;
+        let dirs = self.tab_dirs.borrow();
+        dirs.iter()
+            .find(|(p, _)| p == &page)
+            .map(|(_, dir)| dir.clone())
+    }
+
+    /// Detects the CLI binary for the currently configured client.
+    fn detect_current_client(&self) -> Option<String> {
+        let path = env::var("PATH").ok();
+        let home = env::var("HOME").ok();
+        let shell = env::var("SHELL").ok();
+        let selected_client = self.config.borrow().cli_client;
+        detect_cli_binary(selected_client, path, home, shell)
+    }
+
     /// Sets up GAction handlers for context menu items.
     fn setup_actions(&self) {
         let obj = self.obj();
@@ -54,9 +106,7 @@ impl AntigravityWindow {
         // Copy Action
         let copy_action = gtk4::gio::SimpleAction::new("copy", None);
         copy_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
-            let imp = obj.imp();
-            let terminal_borrow = imp.terminal.borrow();
-            if let Some(terminal) = terminal_borrow.as_ref() {
+            if let Some(terminal) = obj.imp().current_terminal() {
                 debug!("Action: Copy");
                 terminal.copy_clipboard_format(Format::Text);
             }
@@ -66,14 +116,28 @@ impl AntigravityWindow {
         // Paste Action
         let paste_action = gtk4::gio::SimpleAction::new("paste", None);
         paste_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
-            let imp = obj.imp();
-            let terminal_borrow = imp.terminal.borrow();
-            if let Some(terminal) = terminal_borrow.as_ref() {
+            if let Some(terminal) = obj.imp().current_terminal() {
                 debug!("Action: Paste");
                 terminal.paste_clipboard();
             }
         }));
         obj.add_action(&paste_action);
+
+        // New Tab Action (bound to Ctrl+Shift+T in main.rs)
+        let new_tab_action = gtk4::gio::SimpleAction::new("new-tab", None);
+        new_tab_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
+            debug!("Action: New Tab");
+            obj.imp().new_tab();
+        }));
+        obj.add_action(&new_tab_action);
+
+        // New Tab in Folder Action (opens a folder picker)
+        let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
+        new_tab_folder_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
+            debug!("Action: New Tab in Folder");
+            obj.imp().new_tab_in_folder();
+        }));
+        obj.add_action(&new_tab_folder_action);
     }
 
     /// Checks the system for Ansible configuration drift by reading the drift report.
@@ -162,8 +226,7 @@ impl AntigravityWindow {
 
                 dialog.connect_response(glib::clone!(@weak obj => move |dialog: &gtk4::MessageDialog, response: gtk4::ResponseType| {
                     if response == gtk4::ResponseType::Yes {
-                        let imp = obj.imp();
-                        if let Some(terminal) = imp.terminal.borrow().as_ref() {
+                        if let Some(terminal) = obj.imp().current_terminal() {
                             let prompt = format!("Can you help me debug and fix this ansible drift issue? Here is the drift report:\n\n{}\n", content);
                             terminal.feed_child(prompt.as_bytes());
                         }
@@ -230,12 +293,134 @@ impl AntigravityWindow {
         );
     }
 
-    /// Sets up the terminal interface.
+    /// Sets up the tabbed terminal interface, then opens the first tab.
     fn setup_terminal_ui(&self, container: &Box, cli_binary: Option<&str>) {
         let obj = self.obj();
-        debug!("Initializing terminal UI");
+        debug!("Initializing tabbed terminal UI");
+
+        let tab_view = adw::TabView::new();
+        *self.tab_view.borrow_mut() = Some(tab_view.clone());
+
+        // `autohide` hides the bar whenever a single tab (or none) is open,
+        // so it only appears once there are actually multiple tabs.
+        let tab_bar = adw::TabBar::builder()
+            .view(&tab_view)
+            .autohide(true)
+            .expand_tabs(true)
+            .build();
+
+        // "New tab" button in the header bar.
+        if let Some(header) = self.header.borrow().as_ref() {
+            let new_tab_btn = Button::builder()
+                .icon_name("tab-new-symbolic")
+                .tooltip_text("New Tab (Ctrl+Shift+T)")
+                .build();
+            new_tab_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
+                obj.imp().new_tab();
+            }));
+            header.pack_start(&new_tab_btn);
+
+            let new_tab_folder_btn = Button::builder()
+                .icon_name("folder-new-symbolic")
+                .tooltip_text("New Tab in Folder…")
+                .build();
+            new_tab_folder_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
+                obj.imp().new_tab_in_folder();
+            }));
+            header.pack_start(&new_tab_folder_btn);
+        }
+
+        container.append(&tab_bar);
+        container.append(&tab_view);
+
+        // Immediately confirm tab closures (no unsaved-state prompt for a terminal).
+        tab_view.connect_close_page(|view, page| {
+            view.close_page_finish(page, true);
+            true // GDK_EVENT_STOP: closure handled the request
+        });
+
+        // Close the window once the last tab is gone.
+        tab_view.connect_notify_local(
+            Some("n-pages"),
+            glib::clone!(@weak obj => move |view, _| {
+                if view.n_pages() == 0 {
+                    info!("Last tab closed, closing window");
+                    obj.close();
+                }
+            }),
+        );
+
+        // Forget a tab's tracked directory when it is removed.
+        tab_view.connect_page_detached(glib::clone!(@weak obj => move |_, page, _| {
+            obj.imp().tab_dirs.borrow_mut().retain(|(p, _)| p != page);
+        }));
+
+        // Keep the header title in sync with the active tab.
+        tab_view.connect_selected_page_notify(glib::clone!(@weak obj => move |view| {
+            let imp = obj.imp();
+            let session_info = view
+                .selected_page()
+                .map(|p| p.title().to_string())
+                .unwrap_or_default();
+            if let Some(window_title) = imp.window_title.borrow().as_ref() {
+                window_title.set_subtitle(&session_info);
+            }
+            if session_info.is_empty() {
+                obj.set_title(Some("Antigravity Terminal"));
+            } else {
+                obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+            }
+        }));
+
+        self.add_terminal_tab(cli_binary, None);
+    }
+
+    /// Opens a new tab rooted in the current tab's directory (fast path).
+    fn new_tab(&self) {
+        let dir = self.current_dir();
+        let detected = self.detect_current_client();
+        self.add_terminal_tab(detected.as_deref(), dir.as_deref());
+    }
+
+    /// Prompts for a folder, then opens a new tab rooted there.
+    fn new_tab_in_folder(&self) {
+        let obj = self.obj();
+        let dialog = gtk4::FileChooserNative::new(
+            Some("Select Folder for New Tab"),
+            Some(obj.upcast_ref::<gtk4::Window>()),
+            gtk4::FileChooserAction::SelectFolder,
+            Some("Open"),
+            Some("Cancel"),
+        );
+        dialog.set_modal(true);
+
+        // Start the picker in the current tab's directory when known.
+        if let Some(dir) = self.current_dir() {
+            let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&dir)));
+        }
+
+        // `run_async` keeps the native dialog alive until the user responds.
+        dialog.run_async(glib::clone!(@weak obj => move |dialog, response| {
+            if response == gtk4::ResponseType::Accept {
+                if let Some(path) = dialog.file().and_then(|f| f.path()) {
+                    let imp = obj.imp();
+                    let dir = path.to_string_lossy().to_string();
+                    let detected = imp.detect_current_client();
+                    imp.add_terminal_tab(detected.as_deref(), Some(&dir));
+                }
+            }
+            dialog.destroy();
+        }));
+    }
+
+    /// Builds a terminal, wraps it in a tab page, and spawns the CLI session.
+    ///
+    /// `dir_override` roots the tab in a specific directory; when `None` the
+    /// configured starting directory (falling back to `$HOME`) is used.
+    fn add_terminal_tab(&self, cli_binary: Option<&str>, dir_override: Option<&str>) {
+        let obj = self.obj();
+        debug!("Adding terminal tab");
         let terminal = Terminal::new();
-        *self.terminal.borrow_mut() = Some(terminal.clone());
 
         // Create Stack for transition
         let stack = Stack::builder()
@@ -243,7 +428,6 @@ impl AntigravityWindow {
             .transition_duration(500)
             .vexpand(true)
             .build();
-        *self.loading_stack.borrow_mut() = Some(stack.clone());
 
         // Loading Screen
         let loading_box = Box::builder()
@@ -315,7 +499,17 @@ impl AntigravityWindow {
         stack.add_named(&scrolled, Some("terminal"));
         stack.set_visible_child_name("loading");
 
-        container.append(&stack);
+        // Add the stack as a new tab page and focus it.
+        let tab_view = match self.tab_view.borrow().as_ref() {
+            Some(view) => view.clone(),
+            None => {
+                warn!("add_terminal_tab called before tab view was initialized");
+                return;
+            }
+        };
+        let page = tab_view.append(&stack);
+        page.set_title("Terminal");
+        tab_view.set_selected_page(&page);
 
         // Terminal Theme Colors (Antigravity Theme)
         let bg_color = gtk4::gdk::RGBA::parse("rgb(24,20,37)").unwrap_or(gtk4::gdk::RGBA::BLACK);
@@ -387,27 +581,49 @@ impl AntigravityWindow {
         info!("Terminal configured, setting up controllers and signals");
 
         // Window Title Handling (Session Info)
-        terminal.connect_window_title_changed(glib::clone!(@weak obj => move |terminal| {
-            let title = terminal.window_title();
-            debug!("Terminal window title changed: {:?}", title);
-            let imp = obj.imp();
-            let window_title_borrow = imp.window_title.borrow();
-
-            if let Some(window_title) = window_title_borrow.as_ref() {
+        terminal.connect_window_title_changed(
+            glib::clone!(@weak obj, @weak page => move |terminal| {
+                let title = terminal.window_title();
+                debug!("Terminal window title changed: {:?}", title);
                 let session_info = title.as_deref().unwrap_or("");
-                window_title.set_subtitle(session_info);
 
-                // Also update the main GtkWindow title so GNOME Shell sees it
-                if !session_info.is_empty() {
-                    obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+                // Label the tab itself.
+                page.set_title(if session_info.is_empty() {
+                    "Terminal"
                 } else {
-                    obj.set_title(Some("Antigravity Terminal"));
+                    session_info
+                });
+
+                // Only drive the window title from the active tab.
+                let imp = obj.imp();
+                let is_active = imp
+                    .tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|view| view.selected_page())
+                    .as_ref()
+                    == Some(&page);
+                if !is_active {
+                    return;
                 }
-            }
-        }));
+
+                if let Some(window_title) = imp.window_title.borrow().as_ref() {
+                    window_title.set_subtitle(session_info);
+
+                    // Also update the main GtkWindow title so GNOME Shell sees it
+                    if !session_info.is_empty() {
+                        obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+                    } else {
+                        obj.set_title(Some("Antigravity Terminal"));
+                    }
+                };
+            }),
+        );
 
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
+        menu.append(Some("New Tab"), Some("win.new-tab"));
+        menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
         menu.append(Some("New Window"), Some("app.new-window"));
 
         let section = gtk4::gio::Menu::new();
@@ -501,17 +717,20 @@ impl AntigravityWindow {
         }));
         terminal.add_controller(key_controller);
 
-        // Respawn with new client if switching, otherwise close the window.
-        terminal.connect_child_exited(glib::clone!(@weak obj => move |_, status| {
+        // Close this tab when its session ends. If a client switch is pending,
+        // open a fresh tab with the new client before removing the old one so
+        // the window never drops to zero tabs.
+        terminal.connect_child_exited(glib::clone!(@weak obj, @weak page => move |_, status| {
             info!("Terminal child exited with status: {}", status);
             let imp = obj.imp();
             let restart = *imp.pending_restart.borrow();
             if restart {
                 *imp.pending_restart.borrow_mut() = false;
-                imp.setup_ui();
-            } else {
-                obj.close();
+                imp.new_tab();
             }
+            if let Some(tab_view) = imp.tab_view.borrow().as_ref() {
+                tab_view.close_page(&page);
+            };
         }));
 
         // Dynamic Shell Detection
@@ -520,8 +739,16 @@ impl AntigravityWindow {
 
         let config = self.config.borrow().clone();
 
-        // Launch the CLI from configured starting directory, falling back to $HOME.
-        let work_dir = resolve_working_directory(&config.starting_directory, &home_dir);
+        // Launch the CLI from the override (per-tab dir) or configured starting
+        // directory, falling back to $HOME. Record it so "new tab in same
+        // directory" can reuse this tab's root.
+        let requested_dir = dir_override
+            .map(str::to_string)
+            .unwrap_or_else(|| config.starting_directory.clone());
+        let work_dir = resolve_working_directory(&requested_dir, &home_dir);
+        self.tab_dirs
+            .borrow_mut()
+            .push((page.clone(), work_dir.clone()));
 
         let command = get_startup_command(cli_binary, &config);
         info!(
@@ -733,16 +960,19 @@ impl AntigravityWindow {
                     current_config.save();
                 }
 
-                if let Some(term) = imp.terminal.borrow().as_ref() {
+                let (scrollback, font_scale) = {
                     let config = imp.config.borrow();
-                    term.set_scrollback_lines(config.scrollback_lines as i64);
-                    term.set_font_scale(config.font_scale);
-                }
+                    (config.scrollback_lines as i64, config.font_scale)
+                };
+                imp.for_each_terminal(|term| {
+                    term.set_scrollback_lines(scrollback);
+                    term.set_font_scale(font_scale);
+                });
 
                 if selected_client != previous_client || dir_changed {
                     info!("CLI client or starting directory changed, restarting terminal session");
                     *imp.pending_restart.borrow_mut() = true;
-                    if let Some(term) = imp.terminal.borrow().as_ref() {
+                    if let Some(term) = imp.current_terminal() {
                         term.feed_child(b"exit\n");
                     }
                 }
