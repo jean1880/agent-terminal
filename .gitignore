@@ -2,3 +2,26 @@
 
 # Scratch diffs from refactors — never an artifact worth tracking.
 *.patch
+
+# Runtime logs (startup.log is a tracked fixture, keep it)
+*.log
+!startup.log
+
+# OS / editor cruft and local env files
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
