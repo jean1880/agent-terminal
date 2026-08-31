@@ -42,13 +42,21 @@ license-file = ["LICENSE", "0"]
 # libvte-2.91-gtk4-0 and the rest with proper version constraints. Listing them by
 # hand as well only produced duplicate entries with weaker bounds.
 depends = "$auto"
-# The package was renamed from antigravity-terminal in 2.0.0. These three fields
-# are what let apt retire the old package instead of leaving it installed
-# alongside this one forever; the transitional stub in packaging/ is the other
-# half (it depends on this package, so an upgrade pulls the rename through).
+# The package was renamed from antigravity-terminal in 2.0.0. What retires the old
+# package is the transitional stub in packaging/: it carries the same name at a
+# higher version, so apt upgrades the real 1.x package into a file-less stub that
+# depends on this one.
+#
+# Versioned Conflicts/Replaces were tried here and removed. The apt pipeline
+# injects an epoch, so what actually ships is 1:2.0.0-1+debmaintainer against an
+# installed 1:1.0.0-2+debmaintainer — and "antigravity-terminal (<< 2.0.0)" is
+# FALSE for that, since any epoch-1 version outranks an epoch-less one. The
+# relations looked right and never fired. Correcting the bound to "<< 1:2.0.0"
+# fixes the packaged case and breaks the local one, where `make package` produces
+# an epoch-less stub that would then conflict with this package. There are no
+# shared paths between the two — binary, desktop entry and icon were all renamed —
+# so neither relation was doing anything the stub does not already do.
 provides = "antigravity-terminal"
-conflicts = "antigravity-terminal (<< 2.0.0)"
-replaces = "antigravity-terminal (<< 2.0.0)"
 # Without this, cargo-deb uses README.md as the extended description and the whole
 # document — markdown, code fences and all — lands in the control file.
 extended-description = """
