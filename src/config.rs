@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CliClient {
     #[default]
@@ -67,15 +68,25 @@ impl ThemeChoice {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+/// Persisted settings.
+///
+/// `#[serde(default)]` is a container attribute here, so any field missing from
+/// the file falls back to that field's value in [`TerminalConfig::default`] — not
+/// to the field type's own default, which would silently turn an absent
+/// `scrollback_lines` into 0 rather than 10000. This is what lets settings be
+/// added and retired without invalidating existing config files.
 pub struct TerminalConfig {
+    /// Retained so existing config files keep round-tripping, but no longer
+    /// surfaced in Settings: nothing ever consumed it. Sourcing a script into the
+    /// TTY before `exec` breaks the CLI's terminal handshake, so when this returns
+    /// it will be as a per-profile environment file merged into the spawn
+    /// environment rather than fed to the terminal.
     pub startup_script: String,
     pub scrollback_lines: u32,
     pub font_scale: f64,
-    #[serde(default)]
     pub cli_client: CliClient,
-    #[serde(default)]
     pub starting_directory: String,
-    #[serde(default)]
     pub theme: ThemeChoice,
 }
 
@@ -146,15 +157,44 @@ impl TerminalConfig {
     }
 
     /// Serializes and writes the config to an explicit path, logging on failure.
+    ///
+    /// The write goes to a sibling temporary file which is then renamed over the
+    /// target. Rename within a directory is atomic on Linux, so an interrupted
+    /// save leaves either the previous config or the new one — never the
+    /// half-written file a plain `fs::write` would produce.
     fn save_to(&self, path: &Path) {
-        match serde_json::to_string_pretty(self) {
-            Ok(content) => {
-                if let Err(e) = fs::write(path, content) {
-                    warn!("Failed to write config to {}: {}", path.display(), e);
-                }
+        let content = match serde_json::to_string_pretty(self) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("Failed to serialize config: {}", e);
+                return;
             }
-            Err(e) => warn!("Failed to serialize config: {}", e),
+        };
+
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = Self::write_all_synced(&tmp, content.as_bytes()) {
+            warn!("Failed to write config to {}: {}", tmp.display(), e);
+            let _ = fs::remove_file(&tmp);
+            return;
         }
+
+        if let Err(e) = fs::rename(&tmp, path) {
+            warn!(
+                "Failed to replace config at {}: {}; settings not saved",
+                path.display(),
+                e
+            );
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// Writes `bytes` to `path`, flushing them to disk before returning. The
+    /// `sync_all` matters: without it the rename can land before the contents do,
+    /// which on a crash yields an empty config rather than an intact old one.
+    fn write_all_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = fs::File::create(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
     }
 }
 
@@ -194,6 +234,126 @@ mod tests {
             TerminalConfig::load_from(&path).cli_client,
             CliClient::default()
         );
+    }
+
+    #[test]
+    fn all_lists_every_theme_in_dropdown_order() {
+        // ALL is hand-maintained and the settings dropdown maps it by index in
+        // BOTH directions: position() to preselect, ALL.get(index) to read back.
+        // A variant missing from ALL therefore mis-maps the picker silently — you
+        // choose Nord and get Gruvbox, with no error anywhere.
+        //
+        // The match is exhaustive deliberately: adding a variant fails to compile
+        // here until ALL is updated to match.
+        fn expected_index(theme: ThemeChoice) -> usize {
+            match theme {
+                ThemeChoice::Antigravity => 0,
+                ThemeChoice::Dracula => 1,
+                ThemeChoice::Nord => 2,
+                ThemeChoice::GruvboxDark => 3,
+                ThemeChoice::SolarizedDark => 4,
+                ThemeChoice::OneDark => 5,
+                ThemeChoice::Monokai => 6,
+            }
+        }
+
+        assert_eq!(ThemeChoice::ALL.len(), 7);
+        for theme in ThemeChoice::ALL {
+            let index = expected_index(theme);
+            assert_eq!(ThemeChoice::ALL[index], theme);
+            assert_eq!(
+                ThemeChoice::ALL.iter().position(|t| *t == theme),
+                Some(index),
+                "{theme} is not at its expected position in ALL"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_display_names_are_unique_and_non_empty() {
+        // The dropdown is built from these strings; duplicates or blanks would
+        // leave the user unable to tell two entries apart.
+        let mut names: Vec<String> = ThemeChoice::ALL.iter().map(ToString::to_string).collect();
+        assert!(names.iter().all(|n| !n.trim().is_empty()));
+        names.sort();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate theme display names");
+    }
+
+    #[test]
+    fn every_theme_round_trips_through_json() {
+        for theme in ThemeChoice::ALL {
+            let encoded = serde_json::to_string(&theme).unwrap();
+            let decoded: ThemeChoice = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, theme, "{theme} did not survive a JSON round trip");
+        }
+    }
+
+    #[test]
+    fn overwrites_in_place_without_leaving_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let mut cfg = TerminalConfig {
+            scrollback_lines: 500,
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+        cfg.scrollback_lines = 900;
+        cfg.save_to(&path);
+
+        assert_eq!(TerminalConfig::load_from(&path).scrollback_lines, 900);
+
+        // The save goes via config.json.tmp and renames; a leftover temp file
+        // would mean the rename never happened.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn partial_file_keeps_defaults_for_missing_fields() {
+        // Container-level #[serde(default)] must fall back to TerminalConfig's own
+        // defaults, not to each field type's default — otherwise a config written
+        // by an older build silently loses its scrollback to 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"theme":"dracula"}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.theme, ThemeChoice::Dracula);
+        assert_eq!(
+            loaded.scrollback_lines,
+            TerminalConfig::default().scrollback_lines
+        );
+        assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+    }
+
+    #[test]
+    fn legacy_startup_script_still_parses() {
+        // The Settings row is gone, but a config file written by v1.x still
+        // carries the key and must not be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"startup_script":"/tmp/old.sh","scrollback_lines":200}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.startup_script, "/tmp/old.sh");
+        assert_eq!(loaded.scrollback_lines, 200);
     }
 
     #[test]

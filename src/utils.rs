@@ -1,6 +1,44 @@
 //! Utility functions for Antigravity Terminal.
 
+use crate::config::CliClient;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use tracing::{debug, info, warn};
+
+thread_local! {
+    /// Detection results, keyed by the client that was asked for.
+    ///
+    /// [`detect_cli_binary`] shells out — including `$SHELL -ic`, which sources
+    /// the user's rc file — so it can take seconds on a heavy interactive shell.
+    /// Caching it here means a second window, or reopening Settings, never pays
+    /// that cost again. GTK confines the application to one thread, so a
+    /// `thread_local` is process-wide in practice; detection itself runs on a
+    /// worker thread and only the result is recorded here, on the main thread.
+    static DETECTION_CACHE: RefCell<HashMap<CliClient, Option<String>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Returns a previously detected binary for `client`.
+///
+/// The double `Option` is meaningful: `None` means "never detected", while
+/// `Some(None)` means "detected, and nothing is installed" — a cached negative
+/// that must not trigger another round of shelling out.
+pub fn cached_cli_binary(client: CliClient) -> Option<Option<String>> {
+    DETECTION_CACHE.with(|cache| cache.borrow().get(&client).cloned())
+}
+
+/// Records a detection result so later lookups can skip the subprocesses.
+pub fn cache_cli_binary(client: CliClient, binary: Option<String>) {
+    DETECTION_CACHE.with(|cache| {
+        cache.borrow_mut().insert(client, binary);
+    });
+}
+
+/// Forgets cached detection results.
+#[cfg(test)]
+pub fn clear_detection_cache() {
+    DETECTION_CACHE.with(|cache| cache.borrow_mut().clear());
+}
 
 /// Standalone detection logic that can run on a background thread.
 /// Takes environment parameters for testability.
@@ -135,10 +173,7 @@ pub fn resolve_working_directory(starting_dir: &str, home_dir: &str) -> String {
 }
 
 /// Determines the startup command for the detected CLI binary.
-pub fn get_startup_command(
-    binary: Option<&str>,
-    _config: &crate::config::TerminalConfig,
-) -> Vec<String> {
+pub fn get_startup_command(binary: Option<&str>) -> Vec<String> {
     match binary {
         Some(name) => {
             // `exec` is critical: it replaces the wrapping interactive shell with the
@@ -163,6 +198,38 @@ mod tests {
     use super::*;
     use std::fs::File;
     use tempfile::tempdir;
+
+    #[test]
+    fn detection_cache_separates_a_miss_from_a_cached_negative() {
+        // The distinction is the whole point: a client that was checked and found
+        // absent must not be re-checked, because "absent" costs three subprocess
+        // spawns including an interactive shell.
+        clear_detection_cache();
+
+        assert_eq!(
+            cached_cli_binary(CliClient::Claude),
+            None,
+            "expected a miss"
+        );
+
+        cache_cli_binary(CliClient::Claude, None);
+        assert_eq!(
+            cached_cli_binary(CliClient::Claude),
+            Some(None),
+            "a cached negative must read back as Some(None), not a miss"
+        );
+
+        cache_cli_binary(CliClient::Agy, Some("agy".to_string()));
+        assert_eq!(
+            cached_cli_binary(CliClient::Agy),
+            Some(Some("agy".to_string()))
+        );
+        // Keys must not collide: Claude's cached negative survives Agy's entry.
+        assert_eq!(cached_cli_binary(CliClient::Claude), Some(None));
+
+        clear_detection_cache();
+        assert_eq!(cached_cli_binary(CliClient::Agy), None);
+    }
 
     #[test]
     fn test_resolve_working_directory() {
@@ -202,8 +269,7 @@ mod tests {
 
     #[test]
     fn test_startup_command_agy_exists() {
-        let config = crate::config::TerminalConfig::default();
-        let cmd = get_startup_command(Some("agy"), &config);
+        let cmd = get_startup_command(Some("agy"));
         assert_eq!(cmd[0], "-ic");
         // exec so the CLI owns the TTY; no --add-dir (workspace = spawn cwd $HOME).
         assert!(cmd[1].ends_with("exec agy"));
@@ -212,8 +278,7 @@ mod tests {
 
     #[test]
     fn test_startup_command_gemini_exists() {
-        let config = crate::config::TerminalConfig::default();
-        let cmd = get_startup_command(Some("gemini"), &config);
+        let cmd = get_startup_command(Some("gemini"));
         assert_eq!(cmd[0], "-ic");
         assert!(cmd[1].ends_with("exec gemini"));
         assert!(!cmd[1].contains("--include-directories"));
@@ -221,8 +286,7 @@ mod tests {
 
     #[test]
     fn test_startup_command_agy_missing() {
-        let config = crate::config::TerminalConfig::default();
-        let cmd = get_startup_command(None, &config);
+        let cmd = get_startup_command(None);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec $SHELL");
     }
@@ -323,8 +387,7 @@ mod tests {
         // exec lets claude own the TTY (status line / CLAUDE.md / trust all work);
         // the workspace comes from the spawn cwd ($HOME), not an --add-dir flag
         // (which would re-prompt for folder access on every launch).
-        let config = crate::config::TerminalConfig::default();
-        let cmd = get_startup_command(Some("claude"), &config);
+        let cmd = get_startup_command(Some("claude"));
         assert_eq!(cmd[0], "-ic");
         assert!(cmd[1].ends_with("exec claude"));
         assert!(!cmd[1].contains("--add-dir"));
