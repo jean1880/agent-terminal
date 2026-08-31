@@ -16,8 +16,34 @@
 | WP7 differentiators | ✅ **done** 2026-08-31 | Attention, search, shortcut rework, session restore, font/cursor. |
 | WP8 indicators | ✅ **done** 2026-08-31 | Three-state indicators; `homelab-drift` feature and CI's second clippy job deleted. |
 
-**All work packages merged to `release/v2.0.0`.** 49 tests, fmt and clippy green.
-Not pushed, not tagged, not merged to `master` — see the deployment ordering below.
+**RELEASED 2026-08-31.** `v2.0.0` tagged and merged to `master`; published to `apt.nuvek.ca`
+as `1:2.0.0-1+debmaintainer` and installed on this workstation. 57 tests, fmt and clippy green.
+
+### Bugs found during deployment itself
+
+- **The `Conflicts`/`Replaces` relations were inert.** The pipeline injects an epoch, so the real
+  comparison was `1:1.0.0-2+debmaintainer << 2.0.0` — false, because any epoch-1 version outranks
+  an epoch-less one. They had appeared to work only because the container test used bare `2.0.0`
+  versions, i.e. it validated a case production never produces. Removed rather than corrected: the
+  epoch-aware bound `<< 1:2.0.0` breaks local `make package`, where the epoch-less stub would then
+  conflict with the package it must sit beside. The transitional stub carries the rename on its own.
+- **`apt-get upgrade` does not complete the rename.** A transitional package must pull in a NEW
+  package, which `apt-get upgrade` refuses to do — it reports the package as *kept back* and the
+  machine silently stays on 1.x. `apt upgrade` and `apt-get dist-upgrade` both work. All three were
+  tested against the live repository, and the release notes say so.
+
+### Traps in the verification scripts themselves
+
+Three checks returned false results before being corrected. Worth remembering, because each looked
+like a passing test:
+
+- `ldd | grep -q 'not found'` reported success when `ldd` had *failed* — no output contains no
+  match. A check that cannot fail proves nothing.
+- A build watcher matched the substring `error` inside `'last_error': None` and declared failure
+  immediately.
+- `apt-get install` on a path containing `:` parses it as `package:architecture` and exits **0**
+  having done nothing, so an install failure was silent and a `||` fallback never fired. Pool
+  filenames drop the epoch (verified against the live repo), so this is a test artefact only.
 
 ### Bugs the verification runs found (that review would not have)
 
@@ -77,7 +103,7 @@ in as a dependency; every shared library resolves (`ldd`, no "not found"); icon 
 `hicolor/scalable/apps` with a basename matching `Icon=`; `desktop-file-validate` passes.
 The validator's hint also prompted pairing `TerminalEmulator` with `System` in `Categories`.
 
-### ⚠ Deployment ordering — WP1 is committed but NOT deployed
+### Deployment ordering — COMPLETED 2026-08-31
 
 `debian-maintainer` changes sit on branch `feat/gemini-terminal-cargo-deb`, unmerged. **The order
 matters and cannot be varied**, because the middle state is broken either way:
@@ -88,8 +114,12 @@ matters and cannot be varied**, because the middle state is broken either way:
 3. Only then merge `release/v2.0.0` → `master` in this repo, which deletes `package.sh`.
 
 Doing 3 before 2 leaves `config.yaml` calling a script that no longer exists. Doing 2 before 1
-leaves it calling a binary the image does not have. Until step 1 happens, **do not merge either
-branch to master.**
+leaves it calling a binary the image does not have.
+
+All three were carried out in that order on 2026-08-31: image `9231cfa -> b9fe01e` deployed by
+`warden` (soak accepted, pin auto-committed to `ansible-homelab`), `config.yaml` copied to the NAS
+(startup logged "Active config matches the image's shipped config"), then `master` merged and
+tagged.
 
 ## Decisions locked (2026-08-30)
 
