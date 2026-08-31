@@ -694,93 +694,158 @@ impl AgentTerminalWindow {
         obj.add_action(&new_tab_folder_action);
     }
 
-    /// Checks the system for Ansible configuration drift by reading the drift report.
-    #[cfg(feature = "homelab-drift")]
-    fn get_drift_status() -> (bool, u32) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let path = std::path::PathBuf::from(home).join("scripts/rag_indexer/drift_report.txt");
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let lines = u32::try_from(content.lines().filter(|l| !l.trim().is_empty()).count())
-                .unwrap_or(0);
-            (lines > 0, lines)
-        } else {
-            (false, 0)
+    /// Adds the configured status indicators to the header bar.
+    ///
+    /// This replaces a single hard-coded Ansible-drift button whose source path
+    /// no longer existed. Because a missing file read as "no drift", it rendered
+    /// a green shield permanently — reporting a healthy system it had never
+    /// actually checked. Indicators are data now, and unreadable is its own
+    /// state rather than a synonym for fine.
+    fn add_status_indicators(&self, header: &adw::HeaderBar) {
+        let indicators = self.config.borrow().indicators.clone();
+        if indicators.len() > crate::config::MAX_INDICATORS {
+            warn!(
+                "{} indicators configured; showing the first {}",
+                indicators.len(),
+                crate::config::MAX_INDICATORS
+            );
+        }
+
+        for indicator in indicators.into_iter().take(crate::config::MAX_INDICATORS) {
+            let button = gtk4::Button::builder()
+                .icon_name(&indicator.icon_unknown)
+                .tooltip_text(format!("{}: checking…", indicator.label))
+                .build();
+            header.pack_end(&button);
+            self.drive_indicator(button, indicator);
         }
     }
 
-    /// Adds the homelab Ansible-drift indicator to the header. Compiled out
-    /// unless the `homelab-drift` feature (on by default) is enabled.
-    #[cfg(not(feature = "homelab-drift"))]
-    fn add_health_indicator(&self, _header: &adw::HeaderBar) {}
-
-    /// Adds a header button reflecting Ansible configuration drift; clicking it
-    /// shows the drift report and offers to hand it to the CLI for debugging.
-    #[cfg(feature = "homelab-drift")]
-    fn add_health_indicator(&self, header: &adw::HeaderBar) {
+    /// Evaluates one indicator now, and on its refresh interval if it has one.
+    fn drive_indicator(&self, button: Button, indicator: crate::config::Indicator) {
         let obj = self.obj();
-        let (has_drift, drift_lines) = Self::get_drift_status();
-        let health_btn = gtk4::Button::builder()
-            .icon_name(if has_drift {
-                "dialog-warning-symbolic"
-            } else {
-                "security-high-symbolic"
-            })
-            .tooltip_text(if has_drift {
-                format!("Warning: {} configuration drift(s) detected", drift_lines)
-            } else {
-                "System configuration fully synchronized".to_string()
-            })
-            .build();
+        // The latest detail, so the click handler shows what the button reflects
+        // rather than re-reading and possibly disagreeing with its own icon.
+        let detail = std::rc::Rc::new(RefCell::new(String::new()));
 
-        health_btn.add_css_class(if has_drift {
-            "warning-indicator"
-        } else {
-            "success-indicator"
-        });
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            detail,
+            #[strong]
+            indicator,
+            move |_| {
+                obj.imp()
+                    .present_indicator_detail(&indicator, &detail.borrow());
+            }
+        ));
 
-        health_btn.connect_clicked(glib::clone!(#[weak] obj, move |_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-            let path = std::path::PathBuf::from(&home).join("scripts/rag_indexer/drift_report.txt");
-            let mut drift_detected = false;
-            let mut content = String::new();
+        let refresh = indicator.refresh_secs;
+        let evaluate = move || {
+            let indicator = indicator.clone();
+            let button = button.clone();
+            let detail = detail.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let source = indicator.source.clone();
+                // A configured command is arbitrary and may block; it never runs
+                // on the main thread.
+                let state =
+                    gtk4::gio::spawn_blocking(move || crate::utils::read_indicator(&source))
+                        .await
+                        .unwrap_or_else(|_| crate::utils::IndicatorState::Unknown {
+                            reason: "Indicator check panicked".to_string(),
+                        });
 
-            if let Ok(c) = std::fs::read_to_string(&path) {
-                if c.lines().filter(|l| !l.trim().is_empty()).count() > 0 {
-                    drift_detected = true;
-                    content = c;
+                let (icon, css, tooltip) = match &state {
+                    crate::utils::IndicatorState::Ok => (
+                        &indicator.icon_ok,
+                        "success-indicator",
+                        format!("{}: OK", indicator.label),
+                    ),
+                    crate::utils::IndicatorState::Warn { .. } => (
+                        &indicator.icon_warn,
+                        "warning-indicator",
+                        format!("{}: needs attention", indicator.label),
+                    ),
+                    crate::utils::IndicatorState::Unknown { reason } => (
+                        &indicator.icon_unknown,
+                        "unknown-indicator",
+                        format!("{}: unknown — {reason}", indicator.label),
+                    ),
+                };
+
+                info!("Indicator {}", tooltip);
+                button.set_icon_name(icon);
+                button.set_tooltip_text(Some(&tooltip));
+                for class in [
+                    "success-indicator",
+                    "warning-indicator",
+                    "unknown-indicator",
+                ] {
+                    button.remove_css_class(class);
                 }
-            }
+                button.add_css_class(css);
+                detail.replace(state.detail().to_string());
+            });
+        };
 
-            if drift_detected {
-                let dialog = adw::AlertDialog::new(
-                    Some("Configuration Drift Detected"),
-                    Some(&format!("The following drifts were detected:\n\n{content}")),
-                );
-                dialog.add_response("close", "Close");
-                dialog.add_response("debug", "Debug Issue");
-                dialog.set_response_appearance("debug", adw::ResponseAppearance::Suggested);
-                dialog.set_default_response(Some("close"));
-                dialog.set_close_response("close");
+        evaluate();
 
-                dialog.connect_response(None, glib::clone!(#[weak] obj, move |_, response| {
-                    if response == "debug" {
-                        if let Some(terminal) = obj.imp().current_terminal() {
-                            let prompt = format!("Can you help me debug and fix this ansible drift issue? Here is the drift report:\n\n{content}\n");
-                            terminal.feed_child(prompt.as_bytes());
-                        }
+        // Re-check on an interval where one is configured. The predecessor read
+        // its source once at window construction and never again, so a drift that
+        // appeared later was never shown.
+        if let Some(secs) = refresh.filter(|s| *s > 0) {
+            glib::timeout_add_local(std::time::Duration::from_secs(secs), move || {
+                evaluate();
+                glib::ControlFlow::Continue
+            });
+        }
+    }
+
+    /// Shows an indicator's detail, and for SendToTerminal offers to hand it over.
+    fn present_indicator_detail(&self, indicator: &crate::config::Indicator, detail: &str) {
+        let obj = self.obj();
+        let body = if detail.trim().is_empty() {
+            "Nothing to report.".to_string()
+        } else {
+            detail.to_string()
+        };
+
+        if indicator.action == crate::config::IndicatorAction::ShowOutput
+            || detail.trim().is_empty()
+        {
+            present_message(&obj, &indicator.label, &body);
+            return;
+        }
+
+        // SendToTerminal types content into a live agent's stdin. That was a
+        // default affordance when the only source was one hard-coded file; with
+        // user-configurable sources it has to be an explicit, previewed choice.
+        let dialog = adw::AlertDialog::new(Some(&indicator.label), Some(&body));
+        dialog.add_response("close", "Close");
+        dialog.add_response("send", "Send to Session");
+        dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+
+        let detail = detail.to_string();
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak]
+                obj,
+                move |_, response| {
+                    if response != "send" {
+                        return;
                     }
-                }));
-                dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
-            } else {
-                present_message(
-                    &obj,
-                    "System Health",
-                    "System configuration is fully synchronized. No configuration drift detected.",
-                );
-            }
-        }));
-
-        header.pack_end(&health_btn);
+                    if let Some(terminal) = obj.imp().current_terminal() {
+                        terminal.feed_child(detail.as_bytes());
+                    }
+                }
+            ),
+        );
+        dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
 
     /// Initializes the user interface, switching between terminal and welcome screen.
@@ -814,8 +879,8 @@ impl AgentTerminalWindow {
         ));
         header.pack_end(&settings_btn);
 
-        // Homelab-specific Ansible drift indicator (feature-gated).
-        self.add_health_indicator(&header);
+        // Configured status indicators, if any.
+        self.add_status_indicators(&header);
 
         content.append(&header);
         *self.header.borrow_mut() = Some(header);

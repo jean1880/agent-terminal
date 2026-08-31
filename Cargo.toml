@@ -6,12 +6,6 @@ edition = "2021"
 authors = ["jdesroches"]
 description = "A standalone GTK4 terminal for driving an AI coding CLI"
 
-[features]
-# The homelab Ansible-drift indicator in the header. On by default; build with
-# --no-default-features for a generic terminal without the homelab integration.
-default = ["homelab-drift"]
-homelab-drift = []
-
 [dependencies]
 # glib, gio and gdk4 are deliberately NOT direct dependencies: every use in this
 # crate goes through the gtk4 re-exports (gtk4::glib, gtk4::gio, gtk4::gdk), so

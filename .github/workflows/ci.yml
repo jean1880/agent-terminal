@@ -42,9 +42,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy (no default features)
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
-
       - name: Test
         # GUI tests call gtk4::init(), which needs a display; run under Xvfb.
         run: xvfb-run -a cargo test --all-targets

@@ -32,9 +32,11 @@ Architectural mandates, standards, and workflows for this codebase.
   (colour schemes, infallible `RGBA::new`), `utils.rs` (pure logic: detection,
   startup command, path resolution), `window/imp.rs` (GTK UI), `main.rs` (app
   setup + logging).
-- **Feature flags**: homelab-specific integrations sit behind a Cargo feature.
-  The Ansible-drift indicator is behind the default-on `homelab-drift` feature;
-  `--no-default-features` must always still compile and is linted in CI.
+- **No feature flags for deployment specifics**: the crate has none. The
+  Ansible-drift indicator used to sit behind `homelab-drift`; it is now one
+  possible entry in the config-declared `indicators` list, which honours the
+  standalone philosophy more strictly than a `#[cfg]` did — anyone gets the same
+  capability, and the shipped binary carries no homelab knowledge at all.
 
 ## 🔒 Security & Robustness
 
@@ -76,9 +78,8 @@ Architectural mandates, standards, and workflows for this codebase.
    shows a plausible startup that has nothing to do with your code. Always use
    `dbus-run-session -- ./target/debug/agent-terminal`. Do not kill the running
    instance to work around this; it is someone's live session.
-4. **Linting**: `cargo fmt` and `cargo clippy --all-targets -- -D warnings`, plus
-   `cargo clippy --no-default-features --all-targets -- -D warnings`. CI enforces
-   fmt, both clippy configurations, and tests under Xvfb.
+4. **Linting**: `cargo fmt` and `cargo clippy --all-targets -- -D warnings`.
+   CI enforces fmt, clippy, and tests under Xvfb.
 5. **Installation**: do **NOT** run `make install` on developer/daily-driver
    machines. Deployment is the `debian-maintainer` apt pipeline
    (`apt.nuvek.ca`), which builds every pushed commit. A manual `make install`
@@ -104,8 +105,13 @@ orchestrator collects artifacts with a non-recursive scan of the workspace root.
   `theme.rs`); add new schemes there and update the guard test. The window chrome
   follows the brand CSS in `main.rs` (background `#181425`, foreground `#c8c8ff`).
 - If you modify startup/detection logic, update and run the tests in `utils.rs`.
-- Put homelab-specific behaviour behind the `homelab-drift` feature (or a new
-  feature); the `--no-default-features` build must stay generic and compile.
+- Deployment-specific behaviour belongs in config, not in the binary. Anything
+  that reads a path or runs a command particular to one machine should be an
+  `indicators` entry rather than new Rust.
+- An indicator-style check has three states, never two. "Could not read the
+  source" must have its own icon and never collapse into "healthy" — that
+  collapse is exactly what made the old drift button report a permanently green
+  shield for a file that had not existed in months.
 - Settings apply on change, not on dialog close. Rows that can hold an invalid
   value must validate inline and refuse to persist rather than silently falling
   back at spawn time.

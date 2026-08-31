@@ -165,6 +165,11 @@ where
 ///
 /// Failures are logged and yield nothing rather than blocking the session.
 pub fn load_env_file(path: &str) -> Vec<(String, String)> {
+    // Expanded here: the path is passed to the shell quoted, so a leading `~`
+    // would otherwise be taken literally.
+    let path = expand_tilde(path);
+    let path = path.as_str();
+
     // `env -0` so values containing newlines survive; `set -a` so assignments
     // without an explicit `export` are still exported.
     let output = std::process::Command::new("/bin/sh")
@@ -207,6 +212,139 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
                 && inherited.get(key).map(String::as_str) != Some(value.as_str())
         })
         .collect()
+}
+
+/// Expands a leading `~` to `$HOME`.
+///
+/// Config values are hand-written, so people write `~/...` and expect it to work.
+/// Nothing else does this for us: `read_to_string` takes the tilde literally, and
+/// a path passed to a shell in quotes is not expanded either.
+pub fn expand_tilde(path: &str) -> String {
+    let trimmed = path.trim();
+    let Some(rest) = trimmed.strip_prefix('~') else {
+        return trimmed.to_string();
+    };
+    // Only a bare `~` or `~/`; `~user` is someone else's home and not ours to guess.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return trimmed.to_string();
+    }
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}{rest}"),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
+/// What an indicator found.
+///
+/// Three states, not two. The predecessor had only ok/warn, so a source it could
+/// not read fell into "ok" and the header reported a healthy system it had never
+/// actually checked. `Unknown` exists so that failure can never again be
+/// mistaken for health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndicatorState {
+    Ok,
+    Warn { detail: String },
+    Unknown { reason: String },
+}
+
+impl IndicatorState {
+    /// The detail text to show when the indicator is clicked.
+    pub fn detail(&self) -> &str {
+        match self {
+            IndicatorState::Ok => "",
+            IndicatorState::Warn { detail } => detail,
+            IndicatorState::Unknown { reason } => reason,
+        }
+    }
+}
+
+/// Reads an indicator's source. Blocking — callers must run it off the main
+/// thread, for the same reason CLI resolution does.
+pub fn read_indicator(source: &crate::config::IndicatorSource) -> IndicatorState {
+    match source {
+        crate::config::IndicatorSource::File { path } => {
+            let path = &expand_tilde(path);
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    if content.lines().any(|line| !line.trim().is_empty()) {
+                        IndicatorState::Warn { detail: content }
+                    } else {
+                        IndicatorState::Ok
+                    }
+                }
+                Err(err) => IndicatorState::Unknown {
+                    reason: format!("Could not read {path}: {err}"),
+                },
+            }
+        }
+        crate::config::IndicatorSource::Command { argv, timeout_secs } => {
+            let Some((command, args)) = argv.split_first() else {
+                return IndicatorState::Unknown {
+                    reason: "Indicator command is empty".to_string(),
+                };
+            };
+            run_with_timeout(command, args, *timeout_secs)
+        }
+    }
+}
+
+/// Runs a command, giving up after `timeout_secs`.
+///
+/// A configured command is arbitrary and may hang; without a bound it would tie
+/// up a worker thread for the life of the process.
+fn run_with_timeout(command: &str, args: &[String], timeout_secs: u64) -> IndicatorState {
+    use std::time::{Duration, Instant};
+
+    let mut child = match std::process::Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return IndicatorState::Unknown {
+                reason: format!("Could not run {command}: {err}"),
+            }
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return IndicatorState::Unknown {
+                    reason: format!("{command} did not finish within {timeout_secs}s"),
+                };
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                return IndicatorState::Unknown {
+                    reason: format!("Failed while waiting for {command}: {err}"),
+                }
+            }
+        }
+    }
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => IndicatorState::Ok,
+        Ok(output) => {
+            let mut detail = String::from_utf8_lossy(&output.stdout).to_string();
+            if detail.trim().is_empty() {
+                detail = String::from_utf8_lossy(&output.stderr).to_string();
+            }
+            if detail.trim().is_empty() {
+                detail = format!("{command} exited with {}", output.status);
+            }
+            IndicatorState::Warn { detail }
+        }
+        Err(err) => IndicatorState::Unknown {
+            reason: format!("Failed to collect output from {command}: {err}"),
+        },
+    }
 }
 
 /// Resolves the working directory to use, handling ~ expansion and fallback to home.
@@ -435,6 +573,129 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("dumb-for-test")
         );
+    }
+
+    #[test]
+    fn tilde_paths_are_expanded_for_config_supplied_files() {
+        // People write ~/... in config; nothing else expands it for us, and a
+        // path handed to a shell in quotes stays literal.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            expand_tilde("~/reports/drift.txt"),
+            format!("{home}/reports/drift.txt")
+        );
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
+        assert_eq!(expand_tilde("  ~/spaced  "), format!("{home}/spaced"));
+        // ~otheruser is someone else's home and not ours to guess at.
+        assert_eq!(expand_tilde("~root/x"), "~root/x");
+    }
+
+    #[test]
+    fn an_indicator_file_path_may_use_a_tilde() {
+        let home = std::env::var("HOME").unwrap();
+        let state = read_indicator(&crate::config::IndicatorSource::File {
+            path: "~/definitely-not-a-real-report-xyz.txt".to_string(),
+        });
+        match state {
+            // The reported path proves the tilde was expanded before the read.
+            IndicatorState::Unknown { reason } => assert!(reason.contains(&home), "{reason}"),
+            other => panic!("expected unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_indicator_file_is_unknown_not_ok() {
+        // The bug this whole feature exists to prevent: the predecessor read a
+        // path that no longer existed, treated the failure as "no drift", and
+        // rendered a green shield for a system it had never checked.
+        let state = read_indicator(&crate::config::IndicatorSource::File {
+            path: "/nonexistent/drift_report.txt".to_string(),
+        });
+        assert!(
+            matches!(state, IndicatorState::Unknown { .. }),
+            "an unreadable source must not read as healthy, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_indicator_file_is_ok_and_a_populated_one_warns() {
+        let dir = tempdir().unwrap();
+
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "\n   \n").unwrap();
+        assert_eq!(
+            read_indicator(&crate::config::IndicatorSource::File {
+                path: empty.to_string_lossy().to_string(),
+            }),
+            IndicatorState::Ok
+        );
+
+        let populated = dir.path().join("drift.txt");
+        std::fs::write(&populated, "role x drifted\n").unwrap();
+        let state = read_indicator(&crate::config::IndicatorSource::File {
+            path: populated.to_string_lossy().to_string(),
+        });
+        match state {
+            IndicatorState::Warn { detail } => assert!(detail.contains("role x drifted")),
+            other => panic!("expected a warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indicator_command_exit_status_selects_the_state() {
+        assert_eq!(
+            read_indicator(&crate::config::IndicatorSource::Command {
+                argv: vec!["true".to_string()],
+                timeout_secs: 5,
+            }),
+            IndicatorState::Ok
+        );
+
+        let state = read_indicator(&crate::config::IndicatorSource::Command {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo bad; exit 1".to_string(),
+            ],
+            timeout_secs: 5,
+        });
+        match state {
+            IndicatorState::Warn { detail } => assert!(detail.contains("bad")),
+            other => panic!("expected a warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrunnable_indicator_command_is_unknown() {
+        let state = read_indicator(&crate::config::IndicatorSource::Command {
+            argv: vec!["definitely-not-a-real-command-xyz".to_string()],
+            timeout_secs: 5,
+        });
+        assert!(matches!(state, IndicatorState::Unknown { .. }), "{state:?}");
+    }
+
+    #[test]
+    fn an_empty_indicator_command_is_unknown() {
+        let state = read_indicator(&crate::config::IndicatorSource::Command {
+            argv: Vec::new(),
+            timeout_secs: 5,
+        });
+        assert!(matches!(state, IndicatorState::Unknown { .. }), "{state:?}");
+    }
+
+    #[test]
+    fn a_hanging_indicator_command_times_out() {
+        // A configured command is arbitrary; without a bound it would hold a
+        // worker thread for the life of the process.
+        let state = read_indicator(&crate::config::IndicatorSource::Command {
+            argv: vec!["sleep".to_string(), "30".to_string()],
+            timeout_secs: 1,
+        });
+        match state {
+            IndicatorState::Unknown { reason } => assert!(reason.contains("did not finish")),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
     }
 
     #[test]
