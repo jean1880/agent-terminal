@@ -43,5 +43,5 @@ priority = "optional"
 assets = [
     ["target/release/antigravity-terminal", "usr/bin/antigravity-terminal", "755"],
     ["assets/antigravity-terminal.desktop", "usr/share/applications/antigravity-terminal.desktop", "644"],
-    ["assets/antigravity_logo.svg", "usr/share/icons/antigravity_logo.svg", "644"],
+    ["assets/antigravity_logo.svg", "usr/share/icons/hicolor/scalable/apps/antigravity-terminal.svg", "644"],
 ]
