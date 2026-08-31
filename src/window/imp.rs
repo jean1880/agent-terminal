@@ -126,6 +126,15 @@ async fn resolve_cli_binary(
     detected
 }
 
+/// Presents a one-button informational dialog anchored to `parent`.
+fn present_message(parent: &super::AntigravityWindow, heading: &str, body: &str) {
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_response("ok", "OK");
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("ok");
+    dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
+}
+
 /// Internal state for the AntigravityWindow.
 #[derive(Default)]
 pub struct AntigravityWindow {
@@ -207,38 +216,54 @@ impl AntigravityWindow {
 
         // Copy Action
         let copy_action = gtk4::gio::SimpleAction::new("copy", None);
-        copy_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
-            if let Some(terminal) = obj.imp().current_terminal() {
-                debug!("Action: Copy");
-                terminal.copy_clipboard_format(Format::Text);
+        copy_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                if let Some(terminal) = obj.imp().current_terminal() {
+                    debug!("Action: Copy");
+                    terminal.copy_clipboard_format(Format::Text);
+                }
             }
-        }));
+        ));
         obj.add_action(&copy_action);
 
         // Paste Action
         let paste_action = gtk4::gio::SimpleAction::new("paste", None);
-        paste_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
-            if let Some(terminal) = obj.imp().current_terminal() {
-                debug!("Action: Paste");
-                terminal.paste_clipboard();
+        paste_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                if let Some(terminal) = obj.imp().current_terminal() {
+                    debug!("Action: Paste");
+                    terminal.paste_clipboard();
+                }
             }
-        }));
+        ));
         obj.add_action(&paste_action);
 
         // New Tab Action (bound to Ctrl+Shift+T in main.rs)
         let new_tab_action = gtk4::gio::SimpleAction::new("new-tab", None);
-        new_tab_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
-            debug!("Action: New Tab");
-            obj.imp().new_tab();
-        }));
+        new_tab_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: New Tab");
+                obj.imp().new_tab();
+            }
+        ));
         obj.add_action(&new_tab_action);
 
         // New Tab in Folder Action (opens a folder picker)
         let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
-        new_tab_folder_action.connect_activate(glib::clone!(@weak obj => move |_, _| {
-            debug!("Action: New Tab in Folder");
-            obj.imp().new_tab_in_folder();
-        }));
+        new_tab_folder_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: New Tab in Folder");
+                obj.imp().new_tab_in_folder();
+            }
+        ));
         obj.add_action(&new_tab_folder_action);
     }
 
@@ -286,7 +311,7 @@ impl AntigravityWindow {
             "success-indicator"
         });
 
-        health_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
+        health_btn.connect_clicked(glib::clone!(#[weak] obj, move |_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
             let path = std::path::PathBuf::from(&home).join("scripts/rag_indexer/drift_report.txt");
             let mut drift_detected = false;
@@ -300,36 +325,31 @@ impl AntigravityWindow {
             }
 
             if drift_detected {
-                let dialog = gtk4::MessageDialog::builder()
-                    .transient_for(&obj)
-                    .message_type(gtk4::MessageType::Warning)
-                    .text("Configuration Drift Detected")
-                    .secondary_text(format!("The following drifts were detected:\n\n{}", content))
-                    .build();
+                let dialog = adw::AlertDialog::new(
+                    Some("Configuration Drift Detected"),
+                    Some(&format!("The following drifts were detected:\n\n{content}")),
+                );
+                dialog.add_response("close", "Close");
+                dialog.add_response("debug", "Debug Issue");
+                dialog.set_response_appearance("debug", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("close"));
+                dialog.set_close_response("close");
 
-                dialog.add_button("Close", gtk4::ResponseType::Cancel);
-                dialog.add_button("Debug Issue", gtk4::ResponseType::Yes);
-
-                dialog.connect_response(glib::clone!(@weak obj => move |dialog: &gtk4::MessageDialog, response: gtk4::ResponseType| {
-                    if response == gtk4::ResponseType::Yes {
+                dialog.connect_response(None, glib::clone!(#[weak] obj, move |_, response| {
+                    if response == "debug" {
                         if let Some(terminal) = obj.imp().current_terminal() {
-                            let prompt = format!("Can you help me debug and fix this ansible drift issue? Here is the drift report:\n\n{}\n", content);
+                            let prompt = format!("Can you help me debug and fix this ansible drift issue? Here is the drift report:\n\n{content}\n");
                             terminal.feed_child(prompt.as_bytes());
                         }
                     }
-                    dialog.close();
                 }));
-                dialog.present();
+                dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
             } else {
-                let dialog = gtk4::MessageDialog::builder()
-                    .transient_for(&obj)
-                    .message_type(gtk4::MessageType::Info)
-                    .buttons(gtk4::ButtonsType::Ok)
-                    .text("System Health")
-                    .secondary_text("System configuration is fully synchronized. No configuration drift detected.")
-                    .build();
-                dialog.connect_response(|dialog: &gtk4::MessageDialog, _| dialog.close());
-                dialog.present();
+                present_message(
+                    &obj,
+                    "System Health",
+                    "System configuration is fully synchronized. No configuration drift detected.",
+                );
             }
         }));
 
@@ -357,10 +377,14 @@ impl AntigravityWindow {
             .icon_name("document-properties-symbolic")
             .tooltip_text("Settings")
             .build();
-        settings_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
-            let imp = obj.imp();
-            imp.show_preferences();
-        }));
+        settings_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                imp.show_preferences();
+            }
+        ));
         header.pack_end(&settings_btn);
 
         // Homelab-specific Ansible drift indicator (feature-gated).
@@ -391,8 +415,12 @@ impl AntigravityWindow {
         let selected_client = self.config.borrow().cli_client;
         let (path, home, shell) = env_triplet();
 
-        glib::MainContext::default().spawn_local(
-            glib::clone!(@weak obj, @weak content => async move {
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            content,
+            async move {
                 let detected = resolve_cli_binary(selected_client, path, home, shell).await;
 
                 let imp = obj.imp();
@@ -407,8 +435,8 @@ impl AntigravityWindow {
                     warn!("No compatible CLI detected, setting up welcome UI");
                     imp.setup_welcome_ui(&content);
                 }
-            }),
-        );
+            }
+        ));
     }
 
     /// Sets up the tabbed terminal interface, then opens the first tab.
@@ -433,18 +461,26 @@ impl AntigravityWindow {
                 .icon_name("tab-new-symbolic")
                 .tooltip_text("New Tab (Ctrl+Shift+T)")
                 .build();
-            new_tab_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
-                obj.imp().new_tab();
-            }));
+            new_tab_btn.connect_clicked(glib::clone!(
+                #[weak]
+                obj,
+                move |_| {
+                    obj.imp().new_tab();
+                }
+            ));
             header.pack_start(&new_tab_btn);
 
             let new_tab_folder_btn = Button::builder()
                 .icon_name("folder-new-symbolic")
                 .tooltip_text("New Tab in Folder…")
                 .build();
-            new_tab_folder_btn.connect_clicked(glib::clone!(@weak obj => move |_| {
-                obj.imp().new_tab_in_folder();
-            }));
+            new_tab_folder_btn.connect_clicked(glib::clone!(
+                #[weak]
+                obj,
+                move |_| {
+                    obj.imp().new_tab_in_folder();
+                }
+            ));
             header.pack_start(&new_tab_folder_btn);
         }
 
@@ -454,41 +490,53 @@ impl AntigravityWindow {
         // Immediately confirm tab closures (no unsaved-state prompt for a terminal).
         tab_view.connect_close_page(|view, page| {
             view.close_page_finish(page, true);
-            true // GDK_EVENT_STOP: closure handled the request
+            glib::Propagation::Stop // the closure handled the close request
         });
 
         // Close the window once the last tab is gone.
         tab_view.connect_notify_local(
             Some("n-pages"),
-            glib::clone!(@weak obj => move |view, _| {
-                if view.n_pages() == 0 {
-                    info!("Last tab closed, closing window");
-                    obj.close();
+            glib::clone!(
+                #[weak]
+                obj,
+                move |view, _| {
+                    if view.n_pages() == 0 {
+                        info!("Last tab closed, closing window");
+                        obj.close();
+                    }
                 }
-            }),
+            ),
         );
 
         // Forget a tab's tracked state when it is removed.
-        tab_view.connect_page_detached(glib::clone!(@weak obj => move |_, page, _| {
-            obj.imp().tabs.borrow_mut().retain(|t| &t.page != page);
-        }));
+        tab_view.connect_page_detached(glib::clone!(
+            #[weak]
+            obj,
+            move |_, page, _| {
+                obj.imp().tabs.borrow_mut().retain(|t| &t.page != page);
+            }
+        ));
 
         // Keep the header title in sync with the active tab.
-        tab_view.connect_selected_page_notify(glib::clone!(@weak obj => move |view| {
-            let imp = obj.imp();
-            let session_info = view
-                .selected_page()
-                .map(|p| p.title().to_string())
-                .unwrap_or_default();
-            if let Some(window_title) = imp.window_title.borrow().as_ref() {
-                window_title.set_subtitle(&session_info);
+        tab_view.connect_selected_page_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |view| {
+                let imp = obj.imp();
+                let session_info = view
+                    .selected_page()
+                    .map(|p| p.title().to_string())
+                    .unwrap_or_default();
+                if let Some(window_title) = imp.window_title.borrow().as_ref() {
+                    window_title.set_subtitle(&session_info);
+                }
+                if session_info.is_empty() {
+                    obj.set_title(Some("Antigravity Terminal"));
+                } else {
+                    obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+                }
             }
-            if session_info.is_empty() {
-                obj.set_title(Some("Antigravity Terminal"));
-            } else {
-                obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
-            }
-        }));
+        ));
 
         self.add_terminal_tab(cli_binary, None);
     }
@@ -521,32 +569,40 @@ impl AntigravityWindow {
     /// Prompts for a folder, then opens a new tab rooted there.
     fn new_tab_in_folder(&self) {
         let obj = self.obj();
-        let dialog = gtk4::FileChooserNative::new(
-            Some("Select Folder for New Tab"),
-            Some(obj.upcast_ref::<gtk4::Window>()),
-            gtk4::FileChooserAction::SelectFolder,
-            Some("Open"),
-            Some("Cancel"),
-        );
-        dialog.set_modal(true);
+        let dialog = gtk4::FileDialog::builder()
+            .title("Select Folder for New Tab")
+            .accept_label("Open")
+            .modal(true)
+            .build();
 
         // Start the picker in the current tab's directory when known.
         if let Some(dir) = self.current_dir() {
-            let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&dir)));
+            dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(&dir)));
         }
 
-        // `run_async` keeps the native dialog alive until the user responds.
-        dialog.run_async(glib::clone!(@weak obj => move |dialog, response| {
-            if response == gtk4::ResponseType::Accept {
-                if let Some(path) = dialog.file().and_then(|f| f.path()) {
-                    let imp = obj.imp();
-                    let dir = path.to_string_lossy().to_string();
-                    let detected = imp.detected_binary.borrow().clone();
-                    imp.add_terminal_tab(detected.as_deref(), Some(&dir));
+        // FileDialog is future-based, so the dialog stays alive for as long as the
+        // future is held and there is no manual destroy() to forget.
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let folder = dialog
+                    .select_folder_future(Some(obj.upcast_ref::<gtk4::Window>()))
+                    .await;
+                match folder {
+                    Ok(file) => {
+                        if let Some(path) = file.path() {
+                            let imp = obj.imp();
+                            let dir = path.to_string_lossy().to_string();
+                            let detected = imp.detected_binary.borrow().clone();
+                            imp.add_terminal_tab(detected.as_deref(), Some(&dir));
+                        }
+                    }
+                    // Dismissing the picker is a normal outcome, not a failure.
+                    Err(err) => debug!("Folder selection cancelled or failed: {err}"),
                 }
             }
-            dialog.destroy();
-        }));
+        ));
     }
 
     /// Builds a terminal, wraps it in a tab page, and spawns the CLI session.
@@ -637,8 +693,12 @@ impl AntigravityWindow {
         let obj = self.obj();
 
         // Terminal title drives the tab label and (when active) the window title.
-        terminal.connect_window_title_changed(
-            glib::clone!(@weak obj, @weak page => move |terminal| {
+        terminal.connect_window_title_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            page,
+            move |terminal| {
                 let title = terminal.window_title();
                 debug!("Terminal window title changed: {:?}", title);
                 let session_info = title.as_deref().unwrap_or("");
@@ -670,17 +730,23 @@ impl AntigravityWindow {
                         obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
                     }
                 };
-            }),
-        );
+            }
+        ));
 
         // Close this tab when its session ends. Closing the last tab closes the
         // window (see the n-pages handler).
-        terminal.connect_child_exited(glib::clone!(@weak obj, @weak page => move |_, status| {
-            info!("Terminal child exited with status: {}", status);
-            if let Some(tab_view) = obj.imp().tab_view.borrow().as_ref() {
-                tab_view.close_page(&page);
-            };
-        }));
+        terminal.connect_child_exited(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            page,
+            move |_, status| {
+                info!("Terminal child exited with status: {}", status);
+                if let Some(tab_view) = obj.imp().tab_view.borrow().as_ref() {
+                    tab_view.close_page(&page);
+                };
+            }
+        ));
     }
 
     /// Attaches the right-click menu, ctrl-click hyperlink, and key shortcuts.
@@ -706,65 +772,91 @@ impl AntigravityWindow {
 
         let click_gesture = gtk4::GestureClick::new();
         click_gesture.set_button(3); // Right click
-        click_gesture.connect_pressed(glib::clone!(@weak popover => move |gesture, _, x, y| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-            popover.set_pointing_to(Some(&rect));
-            popover.popup();
-        }));
+        click_gesture.connect_pressed(glib::clone!(
+            #[weak]
+            popover,
+            move |gesture, _, x, y| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                popover.set_pointing_to(Some(&rect));
+                popover.popup();
+            }
+        ));
         terminal.add_controller(click_gesture);
 
         // Hyperlink Click Handler (Ctrl + Left Click)
         let link_click_gesture = gtk4::GestureClick::new();
         link_click_gesture.set_button(1); // Left click
-        link_click_gesture.connect_pressed(
-            glib::clone!(@weak terminal => move |gesture, _, _x, _y| {
+        link_click_gesture.connect_pressed(glib::clone!(
+            #[weak]
+            terminal,
+            move |gesture, _, _x, _y| {
                 if let Some(event) = gesture.current_event() {
                     let modifiers = event.modifier_state();
                     if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
                         if let Some(uri) = terminal.hyperlink_hover_uri() {
                             gesture.set_state(gtk4::EventSequenceState::Claimed);
                             debug!("Opening hyperlink: {}", uri);
-                            gtk4::show_uri(None::<&gtk4::Window>, &uri, 0);
+                            // UriLauncher replaces the deprecated gtk4::show_uri.
+                            // Fire-and-forget: the portal owns the outcome, and a
+                            // failure to launch is not actionable from here.
+                            gtk4::UriLauncher::new(&uri).launch(
+                                None::<&gtk4::Window>,
+                                None::<&gtk4::gio::Cancellable>,
+                                |result| {
+                                    if let Err(err) = result {
+                                        warn!("Failed to open hyperlink: {err}");
+                                    }
+                                },
+                            );
                         }
                     }
                 }
-            }),
-        );
+            }
+        ));
         terminal.add_controller(link_click_gesture);
 
         // Keyboard Shortcuts (Copy/Paste/Zoom)
         let key_controller = gtk4::EventControllerKey::new();
-        key_controller.connect_key_pressed(glib::clone!(@weak terminal, @weak obj => @default-return glib::Propagation::Proceed, move |_ctrl, key, _code, state| {
-            let is_ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-            let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+        key_controller.connect_key_pressed(glib::clone!(
+            #[weak]
+            terminal,
+            #[weak]
+            obj,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_ctrl, key, _code, state| {
+                let is_ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
 
-            match key {
-                gtk4::gdk::Key::C | gtk4::gdk::Key::c if is_ctrl && is_shift => {
-                    debug!("Hotkey: Copy");
-                    terminal.copy_clipboard_format(Format::Text);
-                    glib::Propagation::Stop
+                match key {
+                    gtk4::gdk::Key::C | gtk4::gdk::Key::c if is_ctrl && is_shift => {
+                        debug!("Hotkey: Copy");
+                        terminal.copy_clipboard_format(Format::Text);
+                        glib::Propagation::Stop
+                    }
+                    gtk4::gdk::Key::V | gtk4::gdk::Key::v if is_ctrl && is_shift => {
+                        debug!("Hotkey: Paste");
+                        terminal.paste_clipboard();
+                        glib::Propagation::Stop
+                    }
+                    gtk4::gdk::Key::plus | gtk4::gdk::Key::equal if is_ctrl => {
+                        obj.imp().set_font_scale(terminal.font_scale() + 0.1);
+                        glib::Propagation::Stop
+                    }
+                    gtk4::gdk::Key::minus if is_ctrl => {
+                        obj.imp()
+                            .set_font_scale((terminal.font_scale() - 0.1).max(0.1));
+                        glib::Propagation::Stop
+                    }
+                    k if k.to_unicode() == Some('0') && is_ctrl => {
+                        obj.imp().set_font_scale(1.0);
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
                 }
-                gtk4::gdk::Key::V | gtk4::gdk::Key::v if is_ctrl && is_shift => {
-                    debug!("Hotkey: Paste");
-                    terminal.paste_clipboard();
-                    glib::Propagation::Stop
-                }
-                gtk4::gdk::Key::plus | gtk4::gdk::Key::equal if is_ctrl => {
-                    obj.imp().set_font_scale(terminal.font_scale() + 0.1);
-                    glib::Propagation::Stop
-                }
-                gtk4::gdk::Key::minus if is_ctrl => {
-                    obj.imp().set_font_scale((terminal.font_scale() - 0.1).max(0.1));
-                    glib::Propagation::Stop
-                }
-                k if k.to_unicode() == Some('0') && is_ctrl => {
-                    obj.imp().set_font_scale(1.0);
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
             }
-        }));
+        ));
         terminal.add_controller(key_controller);
     }
 
@@ -792,13 +884,17 @@ impl AntigravityWindow {
         let obj = self.obj();
         let source = glib::timeout_add_local_once(
             SAVE_DEBOUNCE,
-            glib::clone!(@weak obj => move || {
-                let imp = obj.imp();
-                // The source fires once and is consumed; clear it before saving so
-                // flush_pending_save cannot try to remove an already-dead source.
-                imp.pending_save.replace(None);
-                imp.config.borrow().save();
-            }),
+            glib::clone!(
+                #[weak]
+                obj,
+                move || {
+                    let imp = obj.imp();
+                    // The source fires once and is consumed; clear it before saving so
+                    // flush_pending_save cannot try to remove an already-dead source.
+                    imp.pending_save.replace(None);
+                    imp.config.borrow().save();
+                }
+            ),
         );
         self.pending_save.replace(Some(source));
     }
@@ -833,8 +929,12 @@ impl AntigravityWindow {
         // of the tab, and after the first one there is nothing left for it to do.
         let reveal_handler: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =
             std::rc::Rc::new(RefCell::new(None));
-        let handler_id = terminal.connect_contents_changed(
-            glib::clone!(@weak stack, @strong reveal_handler => move |terminal| {
+        let handler_id = terminal.connect_contents_changed(glib::clone!(
+            #[weak]
+            stack,
+            #[strong]
+            reveal_handler,
+            move |terminal| {
                 if stack.visible_child_name().as_deref() == Some("loading") {
                     debug!("Terminal content detected, switching from loading screen");
                     stack.set_visible_child_name("terminal");
@@ -842,8 +942,8 @@ impl AntigravityWindow {
                 if let Some(id) = reveal_handler.borrow_mut().take() {
                     terminal.disconnect(id);
                 }
-            }),
-        );
+            }
+        ));
         reveal_handler.replace(Some(handler_id));
 
         // Inherit the current user environment, then guarantee terminal
@@ -871,24 +971,26 @@ impl AntigravityWindow {
             || {},
             -1,
             None::<&gtk4::gio::Cancellable>,
-            glib::clone!(@weak obj, @weak stack => move |result| {
-                match result {
-                    Ok(_) => info!("Terminal process spawned, waiting for content..."),
-                    Err(err) => {
-                        error!("Error spawning terminal: {}", err);
-                        stack.set_visible_child_name("terminal"); // Show terminal anyway so error is visible
-                        let dialog = gtk4::MessageDialog::builder()
-                            .transient_for(&obj)
-                            .message_type(gtk4::MessageType::Error)
-                            .buttons(gtk4::ButtonsType::Ok)
-                            .text("Terminal Error")
-                            .secondary_text(format!("Error spawning terminal: {}", err))
-                            .build();
-                        dialog.connect_response(|dialog, _| dialog.close());
-                        dialog.present();
+            glib::clone!(
+                #[weak]
+                obj,
+                #[weak]
+                stack,
+                move |result| {
+                    match result {
+                        Ok(_) => info!("Terminal process spawned, waiting for content..."),
+                        Err(err) => {
+                            error!("Error spawning terminal: {}", err);
+                            stack.set_visible_child_name("terminal"); // Show terminal anyway so error is visible
+                            present_message(
+                                &obj,
+                                "Terminal Error",
+                                &format!("Error spawning terminal: {err}"),
+                            );
+                        }
                     }
                 }
-            }),
+            ),
         );
     }
 
@@ -910,10 +1012,14 @@ impl AntigravityWindow {
             .css_classes(["suggested-action"])
             .build();
 
-        refresh_button.connect_clicked(glib::clone!(@weak obj => move |_| {
-            let imp = obj.imp();
-            imp.setup_ui();
-        }));
+        refresh_button.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                imp.setup_ui();
+            }
+        ));
 
         status_page.set_child(Some(&refresh_button));
         container.append(&status_page);
@@ -923,9 +1029,7 @@ impl AntigravityWindow {
         let obj = self.obj();
         let config = self.config.borrow().clone();
 
-        let window = adw::PreferencesWindow::builder()
-            .transient_for(obj.upcast_ref::<gtk4::Window>())
-            .modal(true)
+        let dialog = adw::PreferencesDialog::builder()
             .search_enabled(false)
             .title("Settings")
             .build();
@@ -962,14 +1066,20 @@ impl AntigravityWindow {
         let scrollback_row = adw::ActionRow::builder().title("Scrollback Lines").build();
         scrollback_row.add_suffix(&scroll_spin);
 
-        let client_model = gtk4::StringList::new(&["Auto-detect", "Gemini", "Agy", "Claude"]);
-
-        let selected_index = match config.cli_client {
-            crate::config::CliClient::Auto => 0,
-            crate::config::CliClient::Gemini => 1,
-            crate::config::CliClient::Agy => 2,
-            crate::config::CliClient::Claude => 3,
-        };
+        // Built from CliClient::ALL, like the theme row below it. The previous
+        // hand-written index match ran in both directions (0 => Auto to read,
+        // Auto => 0 to preselect) with a `_ => Auto` arm swallowing anything
+        // unexpected, so the list and the enum could silently disagree.
+        let client_names: Vec<String> = crate::config::CliClient::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let client_name_refs: Vec<&str> = client_names.iter().map(String::as_str).collect();
+        let client_model = gtk4::StringList::new(&client_name_refs);
+        let selected_index = crate::config::CliClient::ALL
+            .iter()
+            .position(|c| *c == config.cli_client)
+            .unwrap_or(0) as u32;
 
         let font_scale_adj = gtk4::Adjustment::new(config.font_scale, 0.5, 3.0, 0.1, 0.5, 0.0);
         let font_scale_spin = gtk4::SpinButton::builder()
@@ -1009,82 +1119,141 @@ impl AntigravityWindow {
         group.add(&cli_client_row);
         group.add(&theme_row);
         page.add(&group);
-        window.add(&page);
+        dialog.add(&page);
 
-        window.connect_close_request(glib::clone!(
-            @weak obj,
-            @weak cli_client_row,
-            @weak theme_row,
-            @weak starting_directory_entry,
-            @weak scroll_spin,
-            @weak font_scale_spin => @default-return glib::Propagation::Proceed, move |_win| {
-                let imp = obj.imp();
-                let previous_client = imp.config.borrow().cli_client;
-                let previous_dir = imp.config.borrow().starting_directory.clone();
+        // Settings apply as they change rather than in one batch when the dialog
+        // closes. AdwPreferencesDialog has no close-request signal to hang a batch
+        // commit on, and applying per-row is better behaved anyway: each change is
+        // visible immediately, and a rejected value (see the directory row) never
+        // reaches the config at all.
 
-                let selected_client = match cli_client_row.selected() {
-                    0 => crate::config::CliClient::Auto,
-                    1 => crate::config::CliClient::Gemini,
-                    2 => crate::config::CliClient::Agy,
-                    3 => crate::config::CliClient::Claude,
-                    _ => crate::config::CliClient::Auto,
-                };
-                let selected_theme = crate::config::ThemeChoice::ALL
-                    .get(theme_row.selected() as usize)
-                    .copied()
-                    .unwrap_or_default();
-
-                let mut dir_changed = false;
-                {
-                    let mut current_config = imp.config.borrow_mut();
-                    let new_dir = starting_directory_entry.text().to_string();
-                    if new_dir != previous_dir {
-                        dir_changed = true;
-                        current_config.starting_directory = new_dir;
-                    }
-                    current_config.scrollback_lines = scroll_spin.value() as u32;
-                    current_config.font_scale = font_scale_spin.value();
-                    current_config.cli_client = selected_client;
-                    current_config.theme = selected_theme;
-                    current_config.save();
-                }
-
-                let (scrollback, font_scale) = {
-                    let config = imp.config.borrow();
-                    (config.scrollback_lines as i64, config.font_scale)
-                };
-                imp.for_each_terminal(|term| {
-                    term.set_scrollback_lines(scrollback);
-                    term.set_font_scale(font_scale);
-                });
-
-                // Themes apply live to every open tab; no restart needed.
-                imp.for_each_terminal(|term| Theme::apply(term, selected_theme));
-
-                if selected_client != previous_client || dir_changed {
-                    info!("CLI client or starting directory changed, restarting terminal session");
-                    // Re-resolving the client can shell out, so it goes through the
-                    // same off-thread path as startup rather than freezing the
-                    // window as the settings dialog closes.
-                    let client_changed = selected_client != previous_client;
-                    let (path, home, shell) = env_triplet();
-                    glib::MainContext::default().spawn_local(glib::clone!(@weak obj => async move {
-                        let imp = obj.imp();
-                        if client_changed {
-                            let detected =
-                                resolve_cli_binary(selected_client, path, home, shell).await;
-                            *imp.detected_binary.borrow_mut() = detected;
-                        }
-                        imp.restart_current_tab();
-                    }));
-                }
-
-                glib::Propagation::Proceed
+        scroll_spin.connect_value_changed(glib::clone!(
+            #[weak]
+            obj,
+            move |spin| {
+                let lines = spin.value() as u32;
+                obj.imp().config.borrow_mut().scrollback_lines = lines;
+                obj.imp()
+                    .for_each_terminal(|term| term.set_scrollback_lines(i64::from(lines)));
+                obj.imp().schedule_config_save();
             }
         ));
 
-        window.present();
+        font_scale_spin.connect_value_changed(glib::clone!(
+            #[weak]
+            obj,
+            move |spin| {
+                // Reuses the shared setter, so the zoom shortcuts and this row
+                // debounce through the same timer.
+                obj.imp().set_font_scale(spin.value());
+            }
+        ));
+
+        theme_row.connect_selected_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let theme = crate::config::ThemeChoice::ALL
+                    .get(row.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                obj.imp().config.borrow_mut().theme = theme;
+                // Themes apply live to every open tab; no restart needed.
+                obj.imp()
+                    .for_each_terminal(|term| Theme::apply(term, theme));
+                obj.imp().schedule_config_save();
+            }
+        ));
+
+        cli_client_row.connect_selected_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let Some(client) = crate::config::CliClient::ALL
+                    .get(row.selected() as usize)
+                    .copied()
+                else {
+                    return;
+                };
+                let imp = obj.imp();
+                if imp.config.borrow().cli_client == client {
+                    return;
+                }
+                imp.config.borrow_mut().cli_client = client;
+                imp.schedule_config_save();
+                info!("CLI client changed to {}, restarting session", client);
+                imp.restart_with_client(client);
+            }
+        ));
+
+        starting_directory_entry.connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            starting_directory_row,
+            move |entry| {
+                let text = entry.text().to_string();
+                // A path that does not exist used to be accepted, saved, and then
+                // silently swapped for $HOME at spawn time with only a log line —
+                // the user saw a tab in the wrong place and no explanation. Say so
+                // here instead, and refuse to persist it.
+                if !directory_is_usable(&text) {
+                    entry.add_css_class("error");
+                    starting_directory_row.set_subtitle("That directory does not exist");
+                    return;
+                }
+                entry.remove_css_class("error");
+                starting_directory_row.set_subtitle("");
+
+                let imp = obj.imp();
+                if imp.config.borrow().starting_directory == text {
+                    return;
+                }
+                imp.config.borrow_mut().starting_directory = text;
+                imp.schedule_config_save();
+            }
+        ));
+
+        dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
+
+    /// Re-resolves the CLI binary for `client`, then replaces the active tab.
+    ///
+    /// Detection can shell out, so it takes the same off-thread path as startup
+    /// rather than freezing the window while the settings dialog is open.
+    fn restart_with_client(&self, client: crate::config::CliClient) {
+        let obj = self.obj();
+        let (path, home, shell) = env_triplet();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let detected = resolve_cli_binary(client, path, home, shell).await;
+                let imp = obj.imp();
+                *imp.detected_binary.borrow_mut() = detected;
+                imp.restart_current_tab();
+            }
+        ));
+    }
+}
+
+/// Whether a configured starting directory can actually be used.
+///
+/// Blank is valid and means "$HOME"; `~` is expanded the same way
+/// [`resolve_working_directory`] expands it, so the dialog accepts exactly what
+/// the spawn path will accept.
+fn directory_is_usable(dir: &str) -> bool {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let expanded = if let Some(rest) = trimmed.strip_prefix('~') {
+        format!("{home}{rest}")
+    } else {
+        trimmed.to_string()
+    };
+    std::path::Path::new(&expanded).is_dir()
 }
 
 #[cfg(test)]

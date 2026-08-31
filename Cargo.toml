@@ -13,12 +13,19 @@ default = ["homelab-drift"]
 homelab-drift = []
 
 [dependencies]
-gtk4 = "0.8"
-vte4 = "0.7"
-glib = "0.19"
-gio = "0.19"
-gdk4 = "0.8"
-adw = { package = "libadwaita", version = "0.6" }
+# glib, gio and gdk4 are deliberately NOT direct dependencies: every use in this
+# crate goes through the gtk4 re-exports (gtk4::glib, gtk4::gio, gtk4::gdk), so
+# naming them here only creates a second place for versions to drift out of step
+# with whatever gtk4 itself pulls in.
+#
+# Version features are opt-in — the crates' baseline is GTK 4.0 / libadwaita 1.0 —
+# so these two lines are what actually set the minimum system libraries:
+#   v4_10 → GTK 4.10, for gtk4::FileDialog
+#   v1_5  → libadwaita 1.5, for adw::AlertDialog and adw::PreferencesDialog
+# Both are satisfied by Ubuntu 24.04 and newer.
+gtk4 = { version = "0.11", features = ["v4_10"] }
+vte4 = "0.10"
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = "0.3"

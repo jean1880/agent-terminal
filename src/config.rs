@@ -25,6 +25,18 @@ impl std::fmt::Display for CliClient {
     }
 }
 
+impl CliClient {
+    /// All choices in display order; the index matches the settings dropdown.
+    /// Built from this rather than a hand-written index match in both directions,
+    /// which is what let the dropdown and the enum drift apart.
+    pub const ALL: [CliClient; 4] = [
+        CliClient::Auto,
+        CliClient::Gemini,
+        CliClient::Agy,
+        CliClient::Claude,
+    ];
+}
+
 /// The terminal color scheme.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -234,6 +246,33 @@ mod tests {
             TerminalConfig::load_from(&path).cli_client,
             CliClient::default()
         );
+    }
+
+    #[test]
+    fn all_lists_every_client_in_dropdown_order() {
+        // Same hazard as ThemeChoice::ALL: the client dropdown is built from this
+        // array and read back by index, so a variant missing from it mis-maps the
+        // picker. Exhaustive on purpose — a new variant must not compile until ALL
+        // is updated.
+        fn expected_index(client: CliClient) -> usize {
+            match client {
+                CliClient::Auto => 0,
+                CliClient::Gemini => 1,
+                CliClient::Agy => 2,
+                CliClient::Claude => 3,
+            }
+        }
+
+        assert_eq!(CliClient::ALL.len(), 4);
+        for client in CliClient::ALL {
+            let index = expected_index(client);
+            assert_eq!(CliClient::ALL[index], client);
+            assert_eq!(
+                CliClient::ALL.iter().position(|c| *c == client),
+                Some(index),
+                "{client} is not at its expected position in ALL"
+            );
+        }
     }
 
     #[test]

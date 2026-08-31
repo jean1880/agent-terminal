@@ -34,9 +34,13 @@ fn main() -> glib::ExitCode {
 
         // Add "New Window" action
         let new_window_action = gtk4::gio::SimpleAction::new("new-window", None);
-        new_window_action.connect_activate(glib::clone!(@weak app => move |_, _| {
-            app.activate();
-        }));
+        new_window_action.connect_activate(glib::clone!(
+            #[weak]
+            app,
+            move |_, _| {
+                app.activate();
+            }
+        ));
         app.add_action(&new_window_action);
 
         // Bind Ctrl+Shift+T to the per-window "new tab" action. Using an app
