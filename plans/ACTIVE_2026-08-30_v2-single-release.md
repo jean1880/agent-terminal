@@ -11,10 +11,26 @@
 | WP2 non-UI correctness | ✅ **done** 2026-08-31 | Off-thread + cached detection, atomic/debounced saves, dead settings row removed, `ThemeChoice::ALL` guarded. |
 | WP3 dep bump | ✅ **done** 2026-08-31 | gtk4 0.11 / libadwaita 0.9 / vte4 0.10, zero deprecations. Forced the settings apply-on-change rewrite. |
 | WP4 UI correctness | ✅ **done** 2026-08-31 | Crash bar; `restart_tab` given real entry points; exit statuses decoded. |
-| WP5 rename | ⬜ next | Name decided: **`agent-terminal`**. |
-| WP6 profiles | ⬜ | |
-| WP7 differentiators | ⬜ | |
-| WP8 indicators | ⬜ | |
+| WP5 rename | ✅ **done** 2026-08-31 | `agent-terminal`. Config migration + transitional apt package, verified in a container. |
+| WP6 profiles | ✅ **done** 2026-08-31 | `CliClient` gone; detection tests now hermetic; `env_file` restores the startup-script idea safely. |
+| WP7 differentiators | ✅ **done** 2026-08-31 | Attention, search, shortcut rework, session restore, font/cursor. |
+| WP8 indicators | ✅ **done** 2026-08-31 | Three-state indicators; `homelab-drift` feature and CI's second clippy job deleted. |
+
+**All work packages merged to `release/v2.0.0`.** 49 tests, fmt and clippy green.
+Not pushed, not tagged, not merged to `master` — see the deployment ordering below.
+
+### Bugs the verification runs found (that review would not have)
+
+- **`env_file` returned the entire environment.** `env` dumps everything the
+  subshell inherited, so the first working version appended ~100 redundant
+  entries to every session and named every variable — `NEO4J_PASSWORD`,
+  `ANSIBLE_VAULT_PASSWORD`, `GITHUB_TOKEN` — in the debug log. Now diffed against
+  the parent environment so only genuine additions and overrides come through.
+- **Exit statuses were raw `waitpid` values.** VTE's `child-exited` reports 256
+  for `exit 1`, so the crash bar would have shown the user "status 256".
+- **`~` was never expanded** in `env_file` or indicator paths — `read_to_string`
+  takes it literally, and a path handed to a shell in quotes is not expanded
+  either. Found by writing the README example.
 
 ### ⚠ How to actually test a local build (learned the hard way, 2026-08-31)
 
