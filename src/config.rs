@@ -162,6 +162,45 @@ pub struct TerminalConfig {
     /// Which profile to launch. `None` means "use the first one whose command is
     /// actually installed", the behaviour the old `CliClient::Auto` had.
     pub default_profile: Option<String>,
+    /// Pango font description for the terminal. Was a hard-coded constant while
+    /// the *scale* was configurable, which is an odd place to draw the line.
+    pub font: String,
+    pub cursor_shape: CursorShapeChoice,
+    pub cursor_blink: bool,
+    /// Send a desktop notification when a background tab rings the bell — which
+    /// is how a CLI announces it has finished and wants attention.
+    pub notify_on_bell: bool,
+    /// Reopen the previous window's tabs on launch.
+    pub restore_session: bool,
+}
+
+/// The terminal cursor shape.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorShapeChoice {
+    #[default]
+    Block,
+    Ibeam,
+    Underline,
+}
+
+impl std::fmt::Display for CursorShapeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CursorShapeChoice::Block => "Block",
+            CursorShapeChoice::Ibeam => "I-beam",
+            CursorShapeChoice::Underline => "Underline",
+        })
+    }
+}
+
+impl CursorShapeChoice {
+    /// All choices in display order; the index matches the settings dropdown.
+    pub const ALL: [CursorShapeChoice; 3] = [
+        CursorShapeChoice::Block,
+        CursorShapeChoice::Ibeam,
+        CursorShapeChoice::Underline,
+    ];
 }
 
 impl Default for TerminalConfig {
@@ -175,6 +214,85 @@ impl Default for TerminalConfig {
             theme: ThemeChoice::default(),
             profiles: default_profiles(),
             default_profile: None,
+            font: "JetBrains Mono, Fira Code, Monospace 11".to_string(),
+            cursor_shape: CursorShapeChoice::default(),
+            cursor_blink: true,
+            notify_on_bell: false,
+            restore_session: true,
+        }
+    }
+}
+
+/// One restored tab: which profile it ran and where.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionTab {
+    /// `None` means the tab ran whatever auto-detection resolved.
+    #[serde(default)]
+    pub profile: Option<String>,
+    pub dir: String,
+}
+
+/// The tabs that were open when the window last closed.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct SessionState {
+    pub tabs: Vec<SessionTab>,
+    pub selected: usize,
+}
+
+impl SessionState {
+    /// Ceiling on restored tabs. A corrupt or hand-edited session file must not
+    /// be able to spawn an unbounded number of PTYs at launch.
+    pub const MAX_TABS: usize = 20;
+
+    fn path() -> PathBuf {
+        TerminalConfig::config_dir().join("session.json")
+    }
+
+    pub fn load() -> Self {
+        Self::load_from(&Self::path())
+    }
+
+    /// Reads the session file. Anything unreadable or unparseable yields an empty
+    /// session — starting fresh is always safe, so a bad file must never be fatal.
+    fn load_from(path: &Path) -> Self {
+        let Ok(content) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<Self>(&content) {
+            Ok(mut state) => {
+                if state.tabs.len() > Self::MAX_TABS {
+                    warn!(
+                        "Session file lists {} tabs; restoring the first {}",
+                        state.tabs.len(),
+                        Self::MAX_TABS
+                    );
+                    state.tabs.truncate(Self::MAX_TABS);
+                }
+                if state.selected >= state.tabs.len() {
+                    state.selected = 0;
+                }
+                state
+            }
+            Err(e) => {
+                warn!("Ignoring unreadable session file: {e}");
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) {
+        self.save_to(&Self::path());
+    }
+
+    fn save_to(&self, path: &Path) {
+        match serde_json::to_string_pretty(self) {
+            Ok(content) => {
+                if let Err(e) = TerminalConfig::write_all_synced(path, content.as_bytes()) {
+                    warn!("Failed to write session to {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => warn!("Failed to serialize session: {e}"),
         }
     }
 }
@@ -358,6 +476,7 @@ mod tests {
             theme: ThemeChoice::Dracula,
             profiles: default_profiles(),
             default_profile: Some("Claude".to_string()),
+            ..Default::default()
         };
         cfg.save_to(&path);
 
@@ -509,6 +628,73 @@ mod tests {
             TerminalConfig::default().scrollback_lines
         );
         assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+    }
+
+    #[test]
+    fn session_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            tabs: vec![
+                SessionTab {
+                    profile: Some("Claude".to_string()),
+                    dir: "/tmp/a".to_string(),
+                },
+                SessionTab {
+                    profile: None,
+                    dir: "/tmp/b".to_string(),
+                },
+            ],
+            selected: 1,
+        };
+        state.save_to(&path);
+
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.tabs, state.tabs);
+        assert_eq!(loaded.selected, 1);
+    }
+
+    #[test]
+    fn a_corrupt_session_file_starts_fresh_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"{ this is not json")
+            .unwrap();
+        assert!(SessionState::load_from(&path).tabs.is_empty());
+    }
+
+    #[test]
+    fn a_session_file_cannot_spawn_unbounded_tabs() {
+        // A hand-edited or corrupt file must not be able to open hundreds of PTYs
+        // at launch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            tabs: (0..500)
+                .map(|i| SessionTab {
+                    profile: None,
+                    dir: format!("/tmp/{i}"),
+                })
+                .collect(),
+            selected: 400,
+        };
+        state.save_to(&path);
+
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.tabs.len(), SessionState::MAX_TABS);
+        // The recorded selection pointed past the truncation, so it must be
+        // brought back in range rather than left dangling.
+        assert!(loaded.selected < loaded.tabs.len());
+    }
+
+    #[test]
+    fn a_missing_session_file_is_an_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(SessionState::load_from(&dir.path().join("none.json"))
+            .tabs
+            .is_empty());
     }
 
     #[test]

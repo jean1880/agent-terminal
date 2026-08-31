@@ -34,6 +34,14 @@ struct TabState {
     /// When the session was spawned, used to tell a failure to launch apart from
     /// a crash part-way through a session.
     spawned_at: std::time::Instant,
+    /// Per-tab, because VTE holds the search regex and match position on the
+    /// terminal itself — a single window-level bar would leak one tab's search
+    /// state into another.
+    search_bar: gtk4::SearchBar,
+    search_entry: gtk4::SearchEntry,
+    /// Which profile this tab is running, so a restart reuses it and the session
+    /// file can record it.
+    profile: Option<String>,
 }
 
 /// Renders VTE's `child-exited` status as something a person can act on.
@@ -155,6 +163,158 @@ fn build_loading_box() -> Box {
     loading_box.append(&loading_label);
     loading_box.append(&loading_sub);
     loading_box
+}
+
+/// Applies the font and cursor settings to a terminal.
+///
+/// Split out so a settings change can re-apply to every open tab without
+/// rebuilding the rest of the terminal's configuration.
+fn apply_appearance(terminal: &Terminal, config: &crate::config::TerminalConfig) {
+    let font_desc = gtk4::pango::FontDescription::from_string(&config.font);
+    terminal.set_font(Some(&font_desc));
+
+    terminal.set_cursor_shape(match config.cursor_shape {
+        crate::config::CursorShapeChoice::Block => CursorShape::Block,
+        crate::config::CursorShapeChoice::Ibeam => CursorShape::Ibeam,
+        crate::config::CursorShapeChoice::Underline => CursorShape::Underline,
+    });
+    terminal.set_cursor_blink_mode(if config.cursor_blink {
+        CursorBlinkMode::On
+    } else {
+        CursorBlinkMode::Off
+    });
+}
+
+/// PCRE2 flags. VTE requires MULTILINE on search regexes; UTF makes the search
+/// character- rather than byte-oriented.
+const PCRE2_CASELESS: u32 = 0x0000_0008;
+const PCRE2_MULTILINE: u32 = 0x0000_0400;
+const PCRE2_UTF: u32 = 0x0008_0000;
+
+/// Escapes PCRE2 metacharacters so a plain-text search means what it says.
+fn escape_for_search(text: &str) -> String {
+    const META: [char; 17] = [
+        '\\', '^', '$', '.', '[', ']', '|', '(', ')', '?', '*', '+', '{', '}', '-', '#', '/',
+    ];
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if META.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Builds the search bar shown above a tab's terminal.
+///
+/// 10,000 lines of default scrollback had no way to search it — the most
+/// conspicuous gap against every other terminal, and worse here because an agent
+/// session generates far more output than a person typing commands.
+fn build_search_bar(terminal: &Terminal) -> (gtk4::SearchBar, gtk4::SearchEntry) {
+    let entry = gtk4::SearchEntry::builder()
+        .placeholder_text("Search scrollback")
+        .hexpand(true)
+        .build();
+
+    let previous = Button::builder()
+        .icon_name("go-up-symbolic")
+        .tooltip_text("Previous match (Shift+Enter)")
+        .build();
+    let next = Button::builder()
+        .icon_name("go-down-symbolic")
+        .tooltip_text("Next match (Enter)")
+        .build();
+
+    let case_sensitive = gtk4::ToggleButton::builder()
+        .icon_name("format-text-italic-symbolic")
+        .tooltip_text("Match case")
+        .build();
+    let use_regex = gtk4::ToggleButton::builder()
+        .icon_name("system-search-symbolic")
+        .tooltip_text("Regular expression")
+        .build();
+
+    let row = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    row.append(&entry);
+    row.append(&previous);
+    row.append(&next);
+    row.append(&case_sensitive);
+    row.append(&use_regex);
+
+    let bar = gtk4::SearchBar::builder()
+        .child(&row)
+        .show_close_button(true)
+        .build();
+    bar.connect_entry(&entry);
+
+    // Recompiling on every change keeps the highlight in step with the query.
+    let update = {
+        let terminal = terminal.clone();
+        let entry = entry.clone();
+        let case_sensitive = case_sensitive.clone();
+        let use_regex = use_regex.clone();
+        move || {
+            let text = entry.text().to_string();
+            if text.is_empty() {
+                terminal.search_set_regex(None, 0);
+                return;
+            }
+            let pattern = if use_regex.is_active() {
+                text
+            } else {
+                escape_for_search(&text)
+            };
+            let mut flags = PCRE2_MULTILINE | PCRE2_UTF;
+            if !case_sensitive.is_active() {
+                flags |= PCRE2_CASELESS;
+            }
+            match vte4::Regex::for_search(&pattern, flags) {
+                Ok(regex) => terminal.search_set_regex(Some(&regex), 0),
+                // An in-progress regex is invalid more often than not, so this is
+                // an expected state rather than an error worth shouting about.
+                Err(err) => debug!("Search pattern not usable yet: {err}"),
+            }
+        }
+    };
+
+    entry.connect_search_changed({
+        let update = update.clone();
+        move |_| update()
+    });
+    for toggle in [&case_sensitive, &use_regex] {
+        toggle.connect_toggled({
+            let update = update.clone();
+            move |_| update()
+        });
+    }
+
+    entry.connect_activate(glib::clone!(
+        #[weak]
+        terminal,
+        move |_| {
+            terminal.search_find_next();
+        }
+    ));
+    next.connect_clicked(glib::clone!(
+        #[weak]
+        terminal,
+        move |_| {
+            terminal.search_find_next();
+        }
+    ));
+    previous.connect_clicked(glib::clone!(
+        #[weak]
+        terminal,
+        move |_| {
+            terminal.search_find_previous();
+        }
+    ));
+
+    (bar, entry)
 }
 
 /// The first entry of the profile dropdown: "resolve automatically".
@@ -285,6 +445,10 @@ impl WindowImpl for AgentTerminalWindow {
     /// Flushes any debounced config save before the window goes away, so a quick
     /// zoom-then-quit does not lose the change it was still waiting to write.
     fn close_request(&self) -> glib::Propagation {
+        // Both before the window goes: a quick zoom-then-quit must not lose the
+        // change still waiting on the debounce timer, and the tab layout is only
+        // knowable while the tabs still exist.
+        self.save_session();
         self.flush_pending_save();
         self.parent_close_request()
     }
@@ -363,6 +527,109 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&new_tab_action);
+
+        // Zoom, search and tab navigation as window actions rather than key
+        // handlers on the terminal widget. Anything bound to the terminal is
+        // inert the moment focus moves elsewhere — the settings dialog, the
+        // search entry — which is why copy, paste and zoom used to stop working
+        // in exactly the situations where you would reach for them.
+        for (name, delta) in [("zoom-in", 0.1_f64), ("zoom-out", -0.1)] {
+            let action = gtk4::gio::SimpleAction::new(name, None);
+            action.connect_activate(glib::clone!(
+                #[weak]
+                obj,
+                move |_, _| {
+                    let imp = obj.imp();
+                    let current = imp.config.borrow().font_scale;
+                    // Floor rather than clamp to zero: a scale of 0 renders an
+                    // invisible terminal with no obvious way back.
+                    imp.set_font_scale((current + delta).clamp(0.5, 3.0));
+                }
+            ));
+            obj.add_action(&action);
+        }
+
+        let zoom_reset = gtk4::gio::SimpleAction::new("zoom-reset", None);
+        zoom_reset.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| obj.imp().set_font_scale(1.0)
+        ));
+        obj.add_action(&zoom_reset);
+
+        let search_action = gtk4::gio::SimpleAction::new("search", None);
+        search_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| obj.imp().toggle_search()
+        ));
+        obj.add_action(&search_action);
+
+        let close_tab = gtk4::gio::SimpleAction::new("close-tab", None);
+        close_tab.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                let imp = obj.imp();
+                let view = imp.tab_view.borrow().clone();
+                if let Some(view) = view {
+                    if let Some(page) = view.selected_page() {
+                        view.close_page(&page);
+                    }
+                }
+            }
+        ));
+        obj.add_action(&close_tab);
+
+        for (name, forward) in [("next-tab", true), ("previous-tab", false)] {
+            let action = gtk4::gio::SimpleAction::new(name, None);
+            action.connect_activate(glib::clone!(
+                #[weak]
+                obj,
+                move |_, _| {
+                    if let Some(view) = obj.imp().tab_view.borrow().as_ref() {
+                        // select_next_page stops at the end; wrap explicitly so
+                        // cycling works the way it does in every other terminal.
+                        let moved = if forward {
+                            view.select_next_page()
+                        } else {
+                            view.select_previous_page()
+                        };
+                        if !moved && view.n_pages() > 0 {
+                            let wrap = if forward { 0 } else { view.n_pages() - 1 };
+                            view.set_selected_page(&view.nth_page(wrap));
+                        }
+                    }
+                }
+            ));
+            obj.add_action(&action);
+        }
+
+        // Alt+1..9 jump straight to a tab. Parameterised so one action covers all
+        // nine rather than nine near-identical ones.
+        let select_tab =
+            gtk4::gio::SimpleAction::new("select-tab", Some(&i32::static_variant_type()));
+        select_tab.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let Some(index) = target.and_then(|t| t.get::<i32>()) else {
+                    return;
+                };
+                if let Some(view) = obj.imp().tab_view.borrow().as_ref() {
+                    if view.n_pages() == 0 {
+                        return;
+                    }
+                    // -1 means "the last tab", which is what Alt+9 conventionally
+                    // does regardless of how many tabs are actually open.
+                    let target = if index < 0 { view.n_pages() - 1 } else { index };
+                    if target < view.n_pages() {
+                        view.set_selected_page(&view.nth_page(target));
+                    }
+                }
+            }
+        ));
+        obj.add_action(&select_tab);
 
         // New Tab As <profile>. Parameterised by profile name rather than index,
         // so it stays correct if the profile list changes underneath the menu.
@@ -695,6 +962,10 @@ impl AgentTerminalWindow {
             obj,
             move |view| {
                 let imp = obj.imp();
+                // Looking at a tab is the acknowledgement, so clear its marker.
+                if let Some(page) = view.selected_page() {
+                    page.set_needs_attention(false);
+                }
                 let session_info = view
                     .selected_page()
                     .map(|p| p.title().to_string())
@@ -710,7 +981,9 @@ impl AgentTerminalWindow {
             }
         ));
 
-        self.add_terminal_tab(profile, None);
+        if !self.restore_previous_session(profile) {
+            self.add_terminal_tab(profile, None);
+        }
     }
 
     /// Opens a new tab rooted in the current tab's directory (fast path).
@@ -809,8 +1082,10 @@ impl AgentTerminalWindow {
         // The page holds an (initially hidden) exit bar above the stack, so a
         // dead session can report itself without the tab being torn down.
         let (exit_bar, exit_label, restart_btn, close_btn) = build_exit_bar();
+        let (search_bar, search_entry) = build_search_bar(&terminal);
         let tab_content = Box::builder().orientation(Orientation::Vertical).build();
         tab_content.append(&exit_bar);
+        tab_content.append(&search_bar);
         tab_content.append(&stack);
 
         // Add the page and focus it.
@@ -865,6 +1140,9 @@ impl AgentTerminalWindow {
             exit_bar,
             exit_label,
             spawned_at: std::time::Instant::now(),
+            search_bar,
+            search_entry,
+            profile: profile.map(|p| p.name.clone()),
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir);
@@ -872,19 +1150,16 @@ impl AgentTerminalWindow {
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
     fn configure_terminal(&self, terminal: &Terminal) {
-        Theme::apply(terminal, self.config.borrow().theme);
-
-        // High-quality developer monospace font
-        let font_desc =
-            gtk4::pango::FontDescription::from_string("JetBrains Mono, Fira Code, Monospace 11");
-        terminal.set_font(Some(&font_desc));
-
-        terminal.set_cursor_blink_mode(CursorBlinkMode::On);
-        terminal.set_cursor_shape(CursorShape::Block);
-
         let config = self.config.borrow();
+        Theme::apply(terminal, config.theme);
+        apply_appearance(terminal, &config);
+
         terminal.set_scrollback_lines(i64::from(config.scrollback_lines));
         terminal.set_font_scale(config.font_scale);
+
+        // Wrap around so the last match leads back to the first rather than
+        // silently doing nothing.
+        terminal.search_set_wrap_around(true);
 
         terminal.set_enable_sixel(true);
         terminal.set_allow_hyperlink(true);
@@ -936,6 +1211,33 @@ impl AgentTerminalWindow {
             }
         ));
 
+        // A CLI rings the bell when it wants attention — typically when a long
+        // turn has finished. If that tab is not the one being looked at, mark it
+        // so, which is the whole reason to use this over a general terminal.
+        terminal.connect_bell(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            page,
+            move |_| {
+                let imp = obj.imp();
+                let is_selected = imp
+                    .tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|view| view.selected_page())
+                    .as_ref()
+                    == Some(&page);
+                if is_selected {
+                    return;
+                }
+
+                debug!("Bell in a background tab; marking it as needing attention");
+                page.set_needs_attention(true);
+                imp.notify_bell(&page);
+            }
+        ));
+
         // A clean exit closes the tab, as before — that is someone typing `exit`
         // or Ctrl-D and expecting the tab to go away. A non-zero exit does NOT:
         // it used to close the tab and, if it was the last one, the whole window,
@@ -958,6 +1260,125 @@ impl AgentTerminalWindow {
                 }
             }
         ));
+    }
+
+    /// Reopens the tabs from the previous window, if there are any.
+    ///
+    /// Returns whether anything was restored, so the caller can fall back to
+    /// opening a single default tab. `fallback` covers a recorded profile that no
+    /// longer resolves — a tab in the right directory is more useful than no tab.
+    fn restore_previous_session(&self, fallback: Option<&Profile>) -> bool {
+        if !self.config.borrow().restore_session {
+            return false;
+        }
+
+        let state = crate::config::SessionState::load();
+        if state.tabs.is_empty() {
+            return false;
+        }
+
+        info!(
+            "Restoring {} tab(s) from the previous session",
+            state.tabs.len()
+        );
+        let profiles = self.config.borrow().profiles.clone();
+        for tab in &state.tabs {
+            let profile = tab
+                .profile
+                .as_ref()
+                .and_then(|name| profiles.iter().find(|p| &p.name == name))
+                .or(fallback);
+            self.add_terminal_tab(profile, Some(&tab.dir));
+        }
+
+        if let Some(view) = self.tab_view.borrow().as_ref() {
+            if state.selected < view.n_pages() as usize {
+                view.set_selected_page(&view.nth_page(state.selected as i32));
+            }
+        }
+        true
+    }
+
+    /// Records the open tabs so the next launch can reopen them.
+    fn save_session(&self) {
+        if !self.config.borrow().restore_session {
+            return;
+        }
+
+        let selected = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|view| view.selected_page())
+            .and_then(|page| self.tabs.borrow().iter().position(|t| t.page == page))
+            .unwrap_or(0);
+
+        let tabs: Vec<crate::config::SessionTab> = self
+            .tabs
+            .borrow()
+            .iter()
+            .take(crate::config::SessionState::MAX_TABS)
+            .map(|t| crate::config::SessionTab {
+                profile: t.profile.clone(),
+                dir: t.dir.clone(),
+            })
+            .collect();
+
+        debug!("Saving {} tab(s) to the session file", tabs.len());
+        crate::config::SessionState { tabs, selected }.save();
+    }
+
+    /// Optionally raises a desktop notification for a background tab's bell.
+    ///
+    /// Off by default: a notification per bell is intrusive if the CLI uses it
+    /// for anything other than "I am finished". The in-window attention marker
+    /// always applies and costs nothing.
+    fn notify_bell(&self, page: &adw::TabPage) {
+        if !self.config.borrow().notify_on_bell {
+            return;
+        }
+        let Some(app) = self.obj().application() else {
+            return;
+        };
+
+        let title = page.title();
+        let notification = gtk4::gio::Notification::new("Session needs attention");
+        notification.set_body(Some(&format!("{title} is waiting")));
+        notification.set_priority(gtk4::gio::NotificationPriority::Normal);
+        // One id, so repeated bells replace rather than stack up.
+        app.send_notification(Some("agent-terminal-bell"), &notification);
+    }
+
+    /// Re-applies font and cursor settings to every open tab.
+    fn apply_appearance_to_all(&self) {
+        let config = self.config.borrow();
+        self.for_each_terminal(|term| apply_appearance(term, &config));
+    }
+
+    /// Reveals the current tab's search bar and puts the cursor in it.
+    fn toggle_search(&self) {
+        let Some(page) = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|view| view.selected_page())
+        else {
+            return;
+        };
+        let tabs = self.tabs.borrow();
+        let Some(tab) = tabs.iter().find(|t| t.page == page) else {
+            return;
+        };
+
+        let revealing = !tab.search_bar.is_search_mode();
+        tab.search_bar.set_search_mode(revealing);
+        if revealing {
+            tab.search_entry.grab_focus();
+        } else {
+            // Drop the highlight so a dismissed search leaves no residue.
+            tab.terminal.search_set_regex(None, 0);
+            tab.terminal.grab_focus();
+        }
     }
 
     /// Keeps a failed tab open and explains why, leaving the scrollback readable.
@@ -1010,10 +1431,8 @@ impl AgentTerminalWindow {
         tab_view.close_page(page);
     }
 
-    /// Attaches the right-click menu, ctrl-click hyperlink, and key shortcuts.
+    /// Attaches the right-click menu and the ctrl-click hyperlink handler.
     fn wire_input_controllers(&self, terminal: &Terminal) {
-        let obj = self.obj();
-
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Tab"), Some("win.new-tab"));
@@ -1079,48 +1498,11 @@ impl AgentTerminalWindow {
         ));
         terminal.add_controller(link_click_gesture);
 
-        // Keyboard Shortcuts (Copy/Paste/Zoom)
-        let key_controller = gtk4::EventControllerKey::new();
-        key_controller.connect_key_pressed(glib::clone!(
-            #[weak]
-            terminal,
-            #[weak]
-            obj,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_ctrl, key, _code, state| {
-                let is_ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-                let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-
-                match key {
-                    gtk4::gdk::Key::C | gtk4::gdk::Key::c if is_ctrl && is_shift => {
-                        debug!("Hotkey: Copy");
-                        terminal.copy_clipboard_format(Format::Text);
-                        glib::Propagation::Stop
-                    }
-                    gtk4::gdk::Key::V | gtk4::gdk::Key::v if is_ctrl && is_shift => {
-                        debug!("Hotkey: Paste");
-                        terminal.paste_clipboard();
-                        glib::Propagation::Stop
-                    }
-                    gtk4::gdk::Key::plus | gtk4::gdk::Key::equal if is_ctrl => {
-                        obj.imp().set_font_scale(terminal.font_scale() + 0.1);
-                        glib::Propagation::Stop
-                    }
-                    gtk4::gdk::Key::minus if is_ctrl => {
-                        obj.imp()
-                            .set_font_scale((terminal.font_scale() - 0.1).max(0.1));
-                        glib::Propagation::Stop
-                    }
-                    k if k.to_unicode() == Some('0') && is_ctrl => {
-                        obj.imp().set_font_scale(1.0);
-                        glib::Propagation::Stop
-                    }
-                    _ => glib::Propagation::Proceed,
-                }
-            }
-        ));
-        terminal.add_controller(key_controller);
+        // Copy, paste and zoom used to live here, on a controller attached to the
+        // terminal, which meant they went dead whenever focus was anywhere else
+        // and were duplicated once per tab. They are application accelerators
+        // bound to window actions now (see main.rs), leaving nothing that has to
+        // be handled widget-locally.
     }
 
     /// Sets the font scale on all tabs and queues a save.
@@ -1445,13 +1827,119 @@ impl AgentTerminalWindow {
             .selected(theme_index)
             .build();
 
+        // Font family and size were a hard-coded constant while the *scale* was a
+        // setting, which is an odd place to have drawn the line.
+        let font_button = gtk4::FontDialogButton::new(Some(gtk4::FontDialog::new()));
+        font_button.set_font_desc(&gtk4::pango::FontDescription::from_string(&config.font));
+        font_button.set_valign(gtk4::Align::Center);
+        let font_row = adw::ActionRow::builder().title("Terminal Font").build();
+        font_row.add_suffix(&font_button);
+
+        let cursor_names: Vec<String> = crate::config::CursorShapeChoice::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cursor_name_refs: Vec<&str> = cursor_names.iter().map(String::as_str).collect();
+        let cursor_row = adw::ComboRow::builder()
+            .title("Cursor Shape")
+            .model(&gtk4::StringList::new(&cursor_name_refs))
+            .selected(
+                crate::config::CursorShapeChoice::ALL
+                    .iter()
+                    .position(|c| *c == config.cursor_shape)
+                    .unwrap_or(0) as u32,
+            )
+            .build();
+
+        let blink_row = adw::SwitchRow::builder()
+            .title("Blinking Cursor")
+            .active(config.cursor_blink)
+            .build();
+
+        let notify_row = adw::SwitchRow::builder()
+            .title("Notify on Session Bell")
+            .subtitle("Raise a desktop notification when a background tab needs attention")
+            .active(config.notify_on_bell)
+            .build();
+
+        let restore_row = adw::SwitchRow::builder()
+            .title("Restore Tabs on Launch")
+            .subtitle("Reopen the tabs that were open when the window last closed")
+            .active(config.restore_session)
+            .build();
+
         group.add(&starting_directory_row);
         group.add(&scrollback_row);
+        group.add(&font_row);
         group.add(&font_scale_row);
+        group.add(&cursor_row);
+        group.add(&blink_row);
         group.add(&cli_client_row);
         group.add(&theme_row);
+        group.add(&notify_row);
+        group.add(&restore_row);
         page.add(&group);
         dialog.add(&page);
+
+        font_button.connect_font_desc_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |button| {
+                let Some(desc) = button.font_desc() else {
+                    return;
+                };
+                let imp = obj.imp();
+                imp.config.borrow_mut().font = desc.to_str().to_string();
+                imp.apply_appearance_to_all();
+                imp.schedule_config_save();
+            }
+        ));
+
+        cursor_row.connect_selected_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let shape = crate::config::CursorShapeChoice::ALL
+                    .get(row.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                let imp = obj.imp();
+                imp.config.borrow_mut().cursor_shape = shape;
+                imp.apply_appearance_to_all();
+                imp.schedule_config_save();
+            }
+        ));
+
+        blink_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().cursor_blink = row.is_active();
+                imp.apply_appearance_to_all();
+                imp.schedule_config_save();
+            }
+        ));
+
+        notify_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().notify_on_bell = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
+
+        restore_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().restore_session = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
 
         // Settings apply as they change rather than in one batch when the dialog
         // closes. AdwPreferencesDialog has no close-request signal to hang a batch
