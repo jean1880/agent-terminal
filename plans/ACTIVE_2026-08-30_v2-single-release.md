@@ -7,14 +7,34 @@
 
 | WP | Status | Notes |
 |---|---|---|
-| WP1 packaging + hygiene | ✅ **done** 2026-08-31 | Merged to `release/v2.0.0`. Verified in a clean `ubuntu:26.04` container. See "WP1 outcome" below. |
-| WP2 non-UI correctness | ⬜ next | |
-| WP3 dep bump | ⬜ | |
-| WP4 UI correctness | ⬜ | |
-| WP5 rename | ⬜ | Blocked on the `$NEW` name decision |
+| WP1 packaging + hygiene | ✅ **done** 2026-08-31 | Verified in a clean `ubuntu:26.04` container. See "WP1 outcome" below. |
+| WP2 non-UI correctness | ✅ **done** 2026-08-31 | Off-thread + cached detection, atomic/debounced saves, dead settings row removed, `ThemeChoice::ALL` guarded. |
+| WP3 dep bump | ✅ **done** 2026-08-31 | gtk4 0.11 / libadwaita 0.9 / vte4 0.10, zero deprecations. Forced the settings apply-on-change rewrite. |
+| WP4 UI correctness | ✅ **done** 2026-08-31 | Crash bar; `restart_tab` given real entry points; exit statuses decoded. |
+| WP5 rename | ⬜ next | Name decided: **`agent-terminal`**. |
 | WP6 profiles | ⬜ | |
 | WP7 differentiators | ⬜ | |
 | WP8 indicators | ⬜ | |
+
+### ⚠ How to actually test a local build (learned the hard way, 2026-08-31)
+
+`adw::Application` uses GApplication single-instance semantics keyed on `APP_ID`.
+**Launching a local build while the apt-installed one is running does not run your build** —
+GApplication hands the activation to the existing primary instance over D-Bus, which creates
+the window in *its* process with *its* environment, and your binary exits 0 immediately.
+
+The journal then shows a plausible-looking successful startup that has nothing to do with your
+code. Two WP2/WP3 smoke tests were invalidated this way before the PIDs in `journalctl -o
+short-precise` gave it away (log lines attributed to a 14-hour-old `/usr/bin/antigravity-terminal`).
+
+Always run a local build under its own bus:
+
+```bash
+dbus-run-session -- ./target/debug/antigravity-terminal
+```
+
+Do **not** kill the running instance to work around this — it is the user's live session.
+Stub CLIs for exit-path testing live in the session scratchpad (`fakecli/`, `fakecli-clean/`).
 
 ### WP1 outcome — what the plan got wrong, and what it found
 
