@@ -3,9 +3,9 @@
 # Scratch diffs from refactors — never an artifact worth tracking.
 *.patch
 
-# Runtime logs (startup.log is a tracked fixture, keep it)
+# Runtime logs. startup.log was tracked by accident (a stale artifact from the
+# pre-rename "Gemini Terminal" era, not a fixture); logs are never artifacts.
 *.log
-!startup.log
 
 # OS / editor cruft and local env files
 .DS_Store

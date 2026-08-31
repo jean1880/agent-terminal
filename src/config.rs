@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CliClient {
     #[default]
@@ -23,6 +24,142 @@ impl std::fmt::Display for CliClient {
         }
     }
 }
+
+impl CliClient {
+    /// All choices in display order; the index matches the settings dropdown.
+    /// Built from this rather than a hand-written index match in both directions,
+    /// which is what let the dropdown and the enum drift apart.
+    pub const ALL: [CliClient; 4] = [
+        CliClient::Auto,
+        CliClient::Gemini,
+        CliClient::Agy,
+        CliClient::Claude,
+    ];
+}
+
+/// A launchable session: a name, the command to run, and where to run it.
+///
+/// This replaces the closed `CliClient` enum. Adding a fourth CLI used to mean
+/// editing the enum, its `Display`, four arms of the detection function and two
+/// hand-maintained index↔variant mappings in the settings dialog; it is now a
+/// `config.json` edit with no recompile.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// Shown in the settings dropdown and the new-tab menu. Also the key that
+    /// `default_profile` refers to, so it must be unique.
+    pub name: String,
+    /// The command to exec. Resolved against PATH, common install directories,
+    /// and the user's interactive shell.
+    pub command: String,
+    /// Extra arguments appended to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Where to root sessions for this profile. `None` falls back to the global
+    /// starting directory, which itself falls back to `$HOME`.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// A shell file sourced in a subshell whose exported environment is merged
+    /// into the session's. This is the only safe shape for the old
+    /// "startup script" idea: the file must contribute environment, never bytes
+    /// written to the TTY, because output before `exec` breaks the CLI's
+    /// terminal handshake.
+    #[serde(default)]
+    pub env_file: Option<String>,
+}
+
+impl Profile {
+    /// The full argv to exec, command first.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = Vec::with_capacity(1 + self.args.len());
+        argv.push(self.command.clone());
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
+}
+
+/// The profiles a fresh install starts with — the three clients the old
+/// `CliClient` enum hard-coded, in the same preference order.
+fn default_profiles() -> Vec<Profile> {
+    ["Claude", "Agy", "Gemini"]
+        .iter()
+        .map(|name| Profile {
+            name: (*name).to_string(),
+            command: name.to_lowercase(),
+            args: Vec::new(),
+            dir: None,
+            env_file: None,
+        })
+        .collect()
+}
+
+/// Where an indicator gets its state from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum IndicatorSource {
+    /// Non-empty file contents mean "warn"; the contents are the detail.
+    File { path: String },
+    /// A non-zero exit means "warn"; stdout is the detail.
+    Command {
+        argv: Vec<String>,
+        #[serde(default = "default_indicator_timeout")]
+        timeout_secs: u64,
+    },
+}
+
+fn default_indicator_timeout() -> u64 {
+    10
+}
+
+/// What clicking an indicator does.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndicatorAction {
+    /// Show the detail in a dialog.
+    #[default]
+    ShowOutput,
+    /// Show the detail, with an explicit button to type it into the session.
+    ///
+    /// Deliberately still a preview: this writes unreviewed content into a live
+    /// agent's stdin, which is tolerable for a source you hard-coded yourself and
+    /// not for one anybody can configure.
+    SendToTerminal,
+}
+
+/// A header-bar status light driven by a file or a command.
+///
+/// Replaces a single hard-coded Ansible-drift button that read a path which no
+/// longer existed — and, because a missing file read as "no drift", reported
+/// itself permanently green. Nothing here can do that: an unreadable source is
+/// its own state with its own icon.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Indicator {
+    pub label: String,
+    pub source: IndicatorSource,
+    /// How often to re-check. `None` checks once at startup.
+    #[serde(default)]
+    pub refresh_secs: Option<u64>,
+    #[serde(default = "default_icon_ok")]
+    pub icon_ok: String,
+    #[serde(default = "default_icon_warn")]
+    pub icon_warn: String,
+    #[serde(default = "default_icon_unknown")]
+    pub icon_unknown: String,
+    #[serde(default)]
+    pub action: IndicatorAction,
+}
+
+fn default_icon_ok() -> String {
+    "security-high-symbolic".to_string()
+}
+fn default_icon_warn() -> String {
+    "dialog-warning-symbolic".to_string()
+}
+fn default_icon_unknown() -> String {
+    "dialog-question-symbolic".to_string()
+}
+
+/// Ceiling on header indicators, so a config edit cannot fill the header bar.
+pub const MAX_INDICATORS: usize = 5;
 
 /// The terminal color scheme.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,37 +204,264 @@ impl ThemeChoice {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+/// Persisted settings.
+///
+/// `#[serde(default)]` is a container attribute here, so any field missing from
+/// the file falls back to that field's value in [`TerminalConfig::default`] — not
+/// to the field type's own default, which would silently turn an absent
+/// `scrollback_lines` into 0 rather than 10000. This is what lets settings be
+/// added and retired without invalidating existing config files.
 pub struct TerminalConfig {
+    /// Retained so existing config files keep round-tripping, but no longer
+    /// surfaced in Settings: nothing ever consumed it. Sourcing a script into the
+    /// TTY before `exec` breaks the CLI's terminal handshake, so when this returns
+    /// it will be as a per-profile environment file merged into the spawn
+    /// environment rather than fed to the terminal.
     pub startup_script: String,
     pub scrollback_lines: u32,
     pub font_scale: f64,
-    #[serde(default)]
+    /// Superseded by `profiles`/`default_profile` in 2.0. Still parsed so a 1.x
+    /// config keeps its chosen client across the upgrade; see [`Self::normalize`].
     pub cli_client: CliClient,
-    #[serde(default)]
     pub starting_directory: String,
-    #[serde(default)]
     pub theme: ThemeChoice,
+    /// The sessions offered in Settings and the new-tab menu.
+    pub profiles: Vec<Profile>,
+    /// Which profile to launch. `None` means "use the first one whose command is
+    /// actually installed", the behaviour the old `CliClient::Auto` had.
+    pub default_profile: Option<String>,
+    /// Pango font description for the terminal. Was a hard-coded constant while
+    /// the *scale* was configurable, which is an odd place to draw the line.
+    pub font: String,
+    pub cursor_shape: CursorShapeChoice,
+    pub cursor_blink: bool,
+    /// Send a desktop notification when a background tab rings the bell — which
+    /// is how a CLI announces it has finished and wants attention.
+    pub notify_on_bell: bool,
+    /// Reopen the previous window's tabs on launch.
+    pub restore_session: bool,
+    /// Header-bar status lights. Empty by default: this is an extension point,
+    /// not a feature every user wants.
+    pub indicators: Vec<Indicator>,
+    /// Environment variables removed from a spawned session's environment.
+    /// A trailing `*` matches by prefix. See [`default_clear_env`].
+    pub clear_env: Vec<String>,
+}
+
+/// Variables stripped from a session's inherited environment by default.
+///
+/// Sessions inherit the terminal's whole environment on purpose — that is how
+/// nvm- and asdf-managed CLIs stay reachable. But when the terminal is itself
+/// launched from inside an agent session, the *parent session's* identity comes
+/// along with it, and the CLI we spawn concludes it is a nested child of that
+/// session. The visible symptom is Claude Code disabling transcript saving with
+/// "inherited CLAUDE_CODE_CHILD_SESSION marker".
+///
+/// That is not an exotic case for this application: launching it from a terminal
+/// where you are already running an agent, or developing it, does exactly this.
+///
+/// The list is deliberately specific rather than a blanket `CLAUDE_CODE_*` sweep.
+/// That prefix also covers authentication (`CLAUDE_CODE_OAUTH_TOKEN`), provider
+/// selection (`CLAUDE_CODE_USE_BEDROCK`) and user preferences
+/// (`CLAUDE_CODE_ENABLE_TELEMETRY`) — settings people deliberately export and
+/// would be baffled to lose. Every name here was taken from the installed CLI's
+/// own string table, and each identifies a session or connects to one.
+pub fn default_clear_env() -> Vec<String> {
+    [
+        // "I am running inside an agent session", and which one.
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_CLOUD_SESSION_ID",
+        "CLAUDE_CODE_REMOTE_SESSION_ID",
+        "CLAUDE_CODE_REMOTE_SESSION_UUID",
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_PID",
+        // Handles onto the parent session — a socket and its token. Inheriting
+        // these points the new session's IPC at the old session.
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        // How the parent was started, and what it was doing.
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_PROCESS_WRAPPER",
+        "CLAUDE_CODE_SPAWN_TIMESTAMP_MS",
+        "CLAUDE_CODE_AGENT",
+        "CLAUDE_CODE_SUPERVISED",
+        "CLAUDE_CODE_TASK_LIST_ID",
+        "CLAUDE_CODE_TRIGGER_ID",
+        "CLAUDE_CODE_WORKER_EPOCH",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// The terminal cursor shape.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorShapeChoice {
+    #[default]
+    Block,
+    Ibeam,
+    Underline,
+}
+
+impl std::fmt::Display for CursorShapeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CursorShapeChoice::Block => "Block",
+            CursorShapeChoice::Ibeam => "I-beam",
+            CursorShapeChoice::Underline => "Underline",
+        })
+    }
+}
+
+impl CursorShapeChoice {
+    /// All choices in display order; the index matches the settings dropdown.
+    pub const ALL: [CursorShapeChoice; 3] = [
+        CursorShapeChoice::Block,
+        CursorShapeChoice::Ibeam,
+        CursorShapeChoice::Underline,
+    ];
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            startup_script: "~/.config/antigravity-terminal/startup.sh".to_string(),
+            startup_script: "~/.config/agent-terminal/startup.sh".to_string(),
             scrollback_lines: 10000,
             font_scale: 1.0,
             cli_client: CliClient::default(),
             starting_directory: String::new(),
             theme: ThemeChoice::default(),
+            profiles: default_profiles(),
+            default_profile: None,
+            font: "JetBrains Mono, Fira Code, Monospace 11".to_string(),
+            cursor_shape: CursorShapeChoice::default(),
+            cursor_blink: true,
+            notify_on_bell: false,
+            restore_session: true,
+            indicators: Vec::new(),
+            clear_env: default_clear_env(),
+        }
+    }
+}
+
+/// One restored tab: which profile it ran and where.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionTab {
+    /// `None` means the tab ran whatever auto-detection resolved.
+    #[serde(default)]
+    pub profile: Option<String>,
+    pub dir: String,
+}
+
+/// The tabs that were open when the window last closed.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct SessionState {
+    pub tabs: Vec<SessionTab>,
+    pub selected: usize,
+}
+
+impl SessionState {
+    /// Ceiling on restored tabs. A corrupt or hand-edited session file must not
+    /// be able to spawn an unbounded number of PTYs at launch.
+    pub const MAX_TABS: usize = 20;
+
+    fn path() -> PathBuf {
+        TerminalConfig::config_dir().join("session.json")
+    }
+
+    pub fn load() -> Self {
+        Self::load_from(&Self::path())
+    }
+
+    /// Reads the session file. Anything unreadable or unparseable yields an empty
+    /// session — starting fresh is always safe, so a bad file must never be fatal.
+    fn load_from(path: &Path) -> Self {
+        let Ok(content) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<Self>(&content) {
+            Ok(mut state) => {
+                if state.tabs.len() > Self::MAX_TABS {
+                    warn!(
+                        "Session file lists {} tabs; restoring the first {}",
+                        state.tabs.len(),
+                        Self::MAX_TABS
+                    );
+                    state.tabs.truncate(Self::MAX_TABS);
+                }
+                if state.selected >= state.tabs.len() {
+                    state.selected = 0;
+                }
+                state
+            }
+            Err(e) => {
+                warn!("Ignoring unreadable session file: {e}");
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) {
+        self.save_to(&Self::path());
+    }
+
+    fn save_to(&self, path: &Path) {
+        match serde_json::to_string_pretty(self) {
+            Ok(content) => {
+                if let Err(e) = TerminalConfig::write_all_synced(path, content.as_bytes()) {
+                    warn!("Failed to write session to {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => warn!("Failed to serialize session: {e}"),
         }
     }
 }
 
 impl TerminalConfig {
+    /// The base directory for user configuration.
+    ///
+    /// Honours `XDG_CONFIG_HOME` per the XDG Base Directory specification, which
+    /// this previously ignored in favour of a hardcoded `~/.config` — so anyone
+    /// who had relocated their config directory silently got a second one. It is
+    /// also what makes an isolated instance possible:
+    ///
+    /// ```text
+    /// XDG_CONFIG_HOME=/tmp/scratch agent-terminal
+    /// ```
+    ///
+    /// Both the current and the pre-2.0 directory hang off this, so an override
+    /// moves the migration source with it rather than leaving it pointed at the
+    /// real home directory.
+    fn config_home() -> PathBuf {
+        Self::config_home_from(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            std::env::var("HOME").ok(),
+        )
+    }
+
+    /// The resolution itself, with the environment passed in.
+    ///
+    /// Injected rather than read here so it can be tested without mutating
+    /// process-global state, the same way CLI detection takes its environment as
+    /// parameters.
+    fn config_home_from(xdg_config_home: Option<String>, home: Option<String>) -> PathBuf {
+        // An empty value counts as unset, per the specification.
+        if let Some(dir) = xdg_config_home.filter(|d| !d.trim().is_empty()) {
+            return PathBuf::from(dir);
+        }
+        PathBuf::from(home.unwrap_or_else(|| "/".to_string())).join(".config")
+    }
+
     pub fn config_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let dir = PathBuf::from(home)
-            .join(".config")
-            .join("antigravity-terminal");
+        let dir = Self::config_home().join("agent-terminal");
         if !dir.exists() {
             let _ = fs::create_dir_all(&dir);
         }
@@ -108,8 +472,74 @@ impl TerminalConfig {
         Self::config_dir().join("config.json")
     }
 
+    /// The pre-2.0 configuration directory, kept only so settings can be carried
+    /// across the rename.
+    fn legacy_config_path() -> PathBuf {
+        Self::config_home()
+            .join("antigravity-terminal")
+            .join("config.json")
+    }
+
     pub fn load() -> Self {
-        Self::load_from(&Self::config_path())
+        Self::load_or_migrate(&Self::config_path(), &Self::legacy_config_path())
+    }
+
+    /// Loads the config, adopting a pre-rename one the first time if present.
+    ///
+    /// The old file is deliberately left in place rather than moved. Deleting it
+    /// would make a rollback to v1.x — which is `apt install antigravity-terminal`,
+    /// a *different package* — come up with no settings at all. Leaving it costs
+    /// one stale file and keeps the downgrade path intact.
+    fn load_or_migrate(path: &Path, legacy_path: &Path) -> Self {
+        if !path.exists() && legacy_path.exists() {
+            let migrated = Self::load_from(legacy_path);
+            warn!(
+                "Adopting settings from {} into {} (the original is left in place)",
+                legacy_path.display(),
+                path.display()
+            );
+            migrated.save_to(path);
+            return migrated;
+        }
+        Self::load_from(path)
+    }
+
+    /// Fills in anything a pre-2.0 config could not have carried.
+    ///
+    /// A 1.x file has no `profiles` and no `default_profile`, but it does have a
+    /// `cli_client`. Dropping that on the floor would silently move a user who had
+    /// pinned Gemini back to auto-detection, so it is translated into the
+    /// equivalent profile selection instead.
+    fn normalize(mut self) -> Self {
+        if self.profiles.is_empty() {
+            self.profiles = default_profiles();
+        }
+
+        if self.default_profile.is_none() && self.cli_client != CliClient::Auto {
+            let carried = self.cli_client.to_string();
+            if self.profiles.iter().any(|p| p.name == carried) {
+                warn!("Carrying the 1.x '{carried}' client selection over to profiles");
+                self.default_profile = Some(carried);
+            }
+        }
+
+        // A default_profile naming something that no longer exists would silently
+        // fall through to auto-detection; say so rather than leaving the user to
+        // wonder why their choice was ignored.
+        if let Some(name) = &self.default_profile {
+            if !self.profiles.iter().any(|p| &p.name == name) {
+                warn!("Configured default profile '{name}' does not exist; using auto-detection");
+                self.default_profile = None;
+            }
+        }
+
+        self
+    }
+
+    /// The profile the user explicitly chose, if any.
+    pub fn selected_profile(&self) -> Option<&Profile> {
+        let name = self.default_profile.as_ref()?;
+        self.profiles.iter().find(|p| &p.name == name)
     }
 
     /// Loads a config from an explicit path, falling back to defaults. A missing
@@ -128,8 +558,8 @@ impl TerminalConfig {
                 return Self::default();
             }
         };
-        match serde_json::from_str(&content) {
-            Ok(config) => config,
+        match serde_json::from_str::<Self>(&content) {
+            Ok(config) => config.normalize(),
             Err(e) => {
                 warn!(
                     "Failed to parse config at {}: {}; using defaults",
@@ -146,15 +576,44 @@ impl TerminalConfig {
     }
 
     /// Serializes and writes the config to an explicit path, logging on failure.
+    ///
+    /// The write goes to a sibling temporary file which is then renamed over the
+    /// target. Rename within a directory is atomic on Linux, so an interrupted
+    /// save leaves either the previous config or the new one — never the
+    /// half-written file a plain `fs::write` would produce.
     fn save_to(&self, path: &Path) {
-        match serde_json::to_string_pretty(self) {
-            Ok(content) => {
-                if let Err(e) = fs::write(path, content) {
-                    warn!("Failed to write config to {}: {}", path.display(), e);
-                }
+        let content = match serde_json::to_string_pretty(self) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("Failed to serialize config: {}", e);
+                return;
             }
-            Err(e) => warn!("Failed to serialize config: {}", e),
+        };
+
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = Self::write_all_synced(&tmp, content.as_bytes()) {
+            warn!("Failed to write config to {}: {}", tmp.display(), e);
+            let _ = fs::remove_file(&tmp);
+            return;
         }
+
+        if let Err(e) = fs::rename(&tmp, path) {
+            warn!(
+                "Failed to replace config at {}: {}; settings not saved",
+                path.display(),
+                e
+            );
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// Writes `bytes` to `path`, flushing them to disk before returning. The
+    /// `sync_all` matters: without it the rename can land before the contents do,
+    /// which on a crash yields an empty config rather than an intact old one.
+    fn write_all_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = fs::File::create(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
     }
 }
 
@@ -174,6 +633,9 @@ mod tests {
             cli_client: CliClient::Claude,
             starting_directory: "/tmp/project".to_string(),
             theme: ThemeChoice::Dracula,
+            profiles: default_profiles(),
+            default_profile: Some("Claude".to_string()),
+            ..Default::default()
         };
         cfg.save_to(&path);
 
@@ -194,6 +656,417 @@ mod tests {
             TerminalConfig::load_from(&path).cli_client,
             CliClient::default()
         );
+    }
+
+    #[test]
+    fn all_lists_every_client_in_dropdown_order() {
+        // Same hazard as ThemeChoice::ALL: the client dropdown is built from this
+        // array and read back by index, so a variant missing from it mis-maps the
+        // picker. Exhaustive on purpose — a new variant must not compile until ALL
+        // is updated.
+        fn expected_index(client: CliClient) -> usize {
+            match client {
+                CliClient::Auto => 0,
+                CliClient::Gemini => 1,
+                CliClient::Agy => 2,
+                CliClient::Claude => 3,
+            }
+        }
+
+        assert_eq!(CliClient::ALL.len(), 4);
+        for client in CliClient::ALL {
+            let index = expected_index(client);
+            assert_eq!(CliClient::ALL[index], client);
+            assert_eq!(
+                CliClient::ALL.iter().position(|c| *c == client),
+                Some(index),
+                "{client} is not at its expected position in ALL"
+            );
+        }
+    }
+
+    #[test]
+    fn all_lists_every_theme_in_dropdown_order() {
+        // ALL is hand-maintained and the settings dropdown maps it by index in
+        // BOTH directions: position() to preselect, ALL.get(index) to read back.
+        // A variant missing from ALL therefore mis-maps the picker silently — you
+        // choose Nord and get Gruvbox, with no error anywhere.
+        //
+        // The match is exhaustive deliberately: adding a variant fails to compile
+        // here until ALL is updated to match.
+        fn expected_index(theme: ThemeChoice) -> usize {
+            match theme {
+                ThemeChoice::Antigravity => 0,
+                ThemeChoice::Dracula => 1,
+                ThemeChoice::Nord => 2,
+                ThemeChoice::GruvboxDark => 3,
+                ThemeChoice::SolarizedDark => 4,
+                ThemeChoice::OneDark => 5,
+                ThemeChoice::Monokai => 6,
+            }
+        }
+
+        assert_eq!(ThemeChoice::ALL.len(), 7);
+        for theme in ThemeChoice::ALL {
+            let index = expected_index(theme);
+            assert_eq!(ThemeChoice::ALL[index], theme);
+            assert_eq!(
+                ThemeChoice::ALL.iter().position(|t| *t == theme),
+                Some(index),
+                "{theme} is not at its expected position in ALL"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_display_names_are_unique_and_non_empty() {
+        // The dropdown is built from these strings; duplicates or blanks would
+        // leave the user unable to tell two entries apart.
+        let mut names: Vec<String> = ThemeChoice::ALL.iter().map(ToString::to_string).collect();
+        assert!(names.iter().all(|n| !n.trim().is_empty()));
+        names.sort();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate theme display names");
+    }
+
+    #[test]
+    fn every_theme_round_trips_through_json() {
+        for theme in ThemeChoice::ALL {
+            let encoded = serde_json::to_string(&theme).unwrap();
+            let decoded: ThemeChoice = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, theme, "{theme} did not survive a JSON round trip");
+        }
+    }
+
+    #[test]
+    fn overwrites_in_place_without_leaving_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let mut cfg = TerminalConfig {
+            scrollback_lines: 500,
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+        cfg.scrollback_lines = 900;
+        cfg.save_to(&path);
+
+        assert_eq!(TerminalConfig::load_from(&path).scrollback_lines, 900);
+
+        // The save goes via config.json.tmp and renames; a leftover temp file
+        // would mean the rename never happened.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn partial_file_keeps_defaults_for_missing_fields() {
+        // Container-level #[serde(default)] must fall back to TerminalConfig's own
+        // defaults, not to each field type's default — otherwise a config written
+        // by an older build silently loses its scrollback to 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"theme":"dracula"}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.theme, ThemeChoice::Dracula);
+        assert_eq!(
+            loaded.scrollback_lines,
+            TerminalConfig::default().scrollback_lines
+        );
+        assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+    }
+
+    #[test]
+    fn config_home_prefers_xdg_over_home() {
+        // XDG_CONFIG_HOME was ignored entirely before this, so anyone who had
+        // relocated their config directory silently got a second one.
+        assert_eq!(
+            TerminalConfig::config_home_from(
+                Some("/xdg/config".to_string()),
+                Some("/home/someone".to_string())
+            ),
+            PathBuf::from("/xdg/config")
+        );
+    }
+
+    #[test]
+    fn config_home_falls_back_to_home_when_xdg_is_unset_or_blank() {
+        let expected = PathBuf::from("/home/someone/.config");
+        assert_eq!(
+            TerminalConfig::config_home_from(None, Some("/home/someone".to_string())),
+            expected
+        );
+        // The specification treats an empty value as unset.
+        assert_eq!(
+            TerminalConfig::config_home_from(
+                Some("   ".to_string()),
+                Some("/home/someone".to_string())
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn config_home_survives_a_missing_home() {
+        assert_eq!(
+            TerminalConfig::config_home_from(None, None),
+            PathBuf::from("/.config")
+        );
+    }
+
+    #[test]
+    fn session_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            tabs: vec![
+                SessionTab {
+                    profile: Some("Claude".to_string()),
+                    dir: "/tmp/a".to_string(),
+                },
+                SessionTab {
+                    profile: None,
+                    dir: "/tmp/b".to_string(),
+                },
+            ],
+            selected: 1,
+        };
+        state.save_to(&path);
+
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.tabs, state.tabs);
+        assert_eq!(loaded.selected, 1);
+    }
+
+    #[test]
+    fn a_corrupt_session_file_starts_fresh_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"{ this is not json")
+            .unwrap();
+        assert!(SessionState::load_from(&path).tabs.is_empty());
+    }
+
+    #[test]
+    fn a_session_file_cannot_spawn_unbounded_tabs() {
+        // A hand-edited or corrupt file must not be able to open hundreds of PTYs
+        // at launch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            tabs: (0..500)
+                .map(|i| SessionTab {
+                    profile: None,
+                    dir: format!("/tmp/{i}"),
+                })
+                .collect(),
+            selected: 400,
+        };
+        state.save_to(&path);
+
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.tabs.len(), SessionState::MAX_TABS);
+        // The recorded selection pointed past the truncation, so it must be
+        // brought back in range rather than left dangling.
+        assert!(loaded.selected < loaded.tabs.len());
+    }
+
+    #[test]
+    fn a_missing_session_file_is_an_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(SessionState::load_from(&dir.path().join("none.json"))
+            .tabs
+            .is_empty());
+    }
+
+    #[test]
+    fn a_v1_config_keeps_its_pinned_client_as_a_profile() {
+        // Dropping cli_client on the floor would silently move a user who had
+        // pinned Gemini back to auto-detection.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"cli_client":"gemini","scrollback_lines":700}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.default_profile.as_deref(), Some("Gemini"));
+        assert_eq!(loaded.scrollback_lines, 700);
+        // And the default profile list is materialised for it.
+        assert!(loaded.profiles.iter().any(|p| p.command == "gemini"));
+    }
+
+    #[test]
+    fn a_v1_auto_config_stays_on_auto_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"cli_client":"auto"}"#)
+            .unwrap();
+        assert_eq!(TerminalConfig::load_from(&path).default_profile, None);
+    }
+
+    #[test]
+    fn a_default_profile_naming_nothing_falls_back_to_auto() {
+        // Deleting a profile that default_profile pointed at must not leave the
+        // config referring to something that no longer exists.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(
+                br#"{"default_profile":"Deleted","profiles":[{"name":"Claude","command":"claude"}]}"#,
+            )
+            .unwrap();
+        assert_eq!(TerminalConfig::load_from(&path).default_profile, None);
+    }
+
+    #[test]
+    fn custom_profiles_round_trip() {
+        // The whole point of profiles: a new CLI is a config edit, not a rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = TerminalConfig {
+            profiles: vec![Profile {
+                name: "Codex".to_string(),
+                command: "codex".to_string(),
+                args: vec!["--full-auto".to_string()],
+                dir: Some("/tmp/project".to_string()),
+                env_file: Some("/tmp/env.sh".to_string()),
+            }],
+            default_profile: Some("Codex".to_string()),
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.profiles, cfg.profiles);
+        assert_eq!(loaded.default_profile.as_deref(), Some("Codex"));
+        assert_eq!(
+            loaded.selected_profile().map(|p| p.command.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn an_empty_profile_list_is_repopulated() {
+        // An empty list would leave the app with nothing to launch and no way to
+        // recover through the UI.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[]}"#)
+            .unwrap();
+        assert!(!TerminalConfig::load_from(&path).profiles.is_empty());
+    }
+
+    #[test]
+    fn profile_argv_puts_the_command_first() {
+        let profile = Profile {
+            name: "Claude".to_string(),
+            command: "claude".to_string(),
+            args: vec!["--model".to_string(), "opus".to_string()],
+            dir: None,
+            env_file: None,
+        };
+        assert_eq!(profile.argv(), vec!["claude", "--model", "opus"]);
+    }
+
+    #[test]
+    fn adopts_a_pre_rename_config_without_destroying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("antigravity-terminal.json");
+        let current = dir.path().join("agent-terminal.json");
+
+        let original = TerminalConfig {
+            scrollback_lines: 4242,
+            theme: ThemeChoice::Nord,
+            ..Default::default()
+        };
+        original.save_to(&legacy);
+
+        let migrated = TerminalConfig::load_or_migrate(&current, &legacy);
+        assert_eq!(migrated.scrollback_lines, 4242);
+        assert_eq!(migrated.theme, ThemeChoice::Nord);
+
+        // The settings must now exist under the new name...
+        assert!(current.exists(), "migration did not write the new config");
+        assert_eq!(TerminalConfig::load_from(&current).scrollback_lines, 4242);
+
+        // ...and the old file must survive, because rolling back to v1.x means
+        // reinstalling a differently-named package that reads only the old path.
+        assert!(legacy.exists(), "migration must not delete the old config");
+    }
+
+    #[test]
+    fn migration_does_not_clobber_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("antigravity-terminal.json");
+        let current = dir.path().join("agent-terminal.json");
+
+        TerminalConfig {
+            scrollback_lines: 100,
+            ..Default::default()
+        }
+        .save_to(&legacy);
+        TerminalConfig {
+            scrollback_lines: 900,
+            ..Default::default()
+        }
+        .save_to(&current);
+
+        // Already migrated once: the new file wins from then on.
+        assert_eq!(
+            TerminalConfig::load_or_migrate(&current, &legacy).scrollback_lines,
+            900
+        );
+    }
+
+    #[test]
+    fn missing_both_configs_yields_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = TerminalConfig::load_or_migrate(
+            &dir.path().join("new.json"),
+            &dir.path().join("old.json"),
+        );
+        assert_eq!(
+            loaded.scrollback_lines,
+            TerminalConfig::default().scrollback_lines
+        );
+    }
+
+    #[test]
+    fn legacy_startup_script_still_parses() {
+        // The Settings row is gone, but a config file written by v1.x still
+        // carries the key and must not be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"startup_script":"/tmp/old.sh","scrollback_lines":200}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.startup_script, "/tmp/old.sh");
+        assert_eq!(loaded.scrollback_lines, 200);
     }
 
     #[test]

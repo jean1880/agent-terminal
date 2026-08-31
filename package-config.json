@@ -1,7 +1,0 @@
-{
-  "package_name": "antigravity-terminal",
-  "binary_name": "antigravity-terminal",
-  "description": "Standalone GTK4 terminal application for Antigravity AI",
-  "desktop_file": "assets/antigravity-terminal.desktop",
-  "logo_file": "assets/antigravity_logo.png"
-}

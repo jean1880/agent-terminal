@@ -1,12 +1,14 @@
-# Makefile for Antigravity Terminal
+# Makefile for Agent Terminal
 
-APP_NAME = antigravity-terminal
+APP_NAME = agent-terminal
 BINARY = target/release/$(APP_NAME)
-DESKTOP_FILE = assets/antigravity-terminal.desktop
-ICON_FILE = assets/antigravity_logo.svg
+APP_ID = com.jdesroches.AgentTerminal
+DESKTOP_FILE = assets/$(APP_ID).desktop
+ICON_FILE = assets/$(APP_ID).svg
 LOCAL_BIN = $(HOME)/.local/bin
-LOCAL_DESKTOP = $(HOME)/.local/share/applications/antigravity-terminal.desktop
-LOCAL_ICON = $(HOME)/.local/share/icons/antigravity_logo.svg
+LOCAL_DESKTOP = $(HOME)/.local/share/applications/$(APP_ID).desktop
+LOCAL_ICON_DIR = $(HOME)/.local/share/icons/hicolor/scalable/apps
+LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 
 .PHONY: all build start-local clean install uninstall package deps help
 
@@ -44,15 +46,18 @@ install: build
 	@echo "Installing binary to $(LOCAL_BIN)..."
 	mkdir -p $(LOCAL_BIN)
 	cp $(BINARY) $(LOCAL_BIN)/$(APP_NAME)
-	@echo "Installing icon to $(HOME)/.local/share/icons..."
-	mkdir -p $(HOME)/.local/share/icons
+	@echo "Installing icon to $(LOCAL_ICON_DIR)..."
+	mkdir -p $(LOCAL_ICON_DIR)
 	cp $(ICON_FILE) $(LOCAL_ICON)
 	@echo "Updating desktop entry..."
 	mkdir -p $(HOME)/.local/share/applications
 	cp $(DESKTOP_FILE) $(LOCAL_DESKTOP)
 	sed -i 's|^Exec=.*|Exec=$(LOCAL_BIN)/$(APP_NAME)|' $(LOCAL_DESKTOP)
-	sed -i 's|^Icon=.*|Icon=$(LOCAL_ICON)|' $(LOCAL_DESKTOP)
-	@echo "Done! You can now launch Antigravity Terminal from your menu."
+	@# Icon= stays the theme name; the icon is installed into hicolor above so
+	@# lookup resolves it the same way the .deb-installed one does.
+	-update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
+	-gtk4-update-icon-cache -q -t -f $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
+	@echo "Done! You can now launch Agent Terminal from your menu."
 
 uninstall:
 	@echo "Uninstalling $(APP_NAME) from $(LOCAL_BIN)..."

@@ -1,24 +1,25 @@
 [package]
-name = "antigravity-terminal"
-version = "1.0.0"
+name = "agent-terminal"
+version = "2.0.0"
 
 edition = "2021"
 authors = ["jdesroches"]
-description = "A standalone GTK4 terminal application for Antigravity AI"
-
-[features]
-# The homelab Ansible-drift indicator in the header. On by default; build with
-# --no-default-features for a generic terminal without the homelab integration.
-default = ["homelab-drift"]
-homelab-drift = []
+description = "A standalone GTK4 terminal for driving an AI coding CLI"
 
 [dependencies]
-gtk4 = "0.8"
-vte4 = "0.7"
-glib = "0.19"
-gio = "0.19"
-gdk4 = "0.8"
-adw = { package = "libadwaita", version = "0.6" }
+# glib, gio and gdk4 are deliberately NOT direct dependencies: every use in this
+# crate goes through the gtk4 re-exports (gtk4::glib, gtk4::gio, gtk4::gdk), so
+# naming them here only creates a second place for versions to drift out of step
+# with whatever gtk4 itself pulls in.
+#
+# Version features are opt-in — the crates' baseline is GTK 4.0 / libadwaita 1.0 —
+# so these two lines are what actually set the minimum system libraries:
+#   v4_10 → GTK 4.10, for gtk4::FileDialog
+#   v1_5  → libadwaita 1.5, for adw::AlertDialog and adw::PreferencesDialog
+# Both are satisfied by Ubuntu 24.04 and newer.
+gtk4 = { version = "0.11", features = ["v4_10"] }
+vte4 = "0.10"
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = "0.3"
@@ -37,11 +38,36 @@ codegen-units = 1
 maintainer = "jdesroches"
 copyright = "2026, jdesroches"
 license-file = ["LICENSE", "0"]
-depends = "$auto, libvte-2.91-gtk4-0, libadwaita-1-0"
+# $auto runs dpkg-shlibdeps against the built binary, so it derives libadwaita-1-0,
+# libvte-2.91-gtk4-0 and the rest with proper version constraints. Listing them by
+# hand as well only produced duplicate entries with weaker bounds.
+depends = "$auto"
+# The package was renamed from antigravity-terminal in 2.0.0. What retires the old
+# package is the transitional stub in packaging/: it carries the same name at a
+# higher version, so apt upgrades the real 1.x package into a file-less stub that
+# depends on this one.
+#
+# Versioned Conflicts/Replaces were tried here and removed. The apt pipeline
+# injects an epoch, so what actually ships is 1:2.0.0-1+debmaintainer against an
+# installed 1:1.0.0-2+debmaintainer — and "antigravity-terminal (<< 2.0.0)" is
+# FALSE for that, since any epoch-1 version outranks an epoch-less one. The
+# relations looked right and never fired. Correcting the bound to "<< 1:2.0.0"
+# fixes the packaged case and breaks the local one, where `make package` produces
+# an epoch-less stub that would then conflict with this package. There are no
+# shared paths between the two — binary, desktop entry and icon were all renamed —
+# so neither relation was doing anything the stub does not already do.
+provides = "antigravity-terminal"
+# Without this, cargo-deb uses README.md as the extended description and the whole
+# document — markdown, code fences and all — lands in the control file.
+extended-description = """
+A standalone GTK4/VTE terminal purpose-built for driving an AI coding CLI
+(Claude, Antigravity/agy, or Gemini) in a focused, tabbed window. Provides
+tabbed sessions rooted per-directory, selectable colour themes, sixel image
+rendering, hyperlink support, and journald logging."""
 section = "utils"
 priority = "optional"
 assets = [
-    ["target/release/antigravity-terminal", "usr/bin/antigravity-terminal", "755"],
-    ["assets/antigravity-terminal.desktop", "usr/share/applications/antigravity-terminal.desktop", "644"],
-    ["assets/antigravity_logo.svg", "usr/share/icons/antigravity_logo.svg", "644"],
+    ["target/release/agent-terminal", "usr/bin/agent-terminal", "755"],
+    ["assets/com.jdesroches.AgentTerminal.desktop", "usr/share/applications/com.jdesroches.AgentTerminal.desktop", "644"],
+    ["assets/com.jdesroches.AgentTerminal.svg", "usr/share/icons/hicolor/scalable/apps/com.jdesroches.AgentTerminal.svg", "644"],
 ]
