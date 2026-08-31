@@ -37,6 +37,61 @@ impl CliClient {
     ];
 }
 
+/// A launchable session: a name, the command to run, and where to run it.
+///
+/// This replaces the closed `CliClient` enum. Adding a fourth CLI used to mean
+/// editing the enum, its `Display`, four arms of the detection function and two
+/// hand-maintained index↔variant mappings in the settings dialog; it is now a
+/// `config.json` edit with no recompile.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// Shown in the settings dropdown and the new-tab menu. Also the key that
+    /// `default_profile` refers to, so it must be unique.
+    pub name: String,
+    /// The command to exec. Resolved against PATH, common install directories,
+    /// and the user's interactive shell.
+    pub command: String,
+    /// Extra arguments appended to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Where to root sessions for this profile. `None` falls back to the global
+    /// starting directory, which itself falls back to `$HOME`.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// A shell file sourced in a subshell whose exported environment is merged
+    /// into the session's. This is the only safe shape for the old
+    /// "startup script" idea: the file must contribute environment, never bytes
+    /// written to the TTY, because output before `exec` breaks the CLI's
+    /// terminal handshake.
+    #[serde(default)]
+    pub env_file: Option<String>,
+}
+
+impl Profile {
+    /// The full argv to exec, command first.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = Vec::with_capacity(1 + self.args.len());
+        argv.push(self.command.clone());
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
+}
+
+/// The profiles a fresh install starts with — the three clients the old
+/// `CliClient` enum hard-coded, in the same preference order.
+fn default_profiles() -> Vec<Profile> {
+    ["Claude", "Agy", "Gemini"]
+        .iter()
+        .map(|name| Profile {
+            name: (*name).to_string(),
+            command: name.to_lowercase(),
+            args: Vec::new(),
+            dir: None,
+            env_file: None,
+        })
+        .collect()
+}
+
 /// The terminal color scheme.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -97,9 +152,16 @@ pub struct TerminalConfig {
     pub startup_script: String,
     pub scrollback_lines: u32,
     pub font_scale: f64,
+    /// Superseded by `profiles`/`default_profile` in 2.0. Still parsed so a 1.x
+    /// config keeps its chosen client across the upgrade; see [`Self::normalize`].
     pub cli_client: CliClient,
     pub starting_directory: String,
     pub theme: ThemeChoice,
+    /// The sessions offered in Settings and the new-tab menu.
+    pub profiles: Vec<Profile>,
+    /// Which profile to launch. `None` means "use the first one whose command is
+    /// actually installed", the behaviour the old `CliClient::Auto` had.
+    pub default_profile: Option<String>,
 }
 
 impl Default for TerminalConfig {
@@ -111,6 +173,8 @@ impl Default for TerminalConfig {
             cli_client: CliClient::default(),
             starting_directory: String::new(),
             theme: ThemeChoice::default(),
+            profiles: default_profiles(),
+            default_profile: None,
         }
     }
 }
@@ -163,6 +227,44 @@ impl TerminalConfig {
         Self::load_from(path)
     }
 
+    /// Fills in anything a pre-2.0 config could not have carried.
+    ///
+    /// A 1.x file has no `profiles` and no `default_profile`, but it does have a
+    /// `cli_client`. Dropping that on the floor would silently move a user who had
+    /// pinned Gemini back to auto-detection, so it is translated into the
+    /// equivalent profile selection instead.
+    fn normalize(mut self) -> Self {
+        if self.profiles.is_empty() {
+            self.profiles = default_profiles();
+        }
+
+        if self.default_profile.is_none() && self.cli_client != CliClient::Auto {
+            let carried = self.cli_client.to_string();
+            if self.profiles.iter().any(|p| p.name == carried) {
+                warn!("Carrying the 1.x '{carried}' client selection over to profiles");
+                self.default_profile = Some(carried);
+            }
+        }
+
+        // A default_profile naming something that no longer exists would silently
+        // fall through to auto-detection; say so rather than leaving the user to
+        // wonder why their choice was ignored.
+        if let Some(name) = &self.default_profile {
+            if !self.profiles.iter().any(|p| &p.name == name) {
+                warn!("Configured default profile '{name}' does not exist; using auto-detection");
+                self.default_profile = None;
+            }
+        }
+
+        self
+    }
+
+    /// The profile the user explicitly chose, if any.
+    pub fn selected_profile(&self) -> Option<&Profile> {
+        let name = self.default_profile.as_ref()?;
+        self.profiles.iter().find(|p| &p.name == name)
+    }
+
     /// Loads a config from an explicit path, falling back to defaults. A missing
     /// file is expected (first run); a present-but-invalid file is logged so the
     /// user knows their settings were ignored rather than silently discarded.
@@ -179,8 +281,8 @@ impl TerminalConfig {
                 return Self::default();
             }
         };
-        match serde_json::from_str(&content) {
-            Ok(config) => config,
+        match serde_json::from_str::<Self>(&content) {
+            Ok(config) => config.normalize(),
             Err(e) => {
                 warn!(
                     "Failed to parse config at {}: {}; using defaults",
@@ -254,6 +356,8 @@ mod tests {
             cli_client: CliClient::Claude,
             starting_directory: "/tmp/project".to_string(),
             theme: ThemeChoice::Dracula,
+            profiles: default_profiles(),
+            default_profile: Some("Claude".to_string()),
         };
         cfg.save_to(&path);
 
@@ -405,6 +509,102 @@ mod tests {
             TerminalConfig::default().scrollback_lines
         );
         assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+    }
+
+    #[test]
+    fn a_v1_config_keeps_its_pinned_client_as_a_profile() {
+        // Dropping cli_client on the floor would silently move a user who had
+        // pinned Gemini back to auto-detection.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"cli_client":"gemini","scrollback_lines":700}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.default_profile.as_deref(), Some("Gemini"));
+        assert_eq!(loaded.scrollback_lines, 700);
+        // And the default profile list is materialised for it.
+        assert!(loaded.profiles.iter().any(|p| p.command == "gemini"));
+    }
+
+    #[test]
+    fn a_v1_auto_config_stays_on_auto_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"cli_client":"auto"}"#)
+            .unwrap();
+        assert_eq!(TerminalConfig::load_from(&path).default_profile, None);
+    }
+
+    #[test]
+    fn a_default_profile_naming_nothing_falls_back_to_auto() {
+        // Deleting a profile that default_profile pointed at must not leave the
+        // config referring to something that no longer exists.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(
+                br#"{"default_profile":"Deleted","profiles":[{"name":"Claude","command":"claude"}]}"#,
+            )
+            .unwrap();
+        assert_eq!(TerminalConfig::load_from(&path).default_profile, None);
+    }
+
+    #[test]
+    fn custom_profiles_round_trip() {
+        // The whole point of profiles: a new CLI is a config edit, not a rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = TerminalConfig {
+            profiles: vec![Profile {
+                name: "Codex".to_string(),
+                command: "codex".to_string(),
+                args: vec!["--full-auto".to_string()],
+                dir: Some("/tmp/project".to_string()),
+                env_file: Some("/tmp/env.sh".to_string()),
+            }],
+            default_profile: Some("Codex".to_string()),
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.profiles, cfg.profiles);
+        assert_eq!(loaded.default_profile.as_deref(), Some("Codex"));
+        assert_eq!(
+            loaded.selected_profile().map(|p| p.command.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn an_empty_profile_list_is_repopulated() {
+        // An empty list would leave the app with nothing to launch and no way to
+        // recover through the UI.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[]}"#)
+            .unwrap();
+        assert!(!TerminalConfig::load_from(&path).profiles.is_empty());
+    }
+
+    #[test]
+    fn profile_argv_puts_the_command_first() {
+        let profile = Profile {
+            name: "Claude".to_string(),
+            command: "claude".to_string(),
+            args: vec!["--model".to_string(), "opus".to_string()],
+            dir: None,
+            env_file: None,
+        };
+        assert_eq!(profile.argv(), vec!["claude", "--model", "opus"]);
     }
 
     #[test]

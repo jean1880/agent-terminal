@@ -1,7 +1,8 @@
 //! Private implementation details of the AgentTerminalWindow.
 
+use crate::config::Profile;
 use crate::theme::Theme;
-use crate::utils::{detect_cli_binary, get_startup_command, resolve_working_directory};
+use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
@@ -156,6 +157,11 @@ fn build_loading_box() -> Box {
     loading_box
 }
 
+/// The first entry of the profile dropdown: "resolve automatically".
+const AUTO_PROFILE_LABEL: &str = "Auto-detect";
+/// Its index. Every profile sits at its list position plus one.
+const AUTO_INDEX: u32 = 0;
+
 /// The three environment values CLI detection needs, read on the main thread so
 /// they can be moved to a worker.
 fn env_triplet() -> (Option<String>, Option<String>, Option<String>) {
@@ -172,28 +178,62 @@ fn env_triplet() -> (Option<String>, Option<String>, Option<String>) {
 /// which sources the user's rc file — seconds on a heavy shell, during which the
 /// window previously could not even repaint. The result is cached process-wide,
 /// so a second window or a settings change never pays for it twice.
-async fn resolve_cli_binary(
-    client: crate::config::CliClient,
+async fn resolve_active_profile(
+    profiles: Vec<crate::config::Profile>,
+    preferred: Option<String>,
     path: Option<String>,
     home: Option<String>,
     shell: Option<String>,
-) -> Option<String> {
-    if let Some(cached) = crate::utils::cached_cli_binary(client) {
-        debug!("Reusing cached CLI detection for {:?}", client);
-        return cached;
+) -> Option<crate::config::Profile> {
+    // Results already known are handed to the worker rather than looked up from
+    // it: the cache is a main-thread thread_local, so the worker cannot read it.
+    let known: std::collections::HashMap<String, bool> = profiles
+        .iter()
+        .filter_map(|p| {
+            crate::utils::cached_command_available(&p.command).map(|v| (p.command.clone(), v))
+        })
+        .collect();
+
+    if known.len() == profiles.len() {
+        debug!("Every profile command is already resolved; skipping the probe");
+        return resolve_profile(&profiles, preferred.as_deref(), |command| {
+            known.get(command).copied().unwrap_or(false)
+        })
+        .cloned();
     }
 
-    let detected = gtk4::gio::spawn_blocking(move || {
-        detect_cli_binary(client, path.as_deref(), home.as_deref(), shell.as_deref())
+    let (chosen, discovered) = gtk4::gio::spawn_blocking(move || {
+        let probe = crate::utils::SystemProbe::new(path, home, shell);
+        let mut discovered: Vec<(String, bool)> = Vec::new();
+
+        // resolve_profile short-circuits on the first usable profile, so an
+        // installed first choice still costs exactly one lookup — the closure is
+        // only called for commands it actually needs to know about.
+        let chosen = resolve_profile(&profiles, preferred.as_deref(), |command| {
+            if let Some(known) = known.get(command) {
+                return *known;
+            }
+            if let Some((_, seen)) = discovered.iter().find(|(c, _)| c == command) {
+                return *seen;
+            }
+            let available = probe.command_available(command);
+            discovered.push((command.to_string(), available));
+            available
+        })
+        .cloned();
+
+        (chosen, discovered)
     })
     .await
     .unwrap_or_else(|_| {
-        error!("CLI detection panicked on the worker thread; treating as not found");
-        None
+        error!("Profile resolution panicked on the worker thread; treating as unavailable");
+        (None, Vec::new())
     });
 
-    crate::utils::cache_cli_binary(client, detected.clone());
-    detected
+    for (command, available) in discovered {
+        crate::utils::cache_command_available(&command, available);
+    }
+    chosen
 }
 
 /// Presents a one-button informational dialog anchored to `parent`.
@@ -214,10 +254,10 @@ pub struct AgentTerminalWindow {
     /// One entry per open tab. Pruned when a page is detached.
     tabs: RefCell<Vec<TabState>>,
     pub config: RefCell<crate::config::TerminalConfig>,
-    /// The CLI binary resolved at startup, cached so opening a new tab does not
-    /// re-run detection (which may block on an interactive shell) on the UI
-    /// thread. Refreshed when the configured client changes.
-    pub detected_binary: RefCell<Option<String>>,
+    /// The profile resolved at startup, cached so opening a new tab does not
+    /// re-run resolution (which may block on an interactive shell) on the UI
+    /// thread. Refreshed when the selected profile changes.
+    pub active_profile: RefCell<Option<Profile>>,
     /// A queued config save, cancelled and re-armed whenever a setting changes
     /// again before it fires. Held so it can also be flushed on window close.
     pending_save: RefCell<Option<glib::SourceId>>,
@@ -323,6 +363,34 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&new_tab_action);
+
+        // New Tab As <profile>. Parameterised by profile name rather than index,
+        // so it stays correct if the profile list changes underneath the menu.
+        let new_tab_profile_action =
+            gtk4::gio::SimpleAction::new("new-tab-profile", Some(&String::static_variant_type()));
+        new_tab_profile_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let Some(name) = target.and_then(|t| t.get::<String>()) else {
+                    warn!("new-tab-profile activated without a profile name");
+                    return;
+                };
+                let imp = obj.imp();
+                let profile = imp
+                    .config
+                    .borrow()
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .cloned();
+                match profile {
+                    Some(profile) => imp.new_tab_with_profile(&profile),
+                    None => warn!("No profile named '{name}'"),
+                }
+            }
+        ));
+        obj.add_action(&new_tab_profile_action);
 
         // Restart Session Action. restart_tab already existed with exactly the
         // right semantics but was reachable only as a side effect of closing the
@@ -504,7 +572,10 @@ impl AgentTerminalWindow {
         content.append(&status_page);
         obj.set_content(Some(&content));
 
-        let selected_client = self.config.borrow().cli_client;
+        let (profiles, preferred) = {
+            let config = self.config.borrow();
+            (config.profiles.clone(), config.default_profile.clone())
+        };
         let (path, home, shell) = env_triplet();
 
         glib::MainContext::default().spawn_local(glib::clone!(
@@ -513,16 +584,19 @@ impl AgentTerminalWindow {
             #[weak]
             content,
             async move {
-                let detected = resolve_cli_binary(selected_client, path, home, shell).await;
+                let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
 
                 let imp = obj.imp();
-                *imp.detected_binary.borrow_mut() = detected.clone();
+                *imp.active_profile.borrow_mut() = resolved.clone();
 
                 content.remove(&status_page);
 
-                if let Some(ref binary) = detected {
-                    info!("CLI binary '{}' detected, setting up terminal UI", binary);
-                    imp.setup_terminal_ui(&content, Some(binary));
+                if let Some(ref profile) = resolved {
+                    info!(
+                        "Profile '{}' resolved to '{}', setting up terminal UI",
+                        profile.name, profile.command
+                    );
+                    imp.setup_terminal_ui(&content, Some(profile));
                 } else {
                     warn!("No compatible CLI detected, setting up welcome UI");
                     imp.setup_welcome_ui(&content);
@@ -532,7 +606,7 @@ impl AgentTerminalWindow {
     }
 
     /// Sets up the tabbed terminal interface, then opens the first tab.
-    fn setup_terminal_ui(&self, container: &Box, cli_binary: Option<&str>) {
+    fn setup_terminal_ui(&self, container: &Box, profile: Option<&Profile>) {
         let obj = self.obj();
         debug!("Initializing tabbed terminal UI");
 
@@ -547,11 +621,17 @@ impl AgentTerminalWindow {
             .expand_tabs(true)
             .build();
 
-        // "New tab" button in the header bar.
+        // "New tab" in the header bar. A split button rather than a plain one:
+        // clicking it clones the current tab's profile and directory as before,
+        // while the dropdown launches any configured profile directly. That is
+        // the whole point of profiles being data — a second CLI, or the same one
+        // rooted in a different project, is one click away without a trip
+        // through Settings.
         if let Some(header) = self.header.borrow().as_ref() {
-            let new_tab_btn = Button::builder()
+            let new_tab_btn = adw::SplitButton::builder()
                 .icon_name("tab-new-symbolic")
                 .tooltip_text("New Tab (Ctrl+Shift+T)")
+                .menu_model(&self.build_profile_menu())
                 .build();
             new_tab_btn.connect_clicked(glib::clone!(
                 #[weak]
@@ -630,14 +710,14 @@ impl AgentTerminalWindow {
             }
         ));
 
-        self.add_terminal_tab(cli_binary, None);
+        self.add_terminal_tab(profile, None);
     }
 
     /// Opens a new tab rooted in the current tab's directory (fast path).
     fn new_tab(&self) {
         let dir = self.current_dir();
-        let detected = self.detected_binary.borrow().clone();
-        self.add_terminal_tab(detected.as_deref(), dir.as_deref());
+        let profile = self.active_profile.borrow().clone();
+        self.add_terminal_tab(profile.as_ref(), dir.as_deref());
     }
 
     /// Replaces the active tab with a fresh session using the current config
@@ -649,10 +729,10 @@ impl AgentTerminalWindow {
             return;
         };
         let old_page = tab_view.selected_page();
-        let detected = self.detected_binary.borrow().clone();
+        let profile = self.active_profile.borrow().clone();
         // Root the replacement in the configured starting directory (which may
         // have just changed); add_terminal_tab falls back to $HOME.
-        self.add_terminal_tab(detected.as_deref(), None);
+        self.add_terminal_tab(profile.as_ref(), None);
         if let Some(page) = old_page {
             tab_view.close_page(&page);
         }
@@ -686,8 +766,8 @@ impl AgentTerminalWindow {
                         if let Some(path) = file.path() {
                             let imp = obj.imp();
                             let dir = path.to_string_lossy().to_string();
-                            let detected = imp.detected_binary.borrow().clone();
-                            imp.add_terminal_tab(detected.as_deref(), Some(&dir));
+                            let profile = imp.active_profile.borrow().clone();
+                            imp.add_terminal_tab(profile.as_ref(), Some(&dir));
                         }
                     }
                     // Dismissing the picker is a normal outcome, not a failure.
@@ -701,7 +781,7 @@ impl AgentTerminalWindow {
     ///
     /// `dir_override` roots the tab in a specific directory; when `None` the
     /// configured starting directory (falling back to `$HOME`) is used.
-    fn add_terminal_tab(&self, cli_binary: Option<&str>, dir_override: Option<&str>) {
+    fn add_terminal_tab(&self, profile: Option<&Profile>, dir_override: Option<&str>) {
         debug!("Adding terminal tab");
         let terminal = Terminal::new();
 
@@ -787,7 +867,7 @@ impl AgentTerminalWindow {
             spawned_at: std::time::Instant::now(),
         });
 
-        self.spawn_session(&terminal, &stack, cli_binary, &work_dir);
+        self.spawn_session(&terminal, &stack, profile, &work_dir);
     }
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
@@ -924,9 +1004,9 @@ impl AgentTerminalWindow {
             .iter()
             .find(|t| &t.page == page)
             .map(|t| t.dir.clone());
-        let detected = self.detected_binary.borrow().clone();
+        let profile = self.active_profile.borrow().clone();
         info!("Restarting session in {:?}", dir);
-        self.add_terminal_tab(detected.as_deref(), dir.as_deref());
+        self.add_terminal_tab(profile.as_ref(), dir.as_deref());
         tab_view.close_page(page);
     }
 
@@ -937,6 +1017,7 @@ impl AgentTerminalWindow {
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Tab"), Some("win.new-tab"));
+        menu.append_submenu(Some("New Tab As"), &self.build_profile_menu());
         menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
@@ -1095,12 +1176,13 @@ impl AgentTerminalWindow {
         &self,
         terminal: &Terminal,
         stack: &Stack,
-        cli_binary: Option<&str>,
+        profile: Option<&Profile>,
         work_dir: &str,
     ) {
         let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let command = get_startup_command(cli_binary);
+        let command = get_startup_command(profile);
+        let env_file = profile.and_then(|p| p.env_file.clone());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
             shell, command
@@ -1142,71 +1224,111 @@ impl AgentTerminalWindow {
         if !env_strs.iter().any(|s| s.starts_with("COLORTERM=")) {
             env_strs.push("COLORTERM=truecolor".to_string());
         }
-        let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
+        // A profile's env_file is sourced in a subshell, which is a subprocess and
+        // so must not run on the main thread. The terminal widget already exists
+        // and is showing the loading screen, so deferring the spawn by one turn of
+        // the loop costs nothing visible.
+        let work_dir = work_dir.to_string();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            stack,
+            #[weak]
+            terminal,
+            async move {
+                if let Some(path) = env_file {
+                    let extra =
+                        gtk4::gio::spawn_blocking(move || crate::utils::load_env_file(&path))
+                            .await
+                            .unwrap_or_default();
 
-        terminal.spawn_async(
-            PtyFlags::DEFAULT,
-            Some(work_dir),
-            &[&shell, &command[0], &command[1]],
-            &env_ptrs,
-            glib::SpawnFlags::DEFAULT,
-            || {},
-            -1,
-            None::<&gtk4::gio::Cancellable>,
-            glib::clone!(
-                #[weak]
-                obj,
-                #[weak]
-                stack,
-                move |result| {
-                    match result {
-                        Ok(_) => info!("Terminal process spawned, waiting for content..."),
-                        Err(err) => {
-                            error!("Error spawning terminal: {}", err);
-                            stack.set_visible_child_name("terminal"); // Show terminal anyway so error is visible
-                            present_message(
-                                &obj,
-                                "Terminal Error",
-                                &format!("Error spawning terminal: {err}"),
-                            );
-                        }
+                    // Later entries win in the environment block, so appending
+                    // lets the profile override an inherited value.
+                    for (key, value) in extra {
+                        debug!("Env file sets {key}");
+                        env_strs.push(format!("{key}={value}"));
                     }
                 }
-            ),
-        );
+
+                let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
+
+                terminal.spawn_async(
+                    PtyFlags::DEFAULT,
+                    Some(&work_dir),
+                    &[&shell, &command[0], &command[1]],
+                    &env_ptrs,
+                    glib::SpawnFlags::DEFAULT,
+                    || {},
+                    -1,
+                    None::<&gtk4::gio::Cancellable>,
+                    glib::clone!(
+                        #[weak]
+                        obj,
+                        #[weak]
+                        stack,
+                        move |result| {
+                            match result {
+                                Ok(_) => {
+                                    info!("Terminal process spawned, waiting for content...")
+                                }
+                                Err(err) => {
+                                    error!("Error spawning terminal: {}", err);
+                                    // Show the terminal anyway so the error is visible.
+                                    stack.set_visible_child_name("terminal");
+                                    present_message(
+                                        &obj,
+                                        "Terminal Error",
+                                        &format!("Error spawning terminal: {err}"),
+                                    );
+                                }
+                            }
+                        }
+                    ),
+                );
+            }
+        ));
     }
 
     /// Sets up the welcome screen using AdwStatusPage.
     fn setup_welcome_ui(&self, container: &Box) {
         let obj = self.obj();
 
-        // Name whichever client is actually configured. The previous copy told
-        // every user to install `agy` from antigravity.google even when they had
-        // explicitly selected Claude.
-        let configured = self.config.borrow().cli_client;
-        let description = match configured {
-            crate::config::CliClient::Auto => concat!(
-                "No supported AI CLI was found. Your PATH and interactive shell ",
-                "environment (-ic) were both checked for claude, agy and gemini.\n\n",
-                "Install one of them, or pick a specific client in Settings, then ",
-                "check again."
-            )
-            .to_string(),
-            other => format!(
-                concat!(
-                    "{} is selected in Settings, but its command was not found. Your ",
-                    "PATH and interactive shell environment (-ic) were both checked ",
-                    "for `{}`.\n\nInstall it, or choose a different client in ",
-                    "Settings, then check again."
+        // Name whatever is actually configured. The previous copy told every user
+        // to install `agy` from antigravity.google even when they had explicitly
+        // selected Claude.
+        let description = {
+            let config = self.config.borrow();
+            match config.selected_profile() {
+                Some(profile) => format!(
+                    concat!(
+                        "The profile \"{}\" is selected, but its command `{}` was not ",
+                        "found. Your PATH, the usual install directories, and your ",
+                        "interactive shell environment (-ic) were all checked.\n\n",
+                        "Install it, or choose a different profile in Settings, then ",
+                        "check again."
+                    ),
+                    profile.name, profile.command
                 ),
-                other,
-                match other {
-                    crate::config::CliClient::Claude => "claude",
-                    crate::config::CliClient::Agy => "agy",
-                    crate::config::CliClient::Gemini => "gemini",
-                    crate::config::CliClient::Auto => unreachable!("handled above"),
+                None => {
+                    let commands: Vec<&str> =
+                        config.profiles.iter().map(|p| p.command.as_str()).collect();
+                    format!(
+                        concat!(
+                            "No configured AI CLI was found. Your PATH, the usual ",
+                            "install directories, and your interactive shell ",
+                            "environment (-ic) were all checked for: {}.\n\n",
+                            "Install one of them, or add a profile to ",
+                            "~/.config/agent-terminal/config.json, then check again."
+                        ),
+                        if commands.is_empty() {
+                            "nothing — no profiles are configured".to_string()
+                        } else {
+                            commands.join(", ")
+                        }
+                    )
                 }
-            ),
+            }
         };
 
         let status_page = adw::StatusPage::builder()
@@ -1277,20 +1399,19 @@ impl AgentTerminalWindow {
         let scrollback_row = adw::ActionRow::builder().title("Scrollback Lines").build();
         scrollback_row.add_suffix(&scroll_spin);
 
-        // Built from CliClient::ALL, like the theme row below it. The previous
-        // hand-written index match ran in both directions (0 => Auto to read,
-        // Auto => 0 to preselect) with a `_ => Auto` arm swallowing anything
-        // unexpected, so the list and the enum could silently disagree.
-        let client_names: Vec<String> = crate::config::CliClient::ALL
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        // Built from the configured profiles. Index 0 is auto-detection, so the
+        // list is one longer than the profile list and every later index is
+        // offset by one — see AUTO_INDEX below, which is the only place that
+        // relationship is expressed.
+        let mut client_names: Vec<String> = vec![AUTO_PROFILE_LABEL.to_string()];
+        client_names.extend(config.profiles.iter().map(|p| p.name.clone()));
         let client_name_refs: Vec<&str> = client_names.iter().map(String::as_str).collect();
         let client_model = gtk4::StringList::new(&client_name_refs);
-        let selected_index = crate::config::CliClient::ALL
-            .iter()
-            .position(|c| *c == config.cli_client)
-            .unwrap_or(0) as u32;
+        let selected_index = config
+            .default_profile
+            .as_ref()
+            .and_then(|name| config.profiles.iter().position(|p| &p.name == name))
+            .map_or(AUTO_INDEX, |i| i as u32 + 1);
 
         let font_scale_adj = gtk4::Adjustment::new(config.font_scale, 0.5, 3.0, 0.1, 0.5, 0.0);
         let font_scale_spin = gtk4::SpinButton::builder()
@@ -1380,20 +1501,33 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             move |row| {
-                let Some(client) = crate::config::CliClient::ALL
-                    .get(row.selected() as usize)
-                    .copied()
-                else {
-                    return;
-                };
                 let imp = obj.imp();
-                if imp.config.borrow().cli_client == client {
+                let chosen = if row.selected() == AUTO_INDEX {
+                    None
+                } else {
+                    let index = (row.selected() - 1) as usize;
+                    match imp.config.borrow().profiles.get(index) {
+                        Some(profile) => Some(profile.name.clone()),
+                        // The list is rebuilt from the profiles each time the
+                        // dialog opens, so this should not happen; do nothing
+                        // rather than silently selecting something else.
+                        None => {
+                            warn!("Profile row {index} has no matching profile");
+                            return;
+                        }
+                    }
+                };
+
+                if imp.config.borrow().default_profile == chosen {
                     return;
                 }
-                imp.config.borrow_mut().cli_client = client;
+                imp.config.borrow_mut().default_profile = chosen.clone();
                 imp.schedule_config_save();
-                info!("CLI client changed to {}, restarting session", client);
-                imp.restart_with_client(client);
+                info!(
+                    "Profile selection changed to {}, restarting session",
+                    chosen.as_deref().unwrap_or("auto-detect")
+                );
+                imp.restart_with_profile_selection();
             }
         ));
 
@@ -1428,23 +1562,54 @@ impl AgentTerminalWindow {
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
 
-    /// Re-resolves the CLI binary for `client`, then replaces the active tab.
+    /// Re-resolves the selected profile, then replaces the active tab.
     ///
-    /// Detection can shell out, so it takes the same off-thread path as startup
+    /// Resolution can shell out, so it takes the same off-thread path as startup
     /// rather than freezing the window while the settings dialog is open.
-    fn restart_with_client(&self, client: crate::config::CliClient) {
+    fn restart_with_profile_selection(&self) {
         let obj = self.obj();
+        let (profiles, preferred) = {
+            let config = self.config.borrow();
+            (config.profiles.clone(), config.default_profile.clone())
+        };
         let (path, home, shell) = env_triplet();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
-                let detected = resolve_cli_binary(client, path, home, shell).await;
+                let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
                 let imp = obj.imp();
-                *imp.detected_binary.borrow_mut() = detected;
+                *imp.active_profile.borrow_mut() = resolved;
                 imp.restart_current_tab();
             }
         ));
+    }
+
+    /// Opens a new tab running `profile`, rooted in that profile's directory when
+    /// it names one.
+    fn new_tab_with_profile(&self, profile: &Profile) {
+        let dir = profile.dir.clone();
+        info!("Opening a tab for profile '{}'", profile.name);
+        self.add_terminal_tab(Some(profile), dir.as_deref());
+    }
+
+    /// Builds the "new tab as…" menu, one item per configured profile.
+    ///
+    /// Rebuilt on demand rather than cached, so editing config.json and
+    /// reopening the window is enough to see a new profile.
+    fn build_profile_menu(&self) -> gtk4::gio::Menu {
+        let menu = gtk4::gio::Menu::new();
+        for profile in self.config.borrow().profiles.iter() {
+            // The profile name is the action target, so the action handler does
+            // not depend on menu ordering.
+            let item = gtk4::gio::MenuItem::new(Some(&profile.name), None);
+            item.set_action_and_target_value(
+                Some("win.new-tab-profile"),
+                Some(&profile.name.to_variant()),
+            );
+            menu.append_item(&item);
+        }
+        menu
     }
 }
 
