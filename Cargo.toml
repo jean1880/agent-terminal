@@ -37,7 +37,17 @@ codegen-units = 1
 maintainer = "jdesroches"
 copyright = "2026, jdesroches"
 license-file = ["LICENSE", "0"]
-depends = "$auto, libvte-2.91-gtk4-0, libadwaita-1-0"
+# $auto runs dpkg-shlibdeps against the built binary, so it derives libadwaita-1-0,
+# libvte-2.91-gtk4-0 and the rest with proper version constraints. Listing them by
+# hand as well only produced duplicate entries with weaker bounds.
+depends = "$auto"
+# Without this, cargo-deb uses README.md as the extended description and the whole
+# document — markdown, code fences and all — lands in the control file.
+extended-description = """
+A standalone GTK4/VTE terminal purpose-built for driving an AI coding CLI
+(Claude, Antigravity/agy, or Gemini) in a focused, tabbed window. Provides
+tabbed sessions rooted per-directory, selectable colour themes, sixel image
+rendering, hyperlink support, and journald logging."""
 section = "utils"
 priority = "optional"
 assets = [
