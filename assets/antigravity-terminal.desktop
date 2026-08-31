@@ -8,7 +8,7 @@ StartupWMClass=com.jdesroches.AntigravityTerminal
 Icon=antigravity-terminal
 Terminal=false
 StartupNotify=true
-Categories=Development;TerminalEmulator;
+Categories=Development;System;TerminalEmulator;
 Keywords=antigravity;ai;terminal;chat;agy;
 Actions=new-window;
 
