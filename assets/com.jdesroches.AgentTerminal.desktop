@@ -1,0 +1,17 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Agent Terminal
+Comment=Terminal for driving an AI coding CLI
+Exec=agent-terminal
+StartupWMClass=com.jdesroches.AgentTerminal
+Icon=com.jdesroches.AgentTerminal
+Terminal=false
+StartupNotify=true
+Categories=Development;System;TerminalEmulator;
+Keywords=ai;terminal;agent;claude;gemini;agy;cli;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=agent-terminal

@@ -1,10 +1,10 @@
 [package]
-name = "antigravity-terminal"
-version = "1.0.0"
+name = "agent-terminal"
+version = "2.0.0"
 
 edition = "2021"
 authors = ["jdesroches"]
-description = "A standalone GTK4 terminal application for Antigravity AI"
+description = "A standalone GTK4 terminal for driving an AI coding CLI"
 
 [features]
 # The homelab Ansible-drift indicator in the header. On by default; build with
@@ -48,6 +48,13 @@ license-file = ["LICENSE", "0"]
 # libvte-2.91-gtk4-0 and the rest with proper version constraints. Listing them by
 # hand as well only produced duplicate entries with weaker bounds.
 depends = "$auto"
+# The package was renamed from antigravity-terminal in 2.0.0. These three fields
+# are what let apt retire the old package instead of leaving it installed
+# alongside this one forever; the transitional stub in packaging/ is the other
+# half (it depends on this package, so an upgrade pulls the rename through).
+provides = "antigravity-terminal"
+conflicts = "antigravity-terminal (<< 2.0.0)"
+replaces = "antigravity-terminal (<< 2.0.0)"
 # Without this, cargo-deb uses README.md as the extended description and the whole
 # document — markdown, code fences and all — lands in the control file.
 extended-description = """
@@ -58,7 +65,7 @@ rendering, hyperlink support, and journald logging."""
 section = "utils"
 priority = "optional"
 assets = [
-    ["target/release/antigravity-terminal", "usr/bin/antigravity-terminal", "755"],
-    ["assets/antigravity-terminal.desktop", "usr/share/applications/antigravity-terminal.desktop", "644"],
-    ["assets/antigravity_logo.svg", "usr/share/icons/hicolor/scalable/apps/antigravity-terminal.svg", "644"],
+    ["target/release/agent-terminal", "usr/bin/agent-terminal", "755"],
+    ["assets/com.jdesroches.AgentTerminal.desktop", "usr/share/applications/com.jdesroches.AgentTerminal.desktop", "644"],
+    ["assets/com.jdesroches.AgentTerminal.svg", "usr/share/icons/hicolor/scalable/apps/com.jdesroches.AgentTerminal.svg", "644"],
 ]

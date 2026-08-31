@@ -1,7 +1,7 @@
-//! Antigravity Terminal
+//! Agent Terminal
 //!
-//! A standalone GTK4 terminal application specifically themed and configured
-//! for interacting with Antigravity AI.
+//! A standalone GTK4 terminal purpose-built for driving an AI coding CLI
+//! (Claude, Antigravity/`agy`, or Gemini) in a focused, tabbed window.
 
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
@@ -14,16 +14,16 @@ pub mod config;
 mod theme;
 mod utils;
 mod window;
-use window::AntigravityWindow;
+use window::AgentTerminalWindow;
 
-const APP_ID: &str = "com.jdesroches.AntigravityTerminal";
+const APP_ID: &str = "com.jdesroches.AgentTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
     init_logging();
 
     info!(
-        "Starting Antigravity Terminal (v{})...",
+        "Starting Agent Terminal (v{})...",
         env!("CARGO_PKG_VERSION")
     );
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -51,7 +51,7 @@ fn main() -> glib::ExitCode {
 
     app.connect_activate(|app| {
         info!("Application activated: creating window");
-        let window = AntigravityWindow::new(app);
+        let window = AgentTerminalWindow::new(app);
         info!("Window created, presenting...");
         window.present();
         info!("Window presented");
@@ -66,7 +66,7 @@ fn main() -> glib::ExitCode {
 /// Initializes logging.
 ///
 /// Prefers the systemd journal so a desktop-launched session is discoverable
-/// with `journalctl --user -t antigravity-terminal -b`, and falls back to
+/// with `journalctl --user -t agent-terminal -b`, and falls back to
 /// stderr (used by `make start-local`) when the journal is unavailable. Level
 /// defaults to `info` and is overridable via `RUST_LOG`. Also installs a panic
 /// hook so a crash lands in the log instead of vanishing with the process.
@@ -76,7 +76,7 @@ fn init_logging() {
     // Send everything to the journal for desktop-launched sessions. Option<Layer>
     // is itself a no-op Layer, so a missing journal just drops this layer.
     let journald_layer = tracing_journald::layer()
-        .map(|layer| layer.with_syslog_identifier("antigravity-terminal".to_string()))
+        .map(|layer| layer.with_syslog_identifier("agent-terminal".to_string()))
         .map_err(|err| eprintln!("journald unavailable ({err}); relying on stderr"))
         .ok();
 

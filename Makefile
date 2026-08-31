@@ -1,13 +1,14 @@
-# Makefile for Antigravity Terminal
+# Makefile for Agent Terminal
 
-APP_NAME = antigravity-terminal
+APP_NAME = agent-terminal
 BINARY = target/release/$(APP_NAME)
-DESKTOP_FILE = assets/antigravity-terminal.desktop
-ICON_FILE = assets/antigravity_logo.svg
+APP_ID = com.jdesroches.AgentTerminal
+DESKTOP_FILE = assets/$(APP_ID).desktop
+ICON_FILE = assets/$(APP_ID).svg
 LOCAL_BIN = $(HOME)/.local/bin
-LOCAL_DESKTOP = $(HOME)/.local/share/applications/antigravity-terminal.desktop
+LOCAL_DESKTOP = $(HOME)/.local/share/applications/$(APP_ID).desktop
 LOCAL_ICON_DIR = $(HOME)/.local/share/icons/hicolor/scalable/apps
-LOCAL_ICON = $(LOCAL_ICON_DIR)/antigravity-terminal.svg
+LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 
 .PHONY: all build start-local clean install uninstall package deps help
 
@@ -56,7 +57,7 @@ install: build
 	@# lookup resolves it the same way the .deb-installed one does.
 	-update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
 	-gtk4-update-icon-cache -q -t -f $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
-	@echo "Done! You can now launch Antigravity Terminal from your menu."
+	@echo "Done! You can now launch Agent Terminal from your menu."
 
 uninstall:
 	@echo "Uninstalling $(APP_NAME) from $(LOCAL_BIN)..."
