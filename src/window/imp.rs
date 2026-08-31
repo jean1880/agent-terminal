@@ -86,6 +86,46 @@ fn build_loading_box() -> Box {
     loading_box
 }
 
+/// The three environment values CLI detection needs, read on the main thread so
+/// they can be moved to a worker.
+fn env_triplet() -> (Option<String>, Option<String>, Option<String>) {
+    (
+        env::var("PATH").ok(),
+        env::var("HOME").ok(),
+        env::var("SHELL").ok(),
+    )
+}
+
+/// Resolves the CLI binary for `client` without blocking the main thread.
+///
+/// Detection runs `which`, stats a handful of paths, and finally `$SHELL -ic`,
+/// which sources the user's rc file — seconds on a heavy shell, during which the
+/// window previously could not even repaint. The result is cached process-wide,
+/// so a second window or a settings change never pays for it twice.
+async fn resolve_cli_binary(
+    client: crate::config::CliClient,
+    path: Option<String>,
+    home: Option<String>,
+    shell: Option<String>,
+) -> Option<String> {
+    if let Some(cached) = crate::utils::cached_cli_binary(client) {
+        debug!("Reusing cached CLI detection for {:?}", client);
+        return cached;
+    }
+
+    let detected = gtk4::gio::spawn_blocking(move || {
+        detect_cli_binary(client, path.as_deref(), home.as_deref(), shell.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| {
+        error!("CLI detection panicked on the worker thread; treating as not found");
+        None
+    });
+
+    crate::utils::cache_cli_binary(client, detected.clone());
+    detected
+}
+
 /// Internal state for the AntigravityWindow.
 #[derive(Default)]
 pub struct AntigravityWindow {
@@ -99,6 +139,9 @@ pub struct AntigravityWindow {
     /// re-run detection (which may block on an interactive shell) on the UI
     /// thread. Refreshed when the configured client changes.
     pub detected_binary: RefCell<Option<String>>,
+    /// A queued config save, cancelled and re-armed whenever a setting changes
+    /// again before it fires. Held so it can also be flushed on window close.
+    pending_save: RefCell<Option<glib::SourceId>>,
 }
 
 #[glib::object_subclass]
@@ -118,7 +161,15 @@ impl ObjectImpl for AntigravityWindow {
 }
 
 impl WidgetImpl for AntigravityWindow {}
-impl WindowImpl for AntigravityWindow {}
+
+impl WindowImpl for AntigravityWindow {
+    /// Flushes any debounced config save before the window goes away, so a quick
+    /// zoom-then-quit does not lose the change it was still waiting to write.
+    fn close_request(&self) -> glib::Propagation {
+        self.flush_pending_save();
+        self.parent_close_request()
+    }
+}
 impl ApplicationWindowImpl for AntigravityWindow {}
 impl AdwApplicationWindowImpl for AntigravityWindow {}
 
@@ -148,20 +199,6 @@ impl AntigravityWindow {
             .iter()
             .find(|t| t.page == page)
             .map(|t| t.dir.clone())
-    }
-
-    /// Detects the CLI binary for the currently configured client.
-    fn detect_current_client(&self) -> Option<String> {
-        let path = env::var("PATH").ok();
-        let home = env::var("HOME").ok();
-        let shell = env::var("SHELL").ok();
-        let selected_client = self.config.borrow().cli_client;
-        detect_cli_binary(
-            selected_client,
-            path.as_deref(),
-            home.as_deref(),
-            shell.as_deref(),
-        )
     }
 
     /// Sets up GAction handlers for context menu items.
@@ -333,37 +370,32 @@ impl AntigravityWindow {
         *self.header.borrow_mut() = Some(header);
         *self.window_title.borrow_mut() = Some(window_title);
 
-        // Show a temporary "Detecting" state
+        // Show a temporary "Detecting" state. A live spinner, not a static icon:
+        // detection now runs off the main thread, so this page can actually
+        // animate rather than being a frozen placeholder.
+        let spinner = gtk4::Spinner::builder()
+            .spinning(true)
+            .width_request(32)
+            .height_request(32)
+            .build();
         let status_page = adw::StatusPage::builder()
-            .title("Initializing...")
-            .description("Checking for Antigravity CLI environment...")
-            .icon_name("view-refresh-symbolic")
+            .title("Starting up…")
+            .description("Looking for an AI CLI…")
             .vexpand(true)
+            .child(&spinner)
             .build();
 
         content.append(&status_page);
         obj.set_content(Some(&content));
 
-        // Use spawn_local to handle UI state without leaving the main thread
-        let path = env::var("PATH").ok();
-        let home = env::var("HOME").ok();
-        let shell = env::var("SHELL").ok();
+        let selected_client = self.config.borrow().cli_client;
+        let (path, home, shell) = env_triplet();
 
         glib::MainContext::default().spawn_local(
             glib::clone!(@weak obj, @weak content => async move {
-                // Give the UI one frame to render the "Initializing" screen
-                glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                let detected = resolve_cli_binary(selected_client, path, home, shell).await;
 
-                // Perform the detection. We do this here as it's the simplest way
-                // to keep obj/content on the main thread.
                 let imp = obj.imp();
-                let selected_client = imp.config.borrow().cli_client;
-                let detected = detect_cli_binary(
-                    selected_client,
-                    path.as_deref(),
-                    home.as_deref(),
-                    shell.as_deref(),
-                );
                 *imp.detected_binary.borrow_mut() = detected.clone();
 
                 content.remove(&status_page);
@@ -736,13 +768,48 @@ impl AntigravityWindow {
         terminal.add_controller(key_controller);
     }
 
-    /// Sets the font scale on all tabs and persists it.
+    /// Sets the font scale on all tabs and queues a save.
     fn set_font_scale(&self, scale: f64) {
         debug!("Setting font scale: {}", scale);
         self.for_each_terminal(|term| term.set_font_scale(scale));
-        let mut config = self.config.borrow_mut();
-        config.font_scale = scale;
-        config.save();
+        self.config.borrow_mut().font_scale = scale;
+        self.schedule_config_save();
+    }
+
+    /// Persists the config once changes have settled.
+    ///
+    /// Zoom shortcuts repeat many times a second while a key is held, and the
+    /// previous behaviour rewrote config.json on every one of them. Re-arming a
+    /// single timer coalesces a burst into one write; [`Self::flush_pending_save`]
+    /// covers the case where the window closes before it fires.
+    fn schedule_config_save(&self) {
+        const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+        if let Some(pending) = self.pending_save.borrow_mut().take() {
+            pending.remove();
+        }
+
+        let obj = self.obj();
+        let source = glib::timeout_add_local_once(
+            SAVE_DEBOUNCE,
+            glib::clone!(@weak obj => move || {
+                let imp = obj.imp();
+                // The source fires once and is consumed; clear it before saving so
+                // flush_pending_save cannot try to remove an already-dead source.
+                imp.pending_save.replace(None);
+                imp.config.borrow().save();
+            }),
+        );
+        self.pending_save.replace(Some(source));
+    }
+
+    /// Cancels a queued save and writes immediately, if one was pending.
+    fn flush_pending_save(&self) {
+        if let Some(pending) = self.pending_save.borrow_mut().take() {
+            pending.remove();
+            debug!("Flushing pending config save");
+            self.config.borrow().save();
+        }
     }
 
     /// Spawns the shell/CLI in the terminal and reveals it once output appears.
@@ -755,20 +822,29 @@ impl AntigravityWindow {
     ) {
         let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let config = self.config.borrow().clone();
-        let command = get_startup_command(cli_binary, &config);
+        let command = get_startup_command(cli_binary);
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
             shell, command
         );
 
-        // Switch off the loading screen as soon as the command prints anything.
-        terminal.connect_contents_changed(glib::clone!(@weak stack => move |_| {
-            if stack.visible_child_name().as_deref() == Some("loading") {
-                debug!("Terminal content detected, switching from loading screen");
-                stack.set_visible_child_name("terminal");
-            }
-        }));
+        // Switch off the loading screen as soon as the command prints anything,
+        // then disconnect: this signal fires on every screen update for the life
+        // of the tab, and after the first one there is nothing left for it to do.
+        let reveal_handler: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =
+            std::rc::Rc::new(RefCell::new(None));
+        let handler_id = terminal.connect_contents_changed(
+            glib::clone!(@weak stack, @strong reveal_handler => move |terminal| {
+                if stack.visible_child_name().as_deref() == Some("loading") {
+                    debug!("Terminal content detected, switching from loading screen");
+                    stack.set_visible_child_name("terminal");
+                }
+                if let Some(id) = reveal_handler.borrow_mut().take() {
+                    terminal.disconnect(id);
+                }
+            }),
+        );
+        reveal_handler.replace(Some(handler_id));
 
         // Inherit the current user environment, then guarantee terminal
         // capability vars so Claude Code renders its full TUI (status line, etc.).
@@ -858,17 +934,6 @@ impl AntigravityWindow {
         let group = adw::PreferencesGroup::new();
         group.set_title("Terminal Preferences");
 
-        let startup_script_entry = gtk4::Entry::builder()
-            .text(&config.startup_script)
-            .hexpand(true)
-            .valign(gtk4::Align::Center)
-            .build();
-
-        let startup_script_row = adw::ActionRow::builder()
-            .title("Startup Script Path")
-            .build();
-        startup_script_row.add_suffix(&startup_script_entry);
-
         let starting_directory_entry = gtk4::Entry::builder()
             .text(&config.starting_directory)
             .hexpand(true)
@@ -938,7 +1003,6 @@ impl AntigravityWindow {
             .selected(theme_index)
             .build();
 
-        group.add(&startup_script_row);
         group.add(&starting_directory_row);
         group.add(&scrollback_row);
         group.add(&font_scale_row);
@@ -951,7 +1015,6 @@ impl AntigravityWindow {
             @weak obj,
             @weak cli_client_row,
             @weak theme_row,
-            @weak startup_script_entry,
             @weak starting_directory_entry,
             @weak scroll_spin,
             @weak font_scale_spin => @default-return glib::Propagation::Proceed, move |_win| {
@@ -974,7 +1037,6 @@ impl AntigravityWindow {
                 let mut dir_changed = false;
                 {
                     let mut current_config = imp.config.borrow_mut();
-                    current_config.startup_script = startup_script_entry.text().to_string();
                     let new_dir = starting_directory_entry.text().to_string();
                     if new_dir != previous_dir {
                         dir_changed = true;
@@ -999,14 +1061,22 @@ impl AntigravityWindow {
                 // Themes apply live to every open tab; no restart needed.
                 imp.for_each_terminal(|term| Theme::apply(term, selected_theme));
 
-                if selected_client != previous_client {
-                    // Re-resolve the binary so new tabs and the restart use it.
-                    *imp.detected_binary.borrow_mut() = imp.detect_current_client();
-                }
-
                 if selected_client != previous_client || dir_changed {
                     info!("CLI client or starting directory changed, restarting terminal session");
-                    imp.restart_current_tab();
+                    // Re-resolving the client can shell out, so it goes through the
+                    // same off-thread path as startup rather than freezing the
+                    // window as the settings dialog closes.
+                    let client_changed = selected_client != previous_client;
+                    let (path, home, shell) = env_triplet();
+                    glib::MainContext::default().spawn_local(glib::clone!(@weak obj => async move {
+                        let imp = obj.imp();
+                        if client_changed {
+                            let detected =
+                                resolve_cli_binary(selected_client, path, home, shell).await;
+                            *imp.detected_binary.borrow_mut() = detected;
+                        }
+                        imp.restart_current_tab();
+                    }));
                 }
 
                 glib::Propagation::Proceed
