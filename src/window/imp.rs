@@ -1,4 +1,4 @@
-//! Private implementation details of the AntigravityWindow.
+//! Private implementation details of the AgentTerminalWindow.
 
 use crate::theme::Theme;
 use crate::utils::{detect_cli_binary, get_startup_command, resolve_working_directory};
@@ -13,7 +13,7 @@ use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 
 /// Static logo SVG for standalone binary.
-const LOGO_SVG: &str = include_str!("../../assets/antigravity_logo.svg");
+const LOGO_SVG: &str = include_str!("../../assets/com.jdesroches.AgentTerminal.svg");
 
 /// Per-tab state, tracked explicitly so terminal/directory lookups never depend
 /// on walking the tab's widget hierarchy. `dir` is the directory the tab was
@@ -139,12 +139,12 @@ fn build_loading_box() -> Box {
     };
 
     let loading_label = Label::builder()
-        .label("Antigravity is calculating...")
+        .label("Starting your session…")
         .css_classes(["loading-text"])
         .build();
 
     let loading_sub = Label::builder()
-        .label("Spawning secure terminal session")
+        .label("Spawning terminal session")
         .css_classes(["loading-subtext"])
         .build();
 
@@ -197,7 +197,7 @@ async fn resolve_cli_binary(
 }
 
 /// Presents a one-button informational dialog anchored to `parent`.
-fn present_message(parent: &super::AntigravityWindow, heading: &str, body: &str) {
+fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &str) {
     let dialog = adw::AlertDialog::new(Some(heading), Some(body));
     dialog.add_response("ok", "OK");
     dialog.set_default_response(Some("ok"));
@@ -205,9 +205,9 @@ fn present_message(parent: &super::AntigravityWindow, heading: &str, body: &str)
     dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
 }
 
-/// Internal state for the AntigravityWindow.
+/// Internal state for the AgentTerminalWindow.
 #[derive(Default)]
-pub struct AntigravityWindow {
+pub struct AgentTerminalWindow {
     pub header: RefCell<Option<adw::HeaderBar>>,
     pub window_title: RefCell<Option<adw::WindowTitle>>,
     pub tab_view: RefCell<Option<adw::TabView>>,
@@ -224,13 +224,13 @@ pub struct AntigravityWindow {
 }
 
 #[glib::object_subclass]
-impl ObjectSubclass for AntigravityWindow {
-    const NAME: &'static str = "AntigravityWindow";
-    type Type = super::AntigravityWindow;
+impl ObjectSubclass for AgentTerminalWindow {
+    const NAME: &'static str = "AgentTerminalWindow";
+    type Type = super::AgentTerminalWindow;
     type ParentType = adw::ApplicationWindow;
 }
 
-impl ObjectImpl for AntigravityWindow {
+impl ObjectImpl for AgentTerminalWindow {
     fn constructed(&self) {
         self.parent_constructed();
         *self.config.borrow_mut() = crate::config::TerminalConfig::load();
@@ -239,9 +239,9 @@ impl ObjectImpl for AntigravityWindow {
     }
 }
 
-impl WidgetImpl for AntigravityWindow {}
+impl WidgetImpl for AgentTerminalWindow {}
 
-impl WindowImpl for AntigravityWindow {
+impl WindowImpl for AgentTerminalWindow {
     /// Flushes any debounced config save before the window goes away, so a quick
     /// zoom-then-quit does not lose the change it was still waiting to write.
     fn close_request(&self) -> glib::Propagation {
@@ -249,10 +249,10 @@ impl WindowImpl for AntigravityWindow {
         self.parent_close_request()
     }
 }
-impl ApplicationWindowImpl for AntigravityWindow {}
-impl AdwApplicationWindowImpl for AntigravityWindow {}
+impl ApplicationWindowImpl for AgentTerminalWindow {}
+impl AdwApplicationWindowImpl for AgentTerminalWindow {}
 
-impl AntigravityWindow {
+impl AgentTerminalWindow {
     /// Returns the terminal of the currently selected tab, if any.
     fn current_terminal(&self) -> Option<Terminal> {
         let page = self.tab_view.borrow().as_ref()?.selected_page()?;
@@ -451,16 +451,16 @@ impl AntigravityWindow {
     /// Initializes the user interface, switching between terminal and welcome screen.
     fn setup_ui(&self) {
         let obj = self.obj();
-        debug!("Setting up UI for Antigravity Terminal");
+        debug!("Setting up UI for Agent Terminal");
 
         obj.set_default_width(950);
         obj.set_default_height(650);
-        obj.set_title(Some("Antigravity Terminal"));
+        obj.set_title(Some("Agent Terminal"));
 
         let content = Box::builder().orientation(Orientation::Vertical).build();
 
         // Modern AdwHeaderBar
-        let window_title = adw::WindowTitle::new("Antigravity Terminal", "");
+        let window_title = adw::WindowTitle::new("Agent Terminal", "");
         let header = adw::HeaderBar::builder()
             .title_widget(&window_title)
             .build();
@@ -623,9 +623,9 @@ impl AntigravityWindow {
                     window_title.set_subtitle(&session_info);
                 }
                 if session_info.is_empty() {
-                    obj.set_title(Some("Antigravity Terminal"));
+                    obj.set_title(Some("Agent Terminal"));
                 } else {
-                    obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+                    obj.set_title(Some(&format!("Agent Terminal — {}", session_info)));
                 }
             }
         ));
@@ -848,9 +848,9 @@ impl AntigravityWindow {
                 if let Some(window_title) = imp.window_title.borrow().as_ref() {
                     window_title.set_subtitle(session_info);
                     if session_info.is_empty() {
-                        obj.set_title(Some("Antigravity Terminal"));
+                        obj.set_title(Some("Agent Terminal"));
                     } else {
-                        obj.set_title(Some(&format!("Antigravity Terminal — {}", session_info)));
+                        obj.set_title(Some(&format!("Agent Terminal — {}", session_info)));
                     }
                 };
             }
@@ -1180,15 +1180,44 @@ impl AntigravityWindow {
     fn setup_welcome_ui(&self, container: &Box) {
         let obj = self.obj();
 
+        // Name whichever client is actually configured. The previous copy told
+        // every user to install `agy` from antigravity.google even when they had
+        // explicitly selected Claude.
+        let configured = self.config.borrow().cli_client;
+        let description = match configured {
+            crate::config::CliClient::Auto => concat!(
+                "No supported AI CLI was found. Your PATH and interactive shell ",
+                "environment (-ic) were both checked for claude, agy and gemini.\n\n",
+                "Install one of them, or pick a specific client in Settings, then ",
+                "check again."
+            )
+            .to_string(),
+            other => format!(
+                concat!(
+                    "{} is selected in Settings, but its command was not found. Your ",
+                    "PATH and interactive shell environment (-ic) were both checked ",
+                    "for `{}`.\n\nInstall it, or choose a different client in ",
+                    "Settings, then check again."
+                ),
+                other,
+                match other {
+                    crate::config::CliClient::Claude => "claude",
+                    crate::config::CliClient::Agy => "agy",
+                    crate::config::CliClient::Gemini => "gemini",
+                    crate::config::CliClient::Auto => unreachable!("handled above"),
+                }
+            ),
+        };
+
         let status_page = adw::StatusPage::builder()
-            .title("Welcome to Antigravity Terminal")
-            .description("The Antigravity CLI was not detected on your system. We checked your PATH and interactive shell environment (-ic).\n\nTo get started, please install it using the official script:\ncurl -fsSL https://antigravity.google/cli/install.sh | bash\n\nThen launch it:\nagy")
+            .title("No AI CLI detected")
+            .description(description)
             .icon_name("utilities-terminal-symbolic")
             .vexpand(true)
             .build();
 
         let refresh_button = Button::builder()
-            .label("Check for agy again")
+            .label("Check again")
             .halign(Align::Center)
             .margin_top(20)
             .css_classes(["suggested-action"])
@@ -1475,8 +1504,8 @@ mod tests {
         let app = adw::Application::builder()
             .application_id("org.test.Window")
             .build();
-        let window = super::super::AntigravityWindow::new(&app);
+        let window = super::super::AgentTerminalWindow::new(&app);
 
-        assert_eq!(window.title(), Some("Antigravity Terminal".into()));
+        assert_eq!(window.title(), Some("Agent Terminal".into()));
     }
 }

@@ -1,6 +1,6 @@
-# Skill: Antigravity Terminal Architect
+# Skill: Agent Terminal Architect
 
-Specialized guidance for maintaining and extending the `antigravity-terminal` application.
+Specialized guidance for maintaining and extending the `agent-terminal` application.
 
 ## 🎯 Expertise
 - **GTK4/Rust (glib-rs)**: Expert in the GObject subclassing pattern and signal handling.
@@ -27,7 +27,7 @@ When modifying how the terminal launches or interacts with the shell:
 ## 🗺️ File map
 - `src/main.rs` — app setup, logging (journald + panic hook), global CSS, accelerators.
 - `src/window/imp.rs` — GTK window: tabs, terminal spawning, input controllers, settings.
-- `src/window/mod.rs` — the `AntigravityWindow` GObject wrapper.
+- `src/window/mod.rs` — the `AgentTerminalWindow` GObject wrapper.
 - `src/config.rs` — persisted settings (`TerminalConfig`, `CliClient`, `ThemeChoice`).
 - `src/theme.rs` — terminal colour schemes, built via infallible `RGBA::new`.
 - `src/utils.rs` — pure logic: CLI detection, startup command, directory resolution.
@@ -38,4 +38,4 @@ Keep pure logic in `config.rs`/`utils.rs` so it stays unit-testable without a di
 ## 📏 Standards
 - **Naming**: Use `CamelCase` for structs/types and `snake_case` for methods/variables.
 - **Safety**: Prefer safe wrappers over `unsafe` blocks. If `unsafe` is necessary (rare in this project), document the invariants clearly.
-- **Visuals**: Maintain the "Antigravity Theme". Interactive elements should have subtle hover/active states consistent with the current UI.
+- **Visuals**: Maintain the Antigravity brand chrome (the default theme keeps that name). Interactive elements should have subtle hover/active states consistent with the current UI.

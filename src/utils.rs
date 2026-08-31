@@ -1,4 +1,4 @@
-//! Utility functions for Antigravity Terminal.
+//! Utility functions for Agent Terminal.
 
 use crate::config::CliClient;
 use std::cell::RefCell;

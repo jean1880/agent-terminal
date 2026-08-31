@@ -105,7 +105,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            startup_script: "~/.config/antigravity-terminal/startup.sh".to_string(),
+            startup_script: "~/.config/agent-terminal/startup.sh".to_string(),
             scrollback_lines: 10000,
             font_scale: 1.0,
             cli_client: CliClient::default(),
@@ -118,9 +118,7 @@ impl Default for TerminalConfig {
 impl TerminalConfig {
     pub fn config_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let dir = PathBuf::from(home)
-            .join(".config")
-            .join("antigravity-terminal");
+        let dir = PathBuf::from(home).join(".config").join("agent-terminal");
         if !dir.exists() {
             let _ = fs::create_dir_all(&dir);
         }
@@ -131,8 +129,38 @@ impl TerminalConfig {
         Self::config_dir().join("config.json")
     }
 
+    /// The pre-2.0 configuration directory, kept only so settings can be carried
+    /// across the rename.
+    fn legacy_config_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        PathBuf::from(home)
+            .join(".config")
+            .join("antigravity-terminal")
+            .join("config.json")
+    }
+
     pub fn load() -> Self {
-        Self::load_from(&Self::config_path())
+        Self::load_or_migrate(&Self::config_path(), &Self::legacy_config_path())
+    }
+
+    /// Loads the config, adopting a pre-rename one the first time if present.
+    ///
+    /// The old file is deliberately left in place rather than moved. Deleting it
+    /// would make a rollback to v1.x — which is `apt install antigravity-terminal`,
+    /// a *different package* — come up with no settings at all. Leaving it costs
+    /// one stale file and keeps the downgrade path intact.
+    fn load_or_migrate(path: &Path, legacy_path: &Path) -> Self {
+        if !path.exists() && legacy_path.exists() {
+            let migrated = Self::load_from(legacy_path);
+            warn!(
+                "Adopting settings from {} into {} (the original is left in place)",
+                legacy_path.display(),
+                path.display()
+            );
+            migrated.save_to(path);
+            return migrated;
+        }
+        Self::load_from(path)
     }
 
     /// Loads a config from an explicit path, falling back to defaults. A missing
@@ -377,6 +405,69 @@ mod tests {
             TerminalConfig::default().scrollback_lines
         );
         assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+    }
+
+    #[test]
+    fn adopts_a_pre_rename_config_without_destroying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("antigravity-terminal.json");
+        let current = dir.path().join("agent-terminal.json");
+
+        let original = TerminalConfig {
+            scrollback_lines: 4242,
+            theme: ThemeChoice::Nord,
+            ..Default::default()
+        };
+        original.save_to(&legacy);
+
+        let migrated = TerminalConfig::load_or_migrate(&current, &legacy);
+        assert_eq!(migrated.scrollback_lines, 4242);
+        assert_eq!(migrated.theme, ThemeChoice::Nord);
+
+        // The settings must now exist under the new name...
+        assert!(current.exists(), "migration did not write the new config");
+        assert_eq!(TerminalConfig::load_from(&current).scrollback_lines, 4242);
+
+        // ...and the old file must survive, because rolling back to v1.x means
+        // reinstalling a differently-named package that reads only the old path.
+        assert!(legacy.exists(), "migration must not delete the old config");
+    }
+
+    #[test]
+    fn migration_does_not_clobber_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("antigravity-terminal.json");
+        let current = dir.path().join("agent-terminal.json");
+
+        TerminalConfig {
+            scrollback_lines: 100,
+            ..Default::default()
+        }
+        .save_to(&legacy);
+        TerminalConfig {
+            scrollback_lines: 900,
+            ..Default::default()
+        }
+        .save_to(&current);
+
+        // Already migrated once: the new file wins from then on.
+        assert_eq!(
+            TerminalConfig::load_or_migrate(&current, &legacy).scrollback_lines,
+            900
+        );
+    }
+
+    #[test]
+    fn missing_both_configs_yields_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = TerminalConfig::load_or_migrate(
+            &dir.path().join("new.json"),
+            &dir.path().join("old.json"),
+        );
+        assert_eq!(
+            loaded.scrollback_lines,
+            TerminalConfig::default().scrollback_lines
+        );
     }
 
     #[test]
