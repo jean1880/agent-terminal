@@ -23,6 +23,76 @@ struct TabState {
     page: adw::TabPage,
     terminal: Terminal,
     dir: String,
+    /// Holds the loading screen and the terminal. Kept so a session that dies
+    /// before printing anything can still be switched into view — otherwise the
+    /// tab would sit on the loading screen with the error hidden behind it.
+    stack: Stack,
+    /// Revealed when a session exits non-zero, instead of closing the tab.
+    exit_bar: Box,
+    exit_label: Label,
+    /// When the session was spawned, used to tell a failure to launch apart from
+    /// a crash part-way through a session.
+    spawned_at: std::time::Instant,
+}
+
+/// Renders VTE's `child-exited` status as something a person can act on.
+///
+/// The signal carries the raw `waitpid` status, not an exit code — a CLI exiting
+/// 1 arrives here as 256 — so reporting it verbatim would put a meaningless
+/// number in front of the user.
+fn describe_exit(status: i32) -> String {
+    use std::os::unix::process::ExitStatusExt;
+
+    let exit = std::process::ExitStatus::from_raw(status);
+    if let Some(code) = exit.code() {
+        format!("exit status {code}")
+    } else if let Some(signal) = exit.signal() {
+        format!("killed by signal {signal}")
+    } else {
+        format!("wait status {status}")
+    }
+}
+
+/// Whether a `child-exited` status represents an ordinary, deliberate exit.
+fn exited_cleanly(status: i32) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(status).code() == Some(0)
+}
+
+/// A session that exits non-zero used to take its tab — and, if it was the last
+/// tab, the whole window — with it, so a CLI that panicked left nothing on
+/// screen to read. This bar replaces that: the tab stays, the scrollback stays,
+/// and the exit is stated with a way to recover.
+fn build_exit_bar() -> (Box, Label, Button, Button) {
+    let bar = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .visible(false)
+        .css_classes(["exit-bar"])
+        .build();
+
+    let label = Label::builder()
+        .hexpand(true)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["exit-bar-text"])
+        .build();
+
+    let restart = Button::builder()
+        .label("Restart")
+        .valign(Align::Center)
+        .css_classes(["suggested-action"])
+        .build();
+
+    let close = Button::builder()
+        .label("Close Tab")
+        .valign(Align::Center)
+        .build();
+
+    bar.append(&label);
+    bar.append(&restart);
+    bar.append(&close);
+    (bar, label, restart, close)
 }
 
 /// Builds the centered logo + text shown while a session is starting.
@@ -253,6 +323,28 @@ impl AntigravityWindow {
             }
         ));
         obj.add_action(&new_tab_action);
+
+        // Restart Session Action. restart_tab already existed with exactly the
+        // right semantics but was reachable only as a side effect of closing the
+        // settings dialog — there was no way to ask for it directly.
+        let restart_action = gtk4::gio::SimpleAction::new("restart-tab", None);
+        restart_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Restart Session");
+                let imp = obj.imp();
+                let page = imp
+                    .tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|v| v.selected_page());
+                if let Some(page) = page {
+                    imp.restart_tab(&page);
+                }
+            }
+        ));
+        obj.add_action(&restart_action);
 
         // New Tab in Folder Action (opens a folder picker)
         let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
@@ -634,7 +726,14 @@ impl AntigravityWindow {
         stack.add_named(&scrolled, Some("terminal"));
         stack.set_visible_child_name("loading");
 
-        // Add the stack as a new tab page and focus it.
+        // The page holds an (initially hidden) exit bar above the stack, so a
+        // dead session can report itself without the tab being torn down.
+        let (exit_bar, exit_label, restart_btn, close_btn) = build_exit_bar();
+        let tab_content = Box::builder().orientation(Orientation::Vertical).build();
+        tab_content.append(&exit_bar);
+        tab_content.append(&stack);
+
+        // Add the page and focus it.
         let tab_view = match self.tab_view.borrow().as_ref() {
             Some(view) => view.clone(),
             None => {
@@ -642,9 +741,29 @@ impl AntigravityWindow {
                 return;
             }
         };
-        let page = tab_view.append(&stack);
+        let page = tab_view.append(&tab_content);
         page.set_title("Terminal");
         tab_view.set_selected_page(&page);
+
+        let obj = self.obj();
+        restart_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            page,
+            move |_| obj.imp().restart_tab(&page)
+        ));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            page,
+            move |_| {
+                if let Some(view) = obj.imp().tab_view.borrow().as_ref() {
+                    view.close_page(&page);
+                }
+            }
+        ));
 
         self.configure_terminal(&terminal);
         self.wire_tab_signals(&terminal, &page);
@@ -662,6 +781,10 @@ impl AntigravityWindow {
             page: page.clone(),
             terminal: terminal.clone(),
             dir: work_dir.clone(),
+            stack: stack.clone(),
+            exit_bar,
+            exit_label,
+            spawned_at: std::time::Instant::now(),
         });
 
         self.spawn_session(&terminal, &stack, cli_binary, &work_dir);
@@ -733,20 +856,78 @@ impl AntigravityWindow {
             }
         ));
 
-        // Close this tab when its session ends. Closing the last tab closes the
-        // window (see the n-pages handler).
+        // A clean exit closes the tab, as before — that is someone typing `exit`
+        // or Ctrl-D and expecting the tab to go away. A non-zero exit does NOT:
+        // it used to close the tab and, if it was the last one, the whole window,
+        // so a CLI that panicked took its own stack trace off screen before it
+        // could be read.
         terminal.connect_child_exited(glib::clone!(
             #[weak]
             obj,
             #[weak]
             page,
             move |_, status| {
-                info!("Terminal child exited with status: {}", status);
-                if let Some(tab_view) = obj.imp().tab_view.borrow().as_ref() {
-                    tab_view.close_page(&page);
-                };
+                info!("Terminal child exited: {}", describe_exit(status));
+                let imp = obj.imp();
+                if exited_cleanly(status) {
+                    if let Some(tab_view) = imp.tab_view.borrow().as_ref() {
+                        tab_view.close_page(&page);
+                    };
+                } else {
+                    imp.reveal_exit_bar(&page, status);
+                }
             }
         ));
+    }
+
+    /// Keeps a failed tab open and explains why, leaving the scrollback readable.
+    fn reveal_exit_bar(&self, page: &adw::TabPage, status: i32) {
+        // A session that dies almost immediately never really started — usually a
+        // missing binary or a shell rc that aborts — which is a different problem
+        // from a session that ran and then crashed, so say which one it was.
+        const LAUNCH_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let tabs = self.tabs.borrow();
+        let Some(tab) = tabs.iter().find(|t| &t.page == page) else {
+            warn!("Exit reported for a tab that is no longer tracked");
+            return;
+        };
+
+        let detail = describe_exit(status);
+        let message = if tab.spawned_at.elapsed() < LAUNCH_FAILURE_WINDOW {
+            format!("Session failed to start ({detail})")
+        } else {
+            format!("Session ended unexpectedly ({detail})")
+        };
+        tab.exit_label.set_label(&message);
+
+        // If the session died before printing anything the tab is still showing
+        // the loading screen, which would hide whatever it did manage to write.
+        tab.stack.set_visible_child_name("terminal");
+        tab.exit_bar.set_visible(true);
+        page.set_title("Session ended");
+    }
+
+    /// Replaces `page` with a fresh session rooted in the same directory.
+    ///
+    /// Distinct from [`Self::restart_current_tab`], which deliberately re-reads
+    /// the configured starting directory because that is what just changed. Here
+    /// the user is recovering a specific tab and expects to land back where they
+    /// were. Opening before closing keeps the window from dropping to zero tabs.
+    fn restart_tab(&self, page: &adw::TabPage) {
+        let Some(tab_view) = self.tab_view.borrow().clone() else {
+            return;
+        };
+        let dir = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page)
+            .map(|t| t.dir.clone());
+        let detected = self.detected_binary.borrow().clone();
+        info!("Restarting session in {:?}", dir);
+        self.add_terminal_tab(detected.as_deref(), dir.as_deref());
+        tab_view.close_page(page);
     }
 
     /// Attaches the right-click menu, ctrl-click hyperlink, and key shortcuts.
@@ -758,6 +939,7 @@ impl AntigravityWindow {
         menu.append(Some("New Tab"), Some("win.new-tab"));
         menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
         menu.append(Some("New Window"), Some("app.new-window"));
+        menu.append(Some("Restart Session"), Some("win.restart-tab"));
 
         let section = gtk4::gio::Menu::new();
         section.append(Some("Copy"), Some("win.copy"));
@@ -1264,6 +1446,27 @@ mod tests {
         if !gtk4::is_initialized_main_thread() {
             gtk4::init().expect("GTK init failed");
         }
+    }
+
+    #[test]
+    fn exit_status_is_decoded_not_echoed() {
+        // VTE hands over the raw waitpid status, so `exit 1` arrives as 256.
+        // Reporting that verbatim would show the user a meaningless number.
+        assert_eq!(describe_exit(256), "exit status 1");
+        assert_eq!(describe_exit(0), "exit status 0");
+        assert_eq!(describe_exit(2 << 8), "exit status 2");
+        // Low bits set means killed by a signal rather than a normal exit.
+        assert_eq!(describe_exit(9), "killed by signal 9");
+    }
+
+    #[test]
+    fn only_a_zero_exit_counts_as_clean() {
+        assert!(exited_cleanly(0));
+        assert!(!exited_cleanly(256), "exit 1 must not be treated as clean");
+        assert!(
+            !exited_cleanly(9),
+            "a signal death must not be treated as clean"
+        );
     }
 
     #[test]

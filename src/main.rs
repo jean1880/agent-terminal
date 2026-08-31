@@ -46,6 +46,7 @@ fn main() -> glib::ExitCode {
         // Bind Ctrl+Shift+T to the per-window "new tab" action. Using an app
         // accelerator means it is caught before VTE sees the key press.
         app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>T"]);
+        app.set_accels_for_action("win.restart-tab", &["<Ctrl><Shift>R"]);
     });
 
     app.connect_activate(|app| {
@@ -172,6 +173,15 @@ fn load_css() {
         .loading-subtext {
             font-size: 11pt;
             color: #a0a0ff;
+        }
+        .exit-bar {
+            background-color: #3a1f2b;
+            border-bottom: 1px solid #7a3b4c;
+            padding: 8px 12px;
+        }
+        .exit-bar-text {
+            color: #ffc4c4;
+            font-weight: bold;
         }
         .warning-indicator {
             color: #ff7878;
