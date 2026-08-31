@@ -244,6 +244,60 @@ pub struct TerminalConfig {
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
     pub indicators: Vec<Indicator>,
+    /// Environment variables removed from a spawned session's environment.
+    /// A trailing `*` matches by prefix. See [`default_clear_env`].
+    pub clear_env: Vec<String>,
+}
+
+/// Variables stripped from a session's inherited environment by default.
+///
+/// Sessions inherit the terminal's whole environment on purpose — that is how
+/// nvm- and asdf-managed CLIs stay reachable. But when the terminal is itself
+/// launched from inside an agent session, the *parent session's* identity comes
+/// along with it, and the CLI we spawn concludes it is a nested child of that
+/// session. The visible symptom is Claude Code disabling transcript saving with
+/// "inherited CLAUDE_CODE_CHILD_SESSION marker".
+///
+/// That is not an exotic case for this application: launching it from a terminal
+/// where you are already running an agent, or developing it, does exactly this.
+///
+/// The list is deliberately specific rather than a blanket `CLAUDE_CODE_*` sweep.
+/// That prefix also covers authentication (`CLAUDE_CODE_OAUTH_TOKEN`), provider
+/// selection (`CLAUDE_CODE_USE_BEDROCK`) and user preferences
+/// (`CLAUDE_CODE_ENABLE_TELEMETRY`) — settings people deliberately export and
+/// would be baffled to lose. Every name here was taken from the installed CLI's
+/// own string table, and each identifies a session or connects to one.
+pub fn default_clear_env() -> Vec<String> {
+    [
+        // "I am running inside an agent session", and which one.
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_CLOUD_SESSION_ID",
+        "CLAUDE_CODE_REMOTE_SESSION_ID",
+        "CLAUDE_CODE_REMOTE_SESSION_UUID",
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_PID",
+        // Handles onto the parent session — a socket and its token. Inheriting
+        // these points the new session's IPC at the old session.
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        // How the parent was started, and what it was doing.
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_PROCESS_WRAPPER",
+        "CLAUDE_CODE_SPAWN_TIMESTAMP_MS",
+        "CLAUDE_CODE_AGENT",
+        "CLAUDE_CODE_SUPERVISED",
+        "CLAUDE_CODE_TASK_LIST_ID",
+        "CLAUDE_CODE_TRIGGER_ID",
+        "CLAUDE_CODE_WORKER_EPOCH",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 /// The terminal cursor shape.
@@ -292,6 +346,7 @@ impl Default for TerminalConfig {
             notify_on_bell: false,
             restore_session: true,
             indicators: Vec::new(),
+            clear_env: default_clear_env(),
         }
     }
 }
