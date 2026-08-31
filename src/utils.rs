@@ -409,8 +409,14 @@ mod tests {
 
         assert!(keys.contains(&"AGENT_TERMINAL_TEST_ONLY"));
         // PATH and HOME are inherited unchanged, so they must not come back.
-        assert!(!keys.contains(&"PATH"), "inherited PATH leaked through: {keys:?}");
-        assert!(!keys.contains(&"HOME"), "inherited HOME leaked through: {keys:?}");
+        assert!(
+            !keys.contains(&"PATH"),
+            "inherited PATH leaked through: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"HOME"),
+            "inherited HOME leaked through: {keys:?}"
+        );
         assert!(!keys.contains(&"SHLVL"), "shell bookkeeping leaked through");
     }
 

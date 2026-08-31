@@ -43,10 +43,38 @@ fn main() -> glib::ExitCode {
         ));
         app.add_action(&new_window_action);
 
-        // Bind Ctrl+Shift+T to the per-window "new tab" action. Using an app
-        // accelerator means it is caught before VTE sees the key press.
-        app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>T"]);
-        app.set_accels_for_action("win.restart-tab", &["<Ctrl><Shift>R"]);
+        // All shortcuts are application accelerators bound to window actions, so
+        // they are caught before VTE sees the key press.
+        // Anything handled by a controller on the terminal widget stops working
+        // the moment focus moves — to the settings dialog, the search entry, a
+        // header button — which is exactly when a user reaches for copy or zoom.
+        for (action, accels) in [
+            ("win.new-tab", &["<Ctrl><Shift>T"][..]),
+            ("win.restart-tab", &["<Ctrl><Shift>R"]),
+            ("win.close-tab", &["<Ctrl><Shift>W"]),
+            ("win.copy", &["<Ctrl><Shift>C"]),
+            ("win.paste", &["<Ctrl><Shift>V"]),
+            ("win.search", &["<Ctrl><Shift>F"]),
+            // Both the shifted and unshifted key, so Ctrl+= works on layouts
+            // where + needs Shift.
+            (
+                "win.zoom-in",
+                &["<Ctrl>plus", "<Ctrl>equal", "<Ctrl>KP_Add"],
+            ),
+            ("win.zoom-out", &["<Ctrl>minus", "<Ctrl>KP_Subtract"]),
+            ("win.zoom-reset", &["<Ctrl>0", "<Ctrl>KP_0"]),
+            ("win.next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"]),
+            ("win.previous-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"]),
+        ] {
+            app.set_accels_for_action(action, accels);
+        }
+
+        // Alt+1..9 select a tab by position; Alt+9 means "last", as is
+        // conventional, rather than the ninth tab specifically.
+        for n in 1..=9i32 {
+            let index = if n == 9 { -1 } else { n - 1 };
+            app.set_accels_for_action(&format!("win.select-tab({index})"), &[&format!("<Alt>{n}")]);
+        }
     });
 
     app.connect_activate(|app| {
