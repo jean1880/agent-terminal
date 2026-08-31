@@ -214,6 +214,44 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Whether `name` matches a `clear_env` pattern.
+///
+/// Exact match, or prefix match when the pattern ends in `*`. Nothing fancier:
+/// environment variable names are simple, and a real glob would invite patterns
+/// whose blast radius is hard to reason about in a config file.
+fn matches_clear_pattern(name: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
+}
+
+/// Removes the configured variables from a `KEY=VALUE` environment block.
+///
+/// Returns the names removed, so the caller can log what it did — silently
+/// dropping a variable someone deliberately exported would be its own kind of
+/// mystery.
+pub fn strip_env(env: &mut Vec<String>, patterns: &[String]) -> Vec<String> {
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut removed = Vec::new();
+    env.retain(|entry| {
+        // An entry without '=' is malformed; leave it rather than guess.
+        let Some((name, _)) = entry.split_once('=') else {
+            return true;
+        };
+        if patterns.iter().any(|p| matches_clear_pattern(name, p)) {
+            removed.push(name.to_string());
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
 /// Expands a leading `~` to `$HOME`.
 ///
 /// Config values are hand-written, so people write `~/...` and expect it to work.
@@ -573,6 +611,75 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("dumb-for-test")
         );
+    }
+
+    #[test]
+    fn strip_env_removes_the_parent_session_markers() {
+        // The bug: a terminal launched from inside an agent session passed that
+        // session's identity to the CLI it spawned, which then treated itself as
+        // a nested child and turned off transcript saving.
+        let mut env = vec![
+            "PATH=/usr/bin".to_string(),
+            "CLAUDE_CODE_CHILD_SESSION=1".to_string(),
+            "CLAUDECODE=1".to_string(),
+            "CLAUDE_CODE_SESSION_ID=abc123".to_string(),
+            "HOME=/home/someone".to_string(),
+        ];
+        let removed = strip_env(&mut env, &crate::config::default_clear_env());
+
+        assert!(env.contains(&"PATH=/usr/bin".to_string()));
+        assert!(env.contains(&"HOME=/home/someone".to_string()));
+        assert!(!env.iter().any(|e| e.starts_with("CLAUDE")));
+        assert!(removed.contains(&"CLAUDE_CODE_CHILD_SESSION".to_string()));
+        assert_eq!(removed.len(), 3);
+    }
+
+    #[test]
+    fn strip_env_leaves_settings_that_share_the_prefix() {
+        // Why the default list is specific rather than a CLAUDE_CODE_* sweep:
+        // authentication, provider selection and user preferences share that
+        // prefix, and silently dropping them would break a working setup.
+        let mut env = vec![
+            "CLAUDE_CODE_OAUTH_TOKEN=secret".to_string(),
+            "CLAUDE_CODE_USE_BEDROCK=1".to_string(),
+            "CLAUDE_CODE_ENABLE_TELEMETRY=1".to_string(),
+            "CLAUDE_CONFIG_DIR=/home/someone/.claude".to_string(),
+        ];
+        let removed = strip_env(&mut env, &crate::config::default_clear_env());
+
+        assert!(removed.is_empty(), "unexpectedly removed {removed:?}");
+        assert_eq!(env.len(), 4);
+    }
+
+    #[test]
+    fn strip_env_supports_a_trailing_wildcard() {
+        let mut env = vec![
+            "MYAPP_SESSION=1".to_string(),
+            "MYAPP_TOKEN=x".to_string(),
+            "MYAPPLE=keep".to_string(),
+            "OTHER=keep".to_string(),
+        ];
+        let removed = strip_env(&mut env, &["MYAPP_*".to_string()]);
+
+        assert_eq!(removed.len(), 2);
+        assert!(env.contains(&"OTHER=keep".to_string()));
+        // The underscore is part of the prefix, so MYAPPLE is untouched.
+        assert!(env.contains(&"MYAPPLE=keep".to_string()));
+    }
+
+    #[test]
+    fn strip_env_with_no_patterns_changes_nothing() {
+        let mut env = vec!["A=1".to_string(), "B=2".to_string()];
+        assert!(strip_env(&mut env, &[]).is_empty());
+        assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn strip_env_leaves_malformed_entries_alone() {
+        // An entry with no '=' is not ours to interpret.
+        let mut env = vec!["NOT_AN_ASSIGNMENT".to_string(), "A=1".to_string()];
+        strip_env(&mut env, &["NOT_AN_ASSIGNMENT".to_string()]);
+        assert_eq!(env.len(), 2);
     }
 
     #[test]

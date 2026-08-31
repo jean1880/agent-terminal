@@ -1665,6 +1665,23 @@ impl AgentTerminalWindow {
             .iter()
             .map(|os| os.to_string_lossy().to_string())
             .collect();
+
+        // Drop the launching agent session's own identity before the new session
+        // sees it. Inheriting the environment wholesale is deliberate — it is how
+        // nvm- and asdf-managed CLIs stay reachable — but when this terminal was
+        // itself started from inside an agent session, the parent's session
+        // markers come with it and the CLI we spawn concludes it is a nested
+        // child. Stripping happens before the env_file merge below, so a profile
+        // can deliberately put any of these back.
+        let cleared = crate::utils::strip_env(&mut env_strs, &self.config.borrow().clear_env);
+        if !cleared.is_empty() {
+            info!(
+                "Cleared {} inherited session variable(s) from the child environment: {}",
+                cleared.len(),
+                cleared.join(", ")
+            );
+        }
+
         if !env_strs.iter().any(|s| s.starts_with("TERM=")) {
             env_strs.push("TERM=xterm-256color".to_string());
         }
