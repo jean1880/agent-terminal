@@ -2236,11 +2236,30 @@ mod tests {
     #[test]
     fn test_window_initialization() {
         init_gtk();
+
+        // Constructing a window loads (and may migrate) the configuration, which
+        // without this pointed at the developer's real ~/.config and wrote to it
+        // — a unit test with a side effect on the machine running it. Redirecting
+        // XDG_CONFIG_HOME keeps it in a temp directory.
+        //
+        // Safe despite tests running in parallel: this is the only test that
+        // reaches config_dir() at all, since the config tests all use explicit
+        // paths via load_from/save_to.
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+
         let app = adw::Application::builder()
             .application_id("org.test.Window")
             .build();
         let window = super::super::AgentTerminalWindow::new(&app);
 
         assert_eq!(window.title(), Some("Agent Terminal".into()));
+
+        // Prove the redirection actually took: configuration landed in the temp
+        // directory rather than anywhere near the real one.
+        assert!(
+            config_home.path().join("agent-terminal").exists(),
+            "window construction did not use the redirected config home"
+        );
     }
 }
