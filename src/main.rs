@@ -217,6 +217,11 @@ fn load_css() {
         .success-indicator {
             color: #4ee8b0;
         }
+        /* Deliberately distinct from both: an indicator whose source could not
+           be read must never be mistaken for a healthy one. */
+        .unknown-indicator {
+            color: #a0a0ff;
+        }
         ",
     );
     gtk4::style_context_add_provider_for_display(

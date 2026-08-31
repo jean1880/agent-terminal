@@ -92,6 +92,75 @@ fn default_profiles() -> Vec<Profile> {
         .collect()
 }
 
+/// Where an indicator gets its state from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum IndicatorSource {
+    /// Non-empty file contents mean "warn"; the contents are the detail.
+    File { path: String },
+    /// A non-zero exit means "warn"; stdout is the detail.
+    Command {
+        argv: Vec<String>,
+        #[serde(default = "default_indicator_timeout")]
+        timeout_secs: u64,
+    },
+}
+
+fn default_indicator_timeout() -> u64 {
+    10
+}
+
+/// What clicking an indicator does.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndicatorAction {
+    /// Show the detail in a dialog.
+    #[default]
+    ShowOutput,
+    /// Show the detail, with an explicit button to type it into the session.
+    ///
+    /// Deliberately still a preview: this writes unreviewed content into a live
+    /// agent's stdin, which is tolerable for a source you hard-coded yourself and
+    /// not for one anybody can configure.
+    SendToTerminal,
+}
+
+/// A header-bar status light driven by a file or a command.
+///
+/// Replaces a single hard-coded Ansible-drift button that read a path which no
+/// longer existed — and, because a missing file read as "no drift", reported
+/// itself permanently green. Nothing here can do that: an unreadable source is
+/// its own state with its own icon.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Indicator {
+    pub label: String,
+    pub source: IndicatorSource,
+    /// How often to re-check. `None` checks once at startup.
+    #[serde(default)]
+    pub refresh_secs: Option<u64>,
+    #[serde(default = "default_icon_ok")]
+    pub icon_ok: String,
+    #[serde(default = "default_icon_warn")]
+    pub icon_warn: String,
+    #[serde(default = "default_icon_unknown")]
+    pub icon_unknown: String,
+    #[serde(default)]
+    pub action: IndicatorAction,
+}
+
+fn default_icon_ok() -> String {
+    "security-high-symbolic".to_string()
+}
+fn default_icon_warn() -> String {
+    "dialog-warning-symbolic".to_string()
+}
+fn default_icon_unknown() -> String {
+    "dialog-question-symbolic".to_string()
+}
+
+/// Ceiling on header indicators, so a config edit cannot fill the header bar.
+pub const MAX_INDICATORS: usize = 5;
+
 /// The terminal color scheme.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -172,6 +241,9 @@ pub struct TerminalConfig {
     pub notify_on_bell: bool,
     /// Reopen the previous window's tabs on launch.
     pub restore_session: bool,
+    /// Header-bar status lights. Empty by default: this is an extension point,
+    /// not a feature every user wants.
+    pub indicators: Vec<Indicator>,
 }
 
 /// The terminal cursor shape.
@@ -219,6 +291,7 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             notify_on_bell: false,
             restore_session: true,
+            indicators: Vec::new(),
         }
     }
 }

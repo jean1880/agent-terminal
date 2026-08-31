@@ -21,20 +21,32 @@ window.
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
+- **Attention when a turn finishes**: a bell in a background tab marks that tab,
+  with an optional desktop notification — so an agent that finishes while you are
+  elsewhere actually reaches you.
+- **Scrollback search**: `Ctrl + Shift + F`, with case-sensitivity and regex
+  toggles.
+- **Session restore**: reopens the tabs, and their directories, from last time.
 - **Selectable colour themes**: Antigravity (default), Dracula, Nord, Gruvbox
   Dark, Solarized Dark, One Dark, and Monokai — applied live to every open tab.
-- **Configurable CLI client**: auto-detect (prefers `claude`), or pin `Claude`,
-  `Agy`, or `Gemini`. Detection runs off the UI thread and is cached for the life
-  of the process.
+- **Profiles**: any CLI, with its own arguments, directory and environment,
+  defined in `config.json` — no rebuild. Auto-detection picks the first one
+  installed. Resolution runs off the UI thread and is cached for the life of the
+  process. See [Profiles](#profiles).
 - **Settings**: starting directory (validated as you type), scrollback lines,
-  font scale, CLI client, and theme — applied immediately and persisted to
+  font and font scale, cursor shape and blink, profile, theme, notifications and
+  session restore — each applied immediately and persisted to
   `~/.config/agent-terminal/config.json`.
 - **Shortcuts**:
   | Keys | Action |
   |---|---|
   | `Ctrl + Shift + T` | New tab |
+  | `Ctrl + Shift + W` | Close tab |
   | `Ctrl + Shift + R` | Restart the current session |
+  | `Ctrl + Shift + F` | Search the scrollback |
   | `Ctrl + Shift + C` / `V` | Copy / paste |
+  | `Ctrl + Tab` / `Ctrl + Shift + Tab` | Next / previous tab |
+  | `Alt + 1`…`8`, `Alt + 9` | Jump to tab, or the last tab |
   | `Ctrl + Plus` / `Minus` | Zoom (persisted) |
   | `Ctrl + 0` | Reset zoom |
   | `Ctrl + Left-Click` | Open a hovered hyperlink |
@@ -81,12 +93,56 @@ make start-local   # build (debug) and run
 
 ## Advanced Usage 🔧
 
-### Cargo feature flags
-The homelab Ansible-drift indicator is behind the default-on `homelab-drift`
-feature. For a generic terminal without it:
-```bash
-cargo build --release --no-default-features
+### Profiles
+Profiles are the sessions offered in Settings, on the **+** button's dropdown,
+and in the right-click **New Tab As** menu. Adding a CLI is a config edit, not a
+rebuild:
+
+```jsonc
+{
+  "profiles": [
+    { "name": "Claude",  "command": "claude" },
+    { "name": "Codex",   "command": "codex", "args": ["--full-auto"] },
+    // Root a profile in a specific project, with its own environment.
+    { "name": "Infra",   "command": "claude",
+      "dir": "~/git/ansible-homelab",
+      "env_file": "~/.config/agent-terminal/infra.env" }
+  ],
+  "default_profile": "Claude"   // omit, or null, to use the first one installed
+}
 ```
+
+`env_file` is sourced in a subshell and its *exported environment* merged into
+the session. Nothing it prints reaches the terminal — output before `exec` breaks
+the CLI's terminal handshake, which is why the old "startup script" setting could
+never work.
+
+### Status indicators
+Optional header-bar lights driven by a file or a command. Empty by default.
+
+```jsonc
+{
+  "indicators": [
+    // Non-empty file contents mean "needs attention"; the contents are the detail.
+    { "label": "Config drift",
+      "source": { "type": "file", "path": "~/reports/drift.txt" },
+      "refresh_secs": 300 },
+
+    // A non-zero exit means "needs attention"; stdout is the detail.
+    { "label": "Backups",
+      "source": { "type": "command", "argv": ["check-backups", "--quiet"],
+                  "timeout_secs": 15 },
+      "refresh_secs": 900,
+      "action": "show-output" }
+  ]
+}
+```
+
+Each indicator has **three** states, not two: OK, needs-attention, and *unknown*.
+A source that cannot be read gets its own icon and says so — it is never quietly
+reported as healthy. Commands run off the UI thread and are killed at their
+timeout. `"action": "send-to-terminal"` adds a button that types the detail into
+the running session, behind a preview.
 
 ### Generating a Debian package (.deb)
 ```bash
@@ -99,7 +155,6 @@ actually links.
 ### Development workflow
 - **Build**: `cargo build` · **Run**: `make start-local`
 - **Lint**: `cargo fmt` and `cargo clippy --all-targets -- -D warnings`
-  (CI also lints `--no-default-features`)
 - **Test**: `cargo test`
 
 ## Project Structure 📁
@@ -109,12 +164,14 @@ actually links.
 - `src/window/mod.rs` — the `AgentTerminalWindow` GObject wrapper.
 - `src/config.rs` — persisted settings and the 1.x migration, with tests.
 - `src/theme.rs` — terminal colour schemes.
-- `src/utils.rs` — pure logic: CLI detection, startup command, path resolution.
+- `src/utils.rs` — pure logic: profile resolution, startup command, env files,
+  status indicators, path resolution.
 
 ## Contributing 🤝
 
 1. Branch: `git checkout -b feature/cool-new-thing`.
-2. Keep it green: `cargo fmt`, both clippy configurations, and `cargo test`.
+2. Keep it green: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and
+   `cargo test`.
 3. Commit using Conventional Commits.
 
 ## License 📄
