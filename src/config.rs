@@ -426,9 +426,42 @@ impl SessionState {
 }
 
 impl TerminalConfig {
+    /// The base directory for user configuration.
+    ///
+    /// Honours `XDG_CONFIG_HOME` per the XDG Base Directory specification, which
+    /// this previously ignored in favour of a hardcoded `~/.config` — so anyone
+    /// who had relocated their config directory silently got a second one. It is
+    /// also what makes an isolated instance possible:
+    ///
+    /// ```text
+    /// XDG_CONFIG_HOME=/tmp/scratch agent-terminal
+    /// ```
+    ///
+    /// Both the current and the pre-2.0 directory hang off this, so an override
+    /// moves the migration source with it rather than leaving it pointed at the
+    /// real home directory.
+    fn config_home() -> PathBuf {
+        Self::config_home_from(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            std::env::var("HOME").ok(),
+        )
+    }
+
+    /// The resolution itself, with the environment passed in.
+    ///
+    /// Injected rather than read here so it can be tested without mutating
+    /// process-global state, the same way CLI detection takes its environment as
+    /// parameters.
+    fn config_home_from(xdg_config_home: Option<String>, home: Option<String>) -> PathBuf {
+        // An empty value counts as unset, per the specification.
+        if let Some(dir) = xdg_config_home.filter(|d| !d.trim().is_empty()) {
+            return PathBuf::from(dir);
+        }
+        PathBuf::from(home.unwrap_or_else(|| "/".to_string())).join(".config")
+    }
+
     pub fn config_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let dir = PathBuf::from(home).join(".config").join("agent-terminal");
+        let dir = Self::config_home().join("agent-terminal");
         if !dir.exists() {
             let _ = fs::create_dir_all(&dir);
         }
@@ -442,9 +475,7 @@ impl TerminalConfig {
     /// The pre-2.0 configuration directory, kept only so settings can be carried
     /// across the rename.
     fn legacy_config_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home)
-            .join(".config")
+        Self::config_home()
             .join("antigravity-terminal")
             .join("config.json")
     }
@@ -756,6 +787,44 @@ mod tests {
             TerminalConfig::default().scrollback_lines
         );
         assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+    }
+
+    #[test]
+    fn config_home_prefers_xdg_over_home() {
+        // XDG_CONFIG_HOME was ignored entirely before this, so anyone who had
+        // relocated their config directory silently got a second one.
+        assert_eq!(
+            TerminalConfig::config_home_from(
+                Some("/xdg/config".to_string()),
+                Some("/home/someone".to_string())
+            ),
+            PathBuf::from("/xdg/config")
+        );
+    }
+
+    #[test]
+    fn config_home_falls_back_to_home_when_xdg_is_unset_or_blank() {
+        let expected = PathBuf::from("/home/someone/.config");
+        assert_eq!(
+            TerminalConfig::config_home_from(None, Some("/home/someone".to_string())),
+            expected
+        );
+        // The specification treats an empty value as unset.
+        assert_eq!(
+            TerminalConfig::config_home_from(
+                Some("   ".to_string()),
+                Some("/home/someone".to_string())
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn config_home_survives_a_missing_home() {
+        assert_eq!(
+            TerminalConfig::config_home_from(None, None),
+            PathBuf::from("/.config")
+        );
     }
 
     #[test]
