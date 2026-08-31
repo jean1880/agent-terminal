@@ -18,10 +18,22 @@ When asked to add a new widget or window:
 
 ### Modifying Terminal Behavior
 When modifying how the terminal launches or interacts with the shell:
-1.  Locate `get_startup_command` in `src/window/imp.rs`.
-2.  Modify the logic and immediately update the unit tests in the `tests` module.
+1.  Locate `get_startup_command` in **`src/utils.rs`** (pure logic lives there, not in
+    the GTK layer). Spawning itself is `spawn_session` in `src/window/imp.rs`.
+2.  Modify the logic and immediately update the unit tests in that file's `tests` module.
 3.  Verify the fix with `cargo test`.
 4.  Check for regressions in shell environment inheritance by running the app.
+
+## 🗺️ File map
+- `src/main.rs` — app setup, logging (journald + panic hook), global CSS, accelerators.
+- `src/window/imp.rs` — GTK window: tabs, terminal spawning, input controllers, settings.
+- `src/window/mod.rs` — the `AntigravityWindow` GObject wrapper.
+- `src/config.rs` — persisted settings (`TerminalConfig`, `CliClient`, `ThemeChoice`).
+- `src/theme.rs` — terminal colour schemes, built via infallible `RGBA::new`.
+- `src/utils.rs` — pure logic: CLI detection, startup command, directory resolution.
+
+Keep pure logic in `config.rs`/`utils.rs` so it stays unit-testable without a display;
+`imp.rs` is covered only by a construction smoke test.
 
 ## 📏 Standards
 - **Naming**: Use `CamelCase` for structs/types and `snake_case` for methods/variables.

@@ -5,10 +5,10 @@ Name=Antigravity Terminal
 Comment=Robust Rust-based Antigravity AI Terminal
 Exec=antigravity-terminal
 StartupWMClass=com.jdesroches.AntigravityTerminal
-Icon=antigravity_logo
+Icon=antigravity-terminal
 Terminal=false
 StartupNotify=true
-Categories=Development;TerminalEmulator;
+Categories=Development;System;TerminalEmulator;
 Keywords=antigravity;ai;terminal;chat;agy;
 Actions=new-window;
 
