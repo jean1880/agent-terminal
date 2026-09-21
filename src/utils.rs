@@ -596,7 +596,7 @@ pub fn list_sessions(
         }
     }
 
-    transcripts.sort_by(|a, b| b.1.cmp(&a.1));
+    transcripts.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     Ok(transcripts
         .into_iter()
         .filter_map(|(path, modified)| {
