@@ -720,7 +720,7 @@ impl AgentTerminalWindow {
             obj,
             move |_, _| {
                 debug!("Action: Resume Session");
-                obj.imp().show_resume_dialog();
+                obj.imp().show_session_browser();
             }
         ));
         obj.add_action(&resume_action);
@@ -2372,11 +2372,245 @@ impl AgentTerminalWindow {
         ));
     }
 
+    /// Lists the resumable sessions, newest first, and resumes the one picked.
+    ///
+    /// Falls back to [`Self::show_resume_id_dialog`] when the profile declares no
+    /// session store, since there is then nothing to list. The store is read off
+    /// the main thread; the dialog shows a spinner meanwhile.
+    fn show_session_browser(&self) {
+        let obj = self.obj();
+        let Some(profile) = self.resume_profile() else {
+            // Reuses open_resume_tab's explanation rather than a second copy.
+            self.show_resume_id_dialog();
+            return;
+        };
+        let Some(store) = profile.session_store.clone() else {
+            self.show_resume_id_dialog();
+            return;
+        };
+        let title_pointer = profile.session_title.clone();
+
+        let dialog = adw::Dialog::builder()
+            .title("Resume Session")
+            .content_width(620)
+            .content_height(560)
+            .build();
+
+        let header = adw::HeaderBar::new();
+        let enter_id = Button::builder()
+            .label("Enter ID…")
+            .tooltip_text("Resume a session by pasting its ID")
+            .build();
+        header.pack_start(&enter_id);
+
+        let search = gtk4::SearchEntry::builder()
+            .placeholder_text("Search by title, folder or ID")
+            .hexpand(true)
+            .build();
+
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .valign(Align::Start)
+            .css_classes(["boxed-list"])
+            .build();
+        let scrolled = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vexpand(true)
+            .child(&list)
+            .build();
+
+        let spinner = gtk4::Spinner::builder()
+            .spinning(true)
+            .width_request(32)
+            .height_request(32)
+            .halign(Align::Center)
+            .valign(Align::Center)
+            .build();
+        let empty = adw::StatusPage::builder()
+            .icon_name("document-open-recent-symbolic")
+            .title("No Sessions Found")
+            .build();
+
+        let pages = Stack::builder().vexpand(true).build();
+        pages.add_named(&spinner, Some("loading"));
+        pages.add_named(&scrolled, Some("list"));
+        pages.add_named(&empty, Some("empty"));
+        pages.set_visible_child_name("loading");
+
+        let content = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(12)
+            .margin_top(6)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        content.append(&search);
+        content.append(&pages);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+
+        // Row index → session, and row index → lower-cased search text. Rows
+        // are appended once and never reordered, and filtering hides rows
+        // without changing their index, so the index is a stable key.
+        let sessions: std::rc::Rc<RefCell<Vec<crate::utils::SessionSummary>>> =
+            std::rc::Rc::default();
+        let haystacks: std::rc::Rc<RefCell<Vec<String>>> = std::rc::Rc::default();
+
+        list.set_filter_func(glib::clone!(
+            #[weak]
+            search,
+            #[strong]
+            haystacks,
+            #[upgrade_or]
+            true,
+            move |row| {
+                let query = search.text().to_lowercase();
+                let query = query.trim();
+                query.is_empty()
+                    || usize::try_from(row.index())
+                        .ok()
+                        .and_then(|i| haystacks.borrow().get(i).cloned())
+                        .is_some_and(|text| text.contains(query))
+            }
+        ));
+        search.connect_search_changed(glib::clone!(
+            #[weak]
+            list,
+            move |_| list.invalidate_filter()
+        ));
+        // Enter resumes the top match, so type-then-Enter works without a mouse.
+        search.connect_activate(glib::clone!(
+            #[weak]
+            list,
+            move |_| {
+                let mut index = 0;
+                while let Some(row) = list.row_at_index(index) {
+                    if row.is_child_visible() {
+                        row.activate();
+                        return;
+                    }
+                    index += 1;
+                }
+            }
+        ));
+
+        list.connect_row_activated(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            dialog,
+            #[strong]
+            sessions,
+            move |_, row| {
+                let Some(session) = usize::try_from(row.index())
+                    .ok()
+                    .and_then(|i| sessions.borrow().get(i).cloned())
+                else {
+                    return;
+                };
+                dialog.close();
+                // The directory is already known from the listing, so the tab
+                // opens without a second lookup. When it is not known, None
+                // takes the lookup path, which reports the failure properly.
+                obj.imp().request_resume(ResumeRequest {
+                    session_id: session.id,
+                    dir: session.dir,
+                });
+            }
+        ));
+
+        enter_id.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+                obj.imp().show_resume_id_dialog();
+            }
+        ));
+
+        dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
+        search.grab_focus();
+
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            list,
+            #[weak]
+            pages,
+            #[weak]
+            empty,
+            async move {
+                let listing = gtk4::gio::spawn_blocking(move || {
+                    crate::utils::list_sessions(&store, title_pointer.as_deref())
+                })
+                .await
+                .unwrap_or_else(|_| Err("Listing sessions panicked".to_string()));
+
+                let found = match listing {
+                    Ok(found) => found,
+                    Err(reason) => {
+                        warn!("Could not list sessions: {reason}");
+                        // Distinct from an empty store: an unreadable one must
+                        // not look like there is simply nothing to resume.
+                        empty.set_icon_name(Some("dialog-warning-symbolic"));
+                        empty.set_title("Could Not Read Sessions");
+                        empty.set_description(Some(&reason));
+                        pages.set_visible_child_name("empty");
+                        return;
+                    }
+                };
+                debug!("Listed {} session(s)", found.len());
+                if found.is_empty() {
+                    pages.set_visible_child_name("empty");
+                    return;
+                }
+
+                let now = std::time::SystemTime::now();
+                let home = env::var("HOME").unwrap_or_default();
+                for session in &found {
+                    let dir = session
+                        .dir
+                        .as_deref()
+                        .map(|d| crate::utils::tildify(d, &home))
+                        .unwrap_or_else(|| "folder unknown".to_string());
+                    let age = now
+                        .duration_since(session.modified)
+                        .map(crate::utils::describe_age)
+                        .unwrap_or_else(|_| "just now".to_string());
+                    let title = session.title.as_deref().unwrap_or(&session.id);
+
+                    let row = adw::ActionRow::builder()
+                        .title(title)
+                        .subtitle(format!("{dir} · {age}"))
+                        // Titles and paths are data; & or < must not be
+                        // read as Pango markup.
+                        .use_markup(false)
+                        .activatable(true)
+                        .tooltip_text(&session.id)
+                        .build();
+                    row.add_suffix(&Image::from_icon_name("go-next-symbolic"));
+                    list.append(&row);
+
+                    haystacks
+                        .borrow_mut()
+                        .push(format!("{title}\n{dir}\n{}", session.id).to_lowercase());
+                }
+                *sessions.borrow_mut() = found;
+                pages.set_visible_child_name("list");
+            }
+        ));
+    }
+
     /// Prompts for a session ID, then opens a tab resuming it.
     ///
     /// The Resume button stays disabled until the ID is valid, so a bad paste is
     /// caught in the dialog rather than surfacing later as a failed tab.
-    fn show_resume_dialog(&self) {
+    fn show_resume_id_dialog(&self) {
         let obj = self.obj();
         let entry = gtk4::Entry::builder()
             .placeholder_text("Session ID")

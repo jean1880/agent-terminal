@@ -532,6 +532,179 @@ pub fn find_session_dir(store: &str, session_id: &str) -> Option<String> {
     }
 }
 
+/// One session as the browser lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    /// The latest title the transcript records, if the profile declares where
+    /// titles live and this session has one.
+    pub title: Option<String>,
+    /// The recorded working directory, only if it still exists.
+    pub dir: Option<String>,
+    /// The transcript's modification time — when the session was last active.
+    pub modified: std::time::SystemTime,
+}
+
+/// Newest sessions listed. Each costs up to two reads of [`SUMMARY_WINDOW`], so
+/// this bounds the scan to a few tens of MiB however large the store grows.
+/// Upgrade path if older sessions are wanted: page in more on scroll.
+pub const MAX_LISTED_SESSIONS: usize = 200;
+
+/// How much of a transcript's head, and of its tail, a summary reads. The
+/// working directory is in the first records; the latest title is near the
+/// end, since titles are re-recorded as a session goes. Transcripts reach
+/// several MiB, so neither end justifies reading the middle.
+const SUMMARY_WINDOW: u64 = 256 * 1024;
+
+/// Longest title shown; titles are one line in a list row.
+const MAX_TITLE_CHARS: usize = 120;
+
+/// Lists the sessions in a store, newest first.
+///
+/// Looks at `*.jsonl` directly in `store` and one directory down, the same
+/// places [`find_session_dir`] searches. A file whose name is not a valid
+/// session ID is skipped: it could not be resumed anyway. `title_pointer` is
+/// the profile's `session_title`.
+///
+/// `Err` means the store itself could not be read — an unreadable store must
+/// not look like an empty one. Blocking: call it off the main thread.
+pub fn list_sessions(
+    store: &str,
+    title_pointer: Option<&str>,
+) -> Result<Vec<SessionSummary>, String> {
+    let store = std::path::PathBuf::from(expand_tilde(store));
+    let top = std::fs::read_dir(&store)
+        .map_err(|err| format!("Could not read {}: {err}", store.display()))?;
+
+    let mut transcripts: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut consider = |path: std::path::PathBuf| {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return;
+        }
+        if let Ok(modified) = path.metadata().and_then(|m| m.modified()) {
+            transcripts.push((path, modified));
+        }
+    };
+    for entry in top.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            for sub in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                consider(sub.path());
+            }
+        } else {
+            consider(path);
+        }
+    }
+
+    transcripts.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(transcripts
+        .into_iter()
+        .filter_map(|(path, modified)| {
+            let id = path.file_stem()?.to_str()?;
+            let id = validate_session_id(id).ok()?.to_string();
+            Some((path, id, modified))
+        })
+        .take(MAX_LISTED_SESSIONS)
+        .map(|(path, id, modified)| summarize_session(&path, id, modified, title_pointer))
+        .collect())
+}
+
+/// Reads the working directory and latest title from a transcript's two ends.
+fn summarize_session(
+    path: &std::path::Path,
+    id: String,
+    modified: std::time::SystemTime,
+    title_pointer: Option<&str>,
+) -> SessionSummary {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+
+    // A cheap substring test before parsing: most lines are large tool output
+    // that mentions neither key, and parsing them all would dominate the scan.
+    let title_key = title_pointer
+        .and_then(|p| p.rsplit('/').next())
+        .filter(|k| !k.is_empty())
+        .map(|k| format!("\"{k}\""));
+    let title_of = |line: &str| -> Option<String> {
+        let (pointer, key) = (title_pointer?, title_key.as_deref()?);
+        if !line.contains(key) {
+            return None;
+        }
+        let record: serde_json::Value = serde_json::from_str(line).ok()?;
+        let title = record.pointer(pointer)?.as_str()?;
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!title.is_empty()).then(|| title.chars().take(MAX_TITLE_CHARS).collect())
+    };
+
+    let mut summary = SessionSummary {
+        id,
+        title: None,
+        dir: None,
+        modified,
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return summary;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    let mut head_title = None;
+    for line in std::io::BufReader::new((&mut file).take(SUMMARY_WINDOW))
+        .lines()
+        .map_while(Result::ok)
+    {
+        if summary.dir.is_none() && line.contains("\"cwd\"") {
+            summary.dir = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|r| r.get("cwd")?.as_str().map(str::to_string));
+        }
+        if let Some(title) = title_of(&line) {
+            head_title = Some(title);
+        }
+    }
+
+    // The tail, when the head did not already cover the whole file. Its first
+    // line is almost certainly partial and is skipped.
+    let mut tail_title = None;
+    if len > SUMMARY_WINDOW && file.seek(SeekFrom::Start(len - SUMMARY_WINDOW)).is_ok() {
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_ok() {
+            let text = String::from_utf8_lossy(&bytes);
+            tail_title = text.lines().skip(1).filter_map(title_of).last();
+        }
+    }
+
+    summary.title = tail_title.or(head_title);
+    summary.dir = summary.dir.filter(|dir| std::path::Path::new(dir).is_dir());
+    summary
+}
+
+/// Renders how long ago something happened, for a list row.
+pub fn describe_age(elapsed: std::time::Duration) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    match elapsed.as_secs() {
+        s if s < MINUTE => "just now".to_string(),
+        s if s < HOUR => format!("{} min ago", s / MINUTE),
+        s if s < DAY => format!("{} h ago", s / HOUR),
+        s if s < 2 * DAY => "yesterday".to_string(),
+        s if s < 60 * DAY => format!("{} days ago", s / DAY),
+        s => format!("{} months ago", s / (30 * DAY)),
+    }
+}
+
+/// Shortens a path under `home` to `~/…` for display.
+pub fn tildify(path: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return path.to_string();
+    }
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// Determines the startup command for a profile.
 ///
 /// `resume` names a session to resume. A profile that cannot resume ignores it
@@ -581,6 +754,7 @@ mod tests {
             env_file: None,
             resume_args: None,
             session_store: None,
+            session_title: None,
         }
     }
 
@@ -684,6 +858,115 @@ mod tests {
         assert_eq!(find_session_dir(store_path, "gone"), None);
 
         assert_eq!(find_session_dir("/nonexistent/store", "abc"), None);
+    }
+
+    /// Writes a transcript and backdates it, so ordering is deterministic.
+    fn transcript(dir: &std::path::Path, id: &str, body: &str, age_secs: u64) {
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&path, body).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn sessions_are_listed_newest_first_with_their_latest_title() {
+        let store = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let project_dir = project.path().to_str().unwrap();
+        let sub = store.path().join("-proj");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Retitled part-way through: the later title must win.
+        transcript(
+            &sub,
+            "new-1",
+            &format!(
+                "{{\"cwd\":\"{project_dir}\"}}\n{{\"aiTitle\":\"First draft\"}}\n\
+                 {{\"aiTitle\":\"Final  title\\nsecond line\"}}\n"
+            ),
+            10,
+        );
+        transcript(
+            store.path(),
+            "old-1",
+            "{\"cwd\":\"/nonexistent/gone\"}\n",
+            5000,
+        );
+        // Not a valid session ID, so not resumable, so not listed.
+        transcript(&sub, "not.an.id", "{}\n", 1);
+
+        let sessions = list_sessions(store.path().to_str().unwrap(), Some("/aiTitle")).unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["new-1", "old-1"]);
+
+        // Whitespace, newlines included, is collapsed onto one line.
+        assert_eq!(
+            sessions[0].title.as_deref(),
+            Some("Final title second line")
+        );
+        assert_eq!(sessions[0].dir.as_deref(), Some(project_dir));
+        // A recorded directory that no longer exists is not offered.
+        assert_eq!(sessions[1].title, None);
+        assert_eq!(sessions[1].dir, None);
+    }
+
+    #[test]
+    fn the_title_is_found_in_the_tail_of_a_large_transcript() {
+        // Only the two ends are read, so a title recorded near the end of a
+        // file much larger than the window must still be found there.
+        let store = tempdir().unwrap();
+        let filler = format!("{{\"blob\":\"{}\"}}\n", "x".repeat(1024));
+        let body = format!(
+            "{{\"aiTitle\":\"Early\"}}\n{}{{\"aiTitle\":\"Late\"}}\n",
+            filler.repeat(600)
+        );
+        assert!(body.len() as u64 > 2 * SUMMARY_WINDOW);
+        transcript(store.path(), "big", &body, 1);
+
+        let sessions = list_sessions(store.path().to_str().unwrap(), Some("/aiTitle")).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("Late"));
+    }
+
+    #[test]
+    fn without_a_title_pointer_sessions_are_untitled() {
+        let store = tempdir().unwrap();
+        transcript(store.path(), "s1", "{\"aiTitle\":\"Ignored\"}\n", 1);
+        let sessions = list_sessions(store.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(sessions[0].title, None);
+    }
+
+    #[test]
+    fn an_unreadable_store_is_an_error_not_an_empty_list() {
+        // The indicator lesson: failure to read must never pass for "nothing there".
+        assert!(list_sessions("/nonexistent/store", Some("/aiTitle")).is_err());
+    }
+
+    #[test]
+    fn ages_read_naturally() {
+        use std::time::Duration;
+        assert_eq!(describe_age(Duration::from_secs(5)), "just now");
+        assert_eq!(describe_age(Duration::from_secs(300)), "5 min ago");
+        assert_eq!(describe_age(Duration::from_secs(2 * 3600)), "2 h ago");
+        assert_eq!(describe_age(Duration::from_secs(30 * 3600)), "yesterday");
+        assert_eq!(describe_age(Duration::from_secs(5 * 86400)), "5 days ago");
+        assert_eq!(
+            describe_age(Duration::from_secs(90 * 86400)),
+            "3 months ago"
+        );
+    }
+
+    #[test]
+    fn paths_under_home_are_shortened() {
+        assert_eq!(tildify("/home/u/git/x", "/home/u"), "~/git/x");
+        assert_eq!(tildify("/home/u", "/home/u/"), "~");
+        // A sibling that merely shares the prefix is not under home.
+        assert_eq!(tildify("/home/user2/x", "/home/u"), "/home/user2/x");
+        assert_eq!(tildify("/srv/x", ""), "/srv/x");
     }
 
     /// A stand-in for command lookup. The real probe spawns `which` and an
