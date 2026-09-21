@@ -42,6 +42,21 @@ struct TabState {
     /// Which profile this tab is running, so a restart reuses it and the session
     /// file can record it.
     profile: Option<String>,
+    /// The session this tab was opened to resume, so restarting a crashed tab
+    /// resumes the same conversation instead of silently starting a new one.
+    session_id: Option<String>,
+}
+
+/// A request to open a tab resuming a session.
+///
+/// Queued when it arrives before the window has a tab view — a freshly created
+/// window is still resolving its profile off-thread when the command line that
+/// created it asks for the tab.
+#[derive(Debug, Clone)]
+pub struct ResumeRequest {
+    pub session_id: String,
+    /// Where to resume. `None` means look it up in the profile's session store.
+    pub dir: Option<String>,
 }
 
 /// Renders VTE's `child-exited` status as something a person can act on.
@@ -421,6 +436,11 @@ pub struct AgentTerminalWindow {
     /// A queued config save, cancelled and re-armed whenever a setting changes
     /// again before it fires. Held so it can also be flushed on window close.
     pending_save: RefCell<Option<glib::SourceId>>,
+    /// Resume requests that arrived before the tab view existed.
+    pending_resumes: RefCell<Vec<ResumeRequest>>,
+    /// Set once the window settles on the welcome screen, which has no tab
+    /// view and never will — so a resume must not wait for one.
+    no_cli: std::cell::Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -692,6 +712,18 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&new_tab_folder_action);
+
+        // Resume Session Action (prompts for a session ID)
+        let resume_action = gtk4::gio::SimpleAction::new("resume-session", None);
+        resume_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Resume Session");
+                obj.imp().show_resume_dialog();
+            }
+        ));
+        obj.add_action(&resume_action);
     }
 
     /// Adds the configured status indicators to the header bar.
@@ -960,10 +992,15 @@ impl AgentTerminalWindow {
         // rooted in a different project, is one click away without a trip
         // through Settings.
         if let Some(header) = self.header.borrow().as_ref() {
+            let new_tab_menu = self.build_profile_menu();
+            let resume_section = gtk4::gio::Menu::new();
+            resume_section.append(Some("Resume Session…"), Some("win.resume-session"));
+            new_tab_menu.append_section(None, &resume_section);
+
             let new_tab_btn = adw::SplitButton::builder()
                 .icon_name("tab-new-symbolic")
                 .tooltip_text("New Tab (Ctrl+Shift+T)")
-                .menu_model(&self.build_profile_menu())
+                .menu_model(&new_tab_menu)
                 .build();
             new_tab_btn.connect_clicked(glib::clone!(
                 #[weak]
@@ -1046,8 +1083,15 @@ impl AgentTerminalWindow {
             }
         ));
 
-        if !self.restore_previous_session(profile) {
+        // A window opened *for* a resume shows that session rather than an
+        // extra blank tab beside it. Restored tabs still come back: restoring is
+        // the user's standing preference, and the resume is added to it.
+        let pending: Vec<ResumeRequest> = self.pending_resumes.take();
+        if !self.restore_previous_session(profile) && pending.is_empty() {
             self.add_terminal_tab(profile, None);
+        }
+        for request in pending {
+            self.open_resume_tab(request);
         }
     }
 
@@ -1120,6 +1164,16 @@ impl AgentTerminalWindow {
     /// `dir_override` roots the tab in a specific directory; when `None` the
     /// configured starting directory (falling back to `$HOME`) is used.
     fn add_terminal_tab(&self, profile: Option<&Profile>, dir_override: Option<&str>) {
+        self.add_terminal_tab_resuming(profile, dir_override, None);
+    }
+
+    /// [`Self::add_terminal_tab`], optionally resuming `session_id`.
+    fn add_terminal_tab_resuming(
+        &self,
+        profile: Option<&Profile>,
+        dir_override: Option<&str>,
+        session_id: Option<&str>,
+    ) {
         debug!("Adding terminal tab");
         let terminal = Terminal::new();
 
@@ -1208,9 +1262,10 @@ impl AgentTerminalWindow {
             search_bar,
             search_entry,
             profile: profile.map(|p| p.name.clone()),
+            session_id: session_id.map(str::to_string),
         });
 
-        self.spawn_session(&terminal, &stack, profile, &work_dir);
+        self.spawn_session(&terminal, &stack, profile, &work_dir, session_id);
     }
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
@@ -1484,15 +1539,28 @@ impl AgentTerminalWindow {
         let Some(tab_view) = self.tab_view.borrow().clone() else {
             return;
         };
-        let dir = self
+        let (dir, session_id) = self
             .tabs
             .borrow()
             .iter()
             .find(|t| &t.page == page)
-            .map(|t| t.dir.clone());
-        let profile = self.active_profile.borrow().clone();
+            .map(|t| (Some(t.dir.clone()), t.session_id.clone()))
+            .unwrap_or_default();
         info!("Restarting session in {:?}", dir);
-        self.add_terminal_tab(profile.as_ref(), dir.as_deref());
+        match session_id {
+            // A resumed tab resumes again, rather than trading the conversation
+            // the user asked for for a blank one. Its directory is already known,
+            // so this opens synchronously, before the old page closes. Checking
+            // the profile first matters: if resume was switched off in config,
+            // open_resume_tab would add nothing and closing would lose the tab.
+            Some(session_id) if self.resume_profile().is_some() => {
+                self.open_resume_tab(ResumeRequest { session_id, dir })
+            }
+            _ => {
+                let profile = self.active_profile.borrow().clone();
+                self.add_terminal_tab(profile.as_ref(), dir.as_deref());
+            }
+        }
         tab_view.close_page(page);
     }
 
@@ -1503,6 +1571,7 @@ impl AgentTerminalWindow {
         menu.append(Some("New Tab"), Some("win.new-tab"));
         menu.append_submenu(Some("New Tab As"), &self.build_profile_menu());
         menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
+        menu.append(Some("Resume Session…"), Some("win.resume-session"));
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
 
@@ -1625,10 +1694,11 @@ impl AgentTerminalWindow {
         stack: &Stack,
         profile: Option<&Profile>,
         work_dir: &str,
+        resume: Option<&str>,
     ) {
         let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let command = get_startup_command(profile);
+        let command = get_startup_command(profile, resume);
         let env_file = profile.and_then(|p| p.env_file.clone());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
@@ -1757,6 +1827,22 @@ impl AgentTerminalWindow {
     /// Sets up the welcome screen using AdwStatusPage.
     fn setup_welcome_ui(&self, container: &Box) {
         let obj = self.obj();
+
+        // Nothing can run, so a queued resume cannot either; say so rather than
+        // drop it silently.
+        self.no_cli.set(true);
+        let pending: Vec<ResumeRequest> = self.pending_resumes.take();
+        if !pending.is_empty() {
+            warn!(
+                "Dropping {} resume request(s): no CLI detected",
+                pending.len()
+            );
+            present_message(
+                &obj,
+                "Cannot Resume Session",
+                "No AI CLI was found, so there is nothing to resume the session with.",
+            );
+        }
 
         // Name whatever is actually configured. The previous copy told every user
         // to install `agy` from antigravity.google even when they had explicitly
@@ -2161,6 +2247,199 @@ impl AgentTerminalWindow {
         let dir = profile.dir.clone();
         info!("Opening a tab for profile '{}'", profile.name);
         self.add_terminal_tab(Some(profile), dir.as_deref());
+    }
+
+    /// Opens a tab resuming a session, or queues it until the window can.
+    ///
+    /// The entry point for the command line and the Resume dialog. A new window
+    /// has no tab view until profile resolution finishes; the queue is drained
+    /// by [`Self::setup_terminal_ui`] (or reported by the welcome screen).
+    pub fn request_resume(&self, request: ResumeRequest) {
+        if self.tab_view.borrow().is_some() {
+            self.open_resume_tab(request);
+        } else if self.no_cli.get() {
+            warn!(
+                "Cannot resume {}: no CLI detected in this window",
+                request.session_id
+            );
+        } else {
+            debug!(
+                "Queueing resume of {} until the window is ready",
+                request.session_id
+            );
+            self.pending_resumes.borrow_mut().push(request);
+        }
+    }
+
+    /// The profile to resume with: the active one if it can, otherwise the
+    /// first configured profile that can and is not known to be missing.
+    fn resume_profile(&self) -> Option<Profile> {
+        if let Some(active) = self.active_profile.borrow().as_ref() {
+            if active.can_resume() {
+                return Some(active.clone());
+            }
+        }
+        self.config
+            .borrow()
+            .profiles
+            .iter()
+            // Only a command *known* to be missing is skipped. One not probed yet
+            // is tried: if it is missing, the tab's exit bar says so.
+            .find(|p| {
+                p.can_resume() && crate::utils::cached_command_available(&p.command) != Some(false)
+            })
+            .cloned()
+    }
+
+    /// Opens a tab resuming `request.session_id`.
+    ///
+    /// Without an explicit directory, the profile's session store is searched
+    /// off the main thread for where the session was recorded. A CLI that scopes
+    /// sessions per project cannot find one from any other directory, and it
+    /// says so only inside the tab, so a failed lookup is reported here.
+    fn open_resume_tab(&self, request: ResumeRequest) {
+        let ResumeRequest { session_id, dir } = request;
+        let Some(profile) = self.resume_profile() else {
+            warn!("No profile can resume session {session_id}");
+            present_message(
+                &self.obj(),
+                "Cannot Resume Session",
+                "No configured profile knows how to resume a session. Add \"resume_args\" \
+                 to a profile in config.json, e.g. [\"--resume\", \"{id}\"].",
+            );
+            return;
+        };
+
+        let store = match (&dir, &profile.session_store) {
+            (None, Some(store)) => store.clone(),
+            // An explicit directory wins, and a profile without a store has
+            // nothing to look up: use the profile or starting directory.
+            _ => {
+                info!(
+                    "Resuming session {session_id} with profile '{}' in {:?}",
+                    profile.name, dir
+                );
+                let dir = dir.or_else(|| profile.dir.clone());
+                self.add_terminal_tab_resuming(Some(&profile), dir.as_deref(), Some(&session_id));
+                return;
+            }
+        };
+
+        let obj = self.obj();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let lookup_id = session_id.clone();
+                let found = gtk4::gio::spawn_blocking(move || {
+                    crate::utils::find_session_dir(&store, &lookup_id)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    error!("Session lookup panicked on the worker thread");
+                    None
+                });
+
+                // The window may have closed while the lookup ran. Spawning now
+                // would start a CLI in a window nobody can see or reach.
+                if !obj.is_visible() {
+                    warn!("Window closed before session {session_id} could be resumed");
+                    return;
+                }
+                let imp = obj.imp();
+                let dir = match found {
+                    Some(dir) => {
+                        info!("Session {session_id} was recorded in {dir}");
+                        Some(dir)
+                    }
+                    None => {
+                        let fallback = profile.dir.clone();
+                        present_message(
+                            &obj,
+                            "Session Directory Not Found",
+                            &format!(
+                                "Could not find where session {session_id} was recorded, so it \
+                                 is being resumed from the default directory. If the CLI says \
+                                 the conversation does not exist, reopen it with \
+                                 `agent-terminal --resume {session_id} --dir <project>`."
+                            ),
+                        );
+                        fallback
+                    }
+                };
+                imp.add_terminal_tab_resuming(Some(&profile), dir.as_deref(), Some(&session_id));
+            }
+        ));
+    }
+
+    /// Prompts for a session ID, then opens a tab resuming it.
+    ///
+    /// The Resume button stays disabled until the ID is valid, so a bad paste is
+    /// caught in the dialog rather than surfacing later as a failed tab.
+    fn show_resume_dialog(&self) {
+        let obj = self.obj();
+        let entry = gtk4::Entry::builder()
+            .placeholder_text("Session ID")
+            .activates_default(true)
+            .build();
+
+        let dialog = adw::AlertDialog::new(
+            Some("Resume Session"),
+            Some("Opens a new tab that resumes the session with this ID."),
+        );
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("resume", "Resume");
+        dialog.set_response_appearance("resume", adw::ResponseAppearance::Suggested);
+        dialog.set_response_enabled("resume", false);
+        dialog.set_default_response(Some("resume"));
+        dialog.set_close_response("cancel");
+
+        entry.connect_changed(glib::clone!(
+            #[weak]
+            dialog,
+            move |entry| {
+                let text = entry.text();
+                let valid = crate::utils::validate_session_id(&text);
+                dialog.set_response_enabled("resume", valid.is_ok());
+                // Say why, but not for an empty field the user has not typed in yet.
+                match valid {
+                    Err(reason) if !text.is_empty() => {
+                        entry.add_css_class("error");
+                        entry.set_tooltip_text(Some(&reason));
+                    }
+                    _ => {
+                        entry.remove_css_class("error");
+                        entry.set_tooltip_text(None);
+                    }
+                }
+            }
+        ));
+
+        dialog.connect_response(
+            Some("resume"),
+            glib::clone!(
+                #[weak]
+                obj,
+                #[weak]
+                entry,
+                move |_, _| {
+                    let text = entry.text();
+                    match crate::utils::validate_session_id(&text) {
+                        Ok(id) => obj.imp().request_resume(ResumeRequest {
+                            session_id: id.to_string(),
+                            dir: None,
+                        }),
+                        // Unreachable while the button tracks validity; logged,
+                        // not trusted, in case Enter slips past it.
+                        Err(reason) => warn!("Ignoring invalid session ID: {reason}"),
+                    }
+                }
+            ),
+        );
+
+        dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
+        entry.grab_focus();
     }
 
     /// Builds the "new tab as…" menu, one item per configured profile.

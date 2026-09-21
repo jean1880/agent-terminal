@@ -416,8 +416,128 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
+/// Longest session ID accepted. A UUID is 36; this leaves room for other CLIs'
+/// formats without letting an arbitrary blob into an argv or a filename.
+const MAX_SESSION_ID_LEN: usize = 128;
+
+/// Checks a session ID before it goes anywhere near an argv or a path.
+///
+/// It arrives from the command line or a paste, and is then used both as a
+/// command argument and as a filename inside the session store. So: ASCII
+/// letters, digits, `-` and `_` only (no `/` or `.`, so no path traversal), and
+/// no leading `-` (so it cannot be read as a flag). Surrounding whitespace from
+/// a paste is trimmed rather than rejected.
+pub fn validate_session_id(id: &str) -> Result<&str, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("Session ID is empty".to_string());
+    }
+    if id.len() > MAX_SESSION_ID_LEN {
+        return Err(format!(
+            "Session ID is longer than {MAX_SESSION_ID_LEN} characters"
+        ));
+    }
+    if id.starts_with('-') {
+        return Err("Session ID cannot start with '-'".to_string());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Session ID may only contain letters, digits, '-' and '_'".to_string());
+    }
+    Ok(id)
+}
+
+/// The argv that resumes `session_id` with `profile`, or `None` when the
+/// profile declares no way to resume.
+///
+/// The ID is substituted into the profile's `resume_args` rather than simply
+/// appended, because CLIs disagree on the shape (`--resume <id>`,
+/// `resume <id>`, `--session=<id>`).
+pub fn resume_argv(profile: &Profile, session_id: &str) -> Option<Vec<String>> {
+    if !profile.can_resume() {
+        return None;
+    }
+    let mut argv = profile.argv();
+    argv.extend(
+        profile
+            .resume_args
+            .iter()
+            .flatten()
+            .map(|arg| arg.replace("{id}", session_id)),
+    );
+    Some(argv)
+}
+
+/// Finds the directory `session_id` was recorded in, using a session store.
+///
+/// Looks for `<id>.jsonl` directly in `store` and one level down (Claude keeps
+/// one subdirectory per project), then takes the first record carrying a string
+/// `cwd`. Returns `None` if there is no transcript, no `cwd`, or the directory
+/// has since been removed. Resuming from the wrong directory fails in a way the
+/// user can't see from the tab, so it's better to find out here.
+///
+/// Blocking filesystem I/O: call it off the main thread.
+pub fn find_session_dir(store: &str, session_id: &str) -> Option<String> {
+    use std::io::BufRead;
+
+    let store = std::path::PathBuf::from(expand_tilde(store));
+    let file_name = format!("{session_id}.jsonl");
+
+    // One level of subdirectories. Bounded on purpose: the store is user-named
+    // and a recursive walk of the wrong directory could be enormous.
+    let candidates = std::iter::once(store.join(&file_name)).chain(
+        std::fs::read_dir(&store)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .map(|dir| dir.join(&file_name)),
+    );
+
+    let transcript = candidates.into_iter().find(|path| path.is_file())?;
+    debug!(
+        "Session {session_id} transcript found at {}",
+        transcript.display()
+    );
+
+    let file = match std::fs::File::open(&transcript) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!("Could not open {}: {err}", transcript.display());
+            return None;
+        }
+    };
+
+    let dir = std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| {
+            let record: serde_json::Value = serde_json::from_str(&line).ok()?;
+            record.get("cwd")?.as_str().map(str::to_string)
+        });
+
+    match dir {
+        Some(dir) if std::path::Path::new(&dir).is_dir() => Some(dir),
+        Some(dir) => {
+            warn!("Session {session_id} was recorded in {dir}, which no longer exists");
+            None
+        }
+        None => {
+            warn!("Session {session_id} transcript records no working directory");
+            None
+        }
+    }
+}
+
 /// Determines the startup command for a profile.
-pub fn get_startup_command(profile: Option<&Profile>) -> Vec<String> {
+///
+/// `resume` names a session to resume. A profile that cannot resume ignores it
+/// with a warning. Callers are expected to pick a resumable profile first; this
+/// is only the safety net.
+pub fn get_startup_command(profile: Option<&Profile>, resume: Option<&str>) -> Vec<String> {
     match profile {
         Some(profile) => {
             // `exec` is critical: it replaces the wrapping interactive shell with the
@@ -430,7 +550,17 @@ pub fn get_startup_command(profile: Option<&Profile>) -> Vec<String> {
             // the TTY at this point disrupts the CLI's initial terminal handshake.
             // A profile's env_file contributes environment instead, merged into the
             // spawn environment rather than sourced into the terminal.
-            let argv: Vec<String> = profile.argv().iter().map(|a| shell_quote(a)).collect();
+            let argv = match resume {
+                Some(id) => resume_argv(profile, id).unwrap_or_else(|| {
+                    warn!(
+                        "Profile '{}' cannot resume sessions; starting a new one",
+                        profile.name
+                    );
+                    profile.argv()
+                }),
+                None => profile.argv(),
+            };
+            let argv: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
             vec!["-ic".to_string(), format!("exec {}", argv.join(" "))]
         }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
@@ -449,7 +579,111 @@ mod tests {
             args: Vec::new(),
             dir: None,
             env_file: None,
+            resume_args: None,
+            session_store: None,
         }
+    }
+
+    fn resumable(name: &str, command: &str) -> Profile {
+        let mut p = profile(name, command);
+        p.resume_args = Some(vec!["--resume".to_string(), "{id}".to_string()]);
+        p
+    }
+
+    #[test]
+    fn session_ids_that_could_escape_are_rejected() {
+        // The ID becomes both an argv element and a filename in the store.
+        assert!(validate_session_id("../../etc/passwd").is_err());
+        assert!(validate_session_id("a/b").is_err());
+        assert!(validate_session_id("--dangerously-skip-permissions").is_err());
+        assert!(validate_session_id("a b").is_err());
+        assert!(validate_session_id("$(reboot)").is_err());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn a_pasted_uuid_is_accepted_and_trimmed() {
+        assert_eq!(
+            validate_session_id("  215bf7f7-88e4-4070-b41b-332500303534\n"),
+            Ok("215bf7f7-88e4-4070-b41b-332500303534")
+        );
+    }
+
+    #[test]
+    fn resume_substitutes_the_id_after_the_profile_arguments() {
+        let mut p = resumable("Claude", "claude");
+        p.args = vec!["--model".to_string(), "opus".to_string()];
+        assert_eq!(
+            resume_argv(&p, "abc-123"),
+            Some(vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+                "--resume".to_string(),
+                "abc-123".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_profile_without_resume_args_cannot_resume() {
+        assert_eq!(resume_argv(&profile("Agy", "agy"), "abc"), None);
+        let mut empty = profile("Claude", "claude");
+        empty.resume_args = Some(Vec::new());
+        assert_eq!(resume_argv(&empty, "abc"), None);
+    }
+
+    #[test]
+    fn startup_command_resumes_when_asked() {
+        let cmd = get_startup_command(Some(&resumable("Claude", "claude")), Some("abc-123"));
+        assert_eq!(cmd[1], "exec 'claude' '--resume' 'abc-123'");
+    }
+
+    #[test]
+    fn startup_command_ignores_resume_for_a_profile_that_cannot() {
+        let cmd = get_startup_command(Some(&profile("Agy", "agy")), Some("abc-123"));
+        assert_eq!(cmd[1], "exec 'agy'");
+    }
+
+    #[test]
+    fn session_dir_is_read_from_a_transcript_one_level_down() {
+        let store = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let project_dir = project.path().to_str().unwrap();
+        let sub = store.path().join("-some-project");
+        std::fs::create_dir_all(&sub).unwrap();
+        // The first record has no cwd, as Claude's leading summary lines don't.
+        std::fs::write(
+            sub.join("abc-123.jsonl"),
+            format!(
+                "{{\"type\":\"summary\"}}\nnot json\n{{\"type\":\"user\",\"cwd\":\"{project_dir}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_session_dir(store.path().to_str().unwrap(), "abc-123").as_deref(),
+            Some(project_dir)
+        );
+    }
+
+    #[test]
+    fn session_dir_is_none_when_unknown_or_gone() {
+        let store = tempdir().unwrap();
+        let store_path = store.path().to_str().unwrap();
+        assert_eq!(find_session_dir(store_path, "missing"), None);
+
+        // A recorded directory that has since been deleted is no better than
+        // none: spawning there would fall back to $HOME and fail to resume.
+        std::fs::write(
+            store.path().join("gone.jsonl"),
+            "{\"cwd\":\"/nonexistent/project/dir\"}\n",
+        )
+        .unwrap();
+        assert_eq!(find_session_dir(store_path, "gone"), None);
+
+        assert_eq!(find_session_dir("/nonexistent/store", "abc"), None);
     }
 
     /// A stand-in for command lookup. The real probe spawns `which` and an
@@ -504,7 +738,7 @@ mod tests {
     fn startup_command_execs_the_profile_command() {
         // exec so the CLI owns the TTY; without it the CLI runs as a child job
         // and comes up degraded.
-        let cmd = get_startup_command(Some(&profile("Claude", "claude")));
+        let cmd = get_startup_command(Some(&profile("Claude", "claude")), None);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec 'claude'");
     }
@@ -514,7 +748,7 @@ mod tests {
         let mut p = profile("Claude", "claude");
         p.args = vec!["--model".to_string(), "opus".to_string()];
         assert_eq!(
-            get_startup_command(Some(&p))[1],
+            get_startup_command(Some(&p), None)[1],
             "exec 'claude' '--model' 'opus'"
         );
     }
@@ -525,7 +759,7 @@ mod tests {
         // with a space would be re-split and one with a $ would be expanded.
         let mut p = profile("Claude", "claude");
         p.args = vec!["a b".to_string(), "$HOME".to_string(), "it's".to_string()];
-        let rendered = get_startup_command(Some(&p))[1].clone();
+        let rendered = get_startup_command(Some(&p), None)[1].clone();
         assert!(rendered.contains("'a b'"), "{rendered}");
         assert!(rendered.contains("'$HOME'"), "{rendered}");
         assert!(rendered.contains(r"'it'\''s'"), "{rendered}");
@@ -533,7 +767,7 @@ mod tests {
 
     #[test]
     fn startup_command_without_a_profile_falls_back_to_the_shell() {
-        let cmd = get_startup_command(None);
+        let cmd = get_startup_command(None, None);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec $SHELL");
     }
