@@ -65,6 +65,17 @@ pub struct Profile {
     /// terminal handshake.
     #[serde(default)]
     pub env_file: Option<String>,
+    /// Arguments that resume a specific session, appended after `args`, with
+    /// `{id}` standing for the session ID — `["--resume", "{id}"]` for Claude.
+    /// `None` or empty means this profile cannot resume a session.
+    #[serde(default)]
+    pub resume_args: Option<Vec<String>>,
+    /// Where this CLI keeps its session transcripts, as `<id>.jsonl` directly
+    /// inside it or one directory down. Used to find the directory a session
+    /// must be resumed from: a CLI that scopes sessions per project cannot see
+    /// one from anywhere else. Each record may carry a `cwd`; the first wins.
+    #[serde(default)]
+    pub session_store: Option<String>,
 }
 
 impl Profile {
@@ -75,6 +86,26 @@ impl Profile {
         argv.extend(self.args.iter().cloned());
         argv
     }
+
+    /// Whether this profile knows how to resume a session.
+    pub fn can_resume(&self) -> bool {
+        self.resume_args.as_ref().is_some_and(|a| !a.is_empty())
+    }
+}
+
+/// The resume settings for CLIs whose conventions are known, keyed by command.
+///
+/// Only Claude for now: its `--resume <id>` and `~/.claude/projects/<dir>/<id>.jsonl`
+/// layout were checked against the installed CLI. Another CLI gets resume by
+/// declaring `resume_args` in config, not by an entry here.
+fn known_resume_settings(command: &str) -> Option<(Vec<String>, String)> {
+    match command {
+        "claude" => Some((
+            vec!["--resume".to_string(), "{id}".to_string()],
+            "~/.claude/projects".to_string(),
+        )),
+        _ => None,
+    }
 }
 
 /// The profiles a fresh install starts with — the three clients the old
@@ -82,12 +113,18 @@ impl Profile {
 fn default_profiles() -> Vec<Profile> {
     ["Claude", "Agy", "Gemini"]
         .iter()
-        .map(|name| Profile {
-            name: (*name).to_string(),
-            command: name.to_lowercase(),
-            args: Vec::new(),
-            dir: None,
-            env_file: None,
+        .map(|name| {
+            let command = name.to_lowercase();
+            let resume = known_resume_settings(&command);
+            Profile {
+                name: (*name).to_string(),
+                args: Vec::new(),
+                dir: None,
+                env_file: None,
+                resume_args: resume.as_ref().map(|(args, _)| args.clone()),
+                session_store: resume.map(|(_, store)| store),
+                command,
+            }
         })
         .collect()
 }
@@ -513,6 +550,19 @@ impl TerminalConfig {
     fn normalize(mut self) -> Self {
         if self.profiles.is_empty() {
             self.profiles = default_profiles();
+        }
+
+        // Profiles saved before resume existed carry neither field, so the
+        // persisted Claude profile would otherwise never be able to resume.
+        // Only a profile that set *neither* is filled in: an explicit
+        // `"resume_args": []` is an opt-out and stays one.
+        for profile in &mut self.profiles {
+            if profile.resume_args.is_none() && profile.session_store.is_none() {
+                if let Some((args, store)) = known_resume_settings(&profile.command) {
+                    profile.resume_args = Some(args);
+                    profile.session_store = Some(store);
+                }
+            }
         }
 
         if self.default_profile.is_none() && self.cli_client != CliClient::Auto {
@@ -950,6 +1000,8 @@ mod tests {
                 args: vec!["--full-auto".to_string()],
                 dir: Some("/tmp/project".to_string()),
                 env_file: Some("/tmp/env.sh".to_string()),
+                resume_args: Some(vec!["resume".to_string(), "{id}".to_string()]),
+                session_store: None,
             }],
             default_profile: Some("Codex".to_string()),
             ..Default::default()
@@ -986,8 +1038,45 @@ mod tests {
             args: vec!["--model".to_string(), "opus".to_string()],
             dir: None,
             env_file: None,
+            resume_args: None,
+            session_store: None,
         };
         assert_eq!(profile.argv(), vec!["claude", "--model", "opus"]);
+    }
+
+    #[test]
+    fn a_pre_resume_claude_profile_gains_resume_settings() {
+        // Every config saved before resume existed has a Claude profile with
+        // neither field; without the backfill it could never resume anything.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[{"name":"Claude","command":"claude"},{"name":"Agy","command":"agy"}]}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert!(loaded.profiles[0].can_resume());
+        assert_eq!(
+            loaded.profiles[0].session_store.as_deref(),
+            Some("~/.claude/projects")
+        );
+        // A CLI with no known convention is left alone rather than guessed at.
+        assert!(!loaded.profiles[1].can_resume());
+    }
+
+    #[test]
+    fn an_explicit_resume_opt_out_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[{"name":"Claude","command":"claude","resume_args":[]}]}"#)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert!(!loaded.profiles[0].can_resume());
+        assert!(loaded.profiles[0].session_store.is_none());
     }
 
     #[test]

@@ -18,6 +18,10 @@ window.
     tab's directory. The tab bar auto-hides when only one tab is open.
   - **New Tab in Folder…** opens a folder picker and roots a new tab there —
     useful because a running CLI session cannot re-root itself.
+- **Resume a session by ID**: `agent-terminal --resume <session-id>` opens a tab
+  in the running window (or a new one), resuming that conversation from the
+  directory it was recorded in. Also on the **+** dropdown and the right-click
+  menu as **Resume Session…**. See [Resuming sessions](#resuming-sessions).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -116,6 +120,36 @@ rebuild:
 the session. Nothing it prints reaches the terminal — output before `exec` breaks
 the CLI's terminal handshake, which is why the old "startup script" setting could
 never work.
+
+### Resuming sessions
+```bash
+agent-terminal --resume 215bf7f7-88e4-4070-b41b-332500303534
+agent-terminal --resume <id> --dir ~/git/some-project   # skip the lookup
+```
+
+A launch while Agent Terminal is already running hands the request to that
+instance and exits, so the tab opens in your existing window. Bad IDs and
+directories are reported on the terminal you typed the command in, with exit
+status 2.
+
+Resuming is declared per profile, so the binary knows no CLI's conventions:
+
+```jsonc
+{ "name": "Claude", "command": "claude",
+  "resume_args": ["--resume", "{id}"],          // {id} is the session ID
+  "session_store": "~/.claude/projects" }       // where <id>.jsonl transcripts live
+```
+
+`session_store` exists because Claude only resumes a session from the project
+directory it was recorded in. The transcript is looked up (directly in the store
+or one directory down) and its first recorded `cwd` becomes the tab's directory.
+If it can't be found, the tab opens in the profile's default directory and a
+dialog explains how to pass `--dir`.
+
+Claude profiles saved before resume existed are filled in with the settings
+above on load. Set `"resume_args": []` to opt out. Other CLIs can resume once
+they declare `resume_args`. Restarting a resumed tab resumes it again rather
+than starting a new session.
 
 ### Status indicators
 Optional header-bar lights driven by a file or a command. Empty by default.

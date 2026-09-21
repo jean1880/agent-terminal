@@ -21,4 +21,15 @@ impl AgentTerminalWindow {
     pub fn new(app: &adw::Application) -> Self {
         glib::Object::builder().property("application", app).build()
     }
+
+    /// Opens a tab resuming `session_id`, once the window is ready for it.
+    ///
+    /// `session_id` must already have passed
+    /// [`crate::utils::validate_session_id`]. `dir` overrides the session-store
+    /// lookup of where the session was recorded.
+    pub fn resume_session(&self, session_id: String, dir: Option<String>) {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp()
+            .request_resume(imp::ResumeRequest { session_id, dir });
+    }
 }

@@ -4,9 +4,9 @@
 //! (Claude, Antigravity/`agy`, or Gemini) in a focused, tabbed window.
 
 use gtk4::prelude::*;
-use gtk4::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
+use gtk4::{gdk, gio, glib, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 use std::io::IsTerminal;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -26,7 +26,31 @@ fn main() -> glib::ExitCode {
         "Starting Agent Terminal (v{})...",
         env!("CARGO_PKG_VERSION")
     );
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // HANDLES_COMMAND_LINE so `--resume` reaches the *running* instance: a second
+    // launch forwards its arguments over D-Bus and exits, and the tab opens in
+    // the window that is already there.
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
+    app.add_main_option(
+        "resume",
+        glib::Char::from(b'r'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Open a tab resuming the session with this ID",
+        Some("SESSION_ID"),
+    );
+    app.add_main_option(
+        "dir",
+        glib::Char::from(b'd'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Directory to resume in (default: where the session was recorded)",
+        Some("DIR"),
+    );
+    app.connect_handle_local_options(check_local_options);
+    app.connect_command_line(handle_command_line);
 
     app.connect_startup(|app| {
         debug!("Application startup: loading CSS");
@@ -89,6 +113,101 @@ fn main() -> glib::ExitCode {
     let exit_code = app.run();
     info!("Application loop exited with code: {:?}", exit_code);
     exit_code
+}
+
+/// Validates the options in the *launching* process, before they are forwarded.
+///
+/// Doing it here means a bad ID or directory is reported on the terminal that
+/// typed it. The primary instance's stderr may be nowhere, and printing to the
+/// caller from there (`g_application_command_line_printerr`) would need GLib
+/// 2.80. It's also the one place where a relative `--dir` still means the
+/// caller's directory, so it's made absolute here.
+fn check_local_options(
+    _app: &adw::Application,
+    options: &glib::VariantDict,
+) -> std::ops::ControlFlow<glib::ExitCode> {
+    use std::ops::ControlFlow::{Break, Continue};
+    const USAGE_ERROR: u8 = 2;
+    let usage_error = |message: String| {
+        eprintln!("agent-terminal: {message}");
+        Break(glib::ExitCode::from(USAGE_ERROR))
+    };
+
+    let resume = options.lookup::<String>("resume").ok().flatten();
+    let dir = options.lookup::<String>("dir").ok().flatten();
+
+    let Some(resume) = resume else {
+        return match dir {
+            Some(_) => usage_error("--dir only applies with --resume".to_string()),
+            None => Continue(()),
+        };
+    };
+
+    match utils::validate_session_id(&resume) {
+        Ok(id) => options.insert_value("resume", &id.to_variant()),
+        Err(reason) => return usage_error(reason),
+    }
+
+    if let Some(dir) = dir {
+        let path = std::path::PathBuf::from(utils::expand_tilde(&dir));
+        let path = match std::env::current_dir() {
+            Ok(cwd) if path.is_relative() => cwd.join(path),
+            _ => path,
+        };
+        if !path.is_dir() {
+            return usage_error(format!("--dir {} is not a directory", path.display()));
+        }
+        options.insert_value("dir", &path.to_string_lossy().to_variant());
+    }
+    Continue(())
+}
+
+/// Handles a launch's command line, in the primary instance.
+///
+/// With no options this is a plain activation, a new window as before. With
+/// `--resume`, the tab opens in the active window, or in a new window when
+/// there isn't one. The options were checked by [`check_local_options`], but
+/// the ID is re-checked: anything on the session bus can send a command line.
+fn handle_command_line(
+    app: &adw::Application,
+    cmdline: &gio::ApplicationCommandLine,
+) -> glib::ExitCode {
+    let options = cmdline.options_dict();
+    let Some(resume) = options.lookup::<String>("resume").ok().flatten() else {
+        app.activate();
+        return glib::ExitCode::SUCCESS;
+    };
+    let session_id = match utils::validate_session_id(&resume) {
+        Ok(id) => id.to_string(),
+        Err(reason) => {
+            warn!("Refusing a forwarded resume request: {reason}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
+    // check_local_options made this absolute and checked it. A forwarded value
+    // that isn't both came from somewhere else, so drop it and fall back to
+    // the session-store lookup rather than guess what it was relative to.
+    let dir = options
+        .lookup::<String>("dir")
+        .ok()
+        .flatten()
+        .filter(|dir| {
+            let path = std::path::Path::new(dir);
+            let usable = path.is_absolute() && path.is_dir();
+            if !usable {
+                warn!("Ignoring a forwarded --dir that is not an absolute directory: {dir}");
+            }
+            usable
+        });
+
+    info!("Command line asks to resume session {session_id}");
+    let window = app
+        .active_window()
+        .and_downcast::<AgentTerminalWindow>()
+        .unwrap_or_else(|| AgentTerminalWindow::new(app));
+    window.resume_session(session_id, dir);
+    window.present();
+    glib::ExitCode::SUCCESS
 }
 
 /// Initializes logging.
