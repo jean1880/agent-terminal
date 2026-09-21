@@ -20,8 +20,9 @@ window.
     useful because a running CLI session cannot re-root itself.
 - **Resume a session by ID**: `agent-terminal --resume <session-id>` opens a tab
   in the running window (or a new one), resuming that conversation from the
-  directory it was recorded in. Also on the **+** dropdown and the right-click
-  menu as **Resume Session…**. See [Resuming sessions](#resuming-sessions).
+  directory it was recorded in. Or browse for it: **Resume Session…** on the
+  **+** dropdown and the right-click menu lists recent sessions by title, folder
+  and age, with search. See [Resuming sessions](#resuming-sessions).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -137,8 +138,19 @@ Resuming is declared per profile, so the binary knows no CLI's conventions:
 ```jsonc
 { "name": "Claude", "command": "claude",
   "resume_args": ["--resume", "{id}"],          // {id} is the session ID
-  "session_store": "~/.claude/projects" }       // where <id>.jsonl transcripts live
+  "session_store": "~/.claude/projects",        // where <id>.jsonl transcripts live
+  "session_title": "/aiTitle" }                 // JSON pointer to a session's title
 ```
+
+**Resume Session…** opens a browser of the store's 200 most recently active
+sessions, newest first. Each row shows the session's title, the folder it will
+resume in, and how long ago it was last active. Type to filter by title, folder
+or ID; Enter resumes the top match. **Enter ID…** in its header falls back to
+pasting an ID. The latest title in a transcript wins, since a CLI may retitle a
+session as it goes; a session without one is listed by ID. Only the first and
+last 256 KiB of each transcript are read, so a store of multi-MiB transcripts
+still lists quickly. A store that cannot be read says so rather than showing an
+empty list.
 
 `session_store` exists because Claude only resumes a session from the project
 directory it was recorded in. The transcript is looked up (directly in the store
@@ -147,7 +159,7 @@ If it can't be found, the tab opens in the profile's default directory and a
 dialog explains how to pass `--dir`.
 
 Claude profiles saved before resume existed are filled in with the settings
-above on load. Set `"resume_args": []` to opt out. Other CLIs can resume once
+above on load, and those saved before the browser gain `session_title`. Set `"resume_args": []` to opt out. Other CLIs can resume once
 they declare `resume_args`. Restarting a resumed tab resumes it again rather
 than starting a new session.
 

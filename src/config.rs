@@ -76,6 +76,12 @@ pub struct Profile {
     /// one from anywhere else. Each record may carry a `cwd`; the first wins.
     #[serde(default)]
     pub session_store: Option<String>,
+    /// A JSON pointer (RFC 6901) to a session's title inside a transcript
+    /// record, e.g. `/aiTitle`. Used by the session browser; the latest match
+    /// wins, because a CLI may retitle a session as it goes. `None` lists
+    /// sessions by ID.
+    #[serde(default)]
+    pub session_title: Option<String>,
 }
 
 impl Profile {
@@ -93,17 +99,26 @@ impl Profile {
     }
 }
 
+/// Resume settings for a CLI whose conventions are known.
+struct KnownResume {
+    args: Vec<String>,
+    store: String,
+    title: String,
+}
+
 /// The resume settings for CLIs whose conventions are known, keyed by command.
 ///
-/// Only Claude for now: its `--resume <id>` and `~/.claude/projects/<dir>/<id>.jsonl`
-/// layout were checked against the installed CLI. Another CLI gets resume by
-/// declaring `resume_args` in config, not by an entry here.
-fn known_resume_settings(command: &str) -> Option<(Vec<String>, String)> {
+/// Only Claude for now: its `--resume <id>`, `~/.claude/projects/<dir>/<id>.jsonl`
+/// layout and `aiTitle` records were checked against the installed CLI and its
+/// transcripts. Another CLI gets resume by declaring the fields in config, not
+/// by an entry here.
+fn known_resume_settings(command: &str) -> Option<KnownResume> {
     match command {
-        "claude" => Some((
-            vec!["--resume".to_string(), "{id}".to_string()],
-            "~/.claude/projects".to_string(),
-        )),
+        "claude" => Some(KnownResume {
+            args: vec!["--resume".to_string(), "{id}".to_string()],
+            store: "~/.claude/projects".to_string(),
+            title: "/aiTitle".to_string(),
+        }),
         _ => None,
     }
 }
@@ -121,8 +136,9 @@ fn default_profiles() -> Vec<Profile> {
                 args: Vec::new(),
                 dir: None,
                 env_file: None,
-                resume_args: resume.as_ref().map(|(args, _)| args.clone()),
-                session_store: resume.map(|(_, store)| store),
+                resume_args: resume.as_ref().map(|r| r.args.clone()),
+                session_store: resume.as_ref().map(|r| r.store.clone()),
+                session_title: resume.map(|r| r.title),
                 command,
             }
         })
@@ -557,11 +573,20 @@ impl TerminalConfig {
         // Only a profile that set *neither* is filled in: an explicit
         // `"resume_args": []` is an opt-out and stays one.
         for profile in &mut self.profiles {
+            let Some(known) = known_resume_settings(&profile.command) else {
+                continue;
+            };
             if profile.resume_args.is_none() && profile.session_store.is_none() {
-                if let Some((args, store)) = known_resume_settings(&profile.command) {
-                    profile.resume_args = Some(args);
-                    profile.session_store = Some(store);
-                }
+                profile.resume_args = Some(known.args);
+                profile.session_store = Some(known.store.clone());
+            }
+            // Saved by the release that added resume but not the browser: the
+            // store is the known one, only the title pointer is missing. A
+            // custom store is left alone — its title format is not ours to guess.
+            if profile.session_title.is_none()
+                && profile.session_store.as_deref() == Some(known.store.as_str())
+            {
+                profile.session_title = Some(known.title);
             }
         }
 
@@ -1002,6 +1027,7 @@ mod tests {
                 env_file: Some("/tmp/env.sh".to_string()),
                 resume_args: Some(vec!["resume".to_string(), "{id}".to_string()]),
                 session_store: None,
+                session_title: None,
             }],
             default_profile: Some("Codex".to_string()),
             ..Default::default()
@@ -1040,8 +1066,34 @@ mod tests {
             env_file: None,
             resume_args: None,
             session_store: None,
+            session_title: None,
         };
         assert_eq!(profile.argv(), vec!["claude", "--model", "opus"]);
+    }
+
+    #[test]
+    fn a_resume_era_profile_gains_only_the_title_pointer() {
+        // Saved by the release that added resume: store present, title absent.
+        // A profile pointed at its own store is not given Claude's title format.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(
+                br#"{"profiles":[
+                    {"name":"Claude","command":"claude","resume_args":["--resume","{id}"],
+                     "session_store":"~/.claude/projects"},
+                    {"name":"Work","command":"claude","resume_args":["--resume","{id}"],
+                     "session_store":"/srv/elsewhere"}]}"#,
+            )
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(
+            loaded.profiles[0].session_title.as_deref(),
+            Some("/aiTitle")
+        );
+        assert_eq!(loaded.profiles[1].session_title, None);
     }
 
     #[test]
@@ -1060,6 +1112,10 @@ mod tests {
         assert_eq!(
             loaded.profiles[0].session_store.as_deref(),
             Some("~/.claude/projects")
+        );
+        assert_eq!(
+            loaded.profiles[0].session_title.as_deref(),
+            Some("/aiTitle")
         );
         // A CLI with no known convention is left alone rather than guessed at.
         assert!(!loaded.profiles[1].can_resume());
