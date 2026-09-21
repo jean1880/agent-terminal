@@ -646,11 +646,16 @@ fn summarize_session(
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
+    // Split on raw bytes and decode each line lossily. `lines()` would stop at
+    // the first line that isn't valid UTF-8, so one corrupt record would hide
+    // every record after it. `map_while` still stops on a real I/O error,
+    // which would only repeat.
     let mut head_title = None;
     for line in std::io::BufReader::new((&mut file).take(SUMMARY_WINDOW))
-        .lines()
+        .split(b'\n')
         .map_while(Result::ok)
     {
+        let line = String::from_utf8_lossy(&line);
         if summary.dir.is_none() && line.contains("\"cwd\"") {
             summary.dir = serde_json::from_str::<serde_json::Value>(&line)
                 .ok()
@@ -661,14 +666,19 @@ fn summarize_session(
         }
     }
 
-    // The tail, when the head did not already cover the whole file. Its first
-    // line is almost certainly partial and is skipped.
+    // The tail, when the head did not already cover the whole file. Reading
+    // starts one byte before the window, so the first piece `split` yields is
+    // always safe to drop: it is empty if the window starts on a line
+    // boundary, and a partial line otherwise. Starting exactly at the window
+    // would instead discard a complete first line whenever the boundary fell
+    // on a newline.
     let mut tail_title = None;
-    if len > SUMMARY_WINDOW && file.seek(SeekFrom::Start(len - SUMMARY_WINDOW)).is_ok() {
+    let tail_start = len.saturating_sub(SUMMARY_WINDOW + 1);
+    if len > SUMMARY_WINDOW && file.seek(SeekFrom::Start(tail_start)).is_ok() {
         let mut bytes = Vec::new();
         if file.read_to_end(&mut bytes).is_ok() {
             let text = String::from_utf8_lossy(&bytes);
-            tail_title = text.lines().skip(1).filter_map(title_of).last();
+            tail_title = text.split('\n').skip(1).filter_map(title_of).last();
         }
     }
 
@@ -930,6 +940,36 @@ mod tests {
 
         let sessions = list_sessions(store.path().to_str().unwrap(), Some("/aiTitle")).unwrap();
         assert_eq!(sessions[0].title.as_deref(), Some("Late"));
+    }
+
+    #[test]
+    fn a_title_line_starting_exactly_at_the_tail_window_is_kept() {
+        // The tail window begins on a line boundary here, so its first line is
+        // complete. Always skipping the first line would drop the only title.
+        let store = tempdir().unwrap();
+        let head = format!("{{\"blob\":\"{}\"}}\n", "x".repeat(SUMMARY_WINDOW as usize));
+        let prefix = "{\"aiTitle\":\"Edge\",\"pad\":\"";
+        let suffix = "\"}\n";
+        let pad = "p".repeat(SUMMARY_WINDOW as usize - prefix.len() - suffix.len());
+        let tail = format!("{prefix}{pad}{suffix}");
+        assert_eq!(tail.len() as u64, SUMMARY_WINDOW);
+        transcript(store.path(), "edge", &format!("{head}{tail}"), 1);
+
+        let sessions = list_sessions(store.path().to_str().unwrap(), Some("/aiTitle")).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("Edge"));
+    }
+
+    #[test]
+    fn a_corrupt_line_does_not_hide_the_records_after_it() {
+        let store = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let project_dir = project.path().to_str().unwrap();
+        let mut body = b"{\"broken\":\"\xff\xfe\"}\n".to_vec();
+        body.extend_from_slice(format!("{{\"cwd\":\"{project_dir}\"}}\n").as_bytes());
+        std::fs::write(store.path().join("bad.jsonl"), body).unwrap();
+
+        let sessions = list_sessions(store.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(sessions[0].dir.as_deref(), Some(project_dir));
     }
 
     #[test]

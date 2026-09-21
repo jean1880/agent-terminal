@@ -2537,6 +2537,11 @@ impl AgentTerminalWindow {
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
         search.grab_focus();
 
+        // The weak refs upgrade once, when the task first runs, so a dialog
+        // closed mid-scan stays alive until the scan finishes. That's bounded
+        // (one scan, no cycle) and harmless: filling a closed dialog shows
+        // nothing. The listing and every per-file summary run in this one
+        // spawn_blocking, not lazily per row.
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             list,
