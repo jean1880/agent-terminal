@@ -98,6 +98,12 @@ fn main() -> glib::ExitCode {
         for n in 1..=9i32 {
             let index = if n == 9 { -1 } else { n - 1 };
             app.set_accels_for_action(&format!("win.select-tab({index})"), &[&format!("<Alt>{n}")]);
+            // Ctrl+Alt+N opens a tab as the Nth configured profile, in the
+            // current tab's directory.
+            app.set_accels_for_action(
+                &format!("win.new-tab-profile-at({})", n - 1),
+                &[&format!("<Ctrl><Alt>{n}")],
+            );
         }
     });
 

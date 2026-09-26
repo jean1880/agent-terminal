@@ -651,33 +651,60 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&select_tab);
 
-        // New Tab As <profile>. Parameterised by profile name rather than index,
-        // so it stays correct if the profile list changes underneath the menu.
-        let new_tab_profile_action =
-            gtk4::gio::SimpleAction::new("new-tab-profile", Some(&String::static_variant_type()));
-        new_tab_profile_action.connect_activate(glib::clone!(
+        // New Tab As <profile> and New Tab in Folder As <profile>. Parameterised
+        // by profile name rather than index, so the menus stay correct if the
+        // profile list changes underneath them.
+        for (name, in_folder) in [("new-tab-profile", false), ("new-tab-folder-profile", true)] {
+            let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
+            action.connect_activate(glib::clone!(
+                #[weak]
+                obj,
+                move |_, target| {
+                    let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
+                        warn!("{name} activated without a profile name");
+                        return;
+                    };
+                    let imp = obj.imp();
+                    let profile = imp
+                        .config
+                        .borrow()
+                        .profiles
+                        .iter()
+                        .find(|p| p.name == profile_name)
+                        .cloned();
+                    match profile {
+                        Some(profile) if in_folder => imp.new_tab_in_folder(Some(profile)),
+                        Some(profile) => imp.new_tab_with_profile(&profile),
+                        None => warn!("No profile named '{profile_name}'"),
+                    }
+                }
+            ));
+            obj.add_action(&action);
+        }
+
+        // Ctrl+Alt+1..9 open the Nth profile, so switching CLI (e.g. to Gemini
+        // when Claude runs out of tokens) needs no menu. Indexed because an
+        // accelerator is bound once per app, before any profile list is known.
+        let new_tab_profile_at =
+            gtk4::gio::SimpleAction::new("new-tab-profile-at", Some(&i32::static_variant_type()));
+        new_tab_profile_at.connect_activate(glib::clone!(
             #[weak]
             obj,
             move |_, target| {
-                let Some(name) = target.and_then(|t| t.get::<String>()) else {
-                    warn!("new-tab-profile activated without a profile name");
+                let Some(index) = target.and_then(|t| t.get::<i32>()) else {
                     return;
                 };
                 let imp = obj.imp();
-                let profile = imp
-                    .config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == name)
-                    .cloned();
+                let profile = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| imp.config.borrow().profiles.get(i).cloned());
                 match profile {
                     Some(profile) => imp.new_tab_with_profile(&profile),
-                    None => warn!("No profile named '{name}'"),
+                    None => debug!("No profile at position {index}"),
                 }
             }
         ));
-        obj.add_action(&new_tab_profile_action);
+        obj.add_action(&new_tab_profile_at);
 
         // Restart Session Action. restart_tab already existed with exactly the
         // right semantics but was reachable only as a side effect of closing the
@@ -708,7 +735,7 @@ impl AgentTerminalWindow {
             obj,
             move |_, _| {
                 debug!("Action: New Tab in Folder");
-                obj.imp().new_tab_in_folder();
+                obj.imp().new_tab_in_folder(None);
             }
         ));
         obj.add_action(&new_tab_folder_action);
@@ -992,14 +1019,14 @@ impl AgentTerminalWindow {
         // rooted in a different project, is one click away without a trip
         // through Settings.
         if let Some(header) = self.header.borrow().as_ref() {
-            let new_tab_menu = self.build_profile_menu();
+            let new_tab_menu = self.build_profile_menu("win.new-tab-profile");
             let resume_section = gtk4::gio::Menu::new();
             resume_section.append(Some("Resume Session…"), Some("win.resume-session"));
             new_tab_menu.append_section(None, &resume_section);
 
             let new_tab_btn = adw::SplitButton::builder()
                 .icon_name("tab-new-symbolic")
-                .tooltip_text("New Tab (Ctrl+Shift+T)")
+                .tooltip_text("New Tab (Ctrl+Shift+T; Ctrl+Alt+1–9 for a specific CLI)")
                 .menu_model(&new_tab_menu)
                 .build();
             new_tab_btn.connect_clicked(glib::clone!(
@@ -1011,15 +1038,18 @@ impl AgentTerminalWindow {
             ));
             header.pack_start(&new_tab_btn);
 
-            let new_tab_folder_btn = Button::builder()
+            // Same split shape: click keeps the current profile, the dropdown
+            // picks the CLI to run in the chosen folder.
+            let new_tab_folder_btn = adw::SplitButton::builder()
                 .icon_name("folder-new-symbolic")
                 .tooltip_text("New Tab in Folder…")
+                .menu_model(&self.build_profile_menu("win.new-tab-folder-profile"))
                 .build();
             new_tab_folder_btn.connect_clicked(glib::clone!(
                 #[weak]
                 obj,
                 move |_| {
-                    obj.imp().new_tab_in_folder();
+                    obj.imp().new_tab_in_folder(None);
                 }
             ));
             header.pack_start(&new_tab_folder_btn);
@@ -1120,8 +1150,9 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// Prompts for a folder, then opens a new tab rooted there.
-    fn new_tab_in_folder(&self) {
+    /// Prompts for a folder, then opens a new tab rooted there running `profile`,
+    /// or the active profile when `None`.
+    fn new_tab_in_folder(&self, profile: Option<Profile>) {
         let obj = self.obj();
         let dialog = gtk4::FileDialog::builder()
             .title("Select Folder for New Tab")
@@ -1148,7 +1179,7 @@ impl AgentTerminalWindow {
                         if let Some(path) = file.path() {
                             let imp = obj.imp();
                             let dir = path.to_string_lossy().to_string();
-                            let profile = imp.active_profile.borrow().clone();
+                            let profile = profile.or_else(|| imp.active_profile.borrow().clone());
                             imp.add_terminal_tab(profile.as_ref(), Some(&dir));
                         }
                     }
@@ -1569,8 +1600,15 @@ impl AgentTerminalWindow {
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Tab"), Some("win.new-tab"));
-        menu.append_submenu(Some("New Tab As"), &self.build_profile_menu());
+        menu.append_submenu(
+            Some("New Tab As"),
+            &self.build_profile_menu("win.new-tab-profile"),
+        );
         menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
+        menu.append_submenu(
+            Some("New Tab in Folder As"),
+            &self.build_profile_menu("win.new-tab-folder-profile"),
+        );
         menu.append(Some("Resume Session…"), Some("win.resume-session"));
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
@@ -2242,9 +2280,10 @@ impl AgentTerminalWindow {
     }
 
     /// Opens a new tab running `profile`, rooted in that profile's directory when
-    /// it names one.
+    /// it names one, else in the current tab's — switching CLI mid-task should
+    /// not lose the project.
     fn new_tab_with_profile(&self, profile: &Profile) {
-        let dir = profile.dir.clone();
+        let dir = profile_tab_dir(profile.dir.as_deref(), self.current_dir());
         info!("Opening a tab for profile '{}'", profile.name);
         self.add_terminal_tab(Some(profile), dir.as_deref());
     }
@@ -2681,24 +2720,28 @@ impl AgentTerminalWindow {
         entry.grab_focus();
     }
 
-    /// Builds the "new tab as…" menu, one item per configured profile.
+    /// Builds a "… as <profile>" menu, one item per configured profile, each
+    /// activating `action` with the profile name.
     ///
     /// Rebuilt on demand rather than cached, so editing config.json and
     /// reopening the window is enough to see a new profile.
-    fn build_profile_menu(&self) -> gtk4::gio::Menu {
+    fn build_profile_menu(&self, action: &str) -> gtk4::gio::Menu {
         let menu = gtk4::gio::Menu::new();
         for profile in self.config.borrow().profiles.iter() {
             // The profile name is the action target, so the action handler does
             // not depend on menu ordering.
             let item = gtk4::gio::MenuItem::new(Some(&profile.name), None);
-            item.set_action_and_target_value(
-                Some("win.new-tab-profile"),
-                Some(&profile.name.to_variant()),
-            );
+            item.set_action_and_target_value(Some(action), Some(&profile.name.to_variant()));
             menu.append_item(&item);
         }
         menu
     }
+}
+
+/// Where a "new tab as <profile>" tab is rooted: the profile's own directory
+/// wins, then the current tab's; `None` falls through to the starting directory.
+fn profile_tab_dir(profile_dir: Option<&str>, current_dir: Option<String>) -> Option<String> {
+    profile_dir.map(str::to_string).or(current_dir)
 }
 
 /// Whether a configured starting directory can actually be used.
@@ -2749,6 +2792,23 @@ mod tests {
             !exited_cleanly(9),
             "a signal death must not be treated as clean"
         );
+    }
+
+    #[test]
+    fn profile_tab_follows_current_tab_unless_profile_pins_a_dir() {
+        let current = Some("/work/project".to_string());
+        // Switching CLI mid-task keeps the project.
+        assert_eq!(
+            profile_tab_dir(None, current.clone()).as_deref(),
+            Some("/work/project")
+        );
+        // A profile rooted elsewhere still wins.
+        assert_eq!(
+            profile_tab_dir(Some("~/other"), current).as_deref(),
+            Some("~/other")
+        );
+        // No tab yet: fall through to the starting directory.
+        assert_eq!(profile_tab_dir(None, None), None);
     }
 
     #[test]
