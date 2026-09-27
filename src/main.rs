@@ -68,6 +68,42 @@ fn main() -> glib::ExitCode {
         ));
         app.add_action(&new_window_action);
 
+        // Targets of the out-of-quota notification. App-level, because a
+        // notification is delivered to the application, not to a window: each
+        // asks every window until the one holding the tab answers.
+        let show_tab = gtk4::gio::SimpleAction::new("show-tab", Some(&u64::static_variant_type()));
+        show_tab.connect_activate(glib::clone!(
+            #[weak]
+            app,
+            move |_, target| {
+                let Some(key) = target.and_then(|t| t.get::<u64>()) else {
+                    return;
+                };
+                if !windows(&app).any(|w| w.show_tab(key)) {
+                    info!("Notification named tab {key}, which has since closed");
+                }
+            }
+        ));
+        app.add_action(&show_tab);
+
+        let continue_tab_in = gtk4::gio::SimpleAction::new(
+            "continue-tab-in",
+            Some(&<(u64, String)>::static_variant_type()),
+        );
+        continue_tab_in.connect_activate(glib::clone!(
+            #[weak]
+            app,
+            move |_, target| {
+                let Some((key, profile)) = target.and_then(|t| t.get::<(u64, String)>()) else {
+                    return;
+                };
+                if !windows(&app).any(|w| w.continue_tab_in(key, &profile)) {
+                    info!("Notification named tab {key}, which has since closed");
+                }
+            }
+        ));
+        app.add_action(&continue_tab_in);
+
         // All shortcuts are application accelerators bound to window actions, so
         // they are caught before VTE sees the key press.
         // Anything handled by a controller on the terminal widget stops working
@@ -129,6 +165,13 @@ fn main() -> glib::ExitCode {
 /// caller from there (`g_application_command_line_printerr`) would need GLib
 /// 2.80. It's also the one place where a relative `--dir` still means the
 /// caller's directory, so it's made absolute here.
+/// The application's terminal windows.
+fn windows(app: &adw::Application) -> impl Iterator<Item = AgentTerminalWindow> {
+    app.windows()
+        .into_iter()
+        .filter_map(|w| w.downcast::<AgentTerminalWindow>().ok())
+}
+
 fn check_local_options(
     _app: &adw::Application,
     options: &glib::VariantDict,

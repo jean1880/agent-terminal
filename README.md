@@ -204,6 +204,13 @@ shows a banner offering **Continue in <next profile>**, which hides again once
 the session replies normally. A transcript that can't be read leaves the banner
 as it was rather than reporting that all is well.
 
+It also raises a desktop notification with the same **Continue in …** button,
+so you can hand off without opening the window. Clicking the notification
+itself brings that tab forward. The notification is withdrawn if the session
+recovers or the tab closes. Nothing switches until you click. Turn it off with
+**Notify When Out of Quota** in Settings (`notify_on_quota`). It is on by
+default, unlike bell notifications.
+
 ```jsonc
 { "name": "Agy", "command": "agy",
   "prompt_args": ["--prompt-interactive", "{prompt}"],   // how to start with a prompt

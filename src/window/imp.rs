@@ -59,7 +59,16 @@ struct TabState {
     /// Set by every screen update and cleared when the screen is checked for
     /// quota markers, so an idle tab is never re-read.
     screen_dirty: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Unique for the life of the process, across windows, so a desktop
+    /// notification can name this tab after it was sent.
+    key: u64,
+    /// Whether a quota notification is out for this tab, so a transcript that
+    /// flickers to unreadable and back does not raise a second one.
+    quota_notified: bool,
 }
+
+/// Source of [`TabState::key`].
+static NEXT_TAB_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl TabState {
     /// The session this tab is running, if the terminal knows it.
@@ -1134,7 +1143,20 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             move |_, page, _| {
-                obj.imp().tabs.borrow_mut().retain(|t| &t.page != page);
+                let imp = obj.imp();
+                let closed: Vec<u64> = imp
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .filter(|t| &t.page == page)
+                    .map(|t| t.key)
+                    .collect();
+                imp.tabs.borrow_mut().retain(|t| &t.page != page);
+                // A notification offering to hand off a closed tab would do
+                // nothing when clicked.
+                for key in closed {
+                    imp.withdraw_quota_notification(key);
+                }
             }
         ));
 
@@ -1388,6 +1410,8 @@ impl AgentTerminalWindow {
             quota_banner,
             quota: QuotaState::Unknown,
             screen_dirty,
+            key: NEXT_TAB_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            quota_notified: false,
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
@@ -2167,6 +2191,12 @@ impl AgentTerminalWindow {
             .active(config.notify_on_bell)
             .build();
 
+        let notify_quota_row = adw::SwitchRow::builder()
+            .title("Notify When Out of Quota")
+            .subtitle("Raise a desktop notification offering to continue in another CLI")
+            .active(config.notify_on_quota)
+            .build();
+
         let restore_row = adw::SwitchRow::builder()
             .title("Restore Tabs on Launch")
             .subtitle("Reopen the tabs that were open when the window last closed")
@@ -2182,6 +2212,7 @@ impl AgentTerminalWindow {
         group.add(&cli_client_row);
         group.add(&theme_row);
         group.add(&notify_row);
+        group.add(&notify_quota_row);
         group.add(&restore_row);
         page.add(&group);
         dialog.add(&page);
@@ -2232,6 +2263,16 @@ impl AgentTerminalWindow {
             move |row| {
                 let imp = obj.imp();
                 imp.config.borrow_mut().notify_on_bell = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
+
+        notify_quota_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().notify_on_quota = row.is_active();
                 imp.schedule_config_save();
             }
         ));
@@ -3152,32 +3193,116 @@ impl AgentTerminalWindow {
             self.handoff_target(tab.profile.as_deref())
         };
 
-        let mut tabs = self.tabs.borrow_mut();
-        let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+        // Decided under the borrow, sent after it: the notification calls
+        // into GApplication, which must not run with a tab borrowed.
+        let mut notify: Option<(u64, String, String)> = None;
+        let mut withdraw: Option<u64> = None;
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+                return;
+            };
+            match &state {
+                QuotaState::Exhausted { detail } => {
+                    let who = tab.profile.as_deref().unwrap_or("This session");
+                    info!("{who} is out of quota: {detail}");
+                    tab.quota_banner
+                        .set_title(&format!("{who} is out of quota — {detail}"));
+                    match &target {
+                        Some(name) => {
+                            tab.quota_banner
+                                .set_button_label(Some(&format!("Continue in {name}")));
+                            tab.quota_banner
+                                .set_action_target_value(Some(&name.to_variant()));
+                        }
+                        None => tab.quota_banner.set_button_label(None),
+                    }
+                    tab.quota_banner.set_revealed(true);
+                    page.set_needs_attention(true);
+                    if !tab.quota_notified && self.config.borrow().notify_on_quota {
+                        tab.quota_notified = true;
+                        notify = Some((tab.key, who.to_string(), detail.clone()));
+                    }
+                }
+                QuotaState::Available => {
+                    tab.quota_banner.set_revealed(false);
+                    if std::mem::take(&mut tab.quota_notified) {
+                        withdraw = Some(tab.key);
+                    }
+                }
+                QuotaState::Unknown => {}
+            }
+            tab.quota = state;
+        }
+
+        if let Some((key, who, detail)) = notify {
+            self.send_quota_notification(key, &who, &detail, target.as_deref());
+        }
+        if let Some(key) = withdraw {
+            self.withdraw_quota_notification(key);
+        }
+    }
+
+    fn quota_notification_id(key: u64) -> String {
+        format!("agent-terminal-quota-{key}")
+    }
+
+    /// Raises the desktop notification for a tab out of quota.
+    ///
+    /// Clicking the body brings the tab forward; the button, when there is a
+    /// profile to hand off to, runs the same hand-off as the banner. Both go
+    /// through app actions keyed by the tab, since a notification outlives the
+    /// focus and selection it was sent under.
+    fn send_quota_notification(&self, key: u64, who: &str, detail: &str, target: Option<&str>) {
+        let Some(app) = self.obj().application() else {
             return;
         };
-        match &state {
-            QuotaState::Exhausted { detail } => {
-                let who = tab.profile.as_deref().unwrap_or("This session");
-                info!("{who} is out of quota: {detail}");
-                tab.quota_banner
-                    .set_title(&format!("{who} is out of quota — {detail}"));
-                match &target {
-                    Some(name) => {
-                        tab.quota_banner
-                            .set_button_label(Some(&format!("Continue in {name}")));
-                        tab.quota_banner
-                            .set_action_target_value(Some(&name.to_variant()));
-                    }
-                    None => tab.quota_banner.set_button_label(None),
-                }
-                tab.quota_banner.set_revealed(true);
-                page.set_needs_attention(true);
-            }
-            QuotaState::Available => tab.quota_banner.set_revealed(false),
-            QuotaState::Unknown => {}
+        let notification = gtk4::gio::Notification::new(&format!("{who} is out of quota"));
+        notification.set_body(Some(detail));
+        notification.set_priority(gtk4::gio::NotificationPriority::High);
+        notification.set_default_action_and_target_value("app.show-tab", Some(&key.to_variant()));
+        if let Some(target) = target {
+            notification.add_button_with_target_value(
+                &format!("Continue in {target}"),
+                "app.continue-tab-in",
+                Some(&(key, target.to_string()).to_variant()),
+            );
         }
-        tab.quota = state;
+        app.send_notification(Some(&Self::quota_notification_id(key)), &notification);
+    }
+
+    fn withdraw_quota_notification(&self, key: u64) {
+        if let Some(app) = self.obj().application() {
+            app.withdraw_notification(&Self::quota_notification_id(key));
+        }
+    }
+
+    /// Selects the tab with `key` and brings its window forward. `false` if
+    /// this window does not hold it.
+    pub fn show_tab(&self, key: u64) -> bool {
+        let page = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.key == key)
+            .map(|t| t.page.clone());
+        let Some(page) = page else {
+            return false;
+        };
+        if let Some(view) = self.tab_view.borrow().as_ref() {
+            view.set_selected_page(&page);
+        }
+        self.obj().present();
+        true
+    }
+
+    /// [`Self::continue_in`] for the tab with `key`, from a notification.
+    pub fn continue_tab_in(&self, key: u64, target: &str) -> bool {
+        if !self.show_tab(key) {
+            return false;
+        }
+        self.continue_in(target);
+        true
     }
 
     /// The session items shared by the new-tab dropdown and the context menu:

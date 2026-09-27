@@ -391,6 +391,10 @@ pub struct TerminalConfig {
     /// Send a desktop notification when a background tab rings the bell — which
     /// is how a CLI announces it has finished and wants attention.
     pub notify_on_bell: bool,
+    /// Send a desktop notification, with a hand-off button, when a session
+    /// runs out of quota. On by default, unlike the bell: it is rare, and it
+    /// means work has stopped.
+    pub notify_on_quota: bool,
     /// Reopen the previous window's tabs on launch.
     pub restore_session: bool,
     /// Header-bar status lights. Empty by default: this is an extension point,
@@ -496,6 +500,7 @@ impl Default for TerminalConfig {
             cursor_shape: CursorShapeChoice::default(),
             cursor_blink: true,
             notify_on_bell: false,
+            notify_on_quota: true,
             restore_session: true,
             indicators: Vec::new(),
             clear_env: default_clear_env(),
@@ -1202,6 +1207,21 @@ mod tests {
         // A CLI with no known convention is left alone rather than guessed at.
         assert!(!loaded.profiles[1].can_resume());
         assert!(!loaded.profiles[1].can_take_prompt());
+    }
+
+    #[test]
+    fn quota_notifications_are_on_for_a_config_that_predates_them() {
+        // Unlike the bell, which a user may find noisy, a stalled session is
+        // worth interrupting for, so an older config opts in.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert!(loaded.notify_on_quota);
+        assert!(!loaded.notify_on_bell);
     }
 
     #[test]

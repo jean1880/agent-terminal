@@ -35,4 +35,18 @@ impl AgentTerminalWindow {
             profile: None,
         });
     }
+
+    /// Selects the tab with `key` (see `TabState::key`) and presents the
+    /// window. `false` if this window does not hold that tab.
+    pub fn show_tab(&self, key: u64) -> bool {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().show_tab(key)
+    }
+
+    /// Hands the tab with `key` off to the profile named `target`. `false` if
+    /// this window does not hold that tab.
+    pub fn continue_tab_in(&self, key: u64, target: &str) -> bool {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().continue_tab_in(key, target)
+    }
 }
