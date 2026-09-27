@@ -30,8 +30,13 @@ Architectural mandates, standards, and workflows for this codebase.
   (a running CLI cannot re-root itself).
 - **Module layout**: `config.rs` (persisted settings + migration), `theme.rs`
   (colour schemes, infallible `RGBA::new`), `utils.rs` (pure logic: detection,
-  startup command, path resolution), `window/imp.rs` (GTK UI), `main.rs` (app
-  setup + logging).
+  startup command, path resolution, session stores), `handoff.rs` (pure logic:
+  hand-off briefs, redaction, quota detection), `window/imp.rs` (GTK UI),
+  `main.rs` (app setup + logging).
+- **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
+  cannot summarize itself, so briefs are built from disk. Every brief goes
+  through `handoff::redact` and is written `0600` in a `0700` directory outside
+  any project. Never add a brief source that skips either.
 - **No feature flags for deployment specifics**: the crate has none. The
   Ansible-drift indicator used to sit behind `homelab-drift`; it is now one
   possible entry in the config-declared `indicators` list, which honours the
@@ -58,7 +63,7 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🧪 Testing Strategy
 
-- **Logic separation**: keep pure logic in `src/utils.rs` and `src/config.rs`,
+- **Logic separation**: keep pure logic in `src/utils.rs`, `src/handoff.rs` and `src/config.rs`,
   decoupled from GTK so it is unit-testable without a display. `window/imp.rs` is
   covered by a construction smoke test plus tests for any pure helpers in it.
 - **Guard hand-maintained arrays**: `CliClient::ALL` and `ThemeChoice::ALL` drive
