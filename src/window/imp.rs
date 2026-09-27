@@ -1,8 +1,9 @@
 //! Private implementation details of the AgentTerminalWindow.
 
-use crate::config::Profile;
+use crate::config::{Profile, SessionFormat};
+use crate::handoff::QuotaState;
 use crate::theme::Theme;
-use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory};
+use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory, Launch};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
@@ -45,6 +46,26 @@ struct TabState {
     /// The session this tab was opened to resume, so restarting a crashed tab
     /// resumes the same conversation instead of silently starting a new one.
     session_id: Option<String>,
+    /// The ID this tab's new session was started under, for a profile that can
+    /// pin one. Deliberately separate from `session_id`: restart does not
+    /// resume it, because a session that died at launch never wrote the
+    /// transcript a resume would need.
+    pinned_id: Option<String>,
+    /// Wall-clock launch time, to find a session whose ID the CLI chose itself.
+    started_at: std::time::SystemTime,
+    /// Offers a hand-off when the session runs out of quota.
+    quota_banner: adw::Banner,
+    quota: QuotaState,
+    /// Set by every screen update and cleared when the screen is checked for
+    /// quota markers, so an idle tab is never re-read.
+    screen_dirty: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl TabState {
+    /// The session this tab is running, if the terminal knows it.
+    fn known_session_id(&self) -> Option<&str> {
+        self.session_id.as_deref().or(self.pinned_id.as_deref())
+    }
 }
 
 /// A request to open a tab resuming a session.
@@ -57,6 +78,10 @@ pub struct ResumeRequest {
     pub session_id: String,
     /// Where to resume. `None` means look it up in the profile's session store.
     pub dir: Option<String>,
+    /// The profile to resume with, by name. `None` means the active profile,
+    /// or the first that can resume. A session ID means nothing to any CLI
+    /// but the one that recorded it, so callers that know which one say so.
+    pub profile: Option<String>,
 }
 
 /// Renders VTE's `child-exited` status as something a person can act on.
@@ -441,6 +466,9 @@ pub struct AgentTerminalWindow {
     /// Set once the window settles on the welcome screen, which has no tab
     /// view and never will — so a resume must not wait for one.
     no_cli: std::cell::Cell<bool>,
+    /// Set while a transcript quota check is running off-thread, so a slow
+    /// disk cannot stack up overlapping checks.
+    quota_poll_running: std::cell::Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -456,6 +484,7 @@ impl ObjectImpl for AgentTerminalWindow {
         *self.config.borrow_mut() = crate::config::TerminalConfig::load();
         self.setup_ui();
         self.setup_actions();
+        self.start_quota_watch();
     }
 }
 
@@ -747,10 +776,33 @@ impl AgentTerminalWindow {
             obj,
             move |_, _| {
                 debug!("Action: Resume Session");
-                obj.imp().show_session_browser();
+                obj.imp().show_session_browser(None);
             }
         ));
         obj.add_action(&resume_action);
+
+        // Both targeted by profile name, like the new-tab-as actions.
+        for name in ["resume-session-profile", "continue-in"] {
+            let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
+            action.connect_activate(glib::clone!(
+                #[weak]
+                obj,
+                move |_, target| {
+                    let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
+                        warn!("{name} activated without a profile name");
+                        return;
+                    };
+                    debug!("Action: {name} {profile_name}");
+                    let imp = obj.imp();
+                    if name == "continue-in" {
+                        imp.continue_in(&profile_name);
+                    } else {
+                        imp.show_session_browser(Some(&profile_name));
+                    }
+                }
+            ));
+            obj.add_action(&action);
+        }
     }
 
     /// Adds the configured status indicators to the header bar.
@@ -1019,10 +1071,8 @@ impl AgentTerminalWindow {
         // rooted in a different project, is one click away without a trip
         // through Settings.
         if let Some(header) = self.header.borrow().as_ref() {
-            let new_tab_menu = self.build_profile_menu("win.new-tab-profile");
-            let resume_section = gtk4::gio::Menu::new();
-            resume_section.append(Some("Resume Session…"), Some("win.resume-session"));
-            new_tab_menu.append_section(None, &resume_section);
+            let new_tab_menu = self.build_profile_menu("win.new-tab-profile", |_| true);
+            new_tab_menu.append_section(None, &self.build_session_section());
 
             let new_tab_btn = adw::SplitButton::builder()
                 .icon_name("tab-new-symbolic")
@@ -1043,7 +1093,7 @@ impl AgentTerminalWindow {
             let new_tab_folder_btn = adw::SplitButton::builder()
                 .icon_name("folder-new-symbolic")
                 .tooltip_text("New Tab in Folder…")
-                .menu_model(&self.build_profile_menu("win.new-tab-folder-profile"))
+                .menu_model(&self.build_profile_menu("win.new-tab-folder-profile", |_| true))
                 .build();
             new_tab_folder_btn.connect_clicked(glib::clone!(
                 #[weak]
@@ -1195,16 +1245,42 @@ impl AgentTerminalWindow {
     /// `dir_override` roots the tab in a specific directory; when `None` the
     /// configured starting directory (falling back to `$HOME`) is used.
     fn add_terminal_tab(&self, profile: Option<&Profile>, dir_override: Option<&str>) {
-        self.add_terminal_tab_resuming(profile, dir_override, None);
+        self.add_terminal_tab_launching(profile, dir_override, Launch::Fresh);
     }
 
-    /// [`Self::add_terminal_tab`], optionally resuming `session_id`.
-    fn add_terminal_tab_resuming(
+    /// [`Self::add_terminal_tab`], resuming a session or starting one with a
+    /// prompt as `launch` says.
+    ///
+    /// A new session on a profile that can pin its ID gets a fresh UUID, so the
+    /// tab knows its own transcript from the start — which quota detection and
+    /// the hand-off brief both depend on.
+    fn add_terminal_tab_launching(
         &self,
         profile: Option<&Profile>,
         dir_override: Option<&str>,
-        session_id: Option<&str>,
+        launch: Launch<'_>,
     ) {
+        let pinned_id = match launch {
+            Launch::Resume(_) => None,
+            _ => profile
+                .filter(|p| p.can_pin_session_id())
+                .map(|_| glib::uuid_string_random().to_string()),
+        };
+        let launch = match launch {
+            Launch::Fresh if pinned_id.is_some() => Launch::New {
+                session_id: pinned_id.as_deref(),
+                prompt: None,
+            },
+            Launch::New { prompt, .. } => Launch::New {
+                session_id: pinned_id.as_deref(),
+                prompt,
+            },
+            other => other,
+        };
+        let session_id = match launch {
+            Launch::Resume(id) => Some(id),
+            _ => None,
+        };
         debug!("Adding terminal tab");
         let terminal = Terminal::new();
 
@@ -1233,7 +1309,20 @@ impl AgentTerminalWindow {
         // dead session can report itself without the tab being torn down.
         let (exit_bar, exit_label, restart_btn, close_btn) = build_exit_bar();
         let (search_bar, search_entry) = build_search_bar(&terminal);
+        // Titles quote the CLI's own message, which is data, not markup. The
+        // button targets win.continue-in; its profile is set when revealed.
+        let quota_banner = adw::Banner::builder()
+            .use_markup(false)
+            .action_name("win.continue-in")
+            .build();
+        let screen_dirty = std::rc::Rc::new(std::cell::Cell::new(true));
+        terminal.connect_contents_changed(glib::clone!(
+            #[strong]
+            screen_dirty,
+            move |_| screen_dirty.set(true)
+        ));
         let tab_content = Box::builder().orientation(Orientation::Vertical).build();
+        tab_content.append(&quota_banner);
         tab_content.append(&exit_bar);
         tab_content.append(&search_bar);
         tab_content.append(&stack);
@@ -1294,9 +1383,14 @@ impl AgentTerminalWindow {
             search_entry,
             profile: profile.map(|p| p.name.clone()),
             session_id: session_id.map(str::to_string),
+            pinned_id: pinned_id.clone(),
+            started_at: std::time::SystemTime::now(),
+            quota_banner,
+            quota: QuotaState::Unknown,
+            screen_dirty,
         });
 
-        self.spawn_session(&terminal, &stack, profile, &work_dir, session_id);
+        self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
     }
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
@@ -1570,23 +1664,28 @@ impl AgentTerminalWindow {
         let Some(tab_view) = self.tab_view.borrow().clone() else {
             return;
         };
-        let (dir, session_id) = self
+        let (dir, session_id, profile) = self
             .tabs
             .borrow()
             .iter()
             .find(|t| &t.page == page)
-            .map(|t| (Some(t.dir.clone()), t.session_id.clone()))
+            .map(|t| (Some(t.dir.clone()), t.session_id.clone(), t.profile.clone()))
             .unwrap_or_default();
         info!("Restarting session in {:?}", dir);
         match session_id {
             // A resumed tab resumes again, rather than trading the conversation
-            // the user asked for for a blank one. Its directory is already known,
-            // so this opens synchronously, before the old page closes. Checking
-            // the profile first matters: if resume was switched off in config,
-            // open_resume_tab would add nothing and closing would lose the tab.
-            Some(session_id) if self.resume_profile().is_some() => {
-                self.open_resume_tab(ResumeRequest { session_id, dir })
-            }
+            // the user asked for for a blank one — and with its own profile,
+            // since another CLI cannot resume this one's session. Its directory
+            // is already known, so this opens synchronously, before the old page
+            // closes. Checking the profile first matters: if resume was switched
+            // off in config, open_resume_tab would add nothing and closing
+            // would lose the tab.
+            Some(session_id) if self.resume_profile_named(profile.as_deref()).is_some() => self
+                .open_resume_tab(ResumeRequest {
+                    session_id,
+                    dir,
+                    profile,
+                }),
             _ => {
                 let profile = self.active_profile.borrow().clone();
                 self.add_terminal_tab(profile.as_ref(), dir.as_deref());
@@ -1602,16 +1701,16 @@ impl AgentTerminalWindow {
         menu.append(Some("New Tab"), Some("win.new-tab"));
         menu.append_submenu(
             Some("New Tab As"),
-            &self.build_profile_menu("win.new-tab-profile"),
+            &self.build_profile_menu("win.new-tab-profile", |_| true),
         );
         menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
         menu.append_submenu(
             Some("New Tab in Folder As"),
-            &self.build_profile_menu("win.new-tab-folder-profile"),
+            &self.build_profile_menu("win.new-tab-folder-profile", |_| true),
         );
-        menu.append(Some("Resume Session…"), Some("win.resume-session"));
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
+        menu.append_section(None, &self.build_session_section());
 
         let section = gtk4::gio::Menu::new();
         section.append(Some("Copy"), Some("win.copy"));
@@ -1732,11 +1831,11 @@ impl AgentTerminalWindow {
         stack: &Stack,
         profile: Option<&Profile>,
         work_dir: &str,
-        resume: Option<&str>,
+        launch: Launch<'_>,
     ) {
         let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let command = get_startup_command(profile, resume);
+        let command = get_startup_command(profile, launch);
         let env_file = profile.and_then(|p| p.env_file.clone());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
@@ -2330,6 +2429,23 @@ impl AgentTerminalWindow {
             .cloned()
     }
 
+    /// The named profile if it can resume; with no name, [`Self::resume_profile`].
+    ///
+    /// A named profile that cannot resume yields `None` rather than a
+    /// substitute: handing its session ID to a different CLI would fail.
+    fn resume_profile_named(&self, name: Option<&str>) -> Option<Profile> {
+        match name {
+            Some(name) => self
+                .config
+                .borrow()
+                .profiles
+                .iter()
+                .find(|p| p.name == name && p.can_resume())
+                .cloned(),
+            None => self.resume_profile(),
+        }
+    }
+
     /// Opens a tab resuming `request.session_id`.
     ///
     /// Without an explicit directory, the profile's session store is searched
@@ -2337,8 +2453,12 @@ impl AgentTerminalWindow {
     /// sessions per project cannot find one from any other directory, and it
     /// says so only inside the tab, so a failed lookup is reported here.
     fn open_resume_tab(&self, request: ResumeRequest) {
-        let ResumeRequest { session_id, dir } = request;
-        let Some(profile) = self.resume_profile() else {
+        let ResumeRequest {
+            session_id,
+            dir,
+            profile,
+        } = request;
+        let Some(profile) = self.resume_profile_named(profile.as_deref()) else {
             warn!("No profile can resume session {session_id}");
             present_message(
                 &self.obj(),
@@ -2349,6 +2469,7 @@ impl AgentTerminalWindow {
             return;
         };
 
+        let format = profile.session_format;
         let store = match (&dir, &profile.session_store) {
             (None, Some(store)) => store.clone(),
             // An explicit directory wins, and a profile without a store has
@@ -2359,7 +2480,11 @@ impl AgentTerminalWindow {
                     profile.name, dir
                 );
                 let dir = dir.or_else(|| profile.dir.clone());
-                self.add_terminal_tab_resuming(Some(&profile), dir.as_deref(), Some(&session_id));
+                self.add_terminal_tab_launching(
+                    Some(&profile),
+                    dir.as_deref(),
+                    Launch::Resume(&session_id),
+                );
                 return;
             }
         };
@@ -2371,7 +2496,7 @@ impl AgentTerminalWindow {
             async move {
                 let lookup_id = session_id.clone();
                 let found = gtk4::gio::spawn_blocking(move || {
-                    crate::utils::find_session_dir(&store, &lookup_id)
+                    crate::utils::find_session_dir_in(format, &store, &lookup_id)
                 })
                 .await
                 .unwrap_or_else(|_| {
@@ -2406,7 +2531,11 @@ impl AgentTerminalWindow {
                         fallback
                     }
                 };
-                imp.add_terminal_tab_resuming(Some(&profile), dir.as_deref(), Some(&session_id));
+                imp.add_terminal_tab_launching(
+                    Some(&profile),
+                    dir.as_deref(),
+                    Launch::Resume(&session_id),
+                );
             }
         ));
     }
@@ -2416,9 +2545,9 @@ impl AgentTerminalWindow {
     /// Falls back to [`Self::show_resume_id_dialog`] when the profile declares no
     /// session store, since there is then nothing to list. The store is read off
     /// the main thread; the dialog shows a spinner meanwhile.
-    fn show_session_browser(&self) {
+    fn show_session_browser(&self, profile_name: Option<&str>) {
         let obj = self.obj();
-        let Some(profile) = self.resume_profile() else {
+        let Some(profile) = self.resume_profile_named(profile_name) else {
             // Reuses open_resume_tab's explanation rather than a second copy.
             self.show_resume_id_dialog();
             return;
@@ -2428,9 +2557,11 @@ impl AgentTerminalWindow {
             return;
         };
         let title_pointer = profile.session_title.clone();
+        let format = profile.session_format;
+        let profile_name = profile.name.clone();
 
         let dialog = adw::Dialog::builder()
-            .title("Resume Session")
+            .title(format!("Resume {} Session", profile.name))
             .content_width(620)
             .content_height(560)
             .build();
@@ -2558,6 +2689,7 @@ impl AgentTerminalWindow {
                 obj.imp().request_resume(ResumeRequest {
                     session_id: session.id,
                     dir: session.dir,
+                    profile: Some(profile_name.clone()),
                 });
             }
         ));
@@ -2590,7 +2722,7 @@ impl AgentTerminalWindow {
             empty,
             async move {
                 let listing = gtk4::gio::spawn_blocking(move || {
-                    crate::utils::list_sessions(&store, title_pointer.as_deref())
+                    crate::utils::list_sessions_in(format, &store, title_pointer.as_deref())
                 })
                 .await
                 .unwrap_or_else(|_| Err("Listing sessions panicked".to_string()));
@@ -2707,6 +2839,7 @@ impl AgentTerminalWindow {
                         Ok(id) => obj.imp().request_resume(ResumeRequest {
                             session_id: id.to_string(),
                             dir: None,
+                            profile: None,
                         }),
                         // Unreachable while the button tracks validity; logged,
                         // not trusted, in case Enter slips past it.
@@ -2725,9 +2858,9 @@ impl AgentTerminalWindow {
     ///
     /// Rebuilt on demand rather than cached, so editing config.json and
     /// reopening the window is enough to see a new profile.
-    fn build_profile_menu(&self, action: &str) -> gtk4::gio::Menu {
+    fn build_profile_menu(&self, action: &str, include: fn(&Profile) -> bool) -> gtk4::gio::Menu {
         let menu = gtk4::gio::Menu::new();
-        for profile in self.config.borrow().profiles.iter() {
+        for profile in self.config.borrow().profiles.iter().filter(|p| include(p)) {
             // The profile name is the action target, so the action handler does
             // not depend on menu ordering.
             let item = gtk4::gio::MenuItem::new(Some(&profile.name), None);
@@ -2736,6 +2869,351 @@ impl AgentTerminalWindow {
         }
         menu
     }
+
+    /// Hands the current tab's task to `target_name` in a new tab.
+    ///
+    /// The source CLI is usually out of quota and cannot be asked for a
+    /// summary, so the brief is assembled here — transcript, working tree, or
+    /// failing both the screen — off the main thread, written privately, and
+    /// named in the new session's opening prompt. The source tab is left as it
+    /// is, so its session can be resumed once its quota resets.
+    fn continue_in(&self, target_name: &str) {
+        let target = self
+            .config
+            .borrow()
+            .profiles
+            .iter()
+            .find(|p| p.name == target_name)
+            .cloned();
+        let Some(target) = target.filter(Profile::can_take_prompt) else {
+            present_message(
+                &self.obj(),
+                "Cannot Hand Off",
+                &format!(
+                    "Profile '{target_name}' cannot start with a prompt. Add \"prompt_args\" \
+                     to it in config.json, e.g. [\"{{prompt}}\"]."
+                ),
+            );
+            return;
+        };
+        let Some(page) = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|view| view.selected_page())
+        else {
+            return;
+        };
+
+        let (source, dir, session_id, since_ms, screen_tail) = {
+            let tabs = self.tabs.borrow();
+            let Some(tab) = tabs.iter().find(|t| t.page == page) else {
+                warn!("Hand-off asked for a tab that is not tracked");
+                return;
+            };
+            let source = tab.profile.as_deref().and_then(|name| {
+                self.config
+                    .borrow()
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .cloned()
+            });
+            let since_ms = tab
+                .started_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            (
+                source,
+                tab.dir.clone(),
+                tab.known_session_id().map(str::to_string),
+                since_ms,
+                screen_text(&tab.terminal).map(|t| crate::handoff::tail_lines(&t, 80)),
+            )
+        };
+
+        let from = source
+            .as_ref()
+            .map_or_else(|| "The previous session".to_string(), |p| p.name.clone());
+        let format = source
+            .as_ref()
+            .map_or(SessionFormat::Jsonl, |p| p.session_format);
+        let store = source.as_ref().and_then(|p| p.session_store.clone());
+        let written_at = glib::DateTime::now_local()
+            .and_then(|now| now.format("%Y-%m-%d %H:%M %Z"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let briefs = crate::handoff::briefs_dir(
+            env::var("XDG_STATE_HOME").ok().as_deref(),
+            env::var("HOME").ok().as_deref(),
+        );
+        info!(
+            "Handing off from '{from}' to '{}' in {dir} (session {:?})",
+            target.name, session_id
+        );
+
+        let obj = self.obj();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let to = target.name.clone();
+                let from_for_brief = from.clone();
+                let tab_dir = dir.clone();
+                let written = gtk4::gio::spawn_blocking(move || {
+                    use crate::handoff::*;
+                    // An AGY tab's ID is AGY's own choice; find the session it
+                    // recorded in this directory since the tab opened.
+                    let session_id = session_id.or_else(|| match (format, store.as_deref()) {
+                        (SessionFormat::AgyHistory, Some(store)) => {
+                            latest_agy_session_in(store, &dir, since_ms)
+                        }
+                        _ => None,
+                    });
+                    let input = BriefInput {
+                        conversation: gather_conversation(
+                            format,
+                            store.as_deref(),
+                            session_id.as_deref(),
+                        ),
+                        tree: read_working_tree(&dir),
+                        from: from_for_brief.clone(),
+                        to: to.clone(),
+                        dir,
+                        session_id,
+                        written_at,
+                        screen_tail,
+                    };
+                    write_brief(
+                        &briefs,
+                        &brief_stem(unix_secs, &from_for_brief, &to),
+                        &render_brief(&input),
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| Err("Writing the brief panicked".to_string()));
+
+                match written {
+                    Ok(path) => {
+                        let prompt = crate::handoff::handoff_prompt(&from, &path);
+                        obj.imp().add_terminal_tab_launching(
+                            Some(&target),
+                            Some(&tab_dir),
+                            Launch::New {
+                                session_id: None,
+                                prompt: Some(&prompt),
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        error!("Hand-off failed: {reason}");
+                        present_message(&obj, "Hand-Off Failed", &reason);
+                    }
+                }
+            }
+        ));
+    }
+
+    /// The profile a quota banner offers to continue in: the first other
+    /// profile that can take a hand-off and is not known to be missing.
+    fn handoff_target(&self, source: Option<&str>) -> Option<String> {
+        self.config
+            .borrow()
+            .profiles
+            .iter()
+            .find(|p| {
+                Some(p.name.as_str()) != source
+                    && p.can_take_prompt()
+                    && crate::utils::cached_command_available(&p.command) != Some(false)
+            })
+            .map(|p| p.name.clone())
+    }
+
+    /// Checks every tab's quota every few seconds for the life of the window.
+    fn start_quota_watch(&self) {
+        const QUOTA_POLL_SECS: u32 = 10;
+        let obj = self.obj();
+        glib::timeout_add_seconds_local(
+            QUOTA_POLL_SECS,
+            glib::clone!(
+                #[weak]
+                obj,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    obj.imp().poll_quota();
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
+    /// One quota check across all tabs.
+    ///
+    /// A tab whose session the terminal knows, on a profile with transcripts,
+    /// is read from its transcript — the structured signal. Otherwise a profile
+    /// with `limit_markers` has its screen searched, but only if it changed.
+    fn poll_quota(&self) {
+        let profiles = self.config.borrow().profiles.clone();
+        let mut pages = Vec::new();
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        let mut screen_states = Vec::new();
+
+        for tab in self.tabs.borrow().iter() {
+            let Some(profile) = tab
+                .profile
+                .as_deref()
+                .and_then(|name| profiles.iter().find(|p| p.name == name))
+            else {
+                continue;
+            };
+            match (
+                profile.session_format,
+                profile.session_store.as_deref(),
+                tab.known_session_id(),
+            ) {
+                (SessionFormat::Jsonl, Some(store), Some(id)) => {
+                    pages.push(tab.page.clone());
+                    jobs.push((store.to_string(), id.to_string()));
+                }
+                _ => {
+                    let Some(markers) = profile.limit_markers.as_deref() else {
+                        continue;
+                    };
+                    if markers.is_empty() || !tab.screen_dirty.replace(false) {
+                        continue;
+                    }
+                    let state = match screen_text(&tab.terminal) {
+                        Some(text) => match crate::handoff::screen_quota_line(&text, markers) {
+                            Some(line) => QuotaState::Exhausted { detail: line },
+                            None => QuotaState::Available,
+                        },
+                        None => QuotaState::Unknown,
+                    };
+                    screen_states.push((tab.page.clone(), state));
+                }
+            }
+        }
+        for (page, state) in screen_states {
+            self.apply_quota_state(&page, state);
+        }
+
+        if jobs.is_empty() || self.quota_poll_running.get() {
+            return;
+        }
+        self.quota_poll_running.set(true);
+        let obj = self.obj();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                // Ceiling: each check lists the store's project directories to
+                // find the transcript, a few hundred stat calls every poll.
+                // Upgrade path: remember the path once it is found.
+                let states = gtk4::gio::spawn_blocking(move || {
+                    jobs.iter()
+                        .map(|(store, id)| {
+                            crate::utils::find_transcript(store, id)
+                                .map_or(QuotaState::Unknown, |path| {
+                                    crate::handoff::transcript_quota_state(&path)
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                let imp = obj.imp();
+                imp.quota_poll_running.set(false);
+                for (page, state) in pages.iter().zip(states) {
+                    imp.apply_quota_state(page, state);
+                }
+            }
+        ));
+    }
+
+    /// Shows or hides a tab's quota banner.
+    ///
+    /// `Unknown` changes nothing on screen: an unreadable transcript neither
+    /// proves nor disproves the limit, so it must not hide a banner that is up.
+    fn apply_quota_state(&self, page: &adw::TabPage, state: QuotaState) {
+        let target = {
+            let tabs = self.tabs.borrow();
+            let Some(tab) = tabs.iter().find(|t| &t.page == page) else {
+                return;
+            };
+            if tab.quota == state {
+                return;
+            }
+            self.handoff_target(tab.profile.as_deref())
+        };
+
+        let mut tabs = self.tabs.borrow_mut();
+        let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+            return;
+        };
+        match &state {
+            QuotaState::Exhausted { detail } => {
+                let who = tab.profile.as_deref().unwrap_or("This session");
+                info!("{who} is out of quota: {detail}");
+                tab.quota_banner
+                    .set_title(&format!("{who} is out of quota — {detail}"));
+                match &target {
+                    Some(name) => {
+                        tab.quota_banner
+                            .set_button_label(Some(&format!("Continue in {name}")));
+                        tab.quota_banner
+                            .set_action_target_value(Some(&name.to_variant()));
+                    }
+                    None => tab.quota_banner.set_button_label(None),
+                }
+                tab.quota_banner.set_revealed(true);
+                page.set_needs_attention(true);
+            }
+            QuotaState::Available => tab.quota_banner.set_revealed(false),
+            QuotaState::Unknown => {}
+        }
+        tab.quota = state;
+    }
+
+    /// The session items shared by the new-tab dropdown and the context menu:
+    /// resume (with the active profile, or as a chosen one), and hand the
+    /// current tab's task to another CLI.
+    fn build_session_section(&self) -> gtk4::gio::Menu {
+        let section = gtk4::gio::Menu::new();
+        section.append(Some("Resume Session…"), Some("win.resume-session"));
+        section.append_submenu(
+            Some("Resume Session As"),
+            &self.build_profile_menu("win.resume-session-profile", Profile::can_resume),
+        );
+        section.append_submenu(
+            Some("Continue In"),
+            &self.build_profile_menu("win.continue-in", Profile::can_take_prompt),
+        );
+        section
+    }
+}
+
+/// A terminal's scrollback and screen as plain text, or `None` if VTE could
+/// not write it. Ceiling: this copies the whole scrollback, so callers read it
+/// only on demand or when the screen has changed. Upgrade path: raise the VTE
+/// floor to 0.72 and read just the last rows with `text_range_format`.
+fn screen_text(terminal: &Terminal) -> Option<String> {
+    let stream = gtk4::gio::MemoryOutputStream::new_resizable();
+    if let Err(err) = terminal.write_contents_sync(
+        &stream,
+        vte4::WriteFlags::Default,
+        None::<&gtk4::gio::Cancellable>,
+    ) {
+        warn!("Could not read the terminal's contents: {err}");
+        return None;
+    }
+    stream.close(None::<&gtk4::gio::Cancellable>).ok()?;
+    Some(String::from_utf8_lossy(&stream.steal_as_bytes()).into_owned())
 }
 
 /// Where a "new tab as <profile>" tab is rooted: the profile's own directory

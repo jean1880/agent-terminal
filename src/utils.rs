@@ -1,6 +1,6 @@
 //! Utility functions for Agent Terminal.
 
-use crate::config::Profile;
+use crate::config::{Profile, SessionFormat};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -331,43 +331,7 @@ pub fn read_indicator(source: &crate::config::IndicatorSource) -> IndicatorState
 /// A configured command is arbitrary and may hang; without a bound it would tie
 /// up a worker thread for the life of the process.
 fn run_with_timeout(command: &str, args: &[String], timeout_secs: u64) -> IndicatorState {
-    use std::time::{Duration, Instant};
-
-    let mut child = match std::process::Command::new(command)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            return IndicatorState::Unknown {
-                reason: format!("Could not run {command}: {err}"),
-            }
-        }
-    };
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return IndicatorState::Unknown {
-                    reason: format!("{command} did not finish within {timeout_secs}s"),
-                };
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => {
-                return IndicatorState::Unknown {
-                    reason: format!("Failed while waiting for {command}: {err}"),
-                }
-            }
-        }
-    }
-
-    match child.wait_with_output() {
+    match run_capture(command, args, None, timeout_secs) {
         Ok(output) if output.status.success() => IndicatorState::Ok,
         Ok(output) => {
             let mut detail = String::from_utf8_lossy(&output.stdout).to_string();
@@ -379,10 +343,81 @@ fn run_with_timeout(command: &str, args: &[String], timeout_secs: u64) -> Indica
             }
             IndicatorState::Warn { detail }
         }
-        Err(err) => IndicatorState::Unknown {
-            reason: format!("Failed to collect output from {command}: {err}"),
-        },
+        Err(reason) => IndicatorState::Unknown { reason },
     }
+}
+
+/// Runs a command, optionally in `cwd`, and collects its output, giving up
+/// after `timeout_secs`. `Err` carries a sentence for the user.
+///
+/// Output is drained on its own threads while the command runs. Waiting first
+/// and reading after would deadlock on any command that fills the pipe buffer
+/// (64 KiB on Linux) — `git diff` on a large change, for one — which would
+/// then be reported as a timeout.
+///
+/// Blocking: call it off the main thread.
+pub fn run_capture(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let mut cmd = std::process::Command::new(command);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("Could not run {command}: {err}"))?;
+
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{command} did not finish within {timeout_secs}s"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(format!("Failed while waiting for {command}: {err}")),
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// Resolves the working directory to use, handling ~ expansion and fallback to home.
@@ -460,13 +495,7 @@ pub fn resume_argv(profile: &Profile, session_id: &str) -> Option<Vec<String>> {
         return None;
     }
     let mut argv = profile.argv();
-    argv.extend(
-        profile
-            .resume_args
-            .iter()
-            .flatten()
-            .map(|arg| arg.replace("{id}", session_id)),
-    );
+    argv.extend(fill(profile.resume_args.as_deref()?, "{id}", session_id));
     Some(argv)
 }
 
@@ -482,27 +511,7 @@ pub fn resume_argv(profile: &Profile, session_id: &str) -> Option<Vec<String>> {
 pub fn find_session_dir(store: &str, session_id: &str) -> Option<String> {
     use std::io::BufRead;
 
-    let store = std::path::PathBuf::from(expand_tilde(store));
-    let file_name = format!("{session_id}.jsonl");
-
-    // One level of subdirectories. Bounded on purpose: the store is user-named
-    // and a recursive walk of the wrong directory could be enormous.
-    let candidates = std::iter::once(store.join(&file_name)).chain(
-        std::fs::read_dir(&store)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .map(|dir| dir.join(&file_name)),
-    );
-
-    let transcript = candidates.into_iter().find(|path| path.is_file())?;
-    debug!(
-        "Session {session_id} transcript found at {}",
-        transcript.display()
-    );
-
+    let transcript = find_transcript(store, session_id)?;
     let file = match std::fs::File::open(&transcript) {
         Ok(file) => file,
         Err(err) => {
@@ -530,6 +539,190 @@ pub fn find_session_dir(store: &str, session_id: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Finds the `<id>.jsonl` transcript for `session_id` in a
+/// [`SessionFormat::Jsonl`] store: directly inside it or one level down.
+///
+/// Blocking filesystem I/O: call it off the main thread.
+pub fn find_transcript(store: &str, session_id: &str) -> Option<std::path::PathBuf> {
+    let store = std::path::PathBuf::from(expand_tilde(store));
+    let file_name = format!("{session_id}.jsonl");
+
+    // One level of subdirectories. Bounded on purpose: the store is user-named
+    // and a recursive walk of the wrong directory could be enormous.
+    let candidates = std::iter::once(store.join(&file_name)).chain(
+        std::fs::read_dir(&store)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .map(|dir| dir.join(&file_name)),
+    );
+
+    let transcript = candidates.into_iter().find(|path| path.is_file())?;
+    debug!(
+        "Session {session_id} transcript found at {}",
+        transcript.display()
+    );
+    Some(transcript)
+}
+
+/// [`find_session_dir`] for either store format.
+pub fn find_session_dir_in(format: SessionFormat, store: &str, session_id: &str) -> Option<String> {
+    match format {
+        SessionFormat::Jsonl => find_session_dir(store, session_id),
+        SessionFormat::AgyHistory => {
+            let rows = match read_agy_history(store) {
+                Ok(rows) => rows,
+                Err(reason) => {
+                    warn!("{reason}");
+                    return None;
+                }
+            };
+            let dir = rows
+                .into_iter()
+                .filter(|row| row.id == session_id)
+                .max_by_key(|row| row.timestamp_ms)?
+                .workspace?;
+            if std::path::Path::new(&dir).is_dir() {
+                Some(dir)
+            } else {
+                warn!("Session {session_id} was recorded in {dir}, which no longer exists");
+                None
+            }
+        }
+    }
+}
+
+/// [`list_sessions`] for either store format.
+pub fn list_sessions_in(
+    format: SessionFormat,
+    store: &str,
+    title_pointer: Option<&str>,
+) -> Result<Vec<SessionSummary>, String> {
+    match format {
+        SessionFormat::Jsonl => list_sessions(store, title_pointer),
+        SessionFormat::AgyHistory => list_agy_sessions(store),
+    }
+}
+
+/// How much of the end of AGY's `history.jsonl` is read. It is one log that
+/// only grows, so the tail holds the recent sessions; one row per prompt runs
+/// to a few hundred bytes, so this covers thousands of prompts. Ceiling: a
+/// session whose prompts all predate the window is not listed. Upgrade path:
+/// an index keyed by `conversationId`, kept by the terminal.
+const AGY_HISTORY_WINDOW: u64 = 4 * 1024 * 1024;
+
+/// One prompt row from AGY's history log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyRow {
+    pub id: String,
+    pub workspace: Option<String>,
+    pub display: Option<String>,
+    pub timestamp_ms: u64,
+}
+
+/// Reads the rows in the tail of an AGY history log, oldest first.
+///
+/// Rows without a valid `conversationId` or a `timestamp` are skipped; a
+/// corrupt line does not hide the ones after it. `Err` means the log itself
+/// could not be read. Blocking: call it off the main thread.
+pub fn read_agy_history(path: &str) -> Result<Vec<AgyRow>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = expand_tilde(path);
+    let mut file =
+        std::fs::File::open(&path).map_err(|err| format!("Could not read {path}: {err}"))?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // As in summarize_session: start one byte early so the first piece is
+    // always a partial (or empty) line that is safe to drop.
+    let start = len.saturating_sub(AGY_HISTORY_WINDOW + 1);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|err| format!("Could not read {path}: {err}"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| format!("Could not read {path}: {err}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+
+    let mut rows: Vec<AgyRow> = text
+        .split('\n')
+        .skip(usize::from(start > 0))
+        .filter_map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).ok()?;
+            let id = record.get("conversationId")?.as_str()?;
+            let id = validate_session_id(id).ok()?.to_string();
+            let text_field = |key: &str| {
+                record
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+            };
+            Some(AgyRow {
+                id,
+                workspace: text_field("workspace"),
+                display: text_field("display"),
+                timestamp_ms: record.get("timestamp")?.as_u64()?,
+            })
+        })
+        .collect();
+    rows.sort_by_key(|row| row.timestamp_ms);
+    Ok(rows)
+}
+
+/// Lists AGY sessions from its history log, newest first.
+///
+/// The title is a session's first prompt in the window — AGY records no title
+/// of its own — and the directory its latest `workspace`.
+fn list_agy_sessions(path: &str) -> Result<Vec<SessionSummary>, String> {
+    let rows = read_agy_history(path)?;
+
+    // Rows are oldest first, so the first row seen for an ID holds its
+    // opening prompt and each later one moves its last-active time on.
+    let mut sessions: Vec<SessionSummary> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(row.timestamp_ms);
+        match index.get(&row.id) {
+            Some(&i) => {
+                let session = &mut sessions[i];
+                session.modified = modified;
+                if row.workspace.is_some() {
+                    session.dir = row.workspace;
+                }
+                if session.title.is_none() {
+                    session.title = row.display.as_deref().and_then(one_line_title);
+                }
+            }
+            None => {
+                index.insert(row.id.clone(), sessions.len());
+                sessions.push(SessionSummary {
+                    title: row.display.as_deref().and_then(one_line_title),
+                    id: row.id,
+                    dir: row.workspace,
+                    modified,
+                });
+            }
+        }
+    }
+
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    sessions.truncate(MAX_LISTED_SESSIONS);
+    for session in &mut sessions {
+        session.dir = session
+            .dir
+            .take()
+            .filter(|dir| std::path::Path::new(dir).is_dir());
+    }
+    Ok(sessions)
+}
+
+/// Collapses whitespace and caps the length, for a one-line list row.
+fn one_line_title(text: &str) -> Option<String> {
+    let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then(|| title.chars().take(MAX_TITLE_CHARS).collect())
 }
 
 /// One session as the browser lists it.
@@ -630,9 +823,7 @@ fn summarize_session(
             return None;
         }
         let record: serde_json::Value = serde_json::from_str(line).ok()?;
-        let title = record.pointer(pointer)?.as_str()?;
-        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!title.is_empty()).then(|| title.chars().take(MAX_TITLE_CHARS).collect())
+        one_line_title(record.pointer(pointer)?.as_str()?)
     };
 
     let mut summary = SessionSummary {
@@ -715,12 +906,72 @@ pub fn tildify(path: &str, home: &str) -> String {
     }
 }
 
+/// How a session starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Launch<'a> {
+    /// A new session, as the profile's plain argv.
+    #[default]
+    Fresh,
+    /// Resume an existing session. Excludes everything else: a resumed
+    /// session already has its ID and its conversation.
+    Resume(&'a str),
+    /// A new session, optionally under an ID the terminal chose (only if the
+    /// profile can pin one) and with an initial prompt (only if it can take one).
+    New {
+        session_id: Option<&'a str>,
+        prompt: Option<&'a str>,
+    },
+}
+
+/// Substitutes `value` for `placeholder` in each template argument.
+///
+/// Whole-argument values only ever land inside one argv entry, and every entry
+/// is shell-quoted afterwards, so a value cannot become a second argument or a
+/// shell construct.
+fn fill(template: &[String], placeholder: &str, value: &str) -> Vec<String> {
+    template
+        .iter()
+        .map(|arg| arg.replace(placeholder, value))
+        .collect()
+}
+
+/// The argv that starts `launch` with `profile`, command first.
+fn launch_argv(profile: &Profile, launch: Launch<'_>) -> Vec<String> {
+    match launch {
+        Launch::Fresh => profile.argv(),
+        Launch::Resume(id) => resume_argv(profile, id).unwrap_or_else(|| {
+            warn!(
+                "Profile '{}' cannot resume sessions; starting a new one",
+                profile.name
+            );
+            profile.argv()
+        }),
+        Launch::New { session_id, prompt } => {
+            let mut argv = profile.argv();
+            if let (Some(id), Some(args)) = (session_id, profile.session_id_args.as_deref()) {
+                argv.extend(fill(args, "{id}", id));
+            }
+            match (prompt, profile.prompt_args.as_deref()) {
+                (Some(prompt), Some(args)) if !args.is_empty() => {
+                    argv.extend(fill(args, "{prompt}", prompt));
+                }
+                (Some(_), _) => warn!(
+                    "Profile '{}' cannot take an initial prompt; starting without it",
+                    profile.name
+                ),
+                (None, _) => {}
+            }
+            argv
+        }
+    }
+}
+
 /// Determines the startup command for a profile.
 ///
-/// `resume` names a session to resume. A profile that cannot resume ignores it
-/// with a warning. Callers are expected to pick a resumable profile first; this
-/// is only the safety net.
-pub fn get_startup_command(profile: Option<&Profile>, resume: Option<&str>) -> Vec<String> {
+/// A profile that cannot do what `launch` asks — resume, or take a prompt —
+/// starts a plain session with a warning. Callers are expected to pick a
+/// capable profile first; this is only the safety net.
+pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec<String> {
     match profile {
         Some(profile) => {
             // `exec` is critical: it replaces the wrapping interactive shell with the
@@ -733,17 +984,10 @@ pub fn get_startup_command(profile: Option<&Profile>, resume: Option<&str>) -> V
             // the TTY at this point disrupts the CLI's initial terminal handshake.
             // A profile's env_file contributes environment instead, merged into the
             // spawn environment rather than sourced into the terminal.
-            let argv = match resume {
-                Some(id) => resume_argv(profile, id).unwrap_or_else(|| {
-                    warn!(
-                        "Profile '{}' cannot resume sessions; starting a new one",
-                        profile.name
-                    );
-                    profile.argv()
-                }),
-                None => profile.argv(),
-            };
-            let argv: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+            let argv: Vec<String> = launch_argv(profile, launch)
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect();
             vec!["-ic".to_string(), format!("exec {}", argv.join(" "))]
         }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
@@ -759,12 +1003,7 @@ mod tests {
         Profile {
             name: name.to_string(),
             command: command.to_string(),
-            args: Vec::new(),
-            dir: None,
-            env_file: None,
-            resume_args: None,
-            session_store: None,
-            session_title: None,
+            ..Profile::default()
         }
     }
 
@@ -820,14 +1059,148 @@ mod tests {
 
     #[test]
     fn startup_command_resumes_when_asked() {
-        let cmd = get_startup_command(Some(&resumable("Claude", "claude")), Some("abc-123"));
+        let cmd = get_startup_command(
+            Some(&resumable("Claude", "claude")),
+            Launch::Resume("abc-123"),
+        );
         assert_eq!(cmd[1], "exec 'claude' '--resume' 'abc-123'");
     }
 
     #[test]
     fn startup_command_ignores_resume_for_a_profile_that_cannot() {
-        let cmd = get_startup_command(Some(&profile("Agy", "agy")), Some("abc-123"));
+        let cmd = get_startup_command(Some(&profile("Agy", "agy")), Launch::Resume("abc-123"));
         assert_eq!(cmd[1], "exec 'agy'");
+    }
+
+    fn handoff_capable(name: &str, command: &str) -> Profile {
+        let mut p = resumable(name, command);
+        p.session_id_args = Some(vec!["--session-id".to_string(), "{id}".to_string()]);
+        p.prompt_args = Some(vec![
+            "--prompt-interactive".to_string(),
+            "{prompt}".to_string(),
+        ]);
+        p
+    }
+
+    #[test]
+    fn a_new_session_pins_its_id_then_takes_its_prompt() {
+        let launch = Launch::New {
+            session_id: Some("abc-123"),
+            prompt: Some("Read the brief"),
+        };
+        let cmd = get_startup_command(Some(&handoff_capable("Claude", "claude")), launch);
+        assert_eq!(
+            cmd[1],
+            "exec 'claude' '--session-id' 'abc-123' '--prompt-interactive' 'Read the brief'"
+        );
+    }
+
+    #[test]
+    fn resume_wins_over_everything_a_new_session_would_add() {
+        let cmd = get_startup_command(
+            Some(&handoff_capable("Claude", "claude")),
+            Launch::Resume("abc-123"),
+        );
+        assert_eq!(cmd[1], "exec 'claude' '--resume' 'abc-123'");
+    }
+
+    #[test]
+    fn a_profile_without_the_templates_starts_plain() {
+        let launch = Launch::New {
+            session_id: Some("abc-123"),
+            prompt: Some("Read the brief"),
+        };
+        let cmd = get_startup_command(Some(&profile("Gemini", "gemini")), launch);
+        assert_eq!(cmd[1], "exec 'gemini'");
+    }
+
+    #[test]
+    fn a_prompt_cannot_break_out_of_its_argument() {
+        let launch = Launch::New {
+            session_id: None,
+            prompt: Some("it's $(reboot); `id` --dangerously-skip-permissions"),
+        };
+        let cmd = get_startup_command(Some(&handoff_capable("Claude", "claude")), launch);
+        assert_eq!(
+            cmd[1],
+            r"exec 'claude' '--prompt-interactive' 'it'\''s $(reboot); `id` --dangerously-skip-permissions'"
+        );
+    }
+
+    /// A captured-shape AGY history log: two sessions, interleaved, plus noise.
+    fn agy_history(dir: &std::path::Path, workspace: &std::path::Path) -> String {
+        let ws = workspace.display();
+        let body = format!(
+            "{{\"display\":\"Port my settings\",\"timestamp\":1000,\"workspace\":\"{ws}\",\"conversationId\":\"aaa-1\"}}\n\
+             {{\"display\":\"Second task\",\"timestamp\":2000,\"workspace\":\"/nowhere/gone\",\"conversationId\":\"bbb-2\"}}\n\
+             not json at all\n\
+             {{\"display\":\"No id\",\"timestamp\":2500}}\n\
+             {{\"display\":\"../escape\",\"timestamp\":2600,\"conversationId\":\"../../etc\"}}\n\
+             {{\"display\":\"Follow-up\",\"timestamp\":3000,\"workspace\":\"{ws}\",\"conversationId\":\"aaa-1\"}}\n"
+        );
+        let path = dir.join("history.jsonl");
+        std::fs::write(&path, body).unwrap();
+        path.display().to_string()
+    }
+
+    #[test]
+    fn agy_sessions_are_grouped_titled_by_first_prompt_and_newest_first() {
+        let dir = tempdir().unwrap();
+        let path = agy_history(dir.path(), dir.path());
+        let sessions = list_sessions_in(SessionFormat::AgyHistory, &path, None).unwrap();
+
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["aaa-1", "bbb-2"]);
+        assert_eq!(sessions[0].title.as_deref(), Some("Port my settings"));
+        assert_eq!(
+            sessions[0].modified,
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(3000)
+        );
+        assert_eq!(
+            sessions[0].dir.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
+        // A workspace that no longer exists is not offered as a place to resume.
+        assert_eq!(sessions[1].dir, None);
+    }
+
+    #[test]
+    fn agy_session_dir_is_its_latest_workspace() {
+        let dir = tempdir().unwrap();
+        let path = agy_history(dir.path(), dir.path());
+        assert_eq!(
+            find_session_dir_in(SessionFormat::AgyHistory, &path, "aaa-1").as_deref(),
+            dir.path().to_str()
+        );
+        assert_eq!(
+            find_session_dir_in(SessionFormat::AgyHistory, &path, "bbb-2"),
+            None
+        );
+        assert_eq!(
+            find_session_dir_in(SessionFormat::AgyHistory, &path, "missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_agy_history_is_an_error_not_an_empty_list() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("absent.jsonl");
+        assert!(list_sessions_in(SessionFormat::AgyHistory, path.to_str().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn agy_history_reads_only_its_tail_and_drops_the_partial_first_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let old = "{\"display\":\"old\",\"timestamp\":1,\"conversationId\":\"old-1\"}\n";
+        let filler = "x".repeat(usize::try_from(AGY_HISTORY_WINDOW).unwrap());
+        let recent = "{\"display\":\"new\",\"timestamp\":2,\"conversationId\":\"new-1\"}\n";
+        std::fs::write(&path, format!("{old}{filler}\n{recent}")).unwrap();
+
+        let rows = read_agy_history(path.to_str().unwrap()).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["new-1"]);
     }
 
     #[test]
@@ -1061,7 +1434,7 @@ mod tests {
     fn startup_command_execs_the_profile_command() {
         // exec so the CLI owns the TTY; without it the CLI runs as a child job
         // and comes up degraded.
-        let cmd = get_startup_command(Some(&profile("Claude", "claude")), None);
+        let cmd = get_startup_command(Some(&profile("Claude", "claude")), Launch::Fresh);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec 'claude'");
     }
@@ -1071,7 +1444,7 @@ mod tests {
         let mut p = profile("Claude", "claude");
         p.args = vec!["--model".to_string(), "opus".to_string()];
         assert_eq!(
-            get_startup_command(Some(&p), None)[1],
+            get_startup_command(Some(&p), Launch::Fresh)[1],
             "exec 'claude' '--model' 'opus'"
         );
     }
@@ -1082,7 +1455,7 @@ mod tests {
         // with a space would be re-split and one with a $ would be expanded.
         let mut p = profile("Claude", "claude");
         p.args = vec!["a b".to_string(), "$HOME".to_string(), "it's".to_string()];
-        let rendered = get_startup_command(Some(&p), None)[1].clone();
+        let rendered = get_startup_command(Some(&p), Launch::Fresh)[1].clone();
         assert!(rendered.contains("'a b'"), "{rendered}");
         assert!(rendered.contains("'$HOME'"), "{rendered}");
         assert!(rendered.contains(r"'it'\''s'"), "{rendered}");
@@ -1090,7 +1463,7 @@ mod tests {
 
     #[test]
     fn startup_command_without_a_profile_falls_back_to_the_shell() {
-        let cmd = get_startup_command(None, None);
+        let cmd = get_startup_command(None, Launch::Fresh);
         assert_eq!(cmd[0], "-ic");
         assert_eq!(cmd[1], "exec $SHELL");
     }

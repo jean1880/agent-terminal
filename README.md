@@ -22,7 +22,13 @@ window.
   in the running window (or a new one), resuming that conversation from the
   directory it was recorded in. Or browse for it: **Resume Session…** on the
   **+** dropdown and the right-click menu lists recent sessions by title, folder
-  and age, with search. See [Resuming sessions](#resuming-sessions).
+  and age, with search; **Resume Session As** browses another CLI's sessions
+  (Claude or Agy). See [Resuming sessions](#resuming-sessions).
+- **Hand a task to another CLI**: when Claude or Agy runs out of quota, a banner
+  on the tab offers **Continue in <other CLI>**. It opens a tab in the same
+  folder whose first prompt points at a brief the terminal wrote from the
+  transcript and the git state. **Continue In** on the menus does the same at
+  any time. See [Handing off between CLIs](#handing-off-between-clis).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -158,10 +164,57 @@ or one directory down) and its first recorded `cwd` becomes the tab's directory.
 If it can't be found, the tab opens in the profile's default directory and a
 dialog explains how to pass `--dir`.
 
-Claude profiles saved before resume existed are filled in with the settings
-above on load, and those saved before the browser gain `session_title`. Set `"resume_args": []` to opt out. Other CLIs can resume once
-they declare `resume_args`. Restarting a resumed tab resumes it again rather
-than starting a new session.
+Agy keeps one history log instead of a transcript per session, so its profile
+declares `"session_format": "agy-history"`. Its sessions are titled by their
+first prompt and resumed with `--conversation <id>` in the workspace they were
+recorded in. Only the last 4 MiB of the log is read.
+
+Claude and Agy profiles saved by an older release are filled in with the
+settings above on load; so are the hand-off settings below. An explicit empty
+list, such as `"resume_args": []`, opts out. Other CLIs can resume once they
+declare `resume_args`. Restarting a resumed tab resumes it again, with the
+tab's own profile, rather than starting a new session.
+
+### Handing off between CLIs
+When one CLI runs out of quota mid-task, **Continue In ▸ <profile>** (on the
+**+** dropdown and the right-click menu) opens a tab running the other one in
+the same folder. It starts with a prompt that points at a *hand-off brief*. The
+out-of-quota CLI cannot summarize its own work, so the terminal writes the
+brief from what is on disk:
+
+- the original request, the latest requests, the last reply and the files the
+  session edited, from the transcript (Agy's log records requests only);
+- `git status`, `git diff HEAD --stat` and the last five commits;
+- the end of the screen, if no transcript can be found.
+
+Briefs are written to `$XDG_STATE_HOME/agent-terminal/handoffs/` (by default
+`~/.local/state/…`). The directory is `0700`, each file is `0600`, and briefs
+older than 7 days are pruned. Credentials in common formats (`ghp_…`, `sk-…`,
+`AIza…`, `Bearer …`, `*_KEY=…`, `"password": …`, PEM blocks) are masked as
+`****` plus their last four characters. The masking works by pattern, so a
+secret in an unrecognized format can get through, and each brief says so. The
+source tab stays open, so you can resume it once its quota resets. The
+receiving CLI may ask permission before reading a file outside the project.
+
+The terminal also watches for the quota running out. A new Claude tab is started
+under an ID the terminal picks (`--session-id`), so its transcript is known, and
+the watcher looks for a `rate_limit` error there. A CLI with no such record uses
+`limit_markers`, text matched near the bottom of the screen. Either way, the tab
+shows a banner offering **Continue in <next profile>**, which hides again once
+the session replies normally. A transcript that can't be read leaves the banner
+as it was rather than reporting that all is well.
+
+```jsonc
+{ "name": "Agy", "command": "agy",
+  "prompt_args": ["--prompt-interactive", "{prompt}"],   // how to start with a prompt
+  "limit_markers": ["RESOURCE_EXHAUSTED", "quota exceeded"] },
+{ "name": "Claude", "command": "claude",
+  "prompt_args": ["{prompt}"],
+  "session_id_args": ["--session-id", "{id}"] }          // start under a chosen ID
+```
+
+Agy's quota message has not been captured yet, so its default markers are the
+Google API's error names. Adjust them once you have seen the real message.
 
 ### Status indicators
 Optional header-bar lights driven by a file or a command. Empty by default.
@@ -211,7 +264,9 @@ actually links.
 - `src/config.rs` — persisted settings and the 1.x migration, with tests.
 - `src/theme.rs` — terminal colour schemes.
 - `src/utils.rs` — pure logic: profile resolution, startup command, env files,
-  status indicators, path resolution.
+  status indicators, path resolution, session stores.
+- `src/handoff.rs` — pure logic for hand-offs: brief building, redaction and
+  quota detection.
 
 ## Contributing 🤝
 

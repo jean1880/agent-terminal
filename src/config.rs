@@ -43,7 +43,7 @@ impl CliClient {
 /// editing the enum, its `Display`, four arms of the detection function and two
 /// hand-maintained index↔variant mappings in the settings dialog; it is now a
 /// `config.json` edit with no recompile.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Profile {
     /// Shown in the settings dropdown and the new-tab menu. Also the key that
     /// `default_profile` refers to, so it must be unique.
@@ -82,6 +82,39 @@ pub struct Profile {
     /// sessions by ID.
     #[serde(default)]
     pub session_title: Option<String>,
+    /// How `session_store` is laid out. See [`SessionFormat`].
+    #[serde(default)]
+    pub session_format: SessionFormat,
+    /// Arguments that start a *new* session under an ID the terminal chooses,
+    /// with `{id}` standing for it — `["--session-id", "{id}"]` for Claude.
+    /// Knowing the ID up front is what lets the terminal find the transcript of
+    /// a session it started, for quota detection and hand-off briefs.
+    #[serde(default)]
+    pub session_id_args: Option<Vec<String>>,
+    /// Arguments that start an interactive session with an initial prompt, with
+    /// `{prompt}` standing for it — `["{prompt}"]` for Claude. Used to hand a
+    /// task over from another profile. `None` or empty: cannot take a hand-off.
+    #[serde(default)]
+    pub prompt_args: Option<Vec<String>>,
+    /// Case-insensitive text that, seen near the bottom of the screen, means the
+    /// CLI has run out of quota. The fallback for a CLI whose transcript carries
+    /// no structured signal; Claude's is read from the transcript instead.
+    #[serde(default)]
+    pub limit_markers: Option<Vec<String>>,
+}
+
+/// How a profile's `session_store` records sessions.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionFormat {
+    /// A directory of `<id>.jsonl` transcripts, directly inside it or one
+    /// directory down, whose records may carry a `cwd` (Claude).
+    #[default]
+    Jsonl,
+    /// A single JSONL log, one row per prompt, carrying `conversationId`,
+    /// `workspace`, `display` and a millisecond `timestamp` (AGY's
+    /// `history.jsonl`).
+    AgyHistory,
 }
 
 impl Profile {
@@ -97,29 +130,100 @@ impl Profile {
     pub fn can_resume(&self) -> bool {
         self.resume_args.as_ref().is_some_and(|a| !a.is_empty())
     }
+
+    /// Whether this profile can start a session under a chosen ID.
+    pub fn can_pin_session_id(&self) -> bool {
+        self.session_id_args.as_ref().is_some_and(|a| !a.is_empty())
+    }
+
+    /// Whether this profile can start with an initial prompt, and so take a
+    /// hand-off.
+    pub fn can_take_prompt(&self) -> bool {
+        self.prompt_args.as_ref().is_some_and(|a| !a.is_empty())
+    }
 }
 
-/// Resume settings for a CLI whose conventions are known.
-struct KnownResume {
-    args: Vec<String>,
+/// Settings for a CLI whose conventions are known.
+struct KnownProfile {
+    resume_args: Vec<String>,
     store: String,
-    title: String,
+    title: Option<String>,
+    format: SessionFormat,
+    session_id_args: Option<Vec<String>>,
+    prompt_args: Vec<String>,
+    limit_markers: Option<Vec<String>>,
 }
 
-/// The resume settings for CLIs whose conventions are known, keyed by command.
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The settings for CLIs whose conventions are known, keyed by command.
 ///
-/// Only Claude for now: its `--resume <id>`, `~/.claude/projects/<dir>/<id>.jsonl`
+/// Claude: `--resume`/`--session-id`, the `~/.claude/projects/<dir>/<id>.jsonl`
 /// layout and `aiTitle` records were checked against the installed CLI and its
-/// transcripts. Another CLI gets resume by declaring the fields in config, not
-/// by an entry here.
-fn known_resume_settings(command: &str) -> Option<KnownResume> {
+/// transcripts; its quota signal is structured, so it needs no markers.
+///
+/// Agy: `--conversation <id>` and `--prompt-interactive` were read from the
+/// binary's own flag text, and `history.jsonl` from a real log. Whether
+/// `--conversation` accepts an ID it has never seen is unknown, so it gets no
+/// `session_id_args`. Its quota message has not been captured yet; the markers
+/// are the Google API's error names.
+///
+/// Another CLI gets these by declaring the fields in config, not by an entry here.
+fn known_profile_settings(command: &str) -> Option<KnownProfile> {
     match command {
-        "claude" => Some(KnownResume {
-            args: vec!["--resume".to_string(), "{id}".to_string()],
+        "claude" => Some(KnownProfile {
+            resume_args: strings(&["--resume", "{id}"]),
             store: "~/.claude/projects".to_string(),
-            title: "/aiTitle".to_string(),
+            title: Some("/aiTitle".to_string()),
+            format: SessionFormat::Jsonl,
+            session_id_args: Some(strings(&["--session-id", "{id}"])),
+            prompt_args: strings(&["{prompt}"]),
+            limit_markers: None,
+        }),
+        "agy" => Some(KnownProfile {
+            resume_args: strings(&["--conversation", "{id}"]),
+            store: "~/.gemini/antigravity-cli/history.jsonl".to_string(),
+            title: None,
+            format: SessionFormat::AgyHistory,
+            session_id_args: None,
+            prompt_args: strings(&["--prompt-interactive", "{prompt}"]),
+            limit_markers: Some(strings(&["RESOURCE_EXHAUSTED", "quota exceeded"])),
         }),
         _ => None,
+    }
+}
+
+/// Fills in whatever a known CLI's profile has not set.
+///
+/// Only an absent field is filled: an explicit empty list (`"resume_args": []`)
+/// is an opt-out and stays one. Resume and store go together, because a store
+/// without the arguments, or the reverse, is a half-configured profile the user
+/// chose. The title pointer and format follow the store only when it is the
+/// known one — a custom store's layout is not ours to guess.
+fn apply_known_settings(profile: &mut Profile) {
+    let Some(known) = known_profile_settings(&profile.command) else {
+        return;
+    };
+    if profile.resume_args.is_none() && profile.session_store.is_none() {
+        profile.resume_args = Some(known.resume_args);
+        profile.session_store = Some(known.store.clone());
+        profile.session_format = known.format;
+    }
+    if profile.session_title.is_none()
+        && profile.session_store.as_deref() == Some(known.store.as_str())
+    {
+        profile.session_title = known.title;
+    }
+    if profile.session_id_args.is_none() {
+        profile.session_id_args = known.session_id_args;
+    }
+    if profile.prompt_args.is_none() {
+        profile.prompt_args = Some(known.prompt_args);
+    }
+    if profile.limit_markers.is_none() {
+        profile.limit_markers = known.limit_markers;
     }
 }
 
@@ -129,18 +233,13 @@ fn default_profiles() -> Vec<Profile> {
     ["Claude", "Agy", "Gemini"]
         .iter()
         .map(|name| {
-            let command = name.to_lowercase();
-            let resume = known_resume_settings(&command);
-            Profile {
+            let mut profile = Profile {
                 name: (*name).to_string(),
-                args: Vec::new(),
-                dir: None,
-                env_file: None,
-                resume_args: resume.as_ref().map(|r| r.args.clone()),
-                session_store: resume.as_ref().map(|r| r.store.clone()),
-                session_title: resume.map(|r| r.title),
-                command,
-            }
+                command: name.to_lowercase(),
+                ..Profile::default()
+            };
+            apply_known_settings(&mut profile);
+            profile
         })
         .collect()
 }
@@ -568,26 +667,11 @@ impl TerminalConfig {
             self.profiles = default_profiles();
         }
 
-        // Profiles saved before resume existed carry neither field, so the
-        // persisted Claude profile would otherwise never be able to resume.
-        // Only a profile that set *neither* is filled in: an explicit
-        // `"resume_args": []` is an opt-out and stays one.
+        // Profiles saved by an older release lack whatever came after it —
+        // resume, the browser's title pointer, hand-off — so a persisted
+        // Claude or Agy profile would otherwise never gain them.
         for profile in &mut self.profiles {
-            let Some(known) = known_resume_settings(&profile.command) else {
-                continue;
-            };
-            if profile.resume_args.is_none() && profile.session_store.is_none() {
-                profile.resume_args = Some(known.args);
-                profile.session_store = Some(known.store.clone());
-            }
-            // Saved by the release that added resume but not the browser: the
-            // store is the known one, only the title pointer is missing. A
-            // custom store is left alone — its title format is not ours to guess.
-            if profile.session_title.is_none()
-                && profile.session_store.as_deref() == Some(known.store.as_str())
-            {
-                profile.session_title = Some(known.title);
-            }
+            apply_known_settings(profile);
         }
 
         if self.default_profile.is_none() && self.cli_client != CliClient::Auto {
@@ -1026,8 +1110,10 @@ mod tests {
                 dir: Some("/tmp/project".to_string()),
                 env_file: Some("/tmp/env.sh".to_string()),
                 resume_args: Some(vec!["resume".to_string(), "{id}".to_string()]),
-                session_store: None,
-                session_title: None,
+                session_format: SessionFormat::AgyHistory,
+                prompt_args: Some(vec!["{prompt}".to_string()]),
+                limit_markers: Some(vec!["quota".to_string()]),
+                ..Profile::default()
             }],
             default_profile: Some("Codex".to_string()),
             ..Default::default()
@@ -1062,11 +1148,7 @@ mod tests {
             name: "Claude".to_string(),
             command: "claude".to_string(),
             args: vec!["--model".to_string(), "opus".to_string()],
-            dir: None,
-            env_file: None,
-            resume_args: None,
-            session_store: None,
-            session_title: None,
+            ..Profile::default()
         };
         assert_eq!(profile.argv(), vec!["claude", "--model", "opus"]);
     }
@@ -1104,7 +1186,7 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::File::create(&path)
             .unwrap()
-            .write_all(br#"{"profiles":[{"name":"Claude","command":"claude"},{"name":"Agy","command":"agy"}]}"#)
+            .write_all(br#"{"profiles":[{"name":"Claude","command":"claude"},{"name":"Gemini","command":"gemini"}]}"#)
             .unwrap();
 
         let loaded = TerminalConfig::load_from(&path);
@@ -1119,6 +1201,51 @@ mod tests {
         );
         // A CLI with no known convention is left alone rather than guessed at.
         assert!(!loaded.profiles[1].can_resume());
+        assert!(!loaded.profiles[1].can_take_prompt());
+    }
+
+    #[test]
+    fn a_pre_handoff_agy_profile_gains_resume_and_handoff_settings() {
+        // Saved before Agy could resume: nothing but name and command.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[{"name":"Agy","command":"agy"}]}"#)
+            .unwrap();
+
+        let agy = &TerminalConfig::load_from(&path).profiles[0];
+        assert_eq!(
+            agy.resume_args.as_deref(),
+            Some(&["--conversation".to_string(), "{id}".to_string()][..])
+        );
+        assert_eq!(agy.session_format, SessionFormat::AgyHistory);
+        assert_eq!(agy.session_title, None);
+        assert!(agy.can_take_prompt());
+        // Not known to accept a fresh ID, so never asked to.
+        assert!(!agy.can_pin_session_id());
+    }
+
+    #[test]
+    fn a_resume_era_claude_profile_gains_handoff_settings_but_keeps_opt_outs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(
+                br#"{"profiles":[
+                    {"name":"Claude","command":"claude","resume_args":["--resume","{id}"],
+                     "session_store":"~/.claude/projects"},
+                    {"name":"Quiet","command":"claude","prompt_args":[],"session_id_args":[]}]}"#,
+            )
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert!(loaded.profiles[0].can_pin_session_id());
+        assert!(loaded.profiles[0].can_take_prompt());
+        assert_eq!(loaded.profiles[0].session_format, SessionFormat::Jsonl);
+        assert!(!loaded.profiles[1].can_pin_session_id());
+        assert!(!loaded.profiles[1].can_take_prompt());
     }
 
     #[test]

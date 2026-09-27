@@ -29,7 +29,10 @@ impl AgentTerminalWindow {
     /// lookup of where the session was recorded.
     pub fn resume_session(&self, session_id: String, dir: Option<String>) {
         use gtk4::subclass::prelude::ObjectSubclassIsExt;
-        self.imp()
-            .request_resume(imp::ResumeRequest { session_id, dir });
+        self.imp().request_resume(imp::ResumeRequest {
+            session_id,
+            dir,
+            profile: None,
+        });
     }
 }
