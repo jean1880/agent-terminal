@@ -250,7 +250,13 @@ Branch: `feat/checkpoints` (off `master` @ b1a7ceb0)
       ~/git/agent-terminal/target/debug/agent-terminal, config_files:
       {"agent-terminal/config.json": <bash profile, starting_directory =
       scratch repo>} }`, then playwright on the returned url.
-- [ ] Release: bump 2.1.0, merge, push; confirm the apt pipeline build
+- [x] Release: bumped to 2.1.0, merged `feat/checkpoints` into master
+      (`96b45611`), gate re-run on master (173/173), pushed; the
+      debian-maintainer build was triggered via its MCP
+- [ ] Still open, needs the user: WP0.1/WP0.2. Run a turn in each CLI and
+      check `journalctl --user -t agent-terminal -g Bell`: which CLIs ring the
+      bell at the end of a turn, and whether any never goes quiet. Then
+      demote the bell log to debug (`imp.rs`, comment names this).
 
 Notes:
 - **Deviation from the plan text (step 4):** untracked files are staged with
