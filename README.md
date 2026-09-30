@@ -32,6 +32,9 @@ window.
 - **Turn checkpoints**: in a git repository, the working tree is snapshotted
   into hidden refs whenever a turn ends, without touching your branch, index
   or stash. See [Turn checkpoints](#turn-checkpoints).
+- **Diff panel**: `Ctrl + Shift + D` shows what changed beside the terminal:
+  uncommitted work, the last turn, or everything since the tab opened. See
+  [Diff panel](#diff-panel).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -64,6 +67,7 @@ window.
   | `Ctrl + Shift + W` | Close tab |
   | `Ctrl + Shift + R` | Restart the current session |
   | `Ctrl + Shift + F` | Search the scrollback |
+  | `Ctrl + Shift + D` | Show or hide the diff panel |
   | `Ctrl + Shift + C` / `V` | Copy / paste |
   | `Ctrl + Tab` / `Ctrl + Shift + Tab` | Next / previous tab |
   | `Ctrl + Page Down` / `Page Up` | Next / previous tab |
@@ -291,6 +295,29 @@ from a repository:
 git for-each-ref --format='delete %(refname)' refs/agent-terminal | git update-ref --stdin
 ```
 
+### Diff panel
+`Ctrl + Shift + D`, or **Show or Hide Changes** on the right-click menu, opens a
+read-only panel beside the terminal. It shows a file list with line counts, and
+a coloured unified diff below it. Clicking a file jumps to its diff. The
+dropdown picks what to compare against:
+
+| Base | Shows |
+|---|---|
+| **Uncommitted** | HEAD against the working tree now, untracked files included |
+| **Last turn** | What the tab's latest checkpoint changed |
+| **This tab** | Everything since the state the tab's first checkpoint was taken on top of, up to now |
+
+A tab's first checkpoint usually comes a few seconds after it opens, once the
+CLI's startup output goes quiet. Uncommitted work already present when the tab
+opened, and not changed before that first checkpoint, counts as the tab's in
+**This tab**.
+
+The panel refreshes when it opens, when a new checkpoint is taken, when the
+base changes, and on its refresh button. It never polls. Git's external diff
+and textconv drivers are not run. Diffs above 1 MiB or 20,000 lines are cut
+short, and one with more than 200,000 changed lines shows only its file
+list. Whether new tabs open with the panel, and its width, are remembered.
+
 ### Generating a Debian package (.deb)
 ```bash
 make package
@@ -315,8 +342,12 @@ actually links.
   status indicators, path resolution, session stores.
 - `src/handoff.rs` — pure logic for hand-offs: brief building, redaction and
   quota detection.
-- `src/git.rs` — git plumbing for turn checkpoints: repo discovery, snapshots
-  through a private index, checkpoint refs and retention.
+- `src/git.rs` — git plumbing for turn checkpoints and the diff panel: repo
+  discovery, snapshots through a private index, checkpoint refs, retention and
+  diffs.
+- `src/diff.rs` — pure logic for the diff panel: bases, numstat parsing, line
+  classification and truncation.
+- `src/window/diff_panel.rs` — the diff panel's widgets.
 
 ## Contributing 🤝
 

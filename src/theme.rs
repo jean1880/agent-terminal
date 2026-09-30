@@ -28,6 +28,18 @@ fn hex(color: u32) -> RGBA {
     )
 }
 
+/// Colours for the diff panel: the terminal's own background and text, and a
+/// foreground for each kind of diff line.
+pub struct DiffColours {
+    pub background: RGBA,
+    pub text: RGBA,
+    pub added: RGBA,
+    pub removed: RGBA,
+    pub hunk: RGBA,
+    pub meta: RGBA,
+    pub file: RGBA,
+}
+
 /// A resolved terminal color scheme: foreground/background, cursor, selection,
 /// and the 16-color ANSI palette.
 pub struct Theme {
@@ -158,6 +170,21 @@ impl Theme {
             highlight_bg: rgb(68, 58, 94),
             highlight_fg: rgb(230, 230, 255),
             palette,
+        }
+    }
+
+    /// Colours for the diff panel, taken from the theme's own palette so it
+    /// matches the terminal beside it.
+    pub fn diff_colours(choice: ThemeChoice) -> DiffColours {
+        let theme = Self::for_choice(choice);
+        DiffColours {
+            background: theme.background,
+            text: theme.foreground,
+            added: theme.palette[2],
+            removed: theme.palette[1],
+            hunk: theme.palette[6],
+            meta: theme.palette[8],
+            file: theme.bold,
         }
     }
 

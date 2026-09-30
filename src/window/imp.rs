@@ -1,5 +1,6 @@
 //! Private implementation details of the AgentTerminalWindow.
 
+use super::diff_panel::DiffPanel;
 use crate::config::{Profile, SessionFormat};
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
@@ -75,6 +76,8 @@ struct TabState {
     /// from `screen_dirty`, which the quota poll consumes.
     last_output: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
     checkpoint: CheckpointTrack,
+    /// What changed in this tab's repository, beside the terminal.
+    diff_panel: DiffPanel,
 }
 
 /// How long a tab's output must be still before its turn counts as over and
@@ -873,6 +876,7 @@ impl AgentTerminalWindow {
             term.set_scrollback_lines(i64::from(scrollback));
             term.set_font_scale(scale);
         });
+        self.recolour_diff_panels(theme);
         // An open Settings dialog's font-scale spin follows too; its other
         // rows show the old values until reopened.
         self.for_each_window(|window| {
@@ -1177,6 +1181,17 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&checkpoint_action);
+
+        let toggle_diff = gtk4::gio::SimpleAction::new("toggle-diff", None);
+        toggle_diff.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Toggle Diff Panel");
+                obj.imp().toggle_diff_panel();
+            }
+        ));
+        obj.add_action(&toggle_diff);
 
         // New Tab in Folder Action (opens a folder picker)
         let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
@@ -1799,11 +1814,29 @@ impl AgentTerminalWindow {
                 last_output.set(std::time::Instant::now());
             }
         ));
+        // The terminal and, beside it, the tab's diff panel. The panel keeps
+        // its width as the window resizes; the terminal takes the rest.
+        let (diff_panel, paned) = {
+            let config = self.config.borrow();
+            let panel = DiffPanel::new(&Theme::diff_colours(config.theme));
+            panel.set_shown(config.diff_panel_visible);
+            let paned = gtk4::Paned::builder()
+                .orientation(Orientation::Horizontal)
+                .start_child(&stack)
+                .end_child(&panel.root)
+                .resize_start_child(true)
+                .resize_end_child(false)
+                .shrink_end_child(false)
+                .vexpand(true)
+                .build();
+            (panel, paned)
+        };
+        self.wire_diff_panel(&diff_panel, &paned);
         let tab_content = Box::builder().orientation(Orientation::Vertical).build();
         tab_content.append(&quota_banner);
         tab_content.append(&exit_bar);
         tab_content.append(&search_bar);
-        tab_content.append(&stack);
+        tab_content.append(&paned);
 
         // Add the page and focus it.
         let tab_view = match self.tab_view.borrow().as_ref() {
@@ -1876,9 +1909,13 @@ impl AgentTerminalWindow {
             bell_pending: false,
             last_output,
             checkpoint: CheckpointTrack::default(),
+            diff_panel: diff_panel.clone(),
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
+        if diff_panel.root.is_visible() {
+            self.refresh_diff(&page);
+        }
     }
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
@@ -2237,6 +2274,7 @@ impl AgentTerminalWindow {
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
         menu.append(Some("Checkpoint Now"), Some("win.checkpoint-now"));
+        menu.append(Some("Show or Hide Changes"), Some("win.toggle-diff"));
         menu.append_section(None, &self.build_session_section());
 
         let section = gtk4::gio::Menu::new();
@@ -2897,6 +2935,7 @@ impl AgentTerminalWindow {
                 // Themes apply live to every open tab; no restart needed.
                 obj.imp()
                     .for_each_terminal_everywhere(|term| Theme::apply(term, theme));
+                obj.imp().recolour_diff_panels(theme);
                 obj.imp().schedule_config_save();
             }
         ));
@@ -3846,6 +3885,139 @@ impl AgentTerminalWindow {
         if manual {
             self.show_toast(&report.toast);
         }
+        // A new checkpoint moves the "last turn" and "this tab" bases.
+        if matches!(
+            result,
+            CheckpointResult::Done(crate::git::CheckpointOutcome::Created(..))
+        ) {
+            self.refresh_diff(page);
+        }
+    }
+
+    /// Connects a new tab's diff panel: its refresh requests, its first
+    /// placement, and remembering the width it is dragged to.
+    fn wire_diff_panel(&self, panel: &DiffPanel, paned: &gtk4::Paned) {
+        // Found at click time, like the exit bar's buttons: the tab may have
+        // been dragged to another window since.
+        let root = panel.root.clone();
+        panel.connect_refresh(move || {
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            let imp = obj.imp();
+            let page = imp
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.diff_panel.root == root)
+                .map(|t| t.page.clone());
+            if let Some(page) = page {
+                imp.refresh_diff(&page);
+            }
+        });
+
+        // A Paned cannot be told "give the end child N pixels" before it has
+        // measured its layout, and showing the panel changes that layout. So
+        // the saved width is applied from the paned's own layout notifications,
+        // once per show (DiffPanel::place), and only a later move that is a
+        // real drag is saved (DiffPanel::dragged_width). The handlers go when
+        // the paned is disposed with its tab.
+        let placer = panel.clone();
+        paned.connect_notify_local(Some("max-position"), move |paned, _| {
+            if let Some(obj) = window_of(paned) {
+                let width = obj.imp().config.borrow().diff_panel_width;
+                placer.place(paned, width);
+            }
+        });
+        let watcher = panel.clone();
+        paned.connect_position_notify(move |paned| {
+            let Some(obj) = window_of(paned) else {
+                return;
+            };
+            let imp = obj.imp();
+            let saved = imp.config.borrow().diff_panel_width;
+            // A layout change can arrive as a position change alone.
+            watcher.place(paned, saved);
+            let Some(width) = watcher.dragged_width(paned) else {
+                return;
+            };
+            if width != saved {
+                imp.config.borrow_mut().diff_panel_width = width;
+                imp.schedule_config_save();
+            }
+        });
+    }
+
+    /// Shows or hides the current tab's diff panel. The choice also becomes
+    /// the default for new tabs.
+    fn toggle_diff_panel(&self) {
+        let Some(page) = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.selected_page())
+        else {
+            return;
+        };
+        let Some(panel) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.page == page)
+            .map(|t| t.diff_panel.clone())
+        else {
+            return;
+        };
+        let visible = !panel.root.is_visible();
+        // Placed by the paned's layout notifications once it has re-measured.
+        panel.set_shown(visible);
+        self.config.borrow_mut().diff_panel_visible = visible;
+        self.schedule_config_save();
+        if visible {
+            self.refresh_diff(&page);
+        }
+    }
+
+    /// Recomputes `page`'s diff off the main thread, if its panel is showing.
+    fn refresh_diff(&self, page: &adw::TabPage) {
+        let Some((dir, key, panel)) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page)
+            .map(|t| (t.dir.clone(), t.key, t.diff_panel.clone()))
+        else {
+            return;
+        };
+        if !panel.root.is_visible() {
+            return;
+        }
+        let base = panel.base();
+        let generation = panel.begin();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gtk4::gio::spawn_blocking(move || {
+                crate::git::tab_diff(std::path::Path::new(&dir), key, base)
+            })
+            .await
+            .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+            panel.show(generation, result);
+        });
+    }
+
+    /// Follows a theme change in every window's diff panels.
+    fn recolour_diff_panels(&self, theme: crate::config::ThemeChoice) {
+        let colours = Theme::diff_colours(theme);
+        self.for_each_window(|window| {
+            let panels: Vec<DiffPanel> = window
+                .tabs
+                .borrow()
+                .iter()
+                .map(|t| t.diff_panel.clone())
+                .collect();
+            for panel in panels {
+                panel.set_colours(&colours);
+            }
+        });
     }
 
     /// A short confirmation over the tab view. The text is data, not markup.
@@ -4332,5 +4504,71 @@ mod tests {
             !config_home.path().join("agent-terminal").exists(),
             "window construction touched the config directory"
         );
+
+        // Here rather than in a test of its own: GTK belongs to the one
+        // thread that initialised it, and tests run on several.
+        diff_panel_shows_each_outcome();
+    }
+
+    fn diff_panel_shows_each_outcome() {
+        use crate::git::{DiffOutcome, TabDiff};
+        let panel = DiffPanel::new(&Theme::diff_colours(Default::default()));
+
+        let generation = panel.begin();
+        panel.show(generation, Err("fatal: <bad>".into()));
+        let (page, title, ..) = panel.visible_state();
+        assert_eq!((page.as_str(), title.as_str()), ("status", "Git failed"));
+
+        let generation = panel.begin();
+        panel.show(generation, Ok(DiffOutcome::NotRepo));
+        assert_eq!(panel.visible_state().1, "Not a git repository");
+
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: Vec::new(),
+                text: String::new(),
+                omitted_lines: 0,
+                too_large: false,
+            })),
+        );
+        assert_eq!(panel.visible_state().1, "No changes");
+
+        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: crate::diff::parse_numstat(b"1\t1\tx\0"),
+                text: text.into(),
+                omitted_lines: 3,
+                too_large: false,
+            })),
+        );
+        let (page, _, summary, shown, rows) = panel.visible_state();
+        assert_eq!(page, "diff");
+        assert_eq!(summary, "1 file, +1 −1");
+        assert!(shown.starts_with(text));
+        assert!(shown.ends_with("3 more lines not shown"), "{shown}");
+        assert_eq!(rows, 1);
+
+        // Before the paned has a size, nothing is placed and no position is
+        // taken for the user's choice of width.
+        let paned = gtk4::Paned::builder()
+            .orientation(Orientation::Horizontal)
+            .end_child(&panel.root)
+            .build();
+        panel.set_shown(true);
+        panel.place(&paned, 400);
+        assert_eq!(panel.dragged_width(&paned), None);
+
+        // A slow refresh finishing after a newer one started is dropped.
+        let stale = panel.begin();
+        let current = panel.begin();
+        panel.show(stale, Ok(DiffOutcome::NotRepo));
+        assert_eq!(panel.visible_state().0, "diff");
+        panel.show(current, Ok(DiffOutcome::NotRepo));
+        assert_eq!(panel.visible_state().0, "status");
     }
 }

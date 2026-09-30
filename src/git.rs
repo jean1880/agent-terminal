@@ -422,6 +422,26 @@ impl Drop for ScratchIndex {
     }
 }
 
+/// Gives the copied index the original's modification time.
+///
+/// Git trusts an index entry whose size and mtime still match the file —
+/// unless the entry is not older than the index file itself ("racily clean"),
+/// in which case it compares content. A copy made now would look newer than
+/// every entry, switching that guard off: a file rewritten at the same size
+/// within one filesystem timestamp tick of the last `git add` would then be
+/// missed. Keeping the original's mtime keeps git's judgement the same as for
+/// the real index.
+fn keep_index_mtime(original: &Path, copy: &Path) -> Result<(), String> {
+    let modified = std::fs::metadata(original)
+        .and_then(|meta| meta.modified())
+        .map_err(|err| format!("Could not read the index's time: {err}"))?;
+    std::fs::File::options()
+        .write(true)
+        .open(copy)
+        .and_then(|file| file.set_modified(modified))
+        .map_err(|err| format!("Could not set the snapshot index's time: {err}"))
+}
+
 /// Size of `path` without following a final symlink; `None` if it is gone or
 /// is neither a regular file nor a symlink.
 fn untracked_size(path: &Path) -> Option<u64> {
@@ -466,10 +486,11 @@ pub fn snapshot_tree(repo: &RepoInfo, tag: &str) -> Result<SnapshotOutcome, Stri
     };
 
     // Starting from a copy of the real index keeps its stat cache, so `add -u`
-    // only re-hashes what changed. Git replaces the index by rename, so the
+    // only re-hashes what changed. The copy must keep the original's mtime —
+    // see keep_index_mtime (racy-clean). Git replaces the index by rename, so the
     // copy is of one whole version or another.
     match std::fs::copy(&repo.index, &scratch.0) {
-        Ok(_) => {}
+        Ok(_) => keep_index_mtime(&repo.index, &scratch.0)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => seed_from_head()?,
         Err(err) => return Err(format!("Could not copy the index: {err}")),
     }
@@ -553,9 +574,13 @@ pub struct RefEntry {
     pub tree: String,
     /// Committer time, seconds since the epoch.
     pub time: u64,
+    /// The commit it was recorded on top of: the tab's previous checkpoint,
+    /// or HEAD for its first. `None` before the repository's first commit.
+    pub parent: Option<String>,
 }
 
-const REF_FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(tree)%00%(committerdate:unix)";
+const REF_FORMAT: &str =
+    "--format=%(refname)%00%(objectname)%00%(tree)%00%(committerdate:unix)%00%(parent)";
 
 /// Parses `for-each-ref` output in [`REF_FORMAT`]. Malformed lines are dropped.
 pub fn parse_ref_listing(stdout: &[u8]) -> Vec<RefEntry> {
@@ -567,11 +592,17 @@ pub fn parse_ref_listing(stdout: &[u8]) -> Vec<RefEntry> {
             let commit = fields.next()?.to_string();
             let tree = fields.next()?.to_string();
             let time = fields.next()?.trim().parse().ok()?;
+            // Space-separated; a checkpoint has at most one.
+            let parent = fields
+                .next()
+                .and_then(|p| p.split_whitespace().next())
+                .map(str::to_string);
             (!refname.is_empty() && !commit.is_empty()).then_some(RefEntry {
                 refname,
                 commit,
                 tree,
                 time,
+                parent,
             })
         })
         .collect()
@@ -755,12 +786,14 @@ fn take_checkpoint_capped(
     create_ref(repo, &refname, &commit)?;
     debug!("Checkpoint {refname} -> {commit}");
 
+    let parent = parent.map(str::to_string);
     let mut entries = entries;
     entries.push(RefEntry {
         refname: refname.clone(),
         commit: commit.clone(),
         tree: snapshot.tree.clone(),
         time: now_unix(),
+        parent,
     });
     let cutoff = now_unix().saturating_sub(RETENTION.as_secs());
     for doomed in refs_to_prune(&entries, key, max_per_tab, cutoff) {
@@ -780,6 +813,139 @@ fn take_checkpoint_capped(
     ))
 }
 
+/// Flags for every diff shown in the panel. A configured external diff or
+/// textconv filter could run anything, and slowly; the panel wants git's own
+/// output. Renames are detected so a move reads as one. Starts with the
+/// subcommand: these are `diff` options, not git's.
+const DIFF: &[&str] = &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M"];
+
+/// Above this many changed lines the diff text is not fetched at all, only
+/// its file list: the whole of `git diff` is read into memory before it is
+/// cut to [`crate::diff::MAX_DIFF_BYTES`], so this bounds that read.
+///
+/// Ceiling: a single enormous line (a minified file) can still be large.
+/// Upgrade path: stream the output and stop reading at the cap.
+const MAX_FETCHED_DIFF_LINES: u64 = 200_000;
+
+/// The empty tree's id in this repository's hash (SHA-1 or SHA-256), the
+/// base for a diff that has no parent to start from.
+pub fn empty_tree(repo: &RepoInfo) -> Result<String, String> {
+    let id = trimmed(&git_raw(
+        &repo.toplevel,
+        ["hash-object", "-t", "tree", "/dev/null"],
+        &[],
+        QUERY_TIMEOUT_SECS,
+    )?);
+    if id.is_empty() {
+        return Err("git hash-object returned nothing".to_string());
+    }
+    Ok(id)
+}
+
+/// A diff ready for the panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabDiff {
+    pub stats: Vec<crate::diff::FileStat>,
+    /// Capped; empty when the diff is too large to fetch.
+    pub text: String,
+    /// Lines of diff text not shown.
+    pub omitted_lines: usize,
+    /// Set when the text was not fetched because the diff is so large.
+    pub too_large: bool,
+}
+
+/// What the panel can show for a tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffOutcome {
+    NotRepo,
+    /// A reason this base has nothing to show yet.
+    Unavailable(String),
+    Ready(TabDiff),
+}
+
+/// Builds the diff for tab `key`, rooted in `dir`, against `base`. Blocking.
+pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<DiffOutcome, String> {
+    use crate::diff::{CheckpointCommit, DiffBase, Unavailable};
+
+    let Some(repo) = discover(dir)? else {
+        return Ok(DiffOutcome::NotRepo);
+    };
+    let entries = list_refs(&repo)?;
+    let checkpoints: Vec<CheckpointCommit> = checkpoints_of(&entries, key)
+        .into_iter()
+        .map(|(_, entry)| CheckpointCommit {
+            commit: entry.commit.clone(),
+            parent: entry.parent.clone(),
+        })
+        .collect();
+
+    // A fresh snapshot stands in for "the working tree now". Its private
+    // index is unique to this call: refreshes can overlap (a base change
+    // while a checkpoint's refresh runs), and one finishing would otherwise
+    // delete the index from under the other, leaving it an empty index and a
+    // tree of untracked files only. Its objects are unreferenced and go at
+    // the user's next `git gc`.
+    static DIFF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = DIFF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let current = if base == DiffBase::LastTurn {
+        String::new()
+    } else {
+        match snapshot_tree(&repo, &format!("diff-{key}-{call}"))? {
+            SnapshotOutcome::Taken(snapshot) => snapshot.tree,
+            SnapshotOutcome::Busy => {
+                return Ok(DiffOutcome::Unavailable(
+                    "Git is busy in this repository; refresh in a moment".to_string(),
+                ))
+            }
+        }
+    };
+    let empty = empty_tree(&repo)?;
+    let (from, to) =
+        match crate::diff::diff_range(base, repo.head.as_deref(), &checkpoints, &current, &empty) {
+            Ok(range) => range,
+            Err(Unavailable::NoCheckpoints) => {
+                return Ok(DiffOutcome::Unavailable(
+                    "No checkpoints in this tab yet".to_string(),
+                ))
+            }
+        };
+
+    let numstat = git_raw(
+        &repo.toplevel,
+        DIFF.iter().copied().chain(["--numstat", "-z", &from, &to]),
+        &[],
+        SNAPSHOT_TIMEOUT_SECS,
+    )?;
+    let stats = crate::diff::parse_numstat(&numstat);
+    let (_, added, deleted) = crate::diff::totals(&stats);
+    if added + deleted > MAX_FETCHED_DIFF_LINES {
+        return Ok(DiffOutcome::Ready(TabDiff {
+            stats,
+            text: String::new(),
+            omitted_lines: 0,
+            too_large: true,
+        }));
+    }
+    let raw = git_raw(
+        &repo.toplevel,
+        DIFF.iter().copied().chain([from.as_str(), to.as_str()]),
+        &[],
+        SNAPSHOT_TIMEOUT_SECS,
+    )?;
+    let full = String::from_utf8_lossy(&raw);
+    let (kept, omitted_lines) = crate::diff::truncate(
+        &full,
+        crate::diff::MAX_DIFF_BYTES,
+        crate::diff::MAX_DIFF_LINES,
+    );
+    Ok(DiffOutcome::Ready(TabDiff {
+        stats,
+        text: kept.to_string(),
+        omitted_lines,
+        too_large: false,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +956,7 @@ mod tests {
             commit: format!("c-{refname}"),
             tree: tree.to_string(),
             time,
+            parent: None,
         }
     }
 
@@ -942,15 +1109,27 @@ mod tests {
 
     #[test]
     fn ref_listing_parses_and_drops_malformed_lines() {
-        let out = b"refs/agent-terminal/1/0001\x00abc\x00def\x001700000000\ngarbage\n";
+        let out = b"refs/agent-terminal/1/0001\x00abc\x00def\x001700000000\x00p1\n\
+                    refs/agent-terminal/1/0002\x00ghi\x00jkl\x001700000001\x00\n\
+                    garbage\n";
         assert_eq!(
             parse_ref_listing(out),
-            vec![RefEntry {
-                refname: "refs/agent-terminal/1/0001".into(),
-                commit: "abc".into(),
-                tree: "def".into(),
-                time: 1_700_000_000,
-            }]
+            vec![
+                RefEntry {
+                    refname: "refs/agent-terminal/1/0001".into(),
+                    commit: "abc".into(),
+                    tree: "def".into(),
+                    time: 1_700_000_000,
+                    parent: Some("p1".into()),
+                },
+                RefEntry {
+                    refname: "refs/agent-terminal/1/0002".into(),
+                    commit: "ghi".into(),
+                    tree: "jkl".into(),
+                    time: 1_700_000_001,
+                    parent: None,
+                },
+            ]
         );
     }
 
@@ -1303,6 +1482,134 @@ mod tests {
             let own = checkpoints_of(&entries, 3);
             let seqs: Vec<u32> = own.iter().map(|(seq, _)| *seq).collect();
             assert_eq!(seqs, vec![3, 4]);
+        }
+
+        fn ready(outcome: DiffOutcome) -> TabDiff {
+            match outcome {
+                DiffOutcome::Ready(diff) => diff,
+                other => panic!("expected a diff, got {other:?}"),
+            }
+        }
+
+        fn paths(diff: &TabDiff) -> Vec<&str> {
+            diff.stats.iter().map(|s| s.path.as_str()).collect()
+        }
+
+        #[test]
+        fn the_copied_index_keeps_the_real_index_time() {
+            // Without this, a same-size edit made just after a commit was
+            // missed by 29 snapshots in 150 (0 in 150 with it): the copy
+            // looked newer than every entry, which switched off git's
+            // racy-clean content check. The race itself is timing-dependent,
+            // so what is pinned here is the mechanism.
+            let tmp = tempfile::tempdir().unwrap();
+            let (original, copy) = (tmp.path().join("index"), tmp.path().join("copy"));
+            fs::write(&original, "idx").unwrap();
+            let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+            fs::File::options()
+                .write(true)
+                .open(&original)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            fs::copy(&original, &copy).unwrap();
+            keep_index_mtime(&original, &copy).unwrap();
+            assert_eq!(fs::metadata(&copy).unwrap().modified().unwrap(), old);
+        }
+
+        #[test]
+        fn overlapping_refreshes_of_one_tab_each_see_the_whole_tree() {
+            use crate::diff::DiffBase;
+            let Some(tmp) = new_repo() else { return };
+            fs::write(tmp.path().join("a.txt"), "changed\n").unwrap();
+            fs::write(tmp.path().join("new.txt"), "fresh\n").unwrap();
+            let dir = tmp.path().to_path_buf();
+            let workers: Vec<_> = (0..6)
+                .map(|_| {
+                    let dir = dir.clone();
+                    std::thread::spawn(move || {
+                        (0..3)
+                            .map(|_| {
+                                let diff = ready(tab_diff(&dir, 9, DiffBase::Uncommitted).unwrap());
+                                paths(&diff).join(",")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                for seen in worker.join().unwrap() {
+                    // A clobbered private index shows tracked files deleted.
+                    assert_eq!(seen, "a.txt,new.txt");
+                }
+            }
+        }
+
+        #[test]
+        fn uncommitted_includes_untracked_files() {
+            use crate::diff::DiffBase;
+            let Some(tmp) = new_repo() else { return };
+            fs::write(tmp.path().join("a.txt"), "two\n").unwrap();
+            fs::write(tmp.path().join("new.txt"), "fresh\n").unwrap();
+            let diff = ready(tab_diff(tmp.path(), 1, DiffBase::Uncommitted).unwrap());
+            assert_eq!(paths(&diff), vec!["a.txt", "new.txt"]);
+            assert!(diff.text.contains("+fresh"), "{}", diff.text);
+            assert!(diff.text.contains("-one"), "{}", diff.text);
+            assert!(!diff.too_large);
+        }
+
+        #[test]
+        fn checkpoint_bases_wait_for_a_checkpoint_then_follow_them() {
+            use crate::diff::DiffBase;
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            assert!(matches!(
+                tab_diff(dir, 5, DiffBase::LastTurn).unwrap(),
+                DiffOutcome::Unavailable(_)
+            ));
+
+            let repo = discover(dir).unwrap().unwrap();
+            fs::write(dir.join("a.txt"), "turn one\n").unwrap();
+            take_checkpoint(&repo, 5, "Claude").unwrap();
+            fs::write(dir.join("b.txt"), "turn two\n").unwrap();
+            take_checkpoint(&repo, 5, "Claude").unwrap();
+            fs::write(dir.join("c.txt"), "since\n").unwrap();
+
+            let last = ready(tab_diff(dir, 5, DiffBase::LastTurn).unwrap());
+            assert_eq!(paths(&last), vec!["b.txt"]);
+            let tab = ready(tab_diff(dir, 5, DiffBase::ThisTab).unwrap());
+            assert_eq!(paths(&tab), vec!["a.txt", "b.txt", "c.txt"]);
+            // Another tab's checkpoints are not this one's.
+            assert!(matches!(
+                tab_diff(dir, 6, DiffBase::LastTurn).unwrap(),
+                DiffOutcome::Unavailable(_)
+            ));
+        }
+
+        #[test]
+        fn an_unborn_repo_diffs_against_the_empty_tree() {
+            use crate::diff::DiffBase;
+            if !git_installed() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            sh(tmp.path(), &["init", "-q"]);
+            fs::write(tmp.path().join("first.txt"), "1\n").unwrap();
+            let diff = ready(tab_diff(tmp.path(), 1, DiffBase::Uncommitted).unwrap());
+            assert_eq!(paths(&diff), vec!["first.txt"]);
+        }
+
+        #[test]
+        fn a_folder_outside_any_repo_has_no_diff() {
+            use crate::diff::DiffBase;
+            if !git_installed() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            assert_eq!(
+                tab_diff(tmp.path(), 1, DiffBase::Uncommitted).unwrap(),
+                DiffOutcome::NotRepo
+            );
         }
     }
 }

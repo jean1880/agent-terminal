@@ -77,16 +77,71 @@ Branch: `feat/checkpoints` (off `master` @ b1a7ceb0)
       Gate: clippy clean, 141/141.
       Deliberately not done: a real-repo age-prune test (the pure test covers
       it), and a sparse-checkout test (documented limit).
-- [ ] WP1 rust-reviewer round 2 (delta)
-- [ ] WP1 commit on `feat/checkpoints`
-- [ ] WP2 diff panel. `src/diff.rs` is written (pure: base→range, numstat,
-      line classifier, truncation; 7 tests) but is **untracked and unhooked**
-      (`mod diff;` was removed from main.rs so the WP1 commit stays clean).
-      Re-add `mod diff;` when wiring. It still needs `parent` on
-      `git::RefEntry` (`%(parent)` in REF_FORMAT), a `git::empty_tree()`
-      (`hash-object -t tree /dev/null`), a `git::diff_text/numstat` using
-      `--no-ext-diff --no-textconv -M`, theme diff colours (palette 1/2/6/8),
-      and the panel UI.
+- [x] WP1 rust-reviewer round 2 (delta): **PASS**. Its one nit (a late result
+      from an attempt that expired after 120 s could clear a newer attempt's
+      `started`) needs a snapshot longer than 120 s against 10 s step
+      timeouts. Not acted on.
+- [x] WP1 committed on `feat/checkpoints`. The repo's commit-msg hook strips
+      the AI co-author trailer, so none is added.
+- [x] WP2 logic: `src/diff.rs` (pure, 7 tests; `mod diff;` hooked up again),
+      `RefEntry.parent` via `%(parent)`, `git::empty_tree`, and
+      `git::tab_diff(dir, key, base)`, which returns
+      NotRepo/Unavailable/Ready(TabDiff). It uses
+      `diff --no-color --no-ext-diff --no-textconv -M`, a snapshot under
+      `index-diff-<key>` so it never shares the checkpoint's private index,
+      and skips fetching the text above 200k changed lines. 4 new real-repo
+      tests pass.
+- [x] WP2 theme diff colours: `Theme::diff_colours` (palette 2/1/6/8 + bold)
+- [x] WP2 panel UI:
+      - `src/window/diff_panel.rs`: dropdown, summary, refresh; status page
+        with Retry; file list that jumps to its diff; tagged TextView; a
+        generation counter that drops stale results
+      - `win.toggle-diff` on Ctrl+Shift+D and in the right-click menu, as
+        "Show or Hide Changes"
+      - flat config `diff_panel_visible`/`diff_panel_width`, width applied on
+        first allocation and saved on drag
+      - refreshes on open, on a new checkpoint, on a base change, and on the
+        button; recoloured on theme change and config reload
+      - the panel smoke test sits inside `test_window_initialization`,
+        because GTK is bound to one thread
+      - README (feature, shortcut, "Diff panel" section, structure) and
+        AGENTS.md (modules, `DiffBase::ALL` guard) updated
+- [x] **WP1 bug found and fixed during WP2:** `fs::copy` gave the private
+      index a fresh mtime, which switched off git's racy-clean check. A
+      same-size edit made right after a commit was missed by **29 of 150**
+      snapshots (measured with a repro loop). `keep_index_mtime` copies the
+      original's mtime: **0 of 150**. A mechanism test pins it, because the
+      race is timing-dependent. The fix ships in the WP2 commit.
+- [x] WP2 gate: fmt, clippy clean, 154/154
+- [x] WP2 rust-reviewer round 1: CHANGES-REQUIRED, 3 SHOULD. All fixed:
+      1. overlapping refreshes shared `index-diff-<key>`. Each call now gets a
+         unique tag. The test `overlapping_refreshes_of_one_tab_each_see_the_whole_tree`
+         failed against the shared tag (an index.lock clash) and passes now.
+      2 & 3. Placement state moved into `DiffPanel`: `placed` resets on each
+         show and `placing` guards programmatic moves (re-entrancy too), so
+         only a real drag is saved.
+      The NITs are done too: the "This tab" semantics are in the README, the
+      gc note is in `tab_diff`, and there's a racy-clean pointer.
+- [x] **WP2 live check** (Broadway + Playwright, isolated `dbus-run-session`,
+      temp `XDG_CONFIG_HOME`, a `bash` profile so no real CLI runs):
+      - a baseline checkpoint about 10 s after launch, and another after an edit
+      - Ctrl+Shift+D shows untracked + modified files at the saved 420 px
+      - hide/show re-places at 420; a drag saved 520 to config
+      - a tab opening with the panel visible uses the saved width
+      - "Last turn" switches correctly
+      Found and fixed live: the diff view was **white** on a dark terminal
+      (now painted with the theme's bg/fg via one shared CssProvider), and
+      the builder's `css_classes` had silently dropped `monospace` (now
+      `add_css_class`). Popovers look light under Broadway; that's app-wide
+      and not new.
+- [x] WP2 gate: fmt, clippy clean, 155/155
+- [ ] WP2 rust-reviewer round 2 (delta)
+- [ ] WP2 commit
+- [ ] WP3: `src/worktree.rs` written (pure paths/branch checks + git
+      add/remove/is_clean, 3 unit + 1 real-repo test), **not hooked up yet**
+      (no `mod worktree;`). Remaining: the dialog, actions/menus/Ctrl+Shift+G,
+      TabState.worktree + tooltip, the close toast, restore of a missing
+      dir, `worktree_root` config, docs.
 - [ ] WP3 worktree tabs
 - [ ] WP4 restore (after soak)
 

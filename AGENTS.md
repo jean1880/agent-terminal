@@ -33,8 +33,10 @@ Architectural mandates, standards, and workflows for this codebase.
   (colour schemes, infallible `RGBA::new`), `utils.rs` (pure logic: detection,
   startup command, path resolution, session stores), `handoff.rs` (pure logic:
   hand-off briefs, redaction, quota detection), `git.rs` (git plumbing for
-  turn checkpoints: shells out, but its parsers and filters are pure),
-  `window/imp.rs` (GTK UI), `main.rs` (app setup + logging).
+  turn checkpoints and diffs: shells out, but its parsers and filters are
+  pure), `diff.rs` (pure logic: diff bases, numstat, line classification,
+  truncation), `window/imp.rs` (GTK UI), `window/diff_panel.rs` (the diff
+  panel's widgets), `main.rs` (app setup + logging).
 - **Checkpoints never touch the user's git state**: snapshots go through a
   private index file under the git dir, and are recorded only as refs under
   `refs/agent-terminal/`, created with an empty old value so none is
@@ -79,8 +81,8 @@ Architectural mandates, standards, and workflows for this codebase.
   repository tests run real git in temp repos with a hermetic config (CI has
   no git identity) and skip themselves when git is absent. `window/imp.rs` is
   covered by a construction smoke test plus tests for any pure helpers in it.
-- **Guard hand-maintained arrays**: `CliClient::ALL` and `ThemeChoice::ALL` drive
-  the settings dropdowns by index in both directions. Both have exhaustive-match
+- **Guard hand-maintained arrays**: `CliClient::ALL`, `ThemeChoice::ALL` and
+  `DiffBase::ALL` drive dropdowns by index in both directions. All have exhaustive-match
   tests so adding a variant fails to compile until the array is updated. Any new
   such array needs the same treatment.
 - **Update tests alongside** any change to detection, startup-command,

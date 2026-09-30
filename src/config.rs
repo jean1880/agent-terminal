@@ -403,6 +403,10 @@ pub struct TerminalConfig {
     /// so each turn can be diffed. On by default: a history only helps if it
     /// was already being kept when something went wrong. See `crate::git`.
     pub checkpoints: bool,
+    /// Whether new tabs open with the diff panel showing. Set by toggling it.
+    pub diff_panel_visible: bool,
+    /// The diff panel's width in pixels, as last dragged.
+    pub diff_panel_width: i32,
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
     pub indicators: Vec<Indicator>,
@@ -607,6 +611,8 @@ impl Default for TerminalConfig {
             notify_on_quota: true,
             restore_session: false,
             checkpoints: true,
+            diff_panel_visible: false,
+            diff_panel_width: 520,
             indicators: Vec::new(),
             clear_env: default_clear_env(),
             disk_stamp: std::cell::Cell::default(),
