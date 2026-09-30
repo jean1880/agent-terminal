@@ -56,6 +56,7 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|app| {
         debug!("Application startup: loading CSS");
         load_css();
+        window::watch_config_file(app);
 
         // Add "New Window" action
         let new_window_action = gtk4::gio::SimpleAction::new("new-window", None);
@@ -158,13 +159,6 @@ fn main() -> glib::ExitCode {
     exit_code
 }
 
-/// Validates the options in the *launching* process, before they are forwarded.
-///
-/// Doing it here means a bad ID or directory is reported on the terminal that
-/// typed it. The primary instance's stderr may be nowhere, and printing to the
-/// caller from there (`g_application_command_line_printerr`) would need GLib
-/// 2.80. It's also the one place where a relative `--dir` still means the
-/// caller's directory, so it's made absolute here.
 /// The application's terminal windows.
 fn windows(app: &adw::Application) -> impl Iterator<Item = AgentTerminalWindow> {
     app.windows()
@@ -172,6 +166,13 @@ fn windows(app: &adw::Application) -> impl Iterator<Item = AgentTerminalWindow> 
         .filter_map(|w| w.downcast::<AgentTerminalWindow>().ok())
 }
 
+/// Validates the options in the *launching* process, before they are forwarded.
+///
+/// Doing it here means a bad ID or directory is reported on the terminal that
+/// typed it. The primary instance's stderr may be nowhere, and printing to the
+/// caller from there (`g_application_command_line_printerr`) would need GLib
+/// 2.80. It's also the one place where a relative `--dir` still means the
+/// caller's directory, so it's made absolute here.
 fn check_local_options(
     _app: &adw::Application,
     options: &glib::VariantDict,

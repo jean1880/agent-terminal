@@ -9,8 +9,9 @@ Architectural mandates, standards, and workflows for this codebase.
   runtime dependencies.
 - **Native GTK4/Libadwaita**: a native Rust binary. Minimum system libraries are
   set by the Cargo version features, currently GTK 4.10 (`v4_10`, for
-  `FileDialog`) and libadwaita 1.5 (`v1_5`, for `AlertDialog`/`PreferencesDialog`).
-  Raising either is a deliberate decision, not a side effect.
+  `FileDialog`), libadwaita 1.5 (`v1_5`, for `AlertDialog`/`PreferencesDialog`)
+  and VTE 0.72 (`v0_72`, for `text_range_format`). Raising any of them is a
+  deliberate decision, not a side effect.
 - **No redundant GTK crates**: `glib`, `gio` and `gdk4` are reached through the
   `gtk4` re-exports (`gtk4::glib`, …). Do not add them as direct dependencies —
   that only creates a second place for versions to drift.

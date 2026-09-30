@@ -395,7 +395,9 @@ pub struct TerminalConfig {
     /// runs out of quota. On by default, unlike the bell: it is rare, and it
     /// means work has stopped.
     pub notify_on_quota: bool,
-    /// Reopen the previous window's tabs on launch.
+    /// Reopen the previous window's tabs on launch. Off by default: a restored
+    /// tab gets its directory and profile back but starts a fresh conversation,
+    /// so by default it only multiplies blank sessions.
     pub restore_session: bool,
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
@@ -403,6 +405,104 @@ pub struct TerminalConfig {
     /// Environment variables removed from a spawned session's environment.
     /// A trailing `*` matches by prefix. See [`default_clear_env`].
     pub clear_env: Vec<String>,
+    /// The file as this process last read or wrote it, so a hand edit made in
+    /// between can be told apart from its own writes. Not persisted.
+    #[serde(skip)]
+    disk_stamp: std::cell::Cell<Option<DiskStamp>>,
+    /// Set while writing would destroy something the user has not got another
+    /// copy of: an unusable file that could not be copied aside, or a hand
+    /// edit in progress that does not parse yet. Cleared by loading a good
+    /// file. Not persisted.
+    #[serde(skip)]
+    save_blocked: std::cell::Cell<bool>,
+}
+
+/// Identifies one version of a file on disk. The inode catches an editor
+/// that saves by renaming a new file into place; the length catches a write
+/// within one coarse timestamp tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    inode: u64,
+}
+
+fn disk_stamp(path: &Path) -> Option<DiskStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    Some(DiskStamp {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+        inode: meta.ino(),
+    })
+}
+
+/// What [`TerminalConfig::check_disk`] found.
+pub enum DiskChange {
+    /// The file is as this process last saw it (or is absent).
+    Unchanged,
+    /// Changed elsewhere, and valid: the settings as they now stand.
+    Updated(Box<TerminalConfig>),
+    /// Changed elsewhere, and unusable. Saving is suspended until it is fixed,
+    /// so an edit in progress is not overwritten; the text says so.
+    Invalid(String),
+}
+
+/// Why the last load fell back to defaults, for the UI to report once.
+static LOAD_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Takes the reason the settings could not be loaded, if they could not.
+pub fn take_load_problem() -> Option<String> {
+    LOAD_PROBLEM.lock().ok()?.take()
+}
+
+fn report_load_problem(problem: String) {
+    warn!("{problem}");
+    if let Ok(mut slot) = LOAD_PROBLEM.lock() {
+        *slot = Some(problem);
+    }
+}
+
+/// Copies `path` to `<name>.<tag>-<nanos>` beside it, so a file about to be
+/// replaced is kept rather than lost. `None` if the copy failed.
+///
+/// An identical copy already kept is reused, so a file that stays broken
+/// across launches leaves one copy rather than one per launch.
+fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
+    let content = match fs::read(path) {
+        Ok(content) => content,
+        Err(err) => {
+            warn!("Could not keep a copy of {}: {err}", path.display());
+            return None;
+        }
+    };
+    let prefix = format!("{}.{tag}-", path.file_name()?.to_string_lossy());
+    let existing = path.parent().and_then(|dir| {
+        fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+            })
+            .find(|p| fs::read(p).is_ok_and(|kept| kept == content))
+    });
+    if existing.is_some() {
+        return existing;
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let copy = path.with_file_name(format!("{prefix}{nanos}"));
+    match fs::write(&copy, &content) {
+        Ok(()) => Some(copy),
+        Err(err) => {
+            warn!("Could not keep a copy of {}: {err}", path.display());
+            None
+        }
+    }
 }
 
 /// Variables stripped from a session's inherited environment by default.
@@ -501,9 +601,11 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             notify_on_bell: false,
             notify_on_quota: true,
-            restore_session: true,
+            restore_session: false,
             indicators: Vec::new(),
             clear_env: default_clear_env(),
+            disk_stamp: std::cell::Cell::default(),
+            save_blocked: std::cell::Cell::default(),
         }
     }
 }
@@ -573,7 +675,7 @@ impl SessionState {
     fn save_to(&self, path: &Path) {
         match serde_json::to_string_pretty(self) {
             Ok(content) => {
-                if let Err(e) = TerminalConfig::write_all_synced(path, content.as_bytes()) {
+                if let Err(e) = TerminalConfig::replace_atomically(path, content.as_bytes()) {
                     warn!("Failed to write session to {}: {}", path.display(), e);
                 }
             }
@@ -649,14 +751,34 @@ impl TerminalConfig {
     /// one stale file and keeps the downgrade path intact.
     fn load_or_migrate(path: &Path, legacy_path: &Path) -> Self {
         if !path.exists() && legacy_path.exists() {
-            let migrated = Self::load_from(legacy_path);
-            warn!(
-                "Adopting settings from {} into {} (the original is left in place)",
-                legacy_path.display(),
-                path.display()
-            );
-            migrated.save_to(path);
-            return migrated;
+            // Only a legacy file that actually parses is adopted. Writing
+            // defaults to the new path in its place would make fixing the old
+            // file afterwards pointless, since the new one wins from then on.
+            match Self::read_config(legacy_path) {
+                Ok(Some(migrated)) => {
+                    warn!(
+                        "Adopting settings from {} into {} (the original is left in place)",
+                        legacy_path.display(),
+                        path.display()
+                    );
+                    migrated.save_to(path);
+                    return migrated;
+                }
+                Ok(None) => {}
+                Err(problem) => {
+                    // Saving now would create the new file and end the chance
+                    // to adopt the old one, so nothing is saved this run.
+                    report_load_problem(format!(
+                        "Your previous settings at {} {problem}, so defaults are in use and \
+                         nothing will be saved this session. Fix that file and relaunch to \
+                         carry it over.",
+                        legacy_path.display()
+                    ));
+                    let config = Self::load_from(path);
+                    config.save_blocked.set(true);
+                    return config;
+                }
+            }
         }
         Self::load_from(path)
     }
@@ -670,6 +792,28 @@ impl TerminalConfig {
     fn normalize(mut self) -> Self {
         if self.profiles.is_empty() {
             self.profiles = default_profiles();
+        }
+
+        // Names are the key every menu and action looks a profile up by, so a
+        // second "Claude" would be unreachable. Renamed rather than dropped:
+        // the next save writes this list back, and dropping would delete it.
+        // A new name must not collide with one a later profile already has.
+        let mut taken: std::collections::HashSet<String> =
+            self.profiles.iter().map(|p| p.name.clone()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for profile in &mut self.profiles {
+            if seen.insert(profile.name.clone()) {
+                continue;
+            }
+            let original = profile.name.clone();
+            let unique = (2..)
+                .map(|n| format!("{original} ({n})"))
+                .find(|name| !taken.contains(name))
+                .unwrap_or_else(|| original.clone());
+            warn!("Profile name '{original}' is used twice; the second is now '{unique}'");
+            taken.insert(unique.clone());
+            seen.insert(unique.clone());
+            profile.name = unique;
         }
 
         // Profiles saved by an older release lack whatever came after it —
@@ -709,28 +853,98 @@ impl TerminalConfig {
     /// Loads a config from an explicit path, falling back to defaults. A missing
     /// file is expected (first run); a present-but-invalid file is logged so the
     /// user knows their settings were ignored rather than silently discarded.
+    ///
+    /// Falling back is only safe because the unusable file is copied aside
+    /// first: the next save of any setting — even a zoom — writes the defaults
+    /// over it, and a typo in a hand edit used to cost every profile and
+    /// indicator that way.
     fn load_from(path: &Path) -> Self {
+        let stamp = disk_stamp(path);
+        let problem = match Self::read_config(path) {
+            Ok(None) => return Self::default(),
+            Ok(Some(config)) => {
+                config.disk_stamp.set(stamp);
+                return config;
+            }
+            Err(problem) => problem,
+        };
+
+        let config = Self::default();
+        match keep_copy(path, "invalid") {
+            Some(copy) => {
+                report_load_problem(format!(
+                    "Settings file {} {problem}, so defaults are in use. Your file was kept \
+                     as {}.",
+                    path.display(),
+                    copy.display()
+                ));
+                // The copy is taken, so the first save may replace the file.
+                config.disk_stamp.set(stamp);
+            }
+            None => {
+                report_load_problem(format!(
+                    "Settings file {} {problem}, and a copy of it could not be kept, so \
+                     defaults are in use and nothing will be saved over it. Fix the file \
+                     and relaunch.",
+                    path.display()
+                ));
+                config.save_blocked.set(true);
+            }
+        }
+        config
+    }
+
+    /// Reads and parses a config file. `Ok(None)` when it does not exist;
+    /// `Err` is a phrase completing "Settings file X …".
+    fn read_config(path: &Path) -> Result<Option<Self>, String> {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
-            Err(e) => {
-                warn!(
-                    "Failed to read config at {}: {}; using defaults",
-                    path.display(),
-                    e
-                );
-                return Self::default();
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("could not be read ({e})")),
         };
-        match serde_json::from_str::<Self>(&content) {
-            Ok(config) => config.normalize(),
-            Err(e) => {
-                warn!(
-                    "Failed to parse config at {}: {}; using defaults",
-                    path.display(),
-                    e
-                );
-                Self::default()
+        serde_json::from_str::<Self>(&content)
+            .map(|config| Some(config.normalize()))
+            .map_err(|e| format!("is not valid ({e})"))
+    }
+
+    /// Whether the settings file was changed by something other than this
+    /// process since it last read or wrote it — a hand edit, typically.
+    ///
+    /// Profiles and indicators can only be set by editing the file, so this is
+    /// how the app keeps up with them: the caller swaps in the settings from an
+    /// `Updated` result. An `Invalid` result suspends saving until the file is
+    /// fixed, so an edit that is half-done does not get written over.
+    pub fn check_disk(&self) -> DiskChange {
+        self.check_disk_at(&Self::config_path())
+    }
+
+    fn check_disk_at(&self, path: &Path) -> DiskChange {
+        let current = disk_stamp(path);
+        if current.is_none() {
+            // Deleted: nothing is left to protect, so saving may resume and
+            // will recreate the file from the settings in memory.
+            self.save_blocked.set(false);
+            self.disk_stamp.set(None);
+            return DiskChange::Unchanged;
+        }
+        if current == self.disk_stamp.get() {
+            return DiskChange::Unchanged;
+        }
+        match Self::read_config(path) {
+            Ok(Some(config)) => {
+                config.disk_stamp.set(current);
+                DiskChange::Updated(Box::new(config))
+            }
+            Ok(None) => DiskChange::Unchanged,
+            Err(problem) => {
+                // Remembered, so the same broken version is reported once.
+                self.disk_stamp.set(current);
+                self.save_blocked.set(true);
+                DiskChange::Invalid(format!(
+                    "Settings file {} {problem}. Changes made in the app will not be saved \
+                     until it is fixed.",
+                    path.display()
+                ))
             }
         }
     }
@@ -746,6 +960,13 @@ impl TerminalConfig {
     /// save leaves either the previous config or the new one — never the
     /// half-written file a plain `fs::write` would produce.
     fn save_to(&self, path: &Path) {
+        if self.save_blocked.get() {
+            warn!(
+                "Not saving settings to {}: the file there is unusable and has no other copy",
+                path.display()
+            );
+            return;
+        }
         let content = match serde_json::to_string_pretty(self) {
             Ok(content) => content,
             Err(e) => {
@@ -754,21 +975,43 @@ impl TerminalConfig {
             }
         };
 
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = Self::write_all_synced(&tmp, content.as_bytes()) {
-            warn!("Failed to write config to {}: {}", tmp.display(), e);
-            let _ = fs::remove_file(&tmp);
-            return;
+        // The app reloads hand edits as they happen (check_disk), so reaching
+        // here with a changed file means one landed in the moment before this
+        // save. Replacing it would discard it; keep it beside the new one.
+        let on_disk = disk_stamp(path);
+        if on_disk.is_some() && on_disk != self.disk_stamp.get() {
+            if let Some(copy) = keep_copy(path, "external") {
+                warn!(
+                    "{} was changed outside Agent Terminal; that version was kept as {}",
+                    path.display(),
+                    copy.display()
+                );
+            }
         }
 
-        if let Err(e) = fs::rename(&tmp, path) {
+        if let Err(e) = Self::replace_atomically(path, content.as_bytes()) {
             warn!(
                 "Failed to replace config at {}: {}; settings not saved",
                 path.display(),
                 e
             );
+            return;
+        }
+        self.disk_stamp.set(disk_stamp(path));
+    }
+
+    /// Writes `bytes` to a sibling temporary file, then renames it over `path`.
+    /// Rename within a directory is atomic, so a crash leaves the old file or
+    /// the new one, never a half-written one.
+    fn replace_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = path.with_file_name(tmp_name);
+        let result = Self::write_all_synced(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+        if result.is_err() {
             let _ = fs::remove_file(&tmp);
         }
+        result
     }
 
     /// Writes `bytes` to `path`, flushing them to disk before returning. The
@@ -1225,6 +1468,25 @@ mod tests {
     }
 
     #[test]
+    fn session_restore_is_off_unless_chosen() {
+        // A restored tab starts a fresh conversation, so restoring by default
+        // only opens extra blank sessions. An explicit choice still stands.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        assert!(!TerminalConfig::load_from(&path).restore_session);
+
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"restore_session":true}"#)
+            .unwrap();
+        assert!(TerminalConfig::load_from(&path).restore_session);
+    }
+
+    #[test]
     fn a_pre_handoff_agy_profile_gains_resume_and_handoff_settings() {
         // Saved before Agy could resume: nothing but name and command.
         let dir = tempfile::tempdir().unwrap();
@@ -1373,5 +1635,138 @@ mod tests {
             TerminalConfig::load_from(&path).scrollback_lines,
             TerminalConfig::default().scrollback_lines
         );
+    }
+
+    fn kept_copies(dir: &Path, tag: &str) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(&format!(".{tag}-")))
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_profile_names_are_made_unique_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":[
+                {"name":"Claude","command":"claude"},
+                {"name":"Claude","command":"claude","args":["--model","opus"]},
+                {"name":"Claude (2)","command":"agy"}]}"#,
+        )
+        .unwrap();
+        let names: Vec<String> = TerminalConfig::load_from(&path)
+            .profiles
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["Claude", "Claude (3)", "Claude (2)"]);
+    }
+
+    #[test]
+    fn an_invalid_file_is_kept_before_defaults_can_replace_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = br#"{ "scrollback_lines": 777, oops }"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(original)
+            .unwrap();
+
+        let loaded = TerminalConfig::load_from(&path);
+        assert!(
+            take_load_problem().is_some(),
+            "the fallback must be reported"
+        );
+        let copies = kept_copies(dir.path(), "invalid");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&copies[0])).unwrap(),
+            original
+        );
+
+        // The first save replaces the file without taking a second copy.
+        loaded.save_to(&path);
+        assert!(kept_copies(dir.path(), "external").is_empty());
+    }
+
+    #[test]
+    fn a_hand_edit_is_picked_up_and_a_broken_one_suspends_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig::default();
+        config.save_to(&path);
+        assert!(matches!(config.check_disk_at(&path), DiskChange::Unchanged));
+
+        // A valid edit comes back as the new settings.
+        std::fs::write(&path, br#"{"scrollback_lines": 4321}"#).unwrap();
+        let DiskChange::Updated(edited) = config.check_disk_at(&path) else {
+            panic!("a valid edit must be picked up");
+        };
+        assert_eq!(edited.scrollback_lines, 4321);
+        assert!(matches!(edited.check_disk_at(&path), DiskChange::Unchanged));
+
+        // A half-done edit is reported once, and nothing is written over it.
+        let broken = br#"{"scrollback_lines": 43"#;
+        std::fs::write(&path, broken).unwrap();
+        assert!(matches!(
+            edited.check_disk_at(&path),
+            DiskChange::Invalid(_)
+        ));
+        assert!(matches!(edited.check_disk_at(&path), DiskChange::Unchanged));
+        edited.save_to(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn a_broken_legacy_file_is_not_replaced_by_migrated_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("antigravity-terminal.json");
+        let current = dir.path().join("agent-terminal.json");
+        std::fs::write(&legacy, b"{ broken").unwrap();
+
+        let loaded = TerminalConfig::load_or_migrate(&current, &legacy);
+        loaded.save_to(&current);
+        assert!(
+            !current.exists(),
+            "writing the new file would make the old one unadoptable"
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"{ broken");
+    }
+
+    #[test]
+    fn a_file_broken_across_launches_is_kept_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{ broken").unwrap();
+        TerminalConfig::load_from(&path);
+        TerminalConfig::load_from(&path);
+        assert_eq!(kept_copies(dir.path(), "invalid").len(), 1);
+    }
+
+    #[test]
+    fn a_save_keeps_an_edit_made_behind_its_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig::default();
+        config.save_to(&path);
+
+        // A hand edit while the app runs; the sleep guarantees a new mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, br#"{"scrollback_lines": 1234}"#).unwrap();
+
+        config.save_to(&path);
+        let copies = kept_copies(dir.path(), "external");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(std::fs::read_to_string(dir.path().join(&copies[0]))
+            .unwrap()
+            .contains("1234"));
+
+        // Nothing changed since that save, so the next one keeps nothing more.
+        config.save_to(&path);
+        assert_eq!(kept_copies(dir.path(), "external").len(), 1);
     }
 }

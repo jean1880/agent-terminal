@@ -16,6 +16,12 @@ glib::wrapper! {
         @implements gio::ActionGroup, gio::ActionMap, gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Native, gtk4::Root, gtk4::ShortcutManager;
 }
 
+/// Starts applying hand edits of config.json to every window. Once per
+/// process, from the application's `startup`.
+pub fn watch_config_file(app: &adw::Application) {
+    imp::AgentTerminalWindow::watch_config_file(app);
+}
+
 impl AgentTerminalWindow {
     /// Creates a new AgentTerminalWindow instance.
     pub fn new(app: &adw::Application) -> Self {
