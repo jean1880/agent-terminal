@@ -399,6 +399,10 @@ pub struct TerminalConfig {
     /// tab gets its directory and profile back but starts a fresh conversation,
     /// so by default it only multiplies blank sessions.
     pub restore_session: bool,
+    /// Snapshot a tab's git working tree into a hidden ref when a turn ends,
+    /// so each turn can be diffed. On by default: a history only helps if it
+    /// was already being kept when something went wrong. See `crate::git`.
+    pub checkpoints: bool,
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
     pub indicators: Vec<Indicator>,
@@ -602,6 +606,7 @@ impl Default for TerminalConfig {
             notify_on_bell: false,
             notify_on_quota: true,
             restore_session: false,
+            checkpoints: true,
             indicators: Vec::new(),
             clear_env: default_clear_env(),
             disk_stamp: std::cell::Cell::default(),
@@ -1484,6 +1489,24 @@ mod tests {
             .write_all(br#"{"restore_session":true}"#)
             .unwrap();
         assert!(TerminalConfig::load_from(&path).restore_session);
+    }
+
+    #[test]
+    fn checkpoints_are_on_unless_turned_off() {
+        // A config written before checkpoints existed gets them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        assert!(TerminalConfig::load_from(&path).checkpoints);
+
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"checkpoints":false}"#)
+            .unwrap();
+        assert!(!TerminalConfig::load_from(&path).checkpoints);
     }
 
     #[test]

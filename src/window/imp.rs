@@ -70,6 +70,96 @@ struct TabState {
     /// any window is still waiting. Tracked here rather than read from the
     /// page's attention marker, which the quota banner also sets.
     bell_pending: bool,
+    /// When the terminal last showed new output. A turn is taken to have
+    /// ended once this has been quiet for [`CHECKPOINT_QUIET`]. Kept apart
+    /// from `screen_dirty`, which the quota poll consumes.
+    last_output: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+    checkpoint: CheckpointTrack,
+}
+
+/// How long a tab's output must be still before its turn counts as over and
+/// its working tree is checkpointed. A CLI that redraws constantly (a clock in
+/// its status line) never goes quiet; its bell is then the only trigger.
+const CHECKPOINT_QUIET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// After this long, an attempt whose result never arrived is treated as lost
+/// and the tab may try again. Its result can go missing when the tab is
+/// dragged between windows at the moment it lands. Comfortably above the
+/// worst case of a snapshot: every git step at its timeout, plus the retry.
+const CHECKPOINT_STALE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Per-tab checkpoint bookkeeping. See [`crate::git`].
+#[derive(Default)]
+struct CheckpointTrack {
+    /// The `last_output` a checkpoint was last attempted for, so a quiet tab
+    /// is snapshotted once rather than on every poll.
+    attempted_for: Option<std::time::Instant>,
+    /// When the attempt in flight started, if one is.
+    started: Option<std::time::Instant>,
+    /// Why the last attempt failed. Shown on the tab until one succeeds.
+    error: Option<String>,
+}
+
+impl CheckpointTrack {
+    fn running(&self) -> bool {
+        self.started
+            .is_some_and(|started| started.elapsed() < CHECKPOINT_STALE)
+    }
+}
+
+/// What a checkpoint attempt came to, off the main thread.
+enum CheckpointResult {
+    NotRepo,
+    Done(crate::git::CheckpointOutcome),
+    Failed(String),
+}
+
+/// What a checkpoint result shows: the toast a manual request gets, and the
+/// tab tooltip, which only a new checkpoint changes.
+#[derive(Debug, PartialEq, Eq)]
+struct CheckpointReport {
+    toast: String,
+    tooltip: Option<String>,
+}
+
+fn describe_checkpoint(result: &CheckpointResult, time: &str) -> CheckpointReport {
+    use crate::git::CheckpointOutcome;
+    let plain = |toast: &str| CheckpointReport {
+        toast: toast.to_string(),
+        tooltip: None,
+    };
+    match result {
+        CheckpointResult::NotRepo => plain("Not a git repository: nothing to checkpoint"),
+        CheckpointResult::Done(CheckpointOutcome::Busy) => {
+            plain("Git is busy in this repository; try again shortly")
+        }
+        CheckpointResult::Done(CheckpointOutcome::Unchanged) => {
+            plain("No changes since the last checkpoint")
+        }
+        CheckpointResult::Done(CheckpointOutcome::Created(cp, skipped)) => {
+            let mut text = format!("Checkpoint {} · {time}", cp.seq);
+            if !skipped.is_empty() {
+                text.push_str(&format!(" · {} path(s) not captured", skipped.len()));
+            }
+            CheckpointReport {
+                toast: text.clone(),
+                tooltip: Some(text),
+            }
+        }
+        CheckpointResult::Failed(err) => plain(&format!("Checkpoint failed: {err}")),
+    }
+}
+
+/// Finds `dir`'s repository and checkpoints it. Blocking.
+fn run_checkpoint(dir: &str, key: u64, label: &str) -> CheckpointResult {
+    match crate::git::discover(std::path::Path::new(dir)) {
+        Ok(None) => CheckpointResult::NotRepo,
+        Ok(Some(repo)) => match crate::git::take_checkpoint(&repo, key, label) {
+            Ok(outcome) => CheckpointResult::Done(outcome),
+            Err(err) => CheckpointResult::Failed(err),
+        },
+        Err(err) => CheckpointResult::Failed(err),
+    }
 }
 
 /// Source of [`TabState::key`].
@@ -582,6 +672,8 @@ pub struct AgentTerminalWindow {
     /// Set while a transcript quota check is running off-thread, so a slow
     /// disk cannot stack up overlapping checks.
     quota_poll_running: std::cell::Cell<bool>,
+    /// Wraps the tab view, for short confirmations that need no dialog.
+    toast_overlay: RefCell<Option<adw::ToastOverlay>>,
 }
 
 #[glib::object_subclass]
@@ -597,6 +689,7 @@ impl ObjectImpl for AgentTerminalWindow {
         self.setup_ui();
         self.setup_actions();
         self.start_quota_watch();
+        self.start_checkpoint_watch();
         self.watch_focus();
         self.report_config_problem();
     }
@@ -1064,6 +1157,27 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&restart_action);
 
+        // Checkpoint the current tab's working tree now, whatever the setting:
+        // asking is an explicit choice.
+        let checkpoint_action = gtk4::gio::SimpleAction::new("checkpoint-now", None);
+        checkpoint_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Checkpoint Now");
+                let imp = obj.imp();
+                let page = imp
+                    .tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|v| v.selected_page());
+                if let Some(page) = page {
+                    imp.request_checkpoint(&page, true);
+                }
+            }
+        ));
+        obj.add_action(&checkpoint_action);
+
         // New Tab in Folder Action (opens a folder picker)
         let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
         new_tab_folder_action.connect_activate(glib::clone!(
@@ -1430,7 +1544,11 @@ impl AgentTerminalWindow {
         }
 
         container.append(&tab_bar);
-        container.append(&tab_view);
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&tab_view));
+        toast_overlay.set_vexpand(true);
+        container.append(&toast_overlay);
+        *self.toast_overlay.borrow_mut() = Some(toast_overlay);
 
         // Immediately confirm tab closures (no unsaved-state prompt for a terminal).
         tab_view.connect_close_page(|view, page| {
@@ -1670,10 +1788,16 @@ impl AgentTerminalWindow {
             .action_target(&"".to_variant())
             .build();
         let screen_dirty = std::rc::Rc::new(std::cell::Cell::new(true));
+        let last_output = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
         terminal.connect_contents_changed(glib::clone!(
             #[strong]
             screen_dirty,
-            move |_| screen_dirty.set(true)
+            #[strong]
+            last_output,
+            move |_| {
+                screen_dirty.set(true);
+                last_output.set(std::time::Instant::now());
+            }
         ));
         let tab_content = Box::builder().orientation(Orientation::Vertical).build();
         tab_content.append(&quota_banner);
@@ -1750,6 +1874,8 @@ impl AgentTerminalWindow {
             key: next_tab_key(),
             quota_notified: false,
             bell_pending: false,
+            last_output,
+            checkpoint: CheckpointTrack::default(),
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
@@ -1831,6 +1957,13 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
+                // Info, not debug: which CLIs ring at the end of a turn decides
+                // whether the bell or the quiet timer drives their checkpoints.
+                // Demote to debug once that is recorded (plan WP0.1, F4/F5).
+                info!("Bell in tab \"{}\"", page.title());
+                if imp.config.borrow().checkpoints {
+                    imp.request_checkpoint(&page, false);
+                }
                 let is_selected = imp
                     .tab_view
                     .borrow()
@@ -2103,6 +2236,7 @@ impl AgentTerminalWindow {
         );
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
+        menu.append(Some("Checkpoint Now"), Some("win.checkpoint-now"));
         menu.append_section(None, &self.build_session_section());
 
         let section = gtk4::gio::Menu::new();
@@ -2603,6 +2737,12 @@ impl AgentTerminalWindow {
             .active(config.restore_session)
             .build();
 
+        let checkpoints_row = adw::SwitchRow::builder()
+            .title("Checkpoint Each Turn")
+            .subtitle("Snapshot a git repository into hidden refs when a turn ends, for diffing")
+            .active(config.checkpoints)
+            .build();
+
         group.add(&starting_directory_row);
         group.add(&scrollback_row);
         group.add(&font_row);
@@ -2614,6 +2754,7 @@ impl AgentTerminalWindow {
         group.add(&notify_row);
         group.add(&notify_quota_row);
         group.add(&restore_row);
+        group.add(&checkpoints_row);
         page.add(&group);
         dialog.add(&page);
 
@@ -2701,6 +2842,16 @@ impl AgentTerminalWindow {
                 if !row.is_active() {
                     crate::config::SessionState::default().save();
                 }
+                imp.schedule_config_save();
+            }
+        ));
+
+        checkpoints_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().checkpoints = row.is_active();
                 imp.schedule_config_save();
             }
         ));
@@ -3550,6 +3701,160 @@ impl AgentTerminalWindow {
         );
     }
 
+    /// Checks every couple of seconds for tabs whose output has gone quiet.
+    /// In-memory only: git runs just for a tab that is due.
+    fn start_checkpoint_watch(&self) {
+        const CHECKPOINT_POLL_SECS: u32 = 2;
+        let obj = self.obj();
+        glib::timeout_add_seconds_local(
+            CHECKPOINT_POLL_SECS,
+            glib::clone!(
+                #[weak]
+                obj,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    obj.imp().poll_checkpoints();
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
+    /// Checkpoints each tab that has shown output since its last attempt and
+    /// has been quiet for [`CHECKPOINT_QUIET`] since.
+    fn poll_checkpoints(&self) {
+        if !self.config.borrow().checkpoints {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due: Vec<adw::TabPage> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| {
+                let last = tab.last_output.get();
+                !tab.checkpoint.running()
+                    && tab.checkpoint.attempted_for != Some(last)
+                    && now.saturating_duration_since(last) >= CHECKPOINT_QUIET
+            })
+            .map(|tab| tab.page.clone())
+            .collect();
+        for page in due {
+            self.request_checkpoint(&page, false);
+        }
+    }
+
+    /// Snapshots `page`'s working tree off the main thread. `manual` reports
+    /// every outcome as a toast; an automatic attempt stays silent unless git
+    /// fails, which marks the tab.
+    fn request_checkpoint(&self, page: &adw::TabPage, manual: bool) {
+        let (dir, key, label) = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+                return;
+            };
+            if tab.checkpoint.running() {
+                return;
+            }
+            tab.checkpoint.started = Some(std::time::Instant::now());
+            tab.checkpoint.attempted_for = Some(tab.last_output.get());
+            (
+                tab.dir.clone(),
+                tab.key,
+                tab.profile.clone().unwrap_or_else(|| "session".to_string()),
+            )
+        };
+        let child = page.child();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gtk4::gio::spawn_blocking(move || run_checkpoint(&dir, key, &label))
+                .await
+                .unwrap_or_else(|_| {
+                    CheckpointResult::Failed("the checkpoint thread panicked".to_string())
+                });
+            // Looked up afterwards, not captured: the tab may have been
+            // dragged to another window meanwhile, or closed.
+            let Some(obj) = window_of(&child) else {
+                return;
+            };
+            // Through the registry, not TabView::page, which is a critical
+            // (and a panic in the bindings) for a child it does not hold.
+            let page = obj
+                .imp()
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.page.child() == child)
+                .map(|t| t.page.clone());
+            if let Some(page) = page {
+                obj.imp().apply_checkpoint(&page, result, manual);
+            }
+        });
+    }
+
+    fn apply_checkpoint(&self, page: &adw::TabPage, result: CheckpointResult, manual: bool) {
+        let time = glib::DateTime::now_local()
+            .and_then(|now| now.format("%H:%M"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let report = describe_checkpoint(&result, &time);
+        // Decided under the borrow; the page is touched after it is released,
+        // since its property setters emit notify signals synchronously.
+        let error = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+                return;
+            };
+            let track = &mut tab.checkpoint;
+            track.started = None;
+            match &result {
+                CheckpointResult::Done(crate::git::CheckpointOutcome::Busy) => {
+                    // Git is mid-operation; the next poll tries again.
+                    track.attempted_for = None;
+                }
+                CheckpointResult::Done(crate::git::CheckpointOutcome::Created(cp, _)) => {
+                    info!("Checkpoint {} for tab {}", cp.refname, tab.key);
+                    track.error = None;
+                }
+                CheckpointResult::Failed(err) => {
+                    warn!("Checkpoint failed in {}: {err}", tab.dir);
+                    track.error = Some(err.clone());
+                }
+                CheckpointResult::NotRepo
+                | CheckpointResult::Done(crate::git::CheckpointOutcome::Unchanged) => {
+                    track.error = None;
+                }
+            }
+            track.error.clone()
+        };
+
+        if let Some(tooltip) = &report.tooltip {
+            page.set_tooltip(tooltip);
+        }
+        match error {
+            Some(err) => {
+                page.set_indicator_icon(Some(&gtk4::gio::ThemedIcon::new(
+                    "dialog-warning-symbolic",
+                )));
+                page.set_indicator_tooltip(&format!("Checkpoint failed: {err}"));
+            }
+            None => {
+                page.set_indicator_icon(None::<&gtk4::gio::Icon>);
+                page.set_indicator_tooltip("");
+            }
+        }
+        if manual {
+            self.show_toast(&report.toast);
+        }
+    }
+
+    /// A short confirmation over the tab view. The text is data, not markup.
+    fn show_toast(&self, text: &str) {
+        if let Some(overlay) = self.toast_overlay.borrow().as_ref() {
+            overlay.add_toast(adw::Toast::builder().title(text).use_markup(false).build());
+        }
+    }
+
     /// One quota check across all tabs.
     ///
     /// A tab whose session the terminal knows, on a profile with transcripts,
@@ -3898,6 +4203,55 @@ mod tests {
         assert_eq!(describe_exit(2 << 8), "exit status 2");
         // Low bits set means killed by a signal rather than a normal exit.
         assert_eq!(describe_exit(9), "killed by signal 9");
+    }
+
+    #[test]
+    fn checkpoint_results_become_toasts_and_only_new_ones_change_the_tooltip() {
+        use crate::git::{Checkpoint, CheckpointOutcome, SkipReason, Skipped};
+        let created = CheckpointResult::Done(CheckpointOutcome::Created(
+            Checkpoint {
+                seq: 4,
+                refname: "refs/agent-terminal/1/0004".into(),
+                commit: "c".into(),
+                tree: "t".into(),
+            },
+            vec![Skipped {
+                path: ".env".into(),
+                reason: SkipReason::Secret,
+            }],
+        ));
+        assert_eq!(
+            describe_checkpoint(&created, "14:02"),
+            CheckpointReport {
+                toast: "Checkpoint 4 · 14:02 · 1 path(s) not captured".into(),
+                tooltip: Some("Checkpoint 4 · 14:02 · 1 path(s) not captured".into()),
+            }
+        );
+        for other in [
+            CheckpointResult::NotRepo,
+            CheckpointResult::Done(CheckpointOutcome::Busy),
+            CheckpointResult::Done(CheckpointOutcome::Unchanged),
+            CheckpointResult::Failed("boom".into()),
+        ] {
+            let report = describe_checkpoint(&other, "14:02");
+            assert_eq!(report.tooltip, None);
+            assert!(!report.toast.is_empty());
+        }
+        assert_eq!(
+            describe_checkpoint(&CheckpointResult::Failed("boom".into()), "").toast,
+            "Checkpoint failed: boom"
+        );
+    }
+
+    #[test]
+    fn a_lost_checkpoint_attempt_expires() {
+        let mut track = CheckpointTrack::default();
+        assert!(!track.running());
+        track.started = Some(std::time::Instant::now());
+        assert!(track.running());
+        // A result that never came back must not stop checkpoints for good.
+        track.started = std::time::Instant::now().checked_sub(CHECKPOINT_STALE);
+        assert!(!track.running());
     }
 
     #[test]

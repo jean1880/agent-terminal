@@ -10,7 +10,7 @@
 //! `gio::spawn_blocking`.
 
 use crate::config::SessionFormat;
-use crate::utils::{expand_tilde, find_transcript, read_agy_history, run_capture};
+use crate::utils::{expand_tilde, find_transcript, read_agy_history};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -576,13 +576,10 @@ pub struct WorkingTree {
     pub note: Option<String>,
 }
 
+/// [`crate::git::git_raw`], trimmed to [`MAX_GIT_LINES`] for the brief.
 fn git(dir: &str, args: &[&str]) -> Result<String, String> {
-    let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-    let output = run_capture("git", &args, Some(dir), GIT_TIMEOUT_SECS)?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let stdout = crate::git::git_raw(Path::new(dir), args, &[], GIT_TIMEOUT_SECS)?;
+    let text = String::from_utf8_lossy(&stdout);
     let lines: Vec<&str> = text.lines().collect();
     let mut kept = lines
         .iter()

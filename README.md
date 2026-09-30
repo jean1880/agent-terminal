@@ -29,6 +29,9 @@ window.
   folder whose first prompt points at a brief the terminal wrote from the
   transcript and the git state. **Continue In** on the menus does the same at
   any time. See [Handing off between CLIs](#handing-off-between-clis).
+- **Turn checkpoints**: in a git repository, the working tree is snapshotted
+  into hidden refs whenever a turn ends, without touching your branch, index
+  or stash. See [Turn checkpoints](#turn-checkpoints).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -262,6 +265,32 @@ reported as healthy. Commands run off the UI thread and are killed at their
 timeout. `"action": "send-to-terminal"` adds a button that types the detail into
 the running session, behind a preview.
 
+### Turn checkpoints
+In a tab whose folder is inside a git repository, the working tree is
+snapshotted each time a turn ends: when the CLI rings the bell, or when its
+output has been quiet for 8 seconds. **Checkpoint Now** on the right-click menu
+takes one on demand. The tab's tooltip shows the latest one. A snapshot that
+fails marks the tab with a warning icon, and the tooltip on that icon says why.
+
+Snapshots are commits recorded only as refs under `refs/agent-terminal/<tab>/`.
+They never touch your branch, index, working tree or stash. Each captures
+tracked changes plus untracked, non-ignored files. It leaves out files over
+5 MiB, more than 2,000 new files, nested repositories, and names that look
+like secrets (`.env*`, `*.pem`, `*.key`, `id_rsa*`, …). Each tab keeps 50
+checkpoints, and any checkpoint older than 7 days is deleted.
+
+A normal `git push` does not send these refs. `git push --mirror`, or a local
+`git clone` of the repository, **does**. Known limits: a dirty submodule's
+contents, and files ignored by `.gitignore`, are not captured. Tracked Git LFS
+files are stored in `.git/lfs/objects` with no size cap.
+
+Turn it off in Settings (**Checkpoint Each Turn**). To remove every checkpoint
+from a repository:
+
+```bash
+git for-each-ref --format='delete %(refname)' refs/agent-terminal | git update-ref --stdin
+```
+
 ### Generating a Debian package (.deb)
 ```bash
 make package
@@ -286,6 +315,8 @@ actually links.
   status indicators, path resolution, session stores.
 - `src/handoff.rs` — pure logic for hand-offs: brief building, redaction and
   quota detection.
+- `src/git.rs` — git plumbing for turn checkpoints: repo discovery, snapshots
+  through a private index, checkpoint refs and retention.
 
 ## Contributing 🤝
 

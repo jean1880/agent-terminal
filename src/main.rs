@@ -11,6 +11,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub mod config;
+mod git;
 mod handoff;
 mod theme;
 mod utils;

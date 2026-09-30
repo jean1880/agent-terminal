@@ -32,8 +32,17 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Module layout**: `config.rs` (persisted settings + migration), `theme.rs`
   (colour schemes, infallible `RGBA::new`), `utils.rs` (pure logic: detection,
   startup command, path resolution, session stores), `handoff.rs` (pure logic:
-  hand-off briefs, redaction, quota detection), `window/imp.rs` (GTK UI),
-  `main.rs` (app setup + logging).
+  hand-off briefs, redaction, quota detection), `git.rs` (git plumbing for
+  turn checkpoints: shells out, but its parsers and filters are pure),
+  `window/imp.rs` (GTK UI), `main.rs` (app setup + logging).
+- **Checkpoints never touch the user's git state**: snapshots go through a
+  private index file under the git dir, and are recorded only as refs under
+  `refs/agent-terminal/`, created with an empty old value so none is
+  overwritten. The user's index, HEAD, working tree and stash are left
+  exactly as they were; `git::tests::repo` proves it, including with a split
+  index and in a linked worktree. Every git call strips inherited
+  `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
+  whose names look like secrets are never captured.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
   cannot summarize itself, so briefs are built from disk. Every brief goes
   through `handoff::redact` and is written `0600` in a `0700` directory outside
@@ -64,8 +73,11 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🧪 Testing Strategy
 
-- **Logic separation**: keep pure logic in `src/utils.rs`, `src/handoff.rs` and `src/config.rs`,
-  decoupled from GTK so it is unit-testable without a display. `window/imp.rs` is
+- **Logic separation**: keep pure logic in `src/utils.rs`, `src/handoff.rs` and `src/config.rs`
+  (plus the parsers and filters in `src/git.rs`),
+  decoupled from GTK so it is unit-testable without a display. `git.rs`'s
+  repository tests run real git in temp repos with a hermetic config (CI has
+  no git identity) and skip themselves when git is absent. `window/imp.rs` is
   covered by a construction smoke test plus tests for any pure helpers in it.
 - **Guard hand-maintained arrays**: `CliClient::ALL` and `ThemeChoice::ALL` drive
   the settings dropdowns by index in both directions. Both have exhaustive-match
