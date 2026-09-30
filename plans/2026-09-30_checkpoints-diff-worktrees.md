@@ -183,7 +183,74 @@ Branch: `feat/checkpoints` (off `master` @ b1a7ceb0)
 - [x] WP3 review round 2: **PASS**
 - [x] WP3 committed on `feat/checkpoints`
 - [ ] WP3 worktree tabs
-- [ ] WP4 restore (after soak)
+- Decisions (2026-09-30, after WP3):
+  - **build WP4 now**, which waives the soak.
+  - **ship as 2.1.0**: bump, merge `feat/checkpoints` into master, push.
+    WP4 is included in the same release.
+- [ ] WP4 restore. The design as built:
+      - "Undo these changes…" in the diff panel for the Last turn / This tab
+        bases restores the working tree to the diff's **left side**. That's
+        the state before the last turn, or the state the tab started from.
+      - a pinned `pre-restore-<nanos>` ref is taken first, even when nothing
+        changed
+      - a confirm dialog lists the files that will change or be deleted, the
+        files left untouched (never captured), and a mid-turn warning
+      - `git restore --source --worktree -- :/`, then contained deletion of
+        untracked additions
+      - a post-check against the target tree
+      - an Undo toast that re-runs the same flow against the pinned ref
+      - code in a new `src/restore.rs`
+- [x] WP4 code:
+      - `restore::{pin, prepare, apply, summary, contained}`
+      - `apply` **refuses if the tree moved since the pin**. An agent writing
+        while the dialog is up would otherwise lose unpinned work.
+      - `TabDiff.undo_to` (the left side; `None` for Uncommitted)
+      - an Undo button in the panel
+      - `confirm_restore`: prepare off-thread, a destructive AlertDialog with
+        the summary, apply off-thread, then a "Changes undone" toast whose
+        Undo re-runs the flow against the pin; an incomplete result lists
+        what differs and the manual `git restore` line.
+      Tests: 8 new (round trip + undo, HEAD/index unchanged, a secret left
+      untouched, emptied dirs removed, a pin even when unchanged, a nested
+      repo left alone, a stale pin refused, summary text, containment, a
+      symlinked parent refused). Gate: clippy clean, 169/169.
+- [x] WP4 live check via `preview_app` (first real use of the tool):
+      - a simulated turn (a tracked edit plus a new file in a new dir)
+      - Last turn shows exactly those changes
+      - Undo shows a dialog with correct `−`/`~` marks (confirmed zoomed)
+      - Undo Changes deletes `gen/`, reverts `notes.txt` and keeps the
+        pre-tab `added.txt`
+      - the toast's Undo re-dialogs and brings everything back
+      - `preview_stop` left no processes.
+      Cosmetic fix: the confirmation label is no longer selectable, since it
+      opened with all its text selected.
+- [x] WP4 docs: README ("Undoing a turn", feature, structure) and AGENTS.md
+      (undo invariants, plus preview_app for live GUI checks)
+- [x] WP4 review round 1: CHANGES-REQUIRED. **A real data-loss path was
+      found and fixed:** a file the target checkpoint has but the current pin
+      skipped (grown past 5 MiB, a secret-looking name, ignored since) was
+      overwritten by `git restore` with no copy anywhere. Those paths are now
+      "protected": excluded from restore, the changed list and the post-check.
+      The test was mutation-checked: without the fix, the 5 MiB file became
+      "small\n". Also:
+      - restore gets a 120 s timeout, and any failure after the stale check
+        names the pin commit and the `git restore` command to recover
+      - a ceiling comment on the check-to-restore window
+      - the pin is discarded on "nothing to undo" and on cancel
+      Gate: 172/172.
+- [x] WP4 review round 2: **PASS**. Its non-UTF-8 nit is closed fail-safe:
+      `prepare` refuses (and drops its pin) when a skipped path's name can't
+      be matched exactly; tested. 173/173.
+- [x] WP4 committed on `feat/checkpoints`
+- (superseded) WP4 live check note: **Do the live check with the preview
+      MCP's `preview_app`** (added to `~/scripts/crates/preview-mcp` on
+      2026-09-30 at the user's request, after the hand-run
+      broadwayd/dbus-run-session shells; reviewed PASS, release built, needs
+      a `/mcp` reconnect). Suggested call: `preview_app { command:
+      ~/git/agent-terminal/target/debug/agent-terminal, config_files:
+      {"agent-terminal/config.json": <bash profile, starting_directory =
+      scratch repo>} }`, then playwright on the returned url.
+- [ ] Release: bump 2.1.0, merge, push; confirm the apt pipeline build
 
 Notes:
 - **Deviation from the plan text (step 4):** untracked files are staged with

@@ -35,9 +35,18 @@ Architectural mandates, standards, and workflows for this codebase.
   hand-off briefs, redaction, quota detection), `git.rs` (git plumbing for
   turn checkpoints and diffs: shells out, but its parsers and filters are
   pure), `diff.rs` (pure logic: diff bases, numstat, line classification,
-  truncation), `worktree.rs` (worktree locations, branch checks, create and
+  truncation), `restore.rs` (undo: pin, restore, contained deletion, check),
+  `worktree.rs` (worktree locations, branch checks, create and
   clean-only remove), `window/imp.rs` (GTK UI), `window/diff_panel.rs` (the
   diff panel's widgets), `main.rs` (app setup + logging).
+- **Undo is itself undoable, and only touches what it pinned**: a restore
+  always pins the current working tree first (even if unchanged), refuses to
+  run if the tree moved since that pin, never touches HEAD or the index, never
+  deletes outside the toplevel or through a symlinked directory, and leaves
+  files checkpoints skip alone. `restore::tests` proves each of these.
+- **Live GUI checks go through the preview MCP's `preview_app`**, never
+  hand-run `gtk4-broadwayd`/`dbus-run-session` shells. It isolates the D-Bus
+  session and XDG homes, and cleans up after itself.
 - **Worktrees are never removed by force**: removal is offered only for a
   clean worktree that no open tab is in, runs `git worktree remove` without
   `--force`, and never deletes the branch. Names reaching git are refused if

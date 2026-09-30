@@ -34,7 +34,8 @@ window.
   or stash. See [Turn checkpoints](#turn-checkpoints).
 - **Diff panel**: `Ctrl + Shift + D` shows what changed beside the terminal:
   uncommitted work, the last turn, or everything since the tab opened. See
-  [Diff panel](#diff-panel).
+  [Diff panel](#diff-panel). Its undo arrow reverts the last turn, keeping what
+  it replaces so the undo can itself be undone. See [Undoing a turn](#undoing-a-turn).
 - **New Tab in Worktree**: `Ctrl + Shift + G` creates a branch in its own git
   worktree and opens a tab there, so two agents can work on one repository
   without trampling each other. See [Worktree tabs](#worktree-tabs).
@@ -322,6 +323,28 @@ and textconv drivers are not run. Diffs above 1 MiB or 20,000 lines are cut
 short, and one with more than 200,000 changed lines shows only its file
 list. Whether new tabs open with the panel, and its width, are remembered.
 
+### Undoing a turn
+With the diff panel on **Last turn** or **This tab**, the undo arrow puts the
+working tree back to the diff's left side: how it was before the last turn, or
+when the tab started. A confirmation lists every file that will change (`~`) or
+be deleted (`−`), and warns if the session still looks busy.
+
+- **The current state is saved first**, as
+  `refs/agent-terminal/<tab>/pre-restore-<time>`, and the **Undo** on the
+  "Changes undone" message puts it back.
+- **Nothing checkpoints never capture is touched**: ignored files, files over
+  5 MiB, names that look like secrets, nested repositories. The confirmation
+  names them.
+- **Commits and staged changes are never touched.** Only the working tree
+  changes; HEAD and the index stay as they are.
+- **If a file changes after you open the confirmation** (the agent still
+  writing), nothing is restored and you're asked to try again, so nothing
+  unsaved can be lost.
+- Deletions stay inside the repository and never follow a symlinked folder.
+- Afterwards the result is checked against the checkpoint. Anything that still
+  differs is reported, with the `git restore` command that puts the saved state
+  back by hand.
+
 ### Worktree tabs
 **New Tab in Worktree…** (`Ctrl + Shift + G`, or the right-click menu, where
 **New Tab in Worktree As** also picks the CLI) asks for a new branch and what to
@@ -379,6 +402,8 @@ actually links.
 - `src/diff.rs` — pure logic for the diff panel: bases, numstat parsing, line
   classification and truncation.
 - `src/window/diff_panel.rs` — the diff panel's widgets.
+- `src/restore.rs` — undoing a turn: saving the current state first, restoring
+  a checkpoint to the working tree, contained deletion and the check after.
 - `src/worktree.rs` — New Tab in Worktree: default locations, branch checks,
   and creating and (clean-only) removing worktrees.
 

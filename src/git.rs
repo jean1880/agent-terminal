@@ -852,6 +852,9 @@ pub struct TabDiff {
     pub omitted_lines: usize,
     /// Set when the text was not fetched because the diff is so large.
     pub too_large: bool,
+    /// What Undo would restore the working tree to: the diff's left side,
+    /// for the checkpoint bases only.
+    pub undo_to: Option<String>,
 }
 
 /// What the panel can show for a tab.
@@ -917,6 +920,9 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
         SNAPSHOT_TIMEOUT_SECS,
     )?;
     let stats = crate::diff::parse_numstat(&numstat);
+    // Undo goes back to the diff's left side. Not offered for Uncommitted,
+    // where that would be "throw away everything since HEAD".
+    let undo_to = (base != DiffBase::Uncommitted).then(|| from.clone());
     let (_, added, deleted) = crate::diff::totals(&stats);
     if added + deleted > MAX_FETCHED_DIFF_LINES {
         return Ok(DiffOutcome::Ready(TabDiff {
@@ -924,6 +930,7 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
             text: String::new(),
             omitted_lines: 0,
             too_large: true,
+            undo_to,
         }));
     }
     let raw = git_raw(
@@ -943,6 +950,7 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
         text: kept.to_string(),
         omitted_lines,
         too_large: false,
+        undo_to,
     }))
 }
 

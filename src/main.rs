@@ -14,6 +14,7 @@ pub mod config;
 mod diff;
 mod git;
 mod handoff;
+mod restore;
 mod theme;
 mod utils;
 mod window;

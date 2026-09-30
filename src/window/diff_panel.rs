@@ -63,6 +63,9 @@ pub struct DiffPanel {
     base: gtk4::DropDown,
     summary: gtk4::Label,
     refresh: gtk4::Button,
+    undo: gtk4::Button,
+    /// What the Undo button restores to, for the diff on show.
+    undo_to: Rc<RefCell<Option<String>>>,
     stack: gtk4::Stack,
     status: adw::StatusPage,
     retry: gtk4::Button,
@@ -106,8 +109,17 @@ impl DiffPanel {
             .margin_start(6)
             .margin_end(6)
             .build();
+        // Offered only for a checkpoint base with something to undo; see
+        // `show_diff`.
+        let undo = gtk4::Button::builder()
+            .icon_name("edit-undo-symbolic")
+            .tooltip_text("Undo these changes…")
+            .css_classes(["flat"])
+            .visible(false)
+            .build();
         header.append(&base);
         header.append(&summary);
+        header.append(&undo);
         header.append(&refresh);
 
         let retry = gtk4::Button::builder()
@@ -183,6 +195,8 @@ impl DiffPanel {
             base,
             summary,
             refresh,
+            undo,
+            undo_to: Rc::new(RefCell::new(None)),
             stack,
             status,
             retry,
@@ -323,6 +337,7 @@ impl DiffPanel {
     }
 
     fn show_status(&self, icon: &str, title: &str, description: &str, retry: bool) {
+        self.set_undo(None);
         self.summary.set_text("");
         self.status.set_icon_name(Some(icon));
         self.status.set_title(title);
@@ -333,7 +348,30 @@ impl DiffPanel {
         self.stack.set_visible_child_name("status");
     }
 
+    fn set_undo(&self, to: Option<String>) {
+        self.undo.set_visible(to.is_some());
+        *self.undo_to.borrow_mut() = to;
+    }
+
+    /// Calls `undo` with the revision to restore to when Undo is clicked.
+    pub fn connect_undo(&self, undo: impl Fn(String) + 'static) {
+        let undo_to = Rc::clone(&self.undo_to);
+        self.undo.connect_clicked(move |_| {
+            let target = undo_to.borrow().clone();
+            if let Some(target) = target {
+                undo(target);
+            }
+        });
+    }
+
+    /// Whether Undo is on offer.
+    #[cfg(test)]
+    pub fn undo_offered(&self) -> bool {
+        self.undo.is_visible() && self.undo_to.borrow().is_some()
+    }
+
     fn show_diff(&self, diff: &TabDiff) {
+        self.set_undo(diff.undo_to.clone());
         self.summary.set_text(&crate::diff::summary(&diff.stats));
 
         while let Some(row) = self.files.row_at_index(0) {

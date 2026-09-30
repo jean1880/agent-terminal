@@ -4035,6 +4035,28 @@ impl AgentTerminalWindow {
             }
         });
 
+        let root = panel.root.clone();
+        let base_of = panel.clone();
+        panel.connect_undo(move |target| {
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            let imp = obj.imp();
+            let page = imp
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.diff_panel.root == root)
+                .map(|t| t.page.clone());
+            let to = match base_of.base() {
+                crate::diff::DiffBase::ThisTab => "how they were when this tab started",
+                _ => "how they were before the last turn",
+            };
+            if let Some(page) = page {
+                imp.confirm_restore(&page, target, to);
+            }
+        });
+
         // A Paned cannot be told "give the end child N pixels" before it has
         // measured its layout, and showing the panel changes that layout. So
         // the saved width is applied from the paned's own layout notifications,
@@ -4465,6 +4487,139 @@ impl AgentTerminalWindow {
                     }
                     Err(err) => present_message(&obj, "Could Not Remove the Worktree", &err),
                 }
+            }
+        ));
+    }
+
+    /// Undo: pins the working tree, shows what restoring `page`'s tree to
+    /// `target` would do, and does it only if confirmed. `to` finishes
+    /// "Puts … back to" in the confirmation.
+    fn confirm_restore(&self, page: &adw::TabPage, target: String, to: &'static str) {
+        let Some((dir, key, mid_turn)) =
+            self.tabs
+                .borrow()
+                .iter()
+                .find(|t| &t.page == page)
+                .map(|t| {
+                    let quiet_for = t.last_output.get().elapsed();
+                    (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
+                })
+        else {
+            return;
+        };
+        let obj = self.obj();
+        let page = page.clone();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let prepared = gtk4::gio::spawn_blocking(move || {
+                    let repo = crate::git::discover(std::path::Path::new(&dir))?
+                        .ok_or_else(|| "This tab's folder is not in a repository".to_string())?;
+                    let plan = crate::restore::prepare(&repo, key, &target)?;
+                    Ok::<_, String>((repo, plan))
+                })
+                .await
+                .unwrap_or_else(|_| Err("preparing the undo panicked".to_string()));
+                let (repo, plan) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        present_message(&obj, "Could Not Prepare the Undo", &err);
+                        return;
+                    }
+                };
+                if plan.changed.is_empty() {
+                    obj.imp()
+                        .show_toast("Nothing to undo: the files already match");
+                    return;
+                }
+
+                let dialog = adw::AlertDialog::new(Some("Undo These Changes?"), None);
+                let text = Label::builder()
+                    .label(crate::restore::summary(&plan, to, mid_turn))
+                    .wrap(true)
+                    .xalign(0.0)
+                    // Not selectable: as the dialog's first focusable widget it
+                    // would open with all of its text selected.
+                    .selectable(false)
+                    .build();
+                let scroll = ScrolledWindow::builder()
+                    .hscrollbar_policy(gtk4::PolicyType::Never)
+                    .max_content_height(360)
+                    .propagate_natural_height(true)
+                    .child(&text)
+                    .build();
+                dialog.set_extra_child(Some(&scroll));
+                dialog.add_responses(&[("cancel", "Cancel"), ("restore", "Undo Changes")]);
+                dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                let response = dialog
+                    .choose_future(Some(obj.upcast_ref::<gtk4::Widget>()))
+                    .await;
+                if response != "restore" {
+                    // Cancelled: the undo point is not needed.
+                    gtk4::gio::spawn_blocking(move || crate::restore::discard(&repo, &plan.pinned));
+                    return;
+                }
+
+                let pinned = plan.pinned.commit.clone();
+                let done = gtk4::gio::spawn_blocking(move || crate::restore::apply(&repo, &plan))
+                    .await
+                    .unwrap_or_else(|_| Err("the undo panicked".to_string()));
+                let imp = obj.imp();
+                match done {
+                    Ok(done) if done.mismatched.is_empty() && done.refused.is_empty() => {
+                        info!("Restored a tab's working tree; undo point {pinned}");
+                        let toast = adw::Toast::builder()
+                            .title("Changes undone")
+                            .button_label("Undo")
+                            .timeout(15)
+                            .build();
+                        toast.connect_button_clicked(glib::clone!(
+                            #[weak]
+                            obj,
+                            #[weak]
+                            page,
+                            move |_| obj.imp().confirm_restore(
+                                &page,
+                                pinned.clone(),
+                                "how they were before the undo"
+                            )
+                        ));
+                        if let Some(overlay) = imp.toast_overlay.borrow().as_ref() {
+                            overlay.add_toast(toast);
+                        }
+                    }
+                    Ok(done) => {
+                        warn!(
+                            "Restore left differences: {:?}; refused: {:?}",
+                            done.mismatched, done.refused
+                        );
+                        present_message(
+                            &obj,
+                            "Undo Was Incomplete",
+                            &format!(
+                                "These still differ from the checkpoint: {}\n\nNot deleted, \
+                                 being outside this folder: {}\n\nThe files as they were \
+                                 before are kept as commit {pinned}; restore it with\n\
+                                 git restore --source={pinned} --worktree -- :/",
+                                if done.mismatched.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    done.mismatched.join(", ")
+                                },
+                                if done.refused.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    done.refused.join(", ")
+                                },
+                            ),
+                        );
+                    }
+                    Err(err) => present_message(&obj, "Could Not Undo the Changes", &err),
+                }
+                imp.refresh_diff(&page);
             }
         ));
     }
@@ -4994,9 +5149,11 @@ mod tests {
                 text: String::new(),
                 omitted_lines: 0,
                 too_large: false,
+                undo_to: None,
             })),
         );
         assert_eq!(panel.visible_state().1, "No changes");
+        assert!(!panel.undo_offered());
 
         let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
         let generation = panel.begin();
@@ -5007,8 +5164,10 @@ mod tests {
                 text: text.into(),
                 omitted_lines: 3,
                 too_large: false,
+                undo_to: Some("c0ffee".into()),
             })),
         );
+        assert!(panel.undo_offered());
         let (page, _, summary, shown, rows) = panel.visible_state();
         assert_eq!(page, "diff");
         assert_eq!(summary, "1 file, +1 −1");
