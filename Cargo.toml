@@ -16,9 +16,11 @@ description = "A standalone GTK4 terminal for driving an AI coding CLI"
 # so these two lines are what actually set the minimum system libraries:
 #   v4_10 → GTK 4.10, for gtk4::FileDialog
 #   v1_5  → libadwaita 1.5, for adw::AlertDialog and adw::PreferencesDialog
-# Both are satisfied by Ubuntu 24.04 and newer.
+#   v0_72 → VTE 0.72, for Terminal::text_range_format (quota markers read from
+#           the bottom rows instead of copying the whole scrollback)
+# All are satisfied by Ubuntu 24.04 (VTE 0.76) and newer.
 gtk4 = { version = "0.11", features = ["v4_10"] }
-vte4 = "0.10"
+vte4 = { version = "0.10", features = ["v0_72"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

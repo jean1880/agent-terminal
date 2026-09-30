@@ -55,8 +55,15 @@ const TOKEN_PREFIXES: &[&str] = &[
     "xoxb-",
     "xoxp-",
     "xoxa-",
+    "xapp-",
     "hf_",
+    // AWS access key IDs, long-term and temporary.
+    "AKIA",
+    "ASIA",
 ];
+
+/// Authorization schemes whose next word is a credential.
+const AUTH_SCHEMES: &[&str] = &["Bearer ", "Basic ", "Token "];
 
 /// Parts of a variable or key name that mark its value as secret.
 const SENSITIVE_NAME_PARTS: &[&str] = &[
@@ -100,7 +107,9 @@ pub fn redact(text: &str) -> String {
             out.push('\n');
         }
         let line = redact_prefixed_tokens(line);
-        let line = redact_bearer(&line);
+        let line = redact_auth_schemes(&line);
+        let line = redact_url_credentials(&line);
+        let line = redact_flag_values(&line);
         out.push_str(&redact_assignments(&line));
     }
     out
@@ -144,10 +153,19 @@ fn redact_prefixed_tokens(line: &str) -> String {
             while end < bytes.len() && is_token_byte(bytes[end]) {
                 end += 1;
             }
+            // A JWT is three dot-joined base64url parts; masking only the
+            // first would leave its claims and signature in the brief.
+            let is_jwt = line[i..end].starts_with("eyJ") && bytes.get(end) == Some(&b'.');
+            if is_jwt {
+                while end < bytes.len() && (is_token_byte(bytes[end]) || bytes[end] == b'.') {
+                    end += 1;
+                }
+            }
             let token = &line[i..end];
-            let is_secret = TOKEN_PREFIXES
-                .iter()
-                .any(|p| token.starts_with(p) && token.len() >= p.len() + 12);
+            let is_secret = (is_jwt && token.len() >= 20)
+                || TOKEN_PREFIXES
+                    .iter()
+                    .any(|p| token.starts_with(p) && token.len() >= p.len() + 12);
             if is_secret {
                 out.push_str(&line[copied..i]);
                 out.push_str(&mask(token));
@@ -162,11 +180,29 @@ fn redact_prefixed_tokens(line: &str) -> String {
     out
 }
 
-fn redact_bearer(line: &str) -> String {
+/// Masks the credential after an authorization scheme, in any letter case.
+///
+/// `Bearer` is specific enough to act on anywhere. `Basic` and `Token` are
+/// ordinary words ("Basic functionality"), so they only count on a line that
+/// is about authorization.
+fn redact_auth_schemes(line: &str) -> String {
+    let about_auth = line.to_ascii_lowercase().contains("authorization");
+    AUTH_SCHEMES
+        .iter()
+        .filter(|scheme| about_auth || scheme.eq_ignore_ascii_case("bearer "))
+        .fold(line.to_string(), |text, scheme| redact_after(&text, scheme))
+}
+
+/// Masks the word following each occurrence of `marker`, ignoring ASCII case.
+fn redact_after(line: &str, marker: &str) -> String {
+    let marker = marker.to_ascii_lowercase();
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
-    while let Some(pos) = rest.find("Bearer ") {
-        let value_start = pos + "Bearer ".len();
+    // ASCII lower-casing keeps every byte where it was, so a position found
+    // in the lowered copy is the same position — and a char boundary — in
+    // the original.
+    while let Some(pos) = rest.to_ascii_lowercase().find(&marker) {
+        let value_start = pos + marker.len();
         let value_len = rest[value_start..]
             .bytes()
             .take_while(|b| {
@@ -183,6 +219,105 @@ fn redact_bearer(line: &str) -> String {
         rest = &rest[value_start + value_len..];
     }
     out.push_str(rest);
+    out
+}
+
+/// Masks the password in `scheme://user:password@host`.
+fn redact_url_credentials(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find("://") {
+        let authority_start = pos + "://".len();
+        let authority = &rest[authority_start..];
+        // The userinfo ends at '@', and only counts if that comes before the
+        // path, query or the end of the word.
+        let limit = authority
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+            .unwrap_or(authority.len());
+        let masked = authority[..limit].rfind('@').and_then(|at| {
+            let colon = authority[..at].find(':')?;
+            let password = &authority[colon + 1..at];
+            (!password.is_empty()).then(|| (colon + 1, at, mask(password)))
+        });
+        match masked {
+            Some((start, end, replacement)) => {
+                out.push_str(&rest[..authority_start + start]);
+                out.push_str(&replacement);
+                rest = &rest[authority_start + end..];
+            }
+            None => {
+                out.push_str(&rest[..authority_start]);
+                rest = &rest[authority_start..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Masks the value in `--password value` / `--api-token value`: the
+/// space-separated flag form, which `redact_assignments` cannot see.
+fn redact_flag_values(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut copied = 0;
+    let mut i = 0;
+    let blank = |b: u8| b == b' ' || b == b'\t';
+    while i + 2 < bytes.len() {
+        let at_flag = bytes[i] == b'-' && bytes[i + 1] == b'-' && (i == 0 || blank(bytes[i - 1]));
+        if !at_flag {
+            i += 1;
+            continue;
+        }
+        let name_start = i + 2;
+        let mut name_end = name_start;
+        while name_end < bytes.len() && is_name_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        if name_end >= bytes.len()
+            || !blank(bytes[name_end])
+            || !is_sensitive_name(&line[name_start..name_end])
+        {
+            i = name_end.max(i + 1);
+            continue;
+        }
+        let mut value_start = name_end;
+        while value_start < bytes.len() && blank(bytes[value_start]) {
+            value_start += 1;
+        }
+        // A quoted value runs to its closing quote, spaces and all.
+        let quote = match bytes.get(value_start) {
+            Some(q @ (b'"' | b'\'')) => {
+                value_start += 1;
+                Some(*q)
+            }
+            _ => None,
+        };
+        let mut value_end = value_start;
+        while value_end < bytes.len() {
+            let b = bytes[value_end];
+            let stop = match quote {
+                Some(q) => b == q,
+                None => blank(b),
+            };
+            if stop {
+                break;
+            }
+            value_end += 1;
+        }
+        let value = &line[value_start..value_end];
+        // A value starting with '-' is the next flag, not this one's argument.
+        if value.chars().count() >= MIN_SECRET_CHARS
+            && !value.starts_with("****")
+            && !value.starts_with('-')
+        {
+            out.push_str(&line[copied..value_start]);
+            out.push_str(&mask(value));
+            copied = value_end;
+        }
+        i = value_end.max(i + 1);
+    }
+    out.push_str(&line[copied..]);
     out
 }
 
@@ -656,22 +791,72 @@ pub fn write_brief(dir: &Path, stem: &str, content: &str) -> Result<PathBuf, Str
         warn!("Could not restrict {}: {err}", dir.display());
     }
 
-    let path = dir.join(format!("{stem}.md"));
-    let tmp = dir.join(format!(".{stem}.md.tmp"));
-    let result = (|| {
+    // Written complete under a name no other writer can pick (process and
+    // time), then published by hard-linking it to the final name. A link
+    // fails rather than replaces when the name is taken, so two hand-offs of
+    // the same pair in the same second — stems are per second — each claim
+    // their own file instead of one replacing the brief the other tab's
+    // prompt points at.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!(".{stem}.{}.{nanos}.tmp", std::process::id()));
+    let written = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)
+        file.sync_all()
     })();
-    if let Err(err) = result {
+    if let Err(err) = written {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Could not write {}: {err}", path.display()));
+        return Err(format!(
+            "Could not write a brief in {}: {err}",
+            dir.display()
+        ));
     }
+
+    // Bounded so a directory that refuses every name cannot loop forever.
+    const MAX_SAME_STEM: u32 = 100;
+    let mut claimed = Err(format!("no free name for {stem} in {}", dir.display()));
+    for n in 1..=MAX_SAME_STEM {
+        let candidate = match n {
+            1 => dir.join(format!("{stem}.md")),
+            n => dir.join(format!("{stem}-{n}.md")),
+        };
+        match std::fs::hard_link(&tmp, &candidate) {
+            Ok(()) => {
+                claimed = Ok(candidate);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // A filesystem without hard links (some FUSE mounts) refuses the
+            // link outright. Fall back to check-then-rename: racy between two
+            // hand-offs in the same second, but a hand-off still works there.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                if candidate.exists() {
+                    continue;
+                }
+                claimed = std::fs::rename(&tmp, &candidate)
+                    .map(|()| candidate.clone())
+                    .map_err(|err| format!("Could not write {}: {err}", candidate.display()));
+                break;
+            }
+            Err(err) => {
+                claimed = Err(format!("Could not write {}: {err}", candidate.display()));
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let path = claimed?;
     info!("Wrote hand-off brief {}", path.display());
     prune_briefs(dir, BRIEF_RETENTION);
     Ok(path)
@@ -683,7 +868,11 @@ fn prune_briefs(dir: &Path, older_than: std::time::Duration) {
     };
     let now = std::time::SystemTime::now();
     for path in entries.flatten().map(|e| e.path()) {
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        // Temp files too: one left by a crash mid-write would otherwise stay.
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("md" | "tmp")
+        ) {
             continue;
         }
         let stale = path
@@ -856,6 +1045,61 @@ mod tests {
     }
 
     #[test]
+    fn the_formats_the_first_pass_missed_are_masked() {
+        // Fake values in real shapes; none is a live credential. The AWS key
+        // is AWS's own documentation example, held apart so the scanner's
+        // allow marker can sit on its line.
+        let aws_example = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
+        let out = redact(&format!(
+            "aws {aws_example} here\n\
+             jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJlLXZhbHVl done\n\
+             Authorization: Basic dXNlcjpodW50ZXIyaHVudGVy\n\
+             git clone https://deploy:s3cretPassw0rd@git.example.com/repo.git\n\
+             tool --password correcthorse --verbose --token --dry-run",
+        ));
+        for leaked in [
+            "IOSFODNN7",
+            "eyJzdWIi",
+            "c2lnbmF0dXJl",
+            "dXNlcjpodW50",
+            "s3cretPassw0rd",
+            "correcthorse",
+        ] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        // What surrounds a secret is left readable.
+        assert!(out.contains("https://deploy:****"), "{out}");
+        assert!(out.contains("@git.example.com/repo.git"), "{out}");
+        assert!(out.contains("--verbose --token --dry-run"), "{out}");
+        assert!(out.contains(" done"), "{out}");
+    }
+
+    #[test]
+    fn scheme_case_quotes_and_tabs_do_not_hide_a_secret() {
+        let out = redact(
+            "authorization: bearer abcdefghijklmnop\n\
+             run\t--password \"correct horse battery\" next\n\
+             run --api-token 'staple-staple-staple'",
+        );
+        for leaked in ["abcdefghijkl", "correct horse", "staple-staple"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(out.contains("\" next"), "{out}");
+    }
+
+    #[test]
+    fn scheme_words_in_ordinary_prose_are_left_alone() {
+        let text = "Basic functionality works. Token budgeting matters.";
+        assert_eq!(redact(text), text);
+    }
+
+    #[test]
+    fn urls_without_credentials_are_untouched() {
+        let text = "see https://example.com/a:b@c and mailto:user@example.com";
+        assert_eq!(redact(text), text);
+    }
+
+    #[test]
     fn redaction_never_splits_a_multibyte_character() {
         let text = "café TOKEN=ééééééééé€ ghp_ßßßßßßßßßßßß 日本語 password: ünïcödé!!";
         let out = redact(text);
@@ -994,8 +1238,16 @@ mod tests {
         // No temp file is left behind.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 
+        // A second brief with the same stem gets its own file rather than
+        // replacing the first, which a running tab's prompt still names.
+        let second = write_brief(&dir, "1-claude-to-agy", "again").unwrap();
+        assert_ne!(second, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "again");
+
         prune_briefs(&dir, std::time::Duration::ZERO);
         assert!(!path.exists());
+        assert!(!second.exists());
     }
 
     #[test]

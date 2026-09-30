@@ -65,10 +65,31 @@ struct TabState {
     /// Whether a quota notification is out for this tab, so a transcript that
     /// flickers to unreadable and back does not raise a second one.
     quota_notified: bool,
+    /// Whether this tab's bell raised the (shared) bell notification and has
+    /// not been looked at since. The notification is withdrawn once no tab in
+    /// any window is still waiting. Tracked here rather than read from the
+    /// page's attention marker, which the quota banner also sets.
+    bell_pending: bool,
 }
 
 /// Source of [`TabState::key`].
-static NEXT_TAB_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_TAB_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-process offset for [`TabState::key`].
+///
+/// GNOME keeps a notification, and its target, across restarts of both the app
+/// and the shell. Keys counting from 1 in every process would let a notification
+/// left by a crashed run select, and hand off, whichever new tab reused its key.
+static TAB_KEY_BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn next_tab_key() -> u64 {
+    let base = *TAB_KEY_BASE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    });
+    base.wrapping_add(NEXT_TAB_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
 
 impl TabState {
     /// The session this tab is running, if the terminal knows it.
@@ -301,12 +322,23 @@ fn build_search_bar(terminal: &Terminal) -> (gtk4::SearchBar, gtk4::SearchEntry)
     bar.connect_entry(&entry);
 
     // Recompiling on every change keeps the highlight in step with the query.
+    // Weak: this closure is connected to the entry's and toggles' own signals,
+    // so a strong capture of any of them is a cycle that keeps the whole tab —
+    // terminal, scrollback and PTY — alive after it closes.
     let update = {
-        let terminal = terminal.clone();
-        let entry = entry.clone();
-        let case_sensitive = case_sensitive.clone();
-        let use_regex = use_regex.clone();
+        let terminal = terminal.downgrade();
+        let entry = entry.downgrade();
+        let case_sensitive = case_sensitive.downgrade();
+        let use_regex = use_regex.downgrade();
         move || {
+            let (Some(terminal), Some(entry), Some(case_sensitive), Some(use_regex)) = (
+                terminal.upgrade(),
+                entry.upgrade(),
+                case_sensitive.upgrade(),
+                use_regex.upgrade(),
+            ) else {
+                return;
+            };
             let text = entry.text().to_string();
             if text.is_empty() {
                 terminal.search_set_regex(None, 0);
@@ -454,6 +486,75 @@ fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &st
     dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
 }
 
+thread_local! {
+    /// The process's one copy of the settings. GTK is single-threaded, so
+    /// thread-local is process-wide in practice.
+    static SHARED_CONFIG: std::rc::Rc<RefCell<crate::config::TerminalConfig>> =
+        std::rc::Rc::new(RefCell::new(initial_config()));
+
+    /// Whether a window has already reopened the previous session. Only the
+    /// first window of a launch does: a later "New Window" wants one fresh
+    /// tab, not a second copy of the last session.
+    static SESSION_RESTORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Tabs mid-way through a drag from one window's tab view to another's,
+    /// between the source's `page-detached` and the target's `page-attached`.
+    static TRANSFERRING: RefCell<Vec<TabState>> = const { RefCell::new(Vec::new()) };
+
+    /// Counts profile re-resolutions, so a slow one that finishes after a
+    /// newer one is discarded rather than applied last.
+    static PROFILE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Watches config.json for hand edits, once per process.
+    static CONFIG_MONITOR: RefCell<Option<gtk4::gio::FileMonitor>> = const { RefCell::new(None) };
+}
+
+/// The settings a process starts with. Tests start from defaults: loading
+/// would read — and could migrate into, or copy files beside — the real
+/// ~/.config of whoever runs them.
+#[cfg(not(test))]
+fn initial_config() -> crate::config::TerminalConfig {
+    crate::config::TerminalConfig::load()
+}
+
+#[cfg(test)]
+fn initial_config() -> crate::config::TerminalConfig {
+    crate::config::TerminalConfig::default()
+}
+
+/// The window a widget currently sits in.
+///
+/// Signal handlers on a tab's widgets look their window up through this
+/// rather than capturing it: a tab can be dragged into another window, and a
+/// captured one would keep answering for a tab it no longer holds.
+fn window_of(widget: &impl IsA<gtk4::Widget>) -> Option<super::AgentTerminalWindow> {
+    widget
+        .as_ref()
+        .root()
+        .and_downcast::<super::AgentTerminalWindow>()
+}
+
+/// Settings shared by every window.
+///
+/// Each window used to load its own copy and save the whole of it, so a change
+/// made in one window was reverted by the next save from any other — even a
+/// zoom. Hand edits to config.json are picked up as they happen; see
+/// [`AgentTerminalWindow::watch_config_file`].
+pub struct SharedConfig(std::rc::Rc<RefCell<crate::config::TerminalConfig>>);
+
+impl Default for SharedConfig {
+    fn default() -> Self {
+        Self(SHARED_CONFIG.with(std::rc::Rc::clone))
+    }
+}
+
+impl std::ops::Deref for SharedConfig {
+    type Target = RefCell<crate::config::TerminalConfig>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Internal state for the AgentTerminalWindow.
 #[derive(Default)]
 pub struct AgentTerminalWindow {
@@ -462,7 +563,10 @@ pub struct AgentTerminalWindow {
     pub tab_view: RefCell<Option<adw::TabView>>,
     /// One entry per open tab. Pruned when a page is detached.
     tabs: RefCell<Vec<TabState>>,
-    pub config: RefCell<crate::config::TerminalConfig>,
+    pub config: SharedConfig,
+    /// The settings dialog's font-scale spin, while it is open, so zooming
+    /// from the keyboard keeps it in step instead of leaving it stale.
+    font_scale_spin: RefCell<glib::WeakRef<gtk4::SpinButton>>,
     /// The profile resolved at startup, cached so opening a new tab does not
     /// re-run resolution (which may block on an interactive shell) on the UI
     /// thread. Refreshed when the selected profile changes.
@@ -490,10 +594,11 @@ impl ObjectSubclass for AgentTerminalWindow {
 impl ObjectImpl for AgentTerminalWindow {
     fn constructed(&self) {
         self.parent_constructed();
-        *self.config.borrow_mut() = crate::config::TerminalConfig::load();
         self.setup_ui();
         self.setup_actions();
         self.start_quota_watch();
+        self.watch_focus();
+        self.report_config_problem();
     }
 }
 
@@ -508,6 +613,9 @@ impl WindowImpl for AgentTerminalWindow {
         // knowable while the tabs still exist.
         self.save_session();
         self.flush_pending_save();
+        // GNOME keeps a notification after its app exits, counted on the dock
+        // badge until withdrawn, and nothing would be left to act on it.
+        self.withdraw_notifications();
         self.parent_close_request()
     }
 }
@@ -515,6 +623,177 @@ impl ApplicationWindowImpl for AgentTerminalWindow {}
 impl AdwApplicationWindowImpl for AgentTerminalWindow {}
 
 impl AgentTerminalWindow {
+    /// Tells the user, once, that their settings file could not be used.
+    /// Deferred to idle so the dialog has a presented window to attach to.
+    fn report_config_problem(&self) {
+        let Some(problem) = crate::config::take_load_problem() else {
+            return;
+        };
+        let obj = self.obj();
+        glib::idle_add_local_once(glib::clone!(
+            #[weak]
+            obj,
+            move || present_message(&obj, "Settings Not Loaded", &problem)
+        ));
+    }
+
+    /// Focusing the window acknowledges the bell of the tab in view, the same
+    /// way selecting a tab does.
+    fn watch_focus(&self) {
+        self.obj().connect_is_active_notify(|window| {
+            if !window.is_active() {
+                return;
+            }
+            let imp = window.imp();
+            let selected = imp
+                .tab_view
+                .borrow()
+                .as_ref()
+                .and_then(|view| view.selected_page());
+            if let Some(page) = selected {
+                imp.acknowledge_bell(&page);
+            }
+        });
+    }
+
+    /// Clears `page`'s pending bell, and withdraws the bell notification once
+    /// no tab in any window is still waiting on it.
+    fn acknowledge_bell(&self, page: &adw::TabPage) {
+        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| &t.page == page) {
+            tab.bell_pending = false;
+        }
+        self.withdraw_bell_if_answered();
+    }
+
+    /// Withdraws the shared bell notification unless some tab, in any window,
+    /// has rung and not been looked at.
+    fn withdraw_bell_if_answered(&self) {
+        let waiting = std::cell::Cell::new(false);
+        self.for_each_window(|window| {
+            if window.tabs.borrow().iter().any(|t| t.bell_pending) {
+                waiting.set(true);
+            }
+        });
+        if waiting.get() {
+            return;
+        }
+        if let Some(app) = self.obj().application() {
+            app.withdraw_notification("agent-terminal-bell");
+        }
+    }
+
+    /// Watches config.json and applies hand edits as they are saved.
+    ///
+    /// Profiles and indicators have no settings UI, so editing the file while
+    /// the app runs is the ordinary way to change them. Without this the app
+    /// would keep its old copy and the next in-app save — a zoom — would
+    /// write it back over the edit. Installed once per process.
+    ///
+    /// Called from the application's `startup`, not from a window: a window
+    /// has no application yet while it is being constructed (GtkWindow's
+    /// `application` is not a construct property), so installing it there
+    /// silently never happened.
+    pub fn watch_config_file(app: &adw::Application) {
+        if CONFIG_MONITOR.with(|m| m.borrow().is_some()) {
+            return;
+        }
+        let file = gtk4::gio::File::for_path(crate::config::TerminalConfig::config_path());
+        let monitor = match file.monitor_file(
+            gtk4::gio::FileMonitorFlags::WATCH_MOVES,
+            None::<&gtk4::gio::Cancellable>,
+        ) {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                warn!("Cannot watch the settings file for edits: {err}");
+                return;
+            }
+        };
+
+        // An editor's save arrives as several events (write, close, rename),
+        // and a file read in the middle of one may not parse yet; act once
+        // the burst has settled.
+        let pending: std::rc::Rc<RefCell<Option<glib::SourceId>>> = std::rc::Rc::default();
+        monitor.connect_changed(glib::clone!(
+            #[weak]
+            app,
+            move |_, _, _, _| {
+                if let Some(id) = pending.borrow_mut().take() {
+                    id.remove();
+                }
+                let source = glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(300),
+                    glib::clone!(
+                        #[weak]
+                        app,
+                        #[strong]
+                        pending,
+                        move || {
+                            pending.replace(None);
+                            let window = app
+                                .windows()
+                                .into_iter()
+                                .find_map(|w| w.downcast::<super::AgentTerminalWindow>().ok());
+                            if let Some(window) = window {
+                                window.imp().reload_config_from_disk();
+                            }
+                        }
+                    ),
+                );
+                pending.replace(Some(source));
+            }
+        ));
+        CONFIG_MONITOR.with(|m| *m.borrow_mut() = Some(monitor));
+    }
+
+    /// Applies config.json as it now stands on disk, if something other than
+    /// this process changed it.
+    fn reload_config_from_disk(&self) {
+        let change = self.config.borrow().check_disk();
+        let new = match change {
+            crate::config::DiskChange::Unchanged => return,
+            crate::config::DiskChange::Invalid(problem) => {
+                warn!("{problem}");
+                // An editor that autosaves mid-edit produces a run of broken
+                // versions; one dialog at a time is enough.
+                if self.obj().visible_dialog().is_none() {
+                    present_message(&self.obj(), "Settings File Has an Error", &problem);
+                }
+                return;
+            }
+            crate::config::DiskChange::Updated(new) => new,
+        };
+
+        info!("Settings file changed on disk; applying it");
+        let profiles_changed = {
+            let old = self.config.borrow();
+            old.default_profile != new.default_profile || old.profiles != new.profiles
+        };
+        *self.config.borrow_mut() = *new;
+
+        let (theme, scrollback, scale) = {
+            let config = self.config.borrow();
+            (config.theme, config.scrollback_lines, config.font_scale)
+        };
+        self.apply_appearance_to_all();
+        self.for_each_terminal_everywhere(|term| {
+            Theme::apply(term, theme);
+            term.set_scrollback_lines(i64::from(scrollback));
+            term.set_font_scale(scale);
+        });
+        // An open Settings dialog's font-scale spin follows too; its other
+        // rows show the old values until reopened.
+        self.for_each_window(|window| {
+            if let Some(spin) = window.font_scale_spin.borrow().upgrade() {
+                spin.set_value(scale);
+            }
+        });
+        if profiles_changed {
+            // Ceiling: the header's profile menus and the indicators are built
+            // with the window; new windows show the edited lists.
+            self.refresh_profile_selection();
+        }
+    }
+
     /// Returns the terminal of the currently selected tab, if any.
     fn current_terminal(&self) -> Option<Terminal> {
         let page = self.tab_view.borrow().as_ref()?.selected_page()?;
@@ -530,6 +809,25 @@ impl AgentTerminalWindow {
         for tab in self.tabs.borrow().iter() {
             f(&tab.terminal);
         }
+    }
+
+    /// Applies a closure to every window of the application, this one included.
+    /// Settings are shared, so a change made in one window applies to all.
+    fn for_each_window(&self, f: impl Fn(&Self)) {
+        let Some(app) = self.obj().application() else {
+            f(self);
+            return;
+        };
+        for window in app.windows() {
+            if let Ok(window) = window.downcast::<super::AgentTerminalWindow>() {
+                f(window.imp());
+            }
+        }
+    }
+
+    /// Applies a closure to every tab's terminal in every window.
+    fn for_each_terminal_everywhere(&self, f: impl Fn(&Terminal)) {
+        self.for_each_window(|window| window.for_each_terminal(&f));
     }
 
     /// The launch directory of the currently selected tab, if tracked.
@@ -862,10 +1160,22 @@ impl AgentTerminalWindow {
         ));
 
         let refresh = indicator.refresh_secs;
-        let evaluate = move || {
+        // Weak, so the refresh timer ends with the window instead of keeping its
+        // button alive and running the check forever after the window closes.
+        let button = button.downgrade();
+        // One check at a time: a check slower than the refresh interval would
+        // otherwise overlap the next, and the older result could land last.
+        let in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+        let evaluate = move || -> bool {
+            let Some(button) = button.upgrade() else {
+                return false;
+            };
+            if in_flight.replace(true) {
+                return true;
+            }
             let indicator = indicator.clone();
-            let button = button.clone();
             let detail = detail.clone();
+            let in_flight = in_flight.clone();
             glib::MainContext::default().spawn_local(async move {
                 let source = indicator.source.clone();
                 // A configured command is arbitrary and may block; it never runs
@@ -876,6 +1186,7 @@ impl AgentTerminalWindow {
                         .unwrap_or_else(|_| crate::utils::IndicatorState::Unknown {
                             reason: "Indicator check panicked".to_string(),
                         });
+                in_flight.set(false);
 
                 let (icon, css, tooltip) = match &state {
                     crate::utils::IndicatorState::Ok => (
@@ -908,6 +1219,7 @@ impl AgentTerminalWindow {
                 button.add_css_class(css);
                 detail.replace(state.detail().to_string());
             });
+            true
         };
 
         evaluate();
@@ -917,8 +1229,11 @@ impl AgentTerminalWindow {
         // appeared later was never shown.
         if let Some(secs) = refresh.filter(|s| *s > 0) {
             glib::timeout_add_local(std::time::Duration::from_secs(secs), move || {
-                evaluate();
-                glib::ControlFlow::Continue
+                if evaluate() {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
             });
         }
     }
@@ -1138,24 +1453,49 @@ impl AgentTerminalWindow {
             ),
         );
 
-        // Forget a tab's tracked state when it is removed.
+        // Forget a tab's tracked state when it is removed — or, when it is being
+        // dragged to another window, park it for that window to pick up.
         tab_view.connect_page_detached(glib::clone!(
             #[weak]
             obj,
-            move |_, page, _| {
+            move |view, page, _| {
                 let imp = obj.imp();
-                let closed: Vec<u64> = imp
-                    .tabs
-                    .borrow()
-                    .iter()
-                    .filter(|t| &t.page == page)
-                    .map(|t| t.key)
-                    .collect();
-                imp.tabs.borrow_mut().retain(|t| &t.page != page);
+                let (leaving, staying): (Vec<TabState>, Vec<TabState>) =
+                    imp.tabs.take().into_iter().partition(|t| &t.page == page);
+                imp.tabs.replace(staying);
+
+                if view.is_transferring_page() {
+                    TRANSFERRING.with(|parked| parked.borrow_mut().extend(leaving));
+                    return;
+                }
                 // A notification offering to hand off a closed tab would do
-                // nothing when clicked.
-                for key in closed {
-                    imp.withdraw_quota_notification(key);
+                // nothing when clicked, and a closed tab's bell cannot be
+                // looked at any more.
+                for tab in &leaving {
+                    imp.withdraw_quota_notification(tab.key);
+                }
+                imp.withdraw_bell_if_answered();
+            }
+        ));
+
+        // A tab dragged in from another window: adopt the state that window
+        // parked. Its signal handlers find their window through the widget
+        // tree (window_of), so they now answer to this one.
+        tab_view.connect_page_attached(glib::clone!(
+            #[weak]
+            obj,
+            move |_, page, _| {
+                let adopted: Vec<TabState> = TRANSFERRING.with(|parked| {
+                    let (mine, others) = parked
+                        .take()
+                        .into_iter()
+                        .partition(|t: &TabState| &t.page == page);
+                    parked.replace(others);
+                    mine
+                });
+                if !adopted.is_empty() {
+                    debug!("Adopting a tab dragged in from another window");
+                    obj.imp().tabs.borrow_mut().extend(adopted);
                 }
             }
         ));
@@ -1166,9 +1506,15 @@ impl AgentTerminalWindow {
             obj,
             move |view| {
                 let imp = obj.imp();
-                // Looking at a tab is the acknowledgement, so clear its marker.
+                // Looking at a tab is the acknowledgement, so clear its marker
+                // and its bell. GNOME keeps a notification, and the dock's
+                // unread badge, until the app withdraws it — even across
+                // restarts — so one never withdrawn stays counted forever. At
+                // startup nothing is pending, so this also clears a notification
+                // a previous run left behind.
                 if let Some(page) = view.selected_page() {
                     page.set_needs_attention(false);
+                    imp.acknowledge_bell(&page);
                 }
                 let session_info = view
                     .selected_page()
@@ -1202,24 +1548,6 @@ impl AgentTerminalWindow {
         let dir = self.current_dir();
         let profile = self.active_profile.borrow().clone();
         self.add_terminal_tab(profile.as_ref(), dir.as_deref());
-    }
-
-    /// Replaces the active tab with a fresh session using the current config
-    /// (client + starting directory). A running TUI client ignores a piped
-    /// "exit", so we open a replacement tab and close the old page directly.
-    /// Opening before closing keeps the window from dropping to zero tabs.
-    fn restart_current_tab(&self) {
-        let Some(tab_view) = self.tab_view.borrow().clone() else {
-            return;
-        };
-        let old_page = tab_view.selected_page();
-        let profile = self.active_profile.borrow().clone();
-        // Root the replacement in the configured starting directory (which may
-        // have just changed); add_terminal_tab falls back to $HOME.
-        self.add_terminal_tab(profile.as_ref(), None);
-        if let Some(page) = old_page {
-            tab_view.close_page(&page);
-        }
     }
 
     /// Prompts for a folder, then opens a new tab rooted there running `profile`,
@@ -1332,10 +1660,14 @@ impl AgentTerminalWindow {
         let (exit_bar, exit_label, restart_btn, close_btn) = build_exit_bar();
         let (search_bar, search_entry) = build_search_bar(&terminal);
         // Titles quote the CLI's own message, which is data, not markup. The
-        // button targets win.continue-in; its profile is set when revealed.
+        // button targets win.continue-in; its profile is set when revealed. The
+        // empty placeholder target is only there so the action's string type
+        // matches: with none, GTK logged a type-mismatch warning per banner.
+        // The button has no label, and so is not shown, until a real one is set.
         let quota_banner = adw::Banner::builder()
             .use_markup(false)
             .action_name("win.continue-in")
+            .action_target(&"".to_variant())
             .build();
         let screen_dirty = std::rc::Rc::new(std::cell::Cell::new(true));
         terminal.connect_contents_changed(glib::clone!(
@@ -1361,21 +1693,26 @@ impl AgentTerminalWindow {
         page.set_title("Terminal");
         tab_view.set_selected_page(&page);
 
-        let obj = self.obj();
+        // Window looked up at click time: the tab may have been dragged to
+        // another window since.
         restart_btn.connect_clicked(glib::clone!(
             #[weak]
-            obj,
-            #[weak]
             page,
-            move |_| obj.imp().restart_tab(&page)
+            move |button| {
+                if let Some(obj) = window_of(button) {
+                    obj.imp().restart_tab(&page);
+                }
+            }
         ));
         close_btn.connect_clicked(glib::clone!(
             #[weak]
-            obj,
-            #[weak]
             page,
-            move |_| {
-                if let Some(view) = obj.imp().tab_view.borrow().as_ref() {
+            move |button| {
+                let Some(obj) = window_of(button) else {
+                    return;
+                };
+                let view = obj.imp().tab_view.borrow().clone();
+                if let Some(view) = view {
                     view.close_page(&page);
                 }
             }
@@ -1410,8 +1747,9 @@ impl AgentTerminalWindow {
             quota_banner,
             quota: QuotaState::Unknown,
             screen_dirty,
-            key: NEXT_TAB_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            key: next_tab_key(),
             quota_notified: false,
+            bell_pending: false,
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
@@ -1436,13 +1774,12 @@ impl AgentTerminalWindow {
     }
 
     /// Wires the terminal's title and exit signals to the tab and window.
+    ///
+    /// Each handler finds its window through [`window_of`] when it runs, not by
+    /// capture, so a tab dragged into another window reports to that one.
     fn wire_tab_signals(&self, terminal: &Terminal, page: &adw::TabPage) {
-        let obj = self.obj();
-
         // Terminal title drives the tab label and (when active) the window title.
         terminal.connect_window_title_changed(glib::clone!(
-            #[weak]
-            obj,
             #[weak]
             page,
             move |terminal| {
@@ -1457,6 +1794,9 @@ impl AgentTerminalWindow {
                 });
 
                 // Only drive the window title from the active tab.
+                let Some(obj) = window_of(terminal) else {
+                    return;
+                };
                 let imp = obj.imp();
                 let is_active = imp
                     .tab_view
@@ -1485,10 +1825,11 @@ impl AgentTerminalWindow {
         // so, which is the whole reason to use this over a general terminal.
         terminal.connect_bell(glib::clone!(
             #[weak]
-            obj,
-            #[weak]
             page,
-            move |_| {
+            move |terminal| {
+                let Some(obj) = window_of(terminal) else {
+                    return;
+                };
                 let imp = obj.imp();
                 let is_selected = imp
                     .tab_view
@@ -1497,12 +1838,20 @@ impl AgentTerminalWindow {
                     .and_then(|view| view.selected_page())
                     .as_ref()
                     == Some(&page);
-                if is_selected {
+                // The tab in view of a focused window is already being looked
+                // at. The tab in view of a window in the background is not:
+                // that is the "finished while I was elsewhere" case the
+                // notification exists for.
+                if is_selected && obj.is_active() {
                     return;
                 }
 
-                debug!("Bell in a background tab; marking it as needing attention");
-                page.set_needs_attention(true);
+                // Only a background tab gets the marker: on the tab in view it
+                // would stay lit until the user switched away and back.
+                if !is_selected {
+                    debug!("Bell in a background tab; marking it as needing attention");
+                    page.set_needs_attention(true);
+                }
                 imp.notify_bell(&page);
             }
         ));
@@ -1514,11 +1863,12 @@ impl AgentTerminalWindow {
         // could be read.
         terminal.connect_child_exited(glib::clone!(
             #[weak]
-            obj,
-            #[weak]
             page,
-            move |_, status| {
+            move |terminal, status| {
                 info!("Terminal child exited: {}", describe_exit(status));
+                let Some(obj) = window_of(terminal) else {
+                    return;
+                };
                 let imp = obj.imp();
                 if exited_cleanly(status) {
                     if let Some(tab_view) = imp.tab_view.borrow().as_ref() {
@@ -1538,6 +1888,10 @@ impl AgentTerminalWindow {
     /// longer resolves — a tab in the right directory is more useful than no tab.
     fn restore_previous_session(&self, fallback: Option<&Profile>) -> bool {
         if !self.config.borrow().restore_session {
+            return false;
+        }
+        // Once per launch: later windows open one fresh tab.
+        if SESSION_RESTORED.with(|done| done.replace(true)) {
             return false;
         }
 
@@ -1614,6 +1968,23 @@ impl AgentTerminalWindow {
         let notification = gtk4::gio::Notification::new("Session needs attention");
         notification.set_body(Some(&format!("{title} is waiting")));
         notification.set_priority(gtk4::gio::NotificationPriority::Normal);
+        // Without a default action, clicking it plainly activates the app,
+        // which opens a second window rather than showing this tab.
+        // Marked pending under the borrow, sent after it: GApplication is not
+        // called into with a tab borrowed.
+        let key = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .map(|t| {
+                t.bell_pending = true;
+                t.key
+            });
+        if let Some(key) = key {
+            notification
+                .set_default_action_and_target_value("app.show-tab", Some(&key.to_variant()));
+        }
         // One id, so repeated bells replace rather than stack up.
         app.send_notification(Some("agent-terminal-bell"), &notification);
     }
@@ -1621,7 +1992,7 @@ impl AgentTerminalWindow {
     /// Re-applies font and cursor settings to every open tab.
     fn apply_appearance_to_all(&self) {
         let config = self.config.borrow();
-        self.for_each_terminal(|term| apply_appearance(term, &config));
+        self.for_each_terminal_everywhere(|term| apply_appearance(term, &config));
     }
 
     /// Reveals the current tab's search bar and puts the cursor in it.
@@ -1680,9 +2051,7 @@ impl AgentTerminalWindow {
 
     /// Replaces `page` with a fresh session rooted in the same directory.
     ///
-    /// Distinct from [`Self::restart_current_tab`], which deliberately re-reads
-    /// the configured starting directory because that is what just changed. Here
-    /// the user is recovering a specific tab and expects to land back where they
+    /// The user is recovering a specific tab and expects to land back where they
     /// were. Opening before closing keeps the window from dropping to zero tabs.
     fn restart_tab(&self, page: &adw::TabPage) {
         let Some(tab_view) = self.tab_view.borrow().clone() else {
@@ -1746,6 +2115,13 @@ impl AgentTerminalWindow {
             .has_arrow(false)
             .build();
         popover.set_parent(terminal);
+        // A child attached with set_parent must be detached by hand before its
+        // parent goes: VTE does not know about it, so nothing else would.
+        terminal.connect_destroy(glib::clone!(
+            #[weak]
+            popover,
+            move |_| popover.unparent()
+        ));
 
         let click_gesture = gtk4::GestureClick::new();
         click_gesture.set_button(3); // Right click
@@ -1802,9 +2178,19 @@ impl AgentTerminalWindow {
 
     /// Sets the font scale on all tabs and queues a save.
     fn set_font_scale(&self, scale: f64) {
+        // Every path in (keys, the spin's arrows) steps by 0.1; rounding here
+        // keeps float error (1.2000000000000002) out of config.json.
+        let scale = (scale * 10.0).round() / 10.0;
         debug!("Setting font scale: {}", scale);
-        self.for_each_terminal(|term| term.set_font_scale(scale));
         self.config.borrow_mut().font_scale = scale;
+        self.for_each_window(|window| {
+            window.for_each_terminal(|term| term.set_font_scale(scale));
+            // Setting an unchanged value emits nothing, so the spin's own
+            // handler calling back in here ends the round trip.
+            if let Some(spin) = window.font_scale_spin.borrow().upgrade() {
+                spin.set_value(scale);
+            }
+        });
         self.schedule_config_save();
     }
 
@@ -1880,6 +2266,18 @@ impl AgentTerminalWindow {
                 if stack.visible_child_name().as_deref() == Some("loading") {
                     debug!("Terminal content detected, switching from loading screen");
                     stack.set_visible_child_name("terminal");
+                    // Hidden behind the loading screen, the terminal could not
+                    // take focus when the window opened, so it lands on a header
+                    // button instead. Take it now if this is the tab in view —
+                    // but not from an open dialog, or a keypress meant for the
+                    // dialog would go to the CLI.
+                    let take_focus = window_of(terminal).is_some_and(|obj| {
+                        obj.visible_dialog().is_none()
+                            && obj.imp().current_terminal().as_ref() == Some(terminal)
+                    });
+                    if take_focus {
+                        terminal.grab_focus();
+                    }
                 }
                 if let Some(id) = reveal_handler.borrow_mut().take() {
                     terminal.disconnect(id);
@@ -2133,9 +2531,11 @@ impl AgentTerminalWindow {
 
         let font_scale_row = adw::ActionRow::builder().title("Font Scale").build();
         font_scale_row.add_suffix(&font_scale_spin);
+        *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
         let cli_client_row = adw::ComboRow::builder()
             .title("Active CLI Client")
+            .subtitle("Used by new tabs; open tabs keep running")
             .model(&client_model)
             .selected(selected_index)
             .build();
@@ -2199,7 +2599,7 @@ impl AgentTerminalWindow {
 
         let restore_row = adw::SwitchRow::builder()
             .title("Restore Tabs on Launch")
-            .subtitle("Reopen the tabs that were open when the window last closed")
+            .subtitle("Reopen the last window's tabs in their folders, as fresh sessions")
             .active(config.restore_session)
             .build();
 
@@ -2263,6 +2663,16 @@ impl AgentTerminalWindow {
             move |row| {
                 let imp = obj.imp();
                 imp.config.borrow_mut().notify_on_bell = row.is_active();
+                // Off means off: a notification already raised would otherwise
+                // stay on the dock badge until something withdrew it.
+                if !row.is_active() {
+                    imp.for_each_window(|window| {
+                        for tab in window.tabs.borrow_mut().iter_mut() {
+                            tab.bell_pending = false;
+                        }
+                    });
+                    imp.withdraw_bell_if_answered();
+                }
                 imp.schedule_config_save();
             }
         ));
@@ -2273,6 +2683,9 @@ impl AgentTerminalWindow {
             move |row| {
                 let imp = obj.imp();
                 imp.config.borrow_mut().notify_on_quota = row.is_active();
+                if !row.is_active() {
+                    imp.for_each_window(Self::withdraw_quota_notifications);
+                }
                 imp.schedule_config_save();
             }
         ));
@@ -2283,6 +2696,11 @@ impl AgentTerminalWindow {
             move |row| {
                 let imp = obj.imp();
                 imp.config.borrow_mut().restore_session = row.is_active();
+                // Nothing is recorded while this is off, so a layout left behind
+                // now would come back, however old, the day it is turned on.
+                if !row.is_active() {
+                    crate::config::SessionState::default().save();
+                }
                 imp.schedule_config_save();
             }
         ));
@@ -2299,8 +2717,9 @@ impl AgentTerminalWindow {
             move |spin| {
                 let lines = spin.value() as u32;
                 obj.imp().config.borrow_mut().scrollback_lines = lines;
-                obj.imp()
-                    .for_each_terminal(|term| term.set_scrollback_lines(i64::from(lines)));
+                obj.imp().for_each_terminal_everywhere(|term| {
+                    term.set_scrollback_lines(i64::from(lines))
+                });
                 obj.imp().schedule_config_save();
             }
         ));
@@ -2326,7 +2745,7 @@ impl AgentTerminalWindow {
                 obj.imp().config.borrow_mut().theme = theme;
                 // Themes apply live to every open tab; no restart needed.
                 obj.imp()
-                    .for_each_terminal(|term| Theme::apply(term, theme));
+                    .for_each_terminal_everywhere(|term| Theme::apply(term, theme));
                 obj.imp().schedule_config_save();
             }
         ));
@@ -2358,10 +2777,10 @@ impl AgentTerminalWindow {
                 imp.config.borrow_mut().default_profile = chosen.clone();
                 imp.schedule_config_save();
                 info!(
-                    "Profile selection changed to {}, restarting session",
+                    "Profile selection changed to {}; applies to new tabs",
                     chosen.as_deref().unwrap_or("auto-detect")
                 );
-                imp.restart_with_profile_selection();
+                imp.refresh_profile_selection();
             }
         ));
 
@@ -2396,25 +2815,39 @@ impl AgentTerminalWindow {
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
 
-    /// Re-resolves the selected profile, then replaces the active tab.
+    /// Re-resolves the selected profile for the tabs opened from now on.
     ///
-    /// Resolution can shell out, so it takes the same off-thread path as startup
-    /// rather than freezing the window while the settings dialog is open.
-    fn restart_with_profile_selection(&self) {
+    /// The open tabs keep running: replacing the active one used to end a live
+    /// conversation just because the default changed. Resolution can shell out,
+    /// so it takes the same off-thread path as startup rather than freezing the
+    /// window while the settings dialog is open.
+    fn refresh_profile_selection(&self) {
         let obj = self.obj();
         let (profiles, preferred) = {
             let config = self.config.borrow();
             (config.profiles.clone(), config.default_profile.clone())
         };
         let (path, home, shell) = env_triplet();
+        // A slow resolution (an -ic probe) can finish after a quicker one
+        // started later — for a newer choice, or a newer profile list under
+        // auto-detect. Only the latest request may land.
+        let generation = PROFILE_GENERATION.with(|g| {
+            g.set(g.get() + 1);
+            g.get()
+        });
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
                 let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
-                let imp = obj.imp();
-                *imp.active_profile.borrow_mut() = resolved;
-                imp.restart_current_tab();
+                if PROFILE_GENERATION.with(std::cell::Cell::get) != generation {
+                    debug!("Dropping a profile resolution a newer one has superseded");
+                    return;
+                }
+                // The default is shared, so every window's new tabs follow it.
+                obj.imp().for_each_window(|window| {
+                    *window.active_profile.borrow_mut() = resolved.clone();
+                });
             }
         ));
     }
@@ -2590,11 +3023,11 @@ impl AgentTerminalWindow {
         let obj = self.obj();
         let Some(profile) = self.resume_profile_named(profile_name) else {
             // Reuses open_resume_tab's explanation rather than a second copy.
-            self.show_resume_id_dialog();
+            self.show_resume_id_dialog(profile_name.map(str::to_string));
             return;
         };
         let Some(store) = profile.session_store.clone() else {
-            self.show_resume_id_dialog();
+            self.show_resume_id_dialog(Some(profile.name.clone()));
             return;
         };
         let title_pointer = profile.session_title.clone();
@@ -2735,6 +3168,7 @@ impl AgentTerminalWindow {
             }
         ));
 
+        let id_profile = profile.name.clone();
         enter_id.connect_clicked(glib::clone!(
             #[weak]
             obj,
@@ -2742,7 +3176,7 @@ impl AgentTerminalWindow {
             dialog,
             move |_| {
                 dialog.close();
-                obj.imp().show_resume_id_dialog();
+                obj.imp().show_resume_id_dialog(Some(id_profile.clone()));
             }
         ));
 
@@ -2823,19 +3257,28 @@ impl AgentTerminalWindow {
         ));
     }
 
-    /// Prompts for a session ID, then opens a tab resuming it.
+    /// Prompts for a session ID, then opens a tab resuming it with `profile`,
+    /// or the active profile when `None`.
+    ///
+    /// The profile is carried through from the session browser: an ID means
+    /// nothing to any CLI but the one that recorded it, so one pasted into
+    /// "Resume Agy Session" must go to Agy, not to whichever CLI is active.
     ///
     /// The Resume button stays disabled until the ID is valid, so a bad paste is
     /// caught in the dialog rather than surfacing later as a failed tab.
-    fn show_resume_id_dialog(&self) {
+    fn show_resume_id_dialog(&self, profile: Option<String>) {
         let obj = self.obj();
         let entry = gtk4::Entry::builder()
             .placeholder_text("Session ID")
             .activates_default(true)
             .build();
 
+        let heading = match &profile {
+            Some(name) => format!("Resume {name} Session"),
+            None => "Resume Session".to_string(),
+        };
         let dialog = adw::AlertDialog::new(
-            Some("Resume Session"),
+            Some(&heading),
             Some("Opens a new tab that resumes the session with this ID."),
         );
         dialog.set_extra_child(Some(&entry));
@@ -2880,7 +3323,7 @@ impl AgentTerminalWindow {
                         Ok(id) => obj.imp().request_resume(ResumeRequest {
                             session_id: id.to_string(),
                             dir: None,
-                            profile: None,
+                            profile: profile.clone(),
                         }),
                         // Unreachable while the button tracks validity; logged,
                         // not trusted, in case Enter slips past it.
@@ -2974,6 +3417,19 @@ impl AgentTerminalWindow {
             )
         };
 
+        // The menus are shared by every tab, so they cannot leave out the one
+        // CLI this tab is running; handing a session to itself is refused here.
+        if source.as_ref().is_some_and(|p| p.name == target.name) {
+            present_message(
+                &self.obj(),
+                "Already Running Here",
+                &format!(
+                    "This tab is already running {}. Choose another CLI to continue in.",
+                    target.name
+                ),
+            );
+            return;
+        }
         let from = source
             .as_ref()
             .map_or_else(|| "The previous session".to_string(), |p| p.name.clone());
@@ -3129,7 +3585,8 @@ impl AgentTerminalWindow {
                     if markers.is_empty() || !tab.screen_dirty.replace(false) {
                         continue;
                     }
-                    let state = match screen_text(&tab.terminal) {
+                    let rows = tab.terminal.row_count();
+                    let state = match text_above_cursor(&tab.terminal, rows) {
                         Some(text) => match crate::handoff::screen_quota_line(&text, markers) {
                             Some(line) => QuotaState::Exhausted { detail: line },
                             None => QuotaState::Available,
@@ -3218,7 +3675,18 @@ impl AgentTerminalWindow {
                         None => tab.quota_banner.set_button_label(None),
                     }
                     tab.quota_banner.set_revealed(true);
-                    page.set_needs_attention(true);
+                    // The tab in view shows its banner; a marker there would
+                    // stay lit until the user switched away and back.
+                    let in_view = self
+                        .tab_view
+                        .borrow()
+                        .as_ref()
+                        .and_then(|view| view.selected_page())
+                        .as_ref()
+                        == Some(page);
+                    if !in_view {
+                        page.set_needs_attention(true);
+                    }
                     if !tab.quota_notified && self.config.borrow().notify_on_quota {
                         tab.quota_notified = true;
                         notify = Some((tab.key, who.to_string(), detail.clone()));
@@ -3269,6 +3737,34 @@ impl AgentTerminalWindow {
             );
         }
         app.send_notification(Some(&Self::quota_notification_id(key)), &notification);
+    }
+
+    /// Withdraws every notification raised for this window's tabs. The bell's
+    /// is shared by every window, so it goes only if no other is still waiting.
+    fn withdraw_notifications(&self) {
+        for tab in self.tabs.borrow_mut().iter_mut() {
+            tab.bell_pending = false;
+        }
+        self.withdraw_bell_if_answered();
+        self.withdraw_quota_notifications();
+    }
+
+    /// Withdraws the out-of-quota notifications raised for this window's tabs.
+    fn withdraw_quota_notifications(&self) {
+        let Some(app) = self.obj().application() else {
+            return;
+        };
+        // Decided under the borrow, withdrawn after it: GApplication must not
+        // be called into with a tab borrowed.
+        let keys: Vec<u64> = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|tab| std::mem::take(&mut tab.quota_notified).then_some(tab.key))
+            .collect();
+        for key in keys {
+            app.withdraw_notification(&Self::quota_notification_id(key));
+        }
     }
 
     fn withdraw_quota_notification(&self, key: u64) {
@@ -3323,10 +3819,32 @@ impl AgentTerminalWindow {
     }
 }
 
+/// Up to `rows` rows of a terminal's buffer ending just above the cursor, as
+/// plain text — the live screen, not wherever the user has scrolled to.
+///
+/// The quota watcher calls this every few seconds on the main thread (VTE can
+/// only be read there), so it reads just those rows rather than the whole
+/// scrollback that [`screen_text`] copies. The cursor's own row is left out:
+/// in a line-based CLI it is where the user types, so a message that merely
+/// mentions "quota exceeded" does not raise a banner while it is written.
+/// Ceiling: a TUI that parks its cursor below an input box still has that box
+/// scanned, and a sent message echoed above the cursor can still match.
+fn text_above_cursor(terminal: &Terminal, rows: i64) -> Option<String> {
+    // Absolute buffer rows, the same coordinates text_range_format takes.
+    let (_, cursor_row) = terminal.cursor_position();
+    let end = cursor_row - 1;
+    if end < 0 {
+        return None;
+    }
+    let start = (end - rows + 1).max(0);
+    let (text, _) =
+        terminal.text_range_format(Format::Text, start, 0, end, terminal.column_count());
+    text.map(|t| t.to_string())
+}
+
 /// A terminal's scrollback and screen as plain text, or `None` if VTE could
-/// not write it. Ceiling: this copies the whole scrollback, so callers read it
-/// only on demand or when the screen has changed. Upgrade path: raise the VTE
-/// floor to 0.72 and read just the last rows with `text_range_format`.
+/// not write it. Copies the whole scrollback: for on-demand use only (a
+/// hand-off brief), never on a timer — see [`text_above_cursor`].
 fn screen_text(terminal: &Terminal) -> Option<String> {
     let stream = gtk4::gio::MemoryOutputStream::new_resizable();
     if let Err(err) = terminal.write_contents_sync(
@@ -3358,12 +3876,7 @@ fn directory_is_usable(dir: &str) -> bool {
         return true;
     }
     let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    let expanded = if let Some(rest) = trimmed.strip_prefix('~') {
-        format!("{home}{rest}")
-    } else {
-        trimmed.to_string()
-    };
-    std::path::Path::new(&expanded).is_dir()
+    std::path::Path::new(&crate::utils::expand_tilde_with(trimmed, &home)).is_dir()
 }
 
 #[cfg(test)]
@@ -3398,6 +3911,25 @@ mod tests {
     }
 
     #[test]
+    fn every_window_sees_one_config() {
+        // Per-window copies let one window's save revert another's change.
+        let first = SharedConfig::default();
+        let second = SharedConfig::default();
+        first.borrow_mut().scrollback_lines = 4242;
+        assert_eq!(second.borrow().scrollback_lines, 4242);
+    }
+
+    #[test]
+    fn tab_keys_are_unique_and_not_reused_across_runs() {
+        // A stored notification from an earlier run names that run's keys;
+        // counting from 1 again would point it at an unrelated live tab.
+        let first = next_tab_key();
+        let second = next_tab_key();
+        assert_ne!(first, second);
+        assert!(first > 1 << 32, "keys must carry a per-process offset");
+    }
+
+    #[test]
     fn profile_tab_follows_current_tab_unless_profile_pins_a_dir() {
         let current = Some("/work/project".to_string());
         // Switching CLI mid-task keeps the project.
@@ -3418,29 +3950,33 @@ mod tests {
     fn test_window_initialization() {
         init_gtk();
 
-        // Constructing a window loads (and may migrate) the configuration, which
-        // without this pointed at the developer's real ~/.config and wrote to it
-        // — a unit test with a side effect on the machine running it. Redirecting
-        // XDG_CONFIG_HOME keeps it in a temp directory.
+        // Under test a window starts from default settings (initial_config), so
+        // constructing one must not touch any config directory — it used to
+        // read, and could migrate into, the developer's real ~/.config.
+        // XDG_CONFIG_HOME is redirected as a net: if that regresses, the
+        // damage lands in a temp directory and the assertion below says so.
         //
         // Safe despite tests running in parallel: this is the only test that
-        // reaches config_dir() at all, since the config tests all use explicit
-        // paths via load_from/save_to.
+        // could reach config_dir() at all, since the config tests all use
+        // explicit paths via load_from/save_to.
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
 
+        // Registered, so `startup` has run before a window is added — as in
+        // the real app. NON_UNIQUE: no session bus name to claim, which also
+        // keeps the test independent of whether a bus is running.
         let app = adw::Application::builder()
             .application_id("org.test.Window")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
             .build();
+        app.register(None::<&gtk4::gio::Cancellable>)
+            .expect("registering a non-unique application");
         let window = super::super::AgentTerminalWindow::new(&app);
 
         assert_eq!(window.title(), Some("Agent Terminal".into()));
-
-        // Prove the redirection actually took: configuration landed in the temp
-        // directory rather than anywhere near the real one.
         assert!(
-            config_home.path().join("agent-terminal").exists(),
-            "window construction did not use the redirected config home"
+            !config_home.path().join("agent-terminal").exists(),
+            "window construction touched the config directory"
         );
     }
 }

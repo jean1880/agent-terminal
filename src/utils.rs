@@ -35,6 +35,10 @@ pub fn clear_command_cache() {
     COMMAND_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
+/// How long sourcing the user's shell rc, or a profile's env file, may take
+/// before it is abandoned. Generous: a heavy rc (nvm, conda) takes seconds.
+pub const SHELL_PROBE_TIMEOUT_SECS: u64 = 15;
+
 /// The real command probe: `which`, then common install directories, then
 /// `$SHELL -ic`.
 ///
@@ -84,20 +88,32 @@ impl SystemProbe {
     ///
     /// The expensive check, and the last resort: it sources the user's rc file,
     /// which is how nvm- and asdf-managed commands are found at all.
+    ///
+    /// Bounded by [`SHELL_PROBE_TIMEOUT_SECS`]: an rc that blocks — on the
+    /// network, a keychain prompt — would otherwise leave the window on its
+    /// "Starting up…" page forever.
     fn known_to_interactive_shell(&self, command: &str) -> bool {
         let shell = self.shell.as_deref().unwrap_or("/bin/sh");
         let mut cmd = std::process::Command::new(shell);
-        cmd.args(["-ic", &format!("command -v {command}")]);
+        // Single-quoted, so a name with a space or a `$` is looked up as
+        // written. Spliced rather than passed as "$1": fish takes extra -c
+        // arguments as $argv and has no $1, and single quotes mean the same
+        // thing in sh, bash, zsh and fish.
+        cmd.args(["-ic", &format!("command -v {}", shell_quote(command))]);
         if let Some(path) = self.path.as_deref().filter(|p| !p.is_empty()) {
             cmd.env("PATH", path);
         }
-        match cmd.output() {
+        match run_command(cmd, shell, SHELL_PROBE_TIMEOUT_SECS) {
             Ok(output) if output.status.success() => {
                 let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 info!("{command} found via shell -ic at {found}");
                 true
             }
-            _ => false,
+            Ok(_) => false,
+            Err(reason) => {
+                warn!("Interactive shell check for {command} gave up: {reason}");
+                false
+            }
         }
     }
 
@@ -172,21 +188,21 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
 
     // `env -0` so values containing newlines survive; `set -a` so assignments
     // without an explicit `export` are still exported.
-    let output = std::process::Command::new("/bin/sh")
-        .arg("-c")
+    // Bounded, like the shell probe: the tab waits on this before spawning,
+    // so a file that blocks would leave it on its loading screen for good.
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
         .arg(r#"set -a; . "$1" >/dev/null 2>&1 || exit 1; env -0"#)
         .arg("sh")
-        .arg(path)
-        .output();
-
-    let output = match output {
+        .arg(path);
+    let output = match run_command(cmd, "/bin/sh", SHELL_PROBE_TIMEOUT_SECS) {
         Ok(output) if output.status.success() => output,
         Ok(_) => {
             warn!("Env file {path} could not be sourced; ignoring it");
             return Vec::new();
         }
-        Err(err) => {
-            warn!("Failed to run a shell to read env file {path}: {err}");
+        Err(reason) => {
+            warn!("Reading env file {path} failed: {reason}; ignoring it");
             return Vec::new();
         }
     };
@@ -258,6 +274,16 @@ pub fn strip_env(env: &mut Vec<String>, patterns: &[String]) -> Vec<String> {
 /// Nothing else does this for us: `read_to_string` takes the tilde literally, and
 /// a path passed to a shell in quotes is not expanded either.
 pub fn expand_tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) => expand_tilde_with(path, &home),
+        Err(_) => path.trim().to_string(),
+    }
+}
+
+/// [`expand_tilde`] against an explicit home directory. The one place `~` is
+/// interpreted, so the settings dialog, the spawn path and config values all
+/// agree on what a path means.
+pub fn expand_tilde_with(path: &str, home: &str) -> String {
     let trimmed = path.trim();
     let Some(rest) = trimmed.strip_prefix('~') else {
         return trimmed.to_string();
@@ -266,10 +292,7 @@ pub fn expand_tilde(path: &str) -> String {
     if !rest.is_empty() && !rest.starts_with('/') {
         return trimmed.to_string();
     }
-    match std::env::var("HOME") {
-        Ok(home) => format!("{home}{rest}"),
-        Err(_) => trimmed.to_string(),
-    }
+    format!("{home}{rest}")
 }
 
 /// What an indicator found.
@@ -362,29 +385,63 @@ pub fn run_capture(
     cwd: Option<&str>,
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
-
     let mut cmd = std::process::Command::new(command);
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    run_command(cmd, command, timeout_secs)
+}
+
+/// [`run_capture`] for a command already built — for callers that also set
+/// its environment. `name` is how errors refer to it.
+///
+/// Blocking: call it off the main thread.
+pub fn run_command(
+    mut cmd: std::process::Command,
+    name: &str,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let command = name;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("Could not run {command}: {err}"))?;
 
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    // Each pipe is drained on its own thread into a shared buffer, and the
+    // thread says when it reached end-of-file. Waiting on that signal with a
+    // deadline — never joining the thread — is what keeps the timeout honest:
+    // a background job the command started (an rc's `foo &`) inherits the
+    // pipes and can hold them open long after the command itself exits.
+    // Ceiling: such a job is not killed, only no longer waited for.
+    type Drained = (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>);
+    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel();
+        let sink = Arc::clone(&buffer);
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut bytes) = sink.lock() {
+                                bytes.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                }
             }
-            bytes
-        })
+            let _ = done.send(());
+        });
+        (buffer, finished)
     };
     let stdout = drain(
         child
@@ -413,31 +470,40 @@ pub fn run_capture(
         }
     };
 
+    // The command has exited, so everything it wrote is already in the pipes;
+    // only a background job writes later. A short grace, shared by both pipes,
+    // lets the drains catch up. Waiting until the overall deadline instead
+    // would make a leaky rc cost the full timeout on every probe.
+    const EXIT_GRACE: Duration = Duration::from_millis(500);
+    let grace_end = Instant::now() + EXIT_GRACE;
+    let collect = |(buffer, finished): Drained| -> Vec<u8> {
+        let wait = grace_end.saturating_duration_since(Instant::now());
+        if finished.recv_timeout(wait).is_err() {
+            debug!("{command} exited but left its output open; taking what arrived");
+        }
+        buffer.lock().map(|bytes| bytes.clone()).unwrap_or_default()
+    };
     Ok(std::process::Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: collect(stdout),
+        stderr: collect(stderr),
     })
 }
 
 /// Resolves the working directory to use, handling ~ expansion and fallback to home.
+///
+/// A path that exists but is not a directory falls back too: the spawn would
+/// otherwise fail on it.
 pub fn resolve_working_directory(starting_dir: &str, home_dir: &str) -> String {
-    let mut work_dir = starting_dir.trim().to_string();
+    let work_dir = expand_tilde_with(starting_dir, home_dir);
     if work_dir.is_empty() {
-        home_dir.to_string()
+        return home_dir.to_string();
+    }
+    if std::path::Path::new(&work_dir).is_dir() {
+        work_dir
     } else {
-        if work_dir.starts_with('~') {
-            work_dir = work_dir.replacen('~', home_dir, 1);
-        }
-        if std::path::Path::new(&work_dir).exists() {
-            work_dir
-        } else {
-            warn!(
-                "Configured starting directory '{}' does not exist, falling back to home directory",
-                work_dir
-            );
-            home_dir.to_string()
-        }
+        warn!("Starting directory '{work_dir}' is not a directory, falling back to home directory");
+        home_dir.to_string()
     }
 }
 
@@ -1736,6 +1802,28 @@ mod tests {
     }
 
     #[test]
+    fn a_background_job_holding_the_pipes_does_not_outlast_the_timeout() {
+        // What an rc's `foo &` does to a probe: the shell exits, the job keeps
+        // its stdout. The call must come back, with what was printed, shortly
+        // after the exit — not at the (here generous) overall timeout.
+        let started = std::time::Instant::now();
+        let output = run_capture(
+            "sh",
+            &["-c".to_string(), "echo found; sleep 30 &".to_string()],
+            None,
+            10,
+        )
+        .expect("the command itself finished");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "found");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "waited on the background job: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn test_resolve_working_directory() {
         let dir = tempdir().unwrap();
         let home_dir = dir.path().to_str().unwrap().to_string();
@@ -1764,5 +1852,16 @@ mod tests {
             resolve_working_directory("~/projects", &home_dir),
             sub_dir_str
         );
+
+        // A file is not somewhere a session can start.
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(
+            resolve_working_directory(file.to_str().unwrap(), &home_dir),
+            home_dir
+        );
+
+        // `~user` is someone else's home: not spliced onto ours.
+        assert_eq!(expand_tilde_with("~projects", &home_dir), "~projects");
     }
 }

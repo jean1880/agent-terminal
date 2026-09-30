@@ -34,10 +34,12 @@ window.
   and **Close Tab**. A clean exit still closes the tab as you would expect.
 - **Attention when a turn finishes**: a bell in a background tab marks that tab,
   with an optional desktop notification — so an agent that finishes while you are
-  elsewhere actually reaches you.
+  elsewhere actually reaches you. The notification also fires for the tab in view
+  when the window itself is in the background, and is cleared once you look.
 - **Scrollback search**: `Ctrl + Shift + F`, with case-sensitivity and regex
   toggles.
-- **Session restore**: reopens the tabs, and their directories, from last time.
+- **Session restore** (off by default): reopens the tabs, and their directories,
+  of the last window closed, each as a fresh session.
 - **Selectable colour themes**: Antigravity (default), Dracula, Nord, Gruvbox
   Dark, Solarized Dark, One Dark, and Monokai — applied live to every open tab.
 - **Profiles**: any CLI, with its own arguments, directory and environment,
@@ -46,8 +48,12 @@ window.
   process. See [Profiles](#profiles).
 - **Settings**: starting directory (validated as you type), scrollback lines,
   font and font scale, cursor shape and blink, profile, theme, notifications and
-  session restore — each applied immediately and persisted to
-  `~/.config/agent-terminal/config.json`.
+  session restore — each applied immediately, to every window, and persisted to
+  `~/.config/agent-terminal/config.json`. Hand edits to that file are picked up
+  while the app runs (profile and indicator lists in the header refresh in new
+  windows). A file that cannot be parsed is copied aside
+  (`config.json.invalid-…`) and reported before defaults can replace it; an
+  edit that does not parse yet suspends saving until it is fixed.
 - **Shortcuts**:
   | Keys | Action |
   |---|---|
@@ -57,10 +63,16 @@ window.
   | `Ctrl + Shift + F` | Search the scrollback |
   | `Ctrl + Shift + C` / `V` | Copy / paste |
   | `Ctrl + Tab` / `Ctrl + Shift + Tab` | Next / previous tab |
+  | `Ctrl + Page Down` / `Page Up` | Next / previous tab |
   | `Alt + 1`…`8`, `Alt + 9` | Jump to tab, or the last tab |
+  | `Ctrl + Alt + 1`…`9` | New tab as the Nth profile, in the current folder |
   | `Ctrl + Plus` / `Minus` | Zoom (persisted) |
   | `Ctrl + 0` | Reset zoom |
   | `Ctrl + Left-Click` | Open a hovered hyperlink |
+
+  These are caught before the terminal sees them, so the CLI never receives
+  them. Two a CLI might otherwise use: `Ctrl + Minus`, which terminals send as
+  `^_` (undo in readline), and `Alt + 1`…`9`, readline's numeric arguments.
 - **Observability**: logs to the systemd journal, with a panic hook, so a
   desktop-launched failure is diagnosable after the fact:
   ```bash
