@@ -135,13 +135,53 @@ Branch: `feat/checkpoints` (off `master` @ b1a7ceb0)
       `add_css_class`). Popovers look light under Broadway; that's app-wide
       and not new.
 - [x] WP2 gate: fmt, clippy clean, 155/155
-- [ ] WP2 rust-reviewer round 2 (delta)
-- [ ] WP2 commit
-- [ ] WP3: `src/worktree.rs` written (pure paths/branch checks + git
-      add/remove/is_clean, 3 unit + 1 real-repo test), **not hooked up yet**
-      (no `mod worktree;`). Remaining: the dialog, actions/menus/Ctrl+Shift+G,
-      TabState.worktree + tooltip, the close toast, restore of a missing
-      dir, `worktree_root` config, docs.
+- [x] WP2 rust-reviewer round 2: **PASS**
+- [x] WP2 committed on `feat/checkpoints`
+- [x] WP3 code:
+      - `src/worktree.rs`: pure paths and branch checks, plus git
+        add/remove/is_clean. A leading `-` is refused, and `--` goes before
+        paths. The main tree comes from `--git-common-dir`, so a worktree tab
+        can spawn another.
+      - `win.new-tab-worktree` (Ctrl+Shift+G) and `new-tab-worktree-profile`,
+        plus right-click "New Tab in Worktree…" and "New Tab in Worktree As".
+      - the AlertDialog validates the branch and base off-thread, debounced
+        250 ms with a generation counter; Create stays insensitive until the
+        newest check passes; the location is previewed; ignored files are
+        noted; creation re-checks.
+      - `TabState.worktree` and a tooltip of `⎇ branch · checkpoint`
+        (`tab_tooltip`, tested).
+      - closing a worktree tab offers a Remove toast only if the worktree is
+        clean and no other open tab uses it. It never forces and never
+        deletes the branch.
+      - restore of a vanished folder shows a toast.
+      - flat config `worktree_root` with a Settings row validated as you type.
+      Deviations: the actions aren't disabled outside a repo; activating one
+      explains instead, since a menu item can't carry a tooltip. There's no
+      window-subtitle branch; the tooltip covers it.
+- [x] WP3 gate: fmt, clippy clean, 160/160
+- [x] WP3 live check (Broadway):
+      - Ctrl+Shift+G opens the dialog with the base defaulting to `master`
+        and a preview of `.live.worktrees/feat-live-check`
+      - Enter creates it and opens a tab there (`git worktree list` confirms)
+      - its diff panel reads "No changes"
+      - `exit` closes the tab and the "is clean — Remove" toast appears
+      - Remove takes the worktree away and keeps the branch
+        (`git branch --list` confirms)
+      - re-entering the now-existing branch shows "already exists" with
+        Create disabled
+- [x] WP3 docs: README (feature, shortcut, "Worktree tabs" section,
+      structure) and AGENTS.md (module, never-forced rule)
+- [x] WP3 review round 1: CHANGES-REQUIRED, 3 SHOULD. All fixed:
+      - "clean" now includes **ignored files**, because `worktree remove`
+        deletes them silently; tested.
+      - in-use is re-checked when Remove is clicked.
+      - add/remove get a 120 s timeout, with a `git worktree prune` hint on
+        timeout.
+      Also: `main_toplevel` refuses submodules and separate git dirs (tested
+      with `--separate-git-dir`), and there are tests for names that read as
+      options. Gate: 162/162.
+- [x] WP3 review round 2: **PASS**
+- [x] WP3 committed on `feat/checkpoints`
 - [ ] WP3 worktree tabs
 - [ ] WP4 restore (after soak)
 

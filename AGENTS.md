@@ -35,8 +35,13 @@ Architectural mandates, standards, and workflows for this codebase.
   hand-off briefs, redaction, quota detection), `git.rs` (git plumbing for
   turn checkpoints and diffs: shells out, but its parsers and filters are
   pure), `diff.rs` (pure logic: diff bases, numstat, line classification,
-  truncation), `window/imp.rs` (GTK UI), `window/diff_panel.rs` (the diff
-  panel's widgets), `main.rs` (app setup + logging).
+  truncation), `worktree.rs` (worktree locations, branch checks, create and
+  clean-only remove), `window/imp.rs` (GTK UI), `window/diff_panel.rs` (the
+  diff panel's widgets), `main.rs` (app setup + logging).
+- **Worktrees are never removed by force**: removal is offered only for a
+  clean worktree that no open tab is in, runs `git worktree remove` without
+  `--force`, and never deletes the branch. Names reaching git are refused if
+  they start with `-`, and paths follow `--`.
 - **Checkpoints never touch the user's git state**: snapshots go through a
   private index file under the git dir, and are recorded only as refs under
   `refs/agent-terminal/`, created with an empty old value so none is

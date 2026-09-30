@@ -17,6 +17,7 @@ mod handoff;
 mod theme;
 mod utils;
 mod window;
+mod worktree;
 use window::AgentTerminalWindow;
 
 const APP_ID: &str = "com.jdesroches.AgentTerminal";
@@ -120,6 +121,7 @@ fn main() -> glib::ExitCode {
             ("win.paste", &["<Ctrl><Shift>V"]),
             ("win.search", &["<Ctrl><Shift>F"]),
             ("win.toggle-diff", &["<Ctrl><Shift>D"]),
+            ("win.new-tab-worktree", &["<Ctrl><Shift>G"]),
             // Both the shifted and unshifted key, so Ctrl+= works on layouts
             // where + needs Shift.
             (

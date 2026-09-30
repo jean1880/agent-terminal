@@ -407,6 +407,10 @@ pub struct TerminalConfig {
     pub diff_panel_visible: bool,
     /// The diff panel's width in pixels, as last dragged.
     pub diff_panel_width: i32,
+    /// Where New Tab in Worktree puts worktrees, as `<root>/<repo>/<branch>`.
+    /// Blank means a hidden sibling of the repository,
+    /// `<parent>/.<repo>.worktrees/<branch>`.
+    pub worktree_root: String,
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
     pub indicators: Vec<Indicator>,
@@ -613,6 +617,7 @@ impl Default for TerminalConfig {
             checkpoints: true,
             diff_panel_visible: false,
             diff_panel_width: 520,
+            worktree_root: String::new(),
             indicators: Vec::new(),
             clear_env: default_clear_env(),
             disk_stamp: std::cell::Cell::default(),

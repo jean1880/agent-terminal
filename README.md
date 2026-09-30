@@ -35,6 +35,9 @@ window.
 - **Diff panel**: `Ctrl + Shift + D` shows what changed beside the terminal:
   uncommitted work, the last turn, or everything since the tab opened. See
   [Diff panel](#diff-panel).
+- **New Tab in Worktree**: `Ctrl + Shift + G` creates a branch in its own git
+  worktree and opens a tab there, so two agents can work on one repository
+  without trampling each other. See [Worktree tabs](#worktree-tabs).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -68,6 +71,7 @@ window.
   | `Ctrl + Shift + R` | Restart the current session |
   | `Ctrl + Shift + F` | Search the scrollback |
   | `Ctrl + Shift + D` | Show or hide the diff panel |
+  | `Ctrl + Shift + G` | New tab in a new worktree |
   | `Ctrl + Shift + C` / `V` | Copy / paste |
   | `Ctrl + Tab` / `Ctrl + Shift + Tab` | Next / previous tab |
   | `Ctrl + Page Down` / `Page Up` | Next / previous tab |
@@ -318,6 +322,33 @@ and textconv drivers are not run. Diffs above 1 MiB or 20,000 lines are cut
 short, and one with more than 200,000 changed lines shows only its file
 list. Whether new tabs open with the panel, and its width, are remembered.
 
+### Worktree tabs
+**New Tab in Worktree…** (`Ctrl + Shift + G`, or the right-click menu, where
+**New Tab in Worktree As** also picks the CLI) asks for a new branch and what to
+start it from. It defaults to the current tab's branch. Both are checked as you
+type, and **Create** stays disabled until they pass. It then runs
+`git worktree add -b <branch>` and opens a tab in the new worktree.
+
+Worktrees go in a hidden folder beside the repository,
+`<parent>/.<repo>.worktrees/<branch>`. They're hidden so tools that scan every
+project folder don't index a second copy of the repository. Set **Worktree
+Folder** in Settings to use `<folder>/<repo>/<branch>` instead. Ignored files
+(`node_modules`, `.env`, build output) aren't copied into a new worktree.
+
+Closing a worktree tab offers **Remove**, but only when the worktree has
+nothing uncommitted, no untracked files, no ignored files, and no other open
+tab is in it. Ignored files count because `git worktree remove` would delete
+them without asking. The in-use check runs again when you click. Removal never
+uses `--force` and never deletes the branch. Anything else is simply kept.
+Submodules and repositories with a separate git directory aren't supported.
+To clean up by hand:
+
+```bash
+git worktree list
+git worktree remove <path>      # refuses if it has changes
+git branch -d <branch>          # refuses if it is unmerged
+```
+
 ### Generating a Debian package (.deb)
 ```bash
 make package
@@ -348,6 +379,8 @@ actually links.
 - `src/diff.rs` — pure logic for the diff panel: bases, numstat parsing, line
   classification and truncation.
 - `src/window/diff_panel.rs` — the diff panel's widgets.
+- `src/worktree.rs` — New Tab in Worktree: default locations, branch checks,
+  and creating and (clean-only) removing worktrees.
 
 ## Contributing 🤝
 
