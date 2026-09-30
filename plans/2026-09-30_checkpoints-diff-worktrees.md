@@ -252,7 +252,11 @@ Branch: `feat/checkpoints` (off `master` @ b1a7ceb0)
       scratch repo>} }`, then playwright on the returned url.
 - [x] Release: bumped to 2.1.0, merged `feat/checkpoints` into master
       (`96b45611`), gate re-run on master (173/173), pushed; the
-      debian-maintainer build was triggered via its MCP
+      debian-maintainer build was triggered via its MCP. The first build came
+      out as `1:2.0.0-8`: the pipeline versions from `git describe --tags`,
+      not Cargo.toml. After tagging `v2.1.0` (annotated, on `96b45611`) and a
+      `rebuild_task` (a tag on an already-built commit is not seen as new),
+      **`1:2.1.0-1+debmaintainer` built successfully (18:02).**
 - [ ] Still open, needs the user: WP0.1/WP0.2. Run a turn in each CLI and
       check `journalctl --user -t agent-terminal -g Bell`: which CLIs ring the
       bell at the end of a turn, and whether any never goes quiet. Then
