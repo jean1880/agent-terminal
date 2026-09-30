@@ -1,5 +1,6 @@
 //! Private implementation details of the AgentTerminalWindow.
 
+use super::diff_panel::DiffPanel;
 use crate::config::{Profile, SessionFormat};
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
@@ -70,6 +71,112 @@ struct TabState {
     /// any window is still waiting. Tracked here rather than read from the
     /// page's attention marker, which the quota banner also sets.
     bell_pending: bool,
+    /// When the terminal last showed new output. A turn is taken to have
+    /// ended once this has been quiet for [`CHECKPOINT_QUIET`]. Kept apart
+    /// from `screen_dirty`, which the quota poll consumes.
+    last_output: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+    checkpoint: CheckpointTrack,
+    /// What changed in this tab's repository, beside the terminal.
+    diff_panel: DiffPanel,
+    /// Set for a tab opened by New Tab in Worktree, so closing it can offer
+    /// to remove a worktree left clean.
+    worktree: Option<crate::worktree::WorktreeInfo>,
+}
+
+/// How long a tab's output must be still before its turn counts as over and
+/// its working tree is checkpointed. A CLI that redraws constantly (a clock in
+/// its status line) never goes quiet; its bell is then the only trigger.
+const CHECKPOINT_QUIET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// After this long, an attempt whose result never arrived is treated as lost
+/// and the tab may try again. Its result can go missing when the tab is
+/// dragged between windows at the moment it lands. Comfortably above the
+/// worst case of a snapshot: every git step at its timeout, plus the retry.
+const CHECKPOINT_STALE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Per-tab checkpoint bookkeeping. See [`crate::git`].
+#[derive(Default)]
+struct CheckpointTrack {
+    /// The `last_output` a checkpoint was last attempted for, so a quiet tab
+    /// is snapshotted once rather than on every poll.
+    attempted_for: Option<std::time::Instant>,
+    /// When the attempt in flight started, if one is.
+    started: Option<std::time::Instant>,
+    /// Why the last attempt failed. Shown on the tab until one succeeds.
+    error: Option<String>,
+}
+
+impl CheckpointTrack {
+    fn running(&self) -> bool {
+        self.started
+            .is_some_and(|started| started.elapsed() < CHECKPOINT_STALE)
+    }
+}
+
+/// What a checkpoint attempt came to, off the main thread.
+enum CheckpointResult {
+    NotRepo,
+    Done(crate::git::CheckpointOutcome),
+    Failed(String),
+}
+
+/// A tab's tooltip: the worktree branch it was opened on, if any, and its
+/// latest checkpoint, if any.
+fn tab_tooltip(branch: Option<&str>, checkpoint: Option<&str>) -> String {
+    match (branch, checkpoint) {
+        (Some(branch), Some(checkpoint)) => format!("⎇ {branch} · {checkpoint}"),
+        (Some(branch), None) => format!("⎇ {branch}"),
+        (None, Some(checkpoint)) => checkpoint.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// What a checkpoint result shows: the toast a manual request gets, and the
+/// tab tooltip, which only a new checkpoint changes.
+#[derive(Debug, PartialEq, Eq)]
+struct CheckpointReport {
+    toast: String,
+    tooltip: Option<String>,
+}
+
+fn describe_checkpoint(result: &CheckpointResult, time: &str) -> CheckpointReport {
+    use crate::git::CheckpointOutcome;
+    let plain = |toast: &str| CheckpointReport {
+        toast: toast.to_string(),
+        tooltip: None,
+    };
+    match result {
+        CheckpointResult::NotRepo => plain("Not a git repository: nothing to checkpoint"),
+        CheckpointResult::Done(CheckpointOutcome::Busy) => {
+            plain("Git is busy in this repository; try again shortly")
+        }
+        CheckpointResult::Done(CheckpointOutcome::Unchanged) => {
+            plain("No changes since the last checkpoint")
+        }
+        CheckpointResult::Done(CheckpointOutcome::Created(cp, skipped)) => {
+            let mut text = format!("Checkpoint {} · {time}", cp.seq);
+            if !skipped.is_empty() {
+                text.push_str(&format!(" · {} path(s) not captured", skipped.len()));
+            }
+            CheckpointReport {
+                toast: text.clone(),
+                tooltip: Some(text),
+            }
+        }
+        CheckpointResult::Failed(err) => plain(&format!("Checkpoint failed: {err}")),
+    }
+}
+
+/// Finds `dir`'s repository and checkpoints it. Blocking.
+fn run_checkpoint(dir: &str, key: u64, label: &str) -> CheckpointResult {
+    match crate::git::discover(std::path::Path::new(dir)) {
+        Ok(None) => CheckpointResult::NotRepo,
+        Ok(Some(repo)) => match crate::git::take_checkpoint(&repo, key, label) {
+            Ok(outcome) => CheckpointResult::Done(outcome),
+            Err(err) => CheckpointResult::Failed(err),
+        },
+        Err(err) => CheckpointResult::Failed(err),
+    }
 }
 
 /// Source of [`TabState::key`].
@@ -582,6 +689,8 @@ pub struct AgentTerminalWindow {
     /// Set while a transcript quota check is running off-thread, so a slow
     /// disk cannot stack up overlapping checks.
     quota_poll_running: std::cell::Cell<bool>,
+    /// Wraps the tab view, for short confirmations that need no dialog.
+    toast_overlay: RefCell<Option<adw::ToastOverlay>>,
 }
 
 #[glib::object_subclass]
@@ -597,6 +706,7 @@ impl ObjectImpl for AgentTerminalWindow {
         self.setup_ui();
         self.setup_actions();
         self.start_quota_watch();
+        self.start_checkpoint_watch();
         self.watch_focus();
         self.report_config_problem();
     }
@@ -780,6 +890,7 @@ impl AgentTerminalWindow {
             term.set_scrollback_lines(i64::from(scrollback));
             term.set_font_scale(scale);
         });
+        self.recolour_diff_panels(theme);
         // An open Settings dialog's font-scale spin follows too; its other
         // rows show the old values until reopened.
         self.for_each_window(|window| {
@@ -1018,6 +1129,45 @@ impl AgentTerminalWindow {
             obj.add_action(&action);
         }
 
+        // New Tab in Worktree, as the active profile or a named one.
+        let new_tab_worktree = gtk4::gio::SimpleAction::new("new-tab-worktree", None);
+        new_tab_worktree.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: New Tab in Worktree");
+                obj.imp().new_tab_in_worktree(None);
+            }
+        ));
+        obj.add_action(&new_tab_worktree);
+        let new_tab_worktree_as = gtk4::gio::SimpleAction::new(
+            "new-tab-worktree-profile",
+            Some(&String::static_variant_type()),
+        );
+        new_tab_worktree_as.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
+                    warn!("new-tab-worktree-profile activated without a profile name");
+                    return;
+                };
+                let imp = obj.imp();
+                let profile = imp
+                    .config
+                    .borrow()
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == profile_name)
+                    .cloned();
+                match profile {
+                    Some(profile) => imp.new_tab_in_worktree(Some(profile)),
+                    None => warn!("No profile named '{profile_name}'"),
+                }
+            }
+        ));
+        obj.add_action(&new_tab_worktree_as);
+
         // Ctrl+Alt+1..9 open the Nth profile, so switching CLI (e.g. to Gemini
         // when Claude runs out of tokens) needs no menu. Indexed because an
         // accelerator is bound once per app, before any profile list is known.
@@ -1063,6 +1213,38 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&restart_action);
+
+        // Checkpoint the current tab's working tree now, whatever the setting:
+        // asking is an explicit choice.
+        let checkpoint_action = gtk4::gio::SimpleAction::new("checkpoint-now", None);
+        checkpoint_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Checkpoint Now");
+                let imp = obj.imp();
+                let page = imp
+                    .tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|v| v.selected_page());
+                if let Some(page) = page {
+                    imp.request_checkpoint(&page, true);
+                }
+            }
+        ));
+        obj.add_action(&checkpoint_action);
+
+        let toggle_diff = gtk4::gio::SimpleAction::new("toggle-diff", None);
+        toggle_diff.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Toggle Diff Panel");
+                obj.imp().toggle_diff_panel();
+            }
+        ));
+        obj.add_action(&toggle_diff);
 
         // New Tab in Folder Action (opens a folder picker)
         let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
@@ -1430,7 +1612,11 @@ impl AgentTerminalWindow {
         }
 
         container.append(&tab_bar);
-        container.append(&tab_view);
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&tab_view));
+        toast_overlay.set_vexpand(true);
+        container.append(&toast_overlay);
+        *self.toast_overlay.borrow_mut() = Some(toast_overlay);
 
         // Immediately confirm tab closures (no unsaved-state prompt for a terminal).
         tab_view.connect_close_page(|view, page| {
@@ -1473,6 +1659,9 @@ impl AgentTerminalWindow {
                 // looked at any more.
                 for tab in &leaving {
                     imp.withdraw_quota_notification(tab.key);
+                    if let Some(worktree) = &tab.worktree {
+                        imp.offer_worktree_removal(worktree.clone());
+                    }
                 }
                 imp.withdraw_bell_if_answered();
             }
@@ -1670,16 +1859,40 @@ impl AgentTerminalWindow {
             .action_target(&"".to_variant())
             .build();
         let screen_dirty = std::rc::Rc::new(std::cell::Cell::new(true));
+        let last_output = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
         terminal.connect_contents_changed(glib::clone!(
             #[strong]
             screen_dirty,
-            move |_| screen_dirty.set(true)
+            #[strong]
+            last_output,
+            move |_| {
+                screen_dirty.set(true);
+                last_output.set(std::time::Instant::now());
+            }
         ));
+        // The terminal and, beside it, the tab's diff panel. The panel keeps
+        // its width as the window resizes; the terminal takes the rest.
+        let (diff_panel, paned) = {
+            let config = self.config.borrow();
+            let panel = DiffPanel::new(&Theme::diff_colours(config.theme));
+            panel.set_shown(config.diff_panel_visible);
+            let paned = gtk4::Paned::builder()
+                .orientation(Orientation::Horizontal)
+                .start_child(&stack)
+                .end_child(&panel.root)
+                .resize_start_child(true)
+                .resize_end_child(false)
+                .shrink_end_child(false)
+                .vexpand(true)
+                .build();
+            (panel, paned)
+        };
+        self.wire_diff_panel(&diff_panel, &paned);
         let tab_content = Box::builder().orientation(Orientation::Vertical).build();
         tab_content.append(&quota_banner);
         tab_content.append(&exit_bar);
         tab_content.append(&search_bar);
-        tab_content.append(&stack);
+        tab_content.append(&paned);
 
         // Add the page and focus it.
         let tab_view = match self.tab_view.borrow().as_ref() {
@@ -1750,9 +1963,16 @@ impl AgentTerminalWindow {
             key: next_tab_key(),
             quota_notified: false,
             bell_pending: false,
+            last_output,
+            checkpoint: CheckpointTrack::default(),
+            diff_panel: diff_panel.clone(),
+            worktree: None,
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
+        if diff_panel.root.is_visible() {
+            self.refresh_diff(&page);
+        }
     }
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
@@ -1831,6 +2051,13 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
+                // Info, not debug: which CLIs ring at the end of a turn decides
+                // whether the bell or the quiet timer drives their checkpoints.
+                // Demote to debug once that is recorded (plan WP0.1, F4/F5).
+                info!("Bell in tab \"{}\"", page.title());
+                if imp.config.borrow().checkpoints {
+                    imp.request_checkpoint(&page, false);
+                }
                 let is_selected = imp
                     .tab_view
                     .borrow()
@@ -1905,13 +2132,34 @@ impl AgentTerminalWindow {
             state.tabs.len()
         );
         let profiles = self.config.borrow().profiles.clone();
+        let mut missing = Vec::new();
         for tab in &state.tabs {
             let profile = tab
                 .profile
                 .as_ref()
                 .and_then(|name| profiles.iter().find(|p| &p.name == name))
                 .or(fallback);
+            // A folder can be gone since — a removed worktree, most often. The
+            // tab still opens, in the starting folder, but not silently.
+            if !std::path::Path::new(&tab.dir).is_dir() {
+                missing.push(tab.dir.clone());
+            }
             self.add_terminal_tab(profile, Some(&tab.dir));
+        }
+        if let Some(first) = missing.first() {
+            let others = missing.len() - 1;
+            let more = if others == 0 {
+                String::new()
+            } else {
+                format!(" and {others} more")
+            };
+            warn!(
+                "Restored tab folder(s) no longer exist: {}",
+                missing.join(", ")
+            );
+            self.show_toast(&format!(
+                "{first}{more} no longer exists; opened in your home folder instead"
+            ));
         }
 
         if let Some(view) = self.tab_view.borrow().as_ref() {
@@ -2101,8 +2349,15 @@ impl AgentTerminalWindow {
             Some("New Tab in Folder As"),
             &self.build_profile_menu("win.new-tab-folder-profile", |_| true),
         );
+        menu.append(Some("New Tab in Worktree…"), Some("win.new-tab-worktree"));
+        menu.append_submenu(
+            Some("New Tab in Worktree As"),
+            &self.build_profile_menu("win.new-tab-worktree-profile", |_| true),
+        );
         menu.append(Some("New Window"), Some("app.new-window"));
         menu.append(Some("Restart Session"), Some("win.restart-tab"));
+        menu.append(Some("Checkpoint Now"), Some("win.checkpoint-now"));
+        menu.append(Some("Show or Hide Changes"), Some("win.toggle-diff"));
         menu.append_section(None, &self.build_session_section());
 
         let section = gtk4::gio::Menu::new();
@@ -2603,6 +2858,21 @@ impl AgentTerminalWindow {
             .active(config.restore_session)
             .build();
 
+        let checkpoints_row = adw::SwitchRow::builder()
+            .title("Checkpoint Each Turn")
+            .subtitle("Snapshot a git repository into hidden refs when a turn ends, for diffing")
+            .active(config.checkpoints)
+            .build();
+
+        let worktree_root_entry = gtk4::Entry::builder()
+            .text(&config.worktree_root)
+            .hexpand(true)
+            .valign(gtk4::Align::Center)
+            .placeholder_text("Blank: a hidden folder beside the repository")
+            .build();
+        let worktree_root_row = adw::ActionRow::builder().title("Worktree Folder").build();
+        worktree_root_row.add_suffix(&worktree_root_entry);
+
         group.add(&starting_directory_row);
         group.add(&scrollback_row);
         group.add(&font_row);
@@ -2614,6 +2884,8 @@ impl AgentTerminalWindow {
         group.add(&notify_row);
         group.add(&notify_quota_row);
         group.add(&restore_row);
+        group.add(&checkpoints_row);
+        group.add(&worktree_root_row);
         page.add(&group);
         dialog.add(&page);
 
@@ -2705,6 +2977,41 @@ impl AgentTerminalWindow {
             }
         ));
 
+        worktree_root_entry.connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            worktree_root_row,
+            move |entry| {
+                let text = entry.text().to_string();
+                // Like the starting directory: a folder that does not exist is
+                // refused here, not discovered when a worktree cannot be made.
+                if !directory_is_usable(&text) {
+                    entry.add_css_class("error");
+                    worktree_root_row.set_subtitle("That directory does not exist");
+                    return;
+                }
+                entry.remove_css_class("error");
+                worktree_root_row.set_subtitle("");
+                let imp = obj.imp();
+                if imp.config.borrow().worktree_root == text {
+                    return;
+                }
+                imp.config.borrow_mut().worktree_root = text;
+                imp.schedule_config_save();
+            }
+        ));
+
+        checkpoints_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().checkpoints = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
+
         // Settings apply as they change rather than in one batch when the dialog
         // closes. AdwPreferencesDialog has no close-request signal to hang a batch
         // commit on, and applying per-row is better behaved anyway: each change is
@@ -2746,6 +3053,7 @@ impl AgentTerminalWindow {
                 // Themes apply live to every open tab; no restart needed.
                 obj.imp()
                     .for_each_terminal_everywhere(|term| Theme::apply(term, theme));
+                obj.imp().recolour_diff_panels(theme);
                 obj.imp().schedule_config_save();
             }
         ));
@@ -3550,6 +3858,779 @@ impl AgentTerminalWindow {
         );
     }
 
+    /// Checks every couple of seconds for tabs whose output has gone quiet.
+    /// In-memory only: git runs just for a tab that is due.
+    fn start_checkpoint_watch(&self) {
+        const CHECKPOINT_POLL_SECS: u32 = 2;
+        let obj = self.obj();
+        glib::timeout_add_seconds_local(
+            CHECKPOINT_POLL_SECS,
+            glib::clone!(
+                #[weak]
+                obj,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    obj.imp().poll_checkpoints();
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
+    /// Checkpoints each tab that has shown output since its last attempt and
+    /// has been quiet for [`CHECKPOINT_QUIET`] since.
+    fn poll_checkpoints(&self) {
+        if !self.config.borrow().checkpoints {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due: Vec<adw::TabPage> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| {
+                let last = tab.last_output.get();
+                !tab.checkpoint.running()
+                    && tab.checkpoint.attempted_for != Some(last)
+                    && now.saturating_duration_since(last) >= CHECKPOINT_QUIET
+            })
+            .map(|tab| tab.page.clone())
+            .collect();
+        for page in due {
+            self.request_checkpoint(&page, false);
+        }
+    }
+
+    /// Snapshots `page`'s working tree off the main thread. `manual` reports
+    /// every outcome as a toast; an automatic attempt stays silent unless git
+    /// fails, which marks the tab.
+    fn request_checkpoint(&self, page: &adw::TabPage, manual: bool) {
+        let (dir, key, label) = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+                return;
+            };
+            if tab.checkpoint.running() {
+                return;
+            }
+            tab.checkpoint.started = Some(std::time::Instant::now());
+            tab.checkpoint.attempted_for = Some(tab.last_output.get());
+            (
+                tab.dir.clone(),
+                tab.key,
+                tab.profile.clone().unwrap_or_else(|| "session".to_string()),
+            )
+        };
+        let child = page.child();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gtk4::gio::spawn_blocking(move || run_checkpoint(&dir, key, &label))
+                .await
+                .unwrap_or_else(|_| {
+                    CheckpointResult::Failed("the checkpoint thread panicked".to_string())
+                });
+            // Looked up afterwards, not captured: the tab may have been
+            // dragged to another window meanwhile, or closed.
+            let Some(obj) = window_of(&child) else {
+                return;
+            };
+            // Through the registry, not TabView::page, which is a critical
+            // (and a panic in the bindings) for a child it does not hold.
+            let page = obj
+                .imp()
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.page.child() == child)
+                .map(|t| t.page.clone());
+            if let Some(page) = page {
+                obj.imp().apply_checkpoint(&page, result, manual);
+            }
+        });
+    }
+
+    fn apply_checkpoint(&self, page: &adw::TabPage, result: CheckpointResult, manual: bool) {
+        let time = glib::DateTime::now_local()
+            .and_then(|now| now.format("%H:%M"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let report = describe_checkpoint(&result, &time);
+        // Decided under the borrow; the page is touched after it is released,
+        // since its property setters emit notify signals synchronously.
+        let (error, branch) = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
+                return;
+            };
+            let branch = tab.worktree.as_ref().map(|w| w.branch.clone());
+            let track = &mut tab.checkpoint;
+            track.started = None;
+            match &result {
+                CheckpointResult::Done(crate::git::CheckpointOutcome::Busy) => {
+                    // Git is mid-operation; the next poll tries again.
+                    track.attempted_for = None;
+                }
+                CheckpointResult::Done(crate::git::CheckpointOutcome::Created(cp, _)) => {
+                    info!("Checkpoint {} for tab {}", cp.refname, tab.key);
+                    track.error = None;
+                }
+                CheckpointResult::Failed(err) => {
+                    warn!("Checkpoint failed in {}: {err}", tab.dir);
+                    track.error = Some(err.clone());
+                }
+                CheckpointResult::NotRepo
+                | CheckpointResult::Done(crate::git::CheckpointOutcome::Unchanged) => {
+                    track.error = None;
+                }
+            }
+            (track.error.clone(), branch)
+        };
+
+        if let Some(tooltip) = &report.tooltip {
+            page.set_tooltip(&tab_tooltip(branch.as_deref(), Some(tooltip)));
+        }
+        match error {
+            Some(err) => {
+                page.set_indicator_icon(Some(&gtk4::gio::ThemedIcon::new(
+                    "dialog-warning-symbolic",
+                )));
+                page.set_indicator_tooltip(&format!("Checkpoint failed: {err}"));
+            }
+            None => {
+                page.set_indicator_icon(None::<&gtk4::gio::Icon>);
+                page.set_indicator_tooltip("");
+            }
+        }
+        if manual {
+            self.show_toast(&report.toast);
+        }
+        // A new checkpoint moves the "last turn" and "this tab" bases.
+        if matches!(
+            result,
+            CheckpointResult::Done(crate::git::CheckpointOutcome::Created(..))
+        ) {
+            self.refresh_diff(page);
+        }
+    }
+
+    /// Connects a new tab's diff panel: its refresh requests, its first
+    /// placement, and remembering the width it is dragged to.
+    fn wire_diff_panel(&self, panel: &DiffPanel, paned: &gtk4::Paned) {
+        // Found at click time, like the exit bar's buttons: the tab may have
+        // been dragged to another window since.
+        let root = panel.root.clone();
+        panel.connect_refresh(move || {
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            let imp = obj.imp();
+            let page = imp
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.diff_panel.root == root)
+                .map(|t| t.page.clone());
+            if let Some(page) = page {
+                imp.refresh_diff(&page);
+            }
+        });
+
+        let root = panel.root.clone();
+        let base_of = panel.clone();
+        panel.connect_undo(move |target| {
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            let imp = obj.imp();
+            let page = imp
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.diff_panel.root == root)
+                .map(|t| t.page.clone());
+            let to = match base_of.base() {
+                crate::diff::DiffBase::ThisTab => "how they were when this tab started",
+                _ => "how they were before the last turn",
+            };
+            if let Some(page) = page {
+                imp.confirm_restore(&page, target, to);
+            }
+        });
+
+        // A Paned cannot be told "give the end child N pixels" before it has
+        // measured its layout, and showing the panel changes that layout. So
+        // the saved width is applied from the paned's own layout notifications,
+        // once per show (DiffPanel::place), and only a later move that is a
+        // real drag is saved (DiffPanel::dragged_width). The handlers go when
+        // the paned is disposed with its tab.
+        let placer = panel.clone();
+        paned.connect_notify_local(Some("max-position"), move |paned, _| {
+            if let Some(obj) = window_of(paned) {
+                let width = obj.imp().config.borrow().diff_panel_width;
+                placer.place(paned, width);
+            }
+        });
+        let watcher = panel.clone();
+        paned.connect_position_notify(move |paned| {
+            let Some(obj) = window_of(paned) else {
+                return;
+            };
+            let imp = obj.imp();
+            let saved = imp.config.borrow().diff_panel_width;
+            // A layout change can arrive as a position change alone.
+            watcher.place(paned, saved);
+            let Some(width) = watcher.dragged_width(paned) else {
+                return;
+            };
+            if width != saved {
+                imp.config.borrow_mut().diff_panel_width = width;
+                imp.schedule_config_save();
+            }
+        });
+    }
+
+    /// Shows or hides the current tab's diff panel. The choice also becomes
+    /// the default for new tabs.
+    fn toggle_diff_panel(&self) {
+        let Some(page) = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.selected_page())
+        else {
+            return;
+        };
+        let Some(panel) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.page == page)
+            .map(|t| t.diff_panel.clone())
+        else {
+            return;
+        };
+        let visible = !panel.root.is_visible();
+        // Placed by the paned's layout notifications once it has re-measured.
+        panel.set_shown(visible);
+        self.config.borrow_mut().diff_panel_visible = visible;
+        self.schedule_config_save();
+        if visible {
+            self.refresh_diff(&page);
+        }
+    }
+
+    /// Recomputes `page`'s diff off the main thread, if its panel is showing.
+    fn refresh_diff(&self, page: &adw::TabPage) {
+        let Some((dir, key, panel)) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page)
+            .map(|t| (t.dir.clone(), t.key, t.diff_panel.clone()))
+        else {
+            return;
+        };
+        if !panel.root.is_visible() {
+            return;
+        }
+        let base = panel.base();
+        let generation = panel.begin();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gtk4::gio::spawn_blocking(move || {
+                crate::git::tab_diff(std::path::Path::new(&dir), key, base)
+            })
+            .await
+            .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+            panel.show(generation, result);
+        });
+    }
+
+    /// Follows a theme change in every window's diff panels.
+    fn recolour_diff_panels(&self, theme: crate::config::ThemeChoice) {
+        let colours = Theme::diff_colours(theme);
+        self.for_each_window(|window| {
+            let panels: Vec<DiffPanel> = window
+                .tabs
+                .borrow()
+                .iter()
+                .map(|t| t.diff_panel.clone())
+                .collect();
+            for panel in panels {
+                panel.set_colours(&colours);
+            }
+        });
+    }
+
+    /// New Tab in Worktree: checks, off the main thread, that the current
+    /// tab is in a repository, then asks for the branch to create.
+    fn new_tab_in_worktree(&self, profile: Option<Profile>) {
+        let Some(dir) = self.current_dir() else {
+            return;
+        };
+        let obj = self.obj();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let found = gtk4::gio::spawn_blocking(move || {
+                    let dir = std::path::Path::new(&dir);
+                    crate::worktree::main_toplevel(dir)
+                        .map(|main| (main, crate::worktree::current_branch(dir)))
+                })
+                .await
+                .unwrap_or_else(|_| Err("the repository check panicked".to_string()));
+                match found {
+                    Ok((main, branch)) => obj.imp().show_worktree_dialog(main, branch, profile),
+                    Err(err) => present_message(
+                        &obj,
+                        "Not in a Git Repository",
+                        &format!(
+                            "New Tab in Worktree starts from the current tab's repository, \
+                             and its folder is not in one.\n\n{err}"
+                        ),
+                    ),
+                }
+            }
+        ));
+    }
+
+    /// Asks for the new branch and its base, checking both as they are typed.
+    fn show_worktree_dialog(
+        &self,
+        main: std::path::PathBuf,
+        current: Option<String>,
+        profile: Option<Profile>,
+    ) {
+        let root = {
+            let root = self.config.borrow().worktree_root.trim().to_string();
+            (!root.is_empty()).then(|| std::path::PathBuf::from(crate::utils::expand_tilde(&root)))
+        };
+
+        let branch = gtk4::Entry::builder()
+            .placeholder_text("feat/my-change")
+            .activates_default(true)
+            .build();
+        let base = gtk4::Entry::builder()
+            .text(current.as_deref().unwrap_or("HEAD"))
+            .activates_default(true)
+            .build();
+        let problem = Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["error"])
+            .build();
+        let location = Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .selectable(true)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let note = Label::builder()
+            .label(
+                "Ignored files (node_modules, .env, build output) are not copied into a \
+                 new worktree.",
+            )
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let form = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(6)
+            .build();
+        form.append(&Label::builder().label("Branch").xalign(0.0).build());
+        form.append(&branch);
+        form.append(&Label::builder().label("Starting from").xalign(0.0).build());
+        form.append(&base);
+        form.append(&location);
+        form.append(&problem);
+        form.append(&note);
+
+        let dialog = adw::AlertDialog::new(
+            Some("New Tab in Worktree"),
+            Some("Creates a branch in a worktree of its own and opens a tab there."),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
+        dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("create"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_enabled("create", false);
+        dialog.set_extra_child(Some(&form));
+
+        // Each edit supersedes the check before it: only the newest may
+        // enable Create. Checked after a pause, and off the main thread.
+        let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let validate = std::rc::Rc::new(glib::clone!(
+            #[weak]
+            dialog,
+            #[weak]
+            branch,
+            #[weak]
+            base,
+            #[weak]
+            problem,
+            #[weak]
+            location,
+            #[strong]
+            main,
+            #[strong]
+            root,
+            #[strong]
+            generation,
+            move || {
+                let current = generation.get().wrapping_add(1);
+                generation.set(current);
+                dialog.set_response_enabled("create", false);
+                let name = branch.text().trim().to_string();
+                let start = base.text().trim().to_string();
+                if name.is_empty() {
+                    location.set_text("");
+                    problem.set_text("");
+                    return;
+                }
+                location.set_text(&format!(
+                    "In {}",
+                    crate::worktree::default_path(&main, &name, root.as_deref()).display()
+                ));
+                let main = main.clone();
+                let generation = generation.clone();
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(250),
+                    glib::clone!(
+                        #[weak]
+                        dialog,
+                        #[weak]
+                        problem,
+                        move || {
+                            if generation.get() != current {
+                                return;
+                            }
+                            glib::MainContext::default().spawn_local(async move {
+                                let checked = gtk4::gio::spawn_blocking(move || {
+                                    crate::worktree::check_new_branch(&main, &name)?;
+                                    crate::worktree::resolve_base(&main, &start).map(|_| ())
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("the check panicked".to_string()));
+                                if generation.get() != current {
+                                    return;
+                                }
+                                match checked {
+                                    Ok(()) => {
+                                        problem.set_text("");
+                                        dialog.set_response_enabled("create", true);
+                                    }
+                                    Err(err) => problem.set_text(&err),
+                                }
+                            });
+                        }
+                    ),
+                );
+            }
+        ));
+        for entry in [&branch, &base] {
+            let validate = validate.clone();
+            entry.connect_changed(move |_| validate());
+        }
+
+        let obj = self.obj();
+        branch.grab_focus();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let response = dialog
+                    .choose_future(Some(obj.upcast_ref::<gtk4::Widget>()))
+                    .await;
+                if response != "create" {
+                    return;
+                }
+                let name = branch.text().trim().to_string();
+                let start = base.text().trim().to_string();
+                let path = crate::worktree::default_path(&main, &name, root.as_deref());
+                let info = crate::worktree::WorktreeInfo {
+                    path: path.clone(),
+                    branch: name.clone(),
+                    main_toplevel: main.clone(),
+                };
+                // Checked again: the repository may have moved on since.
+                let created = gtk4::gio::spawn_blocking(move || {
+                    crate::worktree::check_new_branch(&main, &name)?;
+                    let commit = crate::worktree::resolve_base(&main, &start)?;
+                    crate::worktree::add(&main, &name, &path, &commit)
+                })
+                .await
+                .unwrap_or_else(|_| Err("creating the worktree panicked".to_string()));
+                match created {
+                    Ok(()) => {
+                        info!(
+                            "Created worktree {} on {}",
+                            info.path.display(),
+                            info.branch
+                        );
+                        obj.imp().open_worktree_tab(info, profile);
+                    }
+                    Err(err) => present_message(&obj, "Could Not Create the Worktree", &err),
+                }
+            }
+        ));
+    }
+
+    /// Opens a tab in a worktree just created, and remembers it is one.
+    fn open_worktree_tab(&self, info: crate::worktree::WorktreeInfo, profile: Option<Profile>) {
+        let profile = profile.or_else(|| self.active_profile.borrow().clone());
+        let dir = info.path.to_string_lossy().to_string();
+        self.add_terminal_tab(profile.as_ref(), Some(&dir));
+        let page = {
+            let mut tabs = self.tabs.borrow_mut();
+            // The tab just added, unless adding failed and the last is another.
+            tabs.last_mut().filter(|t| t.dir == dir).map(|t| {
+                t.worktree = Some(info.clone());
+                t.page.clone()
+            })
+        };
+        if let Some(page) = page {
+            page.set_tooltip(&tab_tooltip(Some(&info.branch), None));
+        }
+    }
+
+    /// When a worktree tab closes and leaves its worktree clean, offers to
+    /// remove it. Never offered for a worktree another open tab is still in,
+    /// or one with anything uncommitted — that is simply kept.
+    fn offer_worktree_removal(&self, info: crate::worktree::WorktreeInfo) {
+        if self.worktree_in_use(&info.path) {
+            return;
+        }
+        let obj = self.obj();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let path = info.path.clone();
+                let clean = gtk4::gio::spawn_blocking(move || crate::worktree::is_clean(&path))
+                    .await
+                    .unwrap_or_else(|_| Err("the status check panicked".to_string()));
+                match clean {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!("Worktree {} has changes; keeping it", info.path.display());
+                        return;
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Worktree {} not offered for removal: {err}",
+                            info.path.display()
+                        );
+                        return;
+                    }
+                }
+                let toast = adw::Toast::builder()
+                    .title(format!("Worktree ⎇ {} is clean", info.branch))
+                    .use_markup(false)
+                    .button_label("Remove")
+                    .timeout(10)
+                    .build();
+                toast.connect_button_clicked(glib::clone!(
+                    #[weak]
+                    obj,
+                    move |_| obj.imp().remove_worktree(info.clone())
+                ));
+                if let Some(overlay) = obj.imp().toast_overlay.borrow().as_ref() {
+                    overlay.add_toast(toast);
+                }
+            }
+        ));
+    }
+
+    /// Whether any open tab, in any window, is in the worktree at `path`.
+    fn worktree_in_use(&self, path: &std::path::Path) -> bool {
+        let in_use = std::cell::Cell::new(false);
+        self.for_each_window(|window| {
+            if window
+                .tabs
+                .borrow()
+                .iter()
+                .any(|t| std::path::Path::new(&t.dir).starts_with(path))
+            {
+                in_use.set(true);
+            }
+        });
+        in_use.get()
+    }
+
+    /// Removes a worktree the user asked to, keeping its branch.
+    fn remove_worktree(&self, info: crate::worktree::WorktreeInfo) {
+        // Asked again at the click: a tab may have opened there while the
+        // offer was up, and git does not check who is inside a worktree.
+        // Whether it is still clean, `worktree remove` checks itself.
+        if self.worktree_in_use(&info.path) {
+            self.show_toast("A tab is open in that worktree now; it was kept");
+            return;
+        }
+        let obj = self.obj();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let (main, path) = (info.main_toplevel.clone(), info.path.clone());
+                let removed =
+                    gtk4::gio::spawn_blocking(move || crate::worktree::remove(&main, &path))
+                        .await
+                        .unwrap_or_else(|_| Err("removing the worktree panicked".to_string()));
+                match removed {
+                    Ok(()) => {
+                        info!("Removed worktree {}", info.path.display());
+                        obj.imp().show_toast(&format!(
+                            "Removed the worktree; branch {} is kept",
+                            info.branch
+                        ));
+                    }
+                    Err(err) => present_message(&obj, "Could Not Remove the Worktree", &err),
+                }
+            }
+        ));
+    }
+
+    /// Undo: pins the working tree, shows what restoring `page`'s tree to
+    /// `target` would do, and does it only if confirmed. `to` finishes
+    /// "Puts … back to" in the confirmation.
+    fn confirm_restore(&self, page: &adw::TabPage, target: String, to: &'static str) {
+        let Some((dir, key, mid_turn)) =
+            self.tabs
+                .borrow()
+                .iter()
+                .find(|t| &t.page == page)
+                .map(|t| {
+                    let quiet_for = t.last_output.get().elapsed();
+                    (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
+                })
+        else {
+            return;
+        };
+        let obj = self.obj();
+        let page = page.clone();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let prepared = gtk4::gio::spawn_blocking(move || {
+                    let repo = crate::git::discover(std::path::Path::new(&dir))?
+                        .ok_or_else(|| "This tab's folder is not in a repository".to_string())?;
+                    let plan = crate::restore::prepare(&repo, key, &target)?;
+                    Ok::<_, String>((repo, plan))
+                })
+                .await
+                .unwrap_or_else(|_| Err("preparing the undo panicked".to_string()));
+                let (repo, plan) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        present_message(&obj, "Could Not Prepare the Undo", &err);
+                        return;
+                    }
+                };
+                if plan.changed.is_empty() {
+                    obj.imp()
+                        .show_toast("Nothing to undo: the files already match");
+                    return;
+                }
+
+                let dialog = adw::AlertDialog::new(Some("Undo These Changes?"), None);
+                let text = Label::builder()
+                    .label(crate::restore::summary(&plan, to, mid_turn))
+                    .wrap(true)
+                    .xalign(0.0)
+                    // Not selectable: as the dialog's first focusable widget it
+                    // would open with all of its text selected.
+                    .selectable(false)
+                    .build();
+                let scroll = ScrolledWindow::builder()
+                    .hscrollbar_policy(gtk4::PolicyType::Never)
+                    .max_content_height(360)
+                    .propagate_natural_height(true)
+                    .child(&text)
+                    .build();
+                dialog.set_extra_child(Some(&scroll));
+                dialog.add_responses(&[("cancel", "Cancel"), ("restore", "Undo Changes")]);
+                dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                let response = dialog
+                    .choose_future(Some(obj.upcast_ref::<gtk4::Widget>()))
+                    .await;
+                if response != "restore" {
+                    // Cancelled: the undo point is not needed.
+                    gtk4::gio::spawn_blocking(move || crate::restore::discard(&repo, &plan.pinned));
+                    return;
+                }
+
+                let pinned = plan.pinned.commit.clone();
+                let done = gtk4::gio::spawn_blocking(move || crate::restore::apply(&repo, &plan))
+                    .await
+                    .unwrap_or_else(|_| Err("the undo panicked".to_string()));
+                let imp = obj.imp();
+                match done {
+                    Ok(done) if done.mismatched.is_empty() && done.refused.is_empty() => {
+                        info!("Restored a tab's working tree; undo point {pinned}");
+                        let toast = adw::Toast::builder()
+                            .title("Changes undone")
+                            .button_label("Undo")
+                            .timeout(15)
+                            .build();
+                        toast.connect_button_clicked(glib::clone!(
+                            #[weak]
+                            obj,
+                            #[weak]
+                            page,
+                            move |_| obj.imp().confirm_restore(
+                                &page,
+                                pinned.clone(),
+                                "how they were before the undo"
+                            )
+                        ));
+                        if let Some(overlay) = imp.toast_overlay.borrow().as_ref() {
+                            overlay.add_toast(toast);
+                        }
+                    }
+                    Ok(done) => {
+                        warn!(
+                            "Restore left differences: {:?}; refused: {:?}",
+                            done.mismatched, done.refused
+                        );
+                        present_message(
+                            &obj,
+                            "Undo Was Incomplete",
+                            &format!(
+                                "These still differ from the checkpoint: {}\n\nNot deleted, \
+                                 being outside this folder: {}\n\nThe files as they were \
+                                 before are kept as commit {pinned}; restore it with\n\
+                                 git restore --source={pinned} --worktree -- :/",
+                                if done.mismatched.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    done.mismatched.join(", ")
+                                },
+                                if done.refused.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    done.refused.join(", ")
+                                },
+                            ),
+                        );
+                    }
+                    Err(err) => present_message(&obj, "Could Not Undo the Changes", &err),
+                }
+                imp.refresh_diff(&page);
+            }
+        ));
+    }
+
+    /// A short confirmation over the tab view. The text is data, not markup.
+    fn show_toast(&self, text: &str) {
+        if let Some(overlay) = self.toast_overlay.borrow().as_ref() {
+            overlay.add_toast(adw::Toast::builder().title(text).use_markup(false).build());
+        }
+    }
+
     /// One quota check across all tabs.
     ///
     /// A tab whose session the terminal knows, on a profile with transcripts,
@@ -3901,6 +4982,69 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_results_become_toasts_and_only_new_ones_change_the_tooltip() {
+        use crate::git::{Checkpoint, CheckpointOutcome, SkipReason, Skipped};
+        let created = CheckpointResult::Done(CheckpointOutcome::Created(
+            Checkpoint {
+                seq: 4,
+                refname: "refs/agent-terminal/1/0004".into(),
+                commit: "c".into(),
+                tree: "t".into(),
+            },
+            vec![Skipped {
+                path: ".env".into(),
+                reason: SkipReason::Secret,
+            }],
+        ));
+        assert_eq!(
+            describe_checkpoint(&created, "14:02"),
+            CheckpointReport {
+                toast: "Checkpoint 4 · 14:02 · 1 path(s) not captured".into(),
+                tooltip: Some("Checkpoint 4 · 14:02 · 1 path(s) not captured".into()),
+            }
+        );
+        for other in [
+            CheckpointResult::NotRepo,
+            CheckpointResult::Done(CheckpointOutcome::Busy),
+            CheckpointResult::Done(CheckpointOutcome::Unchanged),
+            CheckpointResult::Failed("boom".into()),
+        ] {
+            let report = describe_checkpoint(&other, "14:02");
+            assert_eq!(report.tooltip, None);
+            assert!(!report.toast.is_empty());
+        }
+        assert_eq!(
+            describe_checkpoint(&CheckpointResult::Failed("boom".into()), "").toast,
+            "Checkpoint failed: boom"
+        );
+    }
+
+    #[test]
+    fn a_worktree_tab_names_its_branch_before_its_checkpoint() {
+        assert_eq!(
+            tab_tooltip(Some("feat/x"), Some("Checkpoint 2 · 14:02")),
+            "⎇ feat/x · Checkpoint 2 · 14:02"
+        );
+        assert_eq!(tab_tooltip(Some("feat/x"), None), "⎇ feat/x");
+        assert_eq!(
+            tab_tooltip(None, Some("Checkpoint 1 · 09:00")),
+            "Checkpoint 1 · 09:00"
+        );
+        assert_eq!(tab_tooltip(None, None), "");
+    }
+
+    #[test]
+    fn a_lost_checkpoint_attempt_expires() {
+        let mut track = CheckpointTrack::default();
+        assert!(!track.running());
+        track.started = Some(std::time::Instant::now());
+        assert!(track.running());
+        // A result that never came back must not stop checkpoints for good.
+        track.started = std::time::Instant::now().checked_sub(CHECKPOINT_STALE);
+        assert!(!track.running());
+    }
+
+    #[test]
     fn only_a_zero_exit_counts_as_clean() {
         assert!(exited_cleanly(0));
         assert!(!exited_cleanly(256), "exit 1 must not be treated as clean");
@@ -3978,5 +5122,75 @@ mod tests {
             !config_home.path().join("agent-terminal").exists(),
             "window construction touched the config directory"
         );
+
+        // Here rather than in a test of its own: GTK belongs to the one
+        // thread that initialised it, and tests run on several.
+        diff_panel_shows_each_outcome();
+    }
+
+    fn diff_panel_shows_each_outcome() {
+        use crate::git::{DiffOutcome, TabDiff};
+        let panel = DiffPanel::new(&Theme::diff_colours(Default::default()));
+
+        let generation = panel.begin();
+        panel.show(generation, Err("fatal: <bad>".into()));
+        let (page, title, ..) = panel.visible_state();
+        assert_eq!((page.as_str(), title.as_str()), ("status", "Git failed"));
+
+        let generation = panel.begin();
+        panel.show(generation, Ok(DiffOutcome::NotRepo));
+        assert_eq!(panel.visible_state().1, "Not a git repository");
+
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: Vec::new(),
+                text: String::new(),
+                omitted_lines: 0,
+                too_large: false,
+                undo_to: None,
+            })),
+        );
+        assert_eq!(panel.visible_state().1, "No changes");
+        assert!(!panel.undo_offered());
+
+        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: crate::diff::parse_numstat(b"1\t1\tx\0"),
+                text: text.into(),
+                omitted_lines: 3,
+                too_large: false,
+                undo_to: Some("c0ffee".into()),
+            })),
+        );
+        assert!(panel.undo_offered());
+        let (page, _, summary, shown, rows) = panel.visible_state();
+        assert_eq!(page, "diff");
+        assert_eq!(summary, "1 file, +1 −1");
+        assert!(shown.starts_with(text));
+        assert!(shown.ends_with("3 more lines not shown"), "{shown}");
+        assert_eq!(rows, 1);
+
+        // Before the paned has a size, nothing is placed and no position is
+        // taken for the user's choice of width.
+        let paned = gtk4::Paned::builder()
+            .orientation(Orientation::Horizontal)
+            .end_child(&panel.root)
+            .build();
+        panel.set_shown(true);
+        panel.place(&paned, 400);
+        assert_eq!(panel.dragged_width(&paned), None);
+
+        // A slow refresh finishing after a newer one started is dropped.
+        let stale = panel.begin();
+        let current = panel.begin();
+        panel.show(stale, Ok(DiffOutcome::NotRepo));
+        assert_eq!(panel.visible_state().0, "diff");
+        panel.show(current, Ok(DiffOutcome::NotRepo));
+        assert_eq!(panel.visible_state().0, "status");
     }
 }

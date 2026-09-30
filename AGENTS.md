@@ -32,8 +32,33 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Module layout**: `config.rs` (persisted settings + migration), `theme.rs`
   (colour schemes, infallible `RGBA::new`), `utils.rs` (pure logic: detection,
   startup command, path resolution, session stores), `handoff.rs` (pure logic:
-  hand-off briefs, redaction, quota detection), `window/imp.rs` (GTK UI),
-  `main.rs` (app setup + logging).
+  hand-off briefs, redaction, quota detection), `git.rs` (git plumbing for
+  turn checkpoints and diffs: shells out, but its parsers and filters are
+  pure), `diff.rs` (pure logic: diff bases, numstat, line classification,
+  truncation), `restore.rs` (undo: pin, restore, contained deletion, check),
+  `worktree.rs` (worktree locations, branch checks, create and
+  clean-only remove), `window/imp.rs` (GTK UI), `window/diff_panel.rs` (the
+  diff panel's widgets), `main.rs` (app setup + logging).
+- **Undo is itself undoable, and only touches what it pinned**: a restore
+  always pins the current working tree first (even if unchanged), refuses to
+  run if the tree moved since that pin, never touches HEAD or the index, never
+  deletes outside the toplevel or through a symlinked directory, and leaves
+  files checkpoints skip alone. `restore::tests` proves each of these.
+- **Live GUI checks go through the preview MCP's `preview_app`**, never
+  hand-run `gtk4-broadwayd`/`dbus-run-session` shells. It isolates the D-Bus
+  session and XDG homes, and cleans up after itself.
+- **Worktrees are never removed by force**: removal is offered only for a
+  clean worktree that no open tab is in, runs `git worktree remove` without
+  `--force`, and never deletes the branch. Names reaching git are refused if
+  they start with `-`, and paths follow `--`.
+- **Checkpoints never touch the user's git state**: snapshots go through a
+  private index file under the git dir, and are recorded only as refs under
+  `refs/agent-terminal/`, created with an empty old value so none is
+  overwritten. The user's index, HEAD, working tree and stash are left
+  exactly as they were; `git::tests::repo` proves it, including with a split
+  index and in a linked worktree. Every git call strips inherited
+  `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
+  whose names look like secrets are never captured.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
   cannot summarize itself, so briefs are built from disk. Every brief goes
   through `handoff::redact` and is written `0600` in a `0700` directory outside
@@ -64,11 +89,14 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🧪 Testing Strategy
 
-- **Logic separation**: keep pure logic in `src/utils.rs`, `src/handoff.rs` and `src/config.rs`,
-  decoupled from GTK so it is unit-testable without a display. `window/imp.rs` is
+- **Logic separation**: keep pure logic in `src/utils.rs`, `src/handoff.rs` and `src/config.rs`
+  (plus the parsers and filters in `src/git.rs`),
+  decoupled from GTK so it is unit-testable without a display. `git.rs`'s
+  repository tests run real git in temp repos with a hermetic config (CI has
+  no git identity) and skip themselves when git is absent. `window/imp.rs` is
   covered by a construction smoke test plus tests for any pure helpers in it.
-- **Guard hand-maintained arrays**: `CliClient::ALL` and `ThemeChoice::ALL` drive
-  the settings dropdowns by index in both directions. Both have exhaustive-match
+- **Guard hand-maintained arrays**: `CliClient::ALL`, `ThemeChoice::ALL` and
+  `DiffBase::ALL` drive dropdowns by index in both directions. All have exhaustive-match
   tests so adding a variant fails to compile until the array is updated. Any new
   such array needs the same treatment.
 - **Update tests alongside** any change to detection, startup-command,

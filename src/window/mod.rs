@@ -1,5 +1,6 @@
 //! Main window implementation for Agent Terminal.
 
+mod diff_panel;
 mod imp;
 
 use gtk4::gio;

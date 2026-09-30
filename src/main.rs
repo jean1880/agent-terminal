@@ -11,10 +11,14 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub mod config;
+mod diff;
+mod git;
 mod handoff;
+mod restore;
 mod theme;
 mod utils;
 mod window;
+mod worktree;
 use window::AgentTerminalWindow;
 
 const APP_ID: &str = "com.jdesroches.AgentTerminal";
@@ -117,6 +121,8 @@ fn main() -> glib::ExitCode {
             ("win.copy", &["<Ctrl><Shift>C"]),
             ("win.paste", &["<Ctrl><Shift>V"]),
             ("win.search", &["<Ctrl><Shift>F"]),
+            ("win.toggle-diff", &["<Ctrl><Shift>D"]),
+            ("win.new-tab-worktree", &["<Ctrl><Shift>G"]),
             // Both the shifted and unshifted key, so Ctrl+= works on layouts
             // where + needs Shift.
             (

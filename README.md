@@ -29,6 +29,16 @@ window.
   folder whose first prompt points at a brief the terminal wrote from the
   transcript and the git state. **Continue In** on the menus does the same at
   any time. See [Handing off between CLIs](#handing-off-between-clis).
+- **Turn checkpoints**: in a git repository, the working tree is snapshotted
+  into hidden refs whenever a turn ends, without touching your branch, index
+  or stash. See [Turn checkpoints](#turn-checkpoints).
+- **Diff panel**: `Ctrl + Shift + D` shows what changed beside the terminal:
+  uncommitted work, the last turn, or everything since the tab opened. See
+  [Diff panel](#diff-panel). Its undo arrow reverts the last turn, keeping what
+  it replaces so the undo can itself be undone. See [Undoing a turn](#undoing-a-turn).
+- **New Tab in Worktree**: `Ctrl + Shift + G` creates a branch in its own git
+  worktree and opens a tab there, so two agents can work on one repository
+  without trampling each other. See [Worktree tabs](#worktree-tabs).
 - **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
   its scrollback intact and a bar explaining what happened, offering **Restart**
   and **Close Tab**. A clean exit still closes the tab as you would expect.
@@ -61,6 +71,8 @@ window.
   | `Ctrl + Shift + W` | Close tab |
   | `Ctrl + Shift + R` | Restart the current session |
   | `Ctrl + Shift + F` | Search the scrollback |
+  | `Ctrl + Shift + D` | Show or hide the diff panel |
+  | `Ctrl + Shift + G` | New tab in a new worktree |
   | `Ctrl + Shift + C` / `V` | Copy / paste |
   | `Ctrl + Tab` / `Ctrl + Shift + Tab` | Next / previous tab |
   | `Ctrl + Page Down` / `Page Up` | Next / previous tab |
@@ -262,6 +274,104 @@ reported as healthy. Commands run off the UI thread and are killed at their
 timeout. `"action": "send-to-terminal"` adds a button that types the detail into
 the running session, behind a preview.
 
+### Turn checkpoints
+In a tab whose folder is inside a git repository, the working tree is
+snapshotted each time a turn ends: when the CLI rings the bell, or when its
+output has been quiet for 8 seconds. **Checkpoint Now** on the right-click menu
+takes one on demand. The tab's tooltip shows the latest one. A snapshot that
+fails marks the tab with a warning icon, and the tooltip on that icon says why.
+
+Snapshots are commits recorded only as refs under `refs/agent-terminal/<tab>/`.
+They never touch your branch, index, working tree or stash. Each captures
+tracked changes plus untracked, non-ignored files. It leaves out files over
+5 MiB, more than 2,000 new files, nested repositories, and names that look
+like secrets (`.env*`, `*.pem`, `*.key`, `id_rsa*`, …). Each tab keeps 50
+checkpoints, and any checkpoint older than 7 days is deleted.
+
+A normal `git push` does not send these refs. `git push --mirror`, or a local
+`git clone` of the repository, **does**. Known limits: a dirty submodule's
+contents, and files ignored by `.gitignore`, are not captured. Tracked Git LFS
+files are stored in `.git/lfs/objects` with no size cap.
+
+Turn it off in Settings (**Checkpoint Each Turn**). To remove every checkpoint
+from a repository:
+
+```bash
+git for-each-ref --format='delete %(refname)' refs/agent-terminal | git update-ref --stdin
+```
+
+### Diff panel
+`Ctrl + Shift + D`, or **Show or Hide Changes** on the right-click menu, opens a
+read-only panel beside the terminal. It shows a file list with line counts, and
+a coloured unified diff below it. Clicking a file jumps to its diff. The
+dropdown picks what to compare against:
+
+| Base | Shows |
+|---|---|
+| **Uncommitted** | HEAD against the working tree now, untracked files included |
+| **Last turn** | What the tab's latest checkpoint changed |
+| **This tab** | Everything since the state the tab's first checkpoint was taken on top of, up to now |
+
+A tab's first checkpoint usually comes a few seconds after it opens, once the
+CLI's startup output goes quiet. Uncommitted work already present when the tab
+opened, and not changed before that first checkpoint, counts as the tab's in
+**This tab**.
+
+The panel refreshes when it opens, when a new checkpoint is taken, when the
+base changes, and on its refresh button. It never polls. Git's external diff
+and textconv drivers are not run. Diffs above 1 MiB or 20,000 lines are cut
+short, and one with more than 200,000 changed lines shows only its file
+list. Whether new tabs open with the panel, and its width, are remembered.
+
+### Undoing a turn
+With the diff panel on **Last turn** or **This tab**, the undo arrow puts the
+working tree back to the diff's left side: how it was before the last turn, or
+when the tab started. A confirmation lists every file that will change (`~`) or
+be deleted (`−`), and warns if the session still looks busy.
+
+- **The current state is saved first**, as
+  `refs/agent-terminal/<tab>/pre-restore-<time>`, and the **Undo** on the
+  "Changes undone" message puts it back.
+- **Nothing checkpoints never capture is touched**: ignored files, files over
+  5 MiB, names that look like secrets, nested repositories. The confirmation
+  names them.
+- **Commits and staged changes are never touched.** Only the working tree
+  changes; HEAD and the index stay as they are.
+- **If a file changes after you open the confirmation** (the agent still
+  writing), nothing is restored and you're asked to try again, so nothing
+  unsaved can be lost.
+- Deletions stay inside the repository and never follow a symlinked folder.
+- Afterwards the result is checked against the checkpoint. Anything that still
+  differs is reported, with the `git restore` command that puts the saved state
+  back by hand.
+
+### Worktree tabs
+**New Tab in Worktree…** (`Ctrl + Shift + G`, or the right-click menu, where
+**New Tab in Worktree As** also picks the CLI) asks for a new branch and what to
+start it from. It defaults to the current tab's branch. Both are checked as you
+type, and **Create** stays disabled until they pass. It then runs
+`git worktree add -b <branch>` and opens a tab in the new worktree.
+
+Worktrees go in a hidden folder beside the repository,
+`<parent>/.<repo>.worktrees/<branch>`. They're hidden so tools that scan every
+project folder don't index a second copy of the repository. Set **Worktree
+Folder** in Settings to use `<folder>/<repo>/<branch>` instead. Ignored files
+(`node_modules`, `.env`, build output) aren't copied into a new worktree.
+
+Closing a worktree tab offers **Remove**, but only when the worktree has
+nothing uncommitted, no untracked files, no ignored files, and no other open
+tab is in it. Ignored files count because `git worktree remove` would delete
+them without asking. The in-use check runs again when you click. Removal never
+uses `--force` and never deletes the branch. Anything else is simply kept.
+Submodules and repositories with a separate git directory aren't supported.
+To clean up by hand:
+
+```bash
+git worktree list
+git worktree remove <path>      # refuses if it has changes
+git branch -d <branch>          # refuses if it is unmerged
+```
+
 ### Generating a Debian package (.deb)
 ```bash
 make package
@@ -286,6 +396,16 @@ actually links.
   status indicators, path resolution, session stores.
 - `src/handoff.rs` — pure logic for hand-offs: brief building, redaction and
   quota detection.
+- `src/git.rs` — git plumbing for turn checkpoints and the diff panel: repo
+  discovery, snapshots through a private index, checkpoint refs, retention and
+  diffs.
+- `src/diff.rs` — pure logic for the diff panel: bases, numstat parsing, line
+  classification and truncation.
+- `src/window/diff_panel.rs` — the diff panel's widgets.
+- `src/restore.rs` — undoing a turn: saving the current state first, restoring
+  a checkpoint to the working tree, contained deletion and the check after.
+- `src/worktree.rs` — New Tab in Worktree: default locations, branch checks,
+  and creating and (clean-only) removing worktrees.
 
 ## Contributing 🤝
 
