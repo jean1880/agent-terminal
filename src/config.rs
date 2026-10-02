@@ -285,12 +285,13 @@ pub enum IndicatorAction {
 /// its own state with its own icon.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Indicator {
+    #[serde(alias = "name")]
     pub label: String,
     pub source: IndicatorSource,
     /// How often to re-check. `None` checks once at startup.
     #[serde(default)]
     pub refresh_secs: Option<u64>,
-    #[serde(default = "default_icon_ok")]
+    #[serde(default = "default_icon_ok", alias = "icon")]
     pub icon_ok: String,
     #[serde(default = "default_icon_warn")]
     pub icon_warn: String,
@@ -1543,6 +1544,46 @@ mod tests {
                 "{id}".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn indicators_load_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"indicators":[{"label":"LiteLLM","icon_ok":"network-server-symbolic","source":{"type":"command","argv":["litellm-sync","--indicator"],"timeout_secs":3}}]}"#)
+            .unwrap();
+        let config = TerminalConfig::load_from(&path);
+        assert_eq!(config.indicators.len(), 1);
+        assert_eq!(config.indicators[0].label, "LiteLLM");
+        assert_eq!(config.indicators[0].icon_ok, "network-server-symbolic");
+    }
+
+    #[test]
+    fn indicators_accept_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"indicators":[{"name":"LiteLLM","icon":"network-server-symbolic","source":{"type":"command","argv":["litellm-sync","--indicator"],"timeout_secs":3}}]}"#)
+            .unwrap();
+        let config = TerminalConfig::load_from(&path);
+        assert_eq!(config.indicators.len(), 1);
+        assert_eq!(config.indicators[0].label, "LiteLLM");
+        assert_eq!(config.indicators[0].icon_ok, "network-server-symbolic");
+    }
+
+    #[test]
+    fn local_config_file_parses_cleanly() {
+        let path = std::path::PathBuf::from("/home/jdesroches/.config/agent-terminal/config.json");
+        if path.exists() {
+            let config = TerminalConfig::load_from(&path);
+            assert_eq!(config.indicators.len(), 1);
+            assert_eq!(config.indicators[0].label, "LiteLLM");
+            assert_eq!(config.indicators[0].icon_ok, "network-server-symbolic");
+            assert!(take_load_problem().is_none(), "load problem was reported");
+        }
     }
 
     #[test]
