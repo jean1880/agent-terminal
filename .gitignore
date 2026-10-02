@@ -25,3 +25,6 @@ desktop.ini
 /target/
 **/*.rs.bk
 *.pdb
+
+# Agent overlays and local settings
+.claude/

@@ -414,6 +414,11 @@ pub struct TerminalConfig {
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
     pub indicators: Vec<Indicator>,
+    /// Optional command executed when an agent turn ends (on output quiescence).
+    /// Executed asynchronously in the background. `{id}` expands to the session ID if known,
+    /// `{dir}` expands to the tab's working directory.
+    #[serde(default)]
+    pub turn_command: Option<Vec<String>>,
     /// Environment variables removed from a spawned session's environment.
     /// A trailing `*` matches by prefix. See [`default_clear_env`].
     pub clear_env: Vec<String>,
@@ -619,6 +624,7 @@ impl Default for TerminalConfig {
             diff_panel_width: 520,
             worktree_root: String::new(),
             indicators: Vec::new(),
+            turn_command: None,
             clear_env: default_clear_env(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
@@ -1518,6 +1524,25 @@ mod tests {
             .write_all(br#"{"checkpoints":false}"#)
             .unwrap();
         assert!(!TerminalConfig::load_from(&path).checkpoints);
+    }
+
+    #[test]
+    fn turn_command_loads_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"turn_command":["litellm-sync","--session","{id}"]}"#)
+            .unwrap();
+        let config = TerminalConfig::load_from(&path);
+        assert_eq!(
+            config.turn_command,
+            Some(vec![
+                "litellm-sync".to_string(),
+                "--session".to_string(),
+                "{id}".to_string()
+            ])
+        );
     }
 
     #[test]

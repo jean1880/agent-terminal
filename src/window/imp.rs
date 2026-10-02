@@ -4011,6 +4011,31 @@ impl AgentTerminalWindow {
         ) {
             self.refresh_diff(page);
         }
+
+        // Optional turn command: runs asynchronously on turn quiescence.
+        if let Some(cmd) = &self.config.borrow().turn_command {
+            if let Some(prog) = cmd.first() {
+                let prog = prog.clone();
+                let (sess, dir) = {
+                    let tabs = self.tabs.borrow();
+                    let tab = tabs.iter().find(|t| &t.page == page);
+                    (
+                        tab.and_then(|t| t.session_id.clone().or_else(|| t.pinned_id.clone()))
+                            .unwrap_or_default(),
+                        tab.map(|t| t.dir.clone()).unwrap_or_default(),
+                    )
+                };
+                let args: Vec<String> = cmd[1..]
+                    .iter()
+                    .map(|arg| arg.replace("{id}", &sess).replace("{dir}", &dir))
+                    .collect();
+                gtk4::gio::spawn_blocking(move || {
+                    let mut command = std::process::Command::new(prog);
+                    command.args(&args);
+                    let _ = command.status();
+                });
+            }
+        }
     }
 
     /// Connects a new tab's diff panel: its refresh requests, its first
