@@ -150,28 +150,113 @@ fn contained(target: &Path, workspace: &Path) -> bool {
     true
 }
 
-/// Every named target is inside one workspace root (and there is at least one).
-fn inside_workspace(targets: &[&str], workspaces: &[PathBuf]) -> bool {
-    !targets.is_empty()
-        && targets
-            .iter()
-            .all(|t| workspaces.iter().any(|w| contained(Path::new(t), w)))
+/// Directory or file names that run code outside the agent when found anywhere below the
+/// workspace: git hooks and config (`.git`, also a worktree's `.git` file), direnv, editor task
+/// and launch configs, dev containers, hook managers, Cargo's `runner`/`build` config.
+const SENSITIVE_NAMES: &[&str] = &[
+    ".git",
+    ".envrc",
+    ".direnv",
+    ".vscode",
+    ".idea",
+    ".devcontainer",
+    ".husky",
+    ".pre-commit-config.yaml",
+    ".cargo",
+    ".gitlab-ci.yml",
+    ".circleci",
+];
+
+/// `target` below `base`, as components, trying `base` as given and then resolved (the target
+/// may be named by either the user's path or the real one).
+fn relative_to(target: &Path, base: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = target.strip_prefix(base) {
+        return Some(rel.to_owned());
+    }
+    let real = std::fs::canonicalize(base).ok()?;
+    target.strip_prefix(real).ok().map(Path::to_owned)
 }
 
-/// The policy table. `workspaces` are the session's workspace roots.
+fn names(rel: &Path) -> Vec<String> {
+    rel.components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether editing `target` (inside `workspace`) can run code outside the agent, so that
+/// `AcceptEdits` must still ask. Lexical, on top of [`contained`].
+///
+/// Sensitive: any path with a component in [`SENSITIVE_NAMES`]; `.github/workflows/**`; and,
+/// when the workspace is `home` or an ancestor of it, a top-level dotfile or anything under a
+/// top-level dot-directory of `home` (shell rc files, `~/.config` autostart and systemd user
+/// units, `~/.ssh`, `~/.gemini/config/hooks.json`, which is this gate's own wiring, `~/.claude`).
+/// Paths under `home` that do not start with a dot (`~/projects/x`) are ordinary.
+fn sensitive_target(target: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+    if let Some(rel) = relative_to(target, workspace) {
+        let parts = names(&rel);
+        if parts.iter().any(|p| SENSITIVE_NAMES.contains(&p.as_str()))
+            || parts
+                .windows(2)
+                .any(|w| w[0] == ".github" && w[1] == "workflows")
+        {
+            return true;
+        }
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    // The workspace is `home` or above it; a project below `home` is not exposed to the dotfiles.
+    let root = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
+    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+    if !(home.starts_with(workspace) || real_home.starts_with(&root)) {
+        return false;
+    }
+    relative_to(target, home)
+        .and_then(|rel| names(&rel).into_iter().next())
+        .is_some_and(|first| first.starts_with('.'))
+}
+
+/// Every named target is inside one workspace root (and there is at least one) and is not a
+/// [`sensitive_target`] there.
+fn auto_allowed(targets: &[&str], workspaces: &[PathBuf], home: Option<&Path>) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|t| {
+            let t = Path::new(t);
+            workspaces
+                .iter()
+                .any(|w| contained(t, w) && !sensitive_target(t, w, home))
+        })
+}
+
+/// [`policy_with_home`] with no home directory (tests of the workspace rules alone).
+#[cfg(test)]
+pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verdict {
+    policy_with_home(mode, query, workspaces, None)
+}
+
+/// The policy table. `workspaces` are the session's workspace roots; `home` is the user's home
+/// directory, for the dotfile rule of [`sensitive_target`].
 ///
 /// | mode | read-only | file edit | command / network / MCP / subagent | unknown |
 /// |---|---|---|---|---|
 /// | Plan | allow | deny | deny (network reads: ask) | ask |
 /// | Ask | allow | ask | ask | ask |
-/// | AcceptEdits | allow | allow inside the workspace, else ask | ask | ask |
-pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verdict {
+/// | AcceptEdits | allow | allow inside the workspace unless sensitive, else ask | ask | ask |
+pub fn policy_with_home(
+    mode: Mode,
+    query: &ApprovalQuery,
+    workspaces: &[PathBuf],
+    home: Option<&Path>,
+) -> Verdict {
     let class = classify(&query.tool);
     match (class, mode) {
         (ToolClass::ReadOnly, _) => Verdict::Allow,
         (_, Mode::Plan) if mutates(&query.tool) => Verdict::Deny("plan mode is read-only"),
         (ToolClass::Edit, Mode::AcceptEdits)
-            if inside_workspace(&edit_targets(&query.args), workspaces) =>
+            if auto_allowed(&edit_targets(&query.args), workspaces, home) =>
         {
             Verdict::Allow
         }
@@ -352,6 +437,8 @@ struct ServerInner {
     allowed: RefCell<HashSet<(String, String)>>,
     mode: Cell<Mode>,
     workspaces: Vec<PathBuf>,
+    /// The user's home, for the dotfile rule of [`sensitive_target`]; `None` applies no such rule.
+    home: Option<PathBuf>,
     deadline: Duration,
     /// Queries received and not yet matched to a tool step by the session's canary.
     queries: RefCell<HashMap<String, u32>>,
@@ -385,7 +472,20 @@ impl ApprovalHandle {
     pub fn bind_default(thread: &str, workspace: &Path, mode: Mode) -> Result<Self, String> {
         let dir = runtime_dir(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
             .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?;
-        let handle = Self::bind(&dir, thread, workspace, mode, DEFAULT_DEADLINE)?;
+        let hook_bin = std::env::current_exe()
+            .map_err(|e| format!("cannot resolve the running binary: {e}"))?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute());
+        let handle = Self::bind_with_home(
+            &dir,
+            thread,
+            workspace,
+            mode,
+            DEFAULT_DEADLINE,
+            hook_bin,
+            home,
+        )?;
         if let Some(path) = crate::always_allow::path() {
             handle.use_always_rules(path);
         }
@@ -424,6 +524,8 @@ impl ApprovalHandle {
 
     /// Binds `dir/approval-<pid>-<thread>.sock`. `workspace` bounds `AcceptEdits` auto-allows.
     /// Any failure is an `Err`: the caller then runs agy read-only (no hook, no env).
+    /// Tests only: no home directory, so no dotfile rule (`bind_default` supplies `$HOME`).
+    #[cfg(test)]
     pub fn bind(
         dir: &Path,
         thread: &str,
@@ -442,6 +544,7 @@ impl ApprovalHandle {
     /// (it would make every edit "inside"); a hook binary whose path ends in ` (deleted)` (the
     /// package was upgraded under the running app, and the hook entry would exec a stale or
     /// missing file).
+    #[cfg(test)]
     pub fn bind_with(
         dir: &Path,
         thread: &str,
@@ -449,6 +552,20 @@ impl ApprovalHandle {
         mode: Mode,
         deadline: Duration,
         hook_bin: PathBuf,
+    ) -> Result<Self, String> {
+        Self::bind_with_home(dir, thread, workspace, mode, deadline, hook_bin, None)
+    }
+
+    /// [`Self::bind_with`] with the user's home given: `bind_default` reads it from the
+    /// environment, tests pass their own so none reads the real one.
+    pub fn bind_with_home(
+        dir: &Path,
+        thread: &str,
+        workspace: &Path,
+        mode: Mode,
+        deadline: Duration,
+        hook_bin: PathBuf,
+        home: Option<PathBuf>,
     ) -> Result<Self, String> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         if hook_bin.to_string_lossy().ends_with(" (deleted)") {
@@ -505,6 +622,7 @@ impl ApprovalHandle {
             allowed: RefCell::new(HashSet::new()),
             mode: Cell::new(mode),
             workspaces: vec![workspace.to_owned()],
+            home,
             deadline,
             queries: RefCell::new(HashMap::new()),
             always: RefCell::new(None),
@@ -734,7 +852,12 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         .borrow_mut()
         .entry(query.tool.clone())
         .or_insert(0) += 1;
-    match policy(inner.mode.get(), &query, &inner.workspaces) {
+    match policy_with_home(
+        inner.mode.get(),
+        &query,
+        &inner.workspaces,
+        inner.home.as_deref(),
+    ) {
         Verdict::Allow => {
             return reply(
                 conn,
@@ -940,6 +1063,81 @@ mod tests {
         assert_eq!(policy(acc, &q("call_mcp_tool", Value::Null), &w), Ask);
         assert_eq!(policy(acc, &q("invoke_subagent", Value::Null), &w), Ask);
         assert_eq!(policy(acc, &q("search_web", Value::Null), &w), Ask);
+    }
+
+    #[test]
+    fn accept_edits_asks_for_paths_that_run_code_outside_the_agent() {
+        use Verdict::{Allow, Ask};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("mk");
+        let w = vec![repo.clone()];
+        let at = |rel: &str| edit("write_to_file", &repo.join(rel).to_string_lossy());
+        let acc = Mode::AcceptEdits;
+        assert_eq!(policy(acc, &at("src/main.rs"), &w), Allow);
+        assert_eq!(policy(acc, &at("src/.github.rs"), &w), Allow);
+        for rel in [
+            ".git/hooks/pre-commit",
+            ".git/config",
+            "sub/.git/hooks/post-merge",
+            ".envrc",
+            ".direnv/x",
+            ".vscode/tasks.json",
+            ".idea/workspace.xml",
+            ".github/workflows/ci.yml",
+            ".husky/pre-push",
+            ".cargo/config.toml",
+            ".GIT/config",
+        ] {
+            assert_eq!(policy(acc, &at(rel), &w), Ask, "{rel}");
+        }
+        // Other .github files are ordinary.
+        assert_eq!(policy(acc, &at(".github/CODEOWNERS"), &w), Allow);
+        // Plan still denies and Ask still asks, sensitive or not.
+        assert!(matches!(
+            policy(Mode::Plan, &at(".git/config"), &w),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(policy(Mode::Ask, &at("src/main.rs"), &w), Ask);
+    }
+
+    #[test]
+    fn a_workspace_that_is_home_asks_for_dotfiles_and_dot_directories() {
+        use Verdict::{Allow, Ask};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("projects/x/src")).expect("mk");
+        let acc = Mode::AcceptEdits;
+        let at = |rel: &str| edit("write_to_file", &home.join(rel).to_string_lossy());
+        for w in [vec![home.clone()], vec![tmp.path().to_owned()]] {
+            let p = |q: &ApprovalQuery| policy_with_home(acc, q, &w, Some(&home));
+            for rel in [
+                ".bashrc",
+                ".profile",
+                ".config/autostart/x.desktop",
+                ".config/systemd/user/a.service",
+                ".local/share/applications/a.desktop",
+                ".ssh/authorized_keys",
+                ".gemini/config/hooks.json",
+                ".claude/settings.json",
+            ] {
+                assert_eq!(p(&at(rel)), Ask, "{rel}");
+            }
+            assert_eq!(p(&at("projects/x/src/a.rs")), Allow);
+            assert_eq!(p(&at("notes.txt")), Allow);
+            assert_eq!(p(&at("projects/x/.git/config")), Ask);
+        }
+        // A project below home is not exposed to the dotfile rule, and an unknown home adds none.
+        let project = vec![home.join("projects/x")];
+        let target = edit(
+            "write_to_file",
+            &home.join("projects/x/.config/a").to_string_lossy(),
+        );
+        assert_eq!(policy_with_home(acc, &target, &project, Some(&home)), Allow);
+        assert_eq!(
+            policy_with_home(acc, &at(".bashrc"), std::slice::from_ref(&home), None),
+            Allow
+        );
     }
 
     #[test]
