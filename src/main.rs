@@ -16,6 +16,8 @@ mod approval_server;
 mod chat;
 pub mod config;
 mod hook_config;
+mod account_status;
+mod claude_probe;
 mod model_catalog;
 #[cfg(test)]
 mod testutil;
