@@ -19,6 +19,7 @@ mod chat;
 mod claude_probe;
 mod codex_probe;
 pub mod config;
+mod diff_tool;
 mod hook_config;
 mod icons;
 mod model_catalog;
@@ -84,6 +85,7 @@ fn main() -> glib::ExitCode {
         icons::register();
         load_css();
         window::watch_config_file(app);
+        diff_tool::sweep_stale();
 
         // Add "New Window" action
         let new_window_action = gtk4::gio::SimpleAction::new("new-window", None);
@@ -175,6 +177,9 @@ fn main() -> glib::ExitCode {
             );
         }
     });
+
+    // The old side of any file opened in an external diff tool is deleted with the app.
+    app.connect_shutdown(|_| diff_tool::remove_own());
 
     app.connect_activate(|app| {
         info!("Application activated: creating window");

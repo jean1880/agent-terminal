@@ -1,5 +1,6 @@
 // How a profile's `session_store` is laid out; defined with the readers in
 // `agent-kit` and re-exported so config and the app keep their old path.
+pub use agent_kit::difftool::DiffTool;
 pub use agent_kit::sessions::SessionFormat;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -468,6 +469,11 @@ pub struct TerminalConfig {
     /// `{dir}` expands to the tab's working directory.
     #[serde(default)]
     pub turn_command: Option<Vec<String>>,
+    /// 3.0: the external diff tool the file-change cards' and the diff panel's "Open in …"
+    /// buttons launch. `None` (the default, and what 2.x and early 3.0 configs read as) hides
+    /// the buttons. See [`DiffTool`] for the argv template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_tool: Option<DiffTool>,
     /// Environment variables removed from a spawned session's environment.
     /// A trailing `*` matches by prefix. See [`default_clear_env`].
     pub clear_env: Vec<String>,
@@ -680,6 +686,7 @@ impl Default for TerminalConfig {
             worktree_root: String::new(),
             indicators: Vec::new(),
             turn_command: None,
+            diff_tool: None,
             clear_env: default_clear_env(),
             default_agent: None,
             sidebar_collapsed: false,
@@ -1599,6 +1606,35 @@ mod tests {
                 "{id}".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn a_config_from_before_the_diff_tool_loads_without_one_and_one_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A 2.x / early-3.0 file: no `diff_tool` key at all.
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"checkpoints":true,"theme":"dracula","default_agent":"claude"}"#)
+            .unwrap();
+        let old = TerminalConfig::load_from(&path);
+        assert_eq!(old.diff_tool, None);
+        assert!(old.checkpoints, "the rest of the file still loads");
+
+        // Saving a config without a tool writes no key (older builds read it unchanged).
+        old.save_to(&path);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("diff_tool"));
+
+        let mut config = TerminalConfig::load_from(&path);
+        config.diff_tool = Some(DiffTool {
+            name: "Meld".into(),
+            argv: vec!["meld".into(), "{old}".into(), "{new}".into()],
+        });
+        config.save_to(&path);
+        let back = TerminalConfig::load_from(&path);
+        assert_eq!(back.diff_tool, config.diff_tool);
     }
 
     #[test]

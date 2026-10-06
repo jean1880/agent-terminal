@@ -12,15 +12,35 @@ use gtk4::prelude::*;
 use serde_json::Value;
 use sourceview5::prelude::*;
 
+use super::difftext::{self, DiffText};
 use super::markdown::{self, Block, TextKind};
 use super::model::{format_tokens, ApprovalState, Body, Item, QuestionState, Tone, ToolStatus};
 use super::payload;
+use crate::chat::DiffReply;
+use crate::diff_tool::{self, DiffTools};
 
 /// What a row asks of the view (the view owns the model and the backend).
 pub enum RowEvent {
-    Toggle { id: String, expanded: bool },
-    Approve { request: String, decision: Decision },
-    Answer { request: String, answers: Value },
+    Toggle {
+        id: String,
+        expanded: bool,
+    },
+    Approve {
+        request: String,
+        decision: Decision,
+    },
+    Answer {
+        request: String,
+        answers: Value,
+    },
+    /// A file-change card was asked to show its diff.
+    LoadDiff {
+        id: String,
+    },
+    /// A file-change card's "Open in ‹tool›".
+    OpenDiff {
+        id: String,
+    },
 }
 
 pub type RowSink = Rc<dyn Fn(RowEvent)>;
@@ -148,6 +168,15 @@ thread_local! {
     };
 }
 
+/// Gives `buffer` the app's dark source-view scheme (when GtkSourceView has one of them).
+pub(super) fn apply_scheme(buffer: &sourceview5::Buffer) {
+    SCHEME.with(|s| {
+        if let Some(scheme) = s {
+            buffer.set_style_scheme(Some(scheme));
+        }
+    });
+}
+
 /// A code block: language label + copy button over a read-only, highlighted source view.
 fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -173,11 +202,7 @@ fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
         buffer.set_language(Some(&lang));
         buffer.set_highlight_syntax(true);
     }
-    SCHEME.with(|s| {
-        if let Some(scheme) = s {
-            buffer.set_style_scheme(Some(scheme));
-        }
-    });
+    apply_scheme(&buffer);
     buffer.set_text(text);
     let view = sourceview5::View::with_buffer(&buffer);
     view.set_editable(false);
@@ -604,6 +629,43 @@ pub struct ToolCard {
     error: gtk4::Label,
     children: gtk4::Box,
     last_status: Cell<Option<ToolStatus>>,
+    /// File-change cards only: "View diff" and "Open in ‹tool›", and the diff they reveal.
+    diff: FileDiffUi,
+}
+
+/// The diff part of a file-change card.
+struct FileDiffUi {
+    bar: gtk4::Box,
+    toggle: gtk4::ToggleButton,
+    // Held so the widgets live as long as the card; read by the GTK checks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    open: gtk4::Button,
+    #[cfg_attr(not(test), allow(dead_code))]
+    open_label: gtk4::Label,
+    revealer: gtk4::Revealer,
+    status: gtk4::Label,
+    text: DiffText,
+}
+
+/// Shows or hides "Open in ‹tool›" and words the "View diff" tooltip to match the configured
+/// tool. Cheap; run on build and whenever the tool changes.
+fn refresh_diff_tool(open: &gtk4::Button, label: &gtk4::Label, toggle: &gtk4::ToggleButton) {
+    let tool = DiffTools::shared().get();
+    open.set_visible(tool.is_some());
+    match &tool {
+        Some(t) => {
+            label.set_text(&diff_tool::open_label(t));
+            open.set_tooltip_text(Some(&format!("Open this file in {}", t.name)));
+            toggle.set_tooltip_text(Some("Show this file's diff"));
+        }
+        None => {
+            // The button is hidden, so the hint lives where the user is looking.
+            toggle.set_tooltip_text(Some(&format!(
+                "Show this file's diff. {} to open it in an external viewer.",
+                diff_tool::NO_TOOL_HINT
+            )));
+        }
+    }
 }
 
 fn kind_icon(kind: ItemKind) -> &'static str {
@@ -680,6 +742,11 @@ impl ToolCard {
         header.set_child(Some(&head));
         root.append(&header);
 
+        // The diff bar sits under the header so it is there while the card is collapsed.
+        let diff = Self::build_diff_ui(id, sink);
+        root.append(&diff.bar);
+        root.append(&diff.revealer);
+
         let body = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
         body.add_css_class("card-body");
         let input = mono("");
@@ -730,13 +797,145 @@ impl ToolCard {
             error,
             children,
             last_status: Cell::new(None),
+            diff,
         }
+    }
+
+    fn build_diff_ui(id: &str, sink: &RowSink) -> FileDiffUi {
+        let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        bar.add_css_class("diff-bar");
+        bar.set_visible(false);
+        let toggle = gtk4::ToggleButton::with_label("View diff");
+        toggle.add_css_class("flat");
+        toggle.add_css_class("diff-toggle");
+        let open = gtk4::Button::new();
+        open.add_css_class("flat");
+        open.add_css_class("diff-open");
+        let open_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        open_row.append(&gtk4::Image::from_icon_name(crate::icons::EXTERNAL_ICON));
+        let open_label = label("", &[]);
+        open_row.append(&open_label);
+        open.set_child(Some(&open_row));
+        bar.append(&toggle);
+        bar.append(&open);
+
+        let status = label("", &["diff-status", "dim-label"]);
+        let text = DiffText::new();
+        text.widget().set_visible(false);
+        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        column.add_css_class("diff-section");
+        column.append(&status);
+        column.append(text.widget());
+        let revealer = gtk4::Revealer::new();
+        revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+        revealer.set_child(Some(&column));
+
+        refresh_diff_tool(&open, &open_label, &toggle);
+        let conn = DiffTools::shared().connect_changed(glib::clone!(
+            #[weak]
+            open,
+            #[weak]
+            open_label,
+            #[weak]
+            toggle,
+            move || refresh_diff_tool(&open, &open_label, &toggle)
+        ));
+        bar.connect_destroy(move |_| DiffTools::shared().disconnect(conn));
+
+        let (item, load_sink) = (id.to_owned(), sink.clone());
+        toggle.connect_toggled(glib::clone!(
+            #[weak]
+            revealer,
+            #[weak]
+            status,
+            move |toggle| {
+                revealer.set_reveal_child(toggle.is_active());
+                if toggle.is_active() {
+                    status.set_text("Loading diff…");
+                    status.set_visible(true);
+                    load_sink(RowEvent::LoadDiff { id: item.clone() });
+                }
+            }
+        ));
+        let (item, open_sink) = (id.to_owned(), sink.clone());
+        open.connect_clicked(move |_| open_sink(RowEvent::OpenDiff { id: item.clone() }));
+
+        FileDiffUi {
+            bar,
+            toggle,
+            open,
+            open_label,
+            revealer,
+            status,
+            text,
+        }
+    }
+
+    /// Shows the diff the host computed for this card.
+    pub fn show_diff(&self, reply: &DiffReply) {
+        let ui = &self.diff;
+        if !ui.toggle.is_active() {
+            return; // closed again before the answer arrived
+        }
+        match reply {
+            Ok(shown) if shown.text.trim().is_empty() => {
+                ui.status.set_text("No changes");
+                ui.status.set_visible(true);
+                ui.text.widget().set_visible(false);
+            }
+            Ok(shown) => {
+                ui.text.set(
+                    &shown.text,
+                    &difftext::notes_for(shown.origin, shown.omitted_lines),
+                );
+                ui.status.set_visible(false);
+                ui.text.widget().set_visible(true);
+            }
+            Err(why) => {
+                ui.status.set_text(why);
+                ui.status.set_visible(true);
+                ui.text.widget().set_visible(false);
+            }
+        }
+    }
+
+    /// The diff section's state (tests): toggle on, status text, diff text.
+    #[cfg(test)]
+    pub(super) fn diff_state(&self) -> (bool, String, String, String, Option<String>) {
+        (
+            self.diff.toggle.is_active(),
+            self.diff.status.text().to_string(),
+            self.diff.text.text(),
+            self.diff.text.notes(),
+            self.diff.text.language(),
+        )
+    }
+
+    /// Whether the card offers a diff at all, and whether it offers "Open in" (tests).
+    #[cfg(test)]
+    pub(super) fn diff_buttons(&self) -> (bool, bool, String) {
+        (
+            self.diff.bar.is_visible(),
+            self.diff.open.is_visible(),
+            self.diff.open_label.text().to_string(),
+        )
+    }
+
+    /// Clicks "View diff" (tests).
+    #[cfg(test)]
+    pub(super) fn click_view_diff(&self) {
+        self.diff.toggle.set_active(true);
     }
 
     fn update(&self, item: &Item) {
         let Body::Tool(tool) = &item.body else {
             return;
         };
+        let is_edit = tool.kind == ItemKind::FileChange;
+        self.diff.bar.set_visible(is_edit);
+        if !is_edit {
+            self.diff.revealer.set_reveal_child(false);
+        }
         if self.last_status.get() != Some(tool.status) {
             if let Some(prev) = self.last_status.get() {
                 self.root.remove_css_class(status_class(prev));
@@ -798,6 +997,11 @@ pub struct ApprovalCard {
     title: gtk4::Label,
     reason: gtk4::Label,
     input: gtk4::Label,
+    /// A file-edit request's proposed change, as a diff (instead of the tool-input JSON).
+    diff: DiffText,
+    /// The JSON behind that diff, one click away.
+    raw: gtk4::Expander,
+    raw_text: gtk4::Label,
     buttons: gtk4::Box,
     outcome: gtk4::Label,
     request: RefCell<String>,
@@ -845,6 +1049,15 @@ impl ApprovalCard {
         let input = mono("");
         input.add_css_class("approval-input");
         root.append(&input);
+        let diff = DiffText::new();
+        diff.widget().set_visible(false);
+        root.append(diff.widget());
+        let raw_text = mono("");
+        let raw = gtk4::Expander::new(Some("Show raw"));
+        raw.add_css_class("approval-raw");
+        raw.set_child(Some(&raw_text));
+        raw.set_visible(false);
+        root.append(&raw);
         let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let outcome = label("", &["approval-outcome"]);
         outcome.set_hexpand(true);
@@ -858,12 +1071,27 @@ impl ApprovalCard {
             title,
             reason,
             input,
+            diff,
+            raw,
+            raw_text,
             buttons,
             outcome,
             request: RefCell::new(String::new()),
             built_buttons: Cell::new(false),
             sink: sink.clone(),
         }
+    }
+
+    /// What the card shows of a file edit (tests): the files line, whether the diff and the "Show
+    /// raw" expander are visible, and the diff's text.
+    #[cfg(test)]
+    pub(super) fn diff_view(&self) -> (String, bool, bool, String) {
+        (
+            self.input.text().to_string(),
+            self.diff.widget().is_visible(),
+            self.raw.is_visible(),
+            self.diff.text(),
+        )
     }
 
     fn update(&self, item: &Item) {
@@ -878,19 +1106,53 @@ impl ApprovalCard {
         self.title.set_text(&title);
         self.reason.set_text(a.reason.as_deref().unwrap_or(""));
         self.reason.set_visible(a.reason.is_some());
-        let input = match &a.input {
-            Value::Null => String::new(),
-            v => {
-                let kind = if a.tool.eq_ignore_ascii_case("bash") || a.tool == "run_command" {
-                    ItemKind::Command
-                } else {
-                    ItemKind::Tool
-                };
-                payload::tool_input_text(kind, Some(v), "")
+        // A file edit is shown as the diff it proposes (computed from the request alone), with
+        // the JSON behind it one click away. Commands and everything else keep their input text.
+        let preview = agent_kit::editdiff::preview_from_input(&a.input);
+        let input = if preview.is_empty() {
+            match &a.input {
+                Value::Null => String::new(),
+                v => {
+                    let kind = if a.tool.eq_ignore_ascii_case("bash") || a.tool == "run_command" {
+                        ItemKind::Command
+                    } else {
+                        ItemKind::Tool
+                    };
+                    payload::tool_input_text(kind, Some(v), "")
+                }
             }
+        } else {
+            preview
+                .iter()
+                .map(|e| format!("{}  +{} −{}", e.path, e.added, e.removed))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         self.input.set_visible(!input.is_empty());
         self.input.set_text(&input);
+        if preview.is_empty() {
+            self.diff.widget().set_visible(false);
+            self.raw.set_visible(false);
+        } else {
+            let text: String = preview.iter().map(|e| e.diff.as_str()).collect();
+            let (kept, omitted) = agent_kit::diff::truncate(
+                &text,
+                agent_kit::diff::MAX_DIFF_BYTES,
+                agent_kit::diff::MAX_DIFF_LINES,
+            );
+            self.diff.set(
+                kept,
+                &difftext::notes_for(agent_kit::filediff::Origin::AgentEdit, omitted)
+                    .into_iter()
+                    .map(|n| n.replace("from the agent's edit", "Proposed change"))
+                    .collect::<Vec<_>>(),
+            );
+            self.diff.widget().set_visible(true);
+            let raw = serde_json::to_string_pretty(&a.input).unwrap_or_default();
+            self.raw_text
+                .set_text(&payload::cap_lines(&raw, MAX_CARD_LINES));
+            self.raw.set_visible(true);
+        }
 
         if !self.built_buttons.get() {
             self.built_buttons.set(true);

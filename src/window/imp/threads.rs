@@ -17,6 +17,7 @@ use agent_core::catalog::{model_notice, ModelNotice};
 use agent_core::event::{Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
 
+use super::diffs::ThreadDiffs;
 use super::*;
 use crate::account_status::AccountStatus;
 use crate::agent_proc::AgentEnv;
@@ -83,6 +84,8 @@ pub(super) struct ChatTab {
     /// A session start is in flight for a view that was built without one (its agent was not
     /// Ready); stops a second availability change from starting it twice.
     starting: bool,
+    /// The thread's pre-turn baselines and the source of its file-change cards' diffs.
+    pub(super) diffs: Rc<ThreadDiffs>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -391,7 +394,7 @@ fn load_thread(store: &Store, thread: &str) -> LoadedThread {
 const CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Polls `done` every `step` until it holds or `limit` passes; whether it held.
-async fn wait_until(
+pub(super) async fn wait_until(
     limit: std::time::Duration,
     step: std::time::Duration,
     done: impl Fn() -> bool,
@@ -1595,6 +1598,20 @@ impl AgentTerminalWindow {
             model: None,
             mode,
         });
+        let key = next_tab_key();
+        let diffs = {
+            let holder = holder.downgrade();
+            ThreadDiffs::new(
+                &summary.cwd,
+                key,
+                driver_label(driver),
+                Rc::new(move |text: &str| {
+                    if let Some(window) = holder.upgrade().as_ref().and_then(window_of) {
+                        window.imp().show_toast(text);
+                    }
+                }),
+            )
+        };
         self.tabs.borrow_mut().push(TabState {
             page: page.clone(),
             terminal,
@@ -1612,7 +1629,7 @@ impl AgentTerminalWindow {
             quota_banner: adw::Banner::new(""),
             quota: QuotaState::Unknown,
             screen_dirty: std::rc::Rc::new(std::cell::Cell::new(false)),
-            key: next_tab_key(),
+            key,
             quota_notified: false,
             bell_pending: false,
             last_output: std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
@@ -1643,6 +1660,7 @@ impl AgentTerminalWindow {
                 pending_switch: None,
                 unavailable: false,
                 starting: false,
+                diffs,
             }),
         });
         if diff_panel.root.is_visible() {
@@ -1731,9 +1749,13 @@ impl AgentTerminalWindow {
             loaded,
             hook,
         } = job;
-        let Some((slot, holder)) = self.tabs.borrow().iter().find_map(|t| {
+        let Some((slot, holder, diffs)) = self.tabs.borrow().iter().find_map(|t| {
             (&t.page == page)
-                .then(|| t.chat.as_ref().map(|c| (c.slot.clone(), c.holder.clone())))
+                .then(|| {
+                    t.chat
+                        .as_ref()
+                        .map(|c| (c.slot.clone(), c.holder.clone(), c.diffs.clone()))
+                })
                 .flatten()
         }) else {
             return; // closed while resolving
@@ -1747,6 +1769,7 @@ impl AgentTerminalWindow {
         view.set_vexpand(true);
         view.set_model_source(ModelCatalog::shared());
         view.set_account_status(AccountStatus::shared());
+        view.set_diff_source(diffs);
         view.replay(&history);
         holder.append(&view);
         *slot.view.borrow_mut() = Some(view.downgrade());
@@ -2000,9 +2023,21 @@ impl AgentTerminalWindow {
                     chat.running = true;
                     chat.rate_limited = false;
                     chat.rate_banner.set_revealed(false);
+                    // The state of the files before the turn, for "View diff".
+                    chat.diffs.turn_started(self.config.borrow().checkpoints);
                     After::Sidebar
                 }
+                Event::ItemStarted {
+                    kind: ItemKind::FileChange,
+                    ..
+                } => {
+                    if let Some(item) = &env.item {
+                        chat.diffs.item_started(item);
+                    }
+                    After::Nothing
+                }
                 Event::TurnCompleted { .. } => {
+                    chat.diffs.turn_ended();
                     chat.running = false;
                     chat.approval = false;
                     let attention = !(in_view && focused);
@@ -2014,6 +2049,7 @@ impl AgentTerminalWindow {
                     After::TurnDone { page, attention }
                 }
                 Event::SessionExited { .. } => {
+                    chat.diffs.turn_ended();
                     chat.running = false;
                     chat.approval = false;
                     After::Sidebar

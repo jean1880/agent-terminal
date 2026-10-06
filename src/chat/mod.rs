@@ -48,6 +48,28 @@ pub trait ModelSource {
     fn disconnect(&self, id: u64);
 }
 
+/// What a file-change card asks about: the transcript item and its tool input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffAsk {
+    /// The item's id, which names the turn it belongs to.
+    pub item: String,
+    /// The tool input (`Value::Null` when the agent gave none yet).
+    pub input: serde_json::Value,
+}
+
+/// A card's diff, or why there is none.
+pub type DiffReply = Result<agent_kit::filediff::Shown, String>;
+
+/// Where a file-change card gets its diff and opens it in the external tool. Implemented by the
+/// window (it knows the thread's repository and the turns' baselines); the view only asks.
+pub trait DiffSource {
+    /// Computes the diff off the main thread; `done` runs on the main thread.
+    fn load(&self, ask: DiffAsk, done: Box<dyn FnOnce(DiffReply)>);
+    /// Opens the item's (first) file in the configured external tool. Failures are reported to
+    /// the user by the implementation (a toast).
+    fn open_external(&self, ask: DiffAsk);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionStatus {
     pub driver: Driver,

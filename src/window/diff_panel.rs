@@ -6,6 +6,7 @@
 //! text logic is in [`crate::diff`].
 
 use crate::diff::{DiffBase, LineKind};
+use crate::diff_tool::DiffTools;
 use crate::git::{DiffOutcome, TabDiff};
 use crate::theme::DiffColours;
 use adw::prelude::*;
@@ -55,6 +56,22 @@ fn apply_view_colours(colours: &DiffColours) {
     });
 }
 
+/// A file the user asked to open in the external diff tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFile {
+    /// Repository-relative, as git named it.
+    pub path: String,
+    /// The commit or tree the old side is read from.
+    pub from: String,
+    /// The new side when it is a checkpoint; `None`: the working file.
+    pub to_checkpoint: Option<String>,
+}
+
+type OpenHandler = Rc<dyn Fn(OpenFile)>;
+
+/// The diff on show: its left side, and its right side when that is a checkpoint.
+type Sides = (String, Option<String>);
+
 /// The panel's widgets. Cheap to clone: every field is a reference.
 #[derive(Clone)]
 pub struct DiffPanel {
@@ -76,6 +93,10 @@ pub struct DiffPanel {
     /// Bumped by every refresh, so a slow one that finishes after a newer one
     /// cannot overwrite it.
     generation: Rc<Cell<u64>>,
+    /// Called with the file to open when a row's "Open in …" is clicked.
+    open_handler: Rc<RefCell<Option<OpenHandler>>>,
+    /// The diff on show, for the rows' open buttons.
+    shown_sides: Rc<RefCell<Option<Sides>>>,
     /// Whether the saved width has been applied since the panel was last
     /// shown. Until it has, the divider is where GTK put it, not where the
     /// user did, and must not be saved as their choice.
@@ -204,6 +225,8 @@ impl DiffPanel {
             view,
             file_lines: Rc::new(RefCell::new(Vec::new())),
             generation: Rc::new(Cell::new(0)),
+            open_handler: Rc::new(RefCell::new(None)),
+            shown_sides: Rc::new(RefCell::new(None)),
             placed: Rc::new(Cell::new(false)),
             placing: Rc::new(Cell::new(false)),
         };
@@ -348,6 +371,54 @@ impl DiffPanel {
         self.stack.set_visible_child_name("status");
     }
 
+    /// Calls `open` when a file row's "Open in …" is clicked.
+    pub fn connect_open(&self, open: impl Fn(OpenFile) + 'static) {
+        *self.open_handler.borrow_mut() = Some(Rc::new(open));
+    }
+
+    /// A row's "Open in ‹tool›" button: hidden while no tool is configured, and following the
+    /// setting when it changes. Renamed files open as the new path (the old side reads empty).
+    fn open_button(&self, path: String) -> gtk4::Button {
+        let button = gtk4::Button::builder()
+            .icon_name(crate::icons::EXTERNAL_ICON)
+            .css_classes(["flat", "diff-open"])
+            .valign(gtk4::Align::Center)
+            .build();
+        let refresh = |button: &gtk4::Button| match DiffTools::shared().get() {
+            Some(tool) => {
+                button.set_visible(true);
+                button.set_tooltip_text(Some(&crate::diff_tool::open_label(&tool)));
+            }
+            None => {
+                button.set_visible(false);
+                button.set_tooltip_text(Some(crate::diff_tool::NO_TOOL_HINT));
+            }
+        };
+        refresh(&button);
+        let conn = DiffTools::shared().connect_changed(glib::clone!(
+            #[weak]
+            button,
+            move || refresh(&button)
+        ));
+        button.connect_destroy(move |_| DiffTools::shared().disconnect(conn));
+
+        let handler = Rc::clone(&self.open_handler);
+        let sides = Rc::clone(&self.shown_sides);
+        button.connect_clicked(move |_| {
+            let (Some(handler), Some((from, to_checkpoint))) =
+                (handler.borrow().clone(), sides.borrow().clone())
+            else {
+                return;
+            };
+            handler(OpenFile {
+                path: path.clone(),
+                from,
+                to_checkpoint,
+            });
+        });
+        button
+    }
+
     fn set_undo(&self, to: Option<String>) {
         self.undo.set_visible(to.is_some());
         *self.undo_to.borrow_mut() = to;
@@ -377,14 +448,20 @@ impl DiffPanel {
         while let Some(row) = self.files.row_at_index(0) {
             self.files.remove(&row);
         }
+        *self.shown_sides.borrow_mut() = Some((diff.from.clone(), diff.to_checkpoint.clone()));
         for stat in &diff.stats {
             let label = gtk4::Label::builder()
                 .label(crate::diff::file_row(stat))
                 .xalign(0.0)
+                .hexpand(true)
                 .ellipsize(gtk4::pango::EllipsizeMode::Middle)
                 .tooltip_text(stat.path.as_str())
                 .build();
-            self.files.append(&label);
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            row.append(&label);
+            // Binary files open fine in a tool that knows them; the button is for every row.
+            row.append(&self.open_button(stat.path.clone()));
+            self.files.append(&row);
         }
 
         let buffer = self.view.buffer();

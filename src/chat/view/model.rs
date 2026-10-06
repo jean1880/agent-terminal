@@ -215,6 +215,30 @@ impl Transcript {
         self.last_model.as_deref()
     }
 
+    /// The input an approval card shows. A Codex file-change request names the item it is about
+    /// but carries no diff itself; the diff is in that item's `changes`, which is merged in so the
+    /// card can render it. Everything else is the request's own input.
+    fn approval_input(&self, input: &Value, item: Option<&str>) -> Value {
+        if !agent_kit::editdiff::preview_from_input(input).is_empty() {
+            return input.clone();
+        }
+        let changes = item
+            .and_then(|i| self.items.get(i))
+            .and_then(|i| match &i.body {
+                Body::Tool(t) if t.kind == ItemKind::FileChange => t.input.clone(),
+                _ => None,
+            })
+            .filter(|c| !agent_kit::editdiff::preview_from_input(c).is_empty());
+        match changes {
+            Some(changes) => {
+                let mut merged = input.as_object().cloned().unwrap_or_default();
+                merged.insert("changes".to_owned(), changes);
+                Value::Object(merged)
+            }
+            None => input.clone(),
+        }
+    }
+
     fn next_id(&mut self, prefix: &str) -> ItemId {
         self.seq += 1;
         format!("{prefix}:{}", self.seq)
@@ -483,11 +507,12 @@ impl Transcript {
                     ResponseCapability::Live => ApprovalState::Pending,
                     ResponseCapability::Expired => ApprovalState::Expired,
                 };
+                let input = self.approval_input(input, env.item.as_deref());
                 let body = Body::Approval(Approval {
                     request: request.clone(),
                     tool: tool.clone(),
                     title: title.clone(),
-                    input: input.clone(),
+                    input,
                     reason: reason.clone(),
                     options: options.clone(),
                     state,

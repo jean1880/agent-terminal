@@ -85,6 +85,12 @@ Architectural mandates, standards, and workflows for this codebase.
     `clear_env`), so the indicator shows the account a thread would use.
   - Anything that needs `config.rs`, GTK or the command cache stays in the
     app; a crate never depends on the app.
+- **Diffs and the external diff tool**: `agent-kit`'s `editdiff` (pure line differ and the
+  Claude/agy/Codex edit readers), `filediff` (pre-turn baseline per turn, repo containment, private
+  temp files under `$XDG_RUNTIME_DIR/agent-terminal/diff`) and `difftool` (config shape, presets,
+  per-element placeholder substitution; never a shell). The app's `diff_tool.rs` launches it
+  detached off the main thread. A file-change card compares the working file against the state
+  recorded when its turn started (`window/imp/diffs.rs`), and falls back to the agent's own edit.
 - **Undo is itself undoable, and only touches what it pinned**: a restore
   always pins the current working tree first (even if unchanged), refuses to
   run if the tree moved since that pin, never touches HEAD or the index, never

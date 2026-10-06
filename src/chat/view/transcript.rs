@@ -297,6 +297,19 @@ impl TranscriptView {
         }
     }
 
+    /// A materialised row, for GTK checks in tests.
+    #[cfg(test)]
+    pub fn with_row<R>(&self, id: &str, f: impl FnOnce(&Row) -> R) -> Option<R> {
+        self.rows.borrow().get(id).map(f)
+    }
+
+    /// Hands a computed diff to the file-change card of item `id`, if that row is still a widget.
+    pub fn show_diff(&self, id: &str, reply: &crate::chat::DiffReply) {
+        if let Some(Row::Tool(card)) = self.rows.borrow().get(id) {
+            card.show_diff(reply);
+        }
+    }
+
     pub fn updated(&self, model: &Transcript, id: &str) {
         if let (Some(item), Some(row)) = (model.get(id), self.rows.borrow().get(id)) {
             row.update(item);

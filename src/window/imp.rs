@@ -1,6 +1,8 @@
 //! Private implementation details of the AgentTerminalWindow.
 
 mod agents_prefs;
+mod diff_prefs;
+mod diffs;
 mod thread_menu;
 mod threads;
 
@@ -730,6 +732,8 @@ impl ObjectSubclass for AgentTerminalWindow {
 impl ObjectImpl for AgentTerminalWindow {
     fn constructed(&self) {
         self.parent_constructed();
+        // Before any card is built, so its "Open in …" button starts right.
+        crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
         self.setup_ui();
         self.setup_actions();
         self.start_quota_watch();
@@ -906,6 +910,7 @@ impl AgentTerminalWindow {
             old.default_profile != new.default_profile || old.profiles != new.profiles
         };
         *self.config.borrow_mut() = *new;
+        crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
 
         let (theme, scrollback, scale) = {
             let config = self.config.borrow();
@@ -3042,6 +3047,7 @@ impl AgentTerminalWindow {
         group.add(&checkpoints_row);
         group.add(&worktree_root_row);
         page.add(&group);
+        self.add_diff_tool_group(&page);
         dialog.add(&page);
 
         font_button.connect_font_desc_notify(glib::clone!(
@@ -4249,6 +4255,15 @@ impl AgentTerminalWindow {
             }
         });
 
+        // "Open in …" on a file row.
+        let root = panel.root.clone();
+        panel.connect_open(move |file| {
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            obj.imp().open_panel_file(&root, file);
+        });
+
         let root = panel.root.clone();
         let base_of = panel.clone();
         panel.connect_undo(move |target| {
@@ -4356,6 +4371,42 @@ impl AgentTerminalWindow {
             .await
             .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
             panel.show(generation, result);
+        });
+    }
+
+    /// Opens a diff-panel file in the external diff tool, off the main thread. A missing tool or
+    /// binary, or any failure, is a toast.
+    fn open_panel_file(&self, panel_root: &gtk4::Box, file: super::diff_panel::OpenFile) {
+        let Some(tool) = crate::diff_tool::DiffTools::shared().get() else {
+            self.show_toast(crate::diff_tool::NO_TOOL_HINT);
+            return;
+        };
+        let Some(dir) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.diff_panel.root == *panel_root)
+            .map(|t| t.dir.clone())
+        else {
+            return;
+        };
+        let new_side = match file.to_checkpoint {
+            Some(rev) => crate::diff_tool::NewSide::Rev(rev),
+            None => crate::diff_tool::NewSide::Working,
+        };
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let result = crate::diff_tool::open_from_dir(
+                tool,
+                std::path::PathBuf::from(dir),
+                file.path,
+                file.from,
+                new_side,
+            )
+            .await;
+            if let (Err(why), Some(obj)) = (result, obj.upgrade()) {
+                obj.imp().show_toast(&why);
+            }
         });
     }
 
@@ -5349,6 +5400,7 @@ mod tests {
         // thread that initialised it, and tests run on several.
         diff_panel_shows_each_outcome();
         crate::chat::view::tests::ui_checks();
+        crate::chat::view::tests::diff_ui_checks();
         thread_menu::tests::gtk_checks();
         chat_shell_opens_threads_and_lists_them(&window);
     }
@@ -5433,6 +5485,8 @@ mod tests {
                 omitted_lines: 0,
                 too_large: false,
                 undo_to: None,
+                from: String::new(),
+                to_checkpoint: None,
             })),
         );
         assert_eq!(panel.visible_state().1, "No changes");
@@ -5448,6 +5502,8 @@ mod tests {
                 omitted_lines: 3,
                 too_large: false,
                 undo_to: Some("c0ffee".into()),
+                from: "c0ffee".into(),
+                to_checkpoint: None,
             })),
         );
         assert!(panel.undo_offered());

@@ -17,6 +17,7 @@
 mod cards;
 mod composer;
 pub mod demo;
+mod difftext;
 mod header;
 mod markdown;
 pub mod model;
@@ -37,7 +38,7 @@ use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-use super::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
+use super::{ChatBackend, DiffAsk, DiffSource, EnvelopeSink, ModelSource, SessionStatus};
 use crate::account_status::AccountStatus;
 use cards::{RowEvent, RowSink};
 use composer::{Composer, ComposerHost};
@@ -141,6 +142,8 @@ pub(crate) struct Inner {
     /// The open model picker's refresh hook (see [`PanelCtx::model_listener`]).
     model_listener: ModelListener,
     actions: RefCell<Vec<ActionHandler>>,
+    /// Where file-change cards get their diff and open it in the external tool.
+    diffs: RefCell<Option<Rc<dyn DiffSource>>>,
     /// Items changed since the last flush (streaming deltas are coalesced per frame).
     dirty: RefCell<Vec<String>>,
     flush_queued: Cell<bool>,
@@ -176,6 +179,7 @@ impl ChatView {
                 usage: RefCell::new(None),
                 model_listener: ModelListener::default(),
                 actions: RefCell::new(Vec::new()),
+                diffs: RefCell::new(None),
                 dirty: RefCell::new(Vec::new()),
                 flush_queued: Cell::new(false),
                 widget: view.downgrade(),
@@ -264,6 +268,14 @@ impl ChatView {
     pub fn connect_action(&self, f: impl Fn(&ViewAction) + 'static) {
         if let Some(inner) = self.inner() {
             inner.actions.borrow_mut().push(Rc::new(f));
+        }
+    }
+
+    /// Gives file-change cards a source for their diffs and the external diff tool. Without one
+    /// (the demo) "View diff" says there is none.
+    pub fn set_diff_source(&self, source: Rc<dyn DiffSource>) {
+        if let Some(inner) = self.inner() {
+            *inner.diffs.borrow_mut() = Some(source);
         }
     }
 
@@ -520,7 +532,50 @@ impl Inner {
                 self.handle(changes);
                 self.backend.answer_questions(&request, answers);
             }
+            RowEvent::LoadDiff { id } => self.load_diff(&id),
+            RowEvent::OpenDiff { id } => {
+                let source = self.diffs.borrow().clone();
+                if let (Some(source), Some(ask)) = (source, self.diff_ask(&id)) {
+                    source.open_external(ask);
+                }
+            }
         }
+    }
+
+    /// What a file-change card asks the diff source about: its id and tool input.
+    fn diff_ask(&self, id: &str) -> Option<DiffAsk> {
+        let model = self.model.borrow();
+        let item = model.get(id)?;
+        let model::Body::Tool(tool) = &item.body else {
+            return None;
+        };
+        let input = match &tool.input {
+            Some(v) if !v.is_null() => v.clone(),
+            _ => serde_json::from_str(&tool.input_text).unwrap_or(serde_json::Value::Null),
+        };
+        Some(DiffAsk {
+            item: id.to_owned(),
+            input,
+        })
+    }
+
+    /// A card's "View diff": asks the source and hands the answer back to that card.
+    fn load_diff(self: &Rc<Self>, id: &str) {
+        let source = self.diffs.borrow().clone();
+        let (Some(source), Some(ask)) = (source, self.diff_ask(id)) else {
+            self.transcript
+                .show_diff(id, &Err("No diff is available for this edit.".to_owned()));
+            return;
+        };
+        let (weak, id) = (Rc::downgrade(self), id.to_owned());
+        source.load(
+            ask,
+            Box::new(move |reply| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.transcript.show_diff(&id, &reply);
+                }
+            }),
+        );
     }
 
     /// Runs a built-in locally. `args` is whatever followed the command name.
@@ -870,6 +925,221 @@ pub(crate) mod tests {
             0,
             "the dropped view left a listener"
         );
+    }
+
+    /// Answers every diff request at once with a canned reply, and records what was asked.
+    struct FakeDiffs {
+        asks: RefCell<Vec<DiffAsk>>,
+        opened: RefCell<Vec<DiffAsk>>,
+        reply: crate::chat::DiffReply,
+    }
+
+    impl DiffSource for FakeDiffs {
+        fn load(&self, ask: DiffAsk, done: Box<dyn FnOnce(crate::chat::DiffReply)>) {
+            self.asks.borrow_mut().push(ask);
+            done(self.reply.clone());
+        }
+        fn open_external(&self, ask: DiffAsk) {
+            self.opened.borrow_mut().push(ask);
+        }
+    }
+
+    /// GTK checks of the diff viewer: the card's toggle, its buttons, the approval's diff.
+    pub(crate) fn diff_ui_checks() {
+        use agent_core::event::{Event, ItemKind, ResponseCapability};
+        use agent_kit::filediff::{Origin, Shown};
+        use serde_json::json;
+
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let diff_text = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        let source = Rc::new(FakeDiffs {
+            asks: RefCell::default(),
+            opened: RefCell::default(),
+            reply: Ok(Shown {
+                text: diff_text.to_owned(),
+                origin: Origin::Checkpoint,
+                omitted_lines: 0,
+                files: vec!["src/a.rs".to_owned()],
+            }),
+        });
+        view.set_diff_source(source.clone());
+        let sink = view.sink();
+        let edit_input = json!({"file_path": "/w/src/a.rs", "old_string": "b", "new_string": "B"});
+        sink(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::FileChange,
+                title: "Edit".into(),
+                input: Some(edit_input.clone()),
+                parent: None,
+            })
+            .item("edit1"),
+        );
+        sink(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "ls".into(),
+                input: Some(json!({"command": "ls"})),
+                parent: None,
+            })
+            .item("cmd1"),
+        );
+        let inner = view.inner().expect("inner");
+        let card = |id: &str| {
+            inner.transcript.with_row(id, |row| match row {
+                cards::Row::Tool(card) => Some(card.diff_buttons()),
+                _ => None,
+            })
+        };
+
+        // Only a file edit has a diff bar; the "Open in" button follows the configured tool.
+        let tools = crate::diff_tool::DiffTools::shared();
+        tools.set(None);
+        assert_eq!(
+            card("cmd1").flatten().map(|b| b.0),
+            Some(false),
+            "a command has no diff"
+        );
+        let (bar, open, _) = card("edit1").flatten().expect("edit card");
+        assert!(bar && !open, "no tool configured: View diff only");
+        tools.set(Some(agent_kit::difftool::PRESETS[0].tool()));
+        assert_eq!(
+            card("edit1").flatten(),
+            Some((true, true, "Open in Meld".to_owned()))
+        );
+        tools.set(Some(agent_kit::difftool::DiffTool {
+            name: "Kompare".into(),
+            argv: vec!["kompare".into(), "{old}".into(), "{new}".into()],
+        }));
+        assert_eq!(
+            card("edit1").flatten().map(|b| b.2),
+            Some("Open in Kompare".to_owned())
+        );
+
+        // Toggling View diff asks the source with the item's id and input, and shows the answer.
+        inner.transcript.with_row("edit1", |row| {
+            if let cards::Row::Tool(c) = row {
+                c.click_view_diff();
+            }
+        });
+        let asks = source.asks.borrow().clone();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].item, "edit1");
+        assert_eq!(asks[0].input, edit_input);
+        let state = inner
+            .transcript
+            .with_row("edit1", |row| match row {
+                cards::Row::Tool(c) => Some(c.diff_state()),
+                _ => None,
+            })
+            .flatten()
+            .expect("state");
+        assert!(state.0, "the toggle stays on");
+        assert_eq!(state.2, diff_text);
+        assert_eq!(state.3, "Changes this turn");
+        assert_eq!(state.4.as_deref(), Some("diff"), "highlighted as a diff");
+
+        // A reply that is an error says so instead of a diff.
+        let failing = Rc::new(FakeDiffs {
+            asks: RefCell::default(),
+            opened: RefCell::default(),
+            reply: Err("No diff is available for this edit.".to_owned()),
+        });
+        view.set_diff_source(failing);
+        sink(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::FileChange,
+                title: "Write".into(),
+                input: None,
+                parent: None,
+            })
+            .item("edit2"),
+        );
+        inner.transcript.with_row("edit2", |row| {
+            if let cards::Row::Tool(c) = row {
+                c.click_view_diff();
+            }
+        });
+        let state = inner
+            .transcript
+            .with_row("edit2", |row| match row {
+                cards::Row::Tool(c) => Some(c.diff_state()),
+                _ => None,
+            })
+            .flatten()
+            .expect("state");
+        assert_eq!(state.1, "No diff is available for this edit.");
+        assert_eq!(state.2, "");
+
+        // An Edit approval shows the proposed change as a diff, with the JSON behind "Show raw";
+        // a command approval keeps its command line and has neither.
+        sink(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Edit".into(),
+                title: None,
+                input: edit_input,
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+            })
+            .request("r1"),
+        );
+        sink(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command": "rm -rf build"}),
+                reason: None,
+                options: vec![Decision::Allow],
+                response: ResponseCapability::Live,
+            })
+            .request("r2"),
+        );
+        let approval = |id: &str| {
+            inner
+                .transcript
+                .with_row(id, |row| match row {
+                    cards::Row::Approval(a) => Some(a.diff_view()),
+                    _ => None,
+                })
+                .flatten()
+                .expect("approval card")
+        };
+        let (files, diff_visible, raw_visible, text) = approval("approval:r1");
+        assert_eq!(files, "/w/src/a.rs  +1 −1");
+        assert!(diff_visible && raw_visible);
+        assert!(text.contains("-b\n+B\n"), "{text}");
+        let (files, diff_visible, raw_visible, _) = approval("approval:r2");
+        assert_eq!(files, "$ rm -rf build", "the command stays prominent");
+        assert!(!diff_visible && !raw_visible);
+
+        // A Codex file-change approval carries no diff itself; the item it names has it.
+        sink(&Envelope::new(Event::ItemStarted {
+            kind: ItemKind::FileChange,
+            title: "a.rs".into(),
+            input: Some(json!([{"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-o\n+n\n"}])),
+            parent: None,
+        })
+        .item("cx1"));
+        sink(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "file_change".into(),
+                title: Some("Apply file changes".into()),
+                input: json!({"itemId": "cx1", "reason": "why"}),
+                reason: None,
+                options: vec![Decision::Allow],
+                response: ResponseCapability::Live,
+            })
+            .request("r3")
+            .item("cx1"),
+        );
+        let (_, diff_visible, raw_visible, text) = approval("approval:r3");
+        assert!(diff_visible && raw_visible);
+        assert!(text.contains("-o\n+n\n"), "{text}");
+
+        tools.set(None);
     }
 
     #[derive(Default)]
