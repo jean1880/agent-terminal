@@ -104,6 +104,60 @@ pub struct Profile {
     /// no structured signal; Claude's is read from the transcript instead.
     #[serde(default)]
     pub limit_markers: Option<Vec<String>>,
+    /// 3.0 chat threads: the model a new thread on this agent starts with.
+    /// `None` leaves it to the CLI's own default. Set from Preferences → Agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// 3.0 chat threads: the interaction mode a new thread starts in.
+    /// `None` means ask before edits and commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<agent_core::adapter::Mode>,
+    /// 3.0 chat threads: the reasoning effort a new thread asks for, where the
+    /// agent supports one. `None` leaves it to the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    /// Hides this agent from the new-thread choices. Stored as `disabled`, not
+    /// `enabled`, so a profile written by 2.x (which has neither) stays usable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+/// The chat driver a profile's command runs, judged by the command's file
+/// name: `claude` or `agy`, wherever it is installed. Anything else (Gemini,
+/// a wrapper script) has no adapter and runs as a Terminal thread only.
+pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> {
+    use agent_core::adapter::Driver;
+    let name = Path::new(profile.command.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())?;
+    match name.as_str() {
+        "claude" => Some(Driver::Claude),
+        "agy" => Some(Driver::Agy),
+        _ => None,
+    }
+}
+
+/// Picks the agent for a new chat thread.
+///
+/// In order: the explicit "default agent" choice, the default profile's agent
+/// (when it is Claude or agy), then Claude, then agy. Only an agent `usable`
+/// accepts (enabled, and not known to be missing) is picked; `None` when
+/// neither is.
+pub fn choose_default_agent(
+    explicit: Option<agent_core::adapter::Driver>,
+    default_profile: Option<agent_core::adapter::Driver>,
+    usable: impl Fn(agent_core::adapter::Driver) -> bool,
+) -> Option<agent_core::adapter::Driver> {
+    use agent_core::adapter::Driver;
+    [
+        explicit,
+        default_profile,
+        Some(Driver::Claude),
+        Some(Driver::Agy),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|d| usable(*d))
 }
 
 impl Profile {
@@ -412,6 +466,12 @@ pub struct TerminalConfig {
     /// Environment variables removed from a spawned session's environment.
     /// A trailing `*` matches by prefix. See [`default_clear_env`].
     pub clear_env: Vec<String>,
+    /// 3.0: the agent new chat threads start on. `None` follows the default
+    /// profile when it is Claude or agy, else the first installed of the two.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<agent_core::adapter::Driver>,
+    /// 3.0: whether the thread sidebar is collapsed. Follows its toggle.
+    pub sidebar_collapsed: bool,
     /// The file as this process last read or wrote it, so a hand edit made in
     /// between can be told apart from its own writes. Not persisted.
     #[serde(skip)]
@@ -616,6 +676,8 @@ impl Default for TerminalConfig {
             indicators: Vec::new(),
             turn_command: None,
             clear_env: default_clear_env(),
+            default_agent: None,
+            sidebar_collapsed: false,
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
         }
@@ -854,6 +916,20 @@ impl TerminalConfig {
         }
 
         self
+    }
+
+    /// The position of the profile that defines `driver`'s chat agent: the
+    /// first whose command runs it. Preferences → Agents edits this profile.
+    pub fn agent_profile_index(&self, driver: agent_core::adapter::Driver) -> Option<usize> {
+        self.profiles
+            .iter()
+            .position(|p| profile_driver(p) == Some(driver))
+    }
+
+    /// The profile that defines `driver`'s chat agent, if one does.
+    pub fn agent_profile(&self, driver: agent_core::adapter::Driver) -> Option<&Profile> {
+        self.agent_profile_index(driver)
+            .and_then(|i| self.profiles.get(i))
     }
 
     /// The profile the user explicitly chose, if any.
@@ -1845,5 +1921,85 @@ mod tests {
         // Nothing changed since that save, so the next one keeps nothing more.
         config.save_to(&path);
         assert_eq!(kept_copies(dir.path(), "external").len(), 1);
+    }
+
+    #[test]
+    fn a_2x_config_loads_into_3_0_with_the_agent_fields_defaulted() {
+        use agent_core::adapter::{Driver, Mode};
+        // A config.json as 2.x wrote it: profiles with no 3.0 fields at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{
+              "scrollback_lines": 5000,
+              "default_profile": "Agy",
+              "restore_session": true,
+              "profiles": [
+                {"name": "Claude", "command": "claude", "args": ["--verbose"]},
+                {"name": "Agy", "command": "/opt/agy/bin/agy", "env_file": "~/.agy.env"},
+                {"name": "Gemini", "command": "gemini"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let config = TerminalConfig::load_from(&path);
+        assert_eq!(config.scrollback_lines, 5000);
+        assert_eq!(config.default_agent, None);
+        assert!(!config.sidebar_collapsed);
+        let claude = config.agent_profile(Driver::Claude).expect("claude");
+        assert_eq!(claude.args, ["--verbose"]);
+        assert!(!claude.disabled);
+        assert_eq!(claude.default_model, None);
+        assert_eq!(claude.default_mode, None);
+        let agy = config
+            .agent_profile(Driver::Agy)
+            .expect("agy by its binary name");
+        assert_eq!(agy.env_file.as_deref(), Some("~/.agy.env"));
+        assert_eq!(config.agent_profile_index(Driver::Agy), Some(1));
+        assert_eq!(
+            profile_driver(&config.profiles[2]),
+            None,
+            "gemini has no adapter"
+        );
+
+        // The 3.0 fields round-trip, and an untouched profile writes none of them.
+        let mut config = config;
+        config.default_agent = Some(Driver::Agy);
+        config.sidebar_collapsed = true;
+        config.profiles[0].default_model = Some("opus".into());
+        config.profiles[0].default_mode = Some(Mode::AcceptEdits);
+        config.profiles[0].default_effort = Some("high".into());
+        config.profiles[1].disabled = true;
+        config.save_to(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let gemini_json = text.split("\"Gemini\"").nth(1).unwrap_or_default();
+        assert!(!gemini_json.contains("default_model") && !gemini_json.contains("disabled"));
+        let back = TerminalConfig::load_from(&path);
+        assert_eq!(back.default_agent, Some(Driver::Agy));
+        assert!(back.sidebar_collapsed);
+        assert_eq!(back.profiles[0].default_model.as_deref(), Some("opus"));
+        assert_eq!(back.profiles[0].default_mode, Some(Mode::AcceptEdits));
+        assert_eq!(back.profiles[0].default_effort.as_deref(), Some("high"));
+        assert!(back.profiles[1].disabled);
+    }
+
+    #[test]
+    fn the_default_agent_follows_the_choice_then_the_profile_then_what_is_installed() {
+        use agent_core::adapter::Driver::{Agy, Claude};
+        let all = |_| true;
+        assert_eq!(
+            choose_default_agent(Some(Agy), Some(Claude), all),
+            Some(Agy)
+        );
+        assert_eq!(choose_default_agent(None, Some(Agy), all), Some(Agy));
+        assert_eq!(choose_default_agent(None, None, all), Some(Claude));
+        // An unusable choice (disabled, or not installed) falls through.
+        let only_agy = |d| d == Agy;
+        assert_eq!(
+            choose_default_agent(Some(Claude), None, only_agy),
+            Some(Agy)
+        );
+        assert_eq!(choose_default_agent(None, None, |_| false), None);
     }
 }
