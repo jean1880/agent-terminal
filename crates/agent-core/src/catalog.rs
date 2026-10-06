@@ -374,12 +374,14 @@ pub fn model_notice(
     }
 }
 
-/// The picker's rows: native Claude first, then Antigravity, then Codex, each in catalog order, filtered by
+/// The picker's rows: when `current` is provided, that agent's models float to the top; otherwise
+/// native Claude first, then Antigravity, then Codex, each in catalog order, filtered by
 /// a case-insensitive substring of id, display name or description (every whitespace-separated
 /// word of `query` must match somewhere). Empty groups are dropped.
 pub fn group_for_picker<'a>(
     models: &'a [CatalogModel],
     query: &str,
+    current: Option<Driver>,
 ) -> Vec<(Driver, Vec<&'a CatalogModel>)> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let matches = |m: &CatalogModel| {
@@ -393,7 +395,16 @@ pub fn group_for_picker<'a>(
         .to_lowercase();
         words.iter().all(|w| hay.contains(w))
     };
-    Driver::ALL
+    let mut drivers = Vec::with_capacity(Driver::ALL.len());
+    if let Some(cur) = current {
+        drivers.push(cur);
+    }
+    for d in Driver::ALL {
+        if Some(d) != current {
+            drivers.push(d);
+        }
+    }
+    drivers
         .into_iter()
         .filter_map(|d| {
             let mut rows: Vec<&CatalogModel> = models
@@ -586,7 +597,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
 
         let mut all = vec![m[0].clone()];
         all.extend(parse_agy_models(TSV));
-        let g = group_for_picker(&all, "");
+        let g = group_for_picker(&all, "", None);
         assert_eq!(
             g.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
             [Driver::Agy, Driver::Codex]
@@ -724,7 +735,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             m(Driver::Claude, "opus", &[]),
             m(Driver::Claude, "default", &[]),
         ];
-        let g = group_for_picker(&all, "");
+        let g = group_for_picker(&all, "", None);
         let ids: Vec<&str> = g[0].1.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["opus", "default", "claude-fable-5-1[1m]"]);
     }
@@ -733,7 +744,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     fn picker_groups_claude_first_and_filters() {
         let mut all = parse_agy_models(TSV);
         all.extend(parse_claude_initialize(&init_frame()));
-        let g = group_for_picker(&all, "");
+        let g = group_for_picker(&all, "", None);
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].0, Driver::Claude);
         assert_eq!(g[0].1.len(), 5);
@@ -742,16 +753,37 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         assert_eq!(g[1].1[0].id, "gemini-3.8-flash", "stable order");
 
         // Case-insensitive across id, display and description; all words must match.
-        let g = group_for_picker(&all, "SONNET");
+        let g = group_for_picker(&all, "SONNET", None);
         assert_eq!(g[0].1.len(), 1);
         assert_eq!(g[1].1.len(), 1);
-        let g = group_for_picker(&all, "gemini pro");
+        let g = group_for_picker(&all, "gemini pro", None);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].0, Driver::Agy);
         assert_eq!(g[0].1[0].id, "gemini-3.1-pro");
-        let g = group_for_picker(&all, "efficient");
+        let g = group_for_picker(&all, "efficient", None);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].0, Driver::Claude);
-        assert!(group_for_picker(&all, "zzz").is_empty());
+        assert!(group_for_picker(&all, "zzz", None).is_empty());
+    }
+
+    #[test]
+    fn picker_floats_current_agent_to_top() {
+        let mut all = parse_agy_models(TSV);
+        all.extend(parse_claude_initialize(&init_frame()));
+
+        // In an Antigravity thread, Agy models float to the top.
+        let g = group_for_picker(&all, "", Some(Driver::Agy));
+        assert_eq!(g[0].0, Driver::Agy);
+        assert_eq!(g[1].0, Driver::Claude);
+
+        // In a Claude thread, Claude models float to the top.
+        let g = group_for_picker(&all, "", Some(Driver::Claude));
+        assert_eq!(g[0].0, Driver::Claude);
+        assert_eq!(g[1].0, Driver::Agy);
+
+        // Without current, default order is preserved.
+        let g = group_for_picker(&all, "", None);
+        assert_eq!(g[0].0, Driver::Claude);
+        assert_eq!(g[1].0, Driver::Agy);
     }
 }

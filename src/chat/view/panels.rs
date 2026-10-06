@@ -227,7 +227,7 @@ fn model_list(
     status: &SessionStatus,
     pick: &Pick,
 ) -> gtk4::Widget {
-    let groups = group_for_picker(models, query);
+    let groups = group_for_picker(models, query, Some(status.driver));
     if groups.is_empty() {
         let page = adw::StatusPage::new();
         page.add_css_class("compact");
