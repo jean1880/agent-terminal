@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
-use agent_core::redact::redact;
+use agent_core::redact::{redact, redact_keyed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -151,28 +151,42 @@ pub fn default_path(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<
 /// Masks secrets in every string of an envelope (`raw` included) before it is
 /// persisted.
 ///
-/// Ceiling: redaction is per string, so a token split across two streaming
-/// deltas is not recognized in either. The adapters close each streamed item
-/// with a `ContentSnapshot` of its whole text (agy emits one before every
-/// response completes; Claude sends its own assistant snapshots), and that is
-/// scrubbed whole, so the transcript, which a snapshot replaces, is clean; the
-/// raw delta rows may keep the split fragments. Upgrade path: scrub the
-/// accumulated text per item at append time.
+/// A string under a sensitive key (`api_key`, `password`, …) is masked whole,
+/// as its key alone marks it secret; every other string goes through the
+/// pattern redaction.
+///
+/// Ceiling: redaction is per envelope, so a token split across two streaming
+/// deltas is not recognized here. [`Store::append_event`] closes that gap when
+/// the item completes or snapshots (see `heal_split_deltas`); until then the
+/// earlier delta rows hold the fragments.
 pub fn scrub_envelope(env: Envelope) -> Result<Envelope> {
     let value = serde_json::to_value(&env)?;
-    Ok(serde_json::from_value(scrub_value(value))?)
+    Ok(serde_json::from_value(scrub_value(None, value))?)
 }
 
-fn scrub_value(v: Value) -> Value {
+/// `key` is the name of the nearest enclosing object field; array elements
+/// inherit it, so `{"tokens": ["..."]}` is judged by "tokens".
+fn scrub_value(key: Option<&str>, v: Value) -> Value {
     match v {
-        Value::String(s) => Value::String(redact(&s)),
-        Value::Array(a) => Value::Array(a.into_iter().map(scrub_value).collect()),
-        Value::Object(o) => {
-            Value::Object(o.into_iter().map(|(k, v)| (k, scrub_value(v))).collect())
-        }
+        Value::String(s) => Value::String(match key {
+            Some(k) => redact_keyed(k, &s),
+            None => redact(&s),
+        }),
+        Value::Array(a) => Value::Array(a.into_iter().map(|v| scrub_value(key, v)).collect()),
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| {
+                    let v = scrub_value(Some(&k), v);
+                    (k, v)
+                })
+                .collect(),
+        ),
         other => other,
     }
 }
+
+/// How many of a thread's newest rows [`Store::heal_split_deltas`] searches.
+const HEAL_WINDOW: i64 = 4000;
 
 pub struct Store {
     conn: Connection,
@@ -583,8 +597,82 @@ impl Store {
             )
             .map_err(|e| fk_or(e, thread))?;
         let seq = self.conn.last_insert_rowid();
+        if matches!(
+            scrubbed.event,
+            Event::ItemCompleted { .. } | Event::ContentSnapshot { .. }
+        ) {
+            if let Some(item) = &scrubbed.item {
+                self.heal_split_deltas(thread, item)?;
+            }
+        }
         self.touch(thread, now)?;
         Ok(seq)
+    }
+
+    /// Re-scrubs an item's streamed text as a whole. Each delta is scrubbed
+    /// alone, so a token split across two deltas survives in both rows. When
+    /// the item completes (or snapshots), join each stream's delta text, redact
+    /// it, and if anything changed put the redacted whole in the first row,
+    /// empty the rest (their `seq` stays) and drop those rows' `raw` frames,
+    /// which carry the fragments verbatim.
+    ///
+    /// Ceiling: only the thread's most recent [`HEAL_WINDOW`] rows are
+    /// searched (there is no item column to index), and an item that never
+    /// completes or snapshots keeps its fragments. Upgrade path: an indexed
+    /// `item` column, or carrying a per-item tail in memory at append time.
+    fn heal_split_deltas(&self, thread: &str, item: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, envelope_json FROM events
+             WHERE thread_id = ?1
+               AND seq > (SELECT COALESCE(MAX(seq), 0) FROM events WHERE thread_id = ?1) - ?3
+               AND json_extract(envelope_json, '$.item') = ?2
+               AND json_extract(envelope_json, '$.event.type') = 'content_delta'
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![thread, item, HEAL_WINDOW], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut groups: Vec<(StreamKind, Vec<(i64, Envelope)>)> = Vec::new();
+        for row in rows {
+            let (seq, json) = row?;
+            let env: Envelope = serde_json::from_str(&json)?;
+            let Event::ContentDelta { stream, .. } = &env.event else {
+                continue;
+            };
+            let stream = *stream;
+            match groups.iter_mut().find(|(s, _)| *s == stream) {
+                Some((_, v)) => v.push((seq, env)),
+                None => groups.push((stream, vec![(seq, env)])),
+            }
+        }
+        drop(stmt);
+        for (_, rows) in groups {
+            if rows.len() < 2 {
+                continue;
+            }
+            let joined: String = rows
+                .iter()
+                .filter_map(|(_, e)| match &e.event {
+                    Event::ContentDelta { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let whole = redact(&joined);
+            if whole == joined {
+                continue;
+            }
+            for (i, (seq, mut env)) in rows.into_iter().enumerate() {
+                if let Event::ContentDelta { text, .. } = &mut env.event {
+                    *text = if i == 0 { whole.clone() } else { String::new() };
+                }
+                env.raw = None;
+                self.conn.execute(
+                    "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
+                    params![serde_json::to_string(&env)?, seq],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Stores an imported conversation (an agent's own transcript) in one transaction: every
@@ -1579,6 +1667,65 @@ mod tests {
             .expect("rename");
         assert!(!title(&s).contains("ghp_abcdefghij"), "{}", title(&s));
         assert!(title(&s).contains("****0123"));
+    }
+
+    #[test]
+    fn sensitive_keys_are_masked_in_nested_json_and_raw_frames() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let mut env = Envelope::new(Event::ContentDelta {
+            stream: StreamKind::Assistant,
+            text: "hi".into(),
+        })
+        .item("a1");
+        env.raw = Some(serde_json::json!({
+            "api_key": "plain-secret-9981", // gitleaks:allow
+            "nested": {"db": {"Password": "hunter2hunter2"}, "list": [{"client_secret": "abcdefgh5678"}]}, // gitleaks:allow
+            "note": "fine"
+        }));
+        s.append_event(&t, None, &env).expect("append");
+        let stored = serde_json::to_string(&s.events(&t, None, 10).expect("ev")).expect("json");
+        for leaked in ["plain-secret-9981", "hunter2hunter2", "abcdefgh5678"] {
+            assert!(!stored.contains(leaked), "{leaked} leaked: {stored}");
+        }
+        assert!(
+            stored.contains("****9981") && stored.contains("\"fine\""),
+            "{stored}"
+        );
+    }
+
+    #[test]
+    fn a_token_split_across_deltas_is_masked_once_the_item_completes() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(12);
+        for e in [
+            started("a1", ItemKind::AssistantMessage),
+            delta("a1", &format!("token is {a}")),
+            delta("a1", &format!("{b} ok")),
+        ] {
+            s.append_event(&t, None, &e).expect("append");
+        }
+        let all =
+            |s: &Store| serde_json::to_string(&s.events(&t, None, 50).expect("ev")).expect("j");
+        // Until completion the fragments are all there is.
+        assert!(all(&s).contains(a));
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("a1"),
+        )
+        .expect("complete");
+        let stored = all(&s);
+        assert!(!stored.contains(a) && !stored.contains(b), "{stored}");
+        let msgs = s.transcript_messages(&t).expect("msgs");
+        assert_eq!(msgs[0].text, "token is ****0123 ok");
     }
 
     #[test]

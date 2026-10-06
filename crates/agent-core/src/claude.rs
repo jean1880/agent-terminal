@@ -342,7 +342,7 @@ impl ClaudeAdapter {
                 }
                 _ => Vec::new(),
             },
-            "message_delta" | "message_stop" => Vec::new(),
+            "message_delta" | "message_stop" | "ping" => Vec::new(),
             _ => vec![Envelope::new(Event::Unknown)],
         }
     }
@@ -527,7 +527,7 @@ impl ClaudeAdapter {
                 let Some(id) = str_of(b, "tool_use_id") else {
                     continue;
                 };
-                let text = content_text(b.get("content").unwrap_or(&Value::Null));
+                let text = tool_result_text(b.get("content").unwrap_or(&Value::Null));
                 let failed = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                 self.close_item(id);
                 out.push(
@@ -732,7 +732,16 @@ impl ClaudeAdapter {
 
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let success = str_of(v, "subtype") == Some("success");
-        let aborted = str_of(v, "terminal_reason") == Some("aborted_streaming");
+        // An abort, or an error result whose `errors` say the run was interrupted or cancelled.
+        let said_cancelled = (is_error || !success)
+            && strings_of(v, "errors").iter().any(|e| {
+                let e = e.to_ascii_lowercase();
+                e.contains("interrupt") || e.contains("cancel")
+            });
+        let aborted = matches!(
+            str_of(v, "terminal_reason"),
+            Some("aborted_streaming" | "aborted_tools")
+        ) || said_cancelled;
         let (state, error) = if aborted || (interrupted_by_us && (is_error || !success)) {
             (TurnState::Interrupted, None)
         } else if success && !is_error {
@@ -1183,6 +1192,24 @@ fn content_text(content: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// Text of a `tool_result`'s `content`: like [`content_text`], but a block with
+/// no text (an image, a `tool_reference`) shows as a `[type]` placeholder, so a
+/// result made only of those is not an empty output.
+fn tool_result_text(content: &Value) -> String {
+    let Value::Array(blocks) = content else {
+        return content_text(content);
+    };
+    blocks
+        .iter()
+        .filter_map(|b| match (str_of(b, "text"), str_of(b, "type")) {
+            (Some(t), _) => Some(t.to_owned()),
+            (None, Some(kind)) => Some(format!("[{kind}]")),
+            (None, None) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn strip_local_tags(text: &str) -> String {
@@ -1687,6 +1714,69 @@ mod tests {
             json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "errors": ["boom"]}),
         );
         assert_eq!(s, TurnState::Failed);
+    }
+
+    #[test]
+    fn aborted_tools_and_cancel_errors_are_interrupted() {
+        let mut a = ClaudeAdapter::new();
+        let state = |a: &mut ClaudeAdapter, frame: Value| match a
+            .feed(&frame.to_string())
+            .remove(0)
+            .event
+        {
+            Event::TurnCompleted { state, .. } => state,
+            other => panic!("not a TurnCompleted: {other:?}"),
+        };
+        assert_eq!(
+            state(
+                &mut a,
+                json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_tools"})
+            ),
+            TurnState::Interrupted
+        );
+        assert_eq!(
+            state(
+                &mut a,
+                json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "errors": ["Request was Cancelled by user"]})
+            ),
+            TurnState::Interrupted
+        );
+        // A genuine failure stays one.
+        assert_eq!(
+            state(
+                &mut a,
+                json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "errors": ["boom"]})
+            ),
+            TurnState::Failed
+        );
+    }
+
+    #[test]
+    fn a_tool_result_of_only_non_text_blocks_is_not_empty() {
+        let mut a = ClaudeAdapter::new();
+        let frame = json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+                {"type": "tool_reference", "tool_name": "Grep"}
+            ]}
+        ]}});
+        let out = a.feed(&frame.to_string());
+        match &out[0].event {
+            Event::ItemCompleted { output, .. } => {
+                assert_eq!(output.as_deref(), Some("[image]\n[tool_reference]"));
+            }
+            other => panic!("not an ItemCompleted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ping_stream_event_is_not_unknown() {
+        let mut a = ClaudeAdapter::new();
+        let out = a.feed(
+            &json!({"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "ping"}})
+                .to_string(),
+        );
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
