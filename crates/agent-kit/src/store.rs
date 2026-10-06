@@ -29,7 +29,7 @@ pub type ProviderThreadId = String;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`].
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -287,6 +287,28 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    // ---- app state ----
+
+    /// A small value the app keeps beside its threads (e.g. which were open), or `None`.
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Sets (replacing) a [`Store::meta`] value. Not redacted: callers store ids, not text.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     pub fn rename_thread(&self, thread: &str, title: &str) -> Result<()> {
@@ -743,6 +765,16 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
              INSERT INTO schema_version (version) VALUES (1);",
         )?;
     }
+    if current < 2 {
+        // Small app state that belongs with the threads (the open-thread list).
+        conn.execute_batch(
+            "CREATE TABLE meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             INSERT INTO schema_version (version) VALUES (2);",
+        )?;
+    }
     Ok(())
 }
 
@@ -1066,7 +1098,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .expect("count");
-        assert_eq!(rows, 1);
+        assert_eq!(rows, SCHEMA_VERSION, "one row per migration step");
         let busy: i64 = s
             .conn
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
@@ -1150,6 +1182,37 @@ mod tests {
     }
 
     #[test]
+    fn meta_values_are_set_replaced_and_survive_a_v1_upgrade() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        // A database as the first schema left it: no meta table yet.
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, cwd TEXT NOT NULL,
+                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                     archived INTEGER NOT NULL DEFAULT 0, active_provider_thread TEXT,
+                     read_seq INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE provider_threads (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
+                     driver TEXT NOT NULL, model TEXT NOT NULL, native_id TEXT,
+                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL,
+                     provider_thread_id TEXT, at INTEGER NOT NULL, envelope_json TEXT NOT NULL);
+                 INSERT INTO threads VALUES ('t1', 'old', '/w', 1, 1, 0, NULL, 0);
+                 INSERT INTO schema_version (version) VALUES (1);",
+            )
+            .expect("v1");
+        }
+        let s = Store::open(&path).expect("upgrade");
+        assert_eq!(s.list_threads(false).expect("list")[0].title, "old");
+        assert_eq!(s.meta("open_threads").expect("meta"), None);
+        s.set_meta("open_threads", "[\"t1\"]").expect("set");
+        s.set_meta("open_threads", "[]").expect("replace");
+        assert_eq!(s.meta("open_threads").expect("meta").as_deref(), Some("[]"));
+    }
+
+    #[test]
     fn migration_is_idempotent_and_refuses_a_newer_schema() {
         let s = store();
         migrate(&s.conn).expect("again");
@@ -1158,7 +1221,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .expect("count");
-        assert_eq!(rows, 1);
+        assert_eq!(rows, SCHEMA_VERSION, "one row per migration step");
 
         s.conn
             .execute("INSERT INTO schema_version (version) VALUES (99)", [])
