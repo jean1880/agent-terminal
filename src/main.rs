@@ -11,8 +11,12 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[allow(dead_code)] // Wired into the window in wave 3.
+mod agent_proc;
+#[allow(dead_code)] // Wired into the window in wave 3.
 mod chat;
 pub mod config;
+#[cfg(test)]
+mod testutil;
 mod theme;
 mod utils;
 mod window;
