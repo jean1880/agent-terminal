@@ -703,9 +703,19 @@ fn parse_side_json(stdout: &str) -> Value {
 
 // ---- native frame models: lenient, every field optional ----
 
+/// Reads an explicit JSON `null` as the type's default, so a frame carrying
+/// `"state": null` still parses (`#[serde(default)]` only covers a missing key).
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct Frame {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     event: String,
     #[serde(default)]
     conversation_id: Option<String>,
@@ -729,11 +739,11 @@ struct Init {
 struct Step {
     #[serde(default)]
     conversation_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     state: String,
     #[serde(default)]
     step_index: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     step_type: String,
     #[serde(default)]
     text_delta: Option<String>,
@@ -759,25 +769,25 @@ struct ToolInfo {
 struct ResultFrame {
     #[serde(default)]
     conversation_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     status: String,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
     usage: Option<AgyUsage>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     denied_actions: Vec<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct AgyUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     thinking_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     cache_read_tokens: u64,
 }
 
@@ -836,6 +846,23 @@ mod tests {
             .filter(|e| matches!(e.event, Event::ItemCompleted { .. }))
             .map(|e| (e.item.as_deref().unwrap_or(""), &e.event))
             .collect()
+    }
+
+    #[test]
+    fn frames_with_explicit_nulls_still_parse() {
+        let mut adapter = AgyAdapter::default();
+        let result = r#"{"event":"result","result":{"status":"SUCCESS","denied_actions":null,"error":null,"usage":{"input_tokens":null,"output_tokens":3}}}"#;
+        let evs = adapter.feed(result);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e.event,
+                Event::TurnCompleted {
+                    state: TurnState::Completed,
+                    ..
+                }
+            )),
+            "{evs:?}"
+        );
     }
 
     fn session(mode: Mode, hook: bool) -> OpenSession {

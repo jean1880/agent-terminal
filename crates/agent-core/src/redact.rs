@@ -78,6 +78,24 @@ pub fn redact(text: &str) -> String {
     out
 }
 
+/// Masks a structured value whose key is known: a string under a sensitive
+/// name (`api_key`, `client_secret`, …) is masked whole, whatever it looks like;
+/// any other value goes through [`redact`]. Short values stay readable, as in
+/// [`redact`].
+///
+/// Ceiling: only the key's own name is judged, so a secret under an innocuous
+/// key still needs a recognizable shape. Upgrade path: entropy scoring.
+pub fn redact_keyed(key: &str, value: &str) -> String {
+    if is_sensitive_name(key)
+        && value.chars().count() >= MIN_SECRET_CHARS
+        && !value.starts_with("****")
+    {
+        mask(value)
+    } else {
+        redact(value)
+    }
+}
+
 fn redact_pem_blocks(text: &str) -> String {
     const BEGIN: &str = "-----BEGIN ";
     const END: &str = "-----END ";
@@ -389,6 +407,18 @@ mod tests {
         assert!(out.contains("API_KEY=****1234"), "{out}");
         assert!(out.contains("\"db_password\": \"****ter2\""), "{out}");
         assert!(out.contains("&state=ok"), "{out}");
+    }
+
+    #[test]
+    fn keyed_values_are_masked_by_their_key_alone() {
+        assert_eq!(redact_keyed("api_key", "plain-secret-9981"), "****9981");
+        assert_eq!(redact_keyed("Password", "hunter2hunter2"), "****ter2");
+        // Short values, harmless keys and prior masks are left alone.
+        assert_eq!(redact_keyed("api_key", "short"), "short");
+        assert_eq!(redact_keyed("name", "plain-value-123"), "plain-value-123");
+        assert_eq!(redact_keyed("api_key", "****9981"), "****9981");
+        // A harmless key still gets pattern redaction.
+        assert!(redact_keyed("note", "ghp_abcdefghijklmnopqrstuvwxyz0123").starts_with("****"));
     }
 
     #[test]
