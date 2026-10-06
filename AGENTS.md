@@ -15,8 +15,13 @@ Architectural mandates, standards, and workflows for this codebase.
 - **No redundant GTK crates**: `glib`, `gio` and `gdk4` are reached through the
   `gtk4` re-exports (`gtk4::glib`, …). Do not add them as direct dependencies —
   that only creates a second place for versions to drift.
-- **PTY Bridge**: terminal interaction is via `vte4`, bridging the UI with the
-  configurable AI CLI (`claude` by default; also `agy`/`gemini`).
+- **Chat-first (3.0)**: the primary surface is a chat thread (`src/chat/`) that
+  drives Claude or agy through a structured adapter (`agent-core`) over a gio
+  process transport (`src/agent_proc.rs`). Every new-session action opens a
+  thread. Terminal pages (2.x) remain for any profile and for CLIs with no
+  adapter.
+- **PTY Bridge**: terminal pages and a thread's drawer use `vte4`, running the
+  configured CLI or the user's `$SHELL`.
 - **PTY Isolation**: sessions inherit the user's interactive environment (`-ic`)
   and full environment variables so tooling (nvm, aliases) stays available.
   `TERM`/`COLORTERM` are forced so the CLI renders its full TUI.
@@ -25,10 +30,14 @@ Architectural mandates, standards, and workflows for this codebase.
   TTY beforehand — it disrupts the CLI's initial terminal handshake. Anything
   resembling a startup script must contribute *environment*, merged into the
   spawn environment, never bytes written to the terminal.
-- **Tabbed sessions**: the window hosts an `adw::TabView`. Each tab is tracked in
-  an explicit `TabState` registry (`src/window/imp.rs`) — never look a terminal up
-  by walking the widget tree. A tab's launch directory is fixed for its lifetime
-  (a running CLI cannot re-root itself).
+- **Threads over a hidden tab view**: the window is an `adw::OverlaySplitView`
+  whose sidebar lists the store's threads. Its content is an `adw::TabView` with
+  no tab bar: one page per open thread or terminal. Each page is tracked in an
+  explicit `TabState` registry (`src/window/imp.rs`); a thread page has
+  `chat: Some(ChatTab)` and its `terminal` is the drawer's shell. Never look a
+  page up by walking the widget tree. A page's directory is fixed for its
+  lifetime. A thread is built (view replayed from the store, then its
+  `ChatSession` started with `view.sink()`) only when it is first shown.
 - **Module layout**: a Cargo workspace. The root package is the GTK app, so
   `cargo build --release` and `cargo deb` at the root still produce the one
   shipped binary; `crates/*` are path libraries with no GTK.
@@ -45,12 +54,25 @@ Architectural mandates, standards, and workflows for this codebase.
     remove), `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
     `paths` (`~` expansion) and `exec` (child processes with a timeout).
+  - `agent-kit`'s `store` is the SQLite thread store (threads, provider
+    threads, scrubbed events, app meta such as the open-thread list).
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
-    `SessionFormat`), `theme.rs` (colour schemes, infallible `RGBA::new`),
-    `utils.rs` (detection, startup command, path resolution, indicators; it
+    `SessionFormat`; per-agent defaults live on the 2.x profiles), `theme.rs`
+    (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
+    `SystemProbe::locate`, startup command, path resolution, indicators; it
     re-exports the kit helpers the window uses), `window/imp.rs` (GTK UI),
-    `window/diff_panel.rs` (the diff panel's widgets), `main.rs` (app setup +
-    logging, and the `agent_kit` imports that keep `crate::git::…` paths).
+    `window/imp/threads.rs` (sidebar, thread pages, drawer, re-homed 2.x
+    features), `window/imp/agents_prefs.rs` (Settings → Agents),
+    `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
+    diff panel's widgets), `main.rs` (app setup + logging, and the `agent_kit`
+    imports that keep `crate::git::…` paths).
+  - Chat: `chat/session.rs` (one thread's backend: adapter, process, store,
+    switching, handoff), `chat/view/` (the GTK view; it only talks to
+    `ChatBackend`), `agent_proc.rs` (gio process transport),
+    `approval_server.rs` / `approval_hook.rs` (agy's approval socket and the
+    `--approval-hook` client), `hook_config.rs` (is the hook installed in
+    `~/.gemini/config/hooks.json`), `model_catalog.rs`, `account_status.rs`,
+    `claude_probe.rs` (both agents' models, usage and account).
   - Anything that needs `config.rs`, GTK or the command cache stays in the
     app; a crate never depends on the app.
 - **Undo is itself undoable, and only touches what it pinned**: a restore
@@ -85,6 +107,20 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🔒 Security & Robustness
 
+- **agy never runs with `--dangerously-skip-permissions` unless the hook is
+  proven**: the flag is passed only with an approval socket bound after
+  `hook_config::check_installed` accepted the hooks file (`ApprovalHandle::
+  bind_checked`). Without it, agy is forced to `--mode plan`. The adapter strips
+  the flag from profile arguments. The session's canary restarts agy read-only
+  if a tool step arrives without a hook query. Never add a path that sets the
+  flag any other way.
+- **Every persisted or injected text is redacted**: the store scrubs every
+  event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
+  fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
+  handoff budget. A new store write or injected prompt must take the same path.
+- **Agent processes get a cleaned environment**: `clear_env` and any inherited
+  approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
+  env file, then the approval socket.
 - **Localhost bound**: interacts only with the local shell; exposes no ports.
 - **Never block the main thread**: anything that shells out — CLI detection above
   all, which may run `$SHELL -ic` and source the user's rc — goes through

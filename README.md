@@ -2,14 +2,94 @@
 
 [![CI](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml)
 
-A standalone GTK4 terminal application written in Rust, purpose-built for driving
-an AI coding CLI (Claude, Antigravity/`agy`, or Gemini) in a focused, tabbed
-window.
+A standalone GTK4 application written in Rust for working with AI coding agents.
+3.0 is chat-first: Claude and Antigravity (`agy`) run as native chat threads,
+and any CLI can still run in a terminal.
+
+> **3.0 is chat-first.** New sessions open as chat threads, not terminal tabs.
+> See [Upgrading from 2.x](#upgrading-from-2x-).
 
 > **Renamed in 2.0.0.** This was `antigravity-terminal` (and, before that,
 > `gemini-terminal`). The binary, package and config directory are now
 > `agent-terminal`; existing settings are adopted automatically on first run —
 > see [Upgrading](#upgrading-from-1x-).
+
+## Chat threads (3.0) 💬
+
+- **A sidebar of threads.** Threads live in a store and are listed in a sidebar,
+  grouped by folder and searchable. Each row shows the agent's colour, the title,
+  how long ago it was active, and a badge: working, needs approval, rate limited
+  or unread. `F9` or `Ctrl+B` (or the header button) shows or hides the sidebar.
+  It overlays the thread when the window is narrow, and its state is remembered.
+- **Every new session is a thread.** `Ctrl+Shift+T` and the header **+** open
+  one. The **+** menu also has New Thread With (Claude or Antigravity), New
+  Thread in Folder…, New Thread in Worktree… (`Ctrl+Shift+G`), Resume Session…
+  and Continue In. A resumed Claude or agy session becomes a thread that resumes
+  it. A thread opens only when you open it, and the threads that were open come
+  back on the next launch.
+- **Native chat.** Each thread shows a transcript with tool cards, inline
+  approvals, a plan panel and a composer with typeahead (`/` commands, `@` files,
+  `$` skills). Its header has the agent and model chip, the mode and the context
+  gauge.
+- **One model picker for both agents.** The chip (or `/model`) lists every Claude
+  model and every agy model, with search and effort levels. Models that agy
+  serves on Google's quota are marked *via Antigravity*. Picking a model of the
+  same agent switches in place. Picking one of the other agent continues the
+  same thread in that agent: a budgeted, redacted summary of the conversation
+  goes with the next message, and a divider marks the switch.
+- **Usage and account.** The usage indicator updates on every turn: in a
+  thread's header for its agent, and for all agents at the foot of the sidebar.
+- **Terminal drawer.** `` Ctrl+` `` opens your `$SHELL` in the thread's folder,
+  under the chat.
+- **2.x features on threads.** The diff panel (`Ctrl+Shift+D`), checkpoints
+  (taken when a turn completes), undo, worktrees and notifications work on
+  threads. `/rewind` undoes the last turn's changes, `/fork` starts a new thread
+  carrying this one's history, and a rate limit offers "Continue in <other
+  agent>".
+- **Terminal threads.** **+** → New Terminal Thread runs any profile in a 2.x
+  terminal page, listed in the sidebar too. A CLI with no chat adapter (Gemini,
+  a script) runs this way.
+- **Settings → Agents.** Configure each agent's command or path (and see whether
+  it is installed, and which version), extra arguments, environment file,
+  default model, mode and effort, and whether it is enabled. You can also pick
+  the default agent for new threads. Changes are saved to `config.json`, on the
+  2.x profiles that run each agent.
+
+### agy's approval hook
+
+agy runs tools without asking unless it has a hook to ask with. agent-terminal
+runs agy with `--dangerously-skip-permissions` **only** when its own approval
+hook is installed in `~/.gemini/config/hooks.json`. Each tool call then waits
+for your answer in the thread. Without the hook, agy runs read-only, in plan
+mode, and the thread tells you so.
+
+To install the hook, add this entry as a top-level key of
+`~/.gemini/config/hooks.json`. Settings → Agents shows the same entry, with a
+Copy button and whether it is installed. The app generates it with
+`hook_config::install_entry_json()`:
+
+```json
+{
+  "agent-terminal-approval": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "bash -c '[ -n \"$AGENT_TERMINAL_APPROVAL_SOCKET\" ] || exit 0; exec \"${AGENT_TERMINAL_HOOK_BIN:-agent-terminal}\" --approval-hook'",
+            "timeout": 600,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      }
+    ]
+  }
+}
+```
+
+The hook does nothing outside agent-terminal, because the socket variable is
+unset there. The app also checks that the hook really fires: if agy runs a tool
+without asking first, the thread is restarted read-only.
 
 ## Features ✨
 
@@ -97,6 +177,21 @@ window.
 - **Standalone identity**: treated as a unique application by your window manager
   (won't group with standard terminals). All assets are embedded in the binary.
 - **Sixel support**: inline image rendering.
+
+## Upgrading from 2.x ⬆️
+
+- **Chat is the default.** `Ctrl+Shift+T`, **+**, New in Folder, New in
+  Worktree, Resume and Continue In now open chat threads. No setting switches
+  back to terminal tabs: that is the deliberate 3.0 change. Use **+** → New
+  Terminal Thread for a 2.x terminal page, with any profile.
+- **Your config keeps working.** 2.x `config.json` loads as it is. Profiles still
+  define the Claude and agy commands, arguments, env files and folders. The new
+  per-agent settings (default model, mode, effort, enabled) and the default agent
+  are optional fields with defaults, and you set them under Settings → Agents.
+- **Threads are stored** in `$XDG_STATE_HOME/agent-terminal/threads.db`
+  (`~/.local/state/…`), with every stored event redacted. 2.x tab restore still
+  applies to terminal pages.
+- **agy runs read-only** until you install its approval hook (see above).
 
 ## Upgrading from 1.x ⬆️
 
@@ -390,7 +485,22 @@ actually links.
 ## Project Structure 📁
 
 - `src/main.rs` — entry point, application setup, logging, global CSS, accelerators.
-- `src/window/imp.rs` — window implementation: tabs, spawning, input, settings.
+- `src/window/imp.rs` — window implementation: pages, spawning, input, settings.
+- `src/window/imp/threads.rs` — the chat-first shell: thread sidebar, thread
+  pages over the hidden tab view, terminal drawer, re-homed 2.x features.
+- `src/window/imp/agents_prefs.rs` — Settings → Agents.
+- `src/window/sidebar_model.rs` — pure sidebar logic: grouping, badges, ages,
+  titles, resume mapping.
+- `src/chat/` — the chat thread: `session.rs` (adapter, process, store,
+  switching, handoff) and `view/` (transcript, composer, panels, model picker).
+- `src/agent_proc.rs` — the agent process transport (gio).
+- `src/approval_server.rs`, `src/approval_hook.rs`, `src/hook_config.rs` — agy's
+  approval socket, the `--approval-hook` client, and the hooks.json check.
+- `src/model_catalog.rs`, `src/account_status.rs`, `src/claude_probe.rs` — both
+  agents' model lists, usage and account.
+- `crates/agent-core` — pure: events, adapters, policies, redaction.
+- `crates/agent-kit` — GTK-free I/O: the thread store, git, diffs, restore,
+  worktrees, hand-off briefs, sessions.
 - `src/window/mod.rs` — the `AgentTerminalWindow` GObject wrapper.
 - `src/config.rs` — persisted settings and the 1.x migration, with tests.
 - `src/theme.rs` — terminal colour schemes.
