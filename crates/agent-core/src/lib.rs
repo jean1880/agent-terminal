@@ -15,5 +15,6 @@ pub mod claude;
 pub mod commands;
 pub mod event;
 pub mod handoff_budget;
+pub mod quota;
 pub mod redact;
 pub mod transition;
