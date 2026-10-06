@@ -136,7 +136,11 @@ impl ModelSource for DemoModels {
         Self::list()
     }
 
-    fn connect_changed(&self, _f: Box<dyn Fn()>) {}
+    fn connect_changed(&self, _f: Box<dyn Fn()>) -> u64 {
+        0
+    }
+
+    fn disconnect(&self, _id: u64) {}
 }
 
 /// Static account and quota data for `--chat-demo`: one agent in the amber, one in the red.

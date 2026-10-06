@@ -87,6 +87,16 @@ pub struct UsageIndicator {
     details: gtk4::Box,
     status: Rc<AccountStatus>,
     filter: Cell<Option<Driver>>,
+    /// The change listener, removed again when the indicator goes away.
+    listener: Cell<Option<u64>>,
+}
+
+impl Drop for UsageIndicator {
+    fn drop(&mut self) {
+        if let Some(id) = self.listener.take() {
+            self.status.disconnect(id);
+        }
+    }
 }
 
 impl UsageIndicator {
@@ -116,14 +126,16 @@ impl UsageIndicator {
             details,
             status,
             filter: Cell::new(filter),
+            listener: Cell::new(None),
         });
         this.repaint();
         let weak = Rc::downgrade(&this);
-        this.status.connect_changed(move || {
+        let id = this.status.connect_changed(move || {
             if let Some(this) = weak.upgrade() {
                 this.repaint();
             }
         });
+        this.listener.set(Some(id));
         // "Resets in" ages while the popover is closed: rebuild it as it opens.
         let weak = Rc::downgrade(&this);
         popover.connect_show(move |_| {

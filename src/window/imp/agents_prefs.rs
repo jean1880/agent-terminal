@@ -131,12 +131,12 @@ impl AgentTerminalWindow {
         page.add(&general);
 
         for driver in [Driver::Claude, Driver::Agy, Driver::Codex] {
-            page.add(&self.agent_group(driver));
+            page.add(&self.agent_group(driver, dialog));
         }
         dialog.add(&page);
     }
 
-    fn agent_group(&self, driver: Driver) -> adw::PreferencesGroup {
+    fn agent_group(&self, driver: Driver, dialog: &adw::PreferencesDialog) -> adw::PreferencesGroup {
         let obj = self.obj();
         let profile = self.agent_profile_now(driver);
         let group = adw::PreferencesGroup::builder()
@@ -339,8 +339,10 @@ impl AgentTerminalWindow {
         ));
         fill_models();
         {
+            // Disconnected when the dialog closes: the catalogue is app-wide.
             let fill = fill_models.clone();
-            ModelCatalog::shared().connect_changed(move || fill());
+            let id = ModelCatalog::shared().connect_changed(move || fill());
+            dialog.connect_closed(move |_| ModelCatalog::shared().disconnect(id));
         }
         model_row.connect_selected_notify(glib::clone!(
             #[weak]

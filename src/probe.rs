@@ -69,6 +69,42 @@ impl<R> InFlight<R> {
     }
 }
 
+/// Change listeners that can be disconnected: a view that goes away must not leave its
+/// callback behind in an app-wide object.
+#[derive(Default)]
+pub struct ListenerSet {
+    next: Cell<u64>,
+    items: RefCell<Vec<(u64, Rc<dyn Fn()>)>>,
+}
+
+impl ListenerSet {
+    /// Registers `f`; the id disconnects it again.
+    pub fn add(&self, f: impl Fn() + 'static) -> u64 {
+        let id = self.next.get() + 1;
+        self.next.set(id);
+        self.items.borrow_mut().push((id, Rc::new(f)));
+        id
+    }
+
+    pub fn remove(&self, id: u64) {
+        self.items.borrow_mut().retain(|(i, _)| *i != id);
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.items.borrow().len()
+    }
+
+    /// Calls every listener. They are cloned out first, so one may call back into the owner,
+    /// connect or disconnect.
+    pub fn notify(&self) {
+        let items: Vec<_> = self.items.borrow().iter().map(|(_, f)| f.clone()).collect();
+        for f in items {
+            f();
+        }
+    }
+}
+
 /// Returns a callback to call once per task; the `n`th call runs `all_done`.
 pub fn join_n(n: u8, all_done: impl Fn() + 'static) -> Rc<dyn Fn()> {
     let pending = Cell::new(n);
@@ -100,6 +136,28 @@ mod tests {
         assert_eq!(*got.borrow(), [(0, 7), (1, 7), (2, 7)]);
         // Cleared: the next caller starts a new probe.
         assert!(flight.join(|_| {}));
+    }
+
+    #[test]
+    fn a_disconnected_listener_is_not_called_and_one_may_disconnect_during_notify() {
+        let set = Rc::new(ListenerSet::default());
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        let a = set.add(move || h.set(h.get() + 1));
+        let h = hits.clone();
+        let s = set.clone();
+        let b = set.add(move || {
+            h.set(h.get() + 10);
+            s.remove(a); // from inside a notify
+        });
+        set.notify();
+        assert_eq!(hits.get(), 11);
+        set.notify();
+        assert_eq!(hits.get(), 21, "a was removed, b ran again");
+        set.remove(b);
+        assert_eq!(set.len(), 0);
+        set.notify();
+        assert_eq!(hits.get(), 21);
     }
 
     #[test]

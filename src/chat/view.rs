@@ -108,6 +108,7 @@ mod imp {
         fn dispose(&self) {
             if let Some(inner) = self.inner.borrow_mut().take() {
                 inner.composer.dispose();
+                inner.disconnect_models();
             }
         }
     }
@@ -132,6 +133,8 @@ pub(crate) struct Inner {
     requests: Rc<Requests>,
     /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
     models: RefCell<Option<Rc<dyn ModelSource>>>,
+    /// The id of the view's listener on `models`, removed when the view goes away.
+    model_conn: Cell<Option<u64>>,
     /// Account and plan usage: fed by this thread's `QuotaUpdated` events, shown in the header.
     account: RefCell<Option<Rc<AccountStatus>>>,
     usage: RefCell<Option<Rc<UsageIndicator>>>,
@@ -168,6 +171,7 @@ impl ChatView {
                 plan: PlanPanel::new(),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
+                model_conn: Cell::new(None),
                 account: RefCell::new(None),
                 usage: RefCell::new(None),
                 model_listener: ModelListener::default(),
@@ -270,12 +274,15 @@ impl ChatView {
         // One connection per source; the open picker (if any) is the listener. The hook is
         // cloned out of its cell first, so it may re-register or clear itself.
         let listener = inner.model_listener.clone();
-        source.connect_changed(Box::new(move || {
+        let id = source.connect_changed(Box::new(move || {
             let hook = listener.borrow().clone();
             if let Some(hook) = hook {
                 hook();
             }
         }));
+        // A source that was set before is let go of first.
+        inner.disconnect_models();
+        inner.model_conn.set(Some(id));
         *inner.models.borrow_mut() = Some(source);
     }
 
@@ -309,6 +316,15 @@ impl ChatView {
 }
 
 impl Inner {
+    /// Removes the view's listener from the model source (app-wide objects must not keep a
+    /// callback for a view that is gone).
+    fn disconnect_models(&self) {
+        let (source, id) = (self.models.borrow().clone(), self.model_conn.take());
+        if let (Some(source), Some(id)) = (source, id) {
+            source.disconnect(id);
+        }
+    }
+
     fn view(&self) -> Option<ChatView> {
         self.widget.upgrade()
     }
@@ -838,6 +854,32 @@ pub(crate) mod tests {
             model: "gpt-5-codex".into(),
         }));
         assert!(hint().starts_with("Message Codex"), "{}", hint());
+
+        // The model-source listener goes away with the view.
+        let source = Rc::new(CountingSource::default());
+        view.set_model_source(source.clone());
+        assert_eq!(source.listeners.len(), 1);
+        view.set_model_source(source.clone());
+        assert_eq!(source.listeners.len(), 1, "replacing a source leaves one");
+        drop(view);
+        assert_eq!(source.listeners.len(), 0, "the dropped view left a listener");
+    }
+
+    #[derive(Default)]
+    struct CountingSource {
+        listeners: crate::probe::ListenerSet,
+    }
+
+    impl ModelSource for CountingSource {
+        fn models(&self) -> Vec<agent_core::catalog::CatalogModel> {
+            Vec::new()
+        }
+        fn connect_changed(&self, f: Box<dyn Fn()>) -> u64 {
+            self.listeners.add(f)
+        }
+        fn disconnect(&self, id: u64) {
+            self.listeners.remove(id);
+        }
     }
 
     #[test]

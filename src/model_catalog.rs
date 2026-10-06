@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent_proc::{run_side, AGY_TIMEOUT};
 use crate::chat::ModelSource;
-use crate::probe::{join_n, ProbeTargets};
+use crate::probe::{join_n, ListenerSet, ProbeTargets};
 use crate::{claude_probe, codex_probe};
 
 // ---------------------------------------------------------------------------------------------
@@ -55,44 +55,15 @@ fn decode_cache(text: &str) -> CacheFile {
     serde_json::from_str(text).unwrap_or_default()
 }
 
-/// Writes `bytes` to `path` through a 0600 temp file in the same directory, `sync_all`, then a
-/// rename, so a crash never leaves a half-written cache.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
 // ---------------------------------------------------------------------------------------------
 // The catalog
 // ---------------------------------------------------------------------------------------------
-
-type Listener = Rc<dyn Fn()>;
 
 pub struct ModelCatalog {
     claude: RefCell<Vec<CatalogModel>>,
     agy: RefCell<Vec<CatalogModel>>,
     codex: RefCell<Vec<CatalogModel>>,
-    listeners: RefCell<Vec<Listener>>,
+    listeners: ListenerSet,
     cache: Option<PathBuf>,
     refreshing: Cell<bool>,
 }
@@ -122,7 +93,7 @@ impl ModelCatalog {
             claude: RefCell::new(loaded.claude),
             agy: RefCell::new(loaded.agy),
             codex: RefCell::new(loaded.codex),
-            listeners: RefCell::new(Vec::new()),
+            listeners: ListenerSet::default(),
             cache,
             refreshing: Cell::new(false),
         }
@@ -137,9 +108,13 @@ impl ModelCatalog {
         all
     }
 
-    /// Calls `f` (on the main thread) every time the snapshot changes.
-    pub fn connect_changed(&self, f: impl Fn() + 'static) {
-        self.listeners.borrow_mut().push(Rc::new(f));
+    /// Calls `f` (on the main thread) every time the snapshot changes. The id disconnects it.
+    pub fn connect_changed(&self, f: impl Fn() + 'static) -> u64 {
+        self.listeners.add(f)
+    }
+
+    pub fn disconnect(&self, id: u64) {
+        self.listeners.remove(id);
     }
 
     /// Replaces one agent's list. An empty list is a failed fetch, not "no models": the previous
@@ -158,11 +133,7 @@ impl ModelCatalog {
         }
         *slot.borrow_mut() = models;
         self.save();
-        // Clone out of the cell: a listener may call back into the catalog.
-        let listeners: Vec<Listener> = self.listeners.borrow().clone();
-        for l in listeners {
-            l();
-        }
+        self.listeners.notify();
     }
 
     fn save(&self) {
@@ -174,7 +145,7 @@ impl ModelCatalog {
         };
         let result = serde_json::to_vec(&file)
             .map_err(std::io::Error::other)
-            .and_then(|bytes| write_atomic(path, &bytes));
+            .and_then(|bytes| agent_kit::fsutil::write_private_atomic(path, &bytes));
         if let Err(e) = result {
             warn!(error = %e, "could not write the model cache");
         }
@@ -248,8 +219,12 @@ impl ModelSource for ModelCatalog {
         ModelCatalog::models(self)
     }
 
-    fn connect_changed(&self, f: Box<dyn Fn()>) {
-        ModelCatalog::connect_changed(self, f);
+    fn connect_changed(&self, f: Box<dyn Fn()>) -> u64 {
+        ModelCatalog::connect_changed(self, f)
+    }
+
+    fn disconnect(&self, id: u64) {
+        ModelCatalog::disconnect(self, id);
     }
 }
 
@@ -311,22 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_is_private_replaces_and_leaves_no_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sub").join("models.json");
-        write_atomic(&path, b"one").unwrap();
-        write_atomic(&path, b"two").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, ["models.json"]);
-    }
-
-    #[test]
     fn catalog_persists_notifies_and_keeps_the_last_good_list() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models.json");
@@ -346,6 +305,10 @@ mod tests {
         assert_eq!(hits.get(), 3);
         let ids: Vec<_> = cat.models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["opus", "g", "gpt"], "Claude first, Codex last");
+
+        // The cache is private (the shared helper is tested in agent-kit).
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
 
         // A fresh catalog is populated from the file straight away.
         let again = ModelCatalog::with_cache(Some(path));

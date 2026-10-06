@@ -22,7 +22,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent_proc::{run_side, AGY_TIMEOUT};
-use crate::probe::{join_n, ProbeTargets};
+use crate::probe::{join_n, ListenerSet, ProbeTargets};
 use crate::{claude_probe, codex_probe};
 
 /// One agent's account and quota windows.
@@ -99,13 +99,11 @@ pub fn google_accounts_path(home: Option<&str>) -> Option<PathBuf> {
     )
 }
 
-type Listener = Rc<dyn Fn()>;
-
 pub struct AccountStatus {
     claude: RefCell<Snapshot>,
     agy: RefCell<Snapshot>,
     codex: RefCell<Snapshot>,
-    listeners: RefCell<Vec<Listener>>,
+    listeners: ListenerSet,
     refreshing: Cell<bool>,
 }
 
@@ -119,7 +117,7 @@ impl AccountStatus {
             claude: RefCell::default(),
             agy: RefCell::default(),
             codex: RefCell::default(),
-            listeners: RefCell::default(),
+            listeners: ListenerSet::default(),
             refreshing: Cell::new(false),
         }
     }
@@ -142,17 +140,17 @@ impl AccountStatus {
         self.slot(driver).borrow().clone()
     }
 
-    /// Calls `f` (on the main thread) after every change.
-    pub fn connect_changed(&self, f: impl Fn() + 'static) {
-        self.listeners.borrow_mut().push(Rc::new(f));
+    /// Calls `f` (on the main thread) after every change. The id disconnects it.
+    pub fn connect_changed(&self, f: impl Fn() + 'static) -> u64 {
+        self.listeners.add(f)
+    }
+
+    pub fn disconnect(&self, id: u64) {
+        self.listeners.remove(id);
     }
 
     fn notify(&self) {
-        // Clone out of the cell: a listener may call back into this object.
-        let listeners: Vec<Listener> = self.listeners.borrow().clone();
-        for l in listeners {
-            l();
-        }
+        self.listeners.notify();
     }
 
     fn update(&self, driver: Driver, account: Option<Account>, windows: Vec<QuotaWindow>) {

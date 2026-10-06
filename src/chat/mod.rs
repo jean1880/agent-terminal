@@ -42,8 +42,10 @@ pub trait ChatBackend {
 pub trait ModelSource {
     /// The current snapshot, possibly empty (nothing fetched or cached yet).
     fn models(&self) -> Vec<agent_core::catalog::CatalogModel>;
-    /// Calls `f` on the main thread each time the snapshot changes.
-    fn connect_changed(&self, f: Box<dyn Fn()>);
+    /// Calls `f` on the main thread each time the snapshot changes; the id disconnects it.
+    fn connect_changed(&self, f: Box<dyn Fn()>) -> u64;
+    /// Removes a listener added by [`Self::connect_changed`].
+    fn disconnect(&self, id: u64);
 }
 
 #[derive(Debug, Clone, PartialEq)]
