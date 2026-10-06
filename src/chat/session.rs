@@ -1,2 +1,1317 @@
 //! One chat thread's backend: adapter + agent process + store + switching and handoff.
-//! Implements [`super::ChatBackend`] (wave 2a).
+//! Implements [`super::ChatBackend`].
+//!
+//! Everything runs on the GTK main thread. The session is shared as an `Rc`; every callback it
+//! hands out (process lines, process exit, approval envelopes, side-process results) holds a
+//! `Weak`, so dropping the session ends the process and removes the approval socket.
+//!
+//! No `RefCell` borrow is ever held across a call that can re-enter (the sink, an adapter call
+//! that emits, the process): the view may call straight back into the backend from the sink.
+//!
+//! Logging never includes prompt or frame bodies.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use agent_core::adapter::{
+    Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
+};
+use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind};
+use agent_core::handoff_budget::{
+    handoff_budget, handoff_coverage, provider_message_with_handoff, render_history,
+    select_history, HistoricalMessage, Role, DEFAULT_HANDOFF_TOKEN_CAP,
+};
+use agent_core::transition::{
+    decide_transition, plan_selection, ModelSelection, SessionState, Transition,
+};
+use agent_kit::store::{ProviderThreadId, Store, ThreadId, TranscriptMessage};
+use gtk4::glib;
+use tracing::{debug, info, warn};
+
+use super::{ChatBackend, EnvelopeSink, SessionStatus};
+use crate::agent_proc::{run_side, AgentProcess, SpawnSpec};
+use crate::approval_server::ApprovalHandle;
+
+/// Builds the adapter for another driver (the window knows how; this crate does not).
+pub type AdapterFactory = Rc<dyn Fn(Driver) -> Box<dyn Adapter>>;
+
+/// Room assumed for the user's next prompt when budgeting a handoff, in budget units.
+const HANDOFF_PROMPT_ALLOWANCE: usize = 2_048;
+
+struct State {
+    model: Option<String>,
+    mode: Mode,
+    running_turn: bool,
+    alive: bool,
+    commands: Vec<AgentCommand>,
+    native_id: Option<String>,
+}
+
+struct Inner {
+    adapter: RefCell<Box<dyn Adapter>>,
+    open: RefCell<OpenSession>,
+    store: Rc<Store>,
+    thread: ThreadId,
+    provider_thread: RefCell<ProviderThreadId>,
+    sink: EnvelopeSink,
+    approval: Option<ApprovalHandle>,
+    factory: RefCell<Option<AdapterFactory>>,
+    proc: RefCell<Option<AgentProcess>>,
+    state: RefCell<State>,
+    /// A rendered, redacted handoff waiting for the next user prompt.
+    pending_handoff: RefCell<Option<String>>,
+    ctl_seq: Cell<u64>,
+    local_seq: Cell<u64>,
+    /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
+    generation: Cell<u64>,
+}
+
+/// One thread's chat backend. See the module docs.
+pub struct ChatSession {
+    inner: Rc<Inner>,
+}
+
+fn driver_name(driver: Driver) -> &'static str {
+    match driver {
+        Driver::Claude => "claude",
+        Driver::Agy => "agy",
+    }
+}
+
+fn driver_label(driver: Driver) -> &'static str {
+    match driver {
+        Driver::Claude => "Claude",
+        Driver::Agy => "Antigravity (agy)",
+    }
+}
+
+impl ChatSession {
+    /// Starts the agent process and returns the live session.
+    ///
+    /// - `open` describes the process; its `approval_hook` field is overwritten from `approval`
+    ///   (hook on only when there is a socket to export, one source for both).
+    /// - The store's active provider thread for `thread` is used, or created from the adapter's
+    ///   driver and `open.model` when there is none.
+    /// - `approval` (agy): the socket exported to the process; envelopes for its requests flow
+    ///   through this session.
+    pub fn new(
+        adapter: Box<dyn Adapter>,
+        mut open: OpenSession,
+        store: Rc<Store>,
+        thread: ThreadId,
+        sink: EnvelopeSink,
+        approval: Option<ApprovalHandle>,
+    ) -> Rc<Self> {
+        let driver = adapter.driver();
+        open.approval_hook = approval.is_some();
+        let hookless_agy = driver == Driver::Agy && approval.is_none() && open.mode != Mode::Plan;
+        if hookless_agy {
+            // The adapter forces `--mode plan` without the hook; say so in the status too.
+            open.mode = Mode::Plan;
+        }
+        let provider_thread = match store.active_provider_thread(&thread) {
+            Ok(Some(p)) => p,
+            _ => match create_provider_thread(&store, &thread, driver, open.model.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "could not create a provider thread");
+                    String::new()
+                }
+            },
+        };
+        let state = State {
+            model: open.model.clone(),
+            mode: open.mode,
+            running_turn: false,
+            alive: false,
+            commands: Vec::new(),
+            native_id: open.resume.clone(),
+        };
+        let inner = Rc::new(Inner {
+            adapter: RefCell::new(adapter),
+            open: RefCell::new(open),
+            store,
+            thread,
+            provider_thread: RefCell::new(provider_thread),
+            sink,
+            approval,
+            factory: RefCell::new(None),
+            proc: RefCell::new(None),
+            state: RefCell::new(state),
+            pending_handoff: RefCell::new(None),
+            ctl_seq: Cell::new(0),
+            local_seq: Cell::new(0),
+            generation: Cell::new(0),
+        });
+        if let Some(handle) = &inner.approval {
+            let weak = Rc::downgrade(&inner);
+            handle.attach(move |env| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.emit(env);
+                }
+            });
+            handle.set_mode(inner.state.borrow().mode);
+        }
+        if hookless_agy {
+            inner.emit(Envelope::new(Event::Notice {
+                text: "Antigravity is running read-only (plan mode): the approval hook is not \
+                       available. Install the `agent-terminal --approval-hook` PreToolUse entry \
+                       in agy's hooks.json so it can edit files and run commands after asking you."
+                    .to_owned(),
+            }));
+        }
+        inner.start_process();
+        Rc::new(Self { inner })
+    }
+
+    /// Lets `switch` build an adapter for the other driver (needed for `CreateWithHandoff`).
+    pub fn set_adapter_factory(&self, factory: AdapterFactory) {
+        *self.inner.factory.borrow_mut() = Some(factory);
+    }
+
+    /// The command line, working directory and environment the next start would use.
+    #[cfg(test)]
+    fn launch_spec(&self) -> SpawnSpec {
+        self.inner.launch_spec()
+    }
+}
+
+fn create_provider_thread(
+    store: &Store,
+    thread: &str,
+    driver: Driver,
+    model: Option<&str>,
+) -> Result<ProviderThreadId, agent_kit::store::StoreError> {
+    let id = store.add_provider_thread(thread, driver_name(driver), model.unwrap_or("default"))?;
+    store.set_active_provider_thread(thread, &id)?;
+    Ok(id)
+}
+
+impl Inner {
+    // ---- events ----
+
+    /// Persists (under the current provider thread), updates the status, then delivers.
+    fn emit(&self, env: Envelope) {
+        let pt = self.provider_thread.borrow().clone();
+        let provider = (!pt.is_empty()).then_some(pt.as_str());
+        if let Err(e) = self.store.append_event(&self.thread, provider, &env) {
+            warn!(error = %e, "could not persist an event");
+        }
+        self.apply(&env);
+        (self.sink)(&env);
+    }
+
+    /// Delivers without persisting (the store already has it).
+    fn deliver(&self, env: &Envelope) {
+        self.apply(env);
+        (self.sink)(env);
+    }
+
+    fn error(&self, message: impl Into<String>) {
+        self.emit(Envelope::new(Event::Error {
+            message: message.into(),
+        }));
+    }
+
+    fn report(&self, e: &AdapterError) {
+        self.error(e.to_string());
+    }
+
+    fn apply(&self, env: &Envelope) {
+        match &env.event {
+            Event::SessionStarted {
+                native_id, model, ..
+            } => {
+                if !native_id.is_empty() {
+                    let pt = self.provider_thread.borrow().clone();
+                    if let Err(e) = self.store.set_native_id(&pt, native_id) {
+                        warn!(error = %e, "could not record the native session id");
+                    }
+                    self.state.borrow_mut().native_id = Some(native_id.clone());
+                }
+                if let Some(m) = model {
+                    self.set_model(m);
+                }
+            }
+            Event::TurnStarted { model } => {
+                if let Some(m) = model {
+                    self.set_model(m);
+                }
+                self.state.borrow_mut().running_turn = true;
+            }
+            Event::TurnCompleted { .. } => self.state.borrow_mut().running_turn = false,
+            Event::ModelChanged { model } => self.set_model(model),
+            Event::ModeChanged { mode } => {
+                self.state.borrow_mut().mode = *mode;
+                self.open.borrow_mut().mode = *mode;
+                if let Some(a) = &self.approval {
+                    a.set_mode(*mode);
+                }
+            }
+            Event::CommandsChanged { commands } => {
+                self.state.borrow_mut().commands = commands.clone();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_model(&self, model: &str) {
+        self.state.borrow_mut().model = Some(model.to_owned());
+        self.open.borrow_mut().model = Some(model.to_owned());
+    }
+
+    // ---- process ----
+
+    fn launch_spec(&self) -> SpawnSpec {
+        // One source for the hook flag and the socket env var: both come from `approval`.
+        self.open.borrow_mut().approval_hook = self.approval.is_some();
+        let open = self.open.borrow();
+        let argv = self.adapter.borrow().argv(&open);
+        SpawnSpec {
+            argv,
+            cwd: (!open.cwd.is_empty()).then(|| open.cwd.clone()),
+            env: self.approval.as_ref().map(|a| a.env()).unwrap_or_default(),
+        }
+    }
+
+    fn start_process(self: &Rc<Self>) {
+        let spec = self.launch_spec();
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        let (w_out, w_err, w_exit) = (
+            Rc::downgrade(self),
+            Rc::downgrade(self),
+            Rc::downgrade(self),
+        );
+        let spawned = AgentProcess::spawn(
+            &spec,
+            move |line| {
+                if let Some(s) = w_out.upgrade() {
+                    s.on_line(generation, line, false);
+                }
+            },
+            move |line| {
+                if let Some(s) = w_err.upgrade() {
+                    s.on_line(generation, line, true);
+                }
+            },
+            move |code| {
+                if let Some(s) = w_exit.upgrade() {
+                    s.on_exit(generation, code);
+                }
+            },
+        );
+        match spawned {
+            Ok(proc) => {
+                let handshake = self.adapter.borrow_mut().handshake();
+                for line in &handshake {
+                    proc.write_line(line);
+                }
+                *self.proc.borrow_mut() = Some(proc);
+                self.state.borrow_mut().alive = true;
+            }
+            Err(e) => {
+                self.state.borrow_mut().alive = false;
+                self.error(e);
+            }
+        }
+    }
+
+    fn on_line(&self, generation: u64, line: &str, stderr: bool) {
+        if generation != self.generation.get() {
+            return;
+        }
+        let envelopes = if stderr {
+            self.adapter.borrow_mut().feed_stderr(line)
+        } else {
+            self.adapter.borrow_mut().feed(line)
+        };
+        for env in envelopes {
+            self.emit(env);
+        }
+    }
+
+    fn on_exit(&self, generation: u64, code: Option<i32>) {
+        if generation != self.generation.get() {
+            return;
+        }
+        info!(code = ?code, "agent exited");
+        self.finish_process(code);
+    }
+
+    /// Closes out the current process: adapter exit envelopes, status, pending approvals.
+    fn finish_process(&self, code: Option<i32>) {
+        let proc = self.proc.borrow_mut().take();
+        drop(proc); // terminates it when it is still running
+        let envelopes = self.adapter.borrow_mut().on_exit(code);
+        {
+            let mut state = self.state.borrow_mut();
+            state.alive = false;
+            state.running_turn = false;
+        }
+        for env in envelopes {
+            self.emit(env);
+        }
+        if let Some(a) = &self.approval {
+            a.expire_all("the agent exited");
+        }
+    }
+
+    /// Stops the process on purpose; its own exit callback is then ignored.
+    fn stop_current(&self) {
+        self.generation.set(self.generation.get() + 1);
+        self.finish_process(None);
+    }
+
+    /// A dead process (agy after an interrupt) is restarted resuming its native session.
+    fn ensure_alive(self: &Rc<Self>) {
+        if self.state.borrow().alive {
+            return;
+        }
+        let native = self.state.borrow().native_id.clone();
+        if let Some(id) = native {
+            let mut open = self.open.borrow_mut();
+            open.resume = Some(id);
+            open.new_session_id = None;
+        }
+        self.start_process();
+    }
+
+    // ---- commands ----
+
+    /// Encodes and carries out one command. False when the adapter refused it.
+    fn command(self: &Rc<Self>, command: Command) -> bool {
+        let result = self.adapter.borrow_mut().encode(command);
+        match result {
+            Ok(actions) => {
+                self.execute(actions);
+                true
+            }
+            Err(e) => {
+                self.report(&e);
+                false
+            }
+        }
+    }
+
+    fn execute(self: &Rc<Self>, actions: Vec<Action>) {
+        for action in actions {
+            match action {
+                Action::Write(lines) => {
+                    let written = {
+                        let proc = self.proc.borrow();
+                        match proc.as_ref().filter(|p| p.is_alive()) {
+                            Some(p) => {
+                                for line in &lines {
+                                    p.write_line(line);
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    if !written {
+                        self.error("The agent is not running.");
+                    }
+                }
+                Action::Interrupt => {
+                    if let Some(p) = self.proc.borrow().as_ref() {
+                        p.interrupt();
+                    }
+                }
+                Action::SideProcess { id, argv } => self.spawn_side(id, argv),
+                Action::Respawn(delta) => self.respawn(&delta),
+            }
+        }
+    }
+
+    fn spawn_side(self: &Rc<Self>, id: String, argv: Vec<String>) {
+        let cwd = Some(self.open.borrow().cwd.clone()).filter(|c| !c.is_empty());
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let (stdout, ok) = run_side(argv, cwd).await;
+            let Some(inner) = weak.upgrade() else { return };
+            let envelopes = inner.adapter.borrow_mut().feed_side(&id, &stdout, ok);
+            for env in envelopes {
+                inner.emit(env);
+            }
+        });
+    }
+
+    /// Stops the process and starts a new one with `delta` applied (the adapter set
+    /// `resume` to the native id so history carries over).
+    fn respawn(self: &Rc<Self>, delta: &OpenSessionDelta) {
+        self.stop_current();
+        {
+            let mut open = self.open.borrow_mut();
+            if let Some(m) = &delta.model {
+                open.model = Some(m.clone());
+            }
+            if let Some(mode) = delta.mode {
+                open.mode = mode;
+            }
+            let native = self.state.borrow().native_id.clone();
+            open.resume = delta.resume.clone().or(native);
+            open.new_session_id = None;
+        }
+        if let Some(m) = &delta.model {
+            self.emit(Envelope::new(Event::ModelChanged { model: m.clone() }));
+        }
+        if let Some(mode) = delta.mode {
+            self.emit(Envelope::new(Event::ModeChanged { mode }));
+        }
+        self.start_process();
+    }
+
+    fn next_local_id(&self, prefix: &str) -> String {
+        let n = self.local_seq.get() + 1;
+        self.local_seq.set(n);
+        format!("{prefix}-{n}")
+    }
+
+    fn send_prompt(self: &Rc<Self>, text: &str) {
+        let pt = self.provider_thread.borrow().clone();
+        let provider = (!pt.is_empty()).then_some(pt.as_str());
+        let item = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => item,
+            Err(e) => {
+                warn!(error = %e, "could not persist the user message");
+                self.next_local_id("user")
+            }
+        };
+        // The store already holds these two; the view still needs to see them.
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item(item.clone()),
+        );
+        self.deliver(
+            &Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: text.to_owned(),
+            })
+            .item(item),
+        );
+
+        let handoff = self.pending_handoff.borrow_mut().take();
+        let text = match handoff {
+            Some(summary) => provider_message_with_handoff(&summary, text),
+            None => text.to_owned(),
+        };
+        self.ensure_alive();
+        self.command(Command::Prompt { text });
+    }
+
+    fn respond_approval(self: &Rc<Self>, request: &str, decision: Decision) {
+        if let Some(handle) = &self.approval {
+            if handle.respond(request, decision) {
+                self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+                return;
+            }
+        }
+        self.command(Command::Approve {
+            request: request.to_owned(),
+            decision,
+            updated_input: None,
+            message: None,
+        });
+    }
+
+    fn set_mode(self: &Rc<Self>, mode: Mode) {
+        if self.command(Command::SetMode { mode }) {
+            if let Some(a) = &self.approval {
+                a.set_mode(mode);
+            }
+        }
+    }
+
+    fn control(self: &Rc<Self>, control: Control) -> String {
+        let n = self.ctl_seq.get() + 1;
+        self.ctl_seq.set(n);
+        let id = format!("ctl-{n}");
+        let result = self.adapter.borrow_mut().encode(Command::Control {
+            id: id.clone(),
+            control,
+        });
+        match result {
+            Ok(actions) => self.execute(actions),
+            Err(e) => {
+                self.report(&e);
+                // The panel is waiting on this id.
+                self.emit(
+                    Envelope::new(Event::ControlResult {
+                        ok: None,
+                        error: Some(e.to_string()),
+                    })
+                    .request(id.clone()),
+                );
+            }
+        }
+        id
+    }
+
+    // ---- switching ----
+
+    fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>) {
+        let (caps, current_driver, mode, status_model) = {
+            let adapter = self.adapter.borrow();
+            let state = self.state.borrow();
+            (
+                adapter.capabilities().clone(),
+                adapter.driver(),
+                state.mode,
+                state.model.clone(),
+            )
+        };
+        let workspace = self.open.borrow().cwd.clone();
+        let current = SessionState {
+            selection: ModelSelection {
+                driver: current_driver,
+                model: status_model.clone().unwrap_or_default(),
+                effort: None,
+            },
+            mode,
+            workspace: workspace.clone(),
+            capabilities: caps.clone(),
+        };
+        let same_driver = driver == current_driver;
+        let target_model = match (&model, same_driver) {
+            (Some(m), _) => m.clone(),
+            (None, true) => status_model.unwrap_or_default(),
+            (None, false) => String::new(),
+        };
+        // The target's own capabilities are not known without its adapter; the policy only
+        // reads the live session's.
+        let target = SessionState {
+            selection: ModelSelection {
+                driver,
+                model: target_model.clone(),
+                effort: None,
+            },
+            mode,
+            workspace,
+            capabilities: caps.clone(),
+        };
+        let plan = plan_selection(&caps, &current.selection, &target.selection);
+        let transition = decide_transition(Some(&current), &target, true, Some(&plan));
+        debug!(?transition, "model switch");
+        match transition {
+            Transition::Reuse => {}
+            Transition::SwitchModelInSession => {
+                self.command(Command::SetModel {
+                    model: target_model,
+                });
+            }
+            Transition::RestartAndResume => {
+                let result = self.adapter.borrow_mut().encode(Command::SetModel {
+                    model: target_model.clone(),
+                });
+                match result {
+                    Ok(actions) => self.execute(actions),
+                    Err(AdapterError::Unsupported(_)) => self.respawn(&OpenSessionDelta {
+                        model: Some(target_model),
+                        mode: None,
+                        resume: self.state.borrow().native_id.clone(),
+                    }),
+                    Err(e) => self.report(&e),
+                }
+            }
+            Transition::CreateWithHandoff => self.create_with_handoff(driver, model),
+            Transition::Reject(reason) => self.error(reason),
+        }
+    }
+
+    fn create_with_handoff(self: &Rc<Self>, driver: Driver, model: Option<String>) {
+        let Some(factory) = self.factory.borrow().clone() else {
+            self.error("Switching agent is not available in this thread.");
+            return;
+        };
+        // Built from the store before anything is stopped, so a failure leaves the thread as it was.
+        let messages = match self.store.transcript_messages(&self.thread) {
+            Ok(m) => m,
+            Err(e) => {
+                self.error(format!("Could not read the thread to hand it off: {e}"));
+                return;
+            }
+        };
+        let from = self.adapter.borrow().driver();
+        let (summary, carried) = build_handoff(
+            &messages,
+            &format!("{} thread {}", driver_label(from), self.thread),
+        );
+
+        self.stop_current();
+        let new_pt =
+            match create_provider_thread(&self.store, &self.thread, driver, model.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.error(format!("Could not start the new agent's thread: {e}"));
+                    return;
+                }
+            };
+        *self.provider_thread.borrow_mut() = new_pt;
+        *self.adapter.borrow_mut() = factory(driver);
+        {
+            let mut open = self.open.borrow_mut();
+            // The profile's program and arguments belong to the old agent; the binary is looked
+            // up on PATH. Ceiling: a custom profile path for the new agent is not carried over;
+            // the window can replace this through the factory's adapter `argv`.
+            open.program = driver_name(driver).to_owned();
+            open.extra_args.clear();
+            open.model = model.clone();
+            open.resume = None;
+            open.new_session_id =
+                (driver == Driver::Claude).then(|| glib::uuid_string_random().to_string());
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.model = model.clone();
+            state.native_id = None;
+            state.commands.clear();
+            state.running_turn = false;
+        }
+        *self.pending_handoff.borrow_mut() = (carried > 0).then_some(summary);
+        self.emit(Envelope::new(Event::Notice {
+            text: format!(
+                "Continuing in {} with {carried} earlier messages",
+                driver_label(driver)
+            ),
+        }));
+        if let Some(m) = model {
+            self.emit(Envelope::new(Event::ModelChanged { model: m }));
+        }
+        self.start_process();
+    }
+
+    fn status(&self) -> SessionStatus {
+        let adapter = self.adapter.borrow();
+        let state = self.state.borrow();
+        SessionStatus {
+            driver: adapter.driver(),
+            model: state.model.clone(),
+            mode: state.mode,
+            running_turn: state.running_turn,
+            alive: state.alive,
+            capabilities: adapter.capabilities().clone(),
+            commands: state.commands.clone(),
+        }
+    }
+}
+
+/// The budgeted, redacted handoff of a thread's history and how many messages it carries.
+/// Tool items count as assistant history; items with no text are skipped, and an item still
+/// open (its process died with it) is described as interrupted.
+fn build_handoff(messages: &[TranscriptMessage], source: &str) -> (String, usize) {
+    let history: Vec<HistoricalMessage> = messages
+        .iter()
+        .filter(|m| !m.text.trim().is_empty())
+        .map(|m| HistoricalMessage {
+            role: if m.role == "user" {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            kind: m.kind.clone(),
+            text: m.text.clone(),
+            item_id: m.item_id.clone(),
+            status: if m.status == "open" {
+                "interrupted".to_owned()
+            } else {
+                m.status.clone()
+            },
+        })
+        .collect();
+    // A fresh session has used nothing; the window is unknown, so the budget is the default cap.
+    let budget = handoff_budget(
+        DEFAULT_HANDOFF_TOKEN_CAP,
+        HANDOFF_PROMPT_ALLOWANCE,
+        &[],
+        0,
+        None,
+        None,
+        None,
+    );
+    let coverage = handoff_coverage(
+        source,
+        history.first().map(|m| m.item_id.as_str()),
+        history.last().map(|m| m.item_id.as_str()),
+    );
+    let selection = select_history(&history, &coverage, budget);
+    let carried = selection.messages.len();
+    (
+        render_history(&selection.messages, &selection.context),
+        carried,
+    )
+}
+
+impl ChatBackend for ChatSession {
+    fn send_prompt(&self, text: &str) {
+        self.inner.send_prompt(text);
+    }
+
+    fn interrupt(&self) {
+        self.inner.command(Command::Interrupt);
+    }
+
+    fn respond_approval(&self, request: &str, decision: Decision) {
+        self.inner.respond_approval(request, decision);
+    }
+
+    fn answer_questions(&self, request: &str, answers: serde_json::Value) {
+        self.inner.command(Command::Answer {
+            request: request.to_owned(),
+            answers,
+        });
+    }
+
+    fn switch(&self, driver: Driver, model: Option<String>) {
+        self.inner.switch(driver, model);
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        self.inner.set_mode(mode);
+    }
+
+    fn control(&self, control: Control) -> String {
+        self.inner.control(control)
+    }
+
+    fn status(&self) -> SessionStatus {
+        self.inner.status()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{in_loop, pump_until};
+    use agent_core::agy::AgyAdapter;
+    use agent_core::caps::Capabilities;
+    use std::path::Path;
+    use std::time::Duration;
+
+    const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
+    const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";
+
+    type Seen = Rc<RefCell<Vec<Envelope>>>;
+
+    fn make_sink() -> (EnvelopeSink, Seen) {
+        let seen: Seen = Rc::default();
+        let s = seen.clone();
+        (
+            Rc::new(move |e: &Envelope| s.borrow_mut().push(e.clone())),
+            seen,
+        )
+    }
+
+    fn has(seen: &Seen, f: impl Fn(&Event) -> bool) -> bool {
+        seen.borrow().iter().any(|e| f(&e.event))
+    }
+
+    fn exited_count(seen: &Seen) -> usize {
+        seen.borrow()
+            .iter()
+            .filter(|e| matches!(e.event, Event::SessionExited { .. }))
+            .count()
+    }
+
+    /// A shell "agent" in `dir`: logs its arguments and the approval env, reads one line, then
+    /// replays the recorded agy frames and exits.
+    fn fake_agy(dir: &Path) -> OpenSession {
+        let frames: Vec<String> = FIXTURE
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["dir"] == "out")
+            .map(|v| v["frame"].to_string())
+            .collect();
+        std::fs::write(dir.join("frames.ndjson"), frames.join("\n") + "\n").expect("frames");
+        let script = dir.join("agent.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "D=$(dirname \"$0\")\n",
+                "echo \"$@\" >> \"$D/args.log\"\n",
+                "echo \"${AGENT_TERMINAL_APPROVAL_SOCKET-unset}\" >> \"$D/sock.log\"\n",
+                "echo \"${AGENT_TERMINAL_HOOK_BIN-unset}\" >> \"$D/hookbin.log\"\n",
+                "read line\n",
+                "cat \"$D/frames.ndjson\"\n",
+            ),
+        )
+        .expect("script");
+        OpenSession {
+            program: "/bin/sh".into(),
+            extra_args: vec![script.to_string_lossy().into_owned()],
+            cwd: dir.to_string_lossy().into_owned(),
+            model: None,
+            mode: Mode::Ask,
+            resume: None,
+            new_session_id: None,
+            approval_hook: false,
+        }
+    }
+
+    fn lines(path: std::path::PathBuf) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn fresh(store: &Store, cwd: &str) -> ThreadId {
+        store.create_thread(cwd, Some("t")).expect("thread")
+    }
+
+    #[test]
+    fn replays_an_agy_turn_into_the_sink_and_the_store_and_resumes_after_exit() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            // Without the hook: read-only, and the user is told.
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("read-only"))
+            ));
+            assert_eq!(session.status().mode, Mode::Plan);
+
+            session.send_prompt("add multiply");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) == 1), "no exit");
+
+            let first = seen.borrow()[seen.borrow().len().saturating_sub(1)].clone();
+            assert!(matches!(
+                first.event,
+                Event::SessionExited { code: Some(0), .. }
+            ));
+            assert!(has(&seen, |e| matches!(e, Event::SessionStarted { .. })));
+            assert!(has(&seen, |e| matches!(e, Event::TurnCompleted { .. })));
+            assert!(has(&seen, |e| matches!(e, Event::ContentDelta { .. })));
+            // The user's own message is echoed first.
+            assert!(matches!(
+                seen.borrow()
+                    .iter()
+                    .find(|e| matches!(
+                        e.event,
+                        Event::ItemStarted {
+                            kind: ItemKind::UserMessage,
+                            ..
+                        }
+                    ))
+                    .map(|e| &e.event),
+                Some(Event::ItemStarted { .. })
+            ));
+
+            let status = session.status();
+            assert!(!status.alive && !status.running_turn);
+            let pts = store.provider_threads(&thread).expect("pts");
+            assert_eq!(pts.len(), 1);
+            assert_eq!(pts[0].native_id.as_deref(), Some(CONVERSATION));
+            let stored = store.events(&thread, None, 1000).expect("events");
+            assert!(stored
+                .iter()
+                .any(|(_, e)| matches!(e.event, Event::TurnCompleted { .. })));
+            assert!(stored
+                .iter()
+                .all(|(_, e)| !matches!(e.event, Event::Unknown) || e.raw.is_some()));
+            let msgs = store.transcript_messages(&thread).expect("msgs");
+            assert_eq!(msgs[0].text, "add multiply");
+
+            // The process is dead: the next prompt restarts it resuming the native session.
+            session.send_prompt("again");
+            assert!(
+                pump_until(ctx, 15, || exited_count(&seen) == 2),
+                "no second exit"
+            );
+            let args = lines(tmp.path().join("args.log"));
+            assert_eq!(args.len(), 2, "{args:?}");
+            assert!(!args[0].contains("--conversation"), "{args:?}");
+            assert!(
+                args[1].contains(&format!("--conversation {CONVERSATION}")),
+                "{args:?}"
+            );
+            assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
+            assert!(args
+                .iter()
+                .all(|a| !a.contains("--dangerously-skip-permissions")));
+        });
+    }
+
+    #[test]
+    fn hook_flag_and_socket_env_come_from_one_value() {
+        in_loop(|ctx| {
+            // Handle present: flag on, both env vars exported and non-blank, same socket.
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = ApprovalHandle::bind(
+                &tmp.path().join("rt"),
+                "t1",
+                tmp.path(),
+                Mode::Ask,
+                Duration::from_secs(30),
+            )
+            .expect("bind");
+            let open = OpenSession {
+                approval_hook: false, // the session must not trust the caller's value
+                ..fake_agy(tmp.path())
+            };
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store.clone(),
+                thread,
+                sink,
+                Some(handle.clone()),
+            );
+            let spec = session.launch_spec();
+            assert!(spec
+                .argv
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"));
+            let env: std::collections::HashMap<_, _> = spec.env.iter().cloned().collect();
+            let socket = env
+                .get("AGENT_TERMINAL_APPROVAL_SOCKET")
+                .expect("socket var");
+            assert!(!socket.trim().is_empty());
+            assert_eq!(Path::new(socket), handle.socket_path());
+            assert!(Path::new(socket).exists(), "listening");
+            let hook = env.get("AGENT_TERMINAL_HOOK_BIN").expect("hook bin var");
+            assert!(Path::new(hook).is_absolute());
+            assert!(
+                !has(&seen, |e| matches!(e, Event::Notice { .. })),
+                "no read-only notice"
+            );
+            assert_eq!(session.status().mode, Mode::Ask);
+
+            // The spawned process really got them.
+            session.send_prompt("go");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
+            assert_eq!(
+                lines(tmp.path().join("sock.log")),
+                std::slice::from_ref(socket)
+            );
+            assert_eq!(
+                lines(tmp.path().join("hookbin.log")),
+                std::slice::from_ref(hook)
+            );
+            assert!(
+                lines(tmp.path().join("args.log"))[0].contains("--dangerously-skip-permissions")
+            );
+            drop(session);
+
+            // No handle: flag off, no env, plan mode.
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let open = OpenSession {
+                approval_hook: true, // ignored: there is no socket to export
+                ..fake_agy(tmp.path())
+            };
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                None,
+            );
+            let spec = session.launch_spec();
+            assert!(spec.env.is_empty());
+            assert!(!spec
+                .argv
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"));
+            assert!(spec.argv.windows(2).any(|w| w == ["--mode", "plan"]));
+            session.send_prompt("go");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
+            assert_eq!(lines(tmp.path().join("sock.log")), ["unset"]);
+            assert_eq!(lines(tmp.path().join("hookbin.log")), ["unset"]);
+        });
+    }
+
+    #[test]
+    fn unsupported_commands_become_error_envelopes() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.respond_approval("r1", Decision::Allow);
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Error { message } if message.contains("not supported"))
+            ));
+
+            let id = session.control(Control::McpStatus);
+            assert_eq!(id, "ctl-1");
+            assert_eq!(session.control(Control::ContextUsage), "ctl-2");
+            assert!(seen.borrow().iter().any(|e| {
+                e.request.as_deref() == Some("ctl-1")
+                    && matches!(e.event, Event::ControlResult { error: Some(_), .. })
+            }));
+            // Let the replay process finish so the test does not leave one behind.
+            drop(session);
+            let _ = ctx;
+        });
+    }
+
+    #[test]
+    fn same_driver_agy_model_switch_restarts_and_resumes() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.send_prompt("hi");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) >= 1));
+            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ModelChanged { model } if model == "gemini-flash")
+            ));
+            assert_eq!(session.status().model.as_deref(), Some("gemini-flash"));
+            session.send_prompt("again");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) >= 3));
+            let args = lines(tmp.path().join("args.log"));
+            let last = args.last().expect("args");
+            assert!(last.contains("--model gemini-flash"), "{args:?}");
+            assert!(
+                last.contains(&format!("--conversation {CONVERSATION}")),
+                "{args:?}"
+            );
+        });
+    }
+
+    // ---- handoff ----
+
+    type Log = Rc<RefCell<Vec<Command>>>;
+
+    /// An adapter whose process is `cat` and which records every command it is asked to encode.
+    struct FakeAdapter {
+        driver: Driver,
+        caps: Capabilities,
+        log: Log,
+    }
+
+    impl FakeAdapter {
+        fn boxed(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Box::new(Self {
+                driver,
+                caps: match driver {
+                    Driver::Claude => Capabilities::claude(),
+                    Driver::Agy => Capabilities::agy(),
+                },
+                log: log.clone(),
+            })
+        }
+    }
+
+    impl Adapter for FakeAdapter {
+        fn driver(&self) -> Driver {
+            self.driver
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn argv(&self, _: &OpenSession) -> Vec<String> {
+            vec!["/bin/cat".into()]
+        }
+        fn handshake(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+        fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
+            self.log.borrow_mut().push(command);
+            Ok(Vec::new())
+        }
+        fn feed(&mut self, _: &str) -> Vec<Envelope> {
+            Vec::new()
+        }
+        fn feed_stderr(&mut self, _: &str) -> Vec<Envelope> {
+            Vec::new()
+        }
+        fn feed_side(&mut self, _: &str, _: &str, _: bool) -> Vec<Envelope> {
+            Vec::new()
+        }
+        fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
+            vec![Envelope::new(Event::SessionExited {
+                code,
+                expected: true,
+            })]
+        }
+    }
+
+    fn prompts(log: &Log) -> Vec<String> {
+        log.borrow()
+            .iter()
+            .filter_map(|c| match c {
+                Command::Prompt { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_with_handoff_moves_history_into_a_new_provider_thread() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let first = pt_of(&store, &thread);
+            // History from the first agent, with a planted secret in the tool output.
+            let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123"; // gitleaks:allow
+            store
+                .append_user_message(&thread, Some(&first), "please list the repo")
+                .expect("user");
+            for e in [
+                Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::AssistantMessage,
+                    title: String::new(),
+                    input: None,
+                    parent: None,
+                })
+                .item("a1"),
+                Envelope::new(Event::ContentSnapshot {
+                    stream: StreamKind::Assistant,
+                    text: format!("Found three files. token={secret}"),
+                })
+                .item("a1"),
+                Envelope::new(Event::ItemCompleted {
+                    status: agent_core::event::ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item("a1"),
+            ] {
+                store
+                    .append_event(&thread, Some(&first), &e)
+                    .expect("event");
+            }
+
+            let (sink, seen) = make_sink();
+            let log_agy: Log = Rc::default();
+            let log_claude: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log_agy),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: vec!["--profile-only".into()],
+                    cwd: "/".into(),
+                    model: Some("gemini-pro".into()),
+                    mode: Mode::Plan,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            // Without a factory a cross-agent switch is refused, and nothing changes.
+            session.switch(Driver::Claude, Some("opus".into()));
+            assert!(has(&seen, |e| matches!(e, Event::Error { .. })));
+            assert_eq!(session.status().driver, Driver::Agy);
+            assert_eq!(store.provider_threads(&thread).expect("pts").len(), 1);
+
+            let log = log_claude.clone();
+            session.set_adapter_factory(Rc::new(move |d| FakeAdapter::boxed(d, &log)));
+            session.switch(Driver::Claude, Some("opus".into()));
+
+            let status = session.status();
+            assert_eq!(status.driver, Driver::Claude);
+            assert_eq!(status.model.as_deref(), Some("opus"));
+            assert!(status.alive);
+            assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+                if text == "Continuing in Claude with 2 earlier messages")));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ModelChanged { model } if model == "opus")
+            ));
+            let pts = store.provider_threads(&thread).expect("pts");
+            assert_eq!(pts.len(), 2);
+            assert_eq!(pts[1].driver, "claude");
+            assert_eq!(
+                store.active_provider_thread(&thread).expect("active"),
+                Some(pts[1].id.clone())
+            );
+
+            // The handoff rides on the next prompt only, and the store keeps the user's words.
+            session.send_prompt("now summarize");
+            session.send_prompt("and again");
+            let sent = prompts(&log_claude);
+            assert_eq!(sent.len(), 2);
+            assert!(sent[0].starts_with("Context handoff:"), "{}", sent[0]);
+            assert!(sent[0].contains("please list the repo"));
+            assert!(sent[0].contains("Found three files"));
+            assert!(sent[0].contains("User message:\nnow summarize"));
+            assert!(!sent[0].contains(secret), "secret leaked into the handoff");
+            assert_eq!(sent[1], "and again");
+            assert!(prompts(&log_agy).is_empty());
+            let msgs = store.transcript_messages(&thread).expect("msgs");
+            assert!(msgs.iter().any(|m| m.text == "now summarize"));
+            assert!(!msgs.iter().any(|m| m.text.contains("Context handoff")));
+            // New events belong to the new provider thread.
+            let all = store.events(&thread, None, 1000).expect("events");
+            assert!(all.len() > 5);
+        });
+    }
+
+    fn pt_of(store: &Store, thread: &str) -> ProviderThreadId {
+        create_provider_thread(store, thread, Driver::Agy, Some("gemini-pro")).expect("pt")
+    }
+
+    #[test]
+    fn build_handoff_redacts_skips_empty_items_and_marks_open_ones_interrupted() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123"; // gitleaks:allow
+        let msg = |role: &str, kind: &str, text: &str, status: &str, id: &str| TranscriptMessage {
+            role: role.into(),
+            kind: kind.into(),
+            text: text.into(),
+            item_id: id.into(),
+            status: status.into(),
+        };
+        let history = [
+            msg("user", "user_message", "run it", "open", "u1"),
+            msg("tool", "command", &format!("out {secret}"), "open", "c1"),
+            msg("tool", "tool", "", "open", "c2"),
+            msg("assistant", "assistant_message", "done", "completed", "a1"),
+        ];
+        let (summary, carried) = build_handoff(&history, "Claude thread t");
+        assert_eq!(carried, 3, "the empty item is skipped");
+        assert!(!summary.contains(secret));
+        assert!(summary.contains("****0123"));
+        assert!(summary.contains("status=interrupted"));
+        assert!(summary.contains("Claude thread t"));
+        assert_eq!(build_handoff(&[], "x").1, 0);
+    }
+}
