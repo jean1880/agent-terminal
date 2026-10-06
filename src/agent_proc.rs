@@ -38,6 +38,8 @@ pub struct SpawnSpec {
     pub env: Vec<(String, String)>,
 }
 
+type ExitCallback = Box<dyn FnOnce(Option<i32>)>;
+
 struct Shared {
     subprocess: gio::Subprocess,
     stdin: Option<gio::OutputStream>,
@@ -48,7 +50,7 @@ struct Shared {
     readers_open: Cell<u8>,
     /// `Some` once the process has been reaped; the inner option is the exit code.
     exit_code: Cell<Option<Option<i32>>>,
-    on_exit: RefCell<Option<Box<dyn FnOnce(Option<i32>)>>>,
+    on_exit: RefCell<Option<ExitCallback>>,
     name: String,
 }
 
