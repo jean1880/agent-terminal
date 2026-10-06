@@ -63,7 +63,7 @@ impl SystemProbe {
         Self { path, home, shell }
     }
 
-    fn on_path(&self, command: &str) -> bool {
+    fn on_path(&self, command: &str) -> Option<String> {
         let mut cmd = std::process::Command::new("which");
         cmd.arg(command);
         if let Some(path) = self.path.as_deref().filter(|p| !p.is_empty()) {
@@ -73,9 +73,9 @@ impl SystemProbe {
             Ok(output) if output.status.success() => {
                 let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 info!("{command} found via 'which' at {found}");
-                true
+                Some(found).filter(|f| !f.is_empty())
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -99,7 +99,7 @@ impl SystemProbe {
     /// Bounded by [`SHELL_PROBE_TIMEOUT_SECS`]: an rc that blocks — on the
     /// network, a keychain prompt — would otherwise leave the window on its
     /// "Starting up…" page forever.
-    fn known_to_interactive_shell(&self, command: &str) -> bool {
+    fn known_to_interactive_shell(&self, command: &str) -> Option<String> {
         let shell = self.shell.as_deref().unwrap_or("/bin/sh");
         let mut cmd = std::process::Command::new(shell);
         // Single-quoted, so a name with a space or a `$` is looked up as
@@ -112,39 +112,48 @@ impl SystemProbe {
         }
         match run_command(cmd, shell, SHELL_PROBE_TIMEOUT_SECS) {
             Ok(output) if output.status.success() => {
-                let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // An rc may print a banner before the answer; the path is the last line.
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let found = stdout.lines().last().unwrap_or_default().trim().to_string();
                 info!("{command} found via shell -ic at {found}");
-                true
+                Some(found).filter(|f| !f.is_empty())
             }
-            Ok(_) => false,
+            Ok(_) => None,
             Err(reason) => {
                 warn!("Interactive shell check for {command} gave up: {reason}");
-                false
+                None
             }
         }
     }
 
     /// Whether `command` can be launched, checked in increasing order of cost.
     pub fn command_available(&self, command: &str) -> bool {
+        self.locate(command).is_some()
+    }
+
+    /// Where `command` runs from, by the same checks as [`Self::command_available`]. A
+    /// command found only by the interactive shell (an nvm install) is not on the app's own
+    /// PATH, so a process the app spawns directly needs this path rather than the name.
+    pub fn locate(&self, command: &str) -> Option<String> {
         debug!("Resolving command {command}");
 
-        if self.on_path(command) {
-            return true;
+        if let Some(found) = self.on_path(command) {
+            return Some(found);
         }
 
         for path in self.candidate_paths(command) {
             if !path.is_empty() && std::path::Path::new(&path).exists() {
                 debug!("{command} found at {path}");
-                return true;
+                return Some(path);
             }
         }
 
-        if self.known_to_interactive_shell(command) {
-            return true;
+        if let Some(found) = self.known_to_interactive_shell(command) {
+            return Some(found);
         }
 
         warn!("{command} not found after all checks");
-        false
+        None
     }
 }
 
