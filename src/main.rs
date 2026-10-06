@@ -447,8 +447,8 @@ fn load_css() {
             color: #ebe9ff;
             font-weight: bold;
         }
-        .thread-dot.dot-claude { color: #f0a37a; }
-        .thread-dot.dot-agy { color: #6ec8ff; }
+        .thread-dot.dot-claude { color: #e8846b; }
+        .thread-dot.dot-agy { color: #5b9cf6; }
         .thread-dot.dot-codex { color: #4cc38a; }
         .thread-term { color: #a0a0ff; }
         .thread-badge.badge-approval { color: #ffcc66; }

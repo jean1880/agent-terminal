@@ -4,7 +4,10 @@
  *   base #181425   sunken #120f1d   surface #1d1830   raised #251f3b
  *   line #2d2444   line-strong #3b3160
  *   text #c8c8ff   bright #ebe9ff   dim #918bbd   faint #6d6794
- *   brand #b49bff  claude #f0a37a   agy #6ec8ff
+ *   brand #b49bff  claude #e8846b   agy #5b9cf6   codex #4cc38a
+ *   (accents match the app-icon dots and DriverInfo::accent_hex in agent-core; text tints
+ *   are the accent mixed 40% toward white: claude #f1b5a6, agy #9dc4f9, for readable
+ *   labels on the dark base)
  *   ok #4ee8b0     bad #ff7878      warn #ffc46b
  */
 
@@ -33,10 +36,10 @@
 .agent-chip .chip-model { color: #918bbd; font-family: monospace; font-size: 0.9em; }
 
 .accent-dot { font-size: 0.8em; color: #b49bff; }
-.accent-claude .accent-dot { color: #f0a37a; }
-.accent-agy .accent-dot { color: #6ec8ff; }
-.agent-chip.accent-claude { border-color: alpha(#f0a37a, 0.45); }
-.agent-chip.accent-agy { border-color: alpha(#6ec8ff, 0.45); }
+.accent-claude .accent-dot { color: #e8846b; }
+.accent-agy .accent-dot { color: #5b9cf6; }
+.agent-chip.accent-claude { border-color: alpha(#e8846b, 0.45); }
+.agent-chip.accent-agy { border-color: alpha(#5b9cf6, 0.45); }
 .accent-codex .accent-dot { color: #4cc38a; }
 .agent-chip.accent-codex { border-color: alpha(#4cc38a, 0.45); }
 
@@ -103,13 +106,13 @@ levelbar.context-level block.empty { background-color: transparent; }
     padding: 2px 0 2px 16px;
     border-left: 2px solid alpha(#b49bff, 0.6);
 }
-.assistant-row.accent-claude { border-left-color: alpha(#f0a37a, 0.75); }
-.assistant-row.accent-agy { border-left-color: alpha(#6ec8ff, 0.75); }
+.assistant-row.accent-claude { border-left-color: alpha(#e8846b, 0.75); }
+.assistant-row.accent-agy { border-left-color: alpha(#5b9cf6, 0.75); }
 .assistant-row.accent-codex { border-left-color: alpha(#4cc38a, 0.75); }
 .assistant-head .agent-name { color: #918bbd; font-weight: 700; font-size: 0.85em; letter-spacing: 0.02em; }
 .stream-caret { color: #b49bff; }
-.accent-claude .stream-caret { color: #f0a37a; }
-.accent-agy .stream-caret { color: #6ec8ff; }
+.accent-claude .stream-caret { color: #e8846b; }
+.accent-agy .stream-caret { color: #5b9cf6; }
 .accent-codex .stream-caret { color: #4cc38a; }
 
 .md-text { color: #dcdaf5; line-height: 1.45; }
@@ -254,8 +257,8 @@ button.pill { padding: 6px 16px; border-radius: 999px; }
 /* question */
 .question-card {
     padding: 14px 16px;
-    border-color: alpha(#6ec8ff, 0.45);
-    background-image: linear-gradient(180deg, alpha(#6ec8ff, 0.06), alpha(#6ec8ff, 0.0) 60%);
+    border-color: alpha(#5b9cf6, 0.45);
+    background-image: linear-gradient(180deg, alpha(#5b9cf6, 0.06), alpha(#5b9cf6, 0.0) 60%);
 }
 .question-card.resolved { border-color: #2d2444; background-image: none; }
 .question-heading { color: #ebe9ff; font-weight: 700; }
@@ -264,8 +267,8 @@ button.pill { padding: 6px 16px; border-radius: 999px; }
     font-weight: 700;
     padding: 1px 8px;
     border-radius: 999px;
-    background-color: alpha(#6ec8ff, 0.14);
-    color: #9fdcff;
+    background-color: alpha(#5b9cf6, 0.14);
+    color: #9dc4f9;
 }
 .question-text { color: #dcdaf5; }
 .question-hint { color: #6d6794; font-size: 0.85em; }
@@ -276,8 +279,8 @@ togglebutton.option-button, button.option-button {
     border: 1px solid #3b3160;
 }
 .option-button:checked {
-    background-color: alpha(#6ec8ff, 0.18);
-    border-color: #6ec8ff;
+    background-color: alpha(#5b9cf6, 0.18);
+    border-color: #5b9cf6;
 }
 .option-label { color: #ebe9ff; font-weight: 600; }
 .option-desc { color: #918bbd; font-size: 0.85em; }
@@ -312,10 +315,10 @@ togglebutton.option-button, button.option-button {
     background-color: #1a152b;
 }
 .divider-text { color: #918bbd; font-size: 0.85em; }
-.switch-divider.accent-claude .divider-pill { border-color: alpha(#f0a37a, 0.6); background-color: alpha(#f0a37a, 0.08); }
-.switch-divider.accent-agy .divider-pill { border-color: alpha(#6ec8ff, 0.6); background-color: alpha(#6ec8ff, 0.08); }
-.switch-divider.accent-claude separator { background-color: alpha(#f0a37a, 0.35); }
-.switch-divider.accent-agy separator { background-color: alpha(#6ec8ff, 0.35); }
+.switch-divider.accent-claude .divider-pill { border-color: alpha(#e8846b, 0.6); background-color: alpha(#e8846b, 0.08); }
+.switch-divider.accent-agy .divider-pill { border-color: alpha(#5b9cf6, 0.6); background-color: alpha(#5b9cf6, 0.08); }
+.switch-divider.accent-claude separator { background-color: alpha(#e8846b, 0.35); }
+.switch-divider.accent-agy separator { background-color: alpha(#5b9cf6, 0.35); }
 .switch-divider.accent-codex .divider-pill { border-color: alpha(#4cc38a, 0.6); background-color: alpha(#4cc38a, 0.08); }
 .switch-divider.accent-codex separator { background-color: alpha(#4cc38a, 0.35); }
 .switch-divider .divider-text { color: #ebe9ff; font-weight: 600; }
@@ -388,9 +391,9 @@ popover.typeahead > contents {
     min-width: 34px;
 }
 .badge-app { background-color: alpha(#b49bff, 0.18); color: #cdbcff; }
-.badge-agent { background-color: alpha(#f0a37a, 0.18); color: #ffc3a3; }
+.badge-agent { background-color: alpha(#e8846b, 0.18); color: #f1b5a6; }
 .badge-skill { background-color: alpha(#4ee8b0, 0.16); color: #8ff3cd; }
-.badge-file { background-color: alpha(#6ec8ff, 0.16); color: #a6dcff; }
+.badge-file { background-color: alpha(#5b9cf6, 0.16); color: #9dc4f9; }
 
 /* panels */
 dialog.chat-panel sheet,
