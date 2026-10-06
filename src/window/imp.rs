@@ -5324,6 +5324,7 @@ mod tests {
         // Here rather than in a test of its own: GTK belongs to the one
         // thread that initialised it, and tests run on several.
         diff_panel_shows_each_outcome();
+        crate::chat::view::tests::ui_checks();
         chat_shell_opens_threads_and_lists_them(&window);
     }
 

@@ -222,9 +222,19 @@ impl Composer {
 
     pub fn refresh_placeholder(&self) {
         if let Some(host) = self.host() {
-            self.placeholder.set_text(&host.placeholder());
+            // Only on a change: this runs after every batch of events.
+            let text = host.placeholder();
+            if self.placeholder.text() != text {
+                self.placeholder.set_text(&text);
+            }
         }
         self.placeholder.set_visible(self.buffer.char_count() == 0);
+    }
+
+    /// What the placeholder currently says.
+    #[cfg(test)]
+    pub fn placeholder_text(&self) -> String {
+        self.placeholder.text().to_string()
     }
 
     fn connect_signals(self: &Rc<Self>) {

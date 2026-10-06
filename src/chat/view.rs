@@ -37,7 +37,7 @@ use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-use super::{ChatBackend, EnvelopeSink, ModelSource};
+use super::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
 use crate::account_status::AccountStatus;
 use cards::{RowEvent, RowSink};
 use composer::{Composer, ComposerHost};
@@ -368,7 +368,8 @@ impl Inner {
                     }
                 }
                 Change::Running => self.refresh_status(),
-                Change::Commands => {}
+                // The hint names the `$ skills` trigger only once the agent lists skills.
+                Change::Commands => self.composer.refresh_placeholder(),
                 Change::Control { request, result } => self.control_result(&request, result),
             }
         }
@@ -426,6 +427,9 @@ impl Inner {
             .clone()
             .or_else(|| self.model.borrow().current_model().map(str::to_owned));
         self.header.set_agent(status.driver, model.as_deref());
+        // The composer's hint names the agent too: it must follow a switch, which arrives as
+        // events and never goes through `refresh_status` (that only runs on running changes).
+        self.composer.refresh_placeholder();
         let usage = self.usage.borrow().clone();
         if let Some(usage) = usage {
             usage.set_filter(Some(status.driver));
@@ -635,24 +639,28 @@ impl ComposerHost for Inner {
     }
 
     fn placeholder(&self) -> String {
-        let status = self.backend.status();
-        let mut tips = vec!["/ commands"];
-        if status.capabilities.file_suggestions {
-            tips.push("@ files");
-        }
-        if status
-            .commands
-            .iter()
-            .any(|c| c.kind == agent_core::event::AgentCommandKind::Skill)
-        {
-            tips.push("$ skills");
-        }
-        format!(
-            "Message {}  ·  {}",
-            cards::driver_name(status.driver),
-            tips.join("  ·  ")
-        )
+        placeholder_text(&self.backend.status())
     }
+}
+
+/// The composer's hint for the thread's CURRENT agent: its name and the triggers it backs.
+fn placeholder_text(status: &SessionStatus) -> String {
+    let mut tips = vec!["/ commands"];
+    if status.capabilities.file_suggestions {
+        tips.push("@ files");
+    }
+    if status
+        .commands
+        .iter()
+        .any(|c| c.kind == agent_core::event::AgentCommandKind::Skill)
+    {
+        tips.push("$ skills");
+    }
+    format!(
+        "Message {}  ·  {}",
+        cards::driver_name(status.driver),
+        tips.join("  ·  ")
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -749,9 +757,88 @@ impl PlanPanel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use agent_core::event::Decision;
+
+    fn status_of(driver: Driver) -> SessionStatus {
+        SessionStatus {
+            driver,
+            model: None,
+            effort: None,
+            mode: Mode::Ask,
+            running_turn: false,
+            alive: true,
+            capabilities: match driver {
+                Driver::Claude => agent_core::caps::Capabilities::claude(),
+                Driver::Agy => agent_core::caps::Capabilities::agy(),
+                Driver::Codex => agent_core::caps::Capabilities::codex(),
+            },
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_placeholder_names_the_current_agent_and_its_triggers() {
+        let claude = placeholder_text(&status_of(Driver::Claude));
+        assert!(claude.starts_with("Message Claude"), "{claude}");
+        assert!(claude.contains("@ files"));
+        let agy = placeholder_text(&status_of(Driver::Agy));
+        assert!(agy.starts_with("Message Antigravity"), "{agy}");
+        assert!(!agy.contains("Claude"));
+        assert!(placeholder_text(&status_of(Driver::Codex)).starts_with("Message Codex"));
+    }
+
+    /// A backend whose status the test changes, as a session does on a switch.
+    struct SwitchableBackend {
+        status: RefCell<SessionStatus>,
+    }
+
+    impl ChatBackend for SwitchableBackend {
+        fn send_prompt(&self, _: &str) {}
+        fn interrupt(&self) {}
+        fn respond_approval(&self, _: &str, _: Decision) {}
+        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
+        fn switch(&self, driver: Driver, _: Option<String>, _: Option<String>) {
+            *self.status.borrow_mut() = status_of(driver);
+        }
+        fn set_mode(&self, _: Mode) {}
+        fn control(&self, _: Control) -> String {
+            String::new()
+        }
+        fn status(&self) -> SessionStatus {
+            self.status.borrow().clone()
+        }
+    }
+
+    /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
+    pub(crate) fn ui_checks() {
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend.clone());
+        let hint = || {
+            view.inner()
+                .map(|i| i.composer.placeholder_text())
+                .unwrap_or_default()
+        };
+        assert!(hint().starts_with("Message Claude"), "{}", hint());
+
+        // The backend switches agent; the view hears of it only as events, never as a status
+        // refresh, and the composer's hint must still follow.
+        backend.switch(Driver::Agy, None, None);
+        view.sink()(&Envelope::new(agent_core::event::Event::ModelChanged {
+            model: "gemini-3.1-pro-high".into(),
+        }));
+        assert!(!hint().contains("Claude"), "{}", hint());
+        assert!(hint().starts_with("Message Antigravity"), "{}", hint());
+
+        backend.switch(Driver::Codex, None, None);
+        view.sink()(&Envelope::new(agent_core::event::Event::ModelChanged {
+            model: "gpt-5-codex".into(),
+        }));
+        assert!(hint().starts_with("Message Codex"), "{}", hint());
+    }
 
     #[test]
     fn help_lists_only_backed_builtins() {
