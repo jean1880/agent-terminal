@@ -97,14 +97,24 @@ pub struct SubagentSummary {
 
 impl SubagentSummary {
     fn of(item: &Item, tool: &Tool) -> Self {
+        // A live Claude sub-agent's input is not known when its card starts: it streams in as
+        // JSON text after. Read the structured input when there is one, else the streamed text,
+        // whole once it parses and field by field while it is still arriving.
+        let streamed: Option<Value> = tool
+            .input
+            .as_ref()
+            .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+            .cloned()
+            .or_else(|| serde_json::from_str(&tool.input_text).ok());
         let field = |key: &str| {
-            tool.input
+            streamed
                 .as_ref()
                 .and_then(|i| i.get(key))
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
                 .map(str::to_owned)
+                .or_else(|| partial_string_field(&tool.input_text, key))
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
         };
         let name = field("subagent_type")
             .or_else(|| field("agent"))
@@ -120,6 +130,27 @@ impl SubagentSummary {
             steps: item.children.len(),
         }
     }
+}
+
+/// The string value of `"key":` in JSON that may still be arriving (cut anywhere). Only a value
+/// whose closing quote has arrived counts, so a half-streamed description is never shown.
+fn partial_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let after = &text[text.find(&needle)? + needle.len()..];
+    let after = after.trim_start().strip_prefix(':')?.trim_start();
+    let body = after.strip_prefix('"')?;
+    // Re-parse the quoted string with serde, up to its closing (unescaped) quote.
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => {
+                return serde_json::from_str::<String>(&format!("\"{}\"", &body[..i])).ok();
+            }
+            _ => escaped = false,
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -991,6 +1022,35 @@ mod tests {
         assert_eq!(list[0].status, ToolStatus::Running);
         assert_eq!(list[1].name, "Task", "no type: the tool's title");
         assert_eq!(list[1].task, "Check the tests");
+    }
+
+    #[test]
+    fn a_live_subagent_is_named_from_its_streamed_input_as_soon_as_each_field_arrives() {
+        // Live Claude: the card starts with no input; the JSON streams in after.
+        let mut t = Transcript::new();
+        t.apply(&started("agent", ItemKind::Subagent, None), Driver::Claude);
+        let stream = |t: &mut Transcript, text: &str| {
+            t.apply(
+                &delta(Some("agent"), StreamKind::ToolInput, text),
+                Driver::Claude,
+            );
+        };
+        let first = |t: &Transcript| t.subagents().into_iter().next().expect("listed");
+        stream(&mut t, r#"{"description": "Find the par"#);
+        assert_eq!(first(&t).task, "", "never a half-streamed description");
+        stream(&mut t, r#"ser \"fast\"", "subagent_type": "Expl"#);
+        assert_eq!(first(&t).task, r#"Find the parser "fast""#);
+        assert_eq!(
+            first(&t).name,
+            "title agent",
+            "type not complete yet: the title"
+        );
+        stream(&mut t, r#"ore", "prompt": "Look at src/"}"#);
+        let s = first(&t);
+        assert_eq!(
+            (s.name.as_str(), s.task.as_str()),
+            ("Explore", r#"Find the parser "fast""#)
+        );
     }
 
     #[test]
