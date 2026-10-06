@@ -29,16 +29,27 @@ Architectural mandates, standards, and workflows for this codebase.
   an explicit `TabState` registry (`src/window/imp.rs`) — never look a terminal up
   by walking the widget tree. A tab's launch directory is fixed for its lifetime
   (a running CLI cannot re-root itself).
-- **Module layout**: `config.rs` (persisted settings + migration), `theme.rs`
-  (colour schemes, infallible `RGBA::new`), `utils.rs` (pure logic: detection,
-  startup command, path resolution, session stores), `handoff.rs` (pure logic:
-  hand-off briefs, redaction, quota detection), `git.rs` (git plumbing for
-  turn checkpoints and diffs: shells out, but its parsers and filters are
-  pure), `diff.rs` (pure logic: diff bases, numstat, line classification,
-  truncation), `restore.rs` (undo: pin, restore, contained deletion, check),
-  `worktree.rs` (worktree locations, branch checks, create and
-  clean-only remove), `window/imp.rs` (GTK UI), `window/diff_panel.rs` (the
-  diff panel's widgets), `main.rs` (app setup + logging).
+- **Module layout**: a Cargo workspace. The root package is the GTK app, so
+  `cargo build --release` and `cargo deb` at the root still produce the one
+  shipped binary; `crates/*` are path libraries with no GTK.
+  - `crates/agent-core` (pure: no GTK, no process or file I/O): `redact`
+    (secret masking applied to every hand-off brief).
+  - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
+    (git plumbing for turn checkpoints and diffs: shells out, but its parsers
+    and filters are pure), `diff` (diff bases, numstat, line classification,
+    truncation), `restore` (undo: pin, restore, contained deletion, check),
+    `worktree` (worktree locations, branch checks, create and clean-only
+    remove), `handoff` (hand-off briefs, session readers, quota detection),
+    `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
+    `paths` (`~` expansion) and `exec` (child processes with a timeout).
+  - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
+    `SessionFormat`), `theme.rs` (colour schemes, infallible `RGBA::new`),
+    `utils.rs` (detection, startup command, path resolution, indicators; it
+    re-exports the kit helpers the window uses), `window/imp.rs` (GTK UI),
+    `window/diff_panel.rs` (the diff panel's widgets), `main.rs` (app setup +
+    logging, and the `agent_kit` imports that keep `crate::git::…` paths).
+  - Anything that needs `config.rs`, GTK or the command cache stays in the
+    app; a crate never depends on the app.
 - **Undo is itself undoable, and only touches what it pinned**: a restore
   always pins the current working tree first (even if unchanged), refuses to
   run if the tree moved since that pin, never touches HEAD or the index, never
@@ -55,13 +66,13 @@ Architectural mandates, standards, and workflows for this codebase.
   private index file under the git dir, and are recorded only as refs under
   `refs/agent-terminal/`, created with an empty old value so none is
   overwritten. The user's index, HEAD, working tree and stash are left
-  exactly as they were; `git::tests::repo` proves it, including with a split
+  exactly as they were; `agent-kit`'s `git::tests::repo` proves it, including with a split
   index and in a linked worktree. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
   whose names look like secrets are never captured.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
   cannot summarize itself, so briefs are built from disk. Every brief goes
-  through `handoff::redact` and is written `0600` in a `0700` directory outside
+  through `agent_core::redact::redact` and is written `0600` in a `0700` directory outside
   any project. Never add a brief source that skips either.
 - **No feature flags for deployment specifics**: the crate has none. The
   Ansible-drift indicator used to sit behind `homelab-drift`; it is now one
@@ -89,12 +100,14 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🧪 Testing Strategy
 
-- **Logic separation**: keep pure logic in `src/utils.rs`, `src/handoff.rs` and `src/config.rs`
-  (plus the parsers and filters in `src/git.rs`),
-  decoupled from GTK so it is unit-testable without a display. `git.rs`'s
-  repository tests run real git in temp repos with a hermetic config (CI has
-  no git identity) and skip themselves when git is absent. `window/imp.rs` is
-  covered by a construction smoke test plus tests for any pure helpers in it.
+- **Logic separation**: keep pure logic in `agent-core`, and GTK-free git and
+  session logic in `agent-kit` (`git`, `diff`, `restore`, `worktree`,
+  `handoff`, `sessions`); the app's `src/utils.rs` and `src/config.rs` hold the
+  rest. All of it is decoupled from GTK so it is unit-testable without a
+  display. `agent-kit`'s repository tests run real git in temp repos with a
+  hermetic config (CI has no git identity) and skip themselves when git is
+  absent. `window/imp.rs` is covered by a construction smoke test plus tests
+  for any pure helpers in it.
 - **Guard hand-maintained arrays**: `CliClient::ALL`, `ThemeChoice::ALL` and
   `DiffBase::ALL` drive dropdowns by index in both directions. All have exhaustive-match
   tests so adding a variant fails to compile until the array is updated. Any new
@@ -112,7 +125,7 @@ Architectural mandates, standards, and workflows for this codebase.
    shows a plausible startup that has nothing to do with your code. Always use
    `dbus-run-session -- ./target/debug/agent-terminal`. Do not kill the running
    instance to work around this; it is someone's live session.
-4. **Linting**: `cargo fmt` and `cargo clippy --all-targets -- -D warnings`.
+4. **Linting**: `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`.
    CI enforces fmt, clippy, and tests under Xvfb.
 5. **Installation**: do **NOT** run `make install` on developer/daily-driver
    machines. Deployment is the `debian-maintainer` apt pipeline

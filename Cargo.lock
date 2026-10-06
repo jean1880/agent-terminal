@@ -3,9 +3,26 @@
 version = 4
 
 [[package]]
+name = "agent-core"
+version = "0.1.0"
+
+[[package]]
+name = "agent-kit"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "agent-terminal"
 version = "2.1.0"
 dependencies = [
+ "agent-core",
+ "agent-kit",
  "gtk4",
  "libadwaita",
  "serde",

@@ -6,6 +6,15 @@ edition = "2021"
 authors = ["jdesroches"]
 description = "A standalone GTK4 terminal for driving an AI coding CLI"
 
+[workspace]
+# The root package is the GTK app; the pure and git logic live in crates/.
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+
 [dependencies]
 # glib, gio and gdk4 are deliberately NOT direct dependencies: every use in this
 # crate goes through the gtk4 re-exports (gtk4::glib, gtk4::gio, gtk4::gdk), so
@@ -22,11 +31,13 @@ description = "A standalone GTK4 terminal for driving an AI coding CLI"
 gtk4 = { version = "0.11", features = ["v4_10"] }
 vte4 = { version = "0.10", features = ["v0_72"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
-tracing = "0.1"
+agent-core = { path = "crates/agent-core" }
+agent-kit = { path = "crates/agent-kit" }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

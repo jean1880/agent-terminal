@@ -11,14 +11,12 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub mod config;
-mod diff;
-mod git;
-mod handoff;
-mod restore;
 mod theme;
 mod utils;
 mod window;
-mod worktree;
+// The GTK-free logic lives in `agent-kit`; these imports keep the
+// `crate::git::…` style paths used throughout the app.
+use agent_kit::{diff, git, handoff, restore, worktree};
 use window::AgentTerminalWindow;
 
 const APP_ID: &str = "com.jdesroches.AgentTerminal";

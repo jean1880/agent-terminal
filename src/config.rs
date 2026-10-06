@@ -1,3 +1,6 @@
+// How a profile's `session_store` is laid out; defined with the readers in
+// `agent-kit` and re-exported so config and the app keep their old path.
+pub use agent_kit::sessions::SessionFormat;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -101,20 +104,6 @@ pub struct Profile {
     /// no structured signal; Claude's is read from the transcript instead.
     #[serde(default)]
     pub limit_markers: Option<Vec<String>>,
-}
-
-/// How a profile's `session_store` records sessions.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum SessionFormat {
-    /// A directory of `<id>.jsonl` transcripts, directly inside it or one
-    /// directory down, whose records may carry a `cwd` (Claude).
-    #[default]
-    Jsonl,
-    /// A single JSONL log, one row per prompt, carrying `conversationId`,
-    /// `workspace`, `display` and a millisecond `timestamp` (AGY's
-    /// `history.jsonl`).
-    AgyHistory,
 }
 
 impl Profile {

@@ -9,7 +9,7 @@
 //! Everything here shells out to `git` and blocks: call it off the main thread.
 //! The parsers and filters are pure and unit-tested on their own.
 
-use crate::utils::run_command;
+use crate::exec::run_command;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};

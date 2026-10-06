@@ -1,0 +1,16 @@
+[package]
+name = "agent-kit"
+version = "0.1.0"
+edition = "2021"
+authors = ["jdesroches"]
+description = "GTK-free git, checkpoint and session logic for agent-terminal"
+publish = false
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
