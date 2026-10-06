@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
 use agent_core::redact::redact;
@@ -24,6 +24,9 @@ use serde_json::Value;
 pub type ThreadId = String;
 /// Identifier of a provider thread (a UUID string).
 pub type ProviderThreadId = String;
+
+/// How long a writer waits on another connection's lock before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`].
 const SCHEMA_VERSION: i64 = 1;
@@ -143,9 +146,12 @@ pub fn default_path(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<
 /// persisted.
 ///
 /// Ceiling: redaction is per string, so a token split across two streaming
-/// deltas is not recognized in either; the authoritative `ContentSnapshot`
-/// that follows is scrubbed whole. Upgrade path: scrub the accumulated text
-/// per item at append time.
+/// deltas is not recognized in either. The adapters close each streamed item
+/// with a `ContentSnapshot` of its whole text (agy emits one before every
+/// response completes; Claude sends its own assistant snapshots), and that is
+/// scrubbed whole, so the transcript, which a snapshot replaces, is clean; the
+/// raw delta rows may keep the split fragments. Upgrade path: scrub the
+/// accumulated text per item at append time.
 pub fn scrub_envelope(env: Envelope) -> Result<Envelope> {
     let value = serde_json::to_value(&env)?;
     Ok(serde_json::from_value(scrub_value(value))?)
@@ -177,8 +183,13 @@ impl Store {
             create_private_dir(parent)?;
         }
         create_private_file(path)?;
+        tighten_permissions(path)?;
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        enable_wal(&conn)?;
+        // NORMAL is durable enough under WAL (a power cut can lose the last commits, never
+        // corrupt) and avoids an fsync per event.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init(conn)
     }
 
@@ -189,6 +200,7 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&conn)?;
         Ok(Self {
             conn,
@@ -211,10 +223,12 @@ impl Store {
             .conn
             .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
         // Stamp the version (4) and variant (10xx) nibbles of a random UUID.
-        let variant = match hex.as_bytes().get(16) {
-            Some(b) => (u8::from_str_radix(&(*b as char).to_string(), 16).unwrap_or(0) & 0x3) | 0x8,
-            None => 0x8,
-        };
+        let nibble = hex
+            .chars()
+            .nth(16)
+            .and_then(|c| c.to_digit(16))
+            .unwrap_or(0);
+        let variant = (nibble & 0x3) | 0x8;
         Ok(format!(
             "{}-{}-4{}-{:x}{}-{}",
             &hex[0..8],
@@ -242,7 +256,7 @@ impl Store {
         self.conn.execute(
             "INSERT INTO threads (id, title, cwd, created_at, updated_at, archived, read_seq)
              VALUES (?1, ?2, ?3, ?4, ?4, 0, 0)",
-            params![id, title.unwrap_or(""), cwd, now],
+            params![id, redact(title.unwrap_or("")), cwd, now],
         )?;
         Ok(id)
     }
@@ -278,7 +292,7 @@ impl Store {
     pub fn rename_thread(&self, thread: &str, title: &str) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE threads SET title = ?2, updated_at = ?3 WHERE id = ?1",
-            params![thread, title, self.now()],
+            params![thread, redact(title), self.now()],
         )?;
         require_row(n, thread)
     }
@@ -392,6 +406,20 @@ impl Store {
         provider_thread: Option<&str>,
         env: &Envelope,
     ) -> Result<i64> {
+        // The insert and the `updated_at` bump commit together or not at all.
+        let tx = self.conn.unchecked_transaction()?;
+        let seq = self.append_in_txn(thread, provider_thread, env)?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// The body of [`Store::append_event`]; the caller owns the transaction.
+    fn append_in_txn(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        env: &Envelope,
+    ) -> Result<i64> {
         let scrubbed = scrub_envelope(env.clone())?;
         let json = serde_json::to_string(&scrubbed)?;
         let now = self.now();
@@ -429,8 +457,8 @@ impl Store {
         })
         .item(item.clone());
         let tx = self.conn.unchecked_transaction()?;
-        self.append_event(thread, provider_thread, &started)?;
-        self.append_event(thread, provider_thread, &snapshot)?;
+        self.append_in_txn(thread, provider_thread, &started)?;
+        self.append_in_txn(thread, provider_thread, &snapshot)?;
         tx.commit()?;
         Ok(item)
     }
@@ -464,7 +492,8 @@ impl Store {
 
     /// Rebuilds the thread's items with their final text: a snapshot replaces
     /// the deltas accumulated so far, later deltas append to it. Items appear
-    /// in the order they first occur.
+    /// in the order they first occur. `Reasoning` items are left out: a
+    /// hand-off built from this must not replay the model's private thinking.
     pub fn transcript_messages(&self, thread: &str) -> Result<Vec<TranscriptMessage>> {
         let mut out: Vec<TranscriptMessage> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
@@ -477,6 +506,8 @@ impl Store {
                 apply_to_transcript(&mut out, &mut index, env);
             }
         }
+        // A hand-off replays this; the model's private thinking must not travel with it.
+        out.retain(|m| m.kind != "reasoning");
         Ok(out)
     }
 }
@@ -524,9 +555,10 @@ fn apply_to_transcript(
     }
 }
 
-/// Tool input lives in `ItemStarted::input`, not in the transcript text.
+/// Tool input lives in `ItemStarted::input`, not in the transcript text, and
+/// reasoning is never part of it.
 fn counts_as_text(stream: StreamKind) -> bool {
-    !matches!(stream, StreamKind::ToolInput)
+    !matches!(stream, StreamKind::ToolInput | StreamKind::Reasoning)
 }
 
 fn role_of(kind: &str) -> &'static str {
@@ -588,6 +620,44 @@ fn create_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Switches to WAL. Changing the journal mode needs an exclusive moment that
+/// SQLite does not always wait for (the busy handler is skipped when another
+/// connection is mid-open), so a busy answer is retried for the busy timeout.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(f, _))
+                if f.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other.map_err(Into::into),
+        }
+    }
+}
+
+/// Brings an existing database (and its directory) down to `0600` / `0700`: files
+/// created by an older build or a loose umask must not stay readable. The
+/// directory is only changed when the same user owns it and the file, so a
+/// shared directory such as `/tmp` is never locked down by pointing the store
+/// into it.
+fn tighten_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = std::fs::metadata(path)?;
+    if file.permissions().mode() & 0o777 != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let dir = std::fs::metadata(parent)?;
+        if dir.uid() == file.uid() && dir.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 fn create_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     // Created `0600` before SQLite opens it; WAL and SHM files copy the main
@@ -604,9 +674,25 @@ fn create_private_file(path: &Path) -> Result<()> {
 // ---- schema ----
 
 /// Brings the schema to [`SCHEMA_VERSION`]. Each step runs once, inside a
-/// transaction, so calling this on an up-to-date database changes nothing.
+/// `BEGIN IMMEDIATE` transaction that re-reads the version after taking the
+/// write lock, so two processes opening a fresh database cannot both create the
+/// tables, and calling this on an up-to-date database changes nothing.
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")?;
+    if schema_version(conn)? == SCHEMA_VERSION {
+        return Ok(()); // the common case takes no write lock
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match migrate_locked(conn) {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
@@ -618,9 +704,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             supported: SCHEMA_VERSION,
         });
     }
+    Ok(current)
+}
+
+fn migrate_locked(conn: &Connection) -> Result<()> {
+    // Another process may have migrated while this one waited for the lock.
+    let current = schema_version(conn)?;
     if current < 1 {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(
+        conn.execute_batch(
             "CREATE TABLE threads (
                  id TEXT PRIMARY KEY,
                  title TEXT NOT NULL,
@@ -651,7 +742,6 @@ fn migrate(conn: &Connection) -> Result<()> {
              CREATE INDEX events_thread_seq ON events(thread_id, seq);
              INSERT INTO schema_version (version) VALUES (1);",
         )?;
-        tx.commit()?;
     }
     Ok(())
 }
@@ -936,6 +1026,127 @@ mod tests {
         }
         let again = Store::open(&path).expect("reopen");
         assert_eq!(again.list_threads(false).expect("l")[0].id, t);
+    }
+
+    #[test]
+    fn open_tightens_an_existing_loose_db_and_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("agent-terminal");
+        std::fs::create_dir(&dir).expect("dir");
+        let path = dir.join("threads.db");
+        drop(Store::open(&path).expect("first"));
+        let chmod = |p: &Path, m| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        chmod(&path, 0o644);
+        chmod(&dir, 0o755);
+        drop(Store::open(&path).expect("reopen"));
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn concurrent_first_opens_all_succeed_and_migrate_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("agent-terminal").join("threads.db");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    Store::open(&path).map(|_| ()).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread").expect("open");
+        }
+        let s = Store::open(&path).expect("open");
+        let rows: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1);
+        let busy: i64 = s
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("busy");
+        assert_eq!(busy, 5000);
+        let sync: i64 = s
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .expect("sync");
+        assert_eq!(sync, 1, "NORMAL");
+    }
+
+    #[test]
+    fn a_failed_append_leaves_no_event_behind() {
+        let s = store();
+        assert!(s
+            .append_event("nope", None, &Envelope::new(Event::Unknown))
+            .is_err());
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 0);
+        // And a good append is atomic with the timestamp bump.
+        let t = s.create_thread("/", None).expect("t");
+        let before = s.list_threads(false).expect("l")[0].updated_at;
+        s.append_event(&t, None, &Envelope::new(Event::Unknown))
+            .expect("a");
+        assert!(s.list_threads(false).expect("l")[0].updated_at > before);
+    }
+
+    #[test]
+    fn thread_titles_are_redacted() {
+        let s = store();
+        // A fake token in a real shape, assembled so no literal sits in a command line.
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let t = s
+            .create_thread("/", Some(&format!("fix {secret}")))
+            .expect("t");
+        let title = |s: &Store| s.list_threads(false).expect("l")[0].title.clone();
+        assert!(!title(&s).contains("ghp_abcdefghij"), "{}", title(&s));
+        s.rename_thread(&t, &format!("again {secret}"))
+            .expect("rename");
+        assert!(!title(&s).contains("ghp_abcdefghij"), "{}", title(&s));
+        assert!(title(&s).contains("****0123"));
+    }
+
+    #[test]
+    fn transcript_leaves_out_reasoning() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let think = |text: &str| {
+            Envelope::new(Event::ContentDelta {
+                stream: StreamKind::Reasoning,
+                text: text.into(),
+            })
+            .item("r1")
+        };
+        for e in [
+            started("r1", ItemKind::Reasoning),
+            think("private thoughts"),
+            Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Reasoning,
+                text: "private thoughts".into(),
+            })
+            .item("r1"),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("r1"),
+            started("a1", ItemKind::AssistantMessage),
+            delta("a1", "answer"),
+        ] {
+            s.append_event(&t, None, &e).expect("append");
+        }
+        let msgs = s.transcript_messages(&t).expect("msgs");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].text, "answer");
     }
 
     #[test]
