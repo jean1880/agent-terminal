@@ -1,0 +1,399 @@
+/* agent-terminal chat view. Dark-first, on the brand chrome (#181425 / #c8c8ff).
+ *
+ * Palette
+ *   base #181425   sunken #120f1d   surface #1d1830   raised #251f3b
+ *   line #2d2444   line-strong #3b3160
+ *   text #c8c8ff   bright #ebe9ff   dim #918bbd   faint #6d6794
+ *   brand #b49bff  claude #f0a37a   agy #6ec8ff
+ *   ok #4ee8b0     bad #ff7878      warn #ffc46b
+ */
+
+.chat-view {
+    background-color: #181425;
+    color: #c8c8ff;
+}
+
+/* ---------------------------------------------------------------- header strip */
+
+.chat-header {
+    padding: 8px 16px;
+    background-color: #151122;
+    border-bottom: 1px solid #2d2444;
+}
+
+.agent-chip {
+    padding: 4px 12px 4px 10px;
+    border-radius: 999px;
+    background-color: #221c37;
+    border: 1px solid #3b3160;
+    box-shadow: none;
+}
+.agent-chip:hover { background-color: #2a2344; }
+.agent-chip .chip-agent { color: #ebe9ff; font-weight: 700; }
+.agent-chip .chip-model { color: #918bbd; font-family: monospace; font-size: 0.9em; }
+
+.accent-dot { font-size: 0.8em; color: #b49bff; }
+.accent-claude .accent-dot { color: #f0a37a; }
+.accent-agy .accent-dot { color: #6ec8ff; }
+.agent-chip.accent-claude { border-color: alpha(#f0a37a, 0.45); }
+.agent-chip.accent-agy { border-color: alpha(#6ec8ff, 0.45); }
+
+.mode-dropdown > button {
+    border-radius: 999px;
+    padding: 2px 10px;
+    background-color: transparent;
+    border: 1px solid #2d2444;
+    color: #c8c8ff;
+}
+
+.activity .activity-text { color: #918bbd; font-size: 0.9em; }
+
+.gauge { padding: 2px 8px; border-radius: 8px; }
+.gauge .gauge-text { color: #918bbd; font-family: monospace; font-size: 0.85em; }
+
+levelbar.context-level trough {
+    min-height: 6px;
+    border-radius: 999px;
+    background-color: #342b52;
+    padding: 0;
+}
+levelbar.context-level block.filled,
+levelbar.context-level block.ok { background-color: #b49bff; border-radius: 999px; }
+levelbar.context-level block.warn { background-color: #ffc46b; border-radius: 999px; }
+levelbar.context-level block.hot { background-color: #ff7878; border-radius: 999px; }
+levelbar.context-level block.empty { background-color: transparent; }
+
+/* ---------------------------------------------------------------- transcript */
+
+.transcript-scroller { background-color: #181425; }
+.transcript { padding: 24px 24px 18px 24px; }
+
+.transcript-empty .empty-title { font-size: 1.4em; font-weight: 700; color: #ebe9ff; }
+.transcript-empty .empty-hint { color: #6d6794; }
+
+.jump-button { min-width: 36px; min-height: 36px; }
+
+/* user bubble */
+.user-row { margin-left: 96px; }
+.user-bubble {
+    background-image: linear-gradient(135deg, #3a2d6b, #2e2557);
+    color: #ebe9ff;
+    padding: 10px 15px;
+    border-radius: 18px 18px 6px 18px;
+    border: 1px solid alpha(#b49bff, 0.25);
+}
+
+/* assistant message */
+.assistant-row {
+    padding: 2px 0 2px 16px;
+    border-left: 2px solid alpha(#b49bff, 0.6);
+}
+.assistant-row.accent-claude { border-left-color: alpha(#f0a37a, 0.75); }
+.assistant-row.accent-agy { border-left-color: alpha(#6ec8ff, 0.75); }
+.assistant-head .agent-name { color: #918bbd; font-weight: 700; font-size: 0.85em; letter-spacing: 0.02em; }
+.stream-caret { color: #b49bff; }
+.accent-claude .stream-caret { color: #f0a37a; }
+.accent-agy .stream-caret { color: #6ec8ff; }
+
+.md-text { color: #dcdaf5; line-height: 1.45; }
+.md-heading { color: #ebe9ff; margin-top: 4px; }
+.md-quote {
+    color: #a9a3d4;
+    padding: 4px 0 4px 12px;
+    border-left: 3px solid #3b3160;
+    font-style: italic;
+}
+.md-list { color: #dcdaf5; }
+separator.md-rule { background-color: #2d2444; margin: 4px 0; }
+
+.code-block {
+    background-color: #110d1c;
+    border: 1px solid #2d2444;
+    border-radius: 10px;
+}
+.code-header {
+    padding: 2px 4px 2px 12px;
+    background-color: #171226;
+    border-bottom: 1px solid #241d38;
+    border-radius: 10px 10px 0 0;
+}
+.code-lang { color: #6d6794; font-family: monospace; font-size: 0.8em; }
+.code-copy { min-height: 24px; min-width: 24px; padding: 2px; color: #918bbd; }
+textview.code-view, textview.code-view text {
+    background-color: #110d1c;
+    color: #dcdaf5;
+    font-family: monospace;
+    font-size: 0.92em;
+}
+.code-block scrolledwindow { border-radius: 0 0 10px 10px; }
+
+/* reasoning */
+.reasoning-toggle { padding: 2px 8px; border-radius: 8px; color: #6d6794; }
+.reasoning-toggle:hover { color: #918bbd; }
+.reasoning-title { color: #6d6794; font-style: italic; }
+.reasoning-text {
+    color: #7e78a6;
+    font-style: italic;
+    padding: 6px 12px 4px 30px;
+}
+
+/* ---------------------------------------------------------------- cards */
+
+.card {
+    background-color: #1d1830;
+    border: 1px solid #2d2444;
+    border-radius: 12px;
+}
+
+.tool-card .card-header {
+    padding: 8px 12px;
+    border-radius: 11px;
+    min-height: 0;
+}
+.tool-card .card-header:hover { background-color: alpha(#ffffff, 0.03); }
+.tool-card .card-title { color: #ebe9ff; font-weight: 700; }
+.tool-card .card-summary { color: #918bbd; font-family: monospace; font-size: 0.9em; }
+.tool-card .kind-icon { color: #918bbd; }
+.tool-card .chevron { color: #6d6794; }
+.tool-card .status-icon { color: #4ee8b0; }
+.tool-card.status-failed { border-color: alpha(#ff7878, 0.45); }
+.tool-card.status-failed .status-icon { color: #ff7878; }
+.tool-card.status-declined .status-icon { color: #ffc46b; }
+.tool-card.status-interrupted .status-icon { color: #918bbd; }
+.tool-card.status-running { border-color: alpha(#b49bff, 0.4); }
+
+.status-badge {
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background-color: alpha(#ff7878, 0.15);
+    color: #ff9a9a;
+}
+.status-declined .status-badge { background-color: alpha(#ffc46b, 0.15); color: #ffd08a; }
+.status-interrupted .status-badge { background-color: alpha(#918bbd, 0.15); color: #b3aee0; }
+
+.card-body { padding: 4px 14px 14px 14px; }
+.card-section .section-title {
+    color: #6d6794;
+    font-size: 0.75em;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+.mono-scroller {
+    background-color: #120f1d;
+    border: 1px solid #241d38;
+    border-radius: 8px;
+}
+.mono-text {
+    font-family: monospace;
+    font-size: 0.88em;
+    color: #c9c6ee;
+    padding: 8px 10px;
+}
+.card-error { color: #ff9a9a; font-family: monospace; font-size: 0.88em; }
+.card-children {
+    padding: 4px 0 2px 12px;
+    border-left: 2px solid #2d2444;
+}
+.card-children .card { background-color: #191529; }
+
+/* approval */
+.approval-card {
+    padding: 14px 16px;
+    border-color: alpha(#ffc46b, 0.5);
+    background-image: linear-gradient(180deg, alpha(#ffc46b, 0.06), alpha(#ffc46b, 0.0) 60%);
+}
+.approval-card .approval-icon { color: #ffc46b; }
+.approval-card .approval-title { color: #ebe9ff; font-weight: 700; font-size: 1.05em; }
+.approval-card .approval-reason { color: #918bbd; }
+.approval-card .approval-input {
+    background-color: #120f1d;
+    border: 1px solid #241d38;
+    border-radius: 8px;
+}
+.approval-card.resolved, .approval-card.expired {
+    border-color: #2d2444;
+    background-image: none;
+}
+.approval-card.resolved .approval-icon { color: #4ee8b0; }
+.approval-card.expired .approval-icon { color: #6d6794; }
+.approval-outcome { color: #918bbd; font-style: italic; }
+.approval-card.resolved .approval-outcome { color: #4ee8b0; font-style: normal; font-weight: 700; }
+
+button.pill { padding: 6px 16px; border-radius: 999px; }
+.chat-view button.suggested-action {
+    background-color: #b49bff;
+    color: #181425;
+    font-weight: 700;
+}
+.chat-view button.suggested-action:hover { background-color: #c4b0ff; }
+.chat-view button.destructive-action {
+    background-color: alpha(#ff7878, 0.16);
+    color: #ff9a9a;
+}
+.chat-view button.destructive-action:hover { background-color: alpha(#ff7878, 0.26); }
+
+/* question */
+.question-card {
+    padding: 14px 16px;
+    border-color: alpha(#6ec8ff, 0.45);
+    background-image: linear-gradient(180deg, alpha(#6ec8ff, 0.06), alpha(#6ec8ff, 0.0) 60%);
+}
+.question-card.resolved { border-color: #2d2444; background-image: none; }
+.question-heading { color: #ebe9ff; font-weight: 700; }
+.question-chip {
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background-color: alpha(#6ec8ff, 0.14);
+    color: #9fdcff;
+}
+.question-text { color: #dcdaf5; }
+.question-hint { color: #6d6794; font-size: 0.85em; }
+togglebutton.option-button, button.option-button {
+    padding: 8px 14px;
+    border-radius: 10px;
+    background-color: #241e3a;
+    border: 1px solid #3b3160;
+}
+.option-button:checked {
+    background-color: alpha(#6ec8ff, 0.18);
+    border-color: #6ec8ff;
+}
+.option-label { color: #ebe9ff; font-weight: 600; }
+.option-desc { color: #918bbd; font-size: 0.85em; }
+
+/* notices, errors, dividers */
+.notice-row {
+    padding: 8px 12px;
+    border-radius: 10px;
+    background-color: alpha(#b49bff, 0.06);
+}
+.notice-row .notice-icon { color: #918bbd; }
+.notice-text { color: #a9a3d4; font-size: 0.92em; }
+.notice-row.warning { background-color: alpha(#ffc46b, 0.08); }
+.notice-row.warning .notice-icon, .notice-row.warning .notice-text { color: #ffd08a; }
+
+.error-row {
+    padding: 10px 14px;
+    border-radius: 10px;
+    background-color: alpha(#ff7878, 0.09);
+    border: 1px solid alpha(#ff7878, 0.35);
+    color: #ff9a9a;
+}
+.error-row .error-title { color: #ff9a9a; font-weight: 700; }
+.error-row .error-text { color: #ffc4c4; }
+
+.divider { margin: 6px 0; }
+.divider separator { background-color: #2d2444; min-height: 1px; }
+.divider-pill {
+    padding: 3px 12px;
+    border-radius: 999px;
+    border: 1px solid #2d2444;
+    background-color: #1a152b;
+}
+.divider-text { color: #918bbd; font-size: 0.85em; }
+.switch-divider.accent-claude .divider-pill { border-color: alpha(#f0a37a, 0.6); background-color: alpha(#f0a37a, 0.08); }
+.switch-divider.accent-agy .divider-pill { border-color: alpha(#6ec8ff, 0.6); background-color: alpha(#6ec8ff, 0.08); }
+.switch-divider.accent-claude separator { background-color: alpha(#f0a37a, 0.35); }
+.switch-divider.accent-agy separator { background-color: alpha(#6ec8ff, 0.35); }
+.switch-divider .divider-text { color: #ebe9ff; font-weight: 600; }
+.compaction-divider .divider-text { font-style: italic; }
+
+/* ---------------------------------------------------------------- bottom: plan + composer */
+
+.chat-bottom {
+    padding: 8px 24px 16px 24px;
+    background-color: #181425;
+}
+
+.plan-card {
+    background-color: #1d1830;
+    border: 1px solid #2d2444;
+    border-radius: 12px;
+}
+.plan-toggle { padding: 6px 12px; border-radius: 11px; }
+.plan-title { color: #ebe9ff; font-weight: 700; font-size: 0.9em; }
+.plan-steps { padding: 0 14px 10px 14px; }
+.plan-step .step-glyph { min-width: 16px; color: #6d6794; }
+.plan-step .step-text { color: #c9c6ee; }
+.plan-step.step-active .step-glyph { color: #b49bff; }
+.plan-step.step-active .step-text { color: #ebe9ff; font-weight: 600; }
+.plan-step.step-done .step-glyph { color: #4ee8b0; }
+.plan-step.step-done .step-text { color: #6d6794; }
+
+.composer {
+    padding: 6px 6px 6px 4px;
+    border-radius: 16px;
+    background-color: #1f1a33;
+    border: 1px solid #3b3160;
+}
+.composer:focus-within { border-color: alpha(#b49bff, 0.7); }
+textview.composer-view, textview.composer-view text {
+    background-color: transparent;
+    color: #ebe9ff;
+    font-size: 1.02em;
+}
+.composer-placeholder { color: #6d6794; }
+button.send-button {
+    min-width: 36px;
+    min-height: 36px;
+    background-color: #b49bff;
+    color: #181425;
+}
+button.send-button:hover { background-color: #c4b0ff; }
+button.send-button.stop { background-color: #ff7878; color: #181425; }
+
+/* typeahead */
+popover.typeahead > contents {
+    padding: 4px;
+    border-radius: 12px;
+    background-color: #1f1a33;
+    border: 1px solid #3b3160;
+    box-shadow: 0 8px 28px alpha(black, 0.45);
+}
+.typeahead-list { background-color: transparent; }
+.typeahead-list row { border-radius: 8px; padding: 0; }
+.typeahead-list row:selected { background-color: alpha(#b49bff, 0.2); }
+.typeahead-row { padding: 6px 10px; }
+.typeahead-name { color: #ebe9ff; font-family: monospace; font-weight: 700; }
+.typeahead-hint { color: #918bbd; font-family: monospace; font-size: 0.9em; }
+.typeahead-desc { color: #918bbd; font-size: 0.9em; }
+.kind-badge {
+    font-size: 0.7em;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 6px;
+    min-width: 34px;
+}
+.badge-app { background-color: alpha(#b49bff, 0.18); color: #cdbcff; }
+.badge-agent { background-color: alpha(#f0a37a, 0.18); color: #ffc3a3; }
+.badge-skill { background-color: alpha(#4ee8b0, 0.16); color: #8ff3cd; }
+.badge-file { background-color: alpha(#6ec8ff, 0.16); color: #a6dcff; }
+
+/* panels */
+dialog.chat-panel sheet,
+dialog.chat-panel floating-sheet > sheet,
+dialog.chat-panel bottom-sheet > sheet,
+.chat-panel toolbarview { background-color: #1d1830; color: #c8c8ff; }
+.chat-panel headerbar { background-color: transparent; box-shadow: none; color: #ebe9ff; }
+.chat-panel list.boxed-list { background-color: #241e3a; border-radius: 12px; }
+.chat-panel list.boxed-list row { color: #ebe9ff; }
+.chat-panel list.boxed-list row .subtitle { color: #918bbd; }
+.chat-panel list.boxed-list row:hover { background-color: alpha(#b49bff, 0.08); }
+.chat-panel .agent-switch button:checked { background-color: alpha(#b49bff, 0.3); color: #ebe9ff; }
+.chat-panel statuspage .title { color: #ebe9ff; }
+.chat-panel image.accent { color: #b49bff; }
+.chat-panel button.suggested-action { background-color: #b49bff; color: #181425; font-weight: 700; }
+.chat-panel button.suggested-action:hover { background-color: #c4b0ff; }
+.chat-panel statuspage image { color: #918bbd; }
+.chat-panel .mcp-dot { font-size: 0.8em; }
+.chat-panel .mcp-ok { color: #4ee8b0; }
+.chat-panel .mcp-pending { color: #ffc46b; }
+.chat-panel .mcp-off { color: #6d6794; }
+.chat-panel .mcp-bad { color: #ff7878; }
+.chat-panel .agent-switch button { padding: 4px 18px; }
+.chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: #ebe9ff; font-family: monospace; }
+.chat-panel .json-row .subtitle { font-family: monospace; }

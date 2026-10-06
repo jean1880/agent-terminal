@@ -31,6 +31,11 @@ tracing = "0.1"
 gtk4 = { version = "0.11", features = ["v4_10"] }
 vte4 = { version = "0.10", features = ["v0_72"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+# The chat composer (and code blocks). v5_12 pairs with GTK 4.10; GtkSourceView 5.12+ is on
+# Ubuntu 24.04 and newer.
+sourceview5 = { version = "0.11", features = ["v5_12", "gtk_v4_10"] }
+# Markdown for assistant messages. Default features off: no HTML renderer, no getopts binary.
+pulldown-cmark = { version = "0.13", default-features = false }
 agent-core = { path = "crates/agent-core" }
 agent-kit = { path = "crates/agent-kit" }
 tracing = { workspace = true }
