@@ -117,10 +117,15 @@ pub fn parse_reply(line: &str) -> Result<ApprovalReply, serde_json::Error> {
 
 /// What the hook prints for agy. `None` stands for every failure to obtain an answer (socket
 /// unreachable, timeout, unparseable reply or payload) and denies: fail closed. Only an explicit
-/// `Allow` or `AllowForSession` lets the call run.
+/// `Allow`, `AllowForSession` or `AllowAlways` lets the call run.
 pub fn hook_output(reply: Option<&ApprovalReply>) -> String {
     let (decision, reason) = match reply {
-        Some(r) if matches!(r.decision, Decision::Allow | Decision::AllowForSession) => {
+        Some(r)
+            if matches!(
+                r.decision,
+                Decision::Allow | Decision::AllowForSession | Decision::AllowAlways
+            ) =>
+        {
             return serde_json::json!({"decision": "allow"}).to_string();
         }
         Some(r) => (
@@ -233,7 +238,11 @@ mod tests {
 
     #[test]
     fn allow_prints_allow() {
-        for d in [Decision::Allow, Decision::AllowForSession] {
+        for d in [
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+        ] {
             let r = ApprovalReply {
                 decision: d,
                 reason: None,

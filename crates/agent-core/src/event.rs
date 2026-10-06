@@ -122,6 +122,11 @@ pub enum Event {
         reason: Option<String>,
         options: Vec<Decision>,
         response: ResponseCapability,
+        /// When "Always allow" is offered: exactly what it would save, in the agent's own terms
+        /// (Claude: `Bash(git status:*)`; agy: the command line and its folder), so the user can
+        /// judge how broad it is before choosing it.
+        #[serde(default)]
+        remembers: Option<String>,
     },
     ApprovalResolved {
         decision: Decision,
@@ -238,6 +243,10 @@ pub enum ItemStatus {
 pub enum Decision {
     Allow,
     AllowForSession,
+    /// Allow, and remember it beyond this session: Claude writes its own suggested rules to the
+    /// project's `.claude/settings.local.json`; agy's exact-match rule is kept by the app per
+    /// workspace. Offered only where such a rule exists; Codex never offers it.
+    AllowAlways,
     Deny,
     Cancel,
 }

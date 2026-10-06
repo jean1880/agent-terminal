@@ -1152,6 +1152,7 @@ pub(crate) mod tests {
                 reason: None,
                 options: vec![Decision::Allow, Decision::Deny],
                 response: ResponseCapability::Live,
+                remembers: None,
             })
             .request("r1"),
         );
@@ -1161,8 +1162,9 @@ pub(crate) mod tests {
                 title: None,
                 input: json!({"command": "rm -rf build"}),
                 reason: None,
-                options: vec![Decision::Allow],
+                options: vec![Decision::Allow, Decision::AllowAlways, Decision::Deny],
                 response: ResponseCapability::Live,
+                remembers: Some("Bash(rm -rf build) in this project".into()),
             })
             .request("r2"),
         );
@@ -1183,6 +1185,21 @@ pub(crate) mod tests {
         let (files, diff_visible, raw_visible, _) = approval("approval:r2");
         assert_eq!(files, "$ rm -rf build", "the command stays prominent");
         assert!(!diff_visible && !raw_visible);
+        // "Always allow" says exactly what it would save; a card without it says nothing.
+        let remembers = |id: &str| {
+            inner
+                .transcript
+                .with_row(id, |row| match row {
+                    cards::Row::Approval(a) => a.remembers_text(),
+                    _ => None,
+                })
+                .flatten()
+        };
+        assert_eq!(
+            remembers("approval:r2").as_deref(),
+            Some("“Always allow” saves: Bash(rm -rf build) in this project")
+        );
+        assert_eq!(remembers("approval:r1"), None);
 
         // A Codex file-change approval carries no diff itself; the item it names has it.
         sink(&Envelope::new(Event::ItemStarted {
@@ -1200,6 +1217,7 @@ pub(crate) mod tests {
                 reason: None,
                 options: vec![Decision::Allow],
                 response: ResponseCapability::Live,
+                remembers: None,
             })
             .request("r3")
             .item("cx1"),
@@ -1256,6 +1274,7 @@ pub(crate) mod tests {
                 reason: None,
                 options: vec![Decision::Allow],
                 response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
             })
             .request("r"),
             Driver::Claude,

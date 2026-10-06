@@ -736,6 +736,8 @@ impl CodexAdapter {
                 reason: s(params, "reason").map(str::to_owned),
                 options,
                 response: ResponseCapability::Live,
+                // Codex has no persistent allow.
+                remembers: None,
             })
             .item(item)
             .request(key),
@@ -1136,6 +1138,9 @@ fn decision_wire(decision: Decision) -> &'static str {
     match decision {
         Decision::Allow => "accept",
         Decision::AllowForSession => "acceptForSession",
+        // Codex has no persistent allow and never offers it, so `encode` refuses it before any
+        // line is written; the name only appears in that refusal.
+        Decision::AllowAlways => "acceptAlways",
         Decision::Deny => "decline",
         Decision::Cancel => "cancel",
     }
@@ -1557,7 +1562,8 @@ mod tests {
         let approval = &ev[13];
         assert_eq!(approval.request.as_deref(), Some("0"));
         assert!(matches!(&approval.event, Event::ApprovalRequested {
-            tool, title: Some(t), reason: Some(r), options, response: ResponseCapability::Live, input
+            tool, title: Some(t), reason: Some(r), options, response: ResponseCapability::Live, input,
+            remembers: None
         } if tool == "command_execution" && t == "ls -la" && r.contains("outside")
             && options == &ALL_DECISIONS.to_vec() && input["command"] == "ls -la"));
         assert!(

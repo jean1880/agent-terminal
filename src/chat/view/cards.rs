@@ -1028,6 +1028,8 @@ pub struct ApprovalCard {
     /// The JSON behind that diff, one click away.
     raw: gtk4::Expander,
     raw_text: gtk4::Label,
+    /// What "Always allow" would save, when it is offered.
+    remembers: gtk4::Label,
     buttons: gtk4::Box,
     outcome: gtk4::Label,
     request: RefCell<String>,
@@ -1039,6 +1041,7 @@ pub fn decision_label(d: Decision) -> &'static str {
     match d {
         Decision::Allow => "Allow",
         Decision::AllowForSession => "Allow for session",
+        Decision::AllowAlways => "Always allow",
         Decision::Deny => "Deny",
         Decision::Cancel => "Cancel",
     }
@@ -1048,6 +1051,7 @@ fn decision_outcome(d: Decision) -> &'static str {
     match d {
         Decision::Allow => "Allowed once",
         Decision::AllowForSession => "Allowed for this session",
+        Decision::AllowAlways => "Always allowed here",
         Decision::Deny => "Denied",
         Decision::Cancel => "Cancelled",
     }
@@ -1084,6 +1088,11 @@ impl ApprovalCard {
         raw.set_child(Some(&raw_text));
         raw.set_visible(false);
         root.append(&raw);
+        let remembers = label("", &["approval-remembers", "dim-label"]);
+        wrapping(&remembers);
+        remembers.set_selectable(true);
+        remembers.set_visible(false);
+        root.append(&remembers);
         let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let outcome = label("", &["approval-outcome"]);
         outcome.set_hexpand(true);
@@ -1100,6 +1109,7 @@ impl ApprovalCard {
             diff,
             raw,
             raw_text,
+            remembers,
             buttons,
             outcome,
             request: RefCell::new(String::new()),
@@ -1187,8 +1197,9 @@ impl ApprovalCard {
             order.sort_by_key(|d| match d {
                 Decision::Cancel => 0,
                 Decision::Deny => 1,
-                Decision::AllowForSession => 2,
-                Decision::Allow => 3,
+                Decision::AllowAlways => 2,
+                Decision::AllowForSession => 3,
+                Decision::Allow => 4,
             });
             for d in order {
                 let b = gtk4::Button::with_label(decision_label(d));
@@ -1230,6 +1241,25 @@ impl ApprovalCard {
         self.outcome.set_text(&outcome);
         self.buttons.set_sensitive(sensitive);
         self.buttons.set_visible(show_buttons);
+        // While the choice is open, say exactly what "Always allow" would keep.
+        match a.remembers.as_deref().filter(|_| {
+            a.state == ApprovalState::Pending && a.options.contains(&Decision::AllowAlways)
+        }) {
+            Some(text) => {
+                self.remembers
+                    .set_text(&format!("“Always allow” saves: {text}"));
+                self.remembers.set_visible(true);
+            }
+            None => self.remembers.set_visible(false),
+        }
+    }
+
+    /// What the card says "Always allow" saves, when it shows it (tests).
+    #[cfg(test)]
+    pub(super) fn remembers_text(&self) -> Option<String> {
+        self.remembers
+            .is_visible()
+            .then(|| self.remembers.text().to_string())
     }
 }
 

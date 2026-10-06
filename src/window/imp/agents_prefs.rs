@@ -502,6 +502,7 @@ impl AgentTerminalWindow {
             .build();
         expander.add_row(&json);
         group.add(&expander);
+        group.add(&always_allowed_rows());
 
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
@@ -523,6 +524,57 @@ impl AgentTerminalWindow {
             }
         ));
     }
+}
+
+/// agy's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
+/// and applies to agy sessions started after it (a running one keeps what it already allowed).
+fn always_allowed_rows() -> adw::ExpanderRow {
+    use crate::always_allow::{self, AlwaysRules};
+    let rules = always_allow::path()
+        .map(|p| AlwaysRules::load(&p))
+        .unwrap_or_default();
+    let expander = adw::ExpanderRow::builder()
+        .title("Always-Allowed Actions")
+        .subtitle(match rules.rules.len() {
+            0 => {
+                "None yet. “Always allow” on an approval adds one, for that folder only".to_owned()
+            }
+            n => format!("{n} remembered. Removing one applies to new agy sessions"),
+        })
+        .build();
+    for rule in rules.rules {
+        let row = adw::ActionRow::builder()
+            .title(rule.summary())
+            .subtitle(&rule.workspace)
+            .title_lines(2)
+            .build();
+        let remove = Button::builder()
+            .icon_name("at-window-close-symbolic")
+            .tooltip_text("Forget this rule")
+            .valign(Align::Center)
+            .css_classes(["flat"])
+            .build();
+        remove.connect_clicked(glib::clone!(
+            #[weak]
+            row,
+            #[weak]
+            expander,
+            move |_| {
+                let Some(path) = always_allow::path() else {
+                    return;
+                };
+                let mut rules = AlwaysRules::load(&path);
+                rules.rules.retain(|r| *r != rule);
+                match rules.save(&path) {
+                    Ok(()) => expander.remove(&row),
+                    Err(e) => warn!(error = %e, "could not save the always-allow rules"),
+                }
+            }
+        ));
+        row.add_suffix(&remove);
+        expander.add_row(&row);
+    }
+    expander
 }
 
 /// The effort levels the catalogue lists for `driver`'s models, in first-seen order.

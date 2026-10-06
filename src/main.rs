@@ -12,6 +12,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod account_status;
 mod agent_proc;
+mod always_allow;
 mod approval_hook;
 mod approval_server;
 mod availability;

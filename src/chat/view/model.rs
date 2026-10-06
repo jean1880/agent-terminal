@@ -82,6 +82,48 @@ pub struct Tool {
     pub status: ToolStatus,
 }
 
+/// One sub-agent, as the explorer lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // the explorer UI lands in the next change
+pub struct SubagentSummary {
+    pub id: ItemId,
+    /// The kind of agent (`Explore`, `general-purpose`…), else the tool's title.
+    pub name: String,
+    /// What it was asked to do: the one-line description, else the prompt's first line.
+    pub task: String,
+    pub status: ToolStatus,
+    /// How many steps (direct children) it has taken so far.
+    pub steps: usize,
+}
+
+impl SubagentSummary {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn of(item: &Item, tool: &Tool) -> Self {
+        let field = |key: &str| {
+            tool.input
+                .as_ref()
+                .and_then(|i| i.get(key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let name = field("subagent_type")
+            .or_else(|| field("agent"))
+            .unwrap_or_else(|| tool.title.clone());
+        let task = field("description")
+            .or_else(|| field("prompt").and_then(|p| p.lines().next().map(str::to_owned)))
+            .unwrap_or_default();
+        Self {
+            id: item.id.clone(),
+            name,
+            task,
+            status: tool.status,
+            steps: item.children.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
@@ -111,6 +153,8 @@ pub struct Approval {
     pub reason: Option<String>,
     pub options: Vec<Decision>,
     pub state: ApprovalState,
+    /// What "Always allow" would save, shown on the card.
+    pub remembers: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +243,25 @@ impl Transcript {
     /// Top-level items in display order.
     pub fn order(&self) -> &[ItemId] {
         &self.order
+    }
+
+    /// Every sub-agent the thread started, nested ones included, in the order they began.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn subagents(&self) -> Vec<SubagentSummary> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&ItemId> = self.order.iter().rev().collect();
+        while let Some(id) = stack.pop() {
+            let Some(item) = self.items.get(id) else {
+                continue;
+            };
+            if let Body::Tool(t) = &item.body {
+                if t.kind == ItemKind::Subagent {
+                    out.push(SubagentSummary::of(item, t));
+                }
+            }
+            stack.extend(item.children.iter().rev());
+        }
+        out
     }
 
     #[allow(dead_code)] // kept as API; exercised by tests
@@ -497,6 +560,7 @@ impl Transcript {
                 reason,
                 options,
                 response,
+                remembers,
             } => {
                 let request = env.request.clone().unwrap_or_else(|| self.next_id("req"));
                 if self.requests.contains_key(&request) {
@@ -516,6 +580,7 @@ impl Transcript {
                     reason: reason.clone(),
                     options: options.clone(),
                     state,
+                    remembers: remembers.clone(),
                 });
                 self.requests.insert(request, id.clone());
                 out.push(Change::Added(self.insert(id, body, None)));
@@ -871,6 +936,52 @@ mod tests {
     }
 
     #[test]
+    fn the_explorer_lists_every_subagent_in_order_with_its_task_and_steps() {
+        let mut t = Transcript::new();
+        let task = |id: &str, parent: Option<&str>, input: serde_json::Value| {
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Task".into(),
+                input: Some(input),
+                parent: parent.map(str::to_owned),
+            })
+            .item(id)
+        };
+        t.apply(&started("u", ItemKind::UserMessage, None), Driver::Claude);
+        t.apply(
+            &task(
+                "a",
+                None,
+                json!({"subagent_type": "Explore", "description": "Find the parser"}),
+            ),
+            Driver::Claude,
+        );
+        t.apply(
+            &started("a1", ItemKind::FileRead, Some("a")),
+            Driver::Claude,
+        );
+        // A sub-agent of a sub-agent, named only by its prompt.
+        t.apply(
+            &task(
+                "b",
+                Some("a"),
+                json!({"prompt": "Check the tests\nthen report"}),
+            ),
+            Driver::Claude,
+        );
+        t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
+        let list = t.subagents();
+        let ids: Vec<_> = list.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(list[0].name, "Explore");
+        assert_eq!(list[0].task, "Find the parser");
+        assert_eq!(list[0].steps, 2, "the read and the nested agent");
+        assert_eq!(list[0].status, ToolStatus::Running);
+        assert_eq!(list[1].name, "Task", "no type: the tool's title");
+        assert_eq!(list[1].task, "Check the tests");
+    }
+
+    #[test]
     fn subagent_children_nest_under_their_parent() {
         let mut t = Transcript::new();
         t.apply(&started("task", ItemKind::Subagent, None), Driver::Claude);
@@ -942,6 +1053,7 @@ mod tests {
             reason: None,
             options: vec![Decision::Allow, Decision::Deny],
             response: ResponseCapability::Live,
+            remembers: None,
         })
         .request("r1");
         let c = t.apply(&req, Driver::Claude);
@@ -982,6 +1094,7 @@ mod tests {
                 reason: None,
                 options: vec![Decision::Allow],
                 response,
+                remembers: None,
             })
             .request(id)
         };

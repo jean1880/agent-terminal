@@ -31,6 +31,8 @@ use crate::chat::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
 use agent_core::catalog::{parse_agy_models, CatalogModel};
 
 /// One script step.
+// A demo script holds a few dozen steps; boxing every envelope would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum Step {
     Emit(Envelope),
     Wait(u32),
@@ -792,6 +794,7 @@ fn script() -> Vec<Step> {
             reason: Some("Ask mode: edits need your approval.".into()),
             options: vec![Decision::Allow, Decision::AllowForSession, Decision::Deny],
             response: ResponseCapability::Live,
+            remembers: None,
         })
         .request("ap1"),
     ));
@@ -1011,6 +1014,7 @@ fn script() -> Vec<Step> {
             reason: None,
             options: vec![Decision::Allow, Decision::Deny],
             response: ResponseCapability::Live,
+            remembers: None,
         })
         .request("ap2"),
     ));

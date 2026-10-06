@@ -298,6 +298,15 @@ pub fn session_key(query: &ApprovalQuery) -> Option<(String, String)> {
     Some((query.tool.clone(), detail))
 }
 
+/// What "Always allow" may keep beyond the session: only an exact shell command line in an exact
+/// folder (a [`session_key`] for `run_command`, so never a runner, wrapper or shell syntax).
+/// Never a file edit (a permanent allow on a path such as `~/.bashrc`, a git hook or the rules
+/// file itself would be a standing write grant) and never an MCP tool (its key ignores the
+/// arguments). Those stay "for this session" at most.
+pub fn always_key(key: &(String, String)) -> Option<(String, String)> {
+    (key.0 == "run_command").then(|| key.clone())
+}
+
 /// Resolves symlinks in the longest existing ancestor of an absolute, `..`-free path.
 fn resolve(path: &Path) -> PathBuf {
     let mut tail = Vec::new();
@@ -346,6 +355,8 @@ struct ServerInner {
     deadline: Duration,
     /// Queries received and not yet matched to a tool step by the session's canary.
     queries: RefCell<HashMap<String, u32>>,
+    /// Where "Always allow" rules are kept ([`crate::always_allow`]); `None` offers no "Always".
+    always: RefCell<Option<PathBuf>>,
 }
 
 impl Drop for ServerInner {
@@ -374,7 +385,41 @@ impl ApprovalHandle {
     pub fn bind_default(thread: &str, workspace: &Path, mode: Mode) -> Result<Self, String> {
         let dir = runtime_dir(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
             .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?;
-        Self::bind(&dir, thread, workspace, mode, DEFAULT_DEADLINE)
+        let handle = Self::bind(&dir, thread, workspace, mode, DEFAULT_DEADLINE)?;
+        if let Some(path) = crate::always_allow::path() {
+            handle.use_always_rules(path);
+        }
+        Ok(handle)
+    }
+
+    /// Keeps "Always allow" rules in `path`: offers "Always allow" from now on and treats this
+    /// workspace's remembered rules as already allowed (an exact match, like the session's).
+    /// The file is a few rules of JSON; reading it is not worth a worker.
+    pub fn use_always_rules(&self, path: PathBuf) {
+        let rules = crate::always_allow::AlwaysRules::load(&path);
+        // Only kinds "Always" may keep, whatever a hand-edited file says.
+        self.inner.allowed.borrow_mut().extend(
+            rules
+                .keys_for(&self.workspace_key())
+                .iter()
+                .filter_map(always_key),
+        );
+        *self.inner.always.borrow_mut() = Some(path);
+    }
+
+    /// The workspace as rules name it: its real path, so a symlink re-pointed later does not
+    /// carry old rules to another folder.
+    fn workspace_key(&self) -> String {
+        self.inner
+            .workspaces
+            .first()
+            .map(|w| {
+                std::fs::canonicalize(w)
+                    .unwrap_or_else(|_| w.clone())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default()
     }
 
     /// Binds `dir/approval-<pid>-<thread>.sock`. `workspace` bounds `AcceptEdits` auto-allows.
@@ -462,6 +507,7 @@ impl ApprovalHandle {
             workspaces: vec![workspace.to_owned()],
             deadline,
             queries: RefCell::new(HashMap::new()),
+            always: RefCell::new(None),
         });
         // From here `Drop` removes the file, including on the early return below.
         std::fs::set_permissions(&inner.path, std::fs::Permissions::from_mode(0o600))
@@ -538,8 +584,13 @@ impl ApprovalHandle {
         let Some(pending) = self.inner.pending.borrow_mut().remove(request) else {
             return false;
         };
-        if decision == Decision::AllowForSession {
+        if matches!(decision, Decision::AllowForSession | Decision::AllowAlways) {
             if let Some(key) = pending.key {
+                if decision == Decision::AllowAlways {
+                    if let Some(always) = always_key(&key) {
+                        self.remember_always(&always);
+                    }
+                }
                 self.inner.allowed.borrow_mut().insert(key);
             }
         }
@@ -551,6 +602,29 @@ impl ApprovalHandle {
             },
         );
         true
+    }
+
+    /// Adds `key` to this workspace's "Always allow" rules on disk. A failed write is logged:
+    /// the call is still allowed, and the rule still holds for this session.
+    ///
+    /// Load, add, save with no lock: two sessions remembering at the same instant can lose one
+    /// rule, and the cost is being asked again.
+    fn remember_always(&self, (tool, detail): &(String, String)) {
+        let Some(path) = self.inner.always.borrow().clone() else {
+            return;
+        };
+        let mut rules = crate::always_allow::AlwaysRules::load(&path);
+        let added = rules.add(crate::always_allow::Rule {
+            workspace: self.workspace_key(),
+            tool: tool.clone(),
+            detail: detail.clone(),
+        });
+        if added {
+            match rules.save(&path) {
+                Ok(()) => info!(tool = %tool, "remembered an always-allow rule"),
+                Err(e) => warn!(error = %e, "could not save the always-allow rule"),
+            }
+        }
     }
 
     /// Denies and expires everything still pending (the agent exited or restarted).
@@ -694,6 +768,21 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     }
 
     let id = query.id.clone();
+    // "Always" only where rules are kept, and only for what stays exact forever (see
+    // `always_key`): the card says precisely what would be saved.
+    let remembers = key
+        .as_ref()
+        .filter(|_| inner.always.borrow().is_some())
+        .and_then(always_key)
+        .map(|(_, detail)| match detail.split_once('\n') {
+            Some((cwd, command)) => format!("`{command}` in {cwd}"),
+            None => detail,
+        });
+    let mut options = vec![Decision::Allow, Decision::AllowForSession];
+    if remembers.is_some() {
+        options.push(Decision::AllowAlways);
+    }
+    options.push(Decision::Deny);
     // Registered before the envelope goes out: the sink may answer synchronously.
     inner.pending.borrow_mut().insert(
         id.clone(),
@@ -713,8 +802,9 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
             title,
             input: query.args.clone(),
             reason: query.cwd.as_ref().map(|c| format!("in {c}")),
-            options: vec![Decision::Allow, Decision::AllowForSession, Decision::Deny],
+            options,
             response: ResponseCapability::Live,
+            remembers,
         })
         .request(id.clone()),
     );
@@ -1110,6 +1200,101 @@ mod tests {
     fn with_id(mut query: ApprovalQuery, id: &str) -> ApprovalQuery {
         query.id = id.into();
         query
+    }
+
+    #[test]
+    fn always_allow_is_remembered_for_the_workspace_and_survives_a_new_session() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let rules = tmp.path().join("state").join("always-allow.json");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            // Without a rules file there is no "Always": nothing could remember it.
+            // (A build runner like `cargo` is never remembered: it runs model-editable files.)
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("ls -la"), "q0"),
+            );
+            assert!(pump_until(ctx, 10, || request_id(&seen).is_some()));
+            let options = |n: usize| match &seen.borrow()[n].event {
+                Event::ApprovalRequested { options, .. } => options.clone(),
+                other => panic!("{other:?}"),
+            };
+            assert!(!options(0).contains(&Decision::AllowAlways));
+            assert!(handle.respond("q0", Decision::Deny));
+            wait_reply(ctx, &rx);
+
+            handle.use_always_rules(rules.clone());
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("ls -la"), "q1"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 2));
+            assert!(options(1).contains(&Decision::AllowAlways));
+            // The card says exactly what would be kept.
+            assert!(
+                matches!(&seen.borrow()[1].event, Event::ApprovalRequested { remembers: Some(r), .. }
+                if r.starts_with("`ls -la` in "))
+            );
+            assert!(handle.respond("q1", Decision::AllowAlways));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
+            // A command that cannot be remembered exactly is never offered "Always".
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("ls -la && rm -rf x"), "q2"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 3));
+            assert!(!options(2).contains(&Decision::AllowAlways));
+            assert!(handle.respond("q2", Decision::Deny));
+            wait_reply(ctx, &rx);
+            // Never for a file edit (a standing write grant on a path) or an MCP tool (any
+            // arguments), even though both can be allowed for the session.
+            let target = tmp.path().join("a.rs").to_string_lossy().into_owned();
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(edit("write_to_file", &target), "q2e"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
+            assert!(!options(3).contains(&Decision::AllowAlways));
+            assert!(options(3).contains(&Decision::AllowForSession));
+            assert!(handle.respond("q2e", Decision::Deny));
+            wait_reply(ctx, &rx);
+            let mcp = q(
+                "call_mcp_tool",
+                serde_json::json!({"ServerName": "fs", "ToolName": "write"}),
+            );
+            let rx = client(handle.socket_path().to_owned(), with_id(mcp, "q2m"));
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 5));
+            assert!(!options(4).contains(&Decision::AllowAlways));
+            assert!(handle.respond("q2m", Decision::Deny));
+            wait_reply(ctx, &rx);
+            drop(handle);
+
+            // A new session in the same workspace allows the exact call without asking.
+            let (again, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            again.use_always_rules(rules.clone());
+            let rx = client(again.socket_path().to_owned(), with_id(cmd("ls -la"), "q3"));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+            assert!(seen.borrow().is_empty(), "no card");
+            // Plan mode still refuses what mutates, whatever is remembered.
+            again.set_mode(Mode::Plan);
+            let rx = client(
+                again.socket_path().to_owned(),
+                with_id(edit("write_to_file", "/elsewhere/a.rs"), "q4"),
+            );
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
+
+            // Another workspace does not inherit it.
+            let other = tempfile::tempdir().expect("other");
+            let (elsewhere, seen) = bound(other.path(), Mode::Ask, DEFAULT_DEADLINE);
+            elsewhere.use_always_rules(rules);
+            let rx = client(
+                elsewhere.socket_path().to_owned(),
+                with_id(cmd("ls -la"), "q5"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 1), "it asks");
+            assert!(elsewhere.respond("q5", Decision::Deny));
+            wait_reply(ctx, &rx);
+        });
     }
 
     #[test]
