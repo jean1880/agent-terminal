@@ -1,3 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#8e75ff">
-  <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z" />
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Agent Terminal app icon. Original artwork for agent-terminal (2026-10-06), no third-party
+       assets: a terminal tile that is also a speech bubble (chat), a prompt chevron, and three
+       cursor dots, one per agent accent. -->
+  <defs>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a08cff"/>
+      <stop offset="1" stop-color="#5a44c8"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2442"/>
+      <stop offset="1" stop-color="#181425"/>
+    </linearGradient>
+  </defs>
+  <!-- depth: the same bubble, dropped and darkened (GNOME HIG front-facing depth) -->
+  <path transform="translate(0 5)" fill="#0d0a16" opacity="0.55"
+        d="M28 14H100A16 16 0 0 1 116 30V82A16 16 0 0 1 100 98H56L32 117L35 98H28A16 16 0 0 1 12 82V30A16 16 0 0 1 28 14Z"/>
+  <!-- bubble body / rim -->
+  <path fill="url(#rim)"
+        d="M28 14H100A16 16 0 0 1 116 30V82A16 16 0 0 1 100 98H56L32 117L35 98H28A16 16 0 0 1 12 82V30A16 16 0 0 1 28 14Z"/>
+  <!-- screen -->
+  <rect x="18" y="20" width="92" height="72" rx="11" fill="url(#screen)"/>
+  <!-- soft top highlight on the screen -->
+  <rect x="24" y="23" width="80" height="2" rx="1" fill="#ffffff" opacity="0.07"/>
+  <!-- prompt chevron -->
+  <polyline points="34,43 50,56 34,69" fill="none" stroke="#c8c8ff" stroke-width="8"
+            stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- cursor: one dot per agent -->
+  <circle cx="64" cy="66" r="5.5" fill="#e8846b"/>
+  <circle cx="80" cy="66" r="5.5" fill="#5b9cf6"/>
+  <circle cx="96" cy="66" r="5.5" fill="#4cc38a"/>
 </svg>
