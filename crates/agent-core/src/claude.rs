@@ -75,6 +75,8 @@ pub struct ClaudeAdapter {
     pending: HashMap<String, PendingApproval>,
     pending_controls: HashSet<String>,
     context_requests: HashSet<String>,
+    /// `get_usage` requests in flight, whose replies also become `QuotaUpdated`.
+    usage_requests: HashSet<String>,
 }
 
 impl Default for ClaudeAdapter {
@@ -107,6 +109,7 @@ impl ClaudeAdapter {
             pending: HashMap::new(),
             pending_controls: HashSet::new(),
             context_requests: HashSet::new(),
+            usage_requests: HashSet::new(),
         }
     }
 
@@ -613,6 +616,7 @@ impl ClaudeAdapter {
         let mut out = Vec::new();
 
         if str_of(resp, "subtype") == Some("error") {
+            self.usage_requests.remove(id);
             let error = str_of(resp, "error")
                 .unwrap_or("control request failed")
                 .to_owned();
@@ -632,8 +636,23 @@ impl ClaudeAdapter {
         );
         let body = body.unwrap_or(Value::Null);
         if self.init_id.as_deref() == Some(id) {
+            if let Some(account) = crate::quota::claude_account(&body) {
+                out.push(Envelope::new(Event::QuotaUpdated {
+                    account: Some(account),
+                    windows: Vec::new(),
+                }));
+            }
             if let Value::Array(list) = body.get("commands").unwrap_or(&Value::Null) {
                 out.push(Envelope::new(self.adopt_commands(list)));
+            }
+        }
+        if self.usage_requests.remove(id) {
+            let windows = crate::quota::claude_usage(&body);
+            if !windows.is_empty() {
+                out.push(Envelope::new(Event::QuotaUpdated {
+                    account: None,
+                    windows,
+                }));
             }
         }
         if self.context_requests.remove(id) {
@@ -662,14 +681,28 @@ impl ClaudeAdapter {
             .and_then(|i| i.get("resetsAt"))
             .and_then(Value::as_u64)
             .map(|s| s.to_string()); // epoch seconds; the UI formats it
+        // Every event carries the plan windows, whatever its status: the usage indicator
+        // updates on every turn. `account: None` leaves the known account unchanged.
+        let windows = info
+            .as_ref()
+            .map(crate::quota::claude_turn_windows)
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        if !windows.is_empty() {
+            out.push(Envelope::new(Event::QuotaUpdated {
+                account: None,
+                windows,
+            }));
+        }
         match status.as_str() {
-            "rejected" => vec![Envelope::new(Event::RateLimited {
+            "rejected" => out.push(Envelope::new(Event::RateLimited {
                 resets_at,
                 detail: info,
-            })],
-            "allowed_warning" => notice("Approaching the usage limit.".to_owned()),
-            _ => Vec::new(),
+            })),
+            "allowed_warning" => out.extend(notice("Approaching the usage limit.".to_owned())),
+            _ => {}
         }
+        out
     }
 
     fn result(&mut self, v: &Value) -> Vec<Envelope> {
@@ -812,6 +845,9 @@ impl Adapter for ClaudeAdapter {
             Command::Control { id, control } => {
                 if matches!(control, Control::ContextUsage) {
                     self.context_requests.insert(id.clone());
+                }
+                if matches!(control, Control::Usage) {
+                    self.usage_requests.insert(id.clone());
                 }
                 let request = control_request_body(&control);
                 self.control_line(&id, request)
@@ -1182,6 +1218,70 @@ mod tests {
 
     fn events(out: &[Envelope]) -> Vec<&Event> {
         out.iter().map(|e| &e.event).collect()
+    }
+
+    #[test]
+    fn every_turn_updates_the_quota_and_initialize_brings_the_account() {
+        // The per-turn rate_limit_event carries both plan windows, with the account unchanged.
+        let (_, out) = replay(APPROVAL);
+        let quotas: Vec<_> = events(&out)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::QuotaUpdated { account, windows } => Some((account, windows)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quotas.len(), 1, "one rate_limit_event in the recording");
+        assert!(quotas[0].0.is_none());
+        assert_eq!(quotas[0].1.len(), 2);
+        assert!(
+            events(&out)
+                .iter()
+                .all(|e| !matches!(e, Event::RateLimited { .. })),
+            "an allowed event is not a rate limit"
+        );
+
+        // The initialize reply carries the account and no windows.
+        let mut a = ClaudeAdapter::new();
+        a.handshake(); // the recording starts with the same request id
+        let mut out = Vec::new();
+        for line in CONTROLS.lines().filter(|l| !l.trim().is_empty()) {
+            let rec: Value = serde_json::from_str(line).expect("fixture line is JSON");
+            if str_of(&rec, "dir") == Some("out") {
+                out.extend(a.feed(&rec["frame"].to_string()));
+            }
+        }
+        let account = events(&out).into_iter().find_map(|e| match e {
+            Event::QuotaUpdated {
+                account: Some(a),
+                windows,
+            } if windows.is_empty() => Some(a),
+            _ => None,
+        });
+        assert_eq!(account.expect("account").label, "user@example.com");
+    }
+
+    #[test]
+    fn a_get_usage_reply_becomes_a_quota_update() {
+        let mut a = ClaudeAdapter::default();
+        a.encode(Command::Control {
+            id: "usage-1".into(),
+            control: Control::Usage,
+        })
+        .expect("encode");
+        let reply = json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "usage-1",
+            "response": {"rate_limits": {"limits": [
+                {"kind": "session", "percent": 50, "resets_at": "2026-10-06T16:30:00+00:00"}]}}}});
+        let out = a.feed(&reply.to_string());
+        assert!(matches!(&out[0].event, Event::ControlResult { ok: Some(_), .. }));
+        assert!(matches!(&out[1].event, Event::QuotaUpdated { account: None, windows }
+            if windows.len() == 1 && windows[0].used == 0.5));
+        // Other control replies do not.
+        let out = a.feed(&reply.to_string());
+        assert!(out
+            .iter()
+            .all(|e| !matches!(e.event, Event::QuotaUpdated { .. })));
     }
 
     #[test]

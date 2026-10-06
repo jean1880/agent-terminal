@@ -49,6 +49,10 @@ enum SideKind {
     Json,
     /// `agy models`: plain TSV, `id<TAB>display`.
     Models,
+    /// `-p /usage --output-format json`: a JSON document whose buckets also become a
+    /// `QuotaUpdated`. agy reports no quota during a turn, so the HOST must request
+    /// `Control::Usage` after each agy `TurnCompleted` to keep the usage indicator current.
+    Usage,
 }
 
 pub struct AgyAdapter {
@@ -448,7 +452,7 @@ impl Adapter for AgyAdapter {
                     Control::ListModels => self.side(id, SideKind::Models, &["models"]),
                     Control::Usage => self.side(
                         id,
-                        SideKind::Json,
+                        SideKind::Usage,
                         &["-p", "/usage", "--output-format", "json"],
                     ),
                     Control::GetSettings => self.side(
@@ -515,6 +519,7 @@ impl Adapter for AgyAdapter {
 
     fn feed_side(&mut self, id: &str, stdout: &str, success: bool) -> Vec<Envelope> {
         let kind = self.side_kinds.remove(id).unwrap_or(SideKind::Json);
+        let mut quota = None;
         let event = if !success {
             let detail = stdout.trim().lines().next().unwrap_or("").trim();
             Event::ControlResult {
@@ -535,9 +540,25 @@ impl Adapter for AgyAdapter {
                     ok: Some(parse_side_json(stdout)),
                     error: None,
                 },
+                SideKind::Usage => {
+                    let doc = parse_side_json(stdout);
+                    let windows = crate::quota::agy_usage(&doc);
+                    if !windows.is_empty() {
+                        quota = Some(Event::QuotaUpdated {
+                            account: None,
+                            windows,
+                        });
+                    }
+                    Event::ControlResult {
+                        ok: Some(doc),
+                        error: None,
+                    }
+                }
             }
         };
-        vec![Envelope::new(event).request(id)]
+        let mut out = vec![Envelope::new(event).request(id)];
+        out.extend(quota.map(Envelope::new));
+        out
     }
 
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
@@ -1181,6 +1202,20 @@ mod tests {
             matches!(&ev[0].event, Event::ControlResult { ok: Some(v), .. }
             if v[1]["id"] == "gemini-b" && v[0]["display"] == "Gemini A")
         );
+
+        // A real /usage document also yields a QuotaUpdated; the ControlResult stays first.
+        a.encode(Command::Control {
+            id: "q".into(),
+            control: Control::Usage,
+        })
+        .expect("ok");
+        let doc = r#"{"command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"window":"5h","remaining_fraction":0.75,"reset_time":"2026-10-06T16:59:24Z"}]}]}}}"#;
+        let ev = a.feed_side("q", doc, true);
+        assert_eq!(ev.len(), 2);
+        assert!(matches!(&ev[0].event, Event::ControlResult { ok: Some(_), .. }));
+        assert!(matches!(&ev[1].event, Event::QuotaUpdated { account: None, windows }
+            if windows.len() == 1 && windows[0].used == 0.25
+                && windows[0].group.as_deref() == Some("Gemini Models")));
 
         let ev = a.feed_side("u", "boom\nmore", false);
         assert!(
