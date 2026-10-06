@@ -12,6 +12,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 #[allow(dead_code)] // Wired into the window in wave 3.
 mod agent_proc;
+mod approval_hook;
+#[allow(dead_code)] // Wired into the window in wave 3.
+mod approval_server;
 #[allow(dead_code)] // Wired into the window in wave 3.
 mod chat;
 pub mod config;
@@ -29,6 +32,11 @@ const APP_ID: &str = "com.jdesroches.AgentTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
+    // agy's PreToolUse gate: a short-lived blocking client, before logging or any GTK setup.
+    if std::env::args().nth(1).as_deref() == Some("--approval-hook") {
+        approval_hook::main();
+        return glib::ExitCode::SUCCESS;
+    }
     init_logging();
 
     info!(
