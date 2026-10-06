@@ -2,7 +2,7 @@
 //! context. Each is an `adw::Dialog` (libadwaita 1.5) that asks the backend through
 //! [`ChatBackend::control`] and fills in when the matching `ControlResult` arrives.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -175,19 +175,52 @@ fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Ve
         .collect()
 }
 
-/// Whether `m` is the model the thread is on now.
+/// Whether `m` is the model the thread is on now (agy rows match at any of their efforts).
 fn is_current(m: &CatalogModel, status: &SessionStatus) -> bool {
-    m.driver == status.driver && status.model.as_deref() == Some(m.id.as_str())
+    m.driver == status.driver && status.model.as_deref().is_some_and(|id| m.is_model(id))
 }
 
-type Pick = Rc<dyn Fn(Driver, String)>;
+/// The effort a row starts on: the thread's own when this is its model, else the model's default.
+fn initial_effort(m: &CatalogModel, status: &SessionStatus) -> Option<String> {
+    let current = if !is_current(m, status) {
+        None
+    } else if m.driver == Driver::Agy {
+        status.model.as_deref().and_then(|id| m.effort_in(id))
+    } else {
+        status.effort.as_deref()
+    };
+    current
+        .or_else(|| m.default_effort())
+        .filter(|_| !m.efforts.is_empty())
+        .map(str::to_owned)
+}
 
-/// The grouped, filtered rows for `query`.
-///
-/// Choosing a row calls `pick(driver, id)`. The effort dropdown on a row is shown for models
-/// that list efforts, but Claude takes effort separately from the model id (it is not part of
-/// `--model`), so the chosen level is not sent yet: it is wired through the mode/settings path
-/// later. agy bakes the level into the id (`...-high`), so its rows have no dropdown.
+/// What choosing a row hands to `switch`: the model value and the effort. agy carries the effort
+/// in the id (`<base>-<effort>`). For Claude the effort is separate, and it is sent only when the
+/// user picked one on this row or the thread already has one; otherwise the row's default would
+/// needlessly restart a session that never had an effort.
+fn choice(
+    m: &CatalogModel,
+    effort: Option<&str>,
+    touched: bool,
+    status: &SessionStatus,
+) -> (String, Option<String>) {
+    let effort = effort.filter(|_| !m.efforts.is_empty());
+    match m.driver {
+        Driver::Agy => (m.model_id_for(effort), effort.map(str::to_owned)),
+        Driver::Claude => {
+            let send = touched || status.effort.is_some();
+            (m.id.clone(), effort.filter(|_| send).map(str::to_owned))
+        }
+    }
+}
+
+/// `pick(driver, model value, effort)`.
+type Pick = Rc<dyn Fn(Driver, String, Option<String>)>;
+
+/// The grouped, filtered rows for `query`. Every row has the same UX for both agents: the name
+/// and, when the model offers efforts, an effort dropdown; choosing the row or changing its
+/// effort calls `pick`.
 fn model_list(
     models: &[CatalogModel],
     query: &str,
@@ -211,6 +244,7 @@ fn model_list(
         }));
         return page.upcast();
     }
+    let status = Rc::new(status.clone()); // shared by every row's handlers
     let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     for (driver, rows) in groups {
         let heading = label(&group_title(driver).to_uppercase(), &["model-group"]);
@@ -234,23 +268,53 @@ fn model_list(
                 tag.set_valign(gtk4::Align::Center);
                 row.add_suffix(&tag);
             }
+            // The effort shown on the row; `touched` once the user has picked one here.
+            let effort: Rc<RefCell<Option<String>>> =
+                Rc::new(RefCell::new(initial_effort(m, &status)));
+            let touched = Rc::new(Cell::new(false));
             if !m.efforts.is_empty() {
                 let efforts: Vec<&str> = m.efforts.iter().map(String::as_str).collect();
                 let dropdown = gtk4::DropDown::from_strings(&efforts);
                 dropdown.set_valign(gtk4::Align::Center);
-                dropdown.set_tooltip_text(Some(
-                    "Effort level (applied from the settings, not yet sent with the model)",
-                ));
+                dropdown.set_tooltip_text(Some("Effort"));
+                let at = effort
+                    .borrow()
+                    .as_deref()
+                    .and_then(|e| m.efforts.iter().position(|x| x == e));
+                dropdown.set_selected(at.and_then(|i| u32::try_from(i).ok()).unwrap_or(0));
+                // Changing the effort switches straight away, like choosing the row.
+                dropdown.connect_selected_notify({
+                    let (m, effort, touched, pick, status) = (
+                        m.clone(),
+                        effort.clone(),
+                        touched.clone(),
+                        pick.clone(),
+                        status.clone(),
+                    );
+                    move |dd| {
+                        let chosen = m.efforts.get(dd.selected() as usize).cloned();
+                        if *effort.borrow() == chosen {
+                            return;
+                        }
+                        *effort.borrow_mut() = chosen;
+                        touched.set(true);
+                        let (id, e) = choice(&m, effort.borrow().as_deref(), true, &status);
+                        pick(m.driver, id, e);
+                    }
+                });
                 row.add_suffix(&dropdown);
             }
-            if is_current(m, status) {
+            if is_current(m, &status) {
                 row.add_css_class("current-model");
                 let check = gtk4::Image::from_icon_name("object-select-symbolic");
                 check.add_css_class("accent");
                 row.add_suffix(&check);
             }
-            let (pick, driver, id) = (pick.clone(), m.driver, m.id.clone());
-            row.connect_activated(move |_| pick(driver, id.clone()));
+            let (pick, m, status) = (pick.clone(), m.clone(), status.clone());
+            row.connect_activated(move |_| {
+                let (id, e) = choice(&m, effort.borrow().as_deref(), touched.get(), &status);
+                pick(m.driver, id, e);
+            });
             list.append(&row);
         }
         column.append(&list);
@@ -284,8 +348,8 @@ pub fn model_picker(ctx: &PanelCtx) {
     let pick: Pick = {
         let backend = ctx.backend.clone();
         let d = d.downgrade();
-        Rc::new(move |driver, id| {
-            backend.switch(driver, Some(id));
+        Rc::new(move |driver, id, effort| {
+            backend.switch(driver, Some(id), effort);
             if let Some(d) = d.upgrade() {
                 d.close();
             }
@@ -648,6 +712,7 @@ mod tests {
         SessionStatus {
             driver,
             model: model.map(str::to_owned),
+            effort: None,
             mode: agent_core::adapter::Mode::Ask,
             running_turn: false,
             alive: true,
@@ -690,6 +755,69 @@ mod tests {
         assert!(!is_current(&m, &status(Driver::Agy, None)));
         assert_eq!(group_title(Driver::Claude), "Claude");
         assert_eq!(group_title(Driver::Agy), "Antigravity (agy)");
+    }
+
+    fn model(driver: Driver, id: &str, efforts: &[&str]) -> CatalogModel {
+        CatalogModel {
+            driver,
+            id: id.into(),
+            display: id.into(),
+            description: None,
+            efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+            via: None,
+        }
+    }
+
+    #[test]
+    fn an_agy_row_matches_the_thread_at_any_effort_and_starts_on_its_effort() {
+        let flash = model(Driver::Agy, "gemini-3.8-flash", &["low", "medium", "high"]);
+        let on_high = status(Driver::Agy, Some("gemini-3.8-flash-high"));
+        assert!(is_current(&flash, &on_high));
+        assert_eq!(initial_effort(&flash, &on_high).as_deref(), Some("high"));
+        // Another row starts on the model's default (medium).
+        let pro = model(Driver::Agy, "gemini-3.1-pro", &["low", "high"]);
+        assert!(!is_current(&pro, &on_high));
+        assert_eq!(initial_effort(&pro, &on_high).as_deref(), Some("low"));
+        let bare = model(Driver::Agy, "plain", &[]);
+        assert_eq!(initial_effort(&bare, &on_high), None);
+    }
+
+    #[test]
+    fn choosing_an_agy_row_composes_the_id_and_keeps_the_effort() {
+        let flash = model(Driver::Agy, "gemini-3.8-flash", &["low", "medium", "high"]);
+        let st = status(Driver::Agy, Some("x"));
+        assert_eq!(
+            choice(&flash, Some("low"), false, &st),
+            ("gemini-3.8-flash-low".to_owned(), Some("low".to_owned()))
+        );
+        let bare = model(Driver::Agy, "plain", &[]);
+        assert_eq!(choice(&bare, None, false, &st), ("plain".to_owned(), None));
+    }
+
+    #[test]
+    fn a_claude_row_sends_effort_only_when_it_matters() {
+        let sonnet = model(Driver::Claude, "sonnet", &["low", "medium", "high"]);
+        let mut st = status(Driver::Claude, Some("opus"));
+        // The thread has no effort and the user did not touch the dropdown: model only.
+        assert_eq!(
+            choice(&sonnet, Some("medium"), false, &st),
+            ("sonnet".to_owned(), None)
+        );
+        // The user picked one: send it.
+        assert_eq!(
+            choice(&sonnet, Some("high"), true, &st),
+            ("sonnet".to_owned(), Some("high".to_owned()))
+        );
+        // The thread has an effort: rows start on it, and it is sent (unchanged = in session).
+        st.effort = Some("high".into());
+        assert_eq!(
+            initial_effort(&model(Driver::Claude, "opus", &["low", "high"]), &st).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            choice(&sonnet, Some("high"), false, &st),
+            ("sonnet".to_owned(), Some("high".to_owned()))
+        );
     }
 
     #[test]

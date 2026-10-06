@@ -64,7 +64,9 @@ fn response_id(frame: &Value) -> Option<&str> {
     if frame.get("type").and_then(Value::as_str) != Some("control_response") {
         return None;
     }
-    frame.pointer("/response/request_id").and_then(Value::as_str)
+    frame
+        .pointer("/response/request_id")
+        .and_then(Value::as_str)
 }
 
 /// Spawns Claude and runs the two requests. See the module docs.
@@ -168,7 +170,9 @@ pub fn probe_shared(program: &str, done: impl FnOnce(&ProbeResult) + 'static) {
         if let Err(why) = &result {
             warn!(why, "claude probe failed");
         }
-        let waiters = IN_FLIGHT.with(|f| f.borrow_mut().take()).unwrap_or_default();
+        let waiters = IN_FLIGHT
+            .with(|f| f.borrow_mut().take())
+            .unwrap_or_default();
         for w in waiters {
             w(&result);
         }

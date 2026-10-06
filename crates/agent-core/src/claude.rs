@@ -686,8 +686,8 @@ impl ClaudeAdapter {
             .and_then(|i| i.get("resetsAt"))
             .and_then(Value::as_u64)
             .map(|s| s.to_string()); // epoch seconds; the UI formats it
-        // Every event carries the plan windows, whatever its status: the usage indicator
-        // updates on every turn. `account: None` leaves the known account unchanged.
+                                     // Every event carries the plan windows, whatever its status: the usage indicator
+                                     // updates on every turn. `account: None` leaves the known account unchanged.
         let windows = info
             .as_ref()
             .map(crate::quota::claude_turn_windows)
@@ -1297,9 +1297,14 @@ mod tests {
             "response": {"rate_limits": {"limits": [
                 {"kind": "session", "percent": 50, "resets_at": "2026-10-06T16:30:00+00:00"}]}}}});
         let out = a.feed(&reply.to_string());
-        assert!(matches!(&out[0].event, Event::ControlResult { ok: Some(_), .. }));
-        assert!(matches!(&out[1].event, Event::QuotaUpdated { account: None, windows }
-            if windows.len() == 1 && windows[0].used == 0.5));
+        assert!(matches!(
+            &out[0].event,
+            Event::ControlResult { ok: Some(_), .. }
+        ));
+        assert!(
+            matches!(&out[1].event, Event::QuotaUpdated { account: None, windows }
+            if windows.len() == 1 && windows[0].used == 0.5)
+        );
         // Other control replies do not.
         let out = a.feed(&reply.to_string());
         assert!(out
@@ -2070,7 +2075,10 @@ mod tests {
                     effort,
                 })
                 .expect("encode");
-            assert!(matches!(actions.as_slice(), [Action::Write(_)]), "{actions:?}");
+            assert!(
+                matches!(actions.as_slice(), [Action::Write(_)]),
+                "{actions:?}"
+            );
         }
         // A different effort restarts the process on the same session.
         assert_eq!(

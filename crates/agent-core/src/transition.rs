@@ -290,17 +290,29 @@ mod tests {
         let base = selection(Driver::Claude, "sonnet", Some("medium"));
         // Same effort, other model: in session.
         assert_eq!(
-            plan_selection(&caps, &base, &selection(Driver::Claude, "opus", Some("medium"))),
+            plan_selection(
+                &caps,
+                &base,
+                &selection(Driver::Claude, "opus", Some("medium"))
+            ),
             SelectionPlan::ApplyOnNextTurn
         );
         // Effort-only change: a restart.
         assert_eq!(
-            plan_selection(&caps, &base, &selection(Driver::Claude, "sonnet", Some("high"))),
+            plan_selection(
+                &caps,
+                &base,
+                &selection(Driver::Claude, "sonnet", Some("high"))
+            ),
             SelectionPlan::RestartSession
         );
         // Model and effort together: also a restart.
         assert_eq!(
-            plan_selection(&caps, &base, &selection(Driver::Claude, "opus", Some("high"))),
+            plan_selection(
+                &caps,
+                &base,
+                &selection(Driver::Claude, "opus", Some("high"))
+            ),
             SelectionPlan::RestartSession
         );
         // And the decision follows the plan.

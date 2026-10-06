@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use super::ChatView;
 use crate::chat::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
-use agent_core::catalog::CatalogModel;
+use agent_core::catalog::{parse_agy_models, CatalogModel};
 
 /// One script step.
 enum Step {
@@ -54,6 +54,7 @@ pub fn demo_backend() -> Rc<DemoBackend> {
         status: RefCell::new(SessionStatus {
             driver: Driver::Claude,
             model: Some("claude-opus-5-5".into()),
+            effort: Some("medium".into()),
             mode: Mode::Ask,
             running_turn: false,
             alive: true,
@@ -88,16 +89,7 @@ impl DemoModels {
             efforts,
             via: None,
         };
-        let agy = |id: &str, display: &str| CatalogModel {
-            driver: Driver::Agy,
-            id: id.into(),
-            display: display.into(),
-            description: None,
-            efforts: Vec::new(),
-            via: (id.starts_with("claude-") || id.starts_with("gpt-"))
-                .then(|| "Antigravity".into()),
-        };
-        vec![
+        let mut models = vec![
             claude(
                 "claude-opus-5-5",
                 "Opus 5.5",
@@ -116,13 +108,22 @@ impl DemoModels {
                 "Fastest, for quick answers",
                 Vec::new(),
             ),
-            agy("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
-            agy("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"),
-            agy("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)"),
-            agy("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
-            agy("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
-            agy("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
-        ]
+        ];
+        // agy lists one id per effort; the catalog folds them into one row per model.
+        models.extend(parse_agy_models(
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n\
+             gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n\
+             gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n\
+             gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n\
+             gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n\
+             claude-opus-5-5-high\tClaude Opus 5.5 (High)\n\
+             claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\n\
+             claude-opus-5-5-low\tClaude Opus 5.5 (Low)\n\
+             claude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)\n\
+             claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n\
+             gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n",
+        ));
+        models
     }
 }
 
@@ -420,11 +421,17 @@ impl ChatBackend for DemoBackend {
         ]);
     }
 
-    fn switch(&self, driver: Driver, model: Option<String>) {
+    fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         let current = self.status.borrow().driver;
         if driver == current {
             let model = model.unwrap_or_else(|| "default".into());
-            self.status.borrow_mut().model = Some(model.clone());
+            {
+                let mut status = self.status.borrow_mut();
+                status.model = Some(model.clone());
+                if effort.is_some() {
+                    status.effort = effort;
+                }
+            }
             self.push([
                 Step::Emit(Envelope::new(Event::ModelChanged {
                     model: model.clone(),
@@ -437,9 +444,10 @@ impl ChatBackend for DemoBackend {
             let model = model.or_else(|| {
                 Some(match driver {
                     Driver::Claude => "claude-opus-5-5".into(),
-                    Driver::Agy => "gemini-3.1-pro".into(),
+                    Driver::Agy => "gemini-3.1-pro-high".into(),
                 })
             });
+            self.status.borrow_mut().effort = effort;
             self.push([
                 Step::SetDriver(driver, model.clone()),
                 Step::Emit(Envelope::new(Event::SessionStarted {
@@ -887,10 +895,13 @@ fn script() -> Vec<Step> {
     ));
     s.push(Step::Wait(400));
     // Provider switch to agy, a reply, then a failing turn and a pending approval.
-    s.push(Step::SetDriver(Driver::Agy, Some("gemini-3.1-pro".into())));
+    s.push(Step::SetDriver(
+        Driver::Agy,
+        Some("gemini-3.1-pro-high".into()),
+    ));
     s.push(Step::Emit(Envelope::new(Event::SessionStarted {
         native_id: "agy-conv".into(),
-        model: Some("gemini-3.1-pro".into()),
+        model: Some("gemini-3.1-pro-high".into()),
         cwd: None,
     })));
     s.push(Step::Emit(started(

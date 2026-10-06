@@ -40,9 +40,11 @@ pub struct Snapshot {
 impl Snapshot {
     /// The window with the highest usage (what the compact indicator shows).
     pub fn most_used(&self) -> Option<&QuotaWindow> {
-        self.windows
-            .iter()
-            .max_by(|a, b| a.used.partial_cmp(&b.used).unwrap_or(std::cmp::Ordering::Equal))
+        self.windows.iter().max_by(|a, b| {
+            a.used
+                .partial_cmp(&b.used)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 }
 
@@ -93,7 +95,11 @@ fn now_epoch() -> i64 {
 /// `~/.gemini/google_accounts.json`, from the value of `HOME`.
 pub fn google_accounts_path(home: Option<&str>) -> Option<PathBuf> {
     let home = home.filter(|h| std::path::Path::new(h).is_absolute())?;
-    Some(PathBuf::from(home).join(".gemini").join("google_accounts.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".gemini")
+            .join("google_accounts.json"),
+    )
 }
 
 type Listener = Rc<dyn Fn()>;
@@ -277,7 +283,12 @@ mod tests {
             10
         ));
         // A per-turn update changes one and leaves the scoped window from get_usage alone.
-        assert!(merge(&mut s, None, vec![win(None, "Weekly (Fable)", 0.0)], 11));
+        assert!(merge(
+            &mut s,
+            None,
+            vec![win(None, "Weekly (Fable)", 0.0)],
+            11
+        ));
         assert!(merge(&mut s, None, vec![win(None, "5-hour", 0.2)], 12));
         assert_eq!(s.windows.len(), 3);
         assert_eq!(s.windows[0].used, 0.2);
@@ -287,7 +298,12 @@ mod tests {
         assert!(!merge(&mut s, None, vec![win(None, "5-hour", 0.2)], 13));
         assert_eq!(s.updated_at, Some(13));
         // Same label in another group is a different window.
-        assert!(merge(&mut s, None, vec![win(Some("Gemini"), "5-hour", 0.9)], 14));
+        assert!(merge(
+            &mut s,
+            None,
+            vec![win(Some("Gemini"), "5-hour", 0.9)],
+            14
+        ));
         assert_eq!(s.windows.len(), 4);
         assert_eq!(s.most_used().unwrap().used, 0.9);
     }

@@ -265,31 +265,31 @@ mod tests {
     /// Shape of a real `get_usage` reply, scrubbed (no identity in it).
     fn usage_reply() -> Value {
         json!({"response": {"request_id": "usage-1", "subtype": "success", "response": {
-            "subscription_type": "pro",
-            "rate_limits": {"limits": [
-                {"group": "session", "kind": "session", "percent": 50,
-                 "resets_at": "2026-10-06T16:30:00.057599+00:00", "scope": null},
-                {"group": "weekly", "kind": "weekly_all", "percent": 49,
-                 "resets_at": "2026-10-10T22:00:00.057620+00:00", "scope": null},
-                {"group": "weekly", "kind": "weekly_scoped", "percent": 0,
-                 "resets_at": "2026-10-10T22:00:00+00:00",
-                 "scope": {"model": {"display_name": "Fable", "id": null}, "surface": null}},
-                {"kind": "mystery", "percent": 9}
-            ]}}}})
+        "subscription_type": "pro",
+        "rate_limits": {"limits": [
+            {"group": "session", "kind": "session", "percent": 50,
+             "resets_at": "2026-10-06T16:30:00.057599+00:00", "scope": null},
+            {"group": "weekly", "kind": "weekly_all", "percent": 49,
+             "resets_at": "2026-10-10T22:00:00.057620+00:00", "scope": null},
+            {"group": "weekly", "kind": "weekly_scoped", "percent": 0,
+             "resets_at": "2026-10-10T22:00:00+00:00",
+             "scope": {"model": {"display_name": "Fable", "id": null}, "surface": null}},
+            {"kind": "mystery", "percent": 9}
+        ]}}}})
     }
 
     fn agy_reply() -> Value {
         json!({"status": "SUCCESS", "response": "ignored text", "command": {"name": "usage", "data": {
-            "groups": [
-                {"name": "Gemini Models", "buckets": [
-                    {"window": "weekly", "remaining_fraction": 0.862052857875824,
-                     "reset_time": "2026-10-09T23:45:50Z"},
-                    {"window": "5h", "remaining_fraction": 0.9938423037528992,
-                     "reset_time": "2026-10-06T16:59:24Z"}]},
-                {"name": "Claude and GPT models", "buckets": [
-                    {"window": "weekly", "remaining_fraction": 1, "reset_time": "2026-10-13T13:13:52Z"},
-                    {"window": "monthly", "remaining_fraction": 0.5}]}
-            ]}}})
+        "groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.862052857875824,
+                 "reset_time": "2026-10-09T23:45:50Z"},
+                {"window": "5h", "remaining_fraction": 0.9938423037528992,
+                 "reset_time": "2026-10-06T16:59:24Z"}]},
+            {"name": "Claude and GPT models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 1, "reset_time": "2026-10-13T13:13:52Z"},
+                {"window": "monthly", "remaining_fraction": 0.5}]}
+        ]}}})
     }
 
     #[test]
@@ -300,7 +300,10 @@ mod tests {
             .clone();
         let w = claude_turn_windows(&info);
         assert_eq!(w.len(), 2);
-        assert_eq!((w[0].label.as_str(), w[0].group.as_deref()), ("5-hour", None));
+        assert_eq!(
+            (w[0].label.as_str(), w[0].group.as_deref()),
+            ("5-hour", None)
+        );
         assert!((w[0].used - 0.07).abs() < 1e-9);
         assert_eq!(w[0].resets_at.as_deref(), Some("2026-10-06T16:30:00Z"));
         assert_eq!(w[1].label, "Weekly");
@@ -331,7 +334,10 @@ mod tests {
             got,
             [("5-hour", 0.5), ("Weekly", 0.49), ("Weekly (Fable)", 0.0)]
         );
-        assert_eq!(w[0].resets_at.as_deref(), Some("2026-10-06T16:30:00.057599+00:00"));
+        assert_eq!(
+            w[0].resets_at.as_deref(),
+            Some("2026-10-06T16:30:00.057599+00:00")
+        );
         assert!(claude_usage(&json!({"nothing": 1})).is_empty());
     }
 
@@ -368,8 +374,14 @@ mod tests {
             parse_rfc3339("2026-10-06T16:30:00.057599+00:00"),
             Some(1_791_304_200)
         );
-        assert_eq!(parse_rfc3339("2026-10-06T12:30:00-04:00"), Some(1_791_304_200));
-        assert_eq!(parse_rfc3339("2026-10-06T18:30:00+02:00"), Some(1_791_304_200));
+        assert_eq!(
+            parse_rfc3339("2026-10-06T12:30:00-04:00"),
+            Some(1_791_304_200)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-06T18:30:00+02:00"),
+            Some(1_791_304_200)
+        );
         assert_eq!(parse_rfc3339("garbage"), None);
         assert_eq!(parse_rfc3339("2026-13-06T00:00:00Z"), None);
     }

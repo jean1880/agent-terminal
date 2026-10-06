@@ -25,7 +25,10 @@ pub trait ChatBackend {
     fn answer_questions(&self, request: &str, answers: serde_json::Value);
     /// Switch model and/or agent. Same agent: in-session or restart per capabilities;
     /// other agent: budgeted, redacted handoff into a new provider thread.
-    fn switch(&self, driver: Driver, model: Option<String>);
+    /// `effort: None` keeps the current effort (same agent) or the agent's own (other agent).
+    /// For agy the effort is already part of `model` (the composed id); Claude takes it
+    /// separately, and a changed effort restarts its process.
+    fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>);
     fn set_mode(&self, mode: Mode);
     /// Returns the request id the `ControlResult` will carry.
     fn control(&self, control: Control) -> String;
@@ -47,6 +50,8 @@ pub trait ModelSource {
 pub struct SessionStatus {
     pub driver: Driver,
     pub model: Option<String>,
+    /// Reasoning effort of the session, when one was asked for.
+    pub effort: Option<String>,
     pub mode: Mode,
     pub running_turn: bool,
     pub alive: bool,

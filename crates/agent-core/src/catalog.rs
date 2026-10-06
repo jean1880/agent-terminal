@@ -378,7 +378,10 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         assert!(flash.is_model("gemini-3.8-flash-high"));
         assert!(flash.is_model("gemini-3.8-flash"));
         assert!(!flash.is_model("gemini-3.1-pro-high"));
-        assert!(!flash.is_model("gemini-3.8-flash-max"), "not an offered effort");
+        assert!(
+            !flash.is_model("gemini-3.8-flash-max"),
+            "not an offered effort"
+        );
         assert_eq!(flash.effort_in("gemini-3.8-flash-low"), Some("low"));
         assert_eq!(flash.effort_in("gemini-3.8-flash"), None);
         let claude = parse_claude_initialize(&init_frame());

@@ -90,6 +90,8 @@ const HANDOFF_PROMPT_ALLOWANCE: usize = 2_048;
 
 struct State {
     model: Option<String>,
+    /// Reasoning effort of the running session (Claude `--effort`); `None` is the agent's own.
+    effort: Option<String>,
     mode: Mode,
     running_turn: bool,
     alive: bool,
@@ -197,6 +199,7 @@ impl ChatSession {
         };
         let state = State {
             model: open.model.clone(),
+            effort: open.effort.clone(),
             mode: open.mode,
             running_turn: false,
             alive: false,
@@ -629,6 +632,10 @@ impl Inner {
             if let Some(m) = &delta.model {
                 open.model = Some(m.clone());
             }
+            if let Some(e) = &delta.effort {
+                open.effort = Some(e.clone());
+                self.state.borrow_mut().effort = Some(e.clone());
+            }
             if let Some(mode) = mode {
                 open.mode = mode;
             }
@@ -771,8 +778,8 @@ impl Inner {
 
     // ---- switching ----
 
-    fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>) {
-        let (caps, current_driver, mode, status_model) = {
+    fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
+        let (caps, current_driver, mode, status_model, current_effort) = {
             let adapter = self.adapter.borrow();
             let state = self.state.borrow();
             (
@@ -780,14 +787,20 @@ impl Inner {
                 adapter.driver(),
                 state.mode,
                 state.model.clone(),
+                state.effort.clone(),
             )
+        };
+        // No effort asked for on the same agent means "keep it", not "clear it".
+        let effort = match (&effort, driver == current_driver) {
+            (None, true) => current_effort.clone(),
+            _ => effort,
         };
         let workspace = self.open.borrow().cwd.clone();
         let current = SessionState {
             selection: ModelSelection {
                 driver: current_driver,
                 model: status_model.clone().unwrap_or_default(),
-                effort: None,
+                effort: current_effort,
             },
             mode,
             workspace: workspace.clone(),
@@ -805,7 +818,7 @@ impl Inner {
             selection: ModelSelection {
                 driver,
                 model: target_model.clone(),
-                effort: None,
+                effort: effort.clone(),
             },
             mode,
             workspace,
@@ -819,11 +832,13 @@ impl Inner {
             Transition::SwitchModelInSession => {
                 self.command(Command::SetModel {
                     model: target_model,
+                    effort: None,
                 });
             }
             Transition::RestartAndResume => {
                 let result = self.adapter.borrow_mut().encode(Command::SetModel {
                     model: target_model.clone(),
+                    effort: effort.clone(),
                 });
                 // Bound first: a `Ref` temporary in the match arm would live through `respawn`,
                 // which borrows the state mutably.
@@ -832,18 +847,24 @@ impl Inner {
                     Ok(actions) => self.execute(actions),
                     Err(AdapterError::Unsupported(_)) => self.respawn(&OpenSessionDelta {
                         model: Some(target_model),
+                        effort,
                         mode: None,
                         resume: native,
                     }),
                     Err(e) => self.report(&e),
                 }
             }
-            Transition::CreateWithHandoff => self.create_with_handoff(driver, model),
+            Transition::CreateWithHandoff => self.create_with_handoff(driver, model, effort),
             Transition::Reject(reason) => self.error(reason),
         }
     }
 
-    fn create_with_handoff(self: &Rc<Self>, driver: Driver, model: Option<String>) {
+    fn create_with_handoff(
+        self: &Rc<Self>,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
         let Some(factory) = self.factory.borrow().clone() else {
             self.error("Switching agent is not available in this thread.");
             return;
@@ -888,6 +909,7 @@ impl Inner {
             open.program = launch.program;
             open.extra_args = launch.extra_args;
             open.model = model.clone();
+            open.effort = effort.clone();
             open.resume = None;
             open.new_session_id =
                 (driver == Driver::Claude).then(|| glib::uuid_string_random().to_string());
@@ -898,6 +920,7 @@ impl Inner {
         {
             let mut state = self.state.borrow_mut();
             state.model = model.clone();
+            state.effort = effort.clone();
             state.native_id = None;
             state.commands.clear();
             state.running_turn = false;
@@ -929,6 +952,7 @@ impl Inner {
         SessionStatus {
             driver: adapter.driver(),
             model: state.model.clone(),
+            effort: state.effort.clone(),
             mode: state.mode,
             running_turn: state.running_turn,
             alive: state.alive,
@@ -1004,8 +1028,8 @@ impl ChatBackend for ChatSession {
         });
     }
 
-    fn switch(&self, driver: Driver, model: Option<String>) {
-        self.inner.switch(driver, model);
+    fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
+        self.inner.switch(driver, model, effort);
     }
 
     fn set_mode(&self, mode: Mode) {
@@ -1083,6 +1107,7 @@ mod tests {
             extra_args: vec![script.to_string_lossy().into_owned()],
             cwd: dir.to_string_lossy().into_owned(),
             model: None,
+            effort: None,
             mode: Mode::Ask,
             resume: None,
             new_session_id: None,
@@ -1331,7 +1356,7 @@ mod tests {
             );
             session.send_prompt("hi");
             assert!(pump_until(ctx, 15, || exited_count(&seen) >= 1));
-            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChanged { model } if model == "gemini-flash")
@@ -1450,6 +1475,7 @@ mod tests {
                     extra_args: vec!["--agy-only".into()],
                     cwd: "/".into(),
                     model: Some("gemini-3.1-pro-high".into()),
+                    effort: None,
                     mode: Mode::Plan,
                     resume: None,
                     new_session_id: None,
@@ -1482,7 +1508,7 @@ mod tests {
             }));
 
             // No model named: the agent's configured default.
-            session.switch(Driver::Claude, None);
+            session.switch(Driver::Claude, None, None);
             assert_eq!(made.get(), 1);
             let spec = session.launch_spec();
             assert_eq!(spec.argv[0], "/bin/true");
@@ -1497,8 +1523,8 @@ mod tests {
             assert_eq!(session.status().model.as_deref(), Some("claude-sonnet-5-5"));
 
             // A model picked from the catalogue wins over the default.
-            session.switch(Driver::Agy, Some("gemini-3.1-pro-high".into()));
-            session.switch(Driver::Claude, Some("claude-opus-5-5".into()));
+            session.switch(Driver::Agy, Some("gemini-3.1-pro-high".into()), None);
+            session.switch(Driver::Claude, Some("claude-opus-5-5".into()), None);
             let spec = session.launch_spec();
             assert!(spec
                 .argv
@@ -1525,6 +1551,7 @@ mod tests {
                     extra_args: Vec::new(),
                     cwd: "/".into(),
                     model: None,
+                    effort: None,
                     mode: Mode::AcceptEdits,
                     resume: None,
                     new_session_id: None,
@@ -1537,7 +1564,7 @@ mod tests {
             );
             let log2 = log.clone();
             session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
-            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert_eq!(session.status().driver, Driver::Agy);
             assert_eq!(session.status().mode, Mode::Plan);
             assert!(has(
@@ -1603,6 +1630,7 @@ mod tests {
                     extra_args: vec!["--profile-only".into()],
                     cwd: "/".into(),
                     model: Some("gemini-pro".into()),
+                    effort: None,
                     mode: Mode::Plan,
                     resume: None,
                     new_session_id: None,
@@ -1614,14 +1642,14 @@ mod tests {
                 None,
             );
             // Without a factory a cross-agent switch is refused, and nothing changes.
-            session.switch(Driver::Claude, Some("opus".into()));
+            session.switch(Driver::Claude, Some("opus".into()), None);
             assert!(has(&seen, |e| matches!(e, Event::Error { .. })));
             assert_eq!(session.status().driver, Driver::Agy);
             assert_eq!(store.provider_threads(&thread).expect("pts").len(), 1);
 
             let log = log_claude.clone();
             session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log))));
-            session.switch(Driver::Claude, Some("opus".into()));
+            session.switch(Driver::Claude, Some("opus".into()), None);
 
             let status = session.status();
             assert_eq!(status.driver, Driver::Claude);
@@ -1686,6 +1714,7 @@ mod tests {
             extra_args: vec![script.to_string_lossy().into_owned()],
             cwd: dir.to_string_lossy().into_owned(),
             model: None,
+            effort: None,
             mode: Mode::Ask,
             resume: None,
             new_session_id: None,
@@ -1829,7 +1858,7 @@ mod tests {
                 |e| matches!(e, Event::Notice { text } if text.contains("stays read-only"))
             ));
             // A model switch (respawn) cannot lift it either.
-            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert_eq!(session.status().mode, Mode::Plan);
             let args = lines(tmp.path().join("args.log"));
             assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
@@ -1850,6 +1879,7 @@ mod tests {
                     extra_args: Vec::new(),
                     cwd: "/".into(),
                     model: Some("gemini-pro".into()),
+                    effort: None,
                     mode: Mode::Plan,
                     resume: None,
                     new_session_id: None,
@@ -1864,7 +1894,7 @@ mod tests {
                 launch_of(FakeAdapter::boxed(d, &Log::default()))
             }));
             assert!(session.status().alive);
-            session.switch(Driver::Claude, Some("opus".into()));
+            session.switch(Driver::Claude, Some("opus".into()), None);
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::Error { message } if message.contains("Could not start"))
@@ -1890,6 +1920,7 @@ mod tests {
                     extra_args: Vec::new(),
                     cwd: "/".into(),
                     model: Some("gemini-pro".into()),
+                    effort: None,
                     mode: Mode::Plan,
                     resume: Some("native-1".into()),
                     new_session_id: None,
@@ -1900,7 +1931,7 @@ mod tests {
                 sink,
                 None,
             );
-            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChanged { model } if model == "gemini-flash")

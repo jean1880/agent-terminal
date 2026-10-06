@@ -10,14 +10,14 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod account_status;
 mod agent_proc;
 mod approval_hook;
 mod approval_server;
 mod chat;
+mod claude_probe;
 pub mod config;
 mod hook_config;
-mod account_status;
-mod claude_probe;
 mod model_catalog;
 #[cfg(test)]
 mod testutil;

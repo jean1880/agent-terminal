@@ -1225,10 +1225,15 @@ mod tests {
         let doc = r#"{"command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"window":"5h","remaining_fraction":0.75,"reset_time":"2026-10-06T16:59:24Z"}]}]}}}"#;
         let ev = a.feed_side("q", doc, true);
         assert_eq!(ev.len(), 2);
-        assert!(matches!(&ev[0].event, Event::ControlResult { ok: Some(_), .. }));
-        assert!(matches!(&ev[1].event, Event::QuotaUpdated { account: None, windows }
+        assert!(matches!(
+            &ev[0].event,
+            Event::ControlResult { ok: Some(_), .. }
+        ));
+        assert!(
+            matches!(&ev[1].event, Event::QuotaUpdated { account: None, windows }
             if windows.len() == 1 && windows[0].used == 0.25
-                && windows[0].group.as_deref() == Some("Gemini Models")));
+                && windows[0].group.as_deref() == Some("Gemini Models"))
+        );
 
         let ev = a.feed_side("u", "boom\nmore", false);
         assert!(
