@@ -2416,6 +2416,7 @@ impl AgentTerminalWindow {
                     self.rewind(&page);
                 }
             }
+            ViewAction::ModeChosen { driver, mode } => self.offer_default_mode(*driver, *mode),
         }
     }
 

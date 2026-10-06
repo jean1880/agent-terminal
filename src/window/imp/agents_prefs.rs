@@ -84,6 +84,50 @@ impl AgentTerminalWindow {
         self.schedule_config_save();
     }
 
+    /// After the user picks `mode` in a thread's header: unless it already is `driver`'s default
+    /// for new threads, a toast offers to make it so (the same setting as Settings → Agents →
+    /// Default Mode, which is easy to miss).
+    pub(super) fn offer_default_mode(&self, driver: Driver, mode: Mode) {
+        if self
+            .agent_profile_now(driver)
+            .default_mode
+            .unwrap_or_default()
+            == mode
+        {
+            return;
+        }
+        let Some(overlay) = self.toast_overlay.borrow().clone() else {
+            return;
+        };
+        let name = MODES
+            .iter()
+            .find(|(m, _)| *m == mode)
+            .map_or("This mode", |(_, n)| *n);
+        let toast = adw::Toast::builder()
+            .title(format!("{name} for this thread"))
+            .use_markup(false)
+            .button_label(format!("Make Default for {}", driver.info().long_label))
+            .timeout(8)
+            .build();
+        let obj = self.obj();
+        toast.connect_button_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                // Ask is the built-in default, stored as none (as the Settings row does).
+                imp.edit_agent_profile(driver, |p| {
+                    p.default_mode = Some(mode).filter(|m| *m != Mode::Ask);
+                });
+                imp.show_toast(&format!(
+                    "New {} threads start in {name}",
+                    driver.info().long_label
+                ));
+            }
+        ));
+        overlay.add_toast(toast);
+    }
+
     fn agent_profile_now(&self, driver: Driver) -> Profile {
         self.config
             .borrow()
@@ -400,9 +444,12 @@ impl AgentTerminalWindow {
                     .unwrap_or(0) as u32,
             )
             .build();
-        if driver == Driver::Agy {
-            mode_row.set_subtitle("Without the approval hook agy always runs in Plan");
-        }
+        mode_row.set_subtitle(if driver == Driver::Agy {
+            "New threads start here; a thread keeps its own. Without the approval hook, \
+             Ask before edits runs as Plan"
+        } else {
+            "New threads start here; a thread keeps its own"
+        });
         mode_row.connect_selected_notify(glib::clone!(
             #[weak]
             obj,
@@ -627,6 +674,21 @@ fn detect_agent(command: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_mode_dropdown_lists_every_mode_once() {
+        // Exhaustive: a new mode does not compile until it is placed in `MODES`.
+        let slot = |m: Mode| match m {
+            Mode::Ask | Mode::AcceptEdits | Mode::Plan => MODES.iter().position(|(x, _)| *x == m),
+        };
+        for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
+            let i = slot(m).expect("listed");
+            assert_eq!(MODES[i].0, m);
+        }
+        let mut seen: Vec<Mode> = MODES.iter().map(|(m, _)| *m).collect();
+        seen.dedup();
+        assert_eq!(seen.len(), MODES.len(), "no mode twice");
+    }
 
     #[test]
     fn arguments_split_like_a_shell_and_refuse_bad_quoting() {

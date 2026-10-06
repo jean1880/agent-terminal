@@ -63,6 +63,9 @@ pub enum ViewAction {
     /// `/compact` on an agent with no compaction command: continue in a fresh thread of the same
     /// agent through a budgeted handoff ("handoff-to-self").
     CompactByHandoff,
+    /// The user picked `mode` in the header for this thread's `driver`: the window offers to make
+    /// it that agent's default for new threads.
+    ModeChosen { driver: Driver, mode: Mode },
 }
 
 type ActionHandler = Rc<dyn Fn(&ViewAction)>;
@@ -588,11 +591,16 @@ impl Inner {
             let Some(mode) = MODES.get(dd.selected() as usize).copied() else {
                 return;
             };
-            inner.set_mode(mode);
+            if inner.set_mode(mode) {
+                // Only a pick made in the header, never a mode the agent reported.
+                let driver = inner.backend.status().driver;
+                inner.emit(ViewAction::ModeChosen { driver, mode });
+            }
         });
     }
 
-    fn set_mode(self: &Rc<Self>, mode: Mode) {
+    /// Asks the backend for `mode`; false when the agent has no such mode (nothing was asked).
+    fn set_mode(self: &Rc<Self>, mode: Mode) -> bool {
         let caps = self.backend.status().capabilities;
         if mode == Mode::Plan && !caps.plan_mode {
             let changes = self
@@ -601,9 +609,10 @@ impl Inner {
                 .push_notice("This agent has no read-only planning mode.", Tone::Warning);
             self.handle(changes);
             self.refresh_status();
-            return;
+            return false;
         }
         self.backend.set_mode(mode);
+        true
     }
 
     fn row_event(self: &Rc<Self>, e: RowEvent) {
@@ -736,7 +745,9 @@ impl Inner {
                 }
             },
             BuiltinAction::SetMode => match typeahead::parse_mode(args) {
-                Some(mode) => self.set_mode(mode),
+                Some(mode) => {
+                    self.set_mode(mode);
+                }
                 None => {
                     // No (or an unknown) argument: open the dropdown instead of guessing.
                     if !args.is_empty() {
@@ -1030,6 +1041,29 @@ pub(crate) mod tests {
             model: "gpt-5-codex".into(),
         }));
         assert!(hint().starts_with("Message Codex"), "{}", hint());
+
+        // A mode picked in the header offers to become the agent's default; a mode the agent
+        // reports moves the picker without offering anything.
+        let chosen: Rc<RefCell<Vec<(Driver, Mode)>>> = Rc::default();
+        let seen = chosen.clone();
+        view.connect_action(move |a| {
+            if let ViewAction::ModeChosen { driver, mode } = a {
+                seen.borrow_mut().push((*driver, *mode));
+            }
+        });
+        let picker = view.inner().map(|i| i.header.mode.clone()).expect("view");
+        let index = |m: Mode| header::MODES.iter().position(|x| *x == m).unwrap_or(0) as u32;
+        picker.set_selected(index(Mode::AcceptEdits));
+        assert_eq!(*chosen.borrow(), [(Driver::Codex, Mode::AcceptEdits)]);
+        view.sink()(&Envelope::new(agent_core::event::Event::ModeChanged {
+            mode: Mode::Ask,
+        }));
+        assert_eq!(
+            picker.selected(),
+            index(Mode::Ask),
+            "the picker follows the agent"
+        );
+        assert_eq!(chosen.borrow().len(), 1, "a reported mode offers nothing");
 
         // The model-source listener goes away with the view.
         let source = Rc::new(CountingSource::default());
