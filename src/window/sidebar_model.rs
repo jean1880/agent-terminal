@@ -342,12 +342,6 @@ pub fn menu_agents(
         .collect()
 }
 
-/// A coloured dot standing for an agent in a menu label (menus take plain text, so the colour
-/// comes from the glyph: coral for Claude, blue for agy, green for Codex).
-pub fn menu_dot(driver: Driver) -> &'static str {
-    driver.info().dot
-}
-
 /// The model and effort to hand to `switch` for a catalogue row at `effort`: agy folds the effort
 /// into the model id, the others take it separately.
 fn model_choice(
@@ -421,7 +415,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                     .agents
                     .iter()
                     .map(|agent| MenuEntry::Submenu {
-                        label: format!("{} {}", menu_dot(agent.driver), driver_label(agent.driver)),
+                        label: driver_label(agent.driver).to_owned(),
                         enabled,
                         entries: agent_entries(agent, enabled, action),
                     })
@@ -646,11 +640,13 @@ mod tests {
         assert_eq!(
             labels,
             [
-                format!("{} Claude", menu_dot(Driver::Claude)),
-                format!("{} Antigravity", menu_dot(Driver::Agy)),
-                format!("{} Codex", menu_dot(Driver::Codex)),
+                "Claude".to_owned(),
+                "Antigravity".to_owned(),
+                "Codex".to_owned(),
             ]
         );
+        // Plain labels: no emoji (a PopoverMenu submenu entry draws no icon).
+        assert!(labels.iter().all(|l| l.is_ascii()));
         let all = items(&[submenu(&menu, "Continue in").clone()]);
         let claude: Vec<_> = all
             .iter()

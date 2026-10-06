@@ -47,6 +47,8 @@ fn to_gio_menu(entries: &[MenuEntry]) -> gio::Menu {
                 );
                 menu.append_item(&item);
             }
+            // GTK's PopoverMenu draws no icon on a submenu entry (verified in the preview), so
+            // agent submenus are plain labels: the brand icons live in the widgets, not here.
             MenuEntry::Submenu { label, entries, .. } => {
                 menu.append_submenu(Some(label), &to_gio_menu(entries));
             }

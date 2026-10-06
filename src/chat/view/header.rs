@@ -46,6 +46,7 @@ pub fn gauge_text(g: &Gauge) -> String {
 pub struct Header {
     pub root: gtk4::Box,
     pub chip: gtk4::Button,
+    brand: gtk4::Image,
     agent: gtk4::Label,
     model: gtk4::Label,
     pub mode: gtk4::DropDown,
@@ -68,12 +69,14 @@ impl Header {
         chip.add_css_class("agent-chip");
         chip.set_tooltip_text(Some("Switch model or agent (/model)"));
         let chip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let dot = label("●", &["accent-dot"]);
+        let brand = gtk4::Image::new();
+        brand.set_pixel_size(14);
+        brand.add_css_class("accent-dot");
         let agent = label("", &["chip-agent"]);
         let model = label("", &["chip-model"]);
         model.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         model.set_max_width_chars(28);
-        chip_box.append(&dot);
+        chip_box.append(&brand);
         chip_box.append(&agent);
         chip_box.append(&model);
         chip_box.append(&gtk4::Image::from_icon_name("at-pan-down-symbolic"));
@@ -118,6 +121,7 @@ impl Header {
         Self {
             root,
             chip,
+            brand,
             agent,
             model,
             mode,
@@ -142,6 +146,8 @@ impl Header {
         }
         self.chip.add_css_class(accent_class(driver));
         self.last_driver.set(Some(driver));
+        self.brand
+            .set_from_gicon(&crate::icons::driver_icon(driver));
         self.agent.set_text(driver_name(driver));
         self.model.set_text(model.unwrap_or("default model"));
     }

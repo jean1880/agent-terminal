@@ -1073,11 +1073,11 @@ impl AgentTerminalWindow {
             .build();
         match row.driver {
             Some(driver) => {
-                let dot = Label::builder()
-                    .label("●")
-                    .css_classes(["thread-dot", &format!("dot-{}", driver_key(driver))])
-                    .tooltip_text(driver_label(driver))
-                    .build();
+                let dot = Image::from_gicon(&crate::icons::driver_icon(driver));
+                dot.set_pixel_size(14);
+                dot.add_css_class("thread-dot");
+                dot.add_css_class(&format!("dot-{}", driver_key(driver)));
+                dot.set_tooltip_text(Some(driver_label(driver)));
                 line.append(&dot);
             }
             None => {

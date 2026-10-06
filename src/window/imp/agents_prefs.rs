@@ -152,6 +152,9 @@ impl AgentTerminalWindow {
             .subtitle(AgentAvailability::shared().get(driver).describe(driver))
             .active(!profile.disabled)
             .build();
+        let brand = gtk4::Image::from_gicon(&crate::icons::driver_icon(driver));
+        brand.set_pixel_size(20);
+        enabled.add_prefix(&brand);
         enabled.connect_active_notify(glib::clone!(
             #[weak]
             obj,

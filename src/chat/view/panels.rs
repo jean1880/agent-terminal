@@ -12,7 +12,7 @@ use agent_core::catalog::{group_for_picker, CatalogModel};
 use gtk4::glib;
 use serde_json::Value;
 
-use super::cards::{driver_name, label};
+use super::cards::{accent_class, brand_image, driver_name, label};
 use super::header::gauge_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
@@ -247,10 +247,14 @@ fn model_list(
     let status = Rc::new(status.clone()); // shared by every row's handlers
     let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     for (driver, rows) in groups {
-        let heading = label(&group_title(driver).to_uppercase(), &["model-group"]);
+        let heading_text = label(&group_title(driver).to_uppercase(), &["model-group"]);
+        let heading = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        heading.add_css_class(accent_class(driver));
         heading.set_halign(gtk4::Align::Start);
         heading.set_margin_top(6);
         heading.set_margin_start(6);
+        heading.append(&brand_image(driver));
+        heading.append(&heading_text);
         column.append(&heading);
         let list = boxed_list();
         for m in rows {

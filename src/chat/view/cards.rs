@@ -34,6 +34,15 @@ pub fn accent_class(driver: Driver) -> &'static str {
     driver.info().accent_class
 }
 
+/// An agent's brand mark, tinted by the enclosing `accent-*` class (`.accent-dot`). Codex
+/// honours the user's override file (`icons::driver_icon`).
+pub fn brand_image(driver: Driver) -> gtk4::Image {
+    let image = gtk4::Image::from_gicon(&crate::icons::driver_icon(driver));
+    image.set_pixel_size(14);
+    image.add_css_class("accent-dot");
+    image
+}
+
 pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     let l = gtk4::Label::new(Some(text));
     l.set_xalign(0.0);
@@ -339,7 +348,7 @@ impl Row {
                 root.add_css_class(accent_class(*driver));
                 let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
                 head.add_css_class("assistant-head");
-                head.append(&label("●", &["accent-dot"]));
+                head.append(&brand_image(*driver));
                 head.append(&label(driver_name(*driver), &["agent-name"]));
                 root.append(&head);
                 let md = MarkdownView::new();
@@ -491,8 +500,8 @@ fn divider(text: &str, class: &str, driver: Option<Driver>) -> gtk4::Widget {
     right.set_valign(gtk4::Align::Center);
     let pill = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     pill.add_css_class("divider-pill");
-    if driver.is_some() {
-        pill.append(&label("●", &["accent-dot"]));
+    if let Some(d) = driver {
+        pill.append(&brand_image(d));
     }
     pill.append(&label(text, &["divider-text"]));
     root.append(&left);

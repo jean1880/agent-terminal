@@ -88,6 +88,19 @@ fn every_symbolic_name_in_the_sources_is_bundled() {
 }
 
 #[test]
+fn every_registry_brand_icon_is_bundled() {
+    // The names live in agent-core (not scanned above), so check them directly.
+    let have = bundled();
+    for driver in agent_core::adapter::Driver::ALL {
+        let name = driver.info().brand_icon;
+        assert!(
+            have.contains(name),
+            "{driver:?} brand icon {name} not bundled"
+        );
+    }
+}
+
+#[test]
 fn every_owned_icon_constant_has_a_file() {
     let have = bundled();
     for name in icons::ICONS {

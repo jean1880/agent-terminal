@@ -38,8 +38,9 @@ pub struct DriverInfo {
     pub accent_class: &'static str,
     /// The accent colour, `#rrggbb` (the CSS classes use the same values).
     pub accent_hex: &'static str,
-    /// A coloured glyph standing for the agent in plain-text menus.
-    pub dot: &'static str,
+    /// The bundled symbolic icon name of the agent's brand mark (`assets/icons`). Codex's mark
+    /// honours a user override in the app (`icons::driver_icon`).
+    pub brand_icon: &'static str,
     /// The command a fresh profile runs and detection looks for.
     pub default_command: &'static str,
     /// The name of the profile created for it.
@@ -55,8 +56,8 @@ const REGISTRY: [DriverInfo; 3] = [
         label: "Claude",
         long_label: "Claude",
         accent_class: "accent-claude",
-        accent_hex: "#f0a37a",
-        dot: "\u{1f7e0}",
+        accent_hex: "#e8846b",
+        brand_icon: "agent-claude-symbolic",
         default_command: "claude",
         profile_name: "Claude",
         install_hint: "Install Claude Code (npm install -g @anthropic-ai/claude-code).",
@@ -67,8 +68,8 @@ const REGISTRY: [DriverInfo; 3] = [
         label: "Antigravity",
         long_label: "Antigravity (agy)",
         accent_class: "accent-agy",
-        accent_hex: "#6ec8ff",
-        dot: "\u{1f535}",
+        accent_hex: "#5b9cf6",
+        brand_icon: "agent-agy-symbolic",
         default_command: "agy",
         profile_name: "Agy",
         install_hint: "Install the Antigravity CLI (agy).",
@@ -80,7 +81,7 @@ const REGISTRY: [DriverInfo; 3] = [
         long_label: "Codex",
         accent_class: "accent-codex",
         accent_hex: "#4cc38a",
-        dot: "\u{1f7e2}",
+        brand_icon: "agent-codex-symbolic",
         default_command: "codex",
         profile_name: "Codex",
         install_hint: "Install the Codex CLI (npm install -g @openai/codex).",
@@ -299,6 +300,9 @@ mod tests {
             assert_eq!(Driver::from_key(info.key), Some(d));
             assert!(!info.label.is_empty() && !info.default_command.is_empty());
             assert!(info.accent_class.starts_with("accent-"));
+            assert!(
+                info.brand_icon.starts_with("agent-") && info.brand_icon.ends_with("-symbolic")
+            );
             assert!(info.accent_hex.starts_with('#') && info.accent_hex.len() == 7);
             // The capability table covers it too.
             let _ = Capabilities::of(d);

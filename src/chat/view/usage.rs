@@ -12,7 +12,7 @@ use agent_core::event::QuotaWindow;
 use agent_core::quota::{parse_rfc3339, resets_in_text};
 use gtk4::prelude::*;
 
-use super::cards::{accent_class, driver_name, label};
+use super::cards::{accent_class, brand_image, driver_name, label};
 use crate::account_status::{AccountStatus, Snapshot};
 use crate::availability::AgentAvailability;
 
@@ -203,7 +203,7 @@ impl UsageIndicator {
 fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     b.add_css_class(accent_class(driver));
-    b.append(&label("●", &["accent-dot"]));
+    b.append(&brand_image(driver));
     match snap.most_used() {
         Some(w) => {
             b.append(&bar(w.used, 56));
@@ -228,7 +228,7 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let section = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     section.add_css_class(accent_class(driver));
     let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    head.append(&label("●", &["accent-dot"]));
+    head.append(&brand_image(driver));
     head.append(&label(driver_name(driver), &["usage-agent"]));
     section.append(&head);
     if let Some(account) = &snap.account {

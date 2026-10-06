@@ -70,9 +70,15 @@ pub const ICONS: &[&str] = &[
 
 /// The brand mark for the agent a thread drives.
 pub fn brand_icon(driver: Driver) -> &'static str {
+    driver.info().brand_icon
+}
+
+/// The brand mark as a `gio::Icon`: Codex honours the user's override file ([`codex_icon`]),
+/// the others are the bundled themed icon.
+pub fn driver_icon(driver: Driver) -> gio::Icon {
     match driver {
-        Driver::Claude => CLAUDE_ICON,
-        Driver::Agy => AGY_ICON,
+        Driver::Codex => codex_icon(),
+        other => gio::ThemedIcon::new(brand_icon(other)).upcast(),
     }
 }
 
