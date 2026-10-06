@@ -14,10 +14,10 @@
 - The branch ships **beta builds** through debian-maintainer on a separate apt suite, `beta`. That needs a
   beta-channel feature in debian-maintainer itself:
   `~/scripts/plans/ACTIVE_2026-10-06_debian-maintainer-beta-channel.md`.
-  - Beta versions look like `1:3.0.0~beta.<n>+g<sha>-<build>+debmaintainer`. `dpkg` verifies they sort
-    above 2.1.0 and below 3.0.0.
-  - Suite `beta` carries `NotAutomatic` + `ButAutomaticUpgrades`. Opt in per package with
-    `apt install agent-terminal/beta`.
+  - Beta versions look like `1:3.0.0~beta.<UTC committer time>+g<sha>-<build>+debmaintainer`. The
+    timestamp stays monotonic across rebases. `dpkg` verifies they sort above 2.1.0 and below 3.0.0.
+  - Suite `beta` carries `NotAutomatic` + `ButAutomaticUpgrades`, so apt gives it priority 100 against
+    stable's 500. Opt in per package with `apt install agent-terminal/beta`.
   - Beta builds need `libgtksourceview-5-dev` in the task dependencies from Phase 3 on.
   - The Cargo.toml version on this branch becomes `3.0.0` in Phase 1, so betas are numbered against 3.0.0.
 
