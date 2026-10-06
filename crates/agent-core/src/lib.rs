@@ -10,6 +10,7 @@ pub mod adapter;
 pub mod agy;
 pub mod approval;
 pub mod caps;
+pub mod catalog;
 pub mod claude;
 pub mod commands;
 pub mod event;
