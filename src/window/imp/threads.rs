@@ -804,6 +804,7 @@ impl AgentTerminalWindow {
                     }
                     if view.n_pages() == 0 {
                         if let Some(title) = imp.window_title.borrow().as_ref() {
+                            title.set_title("Agent Terminal");
                             title.set_subtitle("");
                         }
                         obj.set_title(Some("Agent Terminal"));
@@ -828,7 +829,7 @@ impl AgentTerminalWindow {
 
     /// A page came into view: build a thread on first show, clear its unread state, and put
     /// its title and folder in the header.
-    fn page_shown(&self, page: &adw::TabPage) {
+    pub(super) fn page_shown(&self, page: &adw::TabPage) {
         let info = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
@@ -841,6 +842,10 @@ impl AgentTerminalWindow {
             })
         };
         let Some((thread, title, dir)) = info else {
+            // A terminal page: the 2.x handler puts its terminal title in the subtitle.
+            if let Some(window_title) = self.window_title.borrow().as_ref() {
+                window_title.set_title("Terminal");
+            }
             return;
         };
         if let Err(e) = app_store().mark_read(&thread) {
@@ -1341,8 +1346,9 @@ impl AgentTerminalWindow {
             let Some(chat) = tab.chat.as_mut() else {
                 return;
             };
+            let switched = chat.driver != driver;
             chat.driver = driver;
-            match &env.event {
+            let after = match &env.event {
                 Event::TurnStarted { .. } => {
                     chat.running = true;
                     chat.rate_limited = false;
@@ -1404,6 +1410,11 @@ impl AgentTerminalWindow {
                     }
                 }
                 _ => After::Nothing,
+            };
+            // A switch to the other agent recolours the row.
+            match after {
+                After::Nothing if switched => After::Sidebar,
+                other => other,
             }
         };
         match after {

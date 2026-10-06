@@ -340,6 +340,9 @@ fn install_panic_hook() {
 
 /// Loads global application styles.
 fn load_css() {
+    // The brand chrome is dark; popovers, menus and entries follow it instead of the light
+    // default (their text would otherwise inherit the brand's pale label colour on white).
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     let provider = CssProvider::new();
     provider.load_from_data(
         "
@@ -366,10 +369,6 @@ fn load_css() {
             font-size: 24pt;
             font-weight: bold;
             color: @accent_color;
-        }
-        .subtitle {
-            font-size: 14pt;
-            color: #a0a0ff;
         }
         .command-text {
             font-family: monospace;
@@ -431,7 +430,7 @@ fn load_css() {
         }
         .folder-label {
             color: #8a84b8;
-            margin-start: 6px;
+            margin-left: 6px;
         }
         .thread-row {
             padding: 2px 2px;
@@ -462,6 +461,10 @@ fn load_css() {
         }
         .hook-entry {
             color: #c8c8ff;
+        }
+        headerbar .subtitle {
+            font-size: 9pt;
+            color: #8a84b8;
         }
         ",
     );

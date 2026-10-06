@@ -1750,6 +1750,15 @@ impl AgentTerminalWindow {
                 if let Some(page) = view.selected_page() {
                     page.set_needs_attention(false);
                     imp.acknowledge_bell(&page);
+                    // A thread page titles the window itself (title and folder).
+                    if imp
+                        .tabs
+                        .borrow()
+                        .iter()
+                        .any(|t| t.page == page && t.chat.is_some())
+                    {
+                        return;
+                    }
                 }
                 let session_info = view
                     .selected_page()
@@ -2066,6 +2075,9 @@ impl AgentTerminalWindow {
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);
         }
+        // Selected before it was registered: list it and title the window now.
+        self.page_shown(&page);
+        self.refresh_sidebar();
     }
 
     /// Applies theme, font, cursor, scrollback, and capability settings.
@@ -2834,7 +2846,10 @@ impl AgentTerminalWindow {
             .title("Settings")
             .build();
 
-        let page = adw::PreferencesPage::new();
+        let page = adw::PreferencesPage::builder()
+            .title("Terminal")
+            .icon_name("utilities-terminal-symbolic")
+            .build();
         let group = adw::PreferencesGroup::new();
         group.set_title("Terminal Preferences");
 
