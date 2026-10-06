@@ -33,6 +33,16 @@ pub trait ChatBackend {
     fn status(&self) -> SessionStatus;
 }
 
+/// Where the model picker gets its rows: both agents' full model lists in one snapshot.
+/// Implemented by [`crate::model_catalog::ModelCatalog`] (live) and the demo backend (static).
+/// Without a source the picker falls back to the backend's `Control::ListModels`.
+pub trait ModelSource {
+    /// The current snapshot, possibly empty (nothing fetched or cached yet).
+    fn models(&self) -> Vec<agent_core::catalog::CatalogModel>;
+    /// Calls `f` on the main thread each time the snapshot changes.
+    fn connect_changed(&self, f: Box<dyn Fn()>);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionStatus {
     pub driver: Driver,
