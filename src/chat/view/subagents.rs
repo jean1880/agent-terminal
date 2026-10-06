@@ -144,19 +144,16 @@ impl SubagentButton {
         &self.root
     }
 
-    /// Shows the thread's sub-agents; hidden while there are none. Rows are rebuilt only when
-    /// the set of sub-agents changes; otherwise their labels are set in place.
+    /// Shows the sub-agents it is given (the view passes the running ones); hidden while there
+    /// are none. Rows are rebuilt only when the set of sub-agents changes; otherwise their labels
+    /// are set in place.
     pub fn set(&self, agents: &[SubagentSummary]) {
         self.root.set_visible(!agents.is_empty());
-        let running = agents
-            .iter()
-            .filter(|a| a.status == ToolStatus::Running)
-            .count();
         set_if_changed(
             &self.count,
-            &match running {
-                0 => format!("{}", agents.len()),
-                n => format!("{} · {n} running", agents.len()),
+            &match agents.len() {
+                1 => "1 sub-agent".to_owned(),
+                n => format!("{n} sub-agents"),
             },
         );
         let same = {

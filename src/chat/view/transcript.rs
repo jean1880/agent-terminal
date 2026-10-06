@@ -48,8 +48,18 @@ use super::model::{ItemId, Transcript};
 pub const WINDOW: usize = 150;
 /// Rows materialised per scroll-up step.
 pub const PAGE: usize = 60;
-/// Distance from the end (px) that still counts as "at the bottom".
+/// Distance from the end (px) that counts as reaching the bottom when scrolling down.
 const STICK_SLOP: f64 = 48.0;
+
+/// The scroll position and the two heights it depends on, at one moment.
+#[derive(Debug, Clone, Copy)]
+pub struct Look {
+    pub value: f64,
+    /// Content height.
+    pub upper: f64,
+    /// Visible height.
+    pub page: f64,
+}
 
 pub struct TranscriptView {
     root: gtk4::Overlay,
@@ -60,6 +70,12 @@ pub struct TranscriptView {
     /// Index (into `Transcript::order`) of the first materialised top-level item.
     first: Cell<usize>,
     stick: Cell<bool>,
+    /// Set while the view moves itself (see `move_to`).
+    own_move: Cell<bool>,
+    /// The value and content height at the last look, to tell a user scroll from a relayout.
+    last_value: Cell<f64>,
+    last_upper: Cell<f64>,
+    last_page: Cell<f64>,
     /// Distance from the end to restore after prepending older rows.
     anchor: Cell<Option<f64>>,
     sink: RowSink,
@@ -132,6 +148,10 @@ impl TranscriptView {
             rows: RefCell::new(HashMap::new()),
             first: Cell::new(0),
             stick: Cell::new(true),
+            own_move: Cell::new(false),
+            last_value: Cell::new(0.0),
+            last_upper: Cell::new(0.0),
+            last_page: Cell::new(0.0),
             anchor: Cell::new(None),
             sink,
             empty,
@@ -153,24 +173,72 @@ impl TranscriptView {
         &self.root
     }
 
+    /// Moves the view itself (pinning, anchoring). Marked as its own, so it is never read as the
+    /// user scrolling.
+    fn move_to(&self, value: f64) {
+        let adj = self.scroller.vadjustment();
+        self.own_move.set(true);
+        adj.set_value(value);
+        self.own_move.set(false);
+        self.last_value.set(adj.value());
+        self.last_upper.set(adj.upper());
+        self.last_page.set(adj.page_size());
+    }
+
+    /// Whether a value move the view did not make itself is the user scrolling up. Any device
+    /// (wheel, touchpad, keys, touch, scrollbar) counts, by any amount. A move with the content
+    /// height or the visible height changed since the last look is a relayout (GTK clamping a
+    /// shrunk transcript, the composer growing or shrinking around a send), never the user.
+    pub fn user_moved_up(now: Look, last: Look) -> bool {
+        now.value < last.value - 0.5
+            && (now.upper - last.upper).abs() < 0.5
+            && (now.page - last.page).abs() < 0.5
+    }
+
     fn connect_scrolling(self: &Rc<Self>) {
         let adj = self.scroller.vadjustment();
-        // Only the user scrolling *up* unsticks: content growing, page-size changes and GTK's own
-        // clamping never move the value up with an unchanged upper bound.
+        // The view leaves the bottom only when the user scrolls up, and comes back when they
+        // scroll down into it, jump, or send. Every move it makes itself goes through
+        // `move_to`, so anything else that moves the value is the user (or a relayout).
         let weak = Rc::downgrade(self);
-        let last = Cell::new((0.0_f64, 0.0_f64));
         adj.connect_value_changed(move |adj| {
             let Some(view) = weak.upgrade() else {
                 return;
             };
-            let (last_value, last_upper) = last.replace((adj.value(), adj.upper()));
-            let at_bottom = adj.value() + adj.page_size() >= adj.upper() - STICK_SLOP;
-            if at_bottom {
+            if view.own_move.get() {
+                return;
+            }
+            let now = Look {
+                value: adj.value(),
+                upper: adj.upper(),
+                page: adj.page_size(),
+            };
+            let last = Look {
+                value: view.last_value.replace(now.value),
+                upper: view.last_upper.replace(now.upper),
+                page: view.last_page.replace(now.page),
+            };
+            if Self::user_moved_up(now, last) {
+                view.stick.set(false);
+            } else if now.value > last.value && now.value + now.page >= now.upper - STICK_SLOP {
                 view.stick.set(true);
                 view.jump.set_visible(false);
-            } else if adj.value() < last_value - 0.5 && (adj.upper() - last_upper).abs() < 0.5 {
-                view.stick.set(false);
             }
+        });
+        // While stuck, the bottom is re-pinned every frame. Size notifications alone missed
+        // content that settled after them (a late relayout), which is how a just-sent message
+        // could end up below the fold.
+        let weak = Rc::downgrade(self);
+        self.scroller.add_tick_callback(move |_, _| {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let adj = view.scroller.vadjustment();
+            let end = adj.upper() - adj.page_size();
+            if view.stick.get() && view.anchor.get().is_none() && adj.value() < end - 0.5 {
+                view.move_to(end);
+            }
+            glib::ControlFlow::Continue
         });
         let weak = Rc::downgrade(self);
         let on_size = move |adj: &gtk4::Adjustment| {
@@ -178,9 +246,14 @@ impl TranscriptView {
                 return;
             };
             if let Some(from_end) = view.anchor.take() {
-                adj.set_value((adj.upper() - from_end).max(0.0));
+                view.move_to((adj.upper() - from_end).max(0.0));
             } else if view.stick.get() {
-                adj.set_value(adj.upper() - adj.page_size());
+                view.move_to(adj.upper() - adj.page_size());
+            } else {
+                // Not following: just note the new heights, so the next move is judged against
+                // them.
+                view.last_upper.set(adj.upper());
+                view.last_page.set(adj.page_size());
             }
         };
         adj.connect_upper_notify(on_size.clone());
@@ -229,7 +302,7 @@ impl TranscriptView {
         self.stick.set(true);
         self.jump.set_visible(false);
         let adj = self.scroller.vadjustment();
-        adj.set_value(adj.upper() - adj.page_size());
+        self.move_to(adj.upper() - adj.page_size());
     }
 
     /// Rebuilds everything from the model (initial load, or a thread swap).

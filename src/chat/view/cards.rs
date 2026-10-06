@@ -593,22 +593,18 @@ impl ReasoningRow {
 
     fn update(&self, text: &str, streaming: bool, expanded: bool) {
         let text = text.trim();
-        // Claude often withholds its reasoning: the thinking block arrives (signature only) but
-        // no text ever streams. Say so rather than open onto nothing.
-        let withheld = !streaming && text.is_empty();
+        // Claude often withholds its reasoning: the thinking block arrives (signature only) and
+        // no text ever streams. Such a card takes no space at all, so it cannot make the
+        // transcript jump; the header's "Working…" already says the agent is busy. It shows
+        // as soon as there is reasoning to read.
+        self.root.set_visible(!text.is_empty());
         self.title.set_text(if streaming {
             "Thinking…"
-        } else if withheld {
-            "Thought process (not shared by the model)"
         } else {
             "Thought process"
         });
         self.text.set_text(text);
-        self.revealer.set_reveal_child(expanded && !withheld);
-        self.chevron.set_visible(!withheld);
-        if let Some(toggle) = self.chevron.parent().and_then(|head| head.parent()) {
-            toggle.set_sensitive(!withheld);
-        }
+        self.revealer.set_reveal_child(expanded);
         self.chevron.set_icon_name(Some(if expanded {
             "at-pan-down-symbolic"
         } else {
@@ -616,10 +612,10 @@ impl ReasoningRow {
         }));
     }
 
-    /// The card's title and whether it can be opened (tests).
+    /// The card's title and whether it shows at all (tests).
     #[cfg(test)]
     pub(super) fn reasoning_state(&self) -> (String, bool) {
-        (self.title.text().to_string(), self.chevron.is_visible())
+        (self.title.text().to_string(), self.root.is_visible())
     }
 }
 
