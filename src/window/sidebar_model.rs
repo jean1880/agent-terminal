@@ -66,17 +66,25 @@ pub struct SidebarRow {
     pub badge: Option<Badge>,
     /// Open as a page in this window.
     pub open: bool,
+    /// Archived threads are hidden unless the sidebar's "Show archived" toggle is on.
+    pub archived: bool,
 }
 
 /// Rows matching `query` (case-insensitive, on title and folder), grouped by folder. Groups are
 /// ordered by their newest row and rows newest first, so the folder being worked in is on top.
-pub fn group_rows(rows: Vec<SidebarRow>, query: &str) -> Vec<(String, Vec<SidebarRow>)> {
+/// Archived rows are left out unless `show_archived` (or the thread is open in this window).
+pub fn group_rows(
+    rows: Vec<SidebarRow>,
+    query: &str,
+    show_archived: bool,
+) -> Vec<(String, Vec<SidebarRow>)> {
     let query = query.trim().to_lowercase();
     let mut groups: Vec<(String, Vec<SidebarRow>)> = Vec::new();
     for row in rows.into_iter().filter(|r| {
-        query.is_empty()
-            || r.title.to_lowercase().contains(&query)
-            || r.folder.to_lowercase().contains(&query)
+        (show_archived || !r.archived || r.open)
+            && (query.is_empty()
+                || r.title.to_lowercase().contains(&query)
+                || r.folder.to_lowercase().contains(&query))
     }) {
         match groups.iter_mut().find(|(f, _)| *f == row.folder) {
             Some((_, list)) => list.push(row),
@@ -174,6 +182,290 @@ pub fn driver_key(driver: Driver) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The thread context menu
+// ---------------------------------------------------------------------------------------------
+
+/// What a thread-menu entry does. Encoded into one string target of the `win.thread-menu`
+/// action ([`ThreadAction::encode`]), so the menu holds data and no closures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadAction {
+    /// A NEW thread on `driver` (same folder), seeded with this thread's handoff.
+    ContinueIn {
+        thread: String,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// This thread, in place, moved to `driver`/`model`/`effort` like the header's picker.
+    SwitchTo {
+        thread: String,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    Rename(String),
+    Archive(String),
+    Unarchive(String),
+    Delete(String),
+    OpenFolder(String),
+    CopyId(String),
+}
+
+/// Separates the fields of an encoded [`ThreadAction`] (never part of an id, model or effort).
+const SEP: char = '\u{1f}';
+
+impl ThreadAction {
+    /// `kind SEP thread [SEP driver SEP model SEP effort]`; an absent model or effort is empty.
+    pub fn encode(&self) -> String {
+        let simple = |kind: &str, thread: &str| format!("{kind}{SEP}{thread}");
+        let full = |kind: &str,
+                    thread: &str,
+                    driver: Driver,
+                    model: &Option<String>,
+                    effort: &Option<String>| {
+            format!(
+                "{kind}{SEP}{thread}{SEP}{}{SEP}{}{SEP}{}",
+                driver_key(driver),
+                model.as_deref().unwrap_or(""),
+                effort.as_deref().unwrap_or("")
+            )
+        };
+        match self {
+            Self::ContinueIn {
+                thread,
+                driver,
+                model,
+                effort,
+            } => full("continue", thread, *driver, model, effort),
+            Self::SwitchTo {
+                thread,
+                driver,
+                model,
+                effort,
+            } => full("switch", thread, *driver, model, effort),
+            Self::Rename(t) => simple("rename", t),
+            Self::Archive(t) => simple("archive", t),
+            Self::Unarchive(t) => simple("unarchive", t),
+            Self::Delete(t) => simple("delete", t),
+            Self::OpenFolder(t) => simple("folder", t),
+            Self::CopyId(t) => simple("copy-id", t),
+        }
+    }
+
+    /// The inverse of [`Self::encode`]; `None` for anything else.
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.split(SEP);
+        let kind = parts.next()?;
+        let thread = parts.next().filter(|t| !t.is_empty())?.to_owned();
+        let rest: Vec<&str> = parts.collect();
+        let non_empty = |s: &&str| !s.is_empty();
+        let agent = |rest: &[&str]| -> Option<(Driver, Option<String>, Option<String>)> {
+            let [driver, model, effort] = rest else {
+                return None;
+            };
+            Some((
+                parse_driver(driver)?,
+                Some(*model).filter(non_empty).map(str::to_owned),
+                Some(*effort).filter(non_empty).map(str::to_owned),
+            ))
+        };
+        let simple = |action: Self| rest.is_empty().then_some(action);
+        match kind {
+            "continue" => agent(&rest).map(|(driver, model, effort)| Self::ContinueIn {
+                thread,
+                driver,
+                model,
+                effort,
+            }),
+            "switch" => agent(&rest).map(|(driver, model, effort)| Self::SwitchTo {
+                thread,
+                driver,
+                model,
+                effort,
+            }),
+            "rename" => simple(Self::Rename(thread)),
+            "archive" => simple(Self::Archive(thread)),
+            "unarchive" => simple(Self::Unarchive(thread)),
+            "delete" => simple(Self::Delete(thread)),
+            "folder" => simple(Self::OpenFolder(thread)),
+            "copy-id" => simple(Self::CopyId(thread)),
+            _ => None,
+        }
+    }
+}
+
+/// One entry of a thread's context menu, before it becomes a `gio::Menu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Item {
+        label: String,
+        action: ThreadAction,
+        enabled: bool,
+    },
+    Submenu {
+        label: String,
+        enabled: bool,
+        entries: Vec<MenuEntry>,
+    },
+    /// A group set off by a separator.
+    Section(Vec<MenuEntry>),
+}
+
+/// An enabled agent and the models the catalogue lists for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuAgent {
+    pub driver: Driver,
+    pub models: Vec<agent_core::catalog::CatalogModel>,
+}
+
+/// Everything the thread menu depends on.
+#[derive(Debug, Clone)]
+pub struct ThreadMenuInput {
+    pub thread: String,
+    pub archived: bool,
+    /// The thread has at least one message to hand over ("Continue in" needs one).
+    pub has_messages: bool,
+    /// Only enabled (and installed) agents appear.
+    pub agents: Vec<MenuAgent>,
+}
+
+/// A coloured dot standing for an agent in a menu label (menus take plain text, so the colour
+/// comes from the glyph: coral for Claude, blue for agy, green for Codex).
+pub fn menu_dot(driver: Driver) -> &'static str {
+    match driver {
+        Driver::Claude => "\u{1f7e0}",
+        Driver::Agy => "\u{1f535}",
+        Driver::Codex => "\u{1f7e2}",
+    }
+}
+
+/// The model and effort to hand to `switch` for a catalogue row at `effort`: agy folds the effort
+/// into the model id, the others take it separately.
+fn model_choice(
+    model: &agent_core::catalog::CatalogModel,
+    effort: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let effort = effort.filter(|e| model.efforts.iter().any(|x| x == e));
+    (Some(model.model_id_for(effort)), effort.map(str::to_owned))
+}
+
+/// An agent's submenu: its default model first, then every model (a model with efforts is a
+/// submenu of them, the model's own default marked).
+fn agent_entries(
+    agent: &MenuAgent,
+    enabled: bool,
+    action: impl Fn(Driver, Option<String>, Option<String>) -> ThreadAction,
+) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Item {
+        label: "Default model".to_owned(),
+        action: action(agent.driver, None, None),
+        enabled,
+    }];
+    for m in &agent.models {
+        if m.efforts.is_empty() {
+            let (model, effort) = model_choice(m, None);
+            entries.push(MenuEntry::Item {
+                label: m.display.clone(),
+                action: action(agent.driver, model, effort),
+                enabled,
+            });
+            continue;
+        }
+        let default = m.default_effort();
+        let mut efforts = vec![MenuEntry::Item {
+            label: "Default effort".to_owned(),
+            action: action(agent.driver, Some(m.model_id_for(None)), None),
+            enabled,
+        }];
+        for e in &m.efforts {
+            let (model, effort) = model_choice(m, Some(e));
+            efforts.push(MenuEntry::Item {
+                label: if default == Some(e.as_str()) {
+                    format!("{e} (default)")
+                } else {
+                    e.clone()
+                },
+                action: action(agent.driver, model, effort),
+                enabled,
+            });
+        }
+        entries.push(MenuEntry::Submenu {
+            label: m.display.clone(),
+            enabled,
+            entries: efforts,
+        });
+    }
+    entries
+}
+
+/// The right-click menu of a thread: continue it in another agent (a new thread), switch it in
+/// place, then rename / archive / delete, then open its folder and copy its id.
+pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
+    let by_agent =
+        |label: &str,
+         enabled: bool,
+         action: &dyn Fn(Driver, Option<String>, Option<String>) -> ThreadAction| {
+            MenuEntry::Submenu {
+                label: label.to_owned(),
+                enabled: enabled && !input.agents.is_empty(),
+                entries: input
+                    .agents
+                    .iter()
+                    .map(|agent| MenuEntry::Submenu {
+                        label: format!("{} {}", menu_dot(agent.driver), driver_label(agent.driver)),
+                        enabled,
+                        entries: agent_entries(agent, enabled, action),
+                    })
+                    .collect(),
+            }
+        };
+    let thread = input.thread.clone();
+    let t = thread.clone();
+    let continue_in = by_agent(
+        "Continue in",
+        input.has_messages,
+        &move |driver, model, effort| ThreadAction::ContinueIn {
+            thread: t.clone(),
+            driver,
+            model,
+            effort,
+        },
+    );
+    let t = thread.clone();
+    let switch_to = by_agent(
+        "Switch this thread to",
+        true,
+        &move |driver, model, effort| ThreadAction::SwitchTo {
+            thread: t.clone(),
+            driver,
+            model,
+            effort,
+        },
+    );
+    let item = |label: &str, action: ThreadAction| MenuEntry::Item {
+        label: label.to_owned(),
+        action,
+        enabled: true,
+    };
+    vec![
+        MenuEntry::Section(vec![continue_in, switch_to]),
+        MenuEntry::Section(vec![
+            item("Rename…", ThreadAction::Rename(thread.clone())),
+            if input.archived {
+                item("Unarchive", ThreadAction::Unarchive(thread.clone()))
+            } else {
+                item("Archive", ThreadAction::Archive(thread.clone()))
+            },
+            item("Delete…", ThreadAction::Delete(thread.clone())),
+        ]),
+        MenuEntry::Section(vec![
+            item("Open folder", ThreadAction::OpenFolder(thread.clone())),
+            item("Copy thread id", ThreadAction::CopyId(thread)),
+        ]),
+    ]
+}
+
 pub fn parse_driver(name: &str) -> Option<Driver> {
     match name {
         "claude" => Some(Driver::Claude),
@@ -196,7 +488,35 @@ mod tests {
             driver: Some(Driver::Claude),
             badge: None,
             open: false,
+            archived: false,
         }
+    }
+
+    #[test]
+    fn archived_rows_hide_behind_the_toggle_unless_open() {
+        let mut archived = row("old", "/w/one", 5);
+        archived.archived = true;
+        let mut open_archived = row("open", "/w/one", 6);
+        open_archived.archived = true;
+        open_archived.open = true;
+        let rows = vec![row("a", "/w/one", 10), archived, open_archived];
+        let ids = |groups: Vec<(String, Vec<SidebarRow>)>| -> Vec<String> {
+            groups
+                .into_iter()
+                .flat_map(|(_, r)| r)
+                .map(|r| match r.key {
+                    RowKey::Thread(id) => id,
+                    RowKey::Terminal(_) => "t".into(),
+                })
+                .collect()
+        };
+        assert_eq!(ids(group_rows(rows.clone(), "", false)), ["a", "open"]);
+        assert_eq!(
+            ids(group_rows(rows.clone(), "", true)),
+            ["a", "open", "old"]
+        );
+        // The search still applies to what is shown.
+        assert_eq!(ids(group_rows(rows, "thread old", true)), ["old"]);
     }
 
     #[test]
@@ -209,6 +529,7 @@ mod tests {
                 row("d", "/w/two", 20),
             ],
             "",
+            false,
         );
         let shape: Vec<(&str, Vec<&str>)> = groups
             .iter()
@@ -233,9 +554,239 @@ mod tests {
     #[test]
     fn search_matches_title_or_folder_case_insensitively() {
         let rows = vec![row("a", "/w/One", 1), row("b", "/w/two", 2)];
-        assert_eq!(group_rows(rows.clone(), "one").len(), 1);
-        assert_eq!(group_rows(rows.clone(), "THREAD B")[0].0, "/w/two");
-        assert!(group_rows(rows, "nothing").is_empty());
+        assert_eq!(group_rows(rows.clone(), "one", false).len(), 1);
+        assert_eq!(group_rows(rows.clone(), "THREAD B", false)[0].0, "/w/two");
+        assert!(group_rows(rows, "nothing", false).is_empty());
+    }
+
+    // ---- the thread menu ----
+
+    fn model(driver: Driver, id: &str, efforts: &[&str]) -> agent_core::catalog::CatalogModel {
+        agent_core::catalog::CatalogModel {
+            driver,
+            id: id.into(),
+            display: id.to_uppercase(),
+            description: None,
+            efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+            default_effort: None,
+            via: None,
+        }
+    }
+
+    fn input(has_messages: bool, archived: bool) -> ThreadMenuInput {
+        ThreadMenuInput {
+            thread: "t1".into(),
+            archived,
+            has_messages,
+            agents: vec![
+                MenuAgent {
+                    driver: Driver::Claude,
+                    models: vec![model(Driver::Claude, "opus", &["low", "high"])],
+                },
+                MenuAgent {
+                    driver: Driver::Agy,
+                    models: vec![model(Driver::Agy, "gemini-pro", &["low", "high"])],
+                },
+                MenuAgent {
+                    driver: Driver::Codex,
+                    models: vec![model(Driver::Codex, "gpt", &[])],
+                },
+            ],
+        }
+    }
+
+    /// Every item reachable in a submenu, depth first, as (label, action).
+    fn items(entries: &[MenuEntry]) -> Vec<(String, ThreadAction, bool)> {
+        entries
+            .iter()
+            .flat_map(|e| match e {
+                MenuEntry::Item {
+                    label,
+                    action,
+                    enabled,
+                } => vec![(label.clone(), action.clone(), *enabled)],
+                MenuEntry::Submenu { entries, .. } | MenuEntry::Section(entries) => items(entries),
+            })
+            .collect()
+    }
+
+    fn submenu<'a>(entries: &'a [MenuEntry], label: &str) -> &'a MenuEntry {
+        entries
+            .iter()
+            .flat_map(|e| match e {
+                MenuEntry::Section(s) => s.iter().collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .find(|e| matches!(e, MenuEntry::Submenu { label: l, .. } if l == label))
+            .unwrap_or_else(|| panic!("no submenu {label}"))
+    }
+
+    #[test]
+    fn the_menu_offers_every_enabled_agent_with_its_models_and_efforts() {
+        let menu = thread_menu(&input(true, false));
+        let MenuEntry::Submenu {
+            entries: agents,
+            enabled,
+            ..
+        } = submenu(&menu, "Continue in")
+        else {
+            panic!("a submenu");
+        };
+        assert!(*enabled);
+        let labels: Vec<String> = agents
+            .iter()
+            .map(|a| match a {
+                MenuEntry::Submenu { label, .. } => label.clone(),
+                _ => panic!("agent submenus only"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                format!("{} Claude", menu_dot(Driver::Claude)),
+                format!("{} Antigravity", menu_dot(Driver::Agy)),
+                format!("{} Codex", menu_dot(Driver::Codex)),
+            ]
+        );
+        let all = items(&[submenu(&menu, "Continue in").clone()]);
+        let claude: Vec<_> = all
+            .iter()
+            .filter(|(_, a, _)| {
+                matches!(
+                    a,
+                    ThreadAction::ContinueIn {
+                        driver: Driver::Claude,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        // Default model, the model's default effort and each effort.
+        assert_eq!(claude.len(), 4);
+        assert_eq!(claude[0].0, "Default model");
+        assert!(matches!(
+            &claude[0].1,
+            ThreadAction::ContinueIn {
+                model: None,
+                effort: None,
+                ..
+            }
+        ));
+        assert!(claude.iter().any(|(l, a, _)| l == "high"
+            && matches!(a, ThreadAction::ContinueIn { model: Some(m), effort: Some(e), .. }
+                if m == "opus" && e == "high")));
+        // agy folds the effort into the model id.
+        // (its first effort is the default when `medium` is not offered, and is marked as such)
+        assert!(all.iter().any(|(l, a, _)| l == "low (default)"
+            && matches!(a, ThreadAction::ContinueIn { driver: Driver::Agy, model: Some(m), effort: Some(e), .. }
+                if m == "gemini-pro-low" && e == "low")));
+        // A model with no efforts is a plain item.
+        assert!(all.iter().any(|(l, a, _)| l == "GPT"
+            && matches!(a, ThreadAction::ContinueIn { driver: Driver::Codex, model: Some(m), effort: None, .. }
+                if m == "gpt")));
+        // Switch uses the same agents with its own action.
+        let switch = items(&[submenu(&menu, "Switch this thread to").clone()]);
+        assert_eq!(switch.len(), all.len());
+        assert!(switch
+            .iter()
+            .all(|(_, a, on)| *on && matches!(a, ThreadAction::SwitchTo { .. })));
+    }
+
+    #[test]
+    fn continue_is_disabled_without_messages_and_empty_without_agents() {
+        let menu = thread_menu(&input(false, false));
+        let cont = items(&[submenu(&menu, "Continue in").clone()]);
+        assert!(!cont.is_empty() && cont.iter().all(|(_, _, on)| !on));
+        // Switching in place does not need a history.
+        let switch = items(&[submenu(&menu, "Switch this thread to").clone()]);
+        assert!(switch.iter().all(|(_, _, on)| *on));
+
+        let mut none = input(true, false);
+        none.agents.clear();
+        let menu = thread_menu(&none);
+        for label in ["Continue in", "Switch this thread to"] {
+            assert!(matches!(
+                submenu(&menu, label),
+                MenuEntry::Submenu { enabled: false, entries, .. } if entries.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_toggles_and_the_housekeeping_entries_are_always_there() {
+        let labels = |archived| -> Vec<String> {
+            let menu = thread_menu(&input(true, archived));
+            menu.iter()
+                .filter_map(|e| match e {
+                    MenuEntry::Section(s) => Some(s),
+                    _ => None,
+                })
+                .flat_map(|s| s.iter())
+                .filter_map(|e| match e {
+                    MenuEntry::Item { label, .. } => Some(label.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            labels(false),
+            [
+                "Rename…",
+                "Archive",
+                "Delete…",
+                "Open folder",
+                "Copy thread id"
+            ]
+        );
+        assert_eq!(
+            labels(true),
+            [
+                "Rename…",
+                "Unarchive",
+                "Delete…",
+                "Open folder",
+                "Copy thread id"
+            ]
+        );
+    }
+
+    #[test]
+    fn actions_round_trip_through_their_target_string() {
+        let actions = [
+            ThreadAction::ContinueIn {
+                thread: "t".into(),
+                driver: Driver::Codex,
+                model: Some("gpt-5-codex".into()),
+                effort: Some("high".into()),
+            },
+            ThreadAction::SwitchTo {
+                thread: "t".into(),
+                driver: Driver::Agy,
+                model: None,
+                effort: None,
+            },
+            ThreadAction::Rename("t".into()),
+            ThreadAction::Archive("t".into()),
+            ThreadAction::Unarchive("t".into()),
+            ThreadAction::Delete("t".into()),
+            ThreadAction::OpenFolder("t".into()),
+            ThreadAction::CopyId("t".into()),
+        ];
+        for a in actions {
+            assert_eq!(ThreadAction::decode(&a.encode()), Some(a.clone()), "{a:?}");
+        }
+        // Garbage and malformed targets decode to nothing, never to a wrong action.
+        for bad in [
+            "",
+            "delete",
+            "delete\u{1f}",
+            "bogus\u{1f}t",
+            "delete\u{1f}t\u{1f}extra",
+            "continue\u{1f}t\u{1f}nope\u{1f}\u{1f}",
+            "continue\u{1f}t\u{1f}claude",
+        ] {
+            assert_eq!(ThreadAction::decode(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

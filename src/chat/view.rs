@@ -862,7 +862,11 @@ pub(crate) mod tests {
         view.set_model_source(source.clone());
         assert_eq!(source.listeners.len(), 1, "replacing a source leaves one");
         drop(view);
-        assert_eq!(source.listeners.len(), 0, "the dropped view left a listener");
+        assert_eq!(
+            source.listeners.len(),
+            0,
+            "the dropped view left a listener"
+        );
     }
 
     #[derive(Default)]

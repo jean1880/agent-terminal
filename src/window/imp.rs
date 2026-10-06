@@ -1,6 +1,7 @@
 //! Private implementation details of the AgentTerminalWindow.
 
 mod agents_prefs;
+mod thread_menu;
 mod threads;
 
 use super::diff_panel::DiffPanel;
@@ -699,6 +700,17 @@ pub struct AgentTerminalWindow {
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
     /// The header's "New Thread With" submenu, refilled when agent detection finishes.
     new_with_menu: RefCell<Option<gtk4::gio::Menu>>,
+    /// The stored threads as of the last load (archived included): the sidebar draws from this
+    /// and never reads the store itself. Reloaded off the main thread when the store changes.
+    summaries: RefCell<Option<Vec<agent_kit::store::ThreadSummary>>>,
+    summaries_loading: std::cell::Cell<bool>,
+    /// A change arrived while a reload was running: load again when it ends.
+    summaries_stale: std::cell::Cell<bool>,
+    /// The sidebar's "Show archived" toggle.
+    show_archived: std::cell::Cell<bool>,
+    /// The latest open-thread list not yet written, and whether a writer is running.
+    open_threads_pending: RefCell<Option<String>>,
+    open_threads_writing: std::cell::Cell<bool>,
     /// The thread sidebar beside the pages.
     split_view: RefCell<Option<adw::OverlaySplitView>>,
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
@@ -5325,6 +5337,7 @@ mod tests {
         // thread that initialised it, and tests run on several.
         diff_panel_shows_each_outcome();
         crate::chat::view::tests::ui_checks();
+        thread_menu::tests::gtk_checks();
         chat_shell_opens_threads_and_lists_them(&window);
     }
 
@@ -5356,6 +5369,34 @@ mod tests {
         let rows = imp.sidebar_rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.open && r.folder == dir_s));
+
+        // Archive and delete go through the store; the sidebar follows the loaded list.
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match &r.key {
+                crate::window::sidebar_model::RowKey::Thread(id) => Some(id.clone()),
+                crate::window::sidebar_model::RowKey::Terminal(_) => None,
+            })
+            .collect();
+        let store = threads::app_store();
+        store.set_archived(&ids[0], true).expect("archive");
+        imp.reload_summaries();
+        let rows = imp.sidebar_rows();
+        assert_eq!(rows.iter().filter(|r| r.archived).count(), 1);
+        let hidden = crate::window::sidebar_model::group_rows(rows.clone(), "", false);
+        assert_eq!(
+            hidden.iter().map(|(_, r)| r.len()).sum::<usize>(),
+            2,
+            "an archived thread that is open in the window stays listed"
+        );
+        store.delete_thread(&ids[0]).expect("delete");
+        imp.reload_summaries();
+        assert_eq!(
+            imp.sidebar_rows().len(),
+            1,
+            "the deleted thread left the list"
+        );
+        assert!(imp.summary_of(&ids[0]).is_none());
     }
 
     fn diff_panel_shows_each_outcome() {

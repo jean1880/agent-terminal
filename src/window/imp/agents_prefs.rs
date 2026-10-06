@@ -136,7 +136,11 @@ impl AgentTerminalWindow {
         dialog.add(&page);
     }
 
-    fn agent_group(&self, driver: Driver, dialog: &adw::PreferencesDialog) -> adw::PreferencesGroup {
+    fn agent_group(
+        &self,
+        driver: Driver,
+        dialog: &adw::PreferencesDialog,
+    ) -> adw::PreferencesGroup {
         let obj = self.obj();
         let profile = self.agent_profile_now(driver);
         let group = adw::PreferencesGroup::builder()

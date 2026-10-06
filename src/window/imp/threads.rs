@@ -65,6 +65,12 @@ pub(super) struct ChatTab {
     pending_prompt: Option<String>,
     /// Seeded into the session once it exists (fork, compact-by-handoff).
     pending_handoff: Option<(String, usize, String)>,
+    /// The reasoning effort the session starts with, overriding the profile's default (a thread
+    /// continued in another agent at a chosen effort).
+    pending_effort: Option<String>,
+    /// A switch (agent, model, effort) to apply once the session exists (the thread menu's
+    /// "Switch this thread to" on a thread that is not built yet).
+    pub(super) pending_switch: Option<(Driver, Option<String>, Option<String>)>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -81,7 +87,7 @@ pub(super) struct SessionSlot {
 }
 
 impl SessionSlot {
-    fn get(&self) -> Option<Rc<ChatSession>> {
+    pub(super) fn get(&self) -> Option<Rc<ChatSession>> {
         self.session.borrow().clone()
     }
 
@@ -166,6 +172,9 @@ pub(super) struct ResolvedAgent {
 
 thread_local! {
     static STORE: RefCell<Option<Rc<Store>>> = const { RefCell::new(None) };
+    /// Where the app's store lives, once it opened a file one. `None` (memory only, tests): there
+    /// is nothing a second connection could open, so store jobs run in place.
+    static STORE_PATH: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
     /// Keyed by (command, env file): a profile edit is a new key, so nothing goes stale.
     static RESOLVED: RefCell<HashMap<(String, Option<String>), ResolvedAgent>> =
         RefCell::new(HashMap::new());
@@ -175,23 +184,39 @@ thread_local! {
 /// The app's one thread store, opened on first use. A store that cannot be opened falls back
 /// to memory (threads then last for this run), and says so in the log.
 pub(super) fn app_store() -> Rc<Store> {
-    if let Some(store) = STORE.with(|s| s.borrow().clone()) {
-        return store;
+    match try_app_store() {
+        Ok(store) => store,
+        // Unreachable in practice: `setup_shell` calls `try_app_store` first and puts a dialog up
+        // when even the in-memory store cannot open, before anything else asks for it.
+        Err(e) => {
+            error!("SQLite is unusable: {e}");
+            std::process::exit(70)
+        }
     }
-    let store = open_store();
+}
+
+/// [`app_store`], reporting the one failure it cannot recover from: no SQLite at all.
+pub(super) fn try_app_store() -> Result<Rc<Store>, String> {
+    if let Some(store) = STORE.with(|s| s.borrow().clone()) {
+        return Ok(store);
+    }
+    let store = open_store()?;
     STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
-    store
+    Ok(store)
 }
 
 #[cfg(not(test))]
-fn open_store() -> Rc<Store> {
+fn open_store() -> Result<Rc<Store>, String> {
     let path = agent_kit::store::default_path(
         env::var("XDG_STATE_HOME").ok().as_deref(),
         env::var("HOME").ok().as_deref(),
     );
     if let Some(path) = path {
         match Store::open(&path) {
-            Ok(store) => return Rc::new(store),
+            Ok(store) => {
+                STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+                return Ok(Rc::new(store));
+            }
             Err(e) => error!("Cannot open the thread store at {}: {e}", path.display()),
         }
     }
@@ -199,18 +224,159 @@ fn open_store() -> Rc<Store> {
     in_memory_store()
 }
 
+/// Whether [`store_job`] really leaves the main thread (a file store); false for the in-memory
+/// fallback and under test, where it runs the job in place.
+fn store_is_async() -> bool {
+    STORE_PATH.with(|p| p.borrow().is_some())
+}
+
+/// Runs `job` against the thread store off the main thread, on a connection of its own (SQLite
+/// connections are not `Send`; WAL lets it run beside the main one), and returns its result.
+/// `None`: the worker could not open the store or panicked, already logged. With no file store
+/// the job runs in place on the app's.
+pub(super) async fn store_job<T: Send + 'static>(
+    job: impl FnOnce(&Store) -> T + Send + 'static,
+) -> Option<T> {
+    let Some(path) = STORE_PATH.with(|p| p.borrow().clone()) else {
+        return Some(job(&app_store()));
+    };
+    gtk4::gio::spawn_blocking(move || match Store::open(&path) {
+        Ok(store) => Some(job(&store)),
+        Err(e) => {
+            warn!("Cannot open the thread store on a worker: {e}");
+            None
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        error!("A store job panicked on the worker thread");
+        None
+    })
+}
+
+/// A thread to create (see [`AgentTerminalWindow::create_chat_thread`]).
+pub(super) struct NewThread {
+    pub(super) driver: Driver,
+    /// The folder (the agent's, else the starting directory, when `None`).
+    pub(super) dir: Option<String>,
+    /// Sent once the session has started.
+    pub(super) prompt: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) effort: Option<String>,
+    pub(super) title: Option<String>,
+    /// A budgeted, redacted handoff (summary, messages carried, source) seeded into the session.
+    pub(super) handoff: Option<(String, usize, String)>,
+}
+
+impl NewThread {
+    pub(super) fn new(driver: Driver) -> Self {
+        Self {
+            driver,
+            dir: None,
+            prompt: None,
+            model: None,
+            effort: None,
+            title: None,
+            handoff: None,
+        }
+    }
+}
+
+/// What a thread page needs from the store to be built, read in one off-thread job.
+#[derive(Default)]
+struct LoadedThread {
+    history: Vec<Envelope>,
+    /// The active provider thread (its native session id and model), to resume.
+    provider: Option<agent_kit::store::ProviderThread>,
+}
+
+fn load_thread(store: &Store, thread: &str) -> LoadedThread {
+    let provider = store
+        .active_provider_thread(thread)
+        .ok()
+        .flatten()
+        .and_then(|id| {
+            store
+                .provider_threads(thread)
+                .ok()?
+                .into_iter()
+                .find(|p| p.id == id)
+        });
+    LoadedThread {
+        history: read_history(store, thread),
+        provider,
+    }
+}
+
+/// Everything [`AgentTerminalWindow::build_thread`] needs once the agent is resolved and the
+/// thread read.
+struct BuildJob {
+    thread: String,
+    driver: Driver,
+    dir: String,
+    profile: Profile,
+    resolved: ResolvedAgent,
+    loaded: LoadedThread,
+}
+
+/// The saved open-thread ids that still exist (archived or deleted ones drop out), at most `max`.
+fn restorable(saved: &serde_json::Value, known: &[String], max: usize) -> Vec<String> {
+    saved["open"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .filter(|id| known.contains(id))
+                .take(max)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The thread to bring into view: the saved selection when it is among those reopened, else the
+/// first of them.
+fn selected_to_restore(saved: &serde_json::Value, open: &[String]) -> Option<String> {
+    saved["selected"]
+        .as_str()
+        .filter(|id| open.iter().any(|o| o == id))
+        .or(open.first().map(String::as_str))
+        .map(str::to_owned)
+}
+
+/// A thread's stored events, oldest first, at most [`REPLAY_LIMIT`] (read in batches).
+fn read_history(store: &Store, thread: &str) -> Vec<Envelope> {
+    let mut history = Vec::new();
+    let mut after = None;
+    loop {
+        match store.events(thread, after, 2_000) {
+            Ok(batch) if !batch.is_empty() => {
+                after = batch.last().map(|(seq, _)| *seq);
+                history.extend(batch.into_iter().map(|(_, env)| env));
+                if history.len() >= REPLAY_LIMIT {
+                    break;
+                }
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!("Cannot read thread history: {e}");
+                break;
+            }
+        }
+    }
+    history
+}
+
 /// Tests never touch the real `~/.local/state`.
 #[cfg(test)]
-fn open_store() -> Rc<Store> {
+fn open_store() -> Result<Rc<Store>, String> {
     in_memory_store()
 }
 
-fn in_memory_store() -> Rc<Store> {
-    match Store::open_in_memory() {
-        Ok(store) => Rc::new(store),
-        // An in-memory SQLite that cannot open means no SQLite at all.
-        Err(e) => panic!("SQLite is unusable: {e}"),
-    }
+fn in_memory_store() -> Result<Rc<Store>, String> {
+    // An in-memory SQLite that cannot open means no SQLite at all.
+    Store::open_in_memory()
+        .map(Rc::new)
+        .map_err(|e| e.to_string())
 }
 
 /// The cached resolution of `profile`'s command and env file, if done.
@@ -347,10 +513,10 @@ fn bind_approval(thread: &str, cwd: &str, mode: Mode) -> Option<ApprovalHandle> 
 
 pub(super) struct Sidebar {
     pub(super) root: gtk4::Box,
-    list: gtk4::ListBox,
+    pub(super) list: gtk4::ListBox,
     search: gtk4::SearchEntry,
     /// Row index → what it opens (`None` for a folder header).
-    keys: RefCell<Vec<Option<RowKey>>>,
+    pub(super) keys: RefCell<Vec<Option<RowKey>>>,
     /// Set while the list is rebuilt, so selecting the current row is not taken as a click.
     rebuilding: std::cell::Cell<bool>,
     /// Held for the sidebar's lifetime: the footer's usage indicator.
@@ -362,12 +528,40 @@ impl AgentTerminalWindow {
     /// view, with an empty state when no page is open.
     pub(super) fn setup_shell(&self, container: &Box, tab_view: &adw::TabView) {
         let obj = self.obj();
+        // Threads need a store; if not even an in-memory SQLite opens there is nothing to show.
+        if let Err(e) = try_app_store() {
+            let dialog = adw::AlertDialog::new(
+                Some("Threads Are Unavailable"),
+                Some(&format!(
+                    "Agent Terminal cannot use SQLite on this system, so it cannot keep \
+                     threads.\n\n{e}"
+                )),
+            );
+            dialog.add_response("quit", "Quit");
+            dialog.set_default_response(Some("quit"));
+            dialog.set_close_response("quit");
+            dialog.connect_response(
+                None,
+                glib::clone!(
+                    #[weak]
+                    obj,
+                    move |_, _| {
+                        if let Some(app) = obj.application() {
+                            app.quit();
+                        }
+                    }
+                ),
+            );
+            dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
+            return;
+        }
         let split = adw::OverlaySplitView::new();
         split.set_vexpand(true);
         split.set_min_sidebar_width(240.0);
         split.set_max_sidebar_width(340.0);
         split.set_show_sidebar(!self.config.borrow().sidebar_collapsed);
 
+        self.setup_thread_menu_actions();
         let sidebar = self.build_sidebar();
         split.set_sidebar(Some(&sidebar.root));
 
@@ -525,6 +719,22 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .css_classes(["sidebar-footer"])
             .build();
+        let archived = gtk4::ToggleButton::builder()
+            .label("Show archived")
+            .tooltip_text("Also list archived threads")
+            .css_classes(["flat", "caption"])
+            .halign(Align::Start)
+            .build();
+        archived.connect_toggled(glib::clone!(
+            #[weak]
+            obj,
+            move |button| {
+                let imp = obj.imp();
+                imp.show_archived.set(button.is_active());
+                imp.refresh_sidebar();
+            }
+        ));
+        footer.append(&archived);
         // Every agent's usage and account, updated on every turn.
         let usage = UsageIndicator::new(AccountStatus::shared(), None);
         footer.append(usage.widget());
@@ -562,6 +772,7 @@ impl AgentTerminalWindow {
                 }
             }
         ));
+        self.install_thread_menu_triggers(&sidebar);
         sidebar
     }
 
@@ -586,11 +797,8 @@ impl AgentTerminalWindow {
     /// The rows the sidebar shows: every stored thread, with the live state of the open ones,
     /// and the open terminal pages.
     pub(super) fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        let store = app_store();
-        let summaries = store.list_threads(false).unwrap_or_else(|e| {
-            warn!("Cannot list threads: {e}");
-            Vec::new()
-        });
+        // From the last load: the sidebar never reads the store on the main thread.
+        let summaries = self.summaries.borrow().clone().unwrap_or_default();
         let tabs = self.tabs.borrow();
         let mut rows: Vec<SidebarRow> = summaries
             .into_iter()
@@ -619,6 +827,7 @@ impl AgentTerminalWindow {
                         .or_else(|| s.driver.as_deref().and_then(parse_driver)),
                     badge,
                     open: tab.is_some(),
+                    archived: s.archived,
                 }
             })
             .collect();
@@ -635,19 +844,92 @@ impl AgentTerminalWindow {
                 driver: None,
                 badge: tab.page.needs_attention().then_some(Badge::Unread),
                 open: true,
+                archived: false,
             });
         }
         rows
     }
 
-    /// Rebuilds the sidebar list. Cheap: a few dozen rows, rebuilt on state changes.
+    /// The thread list changed in the store (a thread made, renamed, archived, deleted, or its
+    /// events moved it): load it again, off the main thread, and redraw when it lands. Bursts
+    /// coalesce into one more load. With no file store (memory, tests) it loads in place.
+    pub(super) fn reload_summaries(&self) {
+        if !store_is_async() {
+            let list = app_store().list_threads(true).unwrap_or_else(|e| {
+                warn!("Cannot list threads: {e}");
+                Vec::new()
+            });
+            *self.summaries.borrow_mut() = Some(list);
+            self.refresh_sidebar();
+            return;
+        }
+        if self.summaries_loading.replace(true) {
+            self.summaries_stale.set(true);
+            return;
+        }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            loop {
+                let loaded = store_job(|store| store.list_threads(true)).await;
+                let Some(obj) = obj.upgrade() else { return };
+                let imp = obj.imp();
+                match loaded {
+                    Some(Ok(list)) => *imp.summaries.borrow_mut() = Some(list),
+                    Some(Err(e)) => warn!("Cannot list threads: {e}"),
+                    None => {}
+                }
+                if imp.summaries_stale.replace(false) {
+                    continue;
+                }
+                imp.summaries_loading.set(false);
+                imp.refresh_sidebar();
+                return;
+            }
+        });
+    }
+
+    /// Runs a store write off the main thread, logs a failure, then reloads the thread list.
+    pub(super) fn write_store(
+        &self,
+        what: &'static str,
+        job: impl FnOnce(&Store) -> agent_kit::store::Result<()> + Send + 'static,
+    ) {
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            if let Some(Err(e)) = store_job(job).await {
+                warn!("Cannot {what}: {e}");
+            }
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().reload_summaries();
+            }
+        });
+    }
+
+    /// A stored thread's summary: from the loaded list, else (a thread made a moment ago) a
+    /// one-row read.
+    pub(super) fn summary_of(&self, thread: &str) -> Option<agent_kit::store::ThreadSummary> {
+        let cached = self
+            .summaries
+            .borrow()
+            .as_ref()
+            .and_then(|l| l.iter().find(|s| s.id == thread).cloned());
+        cached.or_else(|| app_store().thread_summary(thread).ok().flatten())
+    }
+
+    /// Redraws the sidebar from what is loaded, with the live state of the open pages. Cheap: a
+    /// few dozen rows, rebuilt on state changes. Nothing loaded yet: asks for the load.
     pub(super) fn refresh_sidebar(&self) {
         let Some(sidebar) = self.sidebar.borrow().clone() else {
             return;
         };
+        if self.summaries.borrow().is_none() {
+            // The load redraws when it lands (at once when there is no file store).
+            self.reload_summaries();
+            return;
+        }
         let rows = self.sidebar_rows();
         let selected = self.selected_row_key();
-        let groups = group_rows(rows, &sidebar.search.text());
+        let groups = group_rows(rows, &sidebar.search.text(), self.show_archived.get());
         let home = env::var("HOME").unwrap_or_default();
         let now = now_ms();
 
@@ -760,7 +1042,7 @@ impl AgentTerminalWindow {
         gtk4::ListBoxRow::builder().child(&line).build()
     }
 
-    fn close_row(&self, key: &RowKey) {
+    pub(super) fn close_row(&self, key: &RowKey) {
         let page = self.tabs.borrow().iter().find_map(|t| {
             let matches = match key {
                 RowKey::Thread(id) => t.chat.as_ref().is_some_and(|c| &c.thread == id),
@@ -774,7 +1056,7 @@ impl AgentTerminalWindow {
         }
     }
 
-    fn selected_row_key(&self) -> Option<RowKey> {
+    pub(super) fn selected_row_key(&self) -> Option<RowKey> {
         let page = self.tab_view.borrow().as_ref()?.selected_page()?;
         let tabs = self.tabs.borrow();
         let tab = tabs.iter().find(|t| t.page == page)?;
@@ -863,9 +1145,8 @@ impl AgentTerminalWindow {
             }
             return;
         };
-        if let Err(e) = app_store().mark_read(&thread) {
-            debug!("Cannot mark thread read: {e}");
-        }
+        let id = thread.clone();
+        self.write_store("mark the thread read", move |s| s.mark_read(&id));
         let home = env::var("HOME").unwrap_or_default();
         if let Some(window_title) = self.window_title.borrow().as_ref() {
             window_title.set_title(if title.is_empty() {
@@ -896,54 +1177,83 @@ impl AgentTerminalWindow {
             _ => None,
         };
         let value = serde_json::json!({ "open": open, "selected": selected });
-        if let Err(e) = app_store().set_meta(OPEN_THREADS_KEY, &value.to_string()) {
-            warn!("Cannot record the open threads: {e}");
+        self.queue_open_threads(value.to_string());
+    }
+
+    /// Writes the open-thread list off the main thread. Writes are one at a time and in order,
+    /// and a burst (several pages opening) keeps only the newest value, so a slow disk can
+    /// neither reorder them nor pile them up.
+    fn queue_open_threads(&self, value: String) {
+        *self.open_threads_pending.borrow_mut() = Some(value);
+        if self.open_threads_writing.replace(true) {
+            return; // the running writer picks the new value up
         }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            loop {
+                let Some(obj) = obj.upgrade() else { return };
+                let next = obj.imp().open_threads_pending.borrow_mut().take();
+                let Some(value) = next else {
+                    obj.imp().open_threads_writing.set(false);
+                    return;
+                };
+                drop(obj);
+                if let Some(Err(e)) = store_job(move |s| s.set_meta(OPEN_THREADS_KEY, &value)).await
+                {
+                    warn!("Cannot record the open threads: {e}");
+                }
+            }
+        });
     }
 
     /// Reopens the threads open when the app last closed (first window of a launch only).
     /// Only the one in view is built now; the rest are built when first shown.
-    pub(super) fn restore_open_threads(&self) -> bool {
-        if CHAT_RESTORED.with(|done| done.replace(true)) {
-            return false;
+    ///
+    /// The stored list is read off the main thread, so the reopening lands a moment later. The
+    /// saved selection is then applied only when nothing else has been put in view meanwhile (a
+    /// resume the window was opened for).
+    pub(super) fn restore_open_threads(&self) {
+        if CHAT_RESTORED.with(|done| done.replace(true)) || try_app_store().is_err() {
+            return;
         }
-        let saved = app_store().meta(OPEN_THREADS_KEY).ok().flatten();
-        let Some(value) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        else {
-            return false;
-        };
-        let known: Vec<String> = app_store()
-            .list_threads(false)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| s.id)
-            .collect();
-        let open: Vec<String> = value["open"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .filter(|id| known.contains(id))
-                    .take(crate::config::SessionState::MAX_TABS)
-                    .collect()
+        let obj = self.obj().downgrade();
+        let before = self.tabs.borrow().len();
+        glib::MainContext::default().spawn_local(async move {
+            let loaded = store_job(|store| {
+                (
+                    store.meta(OPEN_THREADS_KEY).ok().flatten(),
+                    store.list_threads(false).unwrap_or_default(),
+                )
             })
-            .unwrap_or_default();
-        if open.is_empty() {
-            return false;
-        }
-        info!("Reopening {} thread(s) from the last session", open.len());
-        for id in &open {
-            self.open_thread(id, false);
-        }
-        let selected = value["selected"]
-            .as_str()
-            .filter(|id| open.iter().any(|o| o == id))
-            .or(open.first().map(String::as_str))
-            .map(str::to_owned);
-        if let Some(id) = selected {
-            self.open_thread(&id, true);
-        }
-        true
+            .await;
+            let (Some((saved, threads)), Some(obj)) = (loaded, obj.upgrade()) else {
+                return;
+            };
+            let Some(value) =
+                saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            else {
+                return;
+            };
+            let known: Vec<String> = threads.into_iter().map(|s| s.id).collect();
+            let open = restorable(&value, &known, crate::config::SessionState::MAX_TABS);
+            if open.is_empty() {
+                return;
+            }
+            let imp = obj.imp();
+            // Pages added since the restore began belong to something else (a resume): leave
+            // that in view.
+            let others_in_view = imp.tabs.borrow().len() > before;
+            info!("Reopening {} thread(s) from the last session", open.len());
+            for id in &open {
+                imp.open_thread(id, false);
+            }
+            if others_in_view {
+                return;
+            }
+            if let Some(id) = selected_to_restore(&value, &open) {
+                imp.open_thread(&id, true);
+            }
+        });
     }
 
     /// Shows the thread's page, adding it if it is not open. `select` brings it into view (and
@@ -974,11 +1284,7 @@ impl AgentTerminalWindow {
 
     /// Adds an (unbuilt) page for a stored thread.
     fn add_thread_page(&self, thread: &str) -> Option<adw::TabPage> {
-        let summary = app_store()
-            .list_threads(true)
-            .ok()?
-            .into_iter()
-            .find(|s| s.id == thread)?;
+        let summary = self.summary_of(thread)?;
         let driver = summary
             .driver
             .as_deref()
@@ -1125,6 +1431,8 @@ impl AgentTerminalWindow {
                 title_item: None,
                 pending_prompt: None,
                 pending_handoff: None,
+                pending_effort: None,
+                pending_switch: None,
             }),
         });
         if diff_panel.root.is_visible() {
@@ -1169,21 +1477,39 @@ impl AgentTerminalWindow {
             obj,
             async move {
                 let resolved = resolve_agent(profile.clone()).await;
-                obj.imp()
-                    .build_thread(&page, &thread, driver, &dir, &profile, resolved);
+                // A long thread's history is read (and decoded) off the main thread; only the
+                // replay into the view happens here.
+                let loaded = store_job({
+                    let thread = thread.clone();
+                    move |store| load_thread(store, &thread)
+                })
+                .await
+                .unwrap_or_default();
+                obj.imp().build_thread(
+                    &page,
+                    BuildJob {
+                        thread,
+                        driver,
+                        dir,
+                        profile,
+                        resolved,
+                        loaded,
+                    },
+                );
             }
         ));
     }
 
-    fn build_thread(
-        &self,
-        page: &adw::TabPage,
-        thread: &str,
-        driver: Driver,
-        dir: &str,
-        profile: &Profile,
-        resolved: ResolvedAgent,
-    ) {
+    fn build_thread(&self, page: &adw::TabPage, job: BuildJob) {
+        let BuildJob {
+            thread,
+            driver,
+            dir,
+            profile,
+            resolved,
+            loaded,
+        } = job;
+        let (thread, dir, profile) = (thread.as_str(), dir.as_str(), &profile);
         let Some((slot, holder)) = self.tabs.borrow().iter().find_map(|t| {
             (&t.page == page)
                 .then(|| t.chat.as_ref().map(|c| (c.slot.clone(), c.holder.clone())))
@@ -1192,6 +1518,7 @@ impl AgentTerminalWindow {
             return; // closed while resolving
         };
         let store = app_store();
+        let history = loaded.history;
 
         // The view first, so no envelope of the session's start is lost.
         let backend: Rc<dyn ChatBackend> = slot.clone();
@@ -1199,24 +1526,6 @@ impl AgentTerminalWindow {
         view.set_vexpand(true);
         view.set_model_source(ModelCatalog::shared());
         view.set_account_status(AccountStatus::shared());
-        let mut history = Vec::new();
-        let mut after = None;
-        loop {
-            match store.events(thread, after, 2_000) {
-                Ok(batch) if !batch.is_empty() => {
-                    after = batch.last().map(|(seq, _)| *seq);
-                    history.extend(batch.into_iter().map(|(_, env)| env));
-                    if history.len() >= REPLAY_LIMIT {
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(e) => {
-                    warn!("Cannot read thread history: {e}");
-                    break;
-                }
-            }
-        }
         view.replay(&history);
         holder.append(&view);
 
@@ -1233,15 +1542,17 @@ impl AgentTerminalWindow {
         });
 
         // Resume the active provider thread's native session, on its model.
-        let active = store.active_provider_thread(thread).ok().flatten();
-        let provider = active.and_then(|id| {
-            store
-                .provider_threads(thread)
-                .ok()?
-                .into_iter()
-                .find(|p| p.id == id)
-        });
+        let provider = loaded.provider;
         let resume = provider.as_ref().and_then(|p| p.native_id.clone());
+        // An effort chosen for this thread (continued in another agent) beats the profile's.
+        let effort = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .and_then(|t| t.chat.as_mut())
+            .and_then(|c| c.pending_effort.take())
+            .or_else(|| profile.default_effort.clone());
         let model = provider
             .as_ref()
             .and_then(|p| stored_model(Some(&p.model)))
@@ -1256,7 +1567,7 @@ impl AgentTerminalWindow {
             extra_args: profile.args.clone(),
             cwd: dir.to_owned(),
             model,
-            effort: profile.default_effort.clone(),
+            effort,
             mode,
             new_session_id: (resume.is_none() && driver == Driver::Claude)
                 .then(|| glib::uuid_string_random().to_string()),
@@ -1298,7 +1609,7 @@ impl AgentTerminalWindow {
             }
         });
 
-        let (prompt, handoff) = {
+        let (prompt, handoff, switch) = {
             let mut tabs = self.tabs.borrow_mut();
             let chat = tabs
                 .iter_mut()
@@ -1308,13 +1619,20 @@ impl AgentTerminalWindow {
                 Some(chat) => {
                     chat.view = Some(view.clone());
                     chat.building = false;
-                    (chat.pending_prompt.take(), chat.pending_handoff.take())
+                    (
+                        chat.pending_prompt.take(),
+                        chat.pending_handoff.take(),
+                        chat.pending_switch.take(),
+                    )
                 }
-                None => (None, None),
+                None => (None, None, None),
             }
         };
         if let Some((summary, carried, source)) = handoff {
             session.seed_handoff(summary, carried, &source);
+        }
+        if let Some((driver, model, effort)) = switch {
+            session.switch(driver, model, effort);
         }
         if let Some(prompt) = prompt {
             session.send_prompt(&prompt);
@@ -1433,9 +1751,8 @@ impl AgentTerminalWindow {
             After::Nothing => {}
             After::Sidebar => self.refresh_sidebar(),
             After::Title(title) => {
-                if let Err(e) = app_store().rename_thread(thread, &title) {
-                    warn!("Cannot title the thread: {e}");
-                }
+                let (id, stored) = (thread.to_owned(), title.clone());
+                self.write_store("title the thread", move |s| s.rename_thread(&id, &stored));
                 if let Some(page) = self.page_of_thread(thread) {
                     page.set_title(&title);
                     if in_view {
@@ -1461,8 +1778,12 @@ impl AgentTerminalWindow {
                 if self.config.borrow().checkpoints {
                     self.request_checkpoint(&page, false);
                 }
+                // The turn's events moved the thread in the list (and unread); read it again.
                 if in_view {
-                    let _ = app_store().mark_read(thread);
+                    let id = thread.to_owned();
+                    self.write_store("mark the thread read", move |s| s.mark_read(&id));
+                } else {
+                    self.reload_summaries();
                 }
                 if attention {
                     self.notify_bell(&page);
@@ -1480,7 +1801,7 @@ impl AgentTerminalWindow {
         }
     }
 
-    fn page_of_thread(&self, thread: &str) -> Option<adw::TabPage> {
+    pub(super) fn page_of_thread(&self, thread: &str) -> Option<adw::TabPage> {
         self.tabs.borrow().iter().find_map(|t| {
             t.chat
                 .as_ref()
@@ -1489,7 +1810,7 @@ impl AgentTerminalWindow {
         })
     }
 
-    fn slot_of(&self, thread: &str) -> Option<Rc<SessionSlot>> {
+    pub(super) fn slot_of(&self, thread: &str) -> Option<Rc<SessionSlot>> {
         self.tabs.borrow().iter().find_map(|t| {
             t.chat
                 .as_ref()
@@ -1703,6 +2024,25 @@ impl AgentTerminalWindow {
             );
             return;
         };
+        self.create_chat_thread(NewThread {
+            dir,
+            prompt,
+            ..NewThread::new(driver)
+        });
+    }
+
+    /// Creates a thread, opens and shows it. Whatever `new` leaves unset comes from the agent's
+    /// profile. Returns its page.
+    pub(super) fn create_chat_thread(&self, new: NewThread) -> Option<adw::TabPage> {
+        let NewThread {
+            driver,
+            dir,
+            prompt,
+            model,
+            effort,
+            title,
+            handoff,
+        } = new;
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let requested = dir.unwrap_or_else(|| {
             self.config
@@ -1713,20 +2053,21 @@ impl AgentTerminalWindow {
         });
         let cwd = resolve_working_directory(&requested, &home);
         let store = app_store();
-        let thread = match store.create_thread(&cwd, None) {
+        let thread = match store.create_thread(&cwd, title.as_deref()) {
             Ok(id) => id,
             Err(e) => {
                 present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
-                return;
+                return None;
             }
         };
         // The agent is recorded now, so the sidebar and a later reopen know it before the
         // session starts. The session adopts this provider thread.
-        let model = self
-            .config
-            .borrow()
-            .agent_profile(driver)
-            .and_then(|p| p.default_model.clone());
+        let model = model.or_else(|| {
+            self.config
+                .borrow()
+                .agent_profile(driver)
+                .and_then(|p| p.default_model.clone())
+        });
         if let Err(e) = store
             .add_provider_thread(
                 &thread,
@@ -1738,19 +2079,25 @@ impl AgentTerminalWindow {
             warn!("Cannot record the thread's agent: {e}");
         }
         info!("New {} thread in {cwd}", driver_label(driver));
-        if let Some(page) = self.open_thread(&thread, false) {
-            if let Some(chat) = self
-                .tabs
-                .borrow_mut()
-                .iter_mut()
-                .find(|t| t.page == page)
-                .and_then(|t| t.chat.as_mut())
-            {
-                chat.driver = driver;
-                chat.pending_prompt = prompt;
+        self.reload_summaries();
+        let page = self.open_thread(&thread, false)?;
+        if let Some(chat) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| t.page == page)
+            .and_then(|t| t.chat.as_mut())
+        {
+            chat.driver = driver;
+            chat.pending_prompt = prompt;
+            chat.pending_effort = effort;
+            chat.pending_handoff = handoff;
+            if let Some(title) = title {
+                chat.title = title;
             }
-            self.open_thread(&thread, true);
         }
+        self.open_thread(&thread, true);
+        Some(page)
     }
 
     /// Resumes a native Claude or agy session as a chat thread: a new thread whose provider
@@ -1977,5 +2324,83 @@ mod tests {
         assert_eq!(status.driver, Driver::Agy);
         assert!(!status.alive);
         assert_eq!(slot.control(Control::Usage), "ctl-unstarted");
+        let codex = SessionSlot {
+            session: RefCell::new(None),
+            driver: Driver::Codex,
+            model: None,
+            mode: Mode::Ask,
+        };
+        assert_eq!(codex.status().driver, Driver::Codex);
+        assert!(codex.status().capabilities.live_approvals);
+    }
+
+    #[test]
+    fn saved_open_threads_restore_only_what_still_exists_in_order_and_capped() {
+        let saved = serde_json::json!({"open": ["a", "gone", "b", "c"], "selected": "b"});
+        let known: Vec<String> = ["a", "b", "c"].map(str::to_owned).to_vec();
+        let open = restorable(&saved, &known, 2);
+        assert_eq!(open, ["a", "b"]);
+        assert_eq!(selected_to_restore(&saved, &open).as_deref(), Some("b"));
+        // A selection that was not reopened falls back to the first.
+        let saved = serde_json::json!({"open": ["a", "b"], "selected": "c"});
+        assert_eq!(selected_to_restore(&saved, &open).as_deref(), Some("a"));
+        assert!(restorable(&serde_json::json!({}), &known, 5).is_empty());
+        assert_eq!(selected_to_restore(&serde_json::json!({}), &[]), None);
+    }
+
+    #[test]
+    fn history_is_read_in_batches_up_to_the_replay_limit() {
+        let store = Store::open_in_memory().expect("store");
+        let thread = store.create_thread("/w", Some("t")).expect("thread");
+        for _ in 0..2_500 {
+            store
+                .append_event(
+                    &thread,
+                    None,
+                    &Envelope::new(Event::Notice { text: "x".into() }),
+                )
+                .expect("event");
+        }
+        // More than one batch of 2,000, in order, nothing lost.
+        let history = read_history(&store, &thread);
+        assert_eq!(history.len(), 2_500);
+        assert!(read_history(&store, "nope").is_empty());
+    }
+
+    #[test]
+    fn a_store_job_runs_off_the_main_thread_on_a_connection_of_its_own() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("threads.db");
+        let main_store = Store::open(&path).expect("open");
+        let thread = main_store.create_thread("/w", Some("t")).expect("thread");
+        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+        assert!(store_is_async());
+
+        let main_thread = std::thread::current().id();
+        let got = in_loop(|ctx| {
+            let out = Rc::new(RefCell::new(None));
+            let o = out.clone();
+            let id = thread.clone();
+            glib::spawn_future_local(async move {
+                let result = store_job(move |store| {
+                    (
+                        std::thread::current().id(),
+                        store.thread_summary(&id).map(|s| s.map(|s| s.title)),
+                    )
+                })
+                .await;
+                *o.borrow_mut() = Some(result);
+            });
+            assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
+            let got = out.borrow_mut().take();
+            got
+        });
+        STORE_PATH.with(|p| *p.borrow_mut() = None);
+        let (worker, title) = got.flatten().expect("the job ran");
+        assert_ne!(worker, main_thread, "the job ran on the main thread");
+        assert_eq!(title.expect("query").as_deref(), Some("t"));
+        // A write from the worker is visible to the main connection (WAL).
+        assert!(main_store.thread_summary(&thread).expect("read").is_some());
     }
 }

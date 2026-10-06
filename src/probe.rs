@@ -74,8 +74,10 @@ impl<R> InFlight<R> {
 #[derive(Default)]
 pub struct ListenerSet {
     next: Cell<u64>,
-    items: RefCell<Vec<(u64, Rc<dyn Fn()>)>>,
+    items: RefCell<Vec<(u64, Listener)>>,
 }
+
+type Listener = Rc<dyn Fn()>;
 
 impl ListenerSet {
     /// Registers `f`; the id disconnects it again.
