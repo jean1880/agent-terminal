@@ -70,8 +70,10 @@ pub struct RetiredModel {
     pub replacement: Replacement,
 }
 
-/// Builds what another driver starts with (the window knows how; this module does not).
-pub type AdapterFactory = Rc<dyn Fn(Driver) -> AgentLaunch>;
+/// Builds what another driver starts with (the window knows how; this module does not). An `Err`
+/// is the reason the driver cannot be started (missing or switched off): the switch is refused
+/// with it and nothing changes.
+pub type AdapterFactory = Rc<dyn Fn(Driver) -> Result<AgentLaunch, String>>;
 
 /// How long a state-changing tool step may run before its hook query must have arrived.
 const CANARY_GRACE: Duration = Duration::from_secs(3);
@@ -994,7 +996,13 @@ impl Inner {
             &format!("{} thread {}", driver_label(from), self.thread),
         );
 
-        let launch = factory(driver);
+        let launch = match factory(driver) {
+            Ok(launch) => launch,
+            Err(reason) => {
+                self.error(reason);
+                return;
+            }
+        };
         let model = model.or(launch.default_model);
         let effort = effort.or(launch.default_effort);
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
@@ -1780,8 +1788,8 @@ mod tests {
         });
     }
 
-    fn launch_of(adapter: Box<dyn Adapter>) -> AgentLaunch {
-        AgentLaunch {
+    fn launch_of(adapter: Box<dyn Adapter>) -> Result<AgentLaunch, String> {
+        Ok(AgentLaunch {
             adapter,
             program: "unused".into(),
             extra_args: Vec::new(),
@@ -1789,7 +1797,7 @@ mod tests {
             default_effort: None,
             env: LaunchEnv::default(),
             approval: None,
-        }
+        })
     }
 
     #[test]
@@ -1822,7 +1830,7 @@ mod tests {
             let agy_log = log.clone();
             session.set_adapter_factory(Rc::new(move |d| {
                 count.set(count.get() + 1);
-                AgentLaunch {
+                Ok(AgentLaunch {
                     adapter: match d {
                         Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
                         Driver::Agy | Driver::Codex => FakeAdapter::boxed(d, &agy_log),
@@ -1836,7 +1844,7 @@ mod tests {
                         unset: vec!["CLAUDECODE".into()],
                     },
                     approval: None,
-                }
+                })
             }));
 
             // No model named: the agent's configured default.
@@ -2234,6 +2242,43 @@ mod tests {
             let status = session.status();
             assert_eq!(status.driver, Driver::Agy, "still the old agent");
             assert!(status.alive, "and still running");
+        });
+    }
+
+    #[test]
+    fn a_switch_to_an_agent_that_is_not_ready_is_refused_and_changes_nothing() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: Vec::new(),
+                    cwd: "/".into(),
+                    model: Some("gemini-pro".into()),
+                    effort: None,
+                    mode: Mode::Plan,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            session.set_adapter_factory(Rc::new(|d| {
+                Err(format!("{} is not available", driver_label(d)))
+            }));
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            assert!(has(&seen, |e| matches!(e, Event::Error { message }
+                if message == "Claude is not available")));
+            assert_eq!(session.status().driver, Driver::Agy, "still the old agent");
+            assert!(session.status().alive);
+            assert_eq!(store.provider_threads(&thread).expect("pts").len(), 1);
         });
     }
 

@@ -80,6 +80,9 @@ pub(super) struct ChatTab {
     pub(super) pending_switch: Option<(Driver, Option<String>, Option<String>)>,
     /// The banner is showing because the thread's agent is missing or off (not a rate limit).
     unavailable: bool,
+    /// A session start is in flight for a view that was built without one (its agent was not
+    /// Ready); stops a second availability change from starting it twice.
+    starting: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -90,6 +93,9 @@ pub(super) struct ChatTab {
 /// gets this slot, which forwards to the session once it is set.
 pub(super) struct SessionSlot {
     session: RefCell<Option<Rc<ChatSession>>>,
+    /// The view, to tell the user when a prompt cannot go anywhere yet (the thread's agent is
+    /// not Ready, so no session exists). Weak: the view owns this slot.
+    view: RefCell<Option<glib::WeakRef<ChatView>>>,
     driver: Driver,
     model: Option<String>,
     mode: Mode,
@@ -112,7 +118,18 @@ impl ChatBackend for SessionSlot {
     fn send_prompt(&self, text: &str) {
         match self.get() {
             Some(s) => s.send_prompt(text),
-            None => warn!("a prompt arrived before the thread's session started"),
+            None => {
+                warn!("a prompt arrived before the thread's session started");
+                let view = self.view.borrow().as_ref().and_then(|v| v.upgrade());
+                if let Some(view) = view {
+                    view.apply(&Envelope::new(Event::Error {
+                        message: format!(
+                            "{} is not running for this thread yet, so the message was not sent.",
+                            driver_label(self.driver)
+                        ),
+                    }));
+                }
+            }
         }
     }
     fn interrupt(&self) {
@@ -326,6 +343,19 @@ fn live_model(
     )
 }
 
+/// What starting a built thread's session needs.
+struct StartJob {
+    thread: String,
+    driver: Driver,
+    dir: String,
+    profile: Profile,
+    resolved: ResolvedAgent,
+    /// The active provider thread (its native session id and model), to resume.
+    provider: Option<agent_kit::store::ProviderThread>,
+    /// agy's hook verdict (always `Ok` for the others).
+    hook: Result<(), String>,
+}
+
 /// What a thread page needs from the store to be built, read in one off-thread job.
 #[derive(Default)]
 struct LoadedThread {
@@ -334,8 +364,8 @@ struct LoadedThread {
     provider: Option<agent_kit::store::ProviderThread>,
 }
 
-fn load_thread(store: &Store, thread: &str) -> LoadedThread {
-    let provider = store
+fn load_provider(store: &Store, thread: &str) -> Option<agent_kit::store::ProviderThread> {
+    store
         .active_provider_thread(thread)
         .ok()
         .flatten()
@@ -345,10 +375,50 @@ fn load_thread(store: &Store, thread: &str) -> LoadedThread {
                 .ok()?
                 .into_iter()
                 .find(|p| p.id == id)
-        });
+        })
+}
+
+fn load_thread(store: &Store, thread: &str) -> LoadedThread {
     LoadedThread {
         history: read_history(store, thread),
-        provider,
+        provider: load_provider(store, thread),
+    }
+}
+
+/// How long a session start waits for its agent's model list to be fetched in this run, so a
+/// model the agent retired is ported before it reaches argv. A slow probe does not hold a thread
+/// hostage: after this it starts, and the later `set_retired` path still catches the model.
+const CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Polls `done` every `step` until it holds or `limit` passes; whether it held.
+async fn wait_until(
+    limit: std::time::Duration,
+    step: std::time::Duration,
+    done: impl Fn() -> bool,
+) -> bool {
+    let started = std::time::Instant::now();
+    while !done() {
+        if started.elapsed() >= limit {
+            return false;
+        }
+        glib::timeout_future(step).await;
+    }
+    true
+}
+
+/// Waits (at most [`CATALOG_WAIT`]) for `driver`'s model list to be fresh.
+async fn wait_for_fresh_catalog(driver: Driver) {
+    let catalog = ModelCatalog::shared();
+    let fresh = wait_until(CATALOG_WAIT, std::time::Duration::from_millis(100), || {
+        catalog.is_fresh(driver)
+    })
+    .await;
+    if !fresh {
+        info!(
+            "{} model list not fresh after {:?}; starting on the stored model",
+            driver_label(driver),
+            CATALOG_WAIT
+        );
     }
 }
 
@@ -492,8 +562,28 @@ fn now_ms() -> i64 {
 }
 
 /// Builds the adapter, its approval socket and environment for `driver` from the config, using
-/// the cached resolution (a switch cannot wait). Not resolved yet: the command name is tried.
-fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
+/// the cached resolution (a switch cannot wait). An agent that is not Ready (missing, switched
+/// off, still being detected) or has no resolved binary is refused with the reason: nothing is
+/// ever spawned from a guessed command name.
+fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, String> {
+    agent_launch_with(
+        &AgentAvailability::shared().get(driver),
+        driver,
+        thread,
+        cwd,
+    )
+}
+
+/// [`agent_launch`] against an explicit availability.
+fn agent_launch_with(
+    state: &Availability,
+    driver: Driver,
+    thread: &str,
+    cwd: &str,
+) -> Result<AgentLaunch, String> {
+    if !state.is_ready() {
+        return Err(not_ready_reason(driver, state));
+    }
     let config = SharedConfig::default();
     let (profile, clear) = {
         let c = config.borrow();
@@ -505,10 +595,9 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
         )
     };
     let resolved = cached_agent(&profile).unwrap_or_default();
-    let program = resolved
-        .program
-        .clone()
-        .unwrap_or_else(|| profile.command.clone());
+    let Some(program) = resolved.program.clone() else {
+        return Err(not_ready_reason(driver, &Availability::Missing));
+    };
     let adapter = make_adapter(driver, &program);
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
@@ -520,7 +609,7 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
             profile.default_mode.unwrap_or_default(),
         ),
     };
-    AgentLaunch {
+    Ok(AgentLaunch {
         adapter,
         program,
         extra_args: profile.args.clone(),
@@ -531,7 +620,17 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
             unset: unset_list(&clear),
         },
         approval,
-    }
+    })
+}
+
+/// Why `driver` cannot be started in `state`, as the thread says it.
+fn not_ready_reason(driver: Driver, state: &Availability) -> String {
+    let why = match state {
+        Availability::Disabled => "is switched off",
+        Availability::Detecting => "is still being detected",
+        Availability::Missing | Availability::Ready(_) => "is not available",
+    };
+    format!("{} {why}.", driver_label(driver))
 }
 
 /// The adapter for `driver`. Codex reports this app's version in `initialize`'s `clientInfo`.
@@ -1491,6 +1590,7 @@ impl AgentTerminalWindow {
 
         let slot = Rc::new(SessionSlot {
             session: RefCell::new(None),
+            view: RefCell::new(None),
             driver,
             model: None,
             mode,
@@ -1542,6 +1642,7 @@ impl AgentTerminalWindow {
                 pending_effort: None,
                 pending_switch: None,
                 unavailable: false,
+                starting: false,
             }),
         });
         if diff_panel.root.is_visible() {
@@ -1599,6 +1700,11 @@ impl AgentTerminalWindow {
                     Driver::Agy => check_hook().await,
                     Driver::Claude | Driver::Codex => Ok(()),
                 };
+                // A session that will start now waits (briefly) for a fresh model list, so a
+                // retired model is ported before it reaches argv.
+                if AgentAvailability::shared().is_ready(driver) {
+                    wait_for_fresh_catalog(driver).await;
+                }
                 obj.imp().build_thread(
                     &page,
                     BuildJob {
@@ -1625,7 +1731,6 @@ impl AgentTerminalWindow {
             loaded,
             hook,
         } = job;
-        let (thread, dir, profile) = (thread.as_str(), dir.as_str(), &profile);
         let Some((slot, holder)) = self.tabs.borrow().iter().find_map(|t| {
             (&t.page == page)
                 .then(|| t.chat.as_ref().map(|c| (c.slot.clone(), c.holder.clone())))
@@ -1633,10 +1738,10 @@ impl AgentTerminalWindow {
         }) else {
             return; // closed while resolving
         };
-        let store = app_store();
         let history = loaded.history;
 
-        // The view first, so no envelope of the session's start is lost.
+        // The view first, so no envelope of the session's start is lost. It is built from the
+        // store whatever the agent's state: history is readable without the agent.
         let backend: Rc<dyn ChatBackend> = slot.clone();
         let view = ChatView::new(backend);
         view.set_vexpand(true);
@@ -1644,6 +1749,89 @@ impl AgentTerminalWindow {
         view.set_account_status(AccountStatus::shared());
         view.replay(&history);
         holder.append(&view);
+        *slot.view.borrow_mut() = Some(view.downgrade());
+
+        let weak_obj = self.obj().downgrade();
+        let thread_id = thread.clone();
+        view.connect_action(move |action| {
+            if let Some(obj) = weak_obj.upgrade() {
+                obj.imp().view_action(&thread_id, action);
+            }
+        });
+        if let Some(chat) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .and_then(|t| t.chat.as_mut())
+        {
+            chat.view = Some(view.clone());
+            chat.building = false;
+        }
+
+        // No session unless the agent is Ready (found and switched on): a missing or disabled
+        // agent is never spawned from its command name. The banner says so and offers to continue
+        // elsewhere; the session starts by itself if the agent becomes Ready while this thread
+        // is open (`start_pending_sessions`).
+        let ready = AgentAvailability::shared().is_ready(driver) && resolved.program.is_some();
+        if ready {
+            self.start_session(
+                page,
+                StartJob {
+                    thread,
+                    driver,
+                    dir,
+                    profile,
+                    resolved,
+                    provider: loaded.provider,
+                    hook,
+                },
+            );
+        } else {
+            info!(
+                "Thread {thread} opened without a session: {} is not ready",
+                driver_label(driver)
+            );
+            self.update_unavailable_banners();
+            if self
+                .tab_view
+                .borrow()
+                .as_ref()
+                .and_then(|v| v.selected_page())
+                .as_ref()
+                == Some(page)
+            {
+                view.focus_composer();
+            }
+        }
+    }
+
+    /// Starts the session of a thread whose view is built, and applies what was waiting for it.
+    fn start_session(&self, page: &adw::TabPage, job: StartJob) {
+        let StartJob {
+            thread,
+            driver,
+            dir,
+            profile,
+            resolved,
+            provider,
+            hook,
+        } = job;
+        let (thread, dir, profile) = (thread.as_str(), dir.as_str(), &profile);
+        let Some((slot, view)) = self.tabs.borrow_mut().iter_mut().find_map(|t| {
+            (&t.page == page).then(|| {
+                t.chat.as_mut().and_then(|c| {
+                    c.starting = false;
+                    Some((c.slot.clone(), c.view.clone()?))
+                })
+            })?
+        }) else {
+            return; // closed while resolving
+        };
+        if slot.get().is_some() {
+            return; // already running
+        }
+        let store = app_store();
 
         let thread_id = thread.to_owned();
         let view_sink = view.sink();
@@ -1658,7 +1846,6 @@ impl AgentTerminalWindow {
         });
 
         // Resume the active provider thread's native session, on its model.
-        let provider = loaded.provider;
         let resume = provider.as_ref().and_then(|p| p.native_id.clone());
         // An effort chosen for this thread (continued in another agent) beats the profile's.
         let effort = self
@@ -1732,14 +1919,6 @@ impl AgentTerminalWindow {
             }
         }
 
-        let weak_obj = self.obj().downgrade();
-        let thread_id = thread.to_owned();
-        view.connect_action(move |action| {
-            if let Some(obj) = weak_obj.upgrade() {
-                obj.imp().view_action(&thread_id, action);
-            }
-        });
-
         let (prompt, handoff, switch) = {
             let mut tabs = self.tabs.borrow_mut();
             let chat = tabs
@@ -1747,15 +1926,11 @@ impl AgentTerminalWindow {
                 .find(|t| &t.page == page)
                 .and_then(|t| t.chat.as_mut());
             match chat {
-                Some(chat) => {
-                    chat.view = Some(view.clone());
-                    chat.building = false;
-                    (
-                        chat.pending_prompt.take(),
-                        chat.pending_handoff.take(),
-                        chat.pending_switch.take(),
-                    )
-                }
+                Some(chat) => (
+                    chat.pending_prompt.take(),
+                    chat.pending_handoff.take(),
+                    chat.pending_switch.take(),
+                ),
                 None => (None, None, None),
             }
         };
@@ -2439,7 +2614,9 @@ impl AgentTerminalWindow {
                 ));
                 availability.set(driver, classify(false, Some(resolved.program.as_deref())));
             }
-            // Only what is Ready is probed: a missing or switched-off binary is never spawned.
+            // Only what is Ready is probed. The same gate holds for a thread's session
+            // (`build_thread`, `start_session`) and a cross-agent switch (`agent_launch`): a
+            // missing, switched-off or still-detecting agent is never spawned.
             let targets = probe_targets(&availability.all(), |d| {
                 envs.iter()
                     .find(|(driver, _)| *driver == d)
@@ -2482,6 +2659,7 @@ impl AgentTerminalWindow {
         // The picker hides agents that are not ready; an open one redraws.
         ModelCatalog::shared().notify();
         self.update_unavailable_banners();
+        self.start_pending_sessions();
         self.evaluate_models();
         // A "new thread" asked for while the agents were still being detected.
         if !AgentAvailability::shared().any_detecting() {
@@ -2574,6 +2752,86 @@ impl AgentTerminalWindow {
             }
         }
     }
+
+    /// Starts the session of every open thread that was built without one because its agent was
+    /// not Ready and now is. Each start re-resolves the agent and reads the hook verdict and the
+    /// provider thread off the main thread, then waits briefly for a fresh model list, exactly
+    /// like a first build.
+    fn start_pending_sessions(&self) {
+        let availability = AgentAvailability::shared();
+        let waiting: Vec<(adw::TabPage, String, Driver, String)> = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| {
+                let chat = t.chat.as_mut()?;
+                let driver = chat.slot.driver();
+                if chat.view.is_none()
+                    || chat.starting
+                    || chat.slot.get().is_some()
+                    || !availability.is_ready(driver)
+                {
+                    return None;
+                }
+                chat.starting = true;
+                Some((t.page.clone(), chat.thread.clone(), driver, t.dir.clone()))
+            })
+            .collect();
+        for (page, thread, driver, dir) in waiting {
+            let profile = self
+                .config
+                .borrow()
+                .agent_profile(driver)
+                .cloned()
+                .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+            let obj = self.obj().downgrade();
+            glib::MainContext::default().spawn_local(async move {
+                let resolved = resolve_agent(profile.clone()).await;
+                let provider = store_job({
+                    let thread = thread.clone();
+                    move |store| load_provider(store, &thread)
+                })
+                .await
+                .unwrap_or_default();
+                let hook = match driver {
+                    Driver::Agy => check_hook().await,
+                    Driver::Claude | Driver::Codex => Ok(()),
+                };
+                if AgentAvailability::shared().is_ready(driver) {
+                    wait_for_fresh_catalog(driver).await;
+                }
+                let Some(obj) = obj.upgrade() else { return };
+                let ready =
+                    AgentAvailability::shared().is_ready(driver) && resolved.program.is_some();
+                if !ready {
+                    // Gone again while resolving: wait for the next change.
+                    if let Some(chat) = obj
+                        .imp()
+                        .tabs
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|t| t.page == page)
+                        .and_then(|t| t.chat.as_mut())
+                    {
+                        chat.starting = false;
+                    }
+                    return;
+                }
+                obj.imp().start_session(
+                    &page,
+                    StartJob {
+                        thread,
+                        driver,
+                        dir,
+                        profile,
+                        resolved,
+                        provider,
+                        hook,
+                    },
+                );
+            });
+        }
+    }
 }
 
 /// Forgets resolutions that found nothing or whose binary is gone, so the next scan looks again
@@ -2626,6 +2884,39 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_that_is_not_ready_is_never_launched() {
+        for (state, text) in [
+            (Availability::Missing, "Claude is not available."),
+            (Availability::Disabled, "Claude is switched off."),
+            (Availability::Detecting, "Claude is still being detected."),
+        ] {
+            let refused = agent_launch_with(&state, Driver::Claude, "t", "/w");
+            assert_eq!(refused.err().as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn the_catalogue_wait_ends_at_the_limit_or_as_soon_as_the_list_is_fresh() {
+        use std::time::Duration;
+        let ctx = glib::MainContext::new();
+        let step = Duration::from_millis(5);
+        // Never fresh: gives up at the limit (and does not hang).
+        let started = std::time::Instant::now();
+        let fresh = ctx.block_on(wait_until(Duration::from_millis(40), step, || false));
+        assert!(!fresh);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Fresh after a few polls: returns true well before the limit.
+        let polls = std::cell::Cell::new(0);
+        let fresh = ctx.block_on(wait_until(Duration::from_secs(5), step, || {
+            polls.set(polls.get() + 1);
+            polls.get() > 3
+        }));
+        assert!(fresh);
+        // Already fresh: no waiting at all.
+        assert!(ctx.block_on(wait_until(Duration::ZERO, step, || true)));
+    }
+
+    #[test]
     fn unset_list_always_drops_an_inherited_approval_socket() {
         let names = unset_list(&[]);
         assert!(names.iter().any(|n| n == agent_core::approval::ENV_SOCKET));
@@ -2638,6 +2929,7 @@ mod tests {
     fn an_unstarted_slot_reports_its_thread_agent() {
         let slot = SessionSlot {
             session: RefCell::new(None),
+            view: RefCell::new(None),
             driver: Driver::Agy,
             model: Some("gemini".into()),
             mode: Mode::Plan,
@@ -2648,6 +2940,7 @@ mod tests {
         assert_eq!(slot.control(Control::Usage), "ctl-unstarted");
         let codex = SessionSlot {
             session: RefCell::new(None),
+            view: RefCell::new(None),
             driver: Driver::Codex,
             model: None,
             mode: Mode::Ask,
