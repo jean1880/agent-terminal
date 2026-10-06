@@ -15,7 +15,6 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use agent_core::approval::{self, HookInput};
-use agent_core::event::Decision;
 
 /// How long the hook waits for the app's reply: just under the hook's configured 600 s.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(590);
@@ -87,16 +86,11 @@ pub fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Whether a decision lets the call run (for tests and callers that only need the verdict).
-#[allow(dead_code)]
-pub fn allows(decision: Decision) -> bool {
-    matches!(decision, Decision::Allow | Decision::AllowForSession)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_core::approval::{ApprovalQuery, ApprovalReply};
+    use agent_core::event::Decision;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
     use std::thread;

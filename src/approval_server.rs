@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_core::adapter::Mode;
@@ -71,7 +72,6 @@ fn classify(tool: &str) -> ToolClass {
     match tool {
         "view_file" | "list_dir" | "grep_search" | "find_by_name" | "codebase_search"
         | "view_code_item" | "read_resource" | "list_resources" => ToolClass::ReadOnly,
-        t if t.starts_with("get_") => ToolClass::ReadOnly,
         "replace_file_content"
         | "multi_replace_file_content"
         | "write_to_file"
@@ -95,57 +95,64 @@ fn mutates(tool: &str) -> bool {
     ) || classify(tool) == ToolClass::Edit
 }
 
-/// The file an edit tool targets, from the argument names agy uses.
-fn edit_target(args: &Value) -> Option<&str> {
-    ["TargetFile", "AbsolutePath", "FilePath", "Path"]
+const TARGET_KEYS: [&str; 4] = ["TargetFile", "AbsolutePath", "FilePath", "Path"];
+
+/// Every file an edit tool names, from the argument names agy uses. A payload with several
+/// of them is judged on all of them.
+fn edit_targets(args: &Value) -> Vec<&str> {
+    TARGET_KEYS
         .iter()
-        .find_map(|k| args.get(*k).and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
+        .filter_map(|k| args.get(*k).and_then(Value::as_str))
+        .collect()
 }
 
-/// Lexically resolves `.` and `..` (no filesystem access).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+fn has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| c == Component::ParentDir)
 }
 
-/// Resolves symlinks in the longest existing ancestor, so a link out of the workspace is seen.
-fn resolve(path: &Path) -> PathBuf {
-    let path = normalize(path);
-    let mut tail = Vec::new();
-    let mut base = path.as_path();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(base) {
-            let mut real = real;
-            real.extend(tail.iter().rev());
-            return real;
-        }
-        match (base.parent(), base.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_owned());
-                base = parent;
-            }
-            _ => return path,
-        }
-    }
-}
-
-fn inside_workspace(target: &str, workspaces: &[PathBuf]) -> bool {
-    let target = Path::new(target);
-    if !target.is_absolute() {
+/// Whether `target` is inside `workspace` with no symlink on the way.
+///
+/// The target must be absolute and contain no `..` (a link followed by `..` escapes in ways a
+/// lexical check cannot see). Starting from the workspace root (itself resolved: the user may
+/// open a symlinked project path), every component below it that exists is looked at with
+/// `symlink_metadata`, and any symlink, including a dangling leaf, means "not inside". Components
+/// that do not exist yet are fine: that is a file about to be created.
+fn contained(target: &Path, workspace: &Path) -> bool {
+    if !target.is_absolute() || has_parent_dir(target) {
         return false;
     }
-    let target = resolve(target);
-    workspaces.iter().any(|w| target.starts_with(resolve(w)))
+    let Ok(root) = std::fs::canonicalize(workspace) else {
+        return false;
+    };
+    let Ok(relative) = target
+        .strip_prefix(workspace)
+        .or_else(|_| target.strip_prefix(&root))
+    else {
+        return false;
+    };
+    let mut current = root;
+    for part in relative.components() {
+        match part {
+            Component::Normal(name) => current.push(name),
+            Component::CurDir => continue,
+            _ => return false,
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Every named target is inside one workspace root (and there is at least one).
+fn inside_workspace(targets: &[&str], workspaces: &[PathBuf]) -> bool {
+    !targets.is_empty()
+        && targets
+            .iter()
+            .all(|t| workspaces.iter().any(|w| contained(Path::new(t), w)))
 }
 
 /// The policy table. `workspaces` are the session's workspace roots.
@@ -161,7 +168,7 @@ pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verd
         (ToolClass::ReadOnly, _) => Verdict::Allow,
         (_, Mode::Plan) if mutates(&query.tool) => Verdict::Deny("plan mode is read-only"),
         (ToolClass::Edit, Mode::AcceptEdits)
-            if edit_target(&query.args).is_some_and(|t| inside_workspace(t, workspaces)) =>
+            if inside_workspace(&edit_targets(&query.args), workspaces) =>
         {
             Verdict::Allow
         }
@@ -169,23 +176,100 @@ pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verd
     }
 }
 
-/// What "allow for the session" remembers: the tool and, for commands, the first two words.
-/// A command with shell chaining or substitution is never remembered: its prefix does not bound
-/// what runs. Ceiling: `git status` allows `git status --anything`; upgrade path is per-flag rules.
-pub fn session_key(query: &ApprovalQuery) -> Option<(String, String)> {
-    let command = query.args.get("CommandLine").and_then(Value::as_str);
-    let Some(command) = command else {
-        return Some((query.tool.clone(), String::new()));
+/// First words that run something else, so the line says nothing about what executes.
+const WRAPPERS: &[&str] = &[
+    "node", "nodejs", "ruby", "perl", "php", "lua", "deno", "bun", "npx", "bash", "sh", "zsh",
+    "dash", "ksh", "fish", "csh", "tcsh", "env", "sudo", "doas", "su", "xargs", "eval", "exec",
+    "nohup", "timeout", "watch", "command", "busybox", "nice", "ionice", "time", "setsid",
+    "stdbuf", "strace", "ssh", "awk", "gawk",
+];
+
+fn is_wrapper(word: &str) -> bool {
+    let name = word.rsplit('/').next().unwrap_or(word);
+    name.starts_with("python") || WRAPPERS.contains(&name)
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// A command line safe to remember verbatim: no shell syntax that runs or redirects something
+/// else, no leading `NAME=value`, no interpreter or wrapper, no `find -exec/-delete`.
+fn rememberable_command(command: &str) -> bool {
+    const SHELL_SYNTAX: &[&str] = &[";", "&", "|", "`", "$", ">", "<", "\n", "\r"];
+    if SHELL_SYNTAX.iter().any(|c| command.contains(c)) {
+        return false;
+    }
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
     };
-    const CHAINING: &[&str] = &[";", "&", "|", "`", "$(", ">", "<", "\n", "\r"];
-    if CHAINING.iter().any(|c| command.contains(c)) {
-        return None;
+    if is_assignment(first) || is_wrapper(first) {
+        return false;
     }
-    let prefix: Vec<&str> = command.split_whitespace().take(2).collect();
-    if prefix.is_empty() {
-        return None;
+    let find = first.rsplit('/').next() == Some("find");
+    !(find && words.any(|w| matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete")))
+}
+
+/// What "allow for the session" remembers, and only ever an exact match:
+/// - `run_command`: the full `CommandLine` (never a prefix) when [`rememberable_command`];
+/// - `call_mcp_tool`: the server and tool name;
+/// - file edits: the exact target path (absolute, no `..`, symlinks resolved);
+/// - everything else (subagents, network, unknown tools, `send_command_input`): never.
+pub fn session_key(query: &ApprovalQuery) -> Option<(String, String)> {
+    let text = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| query.args.get(*k).and_then(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+    };
+    let detail = match query.tool.as_str() {
+        "run_command" => {
+            let command = query.args.get("CommandLine").and_then(Value::as_str)?;
+            rememberable_command(command).then(|| command.to_owned())?
+        }
+        "call_mcp_tool" => {
+            let server = text(&["ServerName", "server_name", "server", "Server"])?;
+            let tool = text(&["ToolName", "tool_name", "tool", "Name"])?;
+            format!("{server}/{tool}")
+        }
+        tool if classify(tool) == ToolClass::Edit => {
+            let targets = edit_targets(&query.args);
+            let [target] = targets.as_slice() else {
+                return None;
+            };
+            let path = Path::new(target);
+            if !path.is_absolute() || has_parent_dir(path) {
+                return None;
+            }
+            resolve(path).to_string_lossy().into_owned()
+        }
+        _ => return None,
+    };
+    Some((query.tool.clone(), detail))
+}
+
+/// Resolves symlinks in the longest existing ancestor of an absolute, `..`-free path.
+fn resolve(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            let mut real = real;
+            real.extend(tail.iter().rev());
+            return real;
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                base = parent;
+            }
+            _ => return path.to_owned(),
+        }
     }
-    Some((query.tool.clone(), prefix.join(" ")))
 }
 
 /// `$XDG_RUNTIME_DIR/agent-terminal`; takes the value so tests never read the real environment.
@@ -214,11 +298,18 @@ struct ServerInner {
     mode: Cell<Mode>,
     workspaces: Vec<PathBuf>,
     deadline: Duration,
+    /// Queries received and not yet matched to a tool step by the session's canary.
+    queries: RefCell<HashMap<String, u32>>,
 }
 
 impl Drop for ServerInner {
     fn drop(&mut self) {
         self.listener.close();
+        // Nobody is left to answer: deny what is waiting rather than leave a hook hanging.
+        let waiting: Vec<Pending> = self.pending.get_mut().drain().map(|(_, p)| p).collect();
+        for pending in waiting {
+            deny(pending.conn, "agent-terminal session closed");
+        }
         if let Err(e) = std::fs::remove_file(&self.path) {
             debug!(error = %e, "approval socket already gone");
         }
@@ -249,9 +340,32 @@ impl ApprovalHandle {
         mode: Mode,
         deadline: Duration,
     ) -> Result<Self, String> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let hook_bin = std::env::current_exe()
             .map_err(|e| format!("cannot resolve the running binary: {e}"))?;
+        Self::bind_with(dir, thread, workspace, mode, deadline, hook_bin)
+    }
+
+    /// [`Self::bind`] with the hook binary given (tests; `bind` passes `current_exe()`).
+    ///
+    /// Refused, so the caller runs agy read-only: a workspace that is empty, relative or `/`
+    /// (it would make every edit "inside"); a hook binary whose path ends in ` (deleted)` (the
+    /// package was upgraded under the running app, and the hook entry would exec a stale or
+    /// missing file).
+    pub fn bind_with(
+        dir: &Path,
+        thread: &str,
+        workspace: &Path,
+        mode: Mode,
+        deadline: Duration,
+        hook_bin: PathBuf,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if hook_bin.to_string_lossy().ends_with(" (deleted)") {
+            return Err("the running binary was replaced on disk; restart agent-terminal".into());
+        }
+        if !workspace.is_absolute() || workspace.parent().is_none() {
+            return Err("the workspace is not a usable directory".to_owned());
+        }
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -259,7 +373,24 @@ impl ApprovalHandle {
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("cannot secure {}: {e}", dir.display()))?;
-        let path = dir.join(format!("approval-{}-{thread}.sock", std::process::id()));
+        // Unique per bind (a counter), and the thread id is untrusted text in a path: keep
+        // alphanumerics, `-` and `_`, and a bounded length.
+        static BINDS: AtomicU64 = AtomicU64::new(0);
+        let label: String = thread
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(16)
+            .collect();
+        let label = if label.is_empty() {
+            "t".to_owned()
+        } else {
+            label
+        };
+        let path = dir.join(format!(
+            "approval-{}-{}-{label}.sock",
+            std::process::id(),
+            BINDS.fetch_add(1, Ordering::Relaxed)
+        ));
         if path.as_os_str().len() > MAX_SOCKET_PATH {
             return Err("approval socket path is too long".to_owned());
         }
@@ -284,6 +415,7 @@ impl ApprovalHandle {
             mode: Cell::new(mode),
             workspaces: vec![workspace.to_owned()],
             deadline,
+            queries: RefCell::new(HashMap::new()),
         });
         // From here `Drop` removes the file, including on the early return below.
         std::fs::set_permissions(&inner.path, std::fs::Permissions::from_mode(0o600))
@@ -320,6 +452,31 @@ impl ApprovalHandle {
     /// The session's current mode (it changes what is asked).
     pub fn set_mode(&self, mode: Mode) {
         self.inner.mode.set(mode);
+    }
+
+    /// Uses up one recorded hook query for any of `tools`. The session calls this when a tool
+    /// step starts: no query means agy ran the tool without asking us (the hook is not active).
+    pub fn consume_query(&self, tools: &[&str]) -> bool {
+        let mut queries = self.inner.queries.borrow_mut();
+        for tool in tools {
+            if let Some(n) = queries.get_mut(*tool).filter(|n| **n > 0) {
+                *n -= 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`Self::bind_default`] after proving agy's hooks file installs the approval hook
+    /// (`home` is `$HOME`). `Err` means: run agy read-only.
+    pub fn bind_checked(
+        home: Option<&str>,
+        thread: &str,
+        workspace: &Path,
+        mode: Mode,
+    ) -> Result<Self, String> {
+        crate::hook_config::check_installed(home)?;
+        Self::bind_default(thread, workspace, mode)
     }
 
     pub fn has_pending(&self, request: &str) -> bool {
@@ -378,14 +535,26 @@ fn spawn_accept_loop(weak: Weak<ServerInner>, listener: gio::SocketListener) {
             match listener.accept_future().await {
                 Ok((conn, _)) => {
                     if weak.strong_count() == 0 {
+                        deny(conn, "agent-terminal session closed");
                         break;
                     }
                     glib::spawn_future_local(serve(weak.clone(), conn));
                 }
-                Err(e) => {
-                    // Closed on drop; anything else is logged once and ends the loop.
-                    debug!(error = %e.message(), "approval accept loop ended");
+                Err(e)
+                    if e.matches(gio::IOErrorEnum::Closed)
+                        || e.matches(gio::IOErrorEnum::Cancelled) =>
+                {
+                    debug!("approval accept loop ended");
                     break;
+                }
+                Err(e) => {
+                    // A transient failure (a client that vanished mid-accept, fd pressure)
+                    // must not leave the gate deaf: log and keep listening.
+                    warn!(error = %e.message(), "approval accept failed; continuing");
+                    glib::timeout_future(Duration::from_millis(100)).await;
+                    if weak.strong_count() == 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -436,6 +605,11 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         _ => return deny(conn, "malformed approval request"),
     };
 
+    *inner
+        .queries
+        .borrow_mut()
+        .entry(query.tool.clone())
+        .or_insert(0) += 1;
     match policy(inner.mode.get(), &query, &inner.workspaces) {
         Verdict::Allow => {
             return reply(
@@ -558,7 +732,6 @@ mod tests {
             "view_code_item",
             "read_resource",
             "list_resources",
-            "get_something",
         ] {
             for mode in [plan, ask, acc] {
                 assert_eq!(policy(mode, &q(tool, Value::Null), &w), Allow, "{tool}");
@@ -587,7 +760,9 @@ mod tests {
             }
         }
         // Unknown tools always ask, in every mode.
+        // No prefix rule: a `get_*` name is not read-only because of how it starts.
         for mode in [plan, ask, acc] {
+            assert_eq!(policy(mode, &q("get_secrets", Value::Null), &w), Ask);
             assert_eq!(policy(mode, &q("brand_new_tool", Value::Null), &w), Ask);
             assert_eq!(policy(mode, &q("", Value::Null), &w), Ask);
         }
@@ -596,7 +771,11 @@ mod tests {
     #[test]
     fn accept_edits_allows_only_edits_inside_the_workspace() {
         use Verdict::{Allow, Ask};
-        let w = ws();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("mk");
+        let w = vec![repo.clone()];
+        let at = |rel: &str| repo.join(rel).to_string_lossy().into_owned();
         let acc = Mode::AcceptEdits;
         for tool in [
             "write_to_file",
@@ -605,21 +784,18 @@ mod tests {
             "sed_file",
             "notebook_edit",
         ] {
-            assert_eq!(policy(acc, &edit(tool, "/work/repo/src/a.rs"), &w), Allow);
-            assert_eq!(
-                policy(acc, &edit(tool, "/work/repo/new/dir/b.rs"), &w),
-                Allow
-            );
-            assert_eq!(
-                policy(acc, &edit(tool, "/work/repo/../etc/passwd"), &w),
-                Ask
-            );
-            assert_eq!(policy(acc, &edit(tool, "/work/repository/x"), &w), Ask);
+            assert_eq!(policy(acc, &edit(tool, &at("src/a.rs")), &w), Allow);
+            assert_eq!(policy(acc, &edit(tool, &at("new/dir/b.rs")), &w), Allow);
+            assert_eq!(policy(acc, &edit(tool, &at("../etc/passwd")), &w), Ask);
+            assert_eq!(policy(acc, &edit(tool, &at("src/../a.rs")), &w), Ask);
+            let sibling = format!("{}ository/x", repo.display());
+            assert_eq!(policy(acc, &edit(tool, &sibling), &w), Ask);
             assert_eq!(policy(acc, &edit(tool, "/etc/passwd"), &w), Ask);
             assert_eq!(policy(acc, &edit(tool, "relative.rs"), &w), Ask);
             assert_eq!(policy(acc, &q(tool, Value::Null), &w), Ask, "no target");
         }
         // Commands, network, MCP and subagents still ask.
+        let w = ws();
         assert_eq!(policy(acc, &cmd("ls"), &w), Ask);
         assert_eq!(policy(acc, &q("call_mcp_tool", Value::Null), &w), Ask);
         assert_eq!(policy(acc, &q("invoke_subagent", Value::Null), &w), Ask);
@@ -644,32 +820,143 @@ mod tests {
             policy(Mode::AcceptEdits, &target(work.join("link/evil.rs")), &w),
             Verdict::Ask
         );
+        // A link followed by `..` is refused outright, not resolved.
+        let dotdot = format!("{}/link/../ok.rs", work.display());
+        assert_eq!(
+            policy(Mode::AcceptEdits, &edit("write_to_file", &dotdot), &w),
+            Verdict::Ask
+        );
+        // The link itself, and a dangling one: both are symlinks, so not inside.
+        assert_eq!(
+            policy(Mode::AcceptEdits, &target(work.join("link")), &w),
+            Verdict::Ask
+        );
+        std::os::unix::fs::symlink(outside.join("nope"), work.join("dangling")).expect("link");
+        assert_eq!(
+            policy(Mode::AcceptEdits, &target(work.join("dangling")), &w),
+            Verdict::Ask
+        );
+        // A symlinked workspace root is resolved once and trusted (the user opened it).
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&work, &alias).expect("link");
+        assert_eq!(
+            policy(
+                Mode::AcceptEdits,
+                &target(alias.join("fine.rs")),
+                std::slice::from_ref(&alias)
+            ),
+            Verdict::Allow
+        );
+        // Several path keys: ALL must be inside.
+        let both = |second: String| {
+            q(
+                "write_to_file",
+                serde_json::json!({
+                    "TargetFile": work.join("a.rs").to_string_lossy(),
+                    "AbsolutePath": second,
+                }),
+            )
+        };
+        let inside = work.join("b.rs").to_string_lossy().into_owned();
+        assert_eq!(policy(Mode::AcceptEdits, &both(inside), &w), Verdict::Allow);
+        assert_eq!(
+            policy(Mode::AcceptEdits, &both("/etc/passwd".into()), &w),
+            Verdict::Ask
+        );
     }
 
     #[test]
-    fn session_keys_bound_what_is_remembered() {
+    fn session_keys_are_exact_and_refuse_wrappers() {
         let key = |l: &str| session_key(&cmd(l));
+        // Exact full command line, never a prefix.
         assert_eq!(
             key("git status --short"),
-            Some(("run_command".into(), "git status".into()))
+            Some(("run_command".into(), "git status --short".into()))
         );
-        assert_eq!(key("ls"), Some(("run_command".into(), "ls".into())));
-        for chained in [
+        assert_ne!(key("git status --short"), key("git status"));
+        for refused in [
             "git status; rm -rf x",
             "a && b",
             "a | b",
             "echo `id`",
             "echo $(id)",
+            "echo $HOME",
             "cat x > y",
             "a\nb",
             "   ",
+            "python -c x",
+            "python3.12 script.py",
+            "/usr/bin/python3 -c x",
+            "node -e x",
+            "bash -c ls",
+            "sh run.sh",
+            "env FOO=1 ls",
+            "sudo ls",
+            "xargs rm",
+            "nohup ls",
+            "timeout 5 ls",
+            "watch ls",
+            "eval ls",
+            "FOO=1 ls",
+            "find . -name x -exec rm {} +",
+            "find . -delete",
         ] {
-            assert_eq!(key(chained), None, "{chained}");
+            assert_eq!(key(refused), None, "{refused}");
         }
+        // Plain find is fine.
+        assert!(key("find . -name x").is_some());
+        // send_command_input, subagents, network and unknown tools are never remembered.
+        for tool in [
+            "send_command_input",
+            "start_subagent",
+            "invoke_subagent",
+            "search_web",
+            "read_url_content",
+            "mystery",
+        ] {
+            let args = serde_json::json!({"CommandLine": "ls", "TargetFile": "/x"});
+            assert_eq!(session_key(&q(tool, args)), None, "{tool}");
+        }
+    }
+
+    #[test]
+    fn mcp_keys_are_per_server_and_tool() {
+        let mcp = |server: &str, tool: &str| {
+            q(
+                "call_mcp_tool",
+                serde_json::json!({"ServerName": server, "ToolName": tool}),
+            )
+        };
+        let a = session_key(&mcp("fs", "read")).expect("key");
+        assert_eq!(a, ("call_mcp_tool".to_owned(), "fs/read".to_owned()));
+        assert_ne!(Some(a.clone()), session_key(&mcp("fs", "delete")));
+        assert_ne!(Some(a), session_key(&mcp("other", "read")));
         assert_eq!(
-            session_key(&edit("write_to_file", "/x")),
-            Some(("write_to_file".into(), String::new()))
+            session_key(&q("call_mcp_tool", serde_json::json!({}))),
+            None
         );
+    }
+
+    #[test]
+    fn edit_keys_are_the_exact_resolved_path() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = std::fs::canonicalize(tmp.path()).expect("canon");
+        let a = real.join("a.rs").to_string_lossy().into_owned();
+        let b = real.join("b.rs").to_string_lossy().into_owned();
+        let ka = session_key(&edit("write_to_file", &a)).expect("key a");
+        let kb = session_key(&edit("write_to_file", &b)).expect("key b");
+        assert_eq!(ka, ("write_to_file".to_owned(), a.clone()));
+        assert_ne!(ka, kb);
+        // The same file through a symlink is the same key; a different tool is another key.
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let via = link.join("a.rs").to_string_lossy().into_owned();
+        assert_eq!(session_key(&edit("write_to_file", &via)), Some(ka.clone()));
+        assert_ne!(session_key(&edit("sed_file", &a)), Some(ka));
+        // Relative and `..` paths are never remembered.
+        assert_eq!(session_key(&edit("write_to_file", "a.rs")), None);
+        let dotdot = format!("{}/x/../a.rs", real.display());
+        assert_eq!(session_key(&edit("write_to_file", &dotdot)), None);
     }
 
     #[test]
@@ -751,7 +1038,11 @@ mod tests {
             assert_eq!(mode(path.parent().expect("dir")), 0o700);
             assert_eq!(mode(&path), 0o600);
             let name = path.file_name().expect("n").to_string_lossy().into_owned();
-            assert_eq!(name, format!("approval-{}-t1.sock", std::process::id()));
+            assert!(
+                name.starts_with(&format!("approval-{}-", std::process::id()))
+                    && name.ends_with("-t1.sock"),
+                "{name}"
+            );
             let env = handle.env();
             assert_eq!(env[0].0, approval::ENV_SOCKET);
             assert_eq!(env[0].1, path.to_string_lossy());
@@ -786,13 +1077,18 @@ mod tests {
             assert!(!handle.respond("q1", Decision::Allow), "answered once");
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowForSession);
 
-            // The same command prefix is now allowed without a new card.
-            let rx = client(path.clone(), with_id(cmd("git status -b"), "q2"));
+            // The exact same command is now allowed without a new card.
+            let rx = client(path.clone(), with_id(cmd("git status --short"), "q2"));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
             assert_eq!(seen.borrow().len(), 1, "no second card");
+            // A longer variant of it is not: exact match only.
+            let rx = client(path.clone(), with_id(cmd("git status --short -b"), "q2b"));
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 2));
+            assert!(handle.respond("q2b", Decision::Deny));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
             // A different command still asks.
             let rx = client(path.clone(), with_id(cmd("git push"), "q3"));
-            assert!(pump_until(ctx, 10, || seen.borrow().len() == 2));
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 3));
             assert!(handle.respond("q3", Decision::Deny));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
 
@@ -861,6 +1157,82 @@ mod tests {
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
             assert_eq!(seen.borrow()[3].event, Event::ApprovalExpired);
+        });
+    }
+
+    #[test]
+    fn bind_refuses_a_deleted_binary_and_a_useless_workspace() {
+        in_loop(|_| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let dir = tmp.path().join("rt");
+            let bin = |s: &str| PathBuf::from(s);
+            let try_bind = |ws: &Path, hook: PathBuf| {
+                ApprovalHandle::bind_with(&dir, "t", ws, Mode::Ask, DEFAULT_DEADLINE, hook)
+            };
+            assert!(try_bind(tmp.path(), bin("/usr/bin/agent-terminal")).is_ok());
+            let deleted = try_bind(tmp.path(), bin("/usr/bin/agent-terminal (deleted)"));
+            assert!(deleted.is_err_and(|e| e.contains("replaced")));
+            for ws in ["", "/", "relative"] {
+                assert!(
+                    try_bind(Path::new(ws), bin("/usr/bin/agent-terminal")).is_err(),
+                    "{ws:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn socket_names_are_unique_and_sanitized() {
+        in_loop(|_| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let dir = tmp.path().join("rt");
+            let bind = |thread: &str| {
+                ApprovalHandle::bind(&dir, thread, tmp.path(), Mode::Ask, DEFAULT_DEADLINE)
+                    .expect("bind")
+            };
+            let a = bind("same");
+            let b = bind("same");
+            assert_ne!(a.socket_path(), b.socket_path());
+            let evil = bind("../../x/y z\n");
+            let name = evil
+                .socket_path()
+                .file_name()
+                .expect("n")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(evil.socket_path().parent(), a.socket_path().parent());
+            assert!(name.ends_with("-xyz.sock"), "{name}");
+            assert!(bind("")
+                .socket_path()
+                .to_string_lossy()
+                .ends_with("-t.sock"));
+        });
+    }
+
+    #[test]
+    fn dropping_the_server_denies_what_is_pending() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "z1"));
+            assert!(pump_until(ctx, 10, || request_id(&seen).is_some()));
+            drop(handle);
+            let r = wait_reply(ctx, &rx);
+            assert_eq!(r.decision, Decision::Deny);
+        });
+    }
+
+    #[test]
+    fn queries_are_recorded_for_the_canary_and_consumed_once() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, _) = bound(tmp.path(), Mode::Plan, DEFAULT_DEADLINE);
+            assert!(!handle.consume_query(&["run_command"]));
+            let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "k1"));
+            let _ = wait_reply(ctx, &rx); // denied by plan mode, but still recorded
+            assert!(!handle.consume_query(&["write_to_file"]), "other tool");
+            assert!(handle.consume_query(&["write_to_file", "run_command"]));
+            assert!(!handle.consume_query(&["run_command"]), "once only");
         });
     }
 

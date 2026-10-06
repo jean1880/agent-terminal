@@ -18,6 +18,8 @@ mod approval_server;
 #[allow(dead_code)] // Wired into the window in wave 3.
 mod chat;
 pub mod config;
+#[allow(dead_code)] // Wired into the window in wave 3.
+mod hook_config;
 #[cfg(test)]
 mod testutil;
 mod theme;
