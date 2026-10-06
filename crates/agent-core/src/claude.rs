@@ -647,17 +647,28 @@ impl ClaudeAdapter {
         out
     }
 
+    /// The CLI sends `rate_limit_event` every turn, mostly with `status: "allowed"`. Only a refusal
+    /// is a rate limit (it drives "Continue in …"); a warning is a notice; anything else is quiet.
     fn rate_limit(&mut self, v: &Value) -> Vec<Envelope> {
         let info = v.get("rate_limit_info").cloned();
+        let status = info
+            .as_ref()
+            .and_then(|i| str_of(i, "status"))
+            .unwrap_or("")
+            .to_owned();
         let resets_at = info
             .as_ref()
             .and_then(|i| i.get("resetsAt"))
             .and_then(Value::as_u64)
             .map(|s| s.to_string()); // epoch seconds; the UI formats it
-        vec![Envelope::new(Event::RateLimited {
-            resets_at,
-            detail: info,
-        })]
+        match status.as_str() {
+            "rejected" => vec![Envelope::new(Event::RateLimited {
+                resets_at,
+                detail: info,
+            })],
+            "allowed_warning" => notice("Approaching the usage limit.".to_owned()),
+            _ => Vec::new(),
+        }
     }
 
     fn result(&mut self, v: &Value) -> Vec<Envelope> {
@@ -1102,6 +1113,23 @@ fn questions_of(input: &Value) -> Vec<Question> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refused_rate_limit_is_reported() {
+        let frame = |status: &str| {
+            json!({"type": "rate_limit_event", "rate_limit_info": {"status": status, "resetsAt": 1_800_000_000u64}})
+                .to_string()
+        };
+        let mut a = ClaudeAdapter::new();
+        assert!(a.feed(&frame("allowed")).is_empty());
+        let warn = a.feed(&frame("allowed_warning"));
+        assert!(matches!(warn.as_slice(), [e] if matches!(e.event, Event::Notice { .. })));
+        let refused = a.feed(&frame("rejected"));
+        assert!(matches!(
+            refused.as_slice(),
+            [e] if matches!(&e.event, Event::RateLimited { resets_at: Some(r), .. } if r == "1800000000")
+        ));
+    }
 
     const APPROVAL: &str = include_str!("../tests/fixtures/claude-turn-approval.ndjson");
     const CONTROLS: &str = include_str!("../tests/fixtures/claude-controls-slash.ndjson");
