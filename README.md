@@ -208,6 +208,7 @@ left in place** so that reinstalling 1.x still finds its configuration.
 - **GTK 4.10+** (`libgtk-4-dev`)
 - **VTE 2.91 GTK4** (`libvte-2.91-gtk4-dev`)
 - **libadwaita 1.5+** (`libadwaita-1-dev`)
+- **glib-compile-resources** (`libglib2.0-dev-bin`), to bundle the icons at build time
 
 ## Quick Start ⚡
 

@@ -46,6 +46,11 @@ tracing-journald = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[build-dependencies]
+# Compiles assets/icons into a GResource (needs glib-compile-resources on PATH). 0.22 pairs
+# with gtk4 0.11's glib 0.22.
+glib-build-tools = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -90,4 +95,5 @@ assets = [
     ["target/release/agent-terminal", "usr/bin/agent-terminal", "755"],
     ["assets/com.jdesroches.AgentTerminal.desktop", "usr/share/applications/com.jdesroches.AgentTerminal.desktop", "644"],
     ["assets/com.jdesroches.AgentTerminal.svg", "usr/share/icons/hicolor/scalable/apps/com.jdesroches.AgentTerminal.svg", "644"],
+    ["assets/icons/scalable/apps/com.jdesroches.AgentTerminal-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/com.jdesroches.AgentTerminal-symbolic.svg", "644"],
 ]

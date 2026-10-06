@@ -1068,6 +1068,7 @@ pub fn run() -> glib::ExitCode {
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(|app| {
+        crate::icons::register();
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
         let backend = demo_backend();
         let view = ChatView::new(backend.clone());

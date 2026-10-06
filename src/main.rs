@@ -20,6 +20,7 @@ mod claude_probe;
 mod codex_probe;
 pub mod config;
 mod hook_config;
+mod icons;
 mod model_catalog;
 mod probe;
 #[cfg(test)]
@@ -80,6 +81,7 @@ fn main() -> glib::ExitCode {
 
     app.connect_startup(|app| {
         debug!("Application startup: loading CSS");
+        icons::register();
         load_css();
         window::watch_config_file(app);
 

@@ -7,6 +7,9 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Standalone Philosophy**: a single, standalone binary. All assets (SVG, icons)
   are embedded via `include_str!`/`include_bytes!`. Do NOT introduce external
   runtime dependencies.
+- **Bundled icons**: All icons are bundled (`assets/icons`, GResource); never rely on the
+  system icon theme for a name; the icon test (`tests/icons.rs`) guards it. See the rendering
+  note in `THIRD_PARTY.md` before editing an SVG there.
 - **Native GTK4/Libadwaita**: a native Rust binary. Minimum system libraries are
   set by the Cargo version features, currently GTK 4.10 (`v4_10`, for
   `FileDialog`), libadwaita 1.5 (`v1_5`, for `AlertDialog`/`PreferencesDialog`)

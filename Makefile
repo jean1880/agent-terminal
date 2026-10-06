@@ -26,7 +26,7 @@ help:
 
 deps:
 	@echo "Installing system dependencies..."
-	sudo apt update && sudo apt install -y libvte-2.91-gtk4-dev libgtk-4-dev libadwaita-1-dev
+	sudo apt update && sudo apt install -y libvte-2.91-gtk4-dev libgtk-4-dev libadwaita-1-dev libglib2.0-dev-bin
 
 build:
 	@echo "Building $(APP_NAME) in release mode..."

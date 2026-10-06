@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Original artwork for agent-terminal (a checkpoint: a flag on a pole). 16x16 grid, single colour, one plain path.
+     The identity transform is deliberate: see THIRD_PARTY.md ("Rendering note"). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#2e3436" d="M2.8 1h1.6v14H2.8zM5.4 2h8.6l-2.4 3 2.4 3H5.4z" transform="translate(0 0)"/>
+</svg>
