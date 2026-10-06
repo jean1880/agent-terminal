@@ -34,6 +34,8 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 agent-core = { path = "crates/agent-core" }
 agent-kit = { path = "crates/agent-kit" }
 tracing = { workspace = true }
+# For setsid(2) and kill(2) on the agent's process group (agent_proc); not a GTK crate.
+libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = "0.3"
 serde = { workspace = true }

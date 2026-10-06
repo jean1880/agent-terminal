@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 const IO_PRIORITY: glib::Priority = glib::Priority::DEFAULT;
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
 /// How long a process may ignore SIGTERM before it is killed.
 const TERM_GRACE: Duration = Duration::from_secs(3);
 /// After the process exits, how long a pipe held open by a grandchild may delay the exit report.
@@ -42,6 +43,8 @@ type ExitCallback = Box<dyn FnOnce(Option<i32>)>;
 
 struct Shared {
     subprocess: gio::Subprocess,
+    /// The process id, which is also its process group id (it is a session leader).
+    pid: Option<i32>,
     stdin: Option<gio::OutputStream>,
     queue: RefCell<VecDeque<String>>,
     pumping: Cell<bool>,
@@ -55,6 +58,21 @@ struct Shared {
 }
 
 impl Shared {
+    /// Signals the agent's whole process group; falls back to the agent alone.
+    ///
+    /// Ceiling: a tool child that called `setsid` itself (a daemon) is in another group and is
+    /// not reached, and once the agent has exited and been reaped nothing is signalled (its
+    /// pid could be reused). Upgrade path: a cgroup (`systemd-run --user --scope`).
+    fn signal(&self, signal: i32) {
+        if let Some(pid) = self.pid {
+            // SAFETY: kill(2) with a negative pid signals that process group; no memory is touched.
+            if unsafe { libc::kill(-pid, signal) } == 0 {
+                return;
+            }
+        }
+        self.subprocess.send_signal(signal);
+    }
+
     fn reader_done(&self) {
         self.readers_open
             .set(self.readers_open.get().saturating_sub(1));
@@ -104,6 +122,15 @@ impl AgentProcess {
         if let Some(cwd) = &spec.cwd {
             launcher.set_cwd(cwd);
         }
+        // Own session and process group, so the agent's tool children can be signalled with it
+        // (and a terminal Ctrl-C aimed at the app does not reach them). `setsid` is
+        // async-signal-safe, which is all the post-fork child may call.
+        launcher.set_child_setup(|| {
+            // SAFETY: setsid(2) takes no arguments and touches no memory.
+            unsafe {
+                libc::setsid();
+            }
+        });
         for (key, value) in &spec.env {
             launcher.setenv(key, value, true);
         }
@@ -122,7 +149,12 @@ impl AgentProcess {
             "agent process started"
         );
 
+        let pid = subprocess
+            .identifier()
+            .and_then(|id| id.parse::<i32>().ok())
+            .filter(|p| *p > 1);
         let shared = Rc::new(Shared {
+            pid,
             stdin: subprocess.stdin_pipe(),
             subprocess,
             queue: RefCell::new(VecDeque::new()),
@@ -161,7 +193,7 @@ impl AgentProcess {
     /// SIGINT (what agy treats as "stop this turn"; it then exits).
     pub fn interrupt(&self) {
         if self.is_alive() {
-            self.shared.subprocess.send_signal(SIGINT);
+            self.shared.signal(SIGINT);
         }
     }
 
@@ -181,12 +213,12 @@ fn terminate(shared: &Rc<Shared>) {
     if shared.exited.get() {
         return;
     }
-    shared.subprocess.send_signal(SIGTERM);
+    shared.signal(SIGTERM);
     let shared = shared.clone();
     glib::timeout_add_local_once(TERM_GRACE, move || {
         if !shared.exited.get() {
             warn!(program = %shared.name, "agent ignored SIGTERM; killing it");
-            shared.subprocess.force_exit();
+            shared.signal(SIGKILL);
         }
     });
 }
@@ -375,6 +407,34 @@ mod tests {
             proc.terminate();
             assert!(pump_until(ctx, 10, || exit.get().is_some()));
             assert_eq!(exit.get(), Some(None));
+        });
+    }
+
+    /// Whether `pid` is gone (or only a zombie waiting to be reaped).
+    fn is_gone(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[test]
+    fn terminate_takes_the_agents_tool_children_with_it() {
+        in_loop(|ctx| {
+            // The "agent" starts a background child, reports its pid, and waits.
+            let (proc, out, _, exit) = start(&sh("sleep 60 & echo $!; wait"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            let child: i32 = out.borrow()[0].parse().expect("child pid");
+            assert!(!is_gone(child), "child should be running");
+            proc.terminate();
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            assert!(
+                pump_until(ctx, 10, || is_gone(child)),
+                "the tool child outlived the agent"
+            );
         });
     }
 
