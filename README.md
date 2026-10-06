@@ -1,5 +1,7 @@
 # Agent Terminal 🚀
 
+[![CI](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml)
+
 A standalone GTK4 terminal application written in Rust, purpose-built for driving
 an AI coding CLI (Claude, Antigravity/`agy`, or Gemini) in a focused, tabbed
 window.
