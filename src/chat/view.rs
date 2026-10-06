@@ -713,10 +713,10 @@ impl PlanPanel {
         toggle.add_css_class("flat");
         toggle.add_css_class("plan-toggle");
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let icon = gtk4::Image::from_icon_name("view-list-bullet-symbolic");
+        let icon = gtk4::Image::from_icon_name("at-view-list-bullet-symbolic");
         let title = cards::label("Plan", &["plan-title"]);
         title.set_hexpand(true);
-        let chevron = gtk4::Image::from_icon_name("pan-down-symbolic");
+        let chevron = gtk4::Image::from_icon_name("at-pan-down-symbolic");
         head.append(&icon);
         head.append(&title);
         head.append(&chevron);
@@ -737,9 +737,9 @@ impl PlanPanel {
                 let open = !body.reveals_child();
                 body.set_reveal_child(open);
                 chevron.set_icon_name(Some(if open {
-                    "pan-down-symbolic"
+                    "at-pan-down-symbolic"
                 } else {
-                    "pan-up-symbolic"
+                    "at-pan-up-symbolic"
                 }));
             }
         ));

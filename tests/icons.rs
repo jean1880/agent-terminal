@@ -100,8 +100,8 @@ fn every_owned_icon_constant_has_a_file() {
 
 #[test]
 fn bundled_svgs_are_plain_enough_for_gtks_parser() {
-    // GTK 4.22 rejects font/style attributes and ignores <g>; a transform on the path is what
-    // makes it render the vector at the requested size instead of upscaling a 16 px raster.
+    // Clean, parseable files only: GTK's SVG parser rejects font/style/transform attributes
+    // and ignores <g>, and a rejected file silently takes a different render path.
     fn walk(dir: &Path, bad: &mut Vec<String>) {
         for entry in fs::read_dir(dir).expect("read assets/icons").flatten() {
             let path = entry.path();
@@ -111,13 +111,18 @@ fn bundled_svgs_are_plain_enough_for_gtks_parser() {
                 let text = fs::read_to_string(&path).expect("read an svg");
                 // The comment header is prose; judge only the markup after it.
                 let body = text.rsplit("-->").next().unwrap_or(&text);
-                for banned in ["<g", "style=", "font-", "overflow=", "<defs", "<use"] {
+                for banned in [
+                    "<g",
+                    "style=",
+                    "font-",
+                    "overflow=",
+                    "transform=",
+                    "<defs",
+                    "<use",
+                ] {
                     if body.contains(banned) {
                         bad.push(format!("{}: contains {banned}", path.display()));
                     }
-                }
-                if body.contains("<path") && !body.contains("transform=") {
-                    bad.push(format!("{}: path without a transform", path.display()));
                 }
             }
         }
@@ -142,9 +147,23 @@ fn registered_theme_resolves_bundled_icons() {
         icons::CODEX_ICON,
         icons::THINKING_ICON,
         icons::APP_ICON,
-        "chat-message-new-symbolic",
-        "go-up-symbolic",
+        "at-chat-message-new-symbolic",
+        "at-go-up-symbolic",
     ] {
         assert!(theme.has_icon(name), "icon theme cannot resolve {name}");
     }
+    // Adwaita stays the theme: a name that is not bundled still resolves from it.
+    assert!(theme.has_icon("edit-find-symbolic"), "system fallback lost");
+
+    let label = gtk4::Label::new(None);
+    let hero = icons::hero_paintable(icons::APP_ART, 128, &label);
+    assert_eq!(
+        gtk4::gdk::prelude::PaintableExt::intrinsic_width(&hero),
+        128
+    );
+    let tinted = icons::hero_paintable("at-chat-message-new-symbolic", 64, &label);
+    assert_eq!(
+        gtk4::gdk::prelude::PaintableExt::intrinsic_height(&tinted),
+        64
+    );
 }

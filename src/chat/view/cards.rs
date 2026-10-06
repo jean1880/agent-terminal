@@ -149,7 +149,7 @@ fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
     let lang_label = label(lang.unwrap_or("text"), &["code-lang"]);
     lang_label.set_hexpand(true);
     header.append(&lang_label);
-    let copy = gtk4::Button::from_icon_name("edit-copy-symbolic");
+    let copy = gtk4::Button::from_icon_name("at-edit-copy-symbolic");
     copy.add_css_class("flat");
     copy.add_css_class("code-copy");
     copy.set_tooltip_text(Some("Copy"));
@@ -195,13 +195,13 @@ fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
         move |_| {
             let (start, end) = buffer.bounds();
             copy.clipboard().set_text(&buffer.text(&start, &end, false));
-            copy.set_icon_name("object-select-symbolic");
+            copy.set_icon_name("at-object-select-symbolic");
             glib::timeout_add_local_once(
                 std::time::Duration::from_millis(1200),
                 glib::clone!(
                     #[weak]
                     copy,
-                    move || copy.set_icon_name("edit-copy-symbolic")
+                    move || copy.set_icon_name("at-edit-copy-symbolic")
                 ),
             );
         }
@@ -446,8 +446,8 @@ fn notice(text: &str, tone: Tone) -> gtk4::Box {
         root.add_css_class("warning");
     }
     let icon = gtk4::Image::from_icon_name(match tone {
-        Tone::Info => "dialog-information-symbolic",
-        Tone::Warning => "dialog-warning-symbolic",
+        Tone::Info => "at-dialog-information-symbolic",
+        Tone::Warning => "at-dialog-warning-symbolic",
     });
     icon.set_valign(gtk4::Align::Start);
     icon.add_css_class("notice-icon");
@@ -462,7 +462,7 @@ fn notice(text: &str, tone: Tone) -> gtk4::Box {
 fn error_row(message: &str) -> gtk4::Box {
     let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
     root.add_css_class("error-row");
-    let icon = gtk4::Image::from_icon_name("dialog-error-symbolic");
+    let icon = gtk4::Image::from_icon_name("at-dialog-error-symbolic");
     icon.set_valign(gtk4::Align::Start);
     root.append(&icon);
     let col = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -522,7 +522,7 @@ impl ReasoningRow {
         toggle.add_css_class("reasoning-toggle");
         toggle.set_halign(gtk4::Align::Start);
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        let chevron = gtk4::Image::from_icon_name("pan-end-symbolic");
+        let chevron = gtk4::Image::from_icon_name("at-pan-end-symbolic");
         let title = label("Thinking…", &["reasoning-title"]);
         head.append(&chevron);
         head.append(&title);
@@ -566,9 +566,9 @@ impl ReasoningRow {
         self.text.set_text(text.trim());
         self.revealer.set_reveal_child(expanded);
         self.chevron.set_icon_name(Some(if expanded {
-            "pan-down-symbolic"
+            "at-pan-down-symbolic"
         } else {
-            "pan-end-symbolic"
+            "at-pan-end-symbolic"
         }));
     }
 }
@@ -599,14 +599,14 @@ pub struct ToolCard {
 
 fn kind_icon(kind: ItemKind) -> &'static str {
     match kind {
-        ItemKind::Command => "utilities-terminal-symbolic",
-        ItemKind::FileChange => "document-edit-symbolic",
-        ItemKind::FileRead => "x-office-document-symbolic",
+        ItemKind::Command => "at-utilities-terminal-symbolic",
+        ItemKind::FileChange => "at-document-edit-symbolic",
+        ItemKind::FileRead => "at-x-office-document-symbolic",
         ItemKind::McpTool => crate::icons::MCP_ICON,
-        ItemKind::WebSearch => "system-search-symbolic",
+        ItemKind::WebSearch => "at-system-search-symbolic",
         ItemKind::Subagent => crate::icons::SUBAGENT_ICON,
         ItemKind::Reasoning => crate::icons::THINKING_ICON,
-        _ => "applications-engineering-symbolic",
+        _ => "at-applications-engineering-symbolic",
     }
 }
 
@@ -660,7 +660,7 @@ impl ToolCard {
         summary.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         summary.set_hexpand(true);
         let badge = label("", &["status-badge"]);
-        let chevron = gtk4::Image::from_icon_name("pan-end-symbolic");
+        let chevron = gtk4::Image::from_icon_name("at-pan-end-symbolic");
         chevron.add_css_class("chevron");
         head.append(&status);
         head.append(&kind_icon);
@@ -740,10 +740,10 @@ impl ToolCard {
         self.status
             .set_visible_child_name(if running { "spinner" } else { "icon" });
         self.status_icon.set_icon_name(Some(match tool.status {
-            ToolStatus::Running | ToolStatus::Completed => "object-select-symbolic",
-            ToolStatus::Failed => "dialog-error-symbolic",
-            ToolStatus::Declined => "action-unavailable-symbolic",
-            ToolStatus::Interrupted => "media-playback-stop-symbolic",
+            ToolStatus::Running | ToolStatus::Completed => "at-object-select-symbolic",
+            ToolStatus::Failed => "at-dialog-error-symbolic",
+            ToolStatus::Declined => "at-action-unavailable-symbolic",
+            ToolStatus::Interrupted => "at-media-playback-stop-symbolic",
         }));
         self.badge.set_text(match tool.status {
             ToolStatus::Failed => "Failed",
@@ -773,9 +773,9 @@ impl ToolCard {
         self.children.set_visible(!item.children.is_empty());
         self.revealer.set_reveal_child(item.expanded);
         self.chevron.set_icon_name(Some(if item.expanded {
-            "pan-down-symbolic"
+            "at-pan-down-symbolic"
         } else {
-            "pan-end-symbolic"
+            "at-pan-end-symbolic"
         }));
     }
 }
@@ -820,7 +820,7 @@ impl ApprovalCard {
         root.add_css_class("approval-card");
         root.add_css_class("card");
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-        let icon = gtk4::Image::from_icon_name("security-medium-symbolic");
+        let icon = gtk4::Image::from_icon_name("at-security-medium-symbolic");
         icon.add_css_class("approval-icon");
         icon.set_valign(gtk4::Align::Start);
         head.append(&icon);
@@ -953,7 +953,7 @@ impl QuestionCardWidget {
         root.add_css_class("question-card");
         root.add_css_class("card");
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-        head.append(&gtk4::Image::from_icon_name("dialog-question-symbolic"));
+        head.append(&gtk4::Image::from_icon_name("at-dialog-question-symbolic"));
         head.append(&label("The agent has a question", &["question-heading"]));
         root.append(&head);
 

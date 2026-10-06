@@ -13,6 +13,7 @@ const PREFIX: &str = "/com/jdesroches/AgentTerminal/icons";
 fn main() {
     let root = Path::new("assets/icons");
     println!("cargo:rerun-if-changed=assets/icons");
+    println!("cargo:rerun-if-changed=assets/com.jdesroches.AgentTerminal.svg");
     println!("cargo:rerun-if-changed=build.rs");
 
     let mut files = Vec::new();
@@ -23,14 +24,19 @@ fn main() {
     for rel in &files {
         let _ = writeln!(xml, "    <file>{rel}</file>");
     }
-    xml.push_str("  </gresource>\n</gresources>\n");
+    xml.push_str("  </gresource>\n");
+    // The full-colour app icon, for hero use (`APP_ART` in src/icons.rs).
+    xml.push_str("  <gresource prefix=\"/com/jdesroches/AgentTerminal/art\">\n");
+    xml.push_str(
+        "    <file>com.jdesroches.AgentTerminal.svg</file>\n  </gresource>\n</gresources>\n",
+    );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let manifest = out_dir.join("icons.gresource.xml");
     fs::write(&manifest, xml).expect("write the icon resource manifest");
 
     glib_build_tools::compile_resources(
-        &["assets/icons"],
+        &["assets/icons", "assets"],
         manifest.to_str().expect("OUT_DIR is valid UTF-8"),
         "icons.gresource",
     );

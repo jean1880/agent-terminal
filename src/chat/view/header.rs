@@ -76,7 +76,7 @@ impl Header {
         chip_box.append(&dot);
         chip_box.append(&agent);
         chip_box.append(&model);
-        chip_box.append(&gtk4::Image::from_icon_name("pan-down-symbolic"));
+        chip_box.append(&gtk4::Image::from_icon_name("at-pan-down-symbolic"));
         chip.set_child(Some(&chip_box));
         root.append(&chip);
 

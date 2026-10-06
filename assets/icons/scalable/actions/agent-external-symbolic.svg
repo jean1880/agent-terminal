@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Original artwork for agent-terminal (open in an external tool: a window with an outgoing arrow). 16x16 grid, single colour, one plain path.
-     The identity transform is deliberate: see THIRD_PARTY.md ("Rendering note"). -->
+     -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path fill="#2e3436" d="M2 4h5.5v1.6H3.6v6.8h6.8V8.5H12V14H2zM9.5 1.5H15V7l-2-2-3.2 3.2-1.2-1.2L10.8 3.8z" transform="translate(0 0)"/>
+  <path fill="#2e3436" d="M2 4h5.5v1.6H3.6v6.8h6.8V8.5H12V14H2zM9.5 1.5H15V7l-2-2-3.2 3.2-1.2-1.2L10.8 3.8z"/>
 </svg>

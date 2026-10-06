@@ -114,7 +114,7 @@ impl Composer {
         overlay.set_hexpand(true);
         root.append(&overlay);
 
-        let send = gtk4::Button::from_icon_name("go-up-symbolic");
+        let send = gtk4::Button::from_icon_name("at-go-up-symbolic");
         send.add_css_class("circular");
         send.add_css_class("send-button");
         send.set_valign(gtk4::Align::End);
@@ -210,11 +210,11 @@ impl Composer {
     /// Send ⇄ stop.
     pub fn set_running(&self, running: bool) {
         if running {
-            self.send.set_icon_name("media-playback-stop-symbolic");
+            self.send.set_icon_name("at-media-playback-stop-symbolic");
             self.send.add_css_class("stop");
             self.send.set_tooltip_text(Some("Stop (Esc)"));
         } else {
-            self.send.set_icon_name("go-up-symbolic");
+            self.send.set_icon_name("at-go-up-symbolic");
             self.send.remove_css_class("stop");
             self.send.set_tooltip_text(Some("Send (Enter)"));
         }

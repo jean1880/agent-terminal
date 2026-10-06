@@ -3,5 +3,5 @@
      chevron. Not OpenAI's mark; a user may override it at runtime with their own file at
      $XDG_DATA_HOME/agent-terminal/brand/codex.svg. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path fill="#2e3436" fill-rule="evenodd" d="M8 0.6l6.4 3.7v7.4L8 15.4 1.6 11.7V4.3zM8 2.3L3.1 5.2v5.6L8 13.7l4.9-2.9V5.2zM5.6 5.4L9 8 5.6 10.6 4.7 9.4 6.7 8 4.7 6.6zM9.6 9.7h2v1.3h-2z" transform="translate(0 0)"/>
+  <path fill="#2e3436" fill-rule="evenodd" d="M8 0.6l6.4 3.7v7.4L8 15.4 1.6 11.7V4.3zM8 2.3L3.1 5.2v5.6L8 13.7l4.9-2.9V5.2zM5.6 5.4L9 8 5.6 10.6 4.7 9.4 6.7 8 4.7 6.6zM9.6 9.7h2v1.3h-2z"/>
 </svg>

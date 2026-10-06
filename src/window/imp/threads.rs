@@ -678,7 +678,7 @@ impl AgentTerminalWindow {
 
         if let Some(header) = self.header.borrow().as_ref() {
             let toggle = gtk4::ToggleButton::builder()
-                .icon_name("sidebar-show-symbolic")
+                .icon_name("at-sidebar-show-symbolic")
                 .tooltip_text("Show or Hide Threads (F9, Ctrl+B)")
                 .active(split.shows_sidebar())
                 .build();
@@ -741,7 +741,6 @@ impl AgentTerminalWindow {
     fn build_empty_state(&self) -> gtk4::Widget {
         let obj = self.obj();
         let page = adw::StatusPage::builder()
-            .icon_name("chat-message-new-symbolic")
             .title("No thread open")
             .description(
                 "Start a new thread, or pick one from the sidebar.\n\
@@ -749,6 +748,11 @@ impl AgentTerminalWindow {
             )
             .vexpand(true)
             .build();
+        page.set_paintable(Some(&crate::icons::hero_paintable(
+            crate::icons::APP_ART,
+            128,
+            &page,
+        )));
         let new = Button::builder()
             .label("New Thread")
             .halign(Align::Center)
@@ -782,7 +786,7 @@ impl AgentTerminalWindow {
             .hexpand(true)
             .build();
         let new = Button::builder()
-            .icon_name("list-add-symbolic")
+            .icon_name("at-list-add-symbolic")
             .tooltip_text("New Thread (Ctrl+Shift+T)")
             .css_classes(["flat"])
             .build();
@@ -1077,7 +1081,7 @@ impl AgentTerminalWindow {
                 line.append(&dot);
             }
             None => {
-                let icon = Image::from_icon_name("utilities-terminal-symbolic");
+                let icon = Image::from_icon_name("at-utilities-terminal-symbolic");
                 icon.set_tooltip_text(Some("Terminal thread"));
                 icon.add_css_class("thread-term");
                 line.append(&icon);
@@ -1117,7 +1121,7 @@ impl AgentTerminalWindow {
         line.append(&age);
         if row.open {
             let close = Button::builder()
-                .icon_name("window-close-symbolic")
+                .icon_name("at-window-close-symbolic")
                 .tooltip_text("Close (the thread stays in the list)")
                 .css_classes(["flat", "circular", "thread-close"])
                 .valign(Align::Center)

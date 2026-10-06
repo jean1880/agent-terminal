@@ -97,7 +97,7 @@ impl DiffPanel {
             .css_classes(["dim-label"])
             .build();
         let refresh = gtk4::Button::builder()
-            .icon_name("view-refresh-symbolic")
+            .icon_name("at-view-refresh-symbolic")
             .tooltip_text("Refresh")
             .css_classes(["flat"])
             .build();
@@ -112,7 +112,7 @@ impl DiffPanel {
         // Offered only for a checkpoint base with something to undo; see
         // `show_diff`.
         let undo = gtk4::Button::builder()
-            .icon_name("edit-undo-symbolic")
+            .icon_name("at-edit-undo-symbolic")
             .tooltip_text("Undo these changes…")
             .css_classes(["flat"])
             .visible(false)
@@ -316,21 +316,21 @@ impl DiffPanel {
             return;
         }
         match result {
-            Err(err) => self.show_status("dialog-warning-symbolic", "Git failed", &err, true),
+            Err(err) => self.show_status("at-dialog-warning-symbolic", "Git failed", &err, true),
             Ok(DiffOutcome::NotRepo) => self.show_status(
-                "folder-symbolic",
+                "at-folder-symbolic",
                 "Not a git repository",
                 "This tab's folder is not inside a repository.",
                 false,
             ),
             Ok(DiffOutcome::Unavailable(reason)) => self.show_status(
-                "document-open-recent-symbolic",
+                "at-document-open-recent-symbolic",
                 "Nothing to show yet",
                 &reason,
                 false,
             ),
             Ok(DiffOutcome::Ready(diff)) if diff.stats.is_empty() => {
-                self.show_status("object-select-symbolic", "No changes", "", false)
+                self.show_status("at-object-select-symbolic", "No changes", "", false)
             }
             Ok(DiffOutcome::Ready(diff)) => self.show_diff(&diff),
         }
@@ -339,7 +339,7 @@ impl DiffPanel {
     fn show_status(&self, icon: &str, title: &str, description: &str, retry: bool) {
         self.set_undo(None);
         self.summary.set_text("");
-        self.status.set_icon_name(Some(icon));
+        crate::icons::set_status_icon(&self.status, icon);
         self.status.set_title(title);
         // The description is markup; git's messages are not.
         self.status

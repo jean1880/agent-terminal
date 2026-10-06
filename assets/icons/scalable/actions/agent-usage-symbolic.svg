@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Original artwork for agent-terminal (usage and quota: a gauge with its needle). 16x16 grid, single colour, one plain path.
-     The identity transform is deliberate: see THIRD_PARTY.md ("Rendering note"). -->
+     -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path fill="#2e3436" d="M8 1.5a7.5 7.5 0 0 0-6.5 11.2l.4.8h2.5l-.5-.9a5.4 5.4 0 1 1 8.2 0l-.5.9h2.5l.4-.8A7.5 7.5 0 0 0 8 1.5zM10.9 4.4l1.2 1.2-2.7 3.7a1.7 1.7 0 1 1-1.4-1z" transform="translate(0 0)"/>
+  <path fill="#2e3436" d="M8 1.5a7.5 7.5 0 0 0-6.5 11.2l.4.8h2.5l-.5-.9a5.4 5.4 0 1 1 8.2 0l-.5.9h2.5l.4-.8A7.5 7.5 0 0 0 8 1.5zM10.9 4.4l1.2 1.2-2.7 3.7a1.7 1.7 0 1 1-1.4-1z"/>
 </svg>

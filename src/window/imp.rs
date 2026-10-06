@@ -402,20 +402,20 @@ fn build_search_bar(terminal: &Terminal) -> (gtk4::SearchBar, gtk4::SearchEntry)
         .build();
 
     let previous = Button::builder()
-        .icon_name("go-up-symbolic")
+        .icon_name("at-go-up-symbolic")
         .tooltip_text("Previous match (Shift+Enter)")
         .build();
     let next = Button::builder()
-        .icon_name("go-down-symbolic")
+        .icon_name("at-go-down-symbolic")
         .tooltip_text("Next match (Enter)")
         .build();
 
     let case_sensitive = gtk4::ToggleButton::builder()
-        .icon_name("format-text-italic-symbolic")
+        .icon_name("at-format-text-italic-symbolic")
         .tooltip_text("Match case")
         .build();
     let use_regex = gtk4::ToggleButton::builder()
-        .icon_name("system-search-symbolic")
+        .icon_name("at-system-search-symbolic")
         .tooltip_text("Regular expression")
         .build();
 
@@ -1580,7 +1580,7 @@ impl AgentTerminalWindow {
             .build();
 
         let settings_btn = gtk4::Button::builder()
-            .icon_name("document-properties-symbolic")
+            .icon_name("at-document-properties-symbolic")
             .tooltip_text("Settings")
             .build();
         settings_btn.connect_clicked(glib::clone!(
@@ -1664,7 +1664,7 @@ impl AgentTerminalWindow {
         // agent in the current folder; the menu has every other way to start one.
         if let Some(header) = self.header.borrow().as_ref() {
             let new_btn = adw::SplitButton::builder()
-                .icon_name("list-add-symbolic")
+                .icon_name("at-list-add-symbolic")
                 .tooltip_text("New Thread (Ctrl+Shift+T)")
                 .menu_model(&self.build_new_menu())
                 .build();
@@ -1678,12 +1678,12 @@ impl AgentTerminalWindow {
             header.pack_start(&new_btn);
 
             let drawer_btn = Button::builder()
-                .icon_name("utilities-terminal-symbolic")
+                .icon_name("at-utilities-terminal-symbolic")
                 .tooltip_text("Terminal Drawer (Ctrl+`)")
                 .action_name("win.toggle-drawer")
                 .build();
             let diff_btn = Button::builder()
-                .icon_name("view-dual-symbolic")
+                .icon_name("at-view-dual-symbolic")
                 .tooltip_text("Show or Hide Changes (Ctrl+Shift+D)")
                 .action_name("win.toggle-diff")
                 .build();
@@ -2850,9 +2850,9 @@ impl AgentTerminalWindow {
         let status_page = adw::StatusPage::builder()
             .title("No AI CLI detected")
             .description(description)
-            .icon_name("utilities-terminal-symbolic")
             .vexpand(true)
             .build();
+        crate::icons::set_status_icon(&status_page, "at-utilities-terminal-symbolic");
 
         let refresh_button = Button::builder()
             .label("Check again")
@@ -2885,7 +2885,7 @@ impl AgentTerminalWindow {
 
         let page = adw::PreferencesPage::builder()
             .title("Terminal")
-            .icon_name("utilities-terminal-symbolic")
+            .icon_name("at-utilities-terminal-symbolic")
             .build();
         let group = adw::PreferencesGroup::new();
         group.set_title("Terminal Preferences");
@@ -3545,9 +3545,9 @@ impl AgentTerminalWindow {
             .valign(Align::Center)
             .build();
         let empty = adw::StatusPage::builder()
-            .icon_name("document-open-recent-symbolic")
             .title("No Sessions Found")
             .build();
+        crate::icons::set_status_icon(&empty, "at-document-open-recent-symbolic");
 
         let pages = Stack::builder().vexpand(true).build();
         pages.add_named(&spinner, Some("loading"));
@@ -3682,7 +3682,7 @@ impl AgentTerminalWindow {
                         warn!("Could not list sessions: {reason}");
                         // Distinct from an empty store: an unreadable one must
                         // not look like there is simply nothing to resume.
-                        empty.set_icon_name(Some("dialog-warning-symbolic"));
+                        crate::icons::set_status_icon(&empty, "at-dialog-warning-symbolic");
                         empty.set_title("Could Not Read Sessions");
                         empty.set_description(Some(&reason));
                         pages.set_visible_child_name("empty");
@@ -3718,7 +3718,7 @@ impl AgentTerminalWindow {
                         .activatable(true)
                         .tooltip_text(&session.id)
                         .build();
-                    row.add_suffix(&Image::from_icon_name("go-next-symbolic"));
+                    row.add_suffix(&Image::from_icon_name("at-go-next-symbolic"));
                     list.append(&row);
 
                     haystacks
@@ -4181,7 +4181,7 @@ impl AgentTerminalWindow {
         match error {
             Some(err) => {
                 page.set_indicator_icon(Some(&gtk4::gio::ThemedIcon::new(
-                    "dialog-warning-symbolic",
+                    "at-dialog-warning-symbolic",
                 )));
                 page.set_indicator_tooltip(&format!("Checkpoint failed: {err}"));
             }

@@ -103,7 +103,7 @@ impl TranscriptView {
         empty.append(&hint);
         empty.set_can_target(false);
 
-        let jump = gtk4::Button::from_icon_name("go-bottom-symbolic");
+        let jump = gtk4::Button::from_icon_name("at-go-bottom-symbolic");
         jump.add_css_class("circular");
         jump.add_css_class("osd");
         jump.add_css_class("jump-button");

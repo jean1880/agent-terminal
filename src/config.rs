@@ -351,13 +351,13 @@ pub struct Indicator {
 }
 
 fn default_icon_ok() -> String {
-    "security-high-symbolic".to_string()
+    "at-security-high-symbolic".to_string()
 }
 fn default_icon_warn() -> String {
-    "dialog-warning-symbolic".to_string()
+    "at-dialog-warning-symbolic".to_string()
 }
 fn default_icon_unknown() -> String {
-    "dialog-question-symbolic".to_string()
+    "at-dialog-question-symbolic".to_string()
 }
 
 /// Ceiling on header indicators, so a config edit cannot fill the header bar.
@@ -1623,12 +1623,12 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::File::create(&path)
             .unwrap()
-            .write_all(br#"{"indicators":[{"label":"LiteLLM","icon_ok":"network-server-symbolic","source":{"type":"command","argv":["litellm-sync","--indicator"],"timeout_secs":3}}]}"#)
+            .write_all(br#"{"indicators":[{"label":"LiteLLM","icon_ok":"at-network-server-symbolic","source":{"type":"command","argv":["litellm-sync","--indicator"],"timeout_secs":3}}]}"#)
             .unwrap();
         let config = TerminalConfig::load_from(&path);
         assert_eq!(config.indicators.len(), 1);
         assert_eq!(config.indicators[0].label, "LiteLLM");
-        assert_eq!(config.indicators[0].icon_ok, "network-server-symbolic");
+        assert_eq!(config.indicators[0].icon_ok, "at-network-server-symbolic");
     }
 
     #[test]
@@ -1637,12 +1637,12 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::File::create(&path)
             .unwrap()
-            .write_all(br#"{"indicators":[{"name":"LiteLLM","icon":"network-server-symbolic","source":{"type":"command","argv":["litellm-sync","--indicator"],"timeout_secs":3}}]}"#)
+            .write_all(br#"{"indicators":[{"name":"LiteLLM","icon":"at-network-server-symbolic","source":{"type":"command","argv":["litellm-sync","--indicator"],"timeout_secs":3}}]}"#)
             .unwrap();
         let config = TerminalConfig::load_from(&path);
         assert_eq!(config.indicators.len(), 1);
         assert_eq!(config.indicators[0].label, "LiteLLM");
-        assert_eq!(config.indicators[0].icon_ok, "network-server-symbolic");
+        assert_eq!(config.indicators[0].icon_ok, "at-network-server-symbolic");
     }
 
     #[test]

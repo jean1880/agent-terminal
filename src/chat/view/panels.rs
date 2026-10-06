@@ -108,7 +108,7 @@ fn dialog(title: &str, width: i32, height: i32) -> (adw::Dialog, gtk4::Stack) {
 
 fn show_error(stack: &gtk4::Stack, message: &str) {
     let page = adw::StatusPage::new();
-    page.set_icon_name(Some("dialog-error-symbolic"));
+    crate::icons::set_status_icon(&page, "at-dialog-error-symbolic");
     page.set_title("Could not load this panel");
     page.set_description(Some(&glib::markup_escape_text(message)));
     replace_page(stack, "error", &page);
@@ -231,7 +231,7 @@ fn model_list(
     if groups.is_empty() {
         let page = adw::StatusPage::new();
         page.add_css_class("compact");
-        page.set_icon_name(Some("system-search-symbolic"));
+        crate::icons::set_status_icon(&page, "at-system-search-symbolic");
         page.set_title(if models.is_empty() {
             "No models yet"
         } else {
@@ -306,7 +306,7 @@ fn model_list(
             }
             if is_current(m, &status) {
                 row.add_css_class("current-model");
-                let check = gtk4::Image::from_icon_name("object-select-symbolic");
+                let check = gtk4::Image::from_icon_name("at-object-select-symbolic");
                 check.add_css_class("accent");
                 row.add_suffix(&check);
             }
@@ -446,7 +446,7 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                 };
                 if servers.is_empty() {
                     let page = adw::StatusPage::new();
-                    page.set_icon_name(Some("network-server-symbolic"));
+                    crate::icons::set_status_icon(&page, "at-network-server-symbolic");
                     page.set_title("No MCP servers");
                     page.set_description(Some("This session has no MCP servers configured."));
                     replace_page(&stack, "list", &page);
@@ -468,7 +468,7 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                     );
                     row.add_prefix(&dot);
 
-                    let reconnect = gtk4::Button::from_icon_name("view-refresh-symbolic");
+                    let reconnect = gtk4::Button::from_icon_name("at-view-refresh-symbolic");
                     reconnect.add_css_class("flat");
                     reconnect.set_valign(gtk4::Align::Center);
                     reconnect.set_tooltip_text(Some("Reconnect"));

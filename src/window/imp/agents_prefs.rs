@@ -96,7 +96,7 @@ impl AgentTerminalWindow {
         let obj = self.obj();
         let page = adw::PreferencesPage::builder()
             .title("Agents")
-            .icon_name("system-users-symbolic")
+            .icon_name("at-system-users-symbolic")
             .build();
 
         let general = adw::PreferencesGroup::builder()
@@ -462,7 +462,7 @@ impl AgentTerminalWindow {
             .subtitle("Checking ~/.gemini/config/hooks.json…")
             .build();
         let copy = Button::builder()
-            .icon_name("edit-copy-symbolic")
+            .icon_name("at-edit-copy-symbolic")
             .tooltip_text("Copy the hooks.json entry")
             .valign(Align::Center)
             .css_classes(["flat"])
