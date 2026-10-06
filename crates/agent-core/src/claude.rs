@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::adapter::{Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession};
+use crate::adapter::{
+    Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
+};
 use crate::caps::Capabilities;
 use crate::event::{
     AgentCommand, AgentCommandKind, Decision, Envelope, Event, ItemKind, ItemStatus, Question,
@@ -77,6 +79,8 @@ pub struct ClaudeAdapter {
     context_requests: HashSet<String>,
     /// `get_usage` requests in flight, whose replies also become `QuotaUpdated`.
     usage_requests: HashSet<String>,
+    /// `--effort` of the running process (set by `argv`, which takes `&self`).
+    current_effort: std::cell::RefCell<Option<String>>,
 }
 
 impl Default for ClaudeAdapter {
@@ -110,6 +114,7 @@ impl ClaudeAdapter {
             pending_controls: HashSet::new(),
             context_requests: HashSet::new(),
             usage_requests: HashSet::new(),
+            current_effort: std::cell::RefCell::new(None),
         }
     }
 
@@ -780,6 +785,12 @@ impl Adapter for ClaudeAdapter {
             argv.push("--model".to_owned());
             argv.push(model.clone());
         }
+        if let Some(effort) = &session.effort {
+            argv.push("--effort".to_owned());
+            argv.push(effort.clone());
+        }
+        // The effort this process runs with, for `SetModel`'s respawn decision.
+        *self.current_effort.borrow_mut() = session.effort.clone();
         argv.push("--permission-mode".to_owned());
         argv.push(mode_name(session.mode).to_owned());
         // Session flags take `=`; resuming wins over naming a new session.
@@ -831,7 +842,19 @@ impl Adapter for ClaudeAdapter {
                 merged.insert("answers".to_owned(), answers);
                 self.answer_line(&request, Decision::Allow, Some(Value::Object(merged)), None)?
             }
-            Command::SetModel { model } => {
+            Command::SetModel { model, effort } => {
+                // There is no in-session effort control: a different effort means a new process
+                // (`--effort`) resumed on the same session. The same effort (or none given)
+                // stays a live `set_model`.
+                if effort.is_some() && effort != *self.current_effort.borrow() {
+                    return Ok(vec![Action::Respawn(OpenSessionDelta {
+                        model: Some(model),
+                        effort,
+                        mode: None,
+                        // The host fills in the native session id it already holds.
+                        resume: None,
+                    })]);
+                }
                 let id = self.next_id("model");
                 self.control_line(&id, json!({"subtype": "set_model", "model": model}))
             }
@@ -1872,6 +1895,7 @@ mod tests {
             extra_args: vec!["--foo".into()],
             cwd: "/w".into(),
             model: Some("sonnet".into()),
+            effort: None,
             mode: Mode::AcceptEdits,
             resume: Some("abc".into()),
             new_session_id: Some("zzz".into()),
@@ -2023,13 +2047,73 @@ mod tests {
     }
 
     #[test]
+    fn effort_is_a_flag_and_a_changed_effort_respawns() {
+        let mut a = ClaudeAdapter::new();
+        let session = OpenSession {
+            program: "claude".into(),
+            extra_args: vec![],
+            cwd: "/w".into(),
+            model: Some("sonnet".into()),
+            effort: Some("medium".into()),
+            mode: Mode::Ask,
+            resume: None,
+            new_session_id: None,
+            approval_hook: false,
+        };
+        let argv = a.argv(&session);
+        assert!(argv.windows(2).any(|w| w == ["--effort", "medium"]));
+        // Same effort, or none given: a live set_model.
+        for effort in [Some("medium".to_owned()), None] {
+            let actions = a
+                .encode(Command::SetModel {
+                    model: "opus".into(),
+                    effort,
+                })
+                .expect("encode");
+            assert!(matches!(actions.as_slice(), [Action::Write(_)]), "{actions:?}");
+        }
+        // A different effort restarts the process on the same session.
+        assert_eq!(
+            a.encode(Command::SetModel {
+                model: "opus".into(),
+                effort: Some("high".into()),
+            })
+            .expect("encode"),
+            vec![Action::Respawn(OpenSessionDelta {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                mode: None,
+                resume: None,
+            })]
+        );
+        // A session started without an effort treats any explicit effort as a change.
+        let bare = OpenSession {
+            effort: None,
+            ..session
+        };
+        let mut fresh = ClaudeAdapter::new();
+        assert!(!fresh.argv(&bare).iter().any(|x| x == "--effort"));
+        assert!(matches!(
+            fresh
+                .encode(Command::SetModel {
+                    model: "opus".into(),
+                    effort: Some("low".into())
+                })
+                .expect("encode")
+                .as_slice(),
+            [Action::Respawn(_)]
+        ));
+    }
+
+    #[test]
     fn encode_model_mode_and_controls() {
         let mut a = ClaudeAdapter::new();
         assert_eq!(
             written(
                 &mut a,
                 Command::SetModel {
-                    model: "sonnet".into()
+                    model: "sonnet".into(),
+                    effort: None
                 }
             ),
             json!({"type": "control_request", "request_id": "model-1", "request": {"subtype": "set_model", "model": "sonnet"}})

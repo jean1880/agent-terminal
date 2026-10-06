@@ -138,6 +138,7 @@ impl AgyAdapter {
         self.exit_expected = true;
         Action::Respawn(OpenSessionDelta {
             model,
+            effort: None,
             mode,
             resume: self.conversation.clone(),
         })
@@ -442,7 +443,12 @@ impl Adapter for AgyAdapter {
                 self.exit_expected = true;
                 Ok(vec![Action::Interrupt])
             }
-            Command::SetModel { model } => Ok(vec![self.respawn(Some(model), None)]),
+            // `agy --help` lists `--effort`, but `agy models` only offers ids with the effort
+            // baked in (`gemini-3.1-pro-high`) and a base id is not known to be accepted by
+            // `--model`, so the caller passes the composed id (`CatalogModel::model_id_for`) and
+            // `effort` is not sent separately. Upgrade path: pass `--effort` once a base id is
+            // verified to work.
+            Command::SetModel { model, .. } => Ok(vec![self.respawn(Some(model), None)]),
             Command::SetMode { mode } => Ok(vec![self.respawn(None, Some(mode))]),
             Command::Approve { .. } | Command::Answer { .. } => Err(AdapterError::Unsupported(
                 "agy approvals go through the approval hook, not the adapter",
@@ -821,6 +827,7 @@ mod tests {
             extra_args: vec!["--x".into()],
             cwd: "/work/repo".into(),
             model: Some("m1".into()),
+            effort: None,
             mode,
             resume: Some("conv-1".into()),
             new_session_id: None,
@@ -1110,10 +1117,15 @@ mod tests {
             vec![Action::Interrupt]
         );
         assert_eq!(
-            a.encode(Command::SetModel { model: "x".into() })
-                .expect("ok"),
+            // The effort rides in the composed model id; the separate field is not sent.
+            a.encode(Command::SetModel {
+                model: "x-high".into(),
+                effort: Some("high".into())
+            })
+            .expect("ok"),
             vec![Action::Respawn(OpenSessionDelta {
-                model: Some("x".into()),
+                model: Some("x-high".into()),
+                effort: None,
                 mode: None,
                 resume: Some("c9".into())
             })]
@@ -1122,6 +1134,7 @@ mod tests {
             a.encode(Command::SetMode { mode: Mode::Plan }).expect("ok"),
             vec![Action::Respawn(OpenSessionDelta {
                 model: None,
+                effort: None,
                 mode: Some(Mode::Plan),
                 resume: Some("c9".into())
             })]

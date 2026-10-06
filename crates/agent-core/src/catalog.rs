@@ -83,32 +83,134 @@ pub fn parse_claude_initialize(response_json: &Value) -> Vec<CatalogModel> {
         .collect()
 }
 
-/// agy's models from `agy models` output: `id<TAB>Display` per line. Blank lines, lines without
-/// a tab or with an empty id, and ids with whitespace are ignored.
+/// Effort levels from lowest to highest; the order dropdowns list them in.
+pub const EFFORT_ORDER: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+fn effort_rank(effort: &str) -> usize {
+    EFFORT_ORDER
+        .iter()
+        .position(|e| *e == effort)
+        .unwrap_or(EFFORT_ORDER.len())
+}
+
+/// Splits an agy id into (base, effort) when it ends in `-<effort>`.
+fn split_effort(id: &str) -> Option<(&str, &'static str)> {
+    EFFORT_ORDER.iter().find_map(|e| {
+        let base = id.strip_suffix(e)?.strip_suffix('-')?;
+        (!base.is_empty()).then_some((base, *e))
+    })
+}
+
+/// `Gemini 3.1 Pro (High)` -> `Gemini 3.1 Pro` when the parenthetical is the effort.
+fn strip_effort_label(display: &str, effort: &str) -> String {
+    let tail = format!("({})", effort);
+    let display = display.trim();
+    let lower = display.to_lowercase();
+    lower
+        .strip_suffix(&tail)
+        .and_then(|head| display.get(..head.len()))
+        .map_or_else(|| display.to_owned(), |head| head.trim_end().to_owned())
+}
+
+impl CatalogModel {
+    /// The effort a row starts on when nothing says otherwise: `medium` if offered, else the
+    /// first (lowest) one; `None` when the model has no efforts.
+    pub fn default_effort(&self) -> Option<&str> {
+        if self.efforts.iter().any(|e| e == "medium") {
+            Some("medium")
+        } else {
+            self.efforts.first().map(String::as_str)
+        }
+    }
+
+    /// The value to pass as the model for `effort` (see [`Self::default_effort`] when `None`).
+    /// agy encodes effort in the id (`<base>-<effort>`); Claude takes it separately, so its id
+    /// is returned unchanged. An effort the model does not offer falls back to the default.
+    pub fn model_id_for(&self, effort: Option<&str>) -> String {
+        if self.driver != Driver::Agy || self.efforts.is_empty() {
+            return self.id.clone();
+        }
+        let chosen = effort
+            .filter(|e| self.efforts.iter().any(|x| x == e))
+            .or_else(|| self.default_effort());
+        match chosen {
+            Some(e) => format!("{}-{e}", self.id),
+            None => self.id.clone(),
+        }
+    }
+
+    /// Whether `model_id` (what a thread reports as its model) names this model at any effort.
+    pub fn is_model(&self, model_id: &str) -> bool {
+        model_id == self.id || self.effort_in(model_id).is_some()
+    }
+
+    /// The effort encoded in `model_id` when it is this (agy) model at one of its efforts.
+    pub fn effort_in(&self, model_id: &str) -> Option<&str> {
+        if self.driver != Driver::Agy {
+            return None;
+        }
+        let (base, effort) = split_effort(model_id)?;
+        (base == self.id)
+            .then(|| self.efforts.iter().find(|e| *e == effort))
+            .flatten()
+            .map(String::as_str)
+    }
+}
+
+/// agy's models from `agy models` output: `id<TAB>Display` per line, with the effort folded into
+/// the id suffix (`gemini-3.1-pro-high`) and the display (`Gemini 3.1 Pro (High)`). Variants of
+/// one base model become ONE entry: id = the base, display without the parenthetical, efforts =
+/// the offered suffixes in low..max order. An id without an effort suffix stays as it is, with no
+/// efforts. Blank lines, lines without a tab or with an empty id, and ids with whitespace are
+/// ignored.
 pub fn parse_agy_models(tsv: &str) -> Vec<CatalogModel> {
-    tsv.lines()
-        .filter_map(|line| {
-            let (id, display) = line.trim_end_matches('\r').split_once('\t')?;
-            let (id, display) = (id.trim(), display.trim());
-            if id.is_empty() || id.contains(char::is_whitespace) {
-                return None;
+    let mut out: Vec<CatalogModel> = Vec::new();
+    for line in tsv.lines() {
+        let Some((id, display)) = line.trim_end_matches('\r').split_once('\t') else {
+            continue;
+        };
+        let (id, display) = (id.trim(), display.trim());
+        if id.is_empty() || id.contains(char::is_whitespace) {
+            continue;
+        }
+        let (base, effort) = match split_effort(id) {
+            Some((b, e)) => (b, Some(e)),
+            None => (id, None),
+        };
+        let display = match effort {
+            Some(e) => strip_effort_label(display, e),
+            None => display.to_owned(),
+        };
+        let display = if display.is_empty() {
+            base.to_owned()
+        } else {
+            display
+        };
+        let at = match out.iter().position(|m| m.id == base) {
+            Some(i) => i,
+            None => {
+                let via = (base.starts_with("claude-") || base.starts_with("gpt-"))
+                    .then(|| VIA_ANTIGRAVITY.to_owned());
+                out.push(CatalogModel {
+                    driver: Driver::Agy,
+                    id: base.to_owned(),
+                    display,
+                    description: None,
+                    efforts: Vec::new(),
+                    via,
+                });
+                out.len() - 1
             }
-            let via = (id.starts_with("claude-") || id.starts_with("gpt-"))
-                .then(|| VIA_ANTIGRAVITY.to_owned());
-            Some(CatalogModel {
-                driver: Driver::Agy,
-                id: id.to_owned(),
-                display: if display.is_empty() {
-                    id.to_owned()
-                } else {
-                    display.to_owned()
-                },
-                description: None,
-                efforts: Vec::new(),
-                via,
-            })
-        })
-        .collect()
+        };
+        if let Some(e) = effort {
+            let efforts = &mut out[at].efforts;
+            if !efforts.iter().any(|x| x == e) {
+                efforts.push(e.to_owned());
+                efforts.sort_by_key(|x| effort_rank(x));
+            }
+        }
+    }
+    out
 }
 
 /// The picker's rows: native Claude first, then Antigravity, each in catalog order, filtered by
@@ -207,16 +309,81 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
     }
 
     #[test]
-    fn agy_tsv_parses_and_tags_third_party_routes() {
+    fn agy_variants_fold_into_one_model_per_base() {
         let m = parse_agy_models(TSV);
-        assert_eq!(m.len(), 12);
-        assert_eq!(m[3].id, "gemini-3.1-pro-high");
-        assert_eq!(m[3].display, "Gemini 3.1 Pro (High)");
-        assert_eq!(m[3].driver, Driver::Agy);
-        assert_eq!(m[3].via, None);
-        assert_eq!(m[5].via.as_deref(), Some("Antigravity"));
-        assert_eq!(m[11].via.as_deref(), Some("Antigravity"));
-        assert!(m.iter().all(|m| m.efforts.is_empty()));
+        let ids: Vec<&str> = m.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gemini-3.8-flash",
+                "gemini-3.1-pro",
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "gpt-oss-120b"
+            ]
+        );
+        let flash = &m[0];
+        assert_eq!(flash.display, "Gemini 3.8 Flash");
+        assert_eq!(flash.driver, Driver::Agy);
+        // The TSV lists high, medium, low; the dropdown order is low < medium < high.
+        assert_eq!(flash.efforts, ["low", "medium", "high"]);
+        assert_eq!(m[1].efforts, ["low", "high"]);
+        assert_eq!(m[1].display, "Gemini 3.1 Pro");
+        assert_eq!(m[0].via, None);
+        assert_eq!(m[2].via.as_deref(), Some("Antigravity"));
+        assert_eq!(m[4].via.as_deref(), Some("Antigravity"));
+        // A single variant still gets its one effort.
+        assert_eq!(m[4].efforts, ["medium"]);
+        assert_eq!(m[4].display, "GPT-OSS 120B");
+    }
+
+    #[test]
+    fn agy_effort_order_covers_xhigh_and_max_and_unsuffixed_ids() {
+        let m = parse_agy_models(
+            "m-max\tM (Max)\nm-low\tM (Low)\nm-xhigh\tM (XHigh)\nplain\tPlain One\nodd-high\tOdd name\n",
+        );
+        assert_eq!(m[0].id, "m");
+        assert_eq!(m[0].efforts, ["low", "xhigh", "max"]);
+        assert_eq!(m[0].display, "M");
+        assert_eq!((m[1].id.as_str(), m[1].efforts.len()), ("plain", 0));
+        // A display without the parenthetical is kept whole.
+        assert_eq!(m[2].display, "Odd name");
+    }
+
+    #[test]
+    fn model_ids_compose_per_agent() {
+        let agy = parse_agy_models(TSV);
+        let (flash, pro, gpt) = (&agy[0], &agy[1], &agy[4]);
+        assert_eq!(flash.model_id_for(Some("low")), "gemini-3.8-flash-low");
+        assert_eq!(flash.model_id_for(None), "gemini-3.8-flash-medium");
+        // No medium: the first (lowest) effort is the default.
+        assert_eq!(pro.default_effort(), Some("low"));
+        assert_eq!(pro.model_id_for(None), "gemini-3.1-pro-low");
+        // An effort the model does not offer falls back to the default.
+        assert_eq!(pro.model_id_for(Some("max")), "gemini-3.1-pro-low");
+        assert_eq!(gpt.model_id_for(Some("high")), "gpt-oss-120b-medium");
+        // Claude's id never changes.
+        let claude = parse_claude_initialize(&init_frame());
+        assert_eq!(claude[3].model_id_for(Some("high")), "sonnet");
+        // No efforts at all: the id as listed.
+        let bare = parse_agy_models("plain\tPlain\n");
+        assert_eq!(bare[0].model_id_for(Some("high")), "plain");
+        assert_eq!(bare[0].default_effort(), None);
+    }
+
+    #[test]
+    fn a_threads_model_id_maps_back_to_its_row_and_effort() {
+        let agy = parse_agy_models(TSV);
+        let flash = &agy[0];
+        assert!(flash.is_model("gemini-3.8-flash-high"));
+        assert!(flash.is_model("gemini-3.8-flash"));
+        assert!(!flash.is_model("gemini-3.1-pro-high"));
+        assert!(!flash.is_model("gemini-3.8-flash-max"), "not an offered effort");
+        assert_eq!(flash.effort_in("gemini-3.8-flash-low"), Some("low"));
+        assert_eq!(flash.effort_in("gemini-3.8-flash"), None);
+        let claude = parse_claude_initialize(&init_frame());
+        assert_eq!(claude[3].effort_in("sonnet-high"), None);
+        assert!(claude[3].is_model("sonnet"));
     }
 
     #[test]
@@ -240,17 +407,17 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         assert_eq!(g[0].0, Driver::Claude);
         assert_eq!(g[0].1.len(), 5);
         assert_eq!(g[1].0, Driver::Agy);
-        assert_eq!(g[1].1.len(), 12);
-        assert_eq!(g[1].1[0].id, "gemini-3.8-flash-high", "stable order");
+        assert_eq!(g[1].1.len(), 5);
+        assert_eq!(g[1].1[0].id, "gemini-3.8-flash", "stable order");
 
         // Case-insensitive across id, display and description; all words must match.
         let g = group_for_picker(&all, "SONNET");
         assert_eq!(g[0].1.len(), 1);
-        assert_eq!(g[1].1.len(), 3);
-        let g = group_for_picker(&all, "pro high");
+        assert_eq!(g[1].1.len(), 1);
+        let g = group_for_picker(&all, "gemini pro");
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].0, Driver::Agy);
-        assert_eq!(g[0].1[0].id, "gemini-3.1-pro-high");
+        assert_eq!(g[0].1[0].id, "gemini-3.1-pro");
         let g = group_for_picker(&all, "efficient");
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].0, Driver::Claude);

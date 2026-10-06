@@ -45,6 +45,10 @@ pub struct OpenSession {
     pub cwd: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Reasoning effort for the whole session (Claude `--effort`). agy folds effort into its
+    /// model id (`gemini-3.1-pro-high`), so its adapter ignores this.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub mode: Mode,
     /// Native id to resume (Claude `--resume=`, agy `--conversation`).
@@ -81,8 +85,12 @@ pub enum Command {
         request: String,
         answers: Value,
     },
+    /// `effort: None` leaves the effort as it is. Claude has no in-session effort control, so
+    /// an effort different from the session's is a respawn; agy's effort is part of `model`.
     SetModel {
         model: String,
+        #[serde(default)]
+        effort: Option<String>,
     },
     SetMode {
         mode: Mode,
@@ -125,6 +133,7 @@ pub enum Action {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenSessionDelta {
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub mode: Option<Mode>,
     /// Always set by the adapter to the current native id so history carries over.
     pub resume: Option<String>,

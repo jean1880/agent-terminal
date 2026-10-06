@@ -64,8 +64,9 @@ pub struct SessionState {
 /// folded into the verified per-agent behaviour in [`Capabilities`]).
 ///
 /// A different driver always needs a handoff. Within a driver, an agent that switches models
-/// inside the session (Claude) applies the change on the next turn; one that cannot (agy) must
-/// be restarted and resumed. `caps` are the capabilities of the live (current) session.
+/// inside the session (Claude) applies the change on the next turn, unless the effort changes
+/// too (effort is a process flag, so that needs a restart); one that cannot switch in session
+/// (agy) must be restarted and resumed. `caps` are the capabilities of the live (current) session.
 pub fn plan_selection(
     caps: &Capabilities,
     current: &ModelSelection,
@@ -73,7 +74,7 @@ pub fn plan_selection(
 ) -> SelectionPlan {
     if current.driver != target.driver {
         SelectionPlan::CreateWithHandoff
-    } else if caps.model_switch_in_session {
+    } else if caps.model_switch_in_session && current.effort == target.effort {
         SelectionPlan::ApplyOnNextTurn
     } else {
         SelectionPlan::RestartSession
@@ -280,6 +281,39 @@ mod tests {
                 Some(&SelectionPlan::ApplyOnNextTurn)
             ),
             Transition::SwitchModelInSession
+        );
+    }
+
+    #[test]
+    fn a_claude_effort_change_needs_a_restart_but_a_model_change_alone_does_not() {
+        let caps = Capabilities::claude();
+        let base = selection(Driver::Claude, "sonnet", Some("medium"));
+        // Same effort, other model: in session.
+        assert_eq!(
+            plan_selection(&caps, &base, &selection(Driver::Claude, "opus", Some("medium"))),
+            SelectionPlan::ApplyOnNextTurn
+        );
+        // Effort-only change: a restart.
+        assert_eq!(
+            plan_selection(&caps, &base, &selection(Driver::Claude, "sonnet", Some("high"))),
+            SelectionPlan::RestartSession
+        );
+        // Model and effort together: also a restart.
+        assert_eq!(
+            plan_selection(&caps, &base, &selection(Driver::Claude, "opus", Some("high"))),
+            SelectionPlan::RestartSession
+        );
+        // And the decision follows the plan.
+        let mut target = claude_state();
+        target.selection = selection(Driver::Claude, "sonnet", Some("high"));
+        assert_eq!(
+            decide_transition(
+                Some(&claude_state()),
+                &target,
+                true,
+                Some(&SelectionPlan::RestartSession)
+            ),
+            Transition::RestartAndResume
         );
     }
 
