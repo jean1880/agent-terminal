@@ -756,11 +756,20 @@ impl ClaudeAdapter {
 
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let success = str_of(v, "subtype") == Some("success");
-        // An abort, or an error result whose `errors` say the run was interrupted or cancelled.
+        // An abort, or an error result whose `errors` say the user stopped the run. Only those
+        // phrases: a bare "cancel" or "interrupt" ("connection cancelled by server",
+        // "interrupted system call") is a real failure and keeps its error text.
         let said_cancelled = (is_error || !success)
             && strings_of(v, "errors").iter().any(|e| {
                 let e = e.to_ascii_lowercase();
-                e.contains("interrupt") || e.contains("cancel")
+                [
+                    "interrupted by user",
+                    "cancelled by user",
+                    "canceled by user",
+                    "request was aborted",
+                ]
+                .iter()
+                .any(|p| e.contains(p))
             });
         let aborted = matches!(
             str_of(v, "terminal_reason"),
@@ -1820,14 +1829,21 @@ mod tests {
             ),
             TurnState::Interrupted
         );
-        // A genuine failure stays one.
-        assert_eq!(
-            state(
-                &mut a,
-                json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "errors": ["boom"]})
-            ),
-            TurnState::Failed
-        );
+        // A genuine failure stays one, even when its text mentions cancelling.
+        for error in [
+            "boom",
+            "connection cancelled by server",
+            "interrupted system call",
+        ] {
+            assert_eq!(
+                state(
+                    &mut a,
+                    json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "errors": [error]})
+                ),
+                TurnState::Failed,
+                "{error}"
+            );
+        }
     }
 
     #[test]

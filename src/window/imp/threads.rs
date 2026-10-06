@@ -590,11 +590,27 @@ fn read_history_within(
         }
     }
     if start.is_some() {
-        let turn = history
+        // The first whole turn starts at its prompt, which is stored before the agent's
+        // `TurnStarted`: cut at the last user message before that, else at the turn itself. A
+        // window holding no turn start (one turn longer than the limit) starts at its first
+        // prompt, or as it is when it has none.
+        let prompt = |e: &Envelope| {
+            matches!(
+                e.event,
+                Event::ItemStarted {
+                    kind: ItemKind::UserMessage,
+                    ..
+                }
+            )
+        };
+        let cut = match history
             .iter()
             .position(|e| matches!(e.event, Event::TurnStarted { .. }))
-            .unwrap_or(0);
-        history.drain(..turn);
+        {
+            Some(turn) => history[..turn].iter().rposition(prompt).unwrap_or(turn),
+            None => history.iter().position(prompt).unwrap_or(0),
+        };
+        history.drain(..cut);
         history.insert(
             0,
             Envelope::new(Event::Notice {
@@ -3376,7 +3392,21 @@ mod tests {
         let store = Store::open_in_memory().expect("store");
         let thread = store.create_thread("/w", Some("t")).expect("thread");
         let note = |text: String| Envelope::new(Event::Notice { text });
+        // Each turn as a session stores it: the prompt first, then the agent's turn start.
         for turn in 0..10 {
+            store
+                .append_event(
+                    &thread,
+                    None,
+                    &Envelope::new(Event::ItemStarted {
+                        kind: ItemKind::UserMessage,
+                        title: format!("p{turn}"),
+                        input: None,
+                        parent: None,
+                    })
+                    .item(format!("u{turn}")),
+                )
+                .expect("event");
             store
                 .append_event(
                     &thread,
@@ -3386,7 +3416,7 @@ mod tests {
                     }),
                 )
                 .expect("event");
-            for step in 0..4 {
+            for step in 0..3 {
                 store
                     .append_event(&thread, None, &note(format!("{turn}.{step}")))
                     .expect("event");
@@ -3395,15 +3425,48 @@ mod tests {
         let text = |e: &Envelope| match &e.event {
             Event::Notice { text } => text.clone(),
             Event::TurnStarted { model } => model.clone().unwrap_or_default(),
+            Event::ItemStarted { title, .. } => title.clone(),
             _ => String::new(),
         };
-        // 50 events, limit 12: the newest 12 start mid-turn 7, so the cut moves on to turn 8.
+        // 50 events, limit 12: the newest 12 start mid-turn 7, so the cut moves on to turn 8,
+        // starting at its prompt.
         let history = read_history_within(&store, &thread, 12).expect("read");
         let got: Vec<String> = history.iter().map(text).collect();
         assert!(got[0].contains("only its most recent part"), "{got:?}");
-        assert_eq!(got[1], "t8");
-        assert_eq!(got.last().map(String::as_str), Some("9.3"));
+        assert_eq!(got[1..3], ["p8", "t8"], "{got:?}");
+        assert_eq!(got.last().map(String::as_str), Some("9.2"));
         assert_eq!(got.len(), 1 + 10);
+        // One turn longer than the window: no turn start in it, so it is shown from its first
+        // prompt, or as it is.
+        let long = store.create_thread("/w", Some("long")).expect("thread");
+        for step in 0..10 {
+            if step == 7 {
+                // A queued follow-up prompt inside the long turn: the window starts there.
+                store
+                    .append_event(
+                        &long,
+                        None,
+                        &Envelope::new(Event::ItemStarted {
+                            kind: ItemKind::UserMessage,
+                            title: "follow-up".into(),
+                            input: None,
+                            parent: None,
+                        })
+                        .item("u-long"),
+                    )
+                    .expect("event");
+            }
+            store
+                .append_event(&long, None, &note(format!("s{step}")))
+                .expect("event");
+        }
+        // Newest 5: s6, follow-up, s7, s8, s9; the cut drops s6.
+        let got: Vec<String> = read_history_within(&store, &long, 5)
+            .expect("read")
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(got[1..], ["follow-up", "s7", "s8", "s9"], "{got:?}");
         // A thread that fits is replayed whole, with no notice.
         let whole = read_history_within(&store, &thread, 50).expect("read");
         assert_eq!(whole.len(), 50);

@@ -185,7 +185,8 @@ fn scrub_value(key: Option<&str>, v: Value) -> Value {
     }
 }
 
-/// How many of a thread's newest rows [`Store::heal_split_deltas`] searches.
+/// How far back, in global `seq` numbers from a thread's newest row, [`Store::heal_split_deltas`]
+/// searches (rows of other threads in that range count against it).
 const HEAL_WINDOW: i64 = 4000;
 
 pub struct Store {
@@ -602,7 +603,16 @@ impl Store {
             Event::ItemCompleted { .. } | Event::ContentSnapshot { .. }
         ) {
             if let Some(item) = &scrubbed.item {
-                self.heal_split_deltas(thread, item)?;
+                // Under a savepoint: a heal that fails is undone on its own and the event is
+                // still stored (each delta row is already scrubbed alone).
+                self.conn.execute_batch("SAVEPOINT heal")?;
+                match self.heal_split_deltas(thread, item) {
+                    Ok(()) => self.conn.execute_batch("RELEASE heal")?,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not re-scrub an item's streamed text");
+                        self.conn.execute_batch("ROLLBACK TO heal; RELEASE heal")?;
+                    }
+                }
             }
         }
         self.touch(thread, now)?;
@@ -616,8 +626,10 @@ impl Store {
     /// empty the rest (their `seq` stays) and drop those rows' `raw` frames,
     /// which carry the fragments verbatim.
     ///
-    /// Ceiling: only the thread's most recent [`HEAL_WINDOW`] rows are
-    /// searched (there is no item column to index), and an item that never
+    /// Ceiling: only rows within [`HEAL_WINDOW`] sequence numbers of the
+    /// thread's newest are searched (there is no item column to index;
+    /// `seq` is global, so other threads' rows interleaved there shrink the
+    /// window), and an item that never
     /// completes or snapshots keeps its fragments. Upgrade path: an indexed
     /// `item` column, or carrying a per-item tail in memory at append time.
     fn heal_split_deltas(&self, thread: &str, item: &str) -> Result<()> {
@@ -749,7 +761,6 @@ impl Store {
         Ok(item)
     }
 
-    /// Events after `after_seq` (exclusive), oldest first, at most `limit`.
     /// The `seq` just before the newest `n` events of `thread`, to pass as `after_seq` to
     /// [`Store::events`]; `None` when the thread has `n` or fewer events (so all of it fits).
     pub fn tail_after(&self, thread: &str, n: usize) -> Result<Option<i64>> {
@@ -764,6 +775,7 @@ impl Store {
             .optional()?)
     }
 
+    /// Events after `after_seq` (exclusive), oldest first, at most `limit`.
     pub fn events(
         &self,
         thread: &str,

@@ -165,6 +165,11 @@ const SENSITIVE_NAMES: &[&str] = &[
     ".cargo",
     ".gitlab-ci.yml",
     ".circleci",
+    // Project-level agent config: hooks, permissions and MCP servers the next agent run obeys.
+    ".claude",
+    ".gemini",
+    ".agents",
+    ".mcp.json",
 ];
 
 /// `target` below `base`, as components, trying `base` as given and then resolved (the target
@@ -1088,6 +1093,10 @@ mod tests {
             ".husky/pre-push",
             ".cargo/config.toml",
             ".GIT/config",
+            ".claude/settings.json",
+            ".gemini/config/hooks.json",
+            ".agents/x",
+            ".mcp.json",
         ] {
             assert_eq!(policy(acc, &at(rel), &w), Ask, "{rel}");
         }

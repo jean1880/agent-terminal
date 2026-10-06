@@ -1062,11 +1062,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// A thinking block whose text never streams (the model withheld it) must not end as an
-    /// empty, openable "Thought process"; one with text stays openable.
     /// Needs a realised window and a running main loop, so it is not part of the window smoke
     /// test. Run it on a private display: the preview MCP's `preview_app` with the test binary
-    /// and `jump_to_latest_returns_to_the_bottom --ignored --exact --nocapture`.
+    /// and `jump_to_latest_returns_to_the_bottom --ignored --nocapture`.
     #[test]
     #[ignore = "presents a window; run on a private display"]
     fn jump_to_latest_returns_to_the_bottom() {
@@ -1172,6 +1170,8 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// A thinking block whose text never streams (the model withheld it) must not end as an
+    /// empty, openable "Thought process"; one with text stays openable.
     pub(crate) fn reasoning_ui_checks() {
         use agent_core::event::{Event, ItemKind, ItemStatus, StreamKind};
 

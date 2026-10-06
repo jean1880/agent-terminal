@@ -245,9 +245,10 @@ fn terminate(shared: &Rc<Shared>) {
 /// the main loop is over by then, so [`terminate`]'s timer would never fire (and agents run in
 /// their own session, so nothing else would stop them).
 ///
-/// A group is signalled only while its leader is unreaped (running, or a zombie no one reaps once
-/// the loop is over), so a reused pid is never hit. Ceiling: a tool child that left the group
-/// (`setsid`) is not reached; see [`Shared::signal`].
+/// A group is signalled only while a process with the leader's pid exists (running, or a zombie
+/// no one reaps once the loop is over, which keeps its pid reserved). Ceilings: a leader GLib
+/// reaped just before quitting, whose pid was reused within that instant, would be hit; a tool
+/// child that left the group (`setsid`) is not reached (see [`Shared::signal`]).
 pub fn terminate_all() {
     let groups = LIVE.with(|l| std::mem::take(&mut *l.borrow_mut()));
     let signal_group = |pid: i32, signal: i32| {
