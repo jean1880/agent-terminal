@@ -18,7 +18,7 @@ use agent_core::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
 };
 use agent_core::catalog::Replacement;
-use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind};
+use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind, TurnState};
 use agent_core::handoff_budget::{
     handoff_budget, handoff_coverage, provider_message_with_handoff, render_history,
     select_history, HistoricalMessage, Role, DEFAULT_HANDOFF_TOKEN_CAP,
@@ -51,7 +51,8 @@ pub struct AgentLaunch {
     /// The agent's configured default effort, used when the switch names none.
     pub default_effort: Option<String>,
     pub env: LaunchEnv,
-    /// agy: the approval socket for the new process. `None` runs it read-only (plan mode).
+    /// agy: the approval socket for the new process. `None`: no hook, so agy cannot ask (Ask runs
+    /// as Plan; see [`effective_mode`]).
     pub approval: Option<ApprovalHandle>,
 }
 
@@ -141,6 +142,21 @@ struct Inner {
     local_seq: Cell<u64>,
     /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
     generation: Cell<u64>,
+    /// The mode the user last chose. The running mode can differ (agy without its hook cannot
+    /// ask), and a switch to an agent that can honour it goes back to it.
+    wanted_mode: Cell<Mode>,
+}
+
+/// The mode a session can actually run in. agy without its approval hook cannot ask before
+/// acting (headless, it has nobody to ask), so Ask becomes Plan there. Verified live: agy's own
+/// plan mode is not read-only either (it plans, then applies edits); only shell commands are
+/// refused without `--dangerously-skip-permissions`. The notice says so.
+fn effective_mode(hookless_agy: bool, wanted: Mode) -> Mode {
+    if hookless_agy && wanted == Mode::Ask {
+        Mode::Plan
+    } else {
+        wanted
+    }
 }
 
 /// One thread's chat backend. See the module docs.
@@ -197,11 +213,9 @@ impl ChatSession {
     ) -> Rc<Self> {
         let driver = adapter.driver();
         open.approval_hook = approval.is_some();
-        let hookless_agy = driver == Driver::Agy && approval.is_none() && open.mode != Mode::Plan;
-        if hookless_agy {
-            // The adapter forces `--mode plan` without the hook; say so in the status too.
-            open.mode = Mode::Plan;
-        }
+        let hookless_agy = driver == Driver::Agy && approval.is_none();
+        let wanted_mode = open.mode;
+        open.mode = effective_mode(hookless_agy, wanted_mode);
         let provider_thread = match store.active_provider_thread(&thread) {
             Ok(Some(p)) => p,
             _ => match create_provider_thread(&store, &thread, driver, open.model.as_deref()) {
@@ -241,9 +255,12 @@ impl ChatSession {
             ctl_seq: Cell::new(0),
             local_seq: Cell::new(0),
             generation: Cell::new(0),
+            wanted_mode: Cell::new(wanted_mode),
         });
         inner.attach_approval();
-        if hookless_agy {
+        // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
+        // edits does not repeat it on every reopen.
+        if inner.state.borrow().mode != wanted_mode {
             inner.hookless_notice();
         }
         inner.start_process();
@@ -326,9 +343,11 @@ impl Inner {
     fn hookless_notice(&self) {
         self.emit(Envelope::new(Event::Notice {
             text: format!(
-                "Antigravity is running read-only (plan mode): the approval hook is not \
-                 available. To let it edit files and run commands after asking you, add \
-                 this top-level entry to ~/.gemini/config/hooks.json:\n{}",
+                "Antigravity cannot ask you before acting: the approval hook is not installed. \
+                 It refuses shell commands, but applies file edits on its own in every mode \
+                 (in Plan it writes a plan first, then edits). Ask before edits is not \
+                 available. To have it ask you first, add this top-level entry to \
+                 ~/.gemini/config/hooks.json:\n{}",
                 crate::hook_config::install_entry_json()
             ),
         }));
@@ -531,11 +550,12 @@ impl Inner {
         });
     }
 
-    /// The hook is not gating agy: stop it now and carry on read-only (plan mode, no socket).
+    /// The hook is not gating agy: stop it now and carry on without the skip flag (plan mode, no
+    /// socket), so commands are refused again.
     fn trip_canary(self: &Rc<Self>) {
-        warn!("agy ran a tool without a hook query; restarting it read-only");
+        warn!("agy ran a tool without a hook query; restarting it without the skip flag");
         self.error(
-            "agy ran a tool without asking agent-terminal; the approval hook is not active \u{2014} restarting read-only",
+            "agy ran a tool without asking agent-terminal; the approval hook is not active \u{2014} restarting it in plan mode without --dangerously-skip-permissions (it refuses commands, but may still edit files)",
         );
         self.stop_current();
         *self.approval.borrow_mut() = None; // closes the socket
@@ -556,14 +576,19 @@ impl Inner {
             return;
         }
         info!(code = ?code, "agent exited");
-        self.finish_process(code);
+        self.finish_process(code, false);
     }
 
     /// Closes out the current process: adapter exit envelopes, status, pending approvals.
-    fn finish_process(&self, code: Option<i32>) {
+    /// `deliberate`: the app stopped it (a switch or a close), so its exit is expected and an
+    /// open turn was interrupted, never failed.
+    fn finish_process(&self, code: Option<i32>, deliberate: bool) {
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
-        let envelopes = self.adapter.borrow_mut().on_exit(code);
+        let mut envelopes = self.adapter.borrow_mut().on_exit(code);
+        if deliberate {
+            envelopes.iter_mut().for_each(as_deliberate_stop);
+        }
         {
             let mut state = self.state.borrow_mut();
             state.alive = false;
@@ -580,7 +605,7 @@ impl Inner {
     /// Stops the process on purpose; its own exit callback is then ignored.
     fn stop_current(&self) {
         self.generation.set(self.generation.get() + 1);
-        self.finish_process(None);
+        self.finish_process(None, true);
     }
 
     /// A dead process (agy after an interrupt) is restarted resuming its native session.
@@ -683,8 +708,10 @@ impl Inner {
     /// `resume` to the native id so history carries over).
     fn respawn(self: &Rc<Self>, delta: &OpenSessionDelta) {
         self.stop_current();
-        // Without the hook agy stays read-only whatever was asked.
-        let mode = delta.mode.filter(|_| !self.forced_plan());
+        // Without the hook agy cannot ask, so Ask is never put on its command line.
+        let mode = delta
+            .mode
+            .map(|m| effective_mode(self.ask_unavailable(), m));
         let native = self.state.borrow().native_id.clone();
         {
             let mut open = self.open.borrow_mut();
@@ -710,8 +737,9 @@ impl Inner {
         self.start_process();
     }
 
-    /// agy with no approval handle: the adapter forces `--mode plan`, so the mode is not settable.
-    fn forced_plan(&self) -> bool {
+    /// agy with no approval handle: Plan and Accept edits go to its `--mode` flag, but it cannot
+    /// ask before acting.
+    fn ask_unavailable(&self) -> bool {
         self.approval().is_none() && self.adapter.borrow().driver() == Driver::Agy
     }
 
@@ -814,22 +842,30 @@ impl Inner {
                 return;
             }
         }
-        self.command(Command::Approve {
+        // Claude and Codex never acknowledge an answer, so once the adapter has accepted it and
+        // written it, the card is resolved here; otherwise it would sit at "Allow…" for good.
+        let sent = self.command(Command::Approve {
             request: request.to_owned(),
             decision,
             updated_input: None,
             message: None,
         });
+        if sent {
+            self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+        }
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
-        if self.forced_plan() {
-            if mode != Mode::Plan {
-                self.emit(Envelope::new(Event::Notice {
-                    text: "Antigravity stays read-only (plan mode) until the approval hook is installed."
-                        .to_owned(),
-                }));
-            }
+        self.wanted_mode.set(mode);
+        if self.ask_unavailable() && mode == Mode::Ask {
+            self.emit(Envelope::new(Event::Notice {
+                text: "Antigravity cannot ask before edits until the approval hook is installed; \
+                       it stays in its current mode."
+                    .to_owned(),
+            }));
+            // The picker shows the mode actually running.
+            let current = self.state.borrow().mode;
+            self.emit(Envelope::new(Event::ModeChanged { mode: current }));
             return;
         }
         if self.command(Command::SetMode { mode }) {
@@ -1021,8 +1057,11 @@ impl Inner {
         *self.adapter.borrow_mut() = launch.adapter;
         *self.launch_env.borrow_mut() = launch.env;
         *self.approval.borrow_mut() = launch.approval;
-        // agy without its hook is read-only whatever the thread was in.
+        // The user's own mode, as far as the new agent can honour it (agy without its hook
+        // cannot ask). A thread that went through hookless agy gets its Ask back here.
         let hookless_agy = driver == Driver::Agy && self.approval().is_none();
+        let new_mode = effective_mode(hookless_agy, self.wanted_mode.get());
+        let mode_changed = self.state.borrow().mode != new_mode;
         {
             let mut open = self.open.borrow_mut();
             // The new agent's own binary and arguments, from its profile.
@@ -1033,9 +1072,7 @@ impl Inner {
             open.resume = None;
             open.new_session_id =
                 (driver == Driver::Claude).then(|| glib::uuid_string_random().to_string());
-            if hookless_agy {
-                open.mode = Mode::Plan;
-            }
+            open.mode = new_mode;
         }
         {
             let mut state = self.state.borrow_mut();
@@ -1045,23 +1082,27 @@ impl Inner {
             state.native_id = None;
             state.commands.clear();
             state.running_turn = false;
-            if hookless_agy {
-                state.mode = Mode::Plan;
-            }
+            state.mode = new_mode;
         }
         self.attach_approval();
         *self.pending_handoff.borrow_mut() = (carried > 0).then_some(summary);
         self.emit(Envelope::new(Event::Notice {
-            text: format!(
-                "Continuing in {} with {carried} earlier messages",
-                driver_label(driver)
-            ),
+            text: if carried == 0 {
+                format!("Switched to {}", driver_label(driver))
+            } else {
+                format!(
+                    "Continuing in {} with {carried} earlier messages",
+                    driver_label(driver)
+                )
+            },
         }));
         if let Some(m) = model {
             self.emit(Envelope::new(Event::ModelChanged { model: m }));
         }
+        if mode_changed {
+            self.emit(Envelope::new(Event::ModeChanged { mode: new_mode }));
+        }
         if hookless_agy {
-            self.emit(Envelope::new(Event::ModeChanged { mode: Mode::Plan }));
             self.hookless_notice();
         }
         self.start_process();
@@ -1166,6 +1207,19 @@ impl ChatBackend for ChatSession {
     }
 }
 
+/// Rewrites an exit event for a stop the app asked for: the adapter cannot tell that from a
+/// crash, but the session can.
+fn as_deliberate_stop(env: &mut Envelope) {
+    match &mut env.event {
+        Event::SessionExited { expected, .. } => *expected = true,
+        Event::TurnCompleted { state, error, .. } if *state == TurnState::Failed => {
+            *state = TurnState::Interrupted;
+            *error = None;
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,10 +1317,10 @@ mod tests {
                 sink,
                 None,
             );
-            // Without the hook: read-only, and the user is told.
+            // Without the hook agy cannot ask: Ask runs as Plan, and the user is told.
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::Notice { text } if text.contains("read-only"))
+                |e| matches!(e, Event::Notice { text } if text.contains("cannot ask you before acting"))
             ));
             assert_eq!(session.status().mode, Mode::Plan);
 
@@ -1495,7 +1549,7 @@ mod tests {
             assert!(Path::new(hook).is_absolute());
             assert!(
                 !has(&seen, |e| matches!(e, Event::Notice { .. })),
-                "no read-only notice"
+                "no hook notice"
             );
             assert_eq!(session.status().mode, Mode::Ask);
 
@@ -1566,6 +1620,10 @@ mod tests {
                 &seen,
                 |e| matches!(e, Event::Error { message } if message.contains("not supported"))
             ));
+            assert!(
+                !has(&seen, |e| matches!(e, Event::ApprovalResolved { .. })),
+                "a refused answer leaves the card open"
+            );
 
             let id = session.control(Control::McpStatus);
             assert_eq!(id, "ctl-1");
@@ -1577,6 +1635,64 @@ mod tests {
             // Let the replay process finish so the test does not leave one behind.
             drop(session);
             let _ = ctx;
+        });
+    }
+
+    #[test]
+    fn a_stop_the_app_asked_for_is_never_reported_as_a_crash() {
+        // The live bug: switching an idle Claude thread to agy showed "Turn failed: The agent
+        // exited unexpectedly" (Claude's `init` had opened a turn).
+        let mut adapter = agent_core::claude::ClaudeAdapter::new();
+        adapter.feed(
+            r#"{"type":"system","subtype":"init","session_id":"s1","model":"opus","cwd":"/w"}"#,
+        );
+        let mut envs = adapter.on_exit(None);
+        assert!(envs.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        )));
+        envs.iter_mut().for_each(as_deliberate_stop);
+        for e in &envs {
+            match &e.event {
+                Event::SessionExited { expected, .. } => assert!(*expected),
+                Event::TurnCompleted { state, error, .. } => {
+                    assert_eq!(*state, TurnState::Interrupted);
+                    assert!(error.is_none());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_the_adapter_accepts_resolves_the_card() {
+        // Claude never acknowledges an answer: without this the card sits at "Allow…" for good.
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("opus"),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.respond_approval("r1", Decision::AllowForSession);
+            assert!(seen.borrow().iter().any(|e| {
+                e.request.as_deref() == Some("r1")
+                    && matches!(
+                        e.event,
+                        Event::ApprovalResolved {
+                            decision: Decision::AllowForSession
+                        }
+                    )
+            }));
         });
     }
 
@@ -1877,40 +1993,56 @@ mod tests {
         });
     }
 
+    fn claude_on(mode: Mode, log: &Log) -> (Rc<ChatSession>, Seen) {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, "/w");
+        let (sink, seen) = make_sink();
+        let session = ChatSession::new(
+            FakeAdapter::boxed(Driver::Claude, log),
+            OpenSession {
+                program: "unused".into(),
+                extra_args: Vec::new(),
+                cwd: "/".into(),
+                model: None,
+                effort: None,
+                mode,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+            },
+            store,
+            thread,
+            sink,
+            None,
+        );
+        let log2 = log.clone();
+        session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
+        (session, seen)
+    }
+
     #[test]
-    fn switching_to_agy_without_its_hook_lands_read_only() {
+    fn hookless_agy_keeps_accept_edits_and_turns_ask_into_plan_until_you_leave_it() {
         in_loop(|_| {
-            let store = Rc::new(Store::open_in_memory().expect("store"));
-            let thread = fresh(&store, "/w");
-            let (sink, seen) = make_sink();
+            // Accept edits is a real agy flag: it carries over.
             let log: Log = Rc::default();
-            let session = ChatSession::new(
-                FakeAdapter::boxed(Driver::Claude, &log),
-                OpenSession {
-                    program: "unused".into(),
-                    extra_args: Vec::new(),
-                    cwd: "/".into(),
-                    model: None,
-                    effort: None,
-                    mode: Mode::AcceptEdits,
-                    resume: None,
-                    new_session_id: None,
-                    approval_hook: false,
-                },
-                store,
-                thread,
-                sink,
-                None,
-            );
-            let log2 = log.clone();
-            session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
+            let (session, _) = claude_on(Mode::AcceptEdits, &log);
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert_eq!(session.status().driver, Driver::Agy);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+
+            // Ask cannot be honoured without the hook: Plan, and the user is told why.
+            let log: Log = Rc::default();
+            let (session, seen) = claude_on(Mode::Ask, &log);
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert_eq!(session.status().mode, Mode::Plan);
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::Notice { text } if text.contains("read-only"))
+                |e| matches!(e, Event::Notice { text } if text.contains("cannot ask you before acting"))
             ));
+            // Back on Claude, the thread is in Ask again (the live bug: it stayed in Plan).
+            session.switch(Driver::Claude, Some("sonnet".into()), None);
+            assert_eq!(session.status().driver, Driver::Claude);
+            assert_eq!(session.status().mode, Mode::Ask);
         });
     }
 
@@ -2176,8 +2308,8 @@ mod tests {
     }
 
     #[test]
-    fn hookless_agy_stays_in_plan_mode_when_asked_for_more() {
-        in_loop(|_| {
+    fn hookless_agy_takes_plan_and_accept_edits_as_flags_but_never_ask() {
+        in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
@@ -2190,18 +2322,46 @@ mod tests {
                 sink,
                 None,
             );
-            assert_eq!(session.status().mode, Mode::Plan);
-            session.set_mode(Mode::AcceptEdits);
+            // Asked for Ask (the scripted session's mode): Plan, and the user is told why.
             assert_eq!(session.status().mode, Mode::Plan);
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::Notice { text } if text.contains("stays read-only"))
+                |e| matches!(e, Event::Notice { text } if text.contains("cannot ask you before acting"))
             ));
-            // A model switch (respawn) cannot lift it either.
+            assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
+                .len()
+                == 1));
+
+            // Accept edits goes to agy's own flag, through a respawn.
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
+                .len()
+                == 2));
+
+            // Ask is refused and changes nothing.
+            session.set_mode(Mode::Ask);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("cannot ask before edits"))
+            ));
+            // A model switch (respawn) keeps the mode.
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
-            assert_eq!(session.status().mode, Mode::Plan);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
+                .len()
+                == 3));
+
             let args = lines(tmp.path().join("args.log"));
-            assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
+            assert!(args[0].contains("--mode plan"), "{args:?}");
+            assert!(args[1].contains("--mode accept-edits"), "{args:?}");
+            assert!(args[2].contains("--mode accept-edits"), "{args:?}");
+            assert!(
+                args.iter()
+                    .all(|a| !a.contains("--dangerously-skip-permissions")),
+                "{args:?}"
+            );
         });
     }
 

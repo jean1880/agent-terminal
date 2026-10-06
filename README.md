@@ -60,8 +60,14 @@ and any CLI can still run in a terminal.
 agy runs tools without asking unless it has a hook to ask with. agent-terminal
 runs agy with `--dangerously-skip-permissions` **only** when its own approval
 hook is installed in `~/.gemini/config/hooks.json`. Each tool call then waits
-for your answer in the thread. Without the hook, agy runs read-only, in plan
-mode, and the thread tells you so.
+for your answer in the thread.
+
+Without the hook, the mode picker drives agy's own `--mode` flag (Plan or Accept
+edits), and **Ask before edits is unavailable**: headless agy has nobody to ask.
+Be aware of what that means, because it was verified live: without the skip flag
+agy refuses shell commands in every mode, but **it applies file edits in every
+mode, Plan included** (it writes a plan, then carries it out). The thread tells
+you so. Install the hook if you want agy to ask first.
 
 To install the hook, add this entry as a top-level key of
 `~/.gemini/config/hooks.json`. Settings → Agents shows the same entry, with a
@@ -89,7 +95,8 @@ Copy button and whether it is installed. The app generates it with
 
 The hook does nothing outside agent-terminal, because the socket variable is
 unset there. The app also checks that the hook really fires: if agy runs a tool
-without asking first, the thread is restarted read-only.
+without asking first, the thread is restarted without
+`--dangerously-skip-permissions`.
 
 ## Features ✨
 
@@ -191,7 +198,8 @@ without asking first, the thread is restarted read-only.
 - **Threads are stored** in `$XDG_STATE_HOME/agent-terminal/threads.db`
   (`~/.local/state/…`), with every stored event redacted. 2.x tab restore still
   applies to terminal pages.
-- **agy runs read-only** until you install its approval hook (see above).
+- **agy cannot ask before acting** until you install its approval hook (see
+  above): it refuses commands, but edits files on its own.
 
 ## Upgrading from 1.x ⬆️
 

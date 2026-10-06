@@ -19,7 +19,7 @@ use crate::model_catalog::ModelCatalog;
 const MODES: [(Mode, &str); 3] = [
     (Mode::Ask, "Ask before edits"),
     (Mode::AcceptEdits, "Accept edits"),
-    (Mode::Plan, "Plan (read-only)"),
+    (Mode::Plan, "Plan"),
 ];
 
 /// Effort levels offered when the catalogue lists none for the agent.
@@ -496,7 +496,8 @@ impl AgentTerminalWindow {
             .title("Hook Entry")
             .subtitle(
                 "Add it as a top-level key of ~/.gemini/config/hooks.json. Until it is \
-                 installed, agy runs read-only (plan mode).",
+                 installed, agy cannot ask before acting: it refuses shell commands but \
+                 applies file edits on its own, in Plan mode too.",
             )
             .build();
         expander.add_row(&json);
@@ -514,7 +515,7 @@ impl AgentTerminalWindow {
                     }
                     Err(_) => {
                         hook.set_subtitle(
-                            "Not installed: agy runs read-only until the entry below is added",
+                            "Not installed: agy cannot ask before acting until the entry below is added",
                         );
                         hook.add_css_class("error");
                     }

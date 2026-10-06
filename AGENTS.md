@@ -127,10 +127,12 @@ Architectural mandates, standards, and workflows for this codebase.
   proven**: the flag is passed only with an approval socket bound after
   `hook_config::check_installed` accepted the hooks file (`ApprovalHandle::
   bind_checked`, given the verdict of the off-main-thread `check_hook`; a
-  verdict not yet in is an `Err`). Without it, agy is forced to `--mode plan`. The adapter strips
-  the flag from profile arguments. The session's canary restarts agy read-only
-  if a tool step arrives without a hook query. Never add a path that sets the
-  flag any other way.
+  verdict not yet in is an `Err`). Without it, the mode picker drives agy's own `--mode`
+  flag (Plan, Accept edits) and Ask is unavailable, because headless agy cannot ask. Never
+  describe hookless agy as read-only: verified live, it refuses shell commands without the flag
+  but applies file edits in every mode, Plan included. The adapter strips the flag from
+  profile arguments. The session's canary restarts agy without the flag if a tool step arrives
+  without a hook query. Never add a path that sets the flag any other way.
 - **Every persisted or injected text is redacted**: the store scrubs every
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the

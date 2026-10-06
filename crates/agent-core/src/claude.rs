@@ -16,7 +16,8 @@
 //! - The `seen` dedup set is capped at [`SEEN_CAP`] entries and then cleared; a replay older than
 //!   that window would be shown twice.
 //! - `ApprovalResolved` is only emitted for approvals the CLI cancels or that die with the
-//!   process; the UI already knows the decision it sent.
+//!   process. The CLI never acknowledges an answer, so the session resolves the card itself once
+//!   the answer is written (`ChatSession::respond_approval`).
 
 use std::collections::{HashMap, HashSet};
 

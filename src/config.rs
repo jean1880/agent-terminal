@@ -276,10 +276,10 @@ fn apply_known_settings(profile: &mut Profile) {
     }
 }
 
-/// The profiles a fresh install starts with — the three clients the old
-/// `CliClient` enum hard-coded, in the same preference order.
+/// The profiles a fresh install starts with: the chat agents, in preference order. The
+/// standalone Gemini CLI is not one (Gemini is reached through agy).
 fn default_profiles() -> Vec<Profile> {
-    ["Claude", "Agy", "Gemini"]
+    ["Claude", "Agy", "Codex"]
         .iter()
         .map(|name| {
             let mut profile = Profile {
@@ -1389,19 +1389,26 @@ mod tests {
     #[test]
     fn a_v1_config_keeps_its_pinned_client_as_a_profile() {
         // Dropping cli_client on the floor would silently move a user who had
-        // pinned Gemini back to auto-detection.
+        // pinned Claude back to auto-detection.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::File::create(&path)
             .unwrap()
-            .write_all(br#"{"cli_client":"gemini","scrollback_lines":700}"#)
+            .write_all(br#"{"cli_client":"claude","scrollback_lines":700}"#)
             .unwrap();
 
         let loaded = TerminalConfig::load_from(&path);
-        assert_eq!(loaded.default_profile.as_deref(), Some("Gemini"));
+        assert_eq!(loaded.default_profile.as_deref(), Some("Claude"));
         assert_eq!(loaded.scrollback_lines, 700);
         // And the default profile list is materialised for it.
-        assert!(loaded.profiles.iter().any(|p| p.command == "gemini"));
+        assert!(loaded.profiles.iter().any(|p| p.command == "claude"));
+
+        // The standalone Gemini CLI is no longer a default profile, so a 1.x Gemini pin falls
+        // back to auto-detection instead of naming a profile that does not exist.
+        std::fs::write(&path, br#"{"cli_client":"gemini"}"#).unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.default_profile, None);
+        assert!(!loaded.profiles.iter().any(|p| p.command == "gemini"));
     }
 
     #[test]

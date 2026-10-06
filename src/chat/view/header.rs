@@ -16,7 +16,7 @@ pub fn mode_label(mode: Mode) -> &'static str {
     match mode {
         Mode::Ask => "Ask before edits",
         Mode::AcceptEdits => "Accept edits",
-        Mode::Plan => "Plan (read-only)",
+        Mode::Plan => "Plan",
     }
 }
 

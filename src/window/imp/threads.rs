@@ -409,14 +409,15 @@ pub(super) async fn wait_until(
     true
 }
 
-/// Waits (at most [`CATALOG_WAIT`]) for `driver`'s model list to be fresh.
+/// Waits (at most [`CATALOG_WAIT`]) for `driver`'s model list to be fresh, or for its fetch to
+/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s.
 async fn wait_for_fresh_catalog(driver: Driver) {
     let catalog = ModelCatalog::shared();
-    let fresh = wait_until(CATALOG_WAIT, std::time::Duration::from_millis(100), || {
-        catalog.is_fresh(driver)
+    wait_until(CATALOG_WAIT, std::time::Duration::from_millis(100), || {
+        catalog.is_settled(driver)
     })
     .await;
-    if !fresh {
+    if !catalog.is_fresh(driver) {
         info!(
             "{} model list not fresh after {:?}; starting on the stored model",
             driver_label(driver),
@@ -648,8 +649,8 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
 }
 
 /// agy's approval socket, only once its hooks file is proven to install the hook (`hook` is the
-/// verdict of [`check_hook`]). `None`: agy runs read-only and the session explains how to
-/// install it.
+/// verdict of [`check_hook`]). `None`: agy runs without the skip flag, cannot ask before acting,
+/// and the session explains how to install it.
 fn bind_approval(
     hook: Result<(), String>,
     thread: &str,
@@ -659,7 +660,7 @@ fn bind_approval(
     match ApprovalHandle::bind_checked(hook, thread, std::path::Path::new(cwd), mode) {
         Ok(handle) => Some(handle),
         Err(reason) => {
-            info!("agy runs read-only in this thread: {reason}");
+            info!("agy runs without its approval hook in this thread: {reason}");
             None
         }
     }
@@ -683,8 +684,8 @@ pub(super) async fn check_hook() -> Result<(), String> {
 }
 
 /// The last [`check_hook`] verdict. Fail-closed: before any check has finished it is an `Err`, so
-/// agy starts read-only rather than guess. (A stale `Ok` is safe too: the session's canary stops
-/// agy and restarts it read-only when a tool runs without a hook query.)
+/// agy starts without the skip flag rather than guess. (A stale `Ok` is safe too: the session's
+/// canary stops agy and restarts it without the flag when a tool runs without a hook query.)
 fn cached_hook_verdict() -> Result<(), String> {
     HOOK_VERDICT
         .with(|v| v.borrow().clone())
@@ -3026,7 +3027,7 @@ mod tests {
         assert!(before
             .as_ref()
             .is_err_and(|e| e.contains("not been checked")));
-        // And it stays closed through the binding: no socket, so agy runs read-only.
+        // And it stays closed through the binding: no socket, so agy runs without the skip flag.
         assert!(bind_approval(before, "t", "/tmp", Mode::Ask).is_none());
         HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Err("not installed".into())));
         assert_eq!(cached_hook_verdict(), Err("not installed".to_owned()));

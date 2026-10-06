@@ -62,6 +62,9 @@ pub struct AgyAdapter {
     conversation: Option<String>,
     model: Option<String>,
     turn_open: bool,
+    /// A prompt was written and its turn has not opened yet. agy prints `init` as soon as it
+    /// starts, prompt or not, so `init` opens a turn only when one is waiting.
+    prompt_pending: bool,
     /// Ids of items started and not yet completed, in start order.
     open_items: Vec<String>,
     side_seq: u64,
@@ -89,6 +92,7 @@ impl AgyAdapter {
             conversation: None,
             model: None,
             turn_open: false,
+            prompt_pending: false,
             open_items: Vec::new(),
             side_seq: 0,
             side_kinds: HashMap::new(),
@@ -207,6 +211,7 @@ impl AgyAdapter {
     }
 
     fn ensure_turn(&mut self, out: &mut Vec<Envelope>) {
+        self.prompt_pending = false;
         if !self.turn_open {
             self.turn_open = true;
             out.push(Envelope::new(Event::TurnStarted {
@@ -228,8 +233,11 @@ impl AgyAdapter {
             model: init.model,
             cwd: init.cwd,
         }));
-        // The prompt is written before agy prints `init`, so a turn is already under way.
-        self.ensure_turn(out);
+        // A prompt written with the spawn is already a turn; an idle spawn (a thread opened or
+        // switched to agy before anything was asked) is not, and must not show as working.
+        if self.prompt_pending {
+            self.ensure_turn(out);
+        }
     }
 
     fn on_step(&mut self, step: &Step, out: &mut Vec<Envelope>) {
@@ -363,11 +371,15 @@ impl Adapter for AgyAdapter {
     }
 
     /// Fail-safe: `--dangerously-skip-permissions` makes the app's PreToolUse hook the ONLY gate,
-    /// so it is passed solely when the hook is installed (`approval_hook`). Without the hook any
-    /// mode other than Plan is forced down to `--mode plan` (read-only) rather than running
-    /// ungated. Plan itself never needs the flag. For the same reason `session.extra_args` can
-    /// never carry it (`--dangerously-skip-permissions` or `--dangerously-skip-permissions=…`):
-    /// those are dropped silently (no I/O here) and the adapter alone decides.
+    /// so it is passed solely when the hook is installed (`approval_hook`). Plan never needs it.
+    /// For the same reason `session.extra_args` can never carry it
+    /// (`--dangerously-skip-permissions` or `--dangerously-skip-permissions=…`): those are dropped
+    /// silently (no I/O here) and the adapter alone decides.
+    ///
+    /// The mode is agy's own `--mode` flag. Without the hook, agy cannot ask before acting, so Ask
+    /// is sent as `--mode plan` (the session normally never asks for it). Verified live: headless
+    /// agy refuses shell commands without the skip flag in every mode, but applies file edits in
+    /// every mode, Plan included (it plans, then edits).
     fn argv(&self, session: &OpenSession) -> Vec<String> {
         let mut argv = vec![session.program.clone()];
         argv.extend(
@@ -398,10 +410,12 @@ impl Adapter for AgyAdapter {
             argv.push(id.clone());
         }
         let plan = || ["--mode", "plan"].map(str::to_owned);
+        let accept_edits = || ["--mode", "accept-edits"].map(str::to_owned);
         match (session.mode, session.approval_hook) {
-            (Mode::Plan, _) | (_, false) => argv.extend(plan()),
+            (Mode::Plan, _) | (Mode::Ask, false) => argv.extend(plan()),
+            (Mode::AcceptEdits, false) => argv.extend(accept_edits()),
             (Mode::AcceptEdits, true) => {
-                argv.extend(["--mode", "accept-edits"].map(str::to_owned));
+                argv.extend(accept_edits());
                 argv.push("--dangerously-skip-permissions".to_owned());
             }
             (Mode::Ask, true) => argv.push("--dangerously-skip-permissions".to_owned()),
@@ -436,6 +450,7 @@ impl Adapter for AgyAdapter {
                     "event": "user",
                     "message": {"role": "user", "content": text},
                 });
+                self.prompt_pending = true;
                 Ok(vec![Action::Write(vec![line.to_string()])])
             }
             Command::Interrupt => {
@@ -571,7 +586,9 @@ impl Adapter for AgyAdapter {
         let mut out = Vec::new();
         self.close_all(&mut out);
         let expected = std::mem::take(&mut self.exit_expected);
-        if std::mem::take(&mut self.turn_open) {
+        // A prompt that never got its turn (agy died before `init`) failed all the same.
+        let pending = std::mem::take(&mut self.prompt_pending);
+        if std::mem::take(&mut self.turn_open) || pending {
             out.push(env(Event::TurnCompleted {
                 state: if expected {
                     TurnState::Interrupted
@@ -1069,13 +1086,16 @@ mod tests {
     }
 
     #[test]
-    fn argv_without_hook_is_forced_read_only() {
+    fn argv_without_hook_maps_modes_to_flags_and_never_skips_permissions() {
         let a = AgyAdapter::default();
-        for mode in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
+        for (mode, flag) in [
+            (Mode::Ask, "plan"),
+            (Mode::AcceptEdits, "accept-edits"),
+            (Mode::Plan, "plan"),
+        ] {
             let argv = a.argv(&session(mode, false));
-            assert!(argv.windows(2).any(|w| w == ["--mode", "plan"]), "{mode:?}");
+            assert!(argv.windows(2).any(|w| w == ["--mode", flag]), "{mode:?}");
             assert!(!argv.contains(&"--dangerously-skip-permissions".to_owned()));
-            assert!(!argv.contains(&"accept-edits".to_owned()));
         }
     }
 
@@ -1346,8 +1366,41 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_spawn_prints_init_without_starting_a_turn() {
+        // Verified live: agy prints `init` straight after spawn, before any input.
+        let mut a = AgyAdapter::default();
+        let ev = a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e.event, Event::SessionStarted { .. })));
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e.event, Event::TurnStarted { .. })),
+            "an idle agent must not show as working"
+        );
+        // Stopping it then is no failed turn.
+        let ev = a.on_exit(Some(0));
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e.event, Event::TurnCompleted { .. })));
+        // The prompt's own `user_input` step opens the turn.
+        let mut a = AgyAdapter::default();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        a.encode(Command::Prompt { text: "hi".into() })
+            .expect("prompt");
+        let ev = a.feed(
+            r#"{"event":"step_update","step_update":{"state":"DONE","step_index":0,"step_type":"user_input"}}"#,
+        );
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e.event, Event::TurnStarted { .. })));
+    }
+
+    #[test]
     fn on_exit_with_an_open_turn_completes_it() {
         let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() })
+            .expect("prompt");
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
         let ev = a.on_exit(Some(1));
         assert!(matches!(
@@ -1363,6 +1416,8 @@ mod tests {
         ));
 
         let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() })
+            .expect("prompt");
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
         a.encode(Command::Interrupt).expect("interrupt");
         let ev = a.on_exit(Some(130));
