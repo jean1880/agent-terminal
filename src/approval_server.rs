@@ -471,6 +471,7 @@ impl ApprovalHandle {
         Ok(Self { inner })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn socket_path(&self) -> &Path {
         &self.inner.path
     }
@@ -525,6 +526,7 @@ impl ApprovalHandle {
         Self::bind_default(thread, workspace, mode)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn has_pending(&self, request: &str) -> bool {
         self.inner.pending.borrow().contains_key(request)
     }

@@ -405,7 +405,7 @@ pub fn resolve_working_directory(starting_dir: &str, home_dir: &str) -> String {
 /// a space, a quote, or a `$` would otherwise be re-split or expanded by that
 /// shell. Single quotes suppress all expansion; an embedded single quote is
 /// closed, escaped and reopened.
-fn shell_quote(arg: &str) -> String {
+pub fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 

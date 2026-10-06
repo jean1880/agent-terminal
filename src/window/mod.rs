@@ -2,6 +2,7 @@
 
 mod diff_panel;
 mod imp;
+pub(crate) mod sidebar_model;
 
 use gtk4::gio;
 use gtk4::glib;

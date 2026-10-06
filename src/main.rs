@@ -10,20 +10,18 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
-#[allow(dead_code)] // Wired into the window in wave 3.
 mod agent_proc;
 mod approval_hook;
-#[allow(dead_code)] // Wired into the window in wave 3.
 mod approval_server;
-#[allow(dead_code)] // Wired into the window in wave 3.
 mod chat;
 pub mod config;
-#[allow(dead_code)] // Wired into the window in wave 3.
 mod hook_config;
 #[cfg(test)]
 mod testutil;
 mod theme;
 mod utils;
+// Temporary stand-ins until v3/catalog (model catalogue, account status) is merged.
+mod v3_stubs;
 mod window;
 // The GTK-free logic lives in `agent-kit`; these imports keep the
 // `crate::git::…` style paths used throughout the app.
@@ -142,6 +140,8 @@ fn main() -> glib::ExitCode {
             ("win.search", &["<Ctrl><Shift>F"]),
             ("win.toggle-diff", &["<Ctrl><Shift>D"]),
             ("win.new-tab-worktree", &["<Ctrl><Shift>G"]),
+            ("win.toggle-sidebar", &["F9", "<Ctrl>B"]),
+            ("win.toggle-drawer", &["<Ctrl>grave"]),
             // Both the shifted and unshifted key, so Ctrl+= works on layouts
             // where + needs Shift.
             (
@@ -416,6 +416,51 @@ fn load_css() {
            be read must never be mistaken for a healthy one. */
         .unknown-indicator {
             color: #a0a0ff;
+        }
+        /* 3.0 thread sidebar */
+        .thread-sidebar {
+            background-color: #141120;
+            border-right: 1px solid #2d2444;
+        }
+        .thread-list {
+            background-color: transparent;
+        }
+        .thread-list row.folder-row {
+            padding-top: 10px;
+        }
+        .folder-label {
+            color: #8a84b8;
+            margin-start: 6px;
+        }
+        .thread-row {
+            padding: 2px 2px;
+        }
+        .thread-title {
+            color: #c8c8ff;
+        }
+        .thread-title.open {
+            color: #ebe9ff;
+            font-weight: bold;
+        }
+        .thread-dot.dot-claude { color: #f0a37a; }
+        .thread-dot.dot-agy { color: #6ec8ff; }
+        .thread-term { color: #a0a0ff; }
+        .thread-badge.badge-approval { color: #ffcc66; }
+        .thread-badge.badge-limited { color: #ff7878; }
+        .thread-badge.badge-unread { color: #b49bff; }
+        .thread-close {
+            min-width: 20px;
+            min-height: 20px;
+            padding: 0;
+        }
+        .sidebar-footer {
+            border-top: 1px solid #2d2444;
+        }
+        .terminal-drawer {
+            border-top: 1px solid #2d2444;
+        }
+        .hook-entry {
+            color: #c8c8ff;
         }
         ",
     );

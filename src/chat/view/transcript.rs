@@ -345,6 +345,7 @@ impl TranscriptView {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // kept as API for the spike measurements
     pub fn materialised(&self) -> usize {
         let mut n = 0;
         let mut child = self.list.first_child();

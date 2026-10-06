@@ -48,6 +48,7 @@ impl Popup {
         self.open && self.len > 0
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn selected(&self) -> usize {
         self.selected
     }

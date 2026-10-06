@@ -204,6 +204,7 @@ impl AgentProcess {
     }
 
     /// SIGTERM, then SIGKILL if it is still there after a short grace.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn terminate(&self) {
         terminate(&self.shared);
     }

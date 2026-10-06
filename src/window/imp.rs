@@ -1,5 +1,8 @@
 //! Private implementation details of the AgentTerminalWindow.
 
+mod agents_prefs;
+mod threads;
+
 use super::diff_panel::DiffPanel;
 use crate::config::{Profile, SessionFormat};
 use crate::handoff::QuotaState;
@@ -81,6 +84,9 @@ struct TabState {
     /// Set for a tab opened by New Tab in Worktree, so closing it can offer
     /// to remove a worktree left clean.
     worktree: Option<crate::worktree::WorktreeInfo>,
+    /// A chat thread page (3.0). `None`: a 2.x terminal page. For a thread, `terminal`
+    /// is its drawer's shell.
+    chat: Option<threads::ChatTab>,
 }
 
 /// How long a tab's output must be still before its turn counts as over and
@@ -691,6 +697,11 @@ pub struct AgentTerminalWindow {
     quota_poll_running: std::cell::Cell<bool>,
     /// Wraps the tab view, for short confirmations that need no dialog.
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
+    /// The thread sidebar beside the pages.
+    split_view: RefCell<Option<adw::OverlaySplitView>>,
+    sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
+    /// The tab view, or the empty state when no page is open.
+    pages_stack: RefCell<Option<gtk4::Stack>>,
 }
 
 #[glib::object_subclass]
@@ -912,6 +923,9 @@ impl AgentTerminalWindow {
             .borrow()
             .iter()
             .find(|t| t.page == page)
+            // A thread's drawer shell counts only while it has the keyboard: copy, paste and
+            // search otherwise belong to the chat.
+            .filter(|t| t.chat.is_none() || t.terminal.has_focus())
             .map(|t| t.terminal.clone())
     }
 
@@ -964,6 +978,8 @@ impl AgentTerminalWindow {
                 if let Some(terminal) = obj.imp().current_terminal() {
                     debug!("Action: Copy");
                     terminal.copy_clipboard_format(Format::Text);
+                } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&obj) {
+                    let _ = focus.activate_action("clipboard.copy", None);
                 }
             }
         ));
@@ -978,6 +994,8 @@ impl AgentTerminalWindow {
                 if let Some(terminal) = obj.imp().current_terminal() {
                     debug!("Action: Paste");
                     terminal.paste_clipboard();
+                } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&obj) {
+                    let _ = focus.activate_action("clipboard.paste", None);
                 }
             }
         ));
@@ -1245,6 +1263,69 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&toggle_diff);
+
+        // 3.0: the thread sidebar and a thread's terminal drawer.
+        let toggle_sidebar = gtk4::gio::SimpleAction::new("toggle-sidebar", None);
+        toggle_sidebar.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| obj.imp().toggle_sidebar()
+        ));
+        obj.add_action(&toggle_sidebar);
+        let toggle_drawer = gtk4::gio::SimpleAction::new("toggle-drawer", None);
+        toggle_drawer.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| obj.imp().toggle_drawer()
+        ));
+        obj.add_action(&toggle_drawer);
+
+        // New Thread With <agent>, by driver key.
+        let new_thread_agent =
+            gtk4::gio::SimpleAction::new("new-thread-agent", Some(&String::static_variant_type()));
+        new_thread_agent.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let driver = target
+                    .and_then(|t| t.get::<String>())
+                    .and_then(|k| crate::window::sidebar_model::parse_driver(&k));
+                let imp = obj.imp();
+                imp.new_chat_thread(driver, imp.current_dir(), None);
+            }
+        ));
+        obj.add_action(&new_thread_agent);
+
+        // New Terminal Thread as <profile>: the 2.x terminal page, for any profile.
+        let new_terminal = gtk4::gio::SimpleAction::new(
+            "new-terminal-profile",
+            Some(&String::static_variant_type()),
+        );
+        new_terminal.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let Some(name) = target.and_then(|t| t.get::<String>()) else {
+                    return;
+                };
+                let imp = obj.imp();
+                let profile = imp
+                    .config
+                    .borrow()
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .cloned();
+                match profile {
+                    Some(profile) => {
+                        let dir = profile_tab_dir(profile.dir.as_deref(), imp.current_dir());
+                        imp.add_terminal_tab(Some(&profile), dir.as_deref());
+                    }
+                    None => warn!("No profile named '{name}'"),
+                }
+            }
+        ));
+        obj.add_action(&new_terminal);
 
         // New Tab in Folder Action (opens a folder picker)
         let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
@@ -1562,61 +1643,38 @@ impl AgentTerminalWindow {
         let tab_view = adw::TabView::new();
         *self.tab_view.borrow_mut() = Some(tab_view.clone());
 
-        // `autohide` hides the bar whenever a single tab (or none) is open,
-        // so it only appears once there are actually multiple tabs.
-        let tab_bar = adw::TabBar::builder()
-            .view(&tab_view)
-            .autohide(true)
-            .expand_tabs(true)
-            .build();
-
-        // "New tab" in the header bar. A split button rather than a plain one:
-        // clicking it clones the current tab's profile and directory as before,
-        // while the dropdown launches any configured profile directly. That is
-        // the whole point of profiles being data — a second CLI, or the same one
-        // rooted in a different project, is one click away without a trip
-        // through Settings.
+        // Chat-first: the sidebar navigates; the tab view is the hidden page stack, with no
+        // tab bar. "New" in the header is a split button: click opens a thread on the default
+        // agent in the current folder; the menu has every other way to start one.
         if let Some(header) = self.header.borrow().as_ref() {
-            let new_tab_menu = self.build_profile_menu("win.new-tab-profile", |_| true);
-            new_tab_menu.append_section(None, &self.build_session_section());
-
-            let new_tab_btn = adw::SplitButton::builder()
-                .icon_name("tab-new-symbolic")
-                .tooltip_text("New Tab (Ctrl+Shift+T; Ctrl+Alt+1–9 for a specific CLI)")
-                .menu_model(&new_tab_menu)
+            let new_btn = adw::SplitButton::builder()
+                .icon_name("list-add-symbolic")
+                .tooltip_text("New Thread (Ctrl+Shift+T)")
+                .menu_model(&self.build_new_menu())
                 .build();
-            new_tab_btn.connect_clicked(glib::clone!(
+            new_btn.connect_clicked(glib::clone!(
                 #[weak]
                 obj,
                 move |_| {
                     obj.imp().new_tab();
                 }
             ));
-            header.pack_start(&new_tab_btn);
+            header.pack_start(&new_btn);
 
-            // Same split shape: click keeps the current profile, the dropdown
-            // picks the CLI to run in the chosen folder.
-            let new_tab_folder_btn = adw::SplitButton::builder()
-                .icon_name("folder-new-symbolic")
-                .tooltip_text("New Tab in Folder…")
-                .menu_model(&self.build_profile_menu("win.new-tab-folder-profile", |_| true))
+            let drawer_btn = Button::builder()
+                .icon_name("utilities-terminal-symbolic")
+                .tooltip_text("Terminal Drawer (Ctrl+`)")
+                .action_name("win.toggle-drawer")
                 .build();
-            new_tab_folder_btn.connect_clicked(glib::clone!(
-                #[weak]
-                obj,
-                move |_| {
-                    obj.imp().new_tab_in_folder(None);
-                }
-            ));
-            header.pack_start(&new_tab_folder_btn);
+            let diff_btn = Button::builder()
+                .icon_name("view-dual-symbolic")
+                .tooltip_text("Show or Hide Changes (Ctrl+Shift+D)")
+                .action_name("win.toggle-diff")
+                .build();
+            header.pack_end(&diff_btn);
+            header.pack_end(&drawer_btn);
         }
-
-        container.append(&tab_bar);
-        let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&tab_view));
-        toast_overlay.set_vexpand(true);
-        container.append(&toast_overlay);
-        *self.toast_overlay.borrow_mut() = Some(toast_overlay);
+        self.setup_shell(container, &tab_view);
 
         // Immediately confirm tab closures (no unsaved-state prompt for a terminal).
         tab_view.connect_close_page(|view, page| {
@@ -1624,20 +1682,8 @@ impl AgentTerminalWindow {
             glib::Propagation::Stop // the closure handled the close request
         });
 
-        // Close the window once the last tab is gone.
-        tab_view.connect_notify_local(
-            Some("n-pages"),
-            glib::clone!(
-                #[weak]
-                obj,
-                move |view, _| {
-                    if view.n_pages() == 0 {
-                        info!("Last tab closed, closing window");
-                        obj.close();
-                    }
-                }
-            ),
-        );
+        // The last page closing leaves the empty state (see `setup_shell`), not a closed
+        // window: the threads are still in the sidebar.
 
         // Forget a tab's tracked state when it is removed — or, when it is being
         // dragged to another window, park it for that window to pick up.
@@ -1723,20 +1769,57 @@ impl AgentTerminalWindow {
         // A window opened *for* a resume shows that session rather than an
         // extra blank tab beside it. Restored tabs still come back: restoring is
         // the user's standing preference, and the resume is added to it.
+        // 2.x terminal pages come back as before; threads open as they were left. Nothing
+        // restored shows the empty state rather than a blank thread nobody asked for.
         let pending: Vec<ResumeRequest> = self.pending_resumes.take();
-        if !self.restore_previous_session(profile) && pending.is_empty() {
-            self.add_terminal_tab(profile, None);
-        }
+        self.restore_previous_session(profile);
+        self.restore_open_threads();
         for request in pending {
             self.open_resume_tab(request);
         }
+        self.refresh_sidebar();
+    }
+
+    /// The header's New menu: threads first, then resume and hand-off, then terminal pages.
+    fn build_new_menu(&self) -> gtk4::gio::Menu {
+        let menu = gtk4::gio::Menu::new();
+        let threads = gtk4::gio::Menu::new();
+        threads.append(Some("New Thread"), Some("win.new-tab"));
+        let with = gtk4::gio::Menu::new();
+        for driver in [
+            agent_core::adapter::Driver::Claude,
+            agent_core::adapter::Driver::Agy,
+        ] {
+            let item = gtk4::gio::MenuItem::new(
+                Some(crate::window::sidebar_model::driver_label(driver)),
+                None,
+            );
+            item.set_action_and_target_value(
+                Some("win.new-thread-agent"),
+                Some(&crate::window::sidebar_model::driver_key(driver).to_variant()),
+            );
+            with.append_item(&item);
+        }
+        threads.append_submenu(Some("New Thread With"), &with);
+        threads.append(Some("New Thread in Folder…"), Some("win.new-tab-folder"));
+        threads.append(
+            Some("New Thread in Worktree…"),
+            Some("win.new-tab-worktree"),
+        );
+        menu.append_section(None, &threads);
+        menu.append_section(None, &self.build_session_section());
+        let terminal = gtk4::gio::Menu::new();
+        terminal.append_submenu(
+            Some("New Terminal Thread"),
+            &self.build_profile_menu("win.new-terminal-profile", |_| true),
+        );
+        menu.append_section(None, &terminal);
+        menu
     }
 
     /// Opens a new tab rooted in the current tab's directory (fast path).
     fn new_tab(&self) {
-        let dir = self.current_dir();
-        let profile = self.active_profile.borrow().clone();
-        self.add_terminal_tab(profile.as_ref(), dir.as_deref());
+        self.new_chat_thread(None, self.current_dir(), None);
     }
 
     /// Prompts for a folder, then opens a new tab rooted there running `profile`,
@@ -1768,8 +1851,17 @@ impl AgentTerminalWindow {
                         if let Some(path) = file.path() {
                             let imp = obj.imp();
                             let dir = path.to_string_lossy().to_string();
-                            let profile = profile.or_else(|| imp.active_profile.borrow().clone());
-                            imp.add_terminal_tab(profile.as_ref(), Some(&dir));
+                            match profile {
+                                // A profile with no chat adapter runs as a terminal page.
+                                Some(p) if crate::config::profile_driver(&p).is_none() => {
+                                    imp.add_terminal_tab(Some(&p), Some(&dir));
+                                }
+                                p => imp.new_chat_thread(
+                                    p.as_ref().and_then(crate::config::profile_driver),
+                                    Some(dir),
+                                    None,
+                                ),
+                            }
                         }
                     }
                     // Dismissing the picker is a normal outcome, not a failure.
@@ -1967,6 +2059,7 @@ impl AgentTerminalWindow {
             checkpoint: CheckpointTrack::default(),
             diff_panel: diff_panel.clone(),
             worktree: None,
+            chat: None,
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
@@ -2188,6 +2281,7 @@ impl AgentTerminalWindow {
             .tabs
             .borrow()
             .iter()
+            .filter(|t| t.chat.is_none())
             .take(crate::config::SessionState::MAX_TABS)
             .map(|t| crate::config::SessionTab {
                 profile: t.profile.clone(),
@@ -2305,6 +2399,15 @@ impl AgentTerminalWindow {
         let Some(tab_view) = self.tab_view.borrow().clone() else {
             return;
         };
+        // A thread restarts its agent itself (on the next prompt); there is no page to swap.
+        if self
+            .tabs
+            .borrow()
+            .iter()
+            .any(|t| &t.page == page && t.chat.is_some())
+        {
+            return;
+        }
         let (dir, session_id, profile) = self
             .tabs
             .borrow()
@@ -3120,6 +3223,7 @@ impl AgentTerminalWindow {
             }
         ));
 
+        self.add_agents_page(&dialog);
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
 
@@ -3165,8 +3269,11 @@ impl AgentTerminalWindow {
     /// not lose the project.
     fn new_tab_with_profile(&self, profile: &Profile) {
         let dir = profile_tab_dir(profile.dir.as_deref(), self.current_dir());
-        info!("Opening a tab for profile '{}'", profile.name);
-        self.add_terminal_tab(Some(profile), dir.as_deref());
+        info!("Opening a thread for profile '{}'", profile.name);
+        match crate::config::profile_driver(profile) {
+            Some(driver) => self.new_chat_thread(Some(driver), dir, None),
+            None => self.add_terminal_tab(Some(profile), dir.as_deref()),
+        }
     }
 
     /// Opens a tab resuming a session, or queues it until the window can.
@@ -3262,6 +3369,10 @@ impl AgentTerminalWindow {
                     profile.name, dir
                 );
                 let dir = dir.or_else(|| profile.dir.clone());
+                // Claude and agy sessions resume as chat threads; other CLIs in a terminal.
+                if self.resume_mapped(&profile, &session_id, dir.clone()) {
+                    return;
+                }
                 self.add_terminal_tab_launching(
                     Some(&profile),
                     dir.as_deref(),
@@ -3313,6 +3424,9 @@ impl AgentTerminalWindow {
                         fallback
                     }
                 };
+                if imp.resume_mapped(&profile, &session_id, dir.clone()) {
+                    return;
+                }
                 imp.add_terminal_tab_launching(
                     Some(&profile),
                     dir.as_deref(),
@@ -3696,6 +3810,22 @@ impl AgentTerminalWindow {
         else {
             return;
         };
+        // A thread hands itself over in place: budgeted, redacted, shown as a switch divider.
+        if let Some(slot) = self.current_slot() {
+            use crate::chat::ChatBackend as _;
+            match crate::config::profile_driver(&target) {
+                Some(driver) => slot.switch(driver, None),
+                None => present_message(
+                    &self.obj(),
+                    "Cannot Continue There",
+                    &format!(
+                        "'{}' has no chat adapter. Open it from New Terminal Thread instead.",
+                        target.name
+                    ),
+                ),
+            }
+            return;
+        }
 
         let (source, dir, session_id, since_ms, screen_tail) = {
             let tabs = self.tabs.borrow();
@@ -3806,14 +3936,21 @@ impl AgentTerminalWindow {
                 match written {
                     Ok(path) => {
                         let prompt = crate::handoff::handoff_prompt(&from, &path);
-                        obj.imp().add_terminal_tab_launching(
-                            Some(&target),
-                            Some(&tab_dir),
-                            Launch::New {
-                                session_id: None,
-                                prompt: Some(&prompt),
-                            },
-                        );
+                        match crate::config::profile_driver(&target) {
+                            // The brief's pointer is the new thread's first message.
+                            Some(driver) => {
+                                obj.imp()
+                                    .new_chat_thread(Some(driver), Some(tab_dir), Some(prompt))
+                            }
+                            None => obj.imp().add_terminal_tab_launching(
+                                Some(&target),
+                                Some(&tab_dir),
+                                Launch::New {
+                                    session_id: None,
+                                    prompt: Some(&prompt),
+                                },
+                            ),
+                        }
                     }
                     Err(reason) => {
                         error!("Hand-off failed: {reason}");
@@ -4403,12 +4540,20 @@ impl AgentTerminalWindow {
 
     /// Opens a tab in a worktree just created, and remembers it is one.
     fn open_worktree_tab(&self, info: crate::worktree::WorktreeInfo, profile: Option<Profile>) {
-        let profile = profile.or_else(|| self.active_profile.borrow().clone());
         let dir = info.path.to_string_lossy().to_string();
-        self.add_terminal_tab(profile.as_ref(), Some(&dir));
+        match &profile {
+            Some(p) if crate::config::profile_driver(p).is_none() => {
+                self.add_terminal_tab(Some(p), Some(&dir));
+            }
+            p => self.new_chat_thread(
+                p.as_ref().and_then(crate::config::profile_driver),
+                Some(dir.clone()),
+                None,
+            ),
+        }
         let page = {
             let mut tabs = self.tabs.borrow_mut();
-            // The tab just added, unless adding failed and the last is another.
+            // The page just added, unless adding failed and the last is another.
             tabs.last_mut().filter(|t| t.dir == dir).map(|t| {
                 t.worktree = Some(info.clone());
                 t.page.clone()
@@ -5151,6 +5296,37 @@ mod tests {
         // Here rather than in a test of its own: GTK belongs to the one
         // thread that initialised it, and tests run on several.
         diff_panel_shows_each_outcome();
+        chat_shell_opens_threads_and_lists_them(&window);
+    }
+
+    /// The chat-first shell, without a main loop: nothing is resolved or spawned (the agent
+    /// commands point nowhere anyway), only the pages, the registry and the sidebar.
+    fn chat_shell_opens_threads_and_lists_them(window: &super::super::AgentTerminalWindow) {
+        use agent_core::adapter::Driver;
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        let container = Box::new(Orientation::Vertical, 0);
+        imp.setup_terminal_ui(&container, None);
+        assert_eq!(
+            imp.tabs.borrow().len(),
+            0,
+            "nothing restored, no blank thread"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_s = dir.path().to_string_lossy().into_owned();
+        imp.new_chat_thread(Some(Driver::Agy), Some(dir_s.clone()), None);
+        imp.new_chat_thread(Some(Driver::Claude), Some(dir_s.clone()), None);
+        let tabs = imp.tabs.borrow();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs.iter().all(|t| t.chat.is_some() && t.dir == dir_s));
+        assert_eq!(tabs[0].chat.as_ref().map(|c| c.driver), Some(Driver::Agy));
+        drop(tabs);
+        let rows = imp.sidebar_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.open && r.folder == dir_s));
     }
 
     fn diff_panel_shows_each_outcome() {

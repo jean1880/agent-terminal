@@ -137,6 +137,23 @@ pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> 
     }
 }
 
+/// A fresh profile for `driver`'s chat agent, with the known CLI settings filled in. Used when
+/// Preferences → Agents edits an agent the profile list has no entry for.
+pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
+    use agent_core::adapter::Driver;
+    let (name, command) = match driver {
+        Driver::Claude => ("Claude", "claude"),
+        Driver::Agy => ("Agy", "agy"),
+    };
+    let mut profile = Profile {
+        name: name.to_string(),
+        command: command.to_string(),
+        ..Profile::default()
+    };
+    apply_known_settings(&mut profile);
+    profile
+}
+
 /// Picks the agent for a new chat thread.
 ///
 /// In order: the explicit "default agent" choice, the default profile's agent

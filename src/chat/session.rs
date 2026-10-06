@@ -148,6 +148,7 @@ impl ChatSession {
     ///   driver and `open.model` when there is none.
     /// - `approval` (agy): the socket exported to the process; envelopes for its requests flow
     ///   through this session.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn new(
         adapter: Box<dyn Adapter>,
         open: OpenSession,
@@ -231,6 +232,18 @@ impl ChatSession {
     /// Lets `switch` build an adapter for the other driver (needed for `CreateWithHandoff`).
     pub fn set_adapter_factory(&self, factory: AdapterFactory) {
         *self.inner.factory.borrow_mut() = Some(factory);
+    }
+
+    /// Seeds a new thread with a budgeted, redacted handoff (fork, compact-by-handoff): it
+    /// rides on the next real prompt, exactly like a cross-agent switch's.
+    pub fn seed_handoff(&self, summary: String, carried: usize, source: &str) {
+        if carried == 0 {
+            return;
+        }
+        *self.inner.pending_handoff.borrow_mut() = Some(summary);
+        self.inner.emit(Envelope::new(Event::Notice {
+            text: format!("Continuing from {source} with {carried} earlier messages"),
+        }));
     }
 
     #[cfg(test)]
@@ -928,7 +941,7 @@ impl Inner {
 /// The budgeted, redacted handoff of a thread's history and how many messages it carries.
 /// Tool items count as assistant history; items with no text are skipped, and an item still
 /// open (its process died with it) is described as interrupted.
-fn build_handoff(messages: &[TranscriptMessage], source: &str) -> (String, usize) {
+pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> (String, usize) {
     let history: Vec<HistoricalMessage> = messages
         .iter()
         .filter(|m| !m.text.trim().is_empty())

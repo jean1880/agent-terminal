@@ -191,6 +191,7 @@ impl Transcript {
         self.items.get(id)
     }
 
+    #[allow(dead_code)] // kept as API; exercised by tests
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Item> {
         self.items.get_mut(id)
     }
@@ -200,10 +201,12 @@ impl Transcript {
         &self.order
     }
 
+    #[allow(dead_code)] // kept as API; exercised by tests
     pub fn len(&self) -> usize {
         self.order.len()
     }
 
+    #[allow(dead_code)] // kept as API; exercised by tests
     pub fn item_for_request(&self, request: &str) -> Option<&ItemId> {
         self.requests.get(request)
     }
