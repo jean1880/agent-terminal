@@ -33,7 +33,10 @@ Architectural mandates, standards, and workflows for this codebase.
   `cargo build --release` and `cargo deb` at the root still produce the one
   shipped binary; `crates/*` are path libraries with no GTK.
   - `crates/agent-core` (pure: no GTK, no process or file I/O): `redact`
-    (secret masking applied to every hand-off brief).
+    (secret masking applied to every hand-off brief, every injected handoff
+    and every persisted event), `event` (the canonical provider-neutral event
+    stream), `caps` (per-agent capability matrix), `adapter` (the sans-I/O
+    adapter contract) and the per-agent adapters and pure policies built on it.
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,

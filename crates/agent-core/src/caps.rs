@@ -25,6 +25,10 @@ pub struct Capabilities {
     pub streams_text: bool,
     /// Streams reasoning text.
     pub streams_reasoning: bool,
+    /// Asks structured questions the UI answers (Claude AskUserQuestion).
+    pub questions: bool,
+    /// Has a read-only planning mode (`Mode::Plan`).
+    pub plan_mode: bool,
 }
 
 impl Capabilities {
@@ -42,6 +46,8 @@ impl Capabilities {
             compact_command: Some("/compact".to_owned()),
             streams_text: true,
             streams_reasoning: true,
+            questions: true,
+            plan_mode: true,
         }
     }
 
@@ -59,6 +65,8 @@ impl Capabilities {
             compact_command: None,
             streams_text: true,
             streams_reasoning: false,
+            questions: false,
+            plan_mode: true,
         }
     }
 }

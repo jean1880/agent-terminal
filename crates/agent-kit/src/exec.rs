@@ -2,7 +2,7 @@
 
 use tracing::debug;
 
-/// [`run_capture`] for a command already built — for callers that also set
+/// `run_capture` (in the app's `utils.rs`) for a command already built — for callers that also set
 /// its environment. `name` is how errors refer to it.
 ///
 /// Blocking: call it off the main thread.

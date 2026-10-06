@@ -1564,18 +1564,6 @@ mod tests {
     }
 
     #[test]
-    fn local_config_file_parses_cleanly() {
-        let path = std::path::PathBuf::from("/home/jdesroches/.config/agent-terminal/config.json");
-        if path.exists() {
-            let config = TerminalConfig::load_from(&path);
-            assert_eq!(config.indicators.len(), 1);
-            assert_eq!(config.indicators[0].label, "LiteLLM");
-            assert_eq!(config.indicators[0].icon_ok, "network-server-symbolic");
-            assert!(take_load_problem().is_none(), "load problem was reported");
-        }
-    }
-
-    #[test]
     fn a_pre_handoff_agy_profile_gains_resume_and_handoff_settings() {
         // Saved before Agy could resume: nothing but name and command.
         let dir = tempfile::tempdir().unwrap();

@@ -126,6 +126,16 @@ pub enum Event {
     ApprovalResolved {
         decision: Decision,
     },
+    /// The approval can no longer be answered (the process that asked has exited).
+    ApprovalExpired,
+    /// The questions were answered or withdrawn; the UI closes the card.
+    QuestionResolved {
+        answered: bool,
+    },
+    /// The session's permission mode changed (reply to a mode switch, or agent-initiated).
+    ModeChanged {
+        mode: crate::adapter::Mode,
+    },
     /// Structured questions (Claude AskUserQuestion).
     QuestionRequested {
         questions: Vec<Question>,
@@ -157,7 +167,8 @@ pub enum Event {
     Notice {
         text: String,
     },
-    /// Reply to a control request (`Envelope::request` is the request id).
+    /// Reply to a control request (`Envelope::request` is the request id). Exactly one of
+    /// `ok` / `error` is set; a successful reply with no payload is `ok: Some(Value::Null)`.
     ControlResult {
         #[serde(default)]
         ok: Option<Value>,
@@ -168,6 +179,8 @@ pub enum Event {
         message: String,
     },
     /// A native frame this adapter does not map (kept in `raw`; never aborts the stream).
+    /// Also what an older build reads for an event type a newer build stored.
+    #[serde(other)]
     Unknown,
 }
 
@@ -311,6 +324,12 @@ mod tests {
         let json = serde_json::to_string(&env).expect("serialize");
         let back: Envelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn unknown_event_types_from_newer_builds_decode_as_unknown() {
+        let event: Event = serde_json::from_str(r#"{"type":"from_the_future"}"#).expect("decode");
+        assert_eq!(event, Event::Unknown);
     }
 
     #[test]
