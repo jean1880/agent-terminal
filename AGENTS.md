@@ -110,7 +110,8 @@ Architectural mandates, standards, and workflows for this codebase.
 - **agy never runs with `--dangerously-skip-permissions` unless the hook is
   proven**: the flag is passed only with an approval socket bound after
   `hook_config::check_installed` accepted the hooks file (`ApprovalHandle::
-  bind_checked`). Without it, agy is forced to `--mode plan`. The adapter strips
+  bind_checked`, given the verdict of the off-main-thread `check_hook`; a
+  verdict not yet in is an `Err`). Without it, agy is forced to `--mode plan`. The adapter strips
   the flag from profile arguments. The session's canary restarts agy read-only
   if a tool step arrives without a hook query. Never add a path that sets the
   flag any other way.

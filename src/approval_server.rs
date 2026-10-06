@@ -514,15 +514,17 @@ impl ApprovalHandle {
         false
     }
 
-    /// [`Self::bind_default`] after proving agy's hooks file installs the approval hook
-    /// (`home` is `$HOME`). `Err` means: run agy read-only.
+    /// [`Self::bind_default`] only when `hook` says agy's hooks file installs the approval hook
+    /// (the result of [`crate::hook_config::check_installed`], which reads a file and so is run
+    /// off the main thread by the caller). Fail-closed: an `Err` verdict (including "not checked
+    /// yet") binds nothing and means: run agy read-only.
     pub fn bind_checked(
-        home: Option<&str>,
+        hook: Result<(), String>,
         thread: &str,
         workspace: &Path,
         mode: Mode,
     ) -> Result<Self, String> {
-        crate::hook_config::check_installed(home)?;
+        hook?;
         Self::bind_default(thread, workspace, mode)
     }
 
@@ -1316,6 +1318,21 @@ mod tests {
             assert!(handle.consume_query(&["write_to_file", "run_command"]));
             assert!(!handle.consume_query(&["run_command"]), "once only");
         });
+    }
+
+    #[test]
+    fn an_unproven_hook_binds_nothing() {
+        // Fail-closed: a failed or missing verdict never reaches the socket (which would also
+        // read the live `XDG_RUNTIME_DIR`, so only this half is exercised here).
+        for why in ["not installed", "the approval hook has not been checked yet"] {
+            let refused = ApprovalHandle::bind_checked(
+                Err(why.to_owned()),
+                "t1",
+                Path::new("/tmp"),
+                Mode::Ask,
+            );
+            assert_eq!(refused.err().as_deref(), Some(why));
+        }
     }
 
     #[test]

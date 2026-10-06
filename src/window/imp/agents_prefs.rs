@@ -483,17 +483,12 @@ impl AgentTerminalWindow {
         expander.add_row(&json);
         group.add(&expander);
 
-        let home = env::var("HOME").ok();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             hook,
             async move {
-                let installed = gtk4::gio::spawn_blocking(move || {
-                    crate::hook_config::check_installed(home.as_deref())
-                })
-                .await
-                .unwrap_or_else(|_| Err("the check panicked".to_owned()));
-                match installed {
+                // Off the main thread, and it refreshes the verdict new agy sessions use.
+                match super::threads::check_hook().await {
                     Ok(()) => {
                         hook.set_subtitle("Installed: agy asks agent-terminal before it acts");
                         hook.remove_css_class("error");

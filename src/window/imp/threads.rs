@@ -317,6 +317,8 @@ struct BuildJob {
     profile: Profile,
     resolved: ResolvedAgent,
     loaded: LoadedThread,
+    /// agy's hook verdict (always `Ok` for the others, which do not use the hook).
+    hook: Result<(), String>,
 }
 
 /// The saved open-thread ids that still exist (archived or deleted ones drop out), at most `max`.
@@ -467,7 +469,12 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
         Driver::Claude | Driver::Codex => None,
-        Driver::Agy => bind_approval(thread, cwd, profile.default_mode.unwrap_or_default()),
+        Driver::Agy => bind_approval(
+            cached_hook_verdict(),
+            thread,
+            cwd,
+            profile.default_mode.unwrap_or_default(),
+        ),
     };
     AgentLaunch {
         adapter,
@@ -494,17 +501,57 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
     }
 }
 
-/// agy's approval socket, only once its hooks file is proven to install the hook. `None`: agy
-/// runs read-only and the session explains how to install it.
-fn bind_approval(thread: &str, cwd: &str, mode: Mode) -> Option<ApprovalHandle> {
-    let home = env::var("HOME").ok();
-    match ApprovalHandle::bind_checked(home.as_deref(), thread, std::path::Path::new(cwd), mode) {
+/// agy's approval socket, only once its hooks file is proven to install the hook (`hook` is the
+/// verdict of [`check_hook`]). `None`: agy runs read-only and the session explains how to
+/// install it.
+fn bind_approval(
+    hook: Result<(), String>,
+    thread: &str,
+    cwd: &str,
+    mode: Mode,
+) -> Option<ApprovalHandle> {
+    match ApprovalHandle::bind_checked(hook, thread, std::path::Path::new(cwd), mode) {
         Ok(handle) => Some(handle),
         Err(reason) => {
             info!("agy runs read-only in this thread: {reason}");
             None
         }
     }
+}
+
+thread_local! {
+    /// The last verdict on agy's hooks file; `None` until the first check finishes.
+    static HOOK_VERDICT: RefCell<Option<Result<(), String>>> = const { RefCell::new(None) };
+}
+
+/// Reads agy's hooks file off the main thread and remembers the verdict. A thread being built
+/// awaits this; a switch to agy (which cannot wait) uses [`cached_hook_verdict`].
+pub(super) async fn check_hook() -> Result<(), String> {
+    let home = env::var("HOME").ok();
+    let verdict = gtk4::gio::spawn_blocking(move || {
+        crate::hook_config::check_installed(home.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| Err("the hooks check panicked".to_owned()));
+    HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(verdict.clone()));
+    verdict
+}
+
+/// The last [`check_hook`] verdict. Fail-closed: before any check has finished it is an `Err`, so
+/// agy starts read-only rather than guess. (A stale `Ok` is safe too: the session's canary stops
+/// agy and restarts it read-only when a tool runs without a hook query.)
+fn cached_hook_verdict() -> Result<(), String> {
+    HOOK_VERDICT
+        .with(|v| v.borrow().clone())
+        .unwrap_or_else(|| Err("the approval hook has not been checked yet".to_owned()))
+}
+
+/// Starts a [`check_hook`] without waiting for it (window start, focus, the periodic refresh).
+pub(super) fn refresh_hook_verdict() {
+    glib::MainContext::default().spawn_local(async {
+        // Only the cached verdict matters here.
+        let _ = check_hook().await;
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1485,6 +1532,11 @@ impl AgentTerminalWindow {
                 })
                 .await
                 .unwrap_or_default();
+                // agy's hooks file is read off the main thread too; the verdict gates the socket.
+                let hook = match driver {
+                    Driver::Agy => check_hook().await,
+                    Driver::Claude | Driver::Codex => Ok(()),
+                };
                 obj.imp().build_thread(
                     &page,
                     BuildJob {
@@ -1494,6 +1546,7 @@ impl AgentTerminalWindow {
                         profile,
                         resolved,
                         loaded,
+                        hook,
                     },
                 );
             }
@@ -1508,6 +1561,7 @@ impl AgentTerminalWindow {
             profile,
             resolved,
             loaded,
+            hook,
         } = job;
         let (thread, dir, profile) = (thread.as_str(), dir.as_str(), &profile);
         let Some((slot, holder)) = self.tabs.borrow().iter().find_map(|t| {
@@ -1577,7 +1631,7 @@ impl AgentTerminalWindow {
         let adapter = make_adapter(driver, &program);
         let approval = match driver {
             Driver::Claude | Driver::Codex => None,
-            Driver::Agy => bind_approval(thread, dir, mode),
+            Driver::Agy => bind_approval(hook, thread, dir, mode),
         };
         let clear = self.config.borrow().clear_env.clone();
         info!(
@@ -2247,6 +2301,8 @@ impl AgentTerminalWindow {
     }
 
     pub(super) fn refresh_agent_data(&self) {
+        // Also what a switch to agy needs: its hook verdict, read off the main thread.
+        refresh_hook_verdict();
         let (profiles, clear): (Vec<Profile>, Vec<String>) = {
             let config = self.config.borrow();
             (
@@ -2332,6 +2388,20 @@ mod tests {
         };
         assert_eq!(codex.status().driver, Driver::Codex);
         assert!(codex.status().capabilities.live_approvals);
+    }
+
+    #[test]
+    fn an_unchecked_hook_is_treated_as_not_installed() {
+        HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
+        let before = cached_hook_verdict();
+        assert!(before.as_ref().is_err_and(|e| e.contains("not been checked")));
+        // And it stays closed through the binding: no socket, so agy runs read-only.
+        assert!(bind_approval(before, "t", "/tmp", Mode::Ask).is_none());
+        HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Err("not installed".into())));
+        assert_eq!(cached_hook_verdict(), Err("not installed".to_owned()));
+        HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Ok(())));
+        assert_eq!(cached_hook_verdict(), Ok(()));
+        HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
     }
 
     #[test]
