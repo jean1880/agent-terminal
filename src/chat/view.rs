@@ -23,6 +23,7 @@ mod markdown;
 pub mod model;
 mod panels;
 mod payload;
+mod subagents;
 mod transcript;
 mod typeahead;
 pub mod usage;
@@ -148,6 +149,14 @@ pub(crate) struct Inner {
     dirty: RefCell<Vec<String>>,
     flush_queued: Cell<bool>,
     widget: glib::WeakRef<ChatView>,
+    /// Where every card's events go (the transcript's and the sub-agent panel's).
+    row_sink: RowSink,
+    /// The header's list of the thread's sub-agents.
+    subagent_button: Rc<subagents::SubagentButton>,
+    /// The sub-agent shown on its own, while its dialog is open.
+    subagent_panel: RefCell<Option<Rc<subagents::SubagentPanel>>>,
+    /// Sub-agent items (and their steps) changed since the last flush.
+    subagent_changes: RefCell<Vec<String>>,
 }
 
 impl ChatView {
@@ -165,10 +174,16 @@ impl ChatView {
                     inner.row_event(e);
                 }
             });
+            let w = weak.clone();
+            let subagent_button = subagents::SubagentButton::new(move |id| {
+                if let Some(inner) = w.upgrade() {
+                    inner.open_subagent(id);
+                }
+            });
             Inner {
                 backend,
                 model: Rc::new(RefCell::new(Transcript::new())),
-                transcript: TranscriptView::new(sink),
+                transcript: TranscriptView::new(sink.clone()),
                 composer: Composer::new(),
                 header: Header::new(),
                 plan: PlanPanel::new(),
@@ -183,9 +198,14 @@ impl ChatView {
                 dirty: RefCell::new(Vec::new()),
                 flush_queued: Cell::new(false),
                 widget: view.downgrade(),
+                row_sink: sink,
+                subagent_button,
+                subagent_panel: RefCell::new(None),
+                subagent_changes: RefCell::new(Vec::new()),
             }
         });
 
+        inner.header.insert_usage(inner.subagent_button.widget());
         view.append(&inner.header.root);
         view.append(inner.transcript.widget());
         let bottom = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -247,6 +267,7 @@ impl ChatView {
         }
         drop(model);
         inner.refresh_status();
+        inner.refresh_subagents(&[]);
         tracing::info!(
             envelopes = envs.len(),
             ms = started.elapsed().as_millis() as u64,
@@ -380,6 +401,23 @@ impl Inner {
     }
 
     fn handle(self: &Rc<Self>, changes: Vec<Change>) {
+        // A sub-agent or one of its steps coming or changing moves the explorer: noted here,
+        // refreshed with the next flush, once per frame (other items never touch it).
+        {
+            let model = self.model.borrow();
+            let mut noted = self.subagent_changes.borrow_mut();
+            for change in &changes {
+                if let Change::Added(id) | Change::Updated(id) = change {
+                    if model.in_subagent(id) && !noted.contains(id) {
+                        noted.push(id.clone());
+                    }
+                }
+            }
+            if !noted.is_empty() {
+                drop((noted, model));
+                self.queue_flush();
+            }
+        }
         for change in changes {
             match change {
                 Change::Added(id) => {
@@ -426,8 +464,50 @@ impl Inner {
                 for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
                     inner.transcript.updated(&model, id);
                 }
+                drop(model);
+                let changed = std::mem::take(&mut *inner.subagent_changes.borrow_mut());
+                if !changed.is_empty() {
+                    inner.refresh_subagents(&changed);
+                }
             }
         });
+    }
+
+    /// The header's sub-agent list, and the open sub-agent panel (adding its new steps and
+    /// updating the `changed` ones), from the model.
+    fn refresh_subagents(&self, changed: &[String]) {
+        let model = self.model.borrow();
+        let agents = model.subagents();
+        self.subagent_button.set(&agents);
+        if let Some(panel) = self.subagent_panel.borrow().as_ref() {
+            let summary = agents.iter().find(|a| a.id == panel.id());
+            panel.refresh(&model, summary, changed);
+        }
+    }
+
+    /// Shows one sub-agent on its own, in a dialog that follows it until closed.
+    fn open_subagent(self: &Rc<Self>, id: &str) {
+        let panel = subagents::SubagentPanel::new(id, self.row_sink.clone());
+        {
+            let model = self.model.borrow();
+            let summary = model.subagents().into_iter().find(|a| a.id == id);
+            panel.refresh(&model, summary.as_ref(), &[]);
+        }
+        let weak = Rc::downgrade(self);
+        let shown = id.to_owned();
+        adw::prelude::AdwDialogExt::connect_closed(panel.dialog(), move |_| {
+            if let Some(inner) = weak.upgrade() {
+                let mut open = inner.subagent_panel.borrow_mut();
+                if open.as_ref().is_some_and(|p| p.id() == shown) {
+                    *open = None;
+                }
+            }
+        });
+        // A dialog needs a window to sit on; a view that is not in one (yet) has nowhere to show it.
+        if let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) {
+            adw::prelude::AdwDialogExt::present(panel.dialog(), Some(&parent));
+        }
+        *self.subagent_panel.borrow_mut() = Some(panel);
     }
 
     fn control_result(&self, request: &str, result: Result<serde_json::Value, String>) {
@@ -518,6 +598,11 @@ impl Inner {
             RowEvent::Toggle { id, expanded } => {
                 self.model.borrow_mut().set_expanded(&id, expanded);
                 self.transcript.updated(&self.model.borrow(), &id);
+                // The same card may be open in the sub-agent panel too.
+                if self.model.borrow().in_subagent(&id) {
+                    self.subagent_changes.borrow_mut().push(id);
+                    self.queue_flush();
+                }
             }
             RowEvent::Approve { request, decision } => {
                 let changes = self
@@ -566,8 +651,7 @@ impl Inner {
     fn load_diff(self: &Rc<Self>, id: &str) {
         let source = self.diffs.borrow().clone();
         let (Some(source), Some(ask)) = (source, self.diff_ask(id)) else {
-            self.transcript
-                .show_diff(id, &Err("No diff is available for this edit.".to_owned()));
+            self.show_diff(id, &Err("No diff is available for this edit.".to_owned()));
             return;
         };
         let (weak, id) = (Rc::downgrade(self), id.to_owned());
@@ -575,10 +659,19 @@ impl Inner {
             ask,
             Box::new(move |reply| {
                 if let Some(inner) = weak.upgrade() {
-                    inner.transcript.show_diff(&id, &reply);
+                    inner.show_diff(&id, &reply);
                 }
             }),
         );
+    }
+
+    /// A computed diff goes to every copy of the card: the transcript's and, for a sub-agent's
+    /// edit, the open panel's.
+    fn show_diff(&self, id: &str, reply: &super::DiffReply) {
+        self.transcript.show_diff(id, reply);
+        if let Some(panel) = self.subagent_panel.borrow().as_ref() {
+            panel.show_diff(id, reply);
+        }
     }
 
     /// Runs a built-in locally. `args` is whatever followed the command name.
@@ -1011,6 +1104,70 @@ pub(crate) mod tests {
         let (title, openable) = state("shared").flatten().expect("shared row");
         assert_eq!(title, "Thought process");
         assert!(openable);
+    }
+
+    /// The sub-agent explorer: the header lists the thread's sub-agents, and an open panel
+    /// follows the one it shows as new steps arrive.
+    pub(crate) fn subagent_ui_checks() {
+        use agent_core::event::{Event, ItemKind};
+        use serde_json::json;
+
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let inner = view.inner().expect("inner");
+        let ctx = glib::MainContext::default();
+        let pump = || while ctx.iteration(false) {};
+        pump();
+        assert!(
+            !inner.subagent_button.state().0,
+            "hidden with no sub-agents"
+        );
+
+        let sink = view.sink();
+        let step = |id: &str, kind: ItemKind, parent: Option<&str>, input| {
+            sink(
+                &Envelope::new(Event::ItemStarted {
+                    kind,
+                    title: "Task".into(),
+                    input,
+                    parent: parent.map(str::to_owned),
+                })
+                .item(id),
+            );
+        };
+        step(
+            "agent1",
+            ItemKind::Subagent,
+            None,
+            Some(
+                json!({"subagent_type": "Explore", "description": "Map the crate", "prompt": "Map it"}),
+            ),
+        );
+        step("read1", ItemKind::FileRead, Some("agent1"), None);
+        pump();
+        let (visible, count, ids) = inner.subagent_button.state();
+        assert!(visible);
+        assert_eq!(count, "1 · 1 running");
+        assert_eq!(ids, ["agent1"]);
+
+        inner.open_subagent("agent1");
+        let panel = || inner.subagent_panel.borrow().clone().expect("panel open");
+        assert_eq!(panel().steps_shown(), 1);
+        let first = panel().row_widget("read1").expect("step row");
+        step("read2", ItemKind::FileRead, Some("agent1"), None);
+        // A step outside any sub-agent never touches the explorer.
+        step("solo", ItemKind::Command, None, None);
+        pump();
+        assert_eq!(panel().steps_shown(), 2, "the panel follows new steps");
+        assert_eq!(
+            panel().row_widget("read1"),
+            Some(first),
+            "existing steps are updated in place, never rebuilt"
+        );
+        let (_, count, ids) = inner.subagent_button.state();
+        assert_eq!((count.as_str(), ids.len()), ("1 · 1 running", 1));
     }
 
     /// GTK checks of the diff viewer: the card's toggle, its buttons, the approval's diff.

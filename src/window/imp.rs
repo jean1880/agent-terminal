@@ -5406,6 +5406,7 @@ mod tests {
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
         crate::chat::view::tests::reasoning_ui_checks();
+        crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
         chat_shell_opens_threads_and_lists_them(&window);
     }

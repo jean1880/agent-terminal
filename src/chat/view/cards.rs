@@ -72,7 +72,7 @@ pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     l
 }
 
-fn wrapping(l: &gtk4::Label) {
+pub(super) fn wrapping(l: &gtk4::Label) {
     l.set_wrap(true);
     l.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     l.set_hexpand(true);

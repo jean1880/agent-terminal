@@ -60,6 +60,13 @@
 .usage-bar.usage-warn progress { background-color: #ffc46b; }
 .usage-bar.usage-crit progress { background-color: #ff7878; }
 .usage-text { font-family: monospace; font-size: 0.85em; color: #918bbd; }
+.subagent-button { padding: 2px 8px; border-radius: 8px; }
+.subagent-count { font-size: 0.85em; color: #c8c8ff; }
+.subagent-name { font-weight: 600; color: #ebe9ff; }
+.subagent-status, .subagent-task { font-size: 0.85em; }
+.subagent-panel-title { font-weight: 700; font-size: 1.15em; color: #ebe9ff; }
+.subagent-text { color: #c9c6ee; }
+.approval-remembers { font-size: 0.85em; }
 .usage-text.usage-tag { font-size: 0.75em; color: #6d6794; min-width: 2.2em; }
 .usage-text.usage-warn { color: #ffc46b; }
 .usage-text.usage-crit { color: #ff7878; }

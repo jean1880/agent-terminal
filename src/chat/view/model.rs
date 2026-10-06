@@ -84,7 +84,6 @@ pub struct Tool {
 
 /// One sub-agent, as the explorer lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // the explorer UI lands in the next change
 pub struct SubagentSummary {
     pub id: ItemId,
     /// The kind of agent (`Explore`, `general-purpose`…), else the tool's title.
@@ -97,7 +96,6 @@ pub struct SubagentSummary {
 }
 
 impl SubagentSummary {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn of(item: &Item, tool: &Tool) -> Self {
         let field = |key: &str| {
             tool.input
@@ -245,8 +243,22 @@ impl Transcript {
         &self.order
     }
 
+    /// Whether `id` is a sub-agent or one of its steps (at any depth): what the explorer shows.
+    pub fn in_subagent(&self, id: &str) -> bool {
+        let mut next = Some(id);
+        while let Some(id) = next {
+            let Some(item) = self.items.get(id) else {
+                return false;
+            };
+            if matches!(&item.body, Body::Tool(t) if t.kind == ItemKind::Subagent) {
+                return true;
+            }
+            next = item.parent.as_deref();
+        }
+        false
+    }
+
     /// Every sub-agent the thread started, nested ones included, in the order they began.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn subagents(&self) -> Vec<SubagentSummary> {
         let mut out = Vec::new();
         let mut stack: Vec<&ItemId> = self.order.iter().rev().collect();
