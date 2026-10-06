@@ -8,9 +8,6 @@
 //!
 //! The email address is shown in the UI only and is never logged.
 
-// The window wires `shared()` and `refresh()` (parallel change); until then they are unused.
-#![allow(dead_code)]
-
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;

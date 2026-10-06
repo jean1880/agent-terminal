@@ -51,6 +51,8 @@ pub struct AgentLaunch {
     pub extra_args: Vec<String>,
     /// The agent's configured default model, used when the switch names none.
     pub default_model: Option<String>,
+    /// The agent's configured default effort, used when the switch names none.
+    pub default_effort: Option<String>,
     pub env: LaunchEnv,
     /// agy: the approval socket for the new process. `None` runs it read-only (plan mode).
     pub approval: Option<ApprovalHandle>,
@@ -885,6 +887,7 @@ impl Inner {
 
         let launch = factory(driver);
         let model = model.or(launch.default_model);
+        let effort = effort.or(launch.default_effort);
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
         let new_pt =
             match create_provider_thread(&self.store, &self.thread, driver, model.as_deref()) {
@@ -1456,6 +1459,7 @@ mod tests {
             program: "unused".into(),
             extra_args: Vec::new(),
             default_model: None,
+            default_effort: None,
             env: LaunchEnv::default(),
             approval: None,
         }
@@ -1499,6 +1503,7 @@ mod tests {
                     program: "/bin/true".into(),
                     extra_args: vec!["--profile-arg".into()],
                     default_model: (d == Driver::Claude).then(|| "claude-sonnet-5-5".into()),
+                    default_effort: None,
                     env: LaunchEnv {
                         env: vec![("FROM_ENV_FILE".into(), "1".into())],
                         unset: vec!["CLAUDECODE".into()],

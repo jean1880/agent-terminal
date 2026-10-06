@@ -9,9 +9,6 @@
 //! atomic write) so the picker is populated the instant the app starts. A failed refresh keeps
 //! the previous list for that agent. Failures are logged without any frame or output body.
 
-// The window wires `shared()` and `refresh()` (parallel change); until then they are unused.
-#![allow(dead_code)]
-
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;

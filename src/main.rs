@@ -23,8 +23,6 @@ mod model_catalog;
 mod testutil;
 mod theme;
 mod utils;
-// Temporary stand-ins until v3/catalog (model catalogue, account status) is merged.
-mod v3_stubs;
 mod window;
 // The GTK-free logic lives in `agent-kit`; these imports keep the
 // `crate::git::…` style paths used throughout the app.

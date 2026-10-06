@@ -17,12 +17,14 @@ use agent_core::event::{Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
 
 use super::*;
+use crate::account_status::AccountStatus;
 use crate::approval_server::ApprovalHandle;
 use crate::chat::session::{build_handoff, AgentLaunch, ChatSession, LaunchEnv};
+use crate::chat::view::usage::UsageIndicator;
 use crate::chat::view::{ChatView, ViewAction};
 use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
-use crate::v3_stubs::{AccountStatus, ModelCatalog, UsageIndicator};
+use crate::model_catalog::ModelCatalog;
 use crate::window::sidebar_model::{
     badge_for, driver_key, driver_label, group_rows, other_driver, parse_driver, relative_time,
     resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
@@ -111,9 +113,9 @@ impl ChatBackend for SessionSlot {
             s.answer_questions(request, answers);
         }
     }
-    fn switch(&self, driver: Driver, model: Option<String>) {
+    fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         if let Some(s) = self.get() {
-            s.switch(driver, model);
+            s.switch(driver, model, effort);
         }
     }
     fn set_mode(&self, mode: Mode) {
@@ -133,6 +135,7 @@ impl ChatBackend for SessionSlot {
             None => SessionStatus {
                 driver: self.driver,
                 model: self.model.clone(),
+                effort: None,
                 mode: self.mode,
                 running_turn: false,
                 alive: false,
@@ -301,6 +304,7 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
         program,
         extra_args: profile.args.clone(),
         default_model: profile.default_model.clone(),
+        default_effort: profile.default_effort.clone(),
         env: LaunchEnv {
             env: resolved.env,
             unset: unset_list(&clear),
@@ -334,6 +338,8 @@ pub(super) struct Sidebar {
     keys: RefCell<Vec<Option<RowKey>>>,
     /// Set while the list is rebuilt, so selecting the current row is not taken as a click.
     rebuilding: std::cell::Cell<bool>,
+    /// Held for the sidebar's lifetime: the footer's usage indicator.
+    _usage: Rc<UsageIndicator>,
 }
 
 impl AgentTerminalWindow {
@@ -504,7 +510,9 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .css_classes(["sidebar-footer"])
             .build();
-        footer.append(&UsageIndicator::new(AccountStatus::shared(), None).widget());
+        // Every agent's usage and account, updated on every turn.
+        let usage = UsageIndicator::new(AccountStatus::shared(), None);
+        footer.append(usage.widget());
         root.append(&footer);
 
         let sidebar = Rc::new(Sidebar {
@@ -513,6 +521,7 @@ impl AgentTerminalWindow {
             search: search.clone(),
             keys: RefCell::new(Vec::new()),
             rebuilding: std::cell::Cell::new(false),
+            _usage: usage,
         });
         search.connect_search_changed(glib::clone!(
             #[weak]
@@ -1198,7 +1207,6 @@ impl AgentTerminalWindow {
         let sink: EnvelopeSink = Rc::new(move |env: &Envelope| {
             view_sink(env);
             let driver = weak_slot.upgrade().map_or(driver, |s| s.driver());
-            AccountStatus::shared().observe(driver, env);
             if let Some(obj) = weak_obj.upgrade() {
                 obj.imp().on_thread_envelope(&thread_id, driver, env);
             }
@@ -1223,13 +1231,12 @@ impl AgentTerminalWindow {
             .program
             .clone()
             .unwrap_or_else(|| profile.command.clone());
-        // TODO(v3/catalog merge): pass `effort: profile.default_effort.clone()` once
-        // `OpenSession.effort` lands.
         let open = OpenSession {
             program: program.clone(),
             extra_args: profile.args.clone(),
             cwd: dir.to_owned(),
             model,
+            effort: profile.default_effort.clone(),
             mode,
             new_session_id: (resume.is_none() && driver == Driver::Claude)
                 .then(|| glib::uuid_string_random().to_string()),
@@ -1478,7 +1485,7 @@ impl AgentTerminalWindow {
     fn continue_rate_limited(&self, thread: &str) {
         if let Some(slot) = self.slot_of(thread) {
             let target = other_driver(slot.driver());
-            slot.switch(target, None);
+            slot.switch(target, None, None);
         }
     }
 
@@ -1497,7 +1504,7 @@ impl AgentTerminalWindow {
             ViewAction::NewThread => self.new_chat_thread(Some(slot.driver()), dir, None),
             ViewAction::Handoff { target } => {
                 let target = target.unwrap_or_else(|| other_driver(slot.driver()));
-                slot.switch(target, None);
+                slot.switch(target, None, None);
             }
             ViewAction::Fork | ViewAction::CompactByHandoff => {
                 self.fork_thread(thread, slot.driver(), dir);

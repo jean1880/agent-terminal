@@ -12,7 +12,7 @@ use agent_core::adapter::{Driver, Mode};
 
 use super::*;
 use crate::config::Profile;
-use crate::v3_stubs::ModelCatalog;
+use crate::model_catalog::ModelCatalog;
 
 /// The default-mode dropdown, by index both ways.
 const MODES: [(Mode, &str); 3] = [

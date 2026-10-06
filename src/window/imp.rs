@@ -3814,7 +3814,7 @@ impl AgentTerminalWindow {
         if let Some(slot) = self.current_slot() {
             use crate::chat::ChatBackend as _;
             match crate::config::profile_driver(&target) {
-                Some(driver) => slot.switch(driver, None),
+                Some(driver) => slot.switch(driver, None, None),
                 None => present_message(
                     &self.obj(),
                     "Cannot Continue There",
