@@ -154,6 +154,14 @@ pub enum Event {
         #[serde(default)]
         after: Option<u64>,
     },
+    /// Account and plan-quota snapshot for the usage indicator. Claude sends one every turn
+    /// (`rate_limit_event.unifiedWindows`); agy and Codex are refreshed after each turn.
+    /// `account: None` means "unchanged", not "signed out".
+    QuotaUpdated {
+        #[serde(default)]
+        account: Option<Account>,
+        windows: Vec<QuotaWindow>,
+    },
     RateLimited {
         #[serde(default)]
         resets_at: Option<String>,
@@ -284,6 +292,34 @@ pub struct Usage {
     pub cached_input_tokens: u64,
     #[serde(default)]
     pub reasoning_tokens: u64,
+}
+
+/// Who an agent is signed in as. Shown in the UI only; never logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// Email or account name.
+    pub label: String,
+    /// Plan or tier, e.g. "Claude Pro".
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// Who serves the quota, e.g. "firstParty", "Google".
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+/// One plan-quota window, e.g. "5-hour" at 7 % or Antigravity's "Gemini Models / Weekly".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    /// Model group sharing the window (agy: "Gemini Models"); `None` when the plan has one.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Short window name: "5-hour", "Weekly", "Weekly (Fable)".
+    pub label: String,
+    /// Used share, 0.0–1.0 (agy reports remaining; adapters convert).
+    pub used: f64,
+    /// RFC 3339 reset time, when known.
+    #[serde(default)]
+    pub resets_at: Option<String>,
 }
 
 /// A command or skill the agent itself offers (typeahead "agent" and "skill" providers).

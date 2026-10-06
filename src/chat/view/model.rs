@@ -609,7 +609,8 @@ impl Transcript {
                     None,
                 )));
             }
-            Event::Unknown => {}
+            // Quota feeds the usage indicator (app-wide service), not the transcript.
+            Event::QuotaUpdated { .. } | Event::Unknown => {}
         }
         out
     }
