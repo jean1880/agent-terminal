@@ -58,6 +58,18 @@ pub struct SystemProbe {
     shell: Option<String>,
 }
 
+/// The file path in the answer of `command -v NAME` run in an interactive shell, or `None`.
+///
+/// An rc may print a banner first, so the answer is the last line. It counts only when it is an
+/// absolute path: for an alias the shell answers `alias claude='…'` and for a function (or a
+/// builtin) just the bare name, and neither is something the app can exec.
+fn shell_answer_path(stdout: &str) -> Option<String> {
+    let last = stdout.lines().last()?.trim();
+    std::path::Path::new(last)
+        .is_absolute()
+        .then(|| last.to_owned())
+}
+
 impl SystemProbe {
     pub fn new(path: Option<String>, home: Option<String>, shell: Option<String>) -> Self {
         Self { path, home, shell }
@@ -112,11 +124,12 @@ impl SystemProbe {
         }
         match run_command(cmd, shell, SHELL_PROBE_TIMEOUT_SECS) {
             Ok(output) if output.status.success() => {
-                // An rc may print a banner before the answer; the path is the last line.
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let found = stdout.lines().last().unwrap_or_default().trim().to_string();
-                info!("{command} found via shell -ic at {found}");
-                Some(found).filter(|f| !f.is_empty())
+                let found = shell_answer_path(&String::from_utf8_lossy(&output.stdout));
+                match &found {
+                    Some(path) => info!("{command} found via shell -ic at {path}"),
+                    None => info!("{command} is known to the shell but is not a file"),
+                }
+                found
             }
             Ok(_) => None,
             Err(reason) => {
@@ -136,6 +149,11 @@ impl SystemProbe {
     /// PATH, so a process the app spawns directly needs this path rather than the name.
     pub fn locate(&self, command: &str) -> Option<String> {
         debug!("Resolving command {command}");
+
+        // A name that starts with `-` would be read as an option by `which` and the shell.
+        if command.is_empty() || command.starts_with('-') {
+            return None;
+        }
 
         if let Some(found) = self.on_path(command) {
             return Some(found);
@@ -557,6 +575,34 @@ mod tests {
         let mut p = profile(name, command);
         p.resume_args = Some(vec!["--resume".to_string(), "{id}".to_string()]);
         p
+    }
+
+    #[test]
+    fn only_an_absolute_path_counts_as_the_shells_answer() {
+        assert_eq!(
+            shell_answer_path("/home/u/.nvm/bin/claude\n").as_deref(),
+            Some("/home/u/.nvm/bin/claude")
+        );
+        // An rc banner comes first; the answer is the last line.
+        assert_eq!(
+            shell_answer_path("Welcome back\n/usr/bin/agy\n").as_deref(),
+            Some("/usr/bin/agy")
+        );
+        // An alias is answered with its definition, a function with its bare name.
+        assert_eq!(shell_answer_path("alias claude='npx claude --yolo'\n"), None);
+        assert_eq!(shell_answer_path("claude='/opt/x/claude --flag'\n"), None);
+        assert_eq!(shell_answer_path("claude\n"), None);
+        assert_eq!(shell_answer_path("./claude\n"), None);
+        assert_eq!(shell_answer_path(""), None);
+        assert_eq!(shell_answer_path("\n"), None);
+    }
+
+    #[test]
+    fn a_command_that_looks_like_an_option_is_never_looked_up() {
+        let probe = SystemProbe::new(Some("/nonexistent".into()), None, Some("/bin/false".into()));
+        assert_eq!(probe.locate("--help"), None);
+        assert_eq!(probe.locate("-x"), None);
+        assert_eq!(probe.locate(""), None);
     }
 
     #[test]
