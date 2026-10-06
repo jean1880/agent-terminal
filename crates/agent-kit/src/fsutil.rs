@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Writes `bytes` to `path` through a `0600` temp file in the same directory, `sync_all`, then a
 /// rename, so a crash leaves the old file or the new one and never a half-written one, and the
@@ -13,8 +14,15 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .parent()
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
     std::fs::create_dir_all(dir)?;
+    // Unique per call, not just per process: two threads writing the same file must not share a
+    // temp file (one would rename the other's half-written bytes).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
+    tmp_name.push(format!(
+        ".tmp{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = path.with_file_name(tmp_name);
     let result = (|| {
         let mut f = std::fs::OpenOptions::new()
@@ -53,6 +61,33 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(names, ["models.json"]);
+    }
+
+    #[test]
+    fn concurrent_writers_never_share_a_temp_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("shared.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let body = format!("{i}").repeat(4096);
+                        write_private_atomic(&path, body.as_bytes()).expect("write");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        // Whole, from one writer: a shared temp file would interleave digits.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.len(), 4096);
+        let first = text.chars().next().expect("non-empty");
+        assert!(text.chars().all(|c| c == first));
+        let names: Vec<_> = std::fs::read_dir(dir.path()).expect("dir").collect();
+        assert_eq!(names.len(), 1, "no temp file left behind");
     }
 
     #[test]

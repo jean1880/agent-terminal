@@ -3,7 +3,6 @@
 pub use agent_kit::sessions::SessionFormat;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -1094,27 +1093,12 @@ impl TerminalConfig {
         self.disk_stamp.set(disk_stamp(path));
     }
 
-    /// Writes `bytes` to a sibling temporary file, then renames it over `path`.
-    /// Rename within a directory is atomic, so a crash leaves the old file or
-    /// the new one, never a half-written one.
+    /// Replaces `path` through the one shared atomic writer: a uniquely named `0600` sibling,
+    /// `sync_all`, then a rename, so a crash leaves the old file or the new one, never a
+    /// half-written one. `0600` is deliberate for the user's config (it can name env files and
+    /// commands).
     fn replace_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp = path.with_file_name(tmp_name);
-        let result = Self::write_all_synced(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
-    }
-
-    /// Writes `bytes` to `path`, flushing them to disk before returning. The
-    /// `sync_all` matters: without it the rename can land before the contents do,
-    /// which on a crash yields an empty config rather than an intact old one.
-    fn write_all_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        let mut file = fs::File::create(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
+        agent_kit::fsutil::write_private_atomic(path, bytes)
     }
 }
 
