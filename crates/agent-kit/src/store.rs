@@ -246,6 +246,18 @@ impl Store {
         ))
     }
 
+    /// A write transaction that takes the write lock at BEGIN (`IMMEDIATE`). A deferred one that
+    /// reads first fails at once with SQLITE_BUSY_SNAPSHOT when another connection commits in
+    /// between (WAL), without waiting on the busy timeout; this one waits instead. Callers use
+    /// plain statements only: SQLite has no nested transactions, so never call another
+    /// transaction-opening method (`write_txn`, `append_event`, …) while one is open.
+    fn write_txn(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
+
     fn touch(&self, thread: &str, at: i64) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE threads SET updated_at = ?2 WHERE id = ?1",
@@ -284,7 +296,7 @@ impl Store {
         driver: &str,
         native_id: &str,
     ) -> Result<ThreadId> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_txn()?;
         let thread = self.create_thread_at(cwd, title, at_ms)?;
         let pt = self.add_provider_thread(&thread, driver, "default")?;
         self.set_native_id(&pt, native_id)?;
@@ -332,7 +344,7 @@ impl Store {
     /// The native sessions it held are remembered as dismissed ([`Store::native_dismissed`]), so
     /// listing the agents' recent sessions does not bring a deleted thread straight back.
     pub fn delete_thread(&self, thread: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_txn()?;
         let natives: Vec<(String, String)> = self
             .provider_threads(thread)?
             .into_iter()
@@ -350,7 +362,12 @@ impl Store {
     /// Remembers a native session as no longer the thread's to list again (its thread moved on
     /// to another session, e.g. a resume that started a new one).
     pub fn dismiss_native(&self, driver: &str, native_id: &str) -> Result<()> {
-        self.add_dismissed(&[(driver.to_owned(), native_id.to_owned())])
+        // A read-modify-write of one meta value: under the write lock, so two connections
+        // cannot lose each other's entry.
+        let tx = self.write_txn()?;
+        self.add_dismissed(&[(driver.to_owned(), native_id.to_owned())])?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn add_dismissed(&self, natives: &[(String, String)]) -> Result<()> {
@@ -582,7 +599,13 @@ impl Store {
         provider_thread: Option<&str>,
         envs: &[Envelope],
     ) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        // Scrubbed before the write lock is taken, so the main connection (live events) waits
+        // only for the inserts.
+        let rows: Vec<String> = envs
+            .iter()
+            .map(|env| Ok(serde_json::to_string(&scrub_envelope(env.clone())?)?))
+            .collect::<Result<_>>()?;
+        let tx = self.write_txn()?;
         let existing: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE thread_id = ?1",
             params![thread],
@@ -592,8 +615,7 @@ impl Store {
             return Ok(0);
         }
         let at = self.now();
-        for env in envs {
-            let json = serde_json::to_string(&scrub_envelope(env.clone())?)?;
+        for json in &rows {
             self.conn
                 .execute(
                     "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
