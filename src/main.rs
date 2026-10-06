@@ -41,6 +41,11 @@ fn main() -> glib::ExitCode {
     }
     init_logging();
 
+    // Hidden: a window holding only the chat view on a scripted backend (screenshots, review).
+    if std::env::args().skip(1).any(|a| a == "--chat-demo") {
+        return chat::view::demo::run();
+    }
+
     info!(
         "Starting Agent Terminal (v{})...",
         env!("CARGO_PKG_VERSION")
