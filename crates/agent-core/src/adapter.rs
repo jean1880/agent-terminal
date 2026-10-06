@@ -22,6 +22,90 @@ pub enum Driver {
     Codex,
 }
 
+/// Everything the app knows about a driver that is not behaviour: its names, colour and the
+/// command it is detected by. The one place a new driver is described; menus, probes, labels and
+/// Preferences iterate [`Driver::ALL`] and read this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverInfo {
+    pub driver: Driver,
+    /// Stable id: the store's `provider_threads.driver`, menu action targets, config.
+    pub key: &'static str,
+    /// Short name for menus, rows and the composer hint (`Antigravity`).
+    pub label: &'static str,
+    /// Name with the command where it helps (`Antigravity (agy)`).
+    pub long_label: &'static str,
+    /// The CSS class carrying the agent's accent colour.
+    pub accent_class: &'static str,
+    /// The accent colour, `#rrggbb` (the CSS classes use the same values).
+    pub accent_hex: &'static str,
+    /// A coloured glyph standing for the agent in plain-text menus.
+    pub dot: &'static str,
+    /// The command a fresh profile runs and detection looks for.
+    pub default_command: &'static str,
+    /// The name of the profile created for it.
+    pub profile_name: &'static str,
+    /// What to tell the user when the binary is missing.
+    pub install_hint: &'static str,
+}
+
+const REGISTRY: [DriverInfo; 3] = [
+    DriverInfo {
+        driver: Driver::Claude,
+        key: "claude",
+        label: "Claude",
+        long_label: "Claude",
+        accent_class: "accent-claude",
+        accent_hex: "#f0a37a",
+        dot: "\u{1f7e0}",
+        default_command: "claude",
+        profile_name: "Claude",
+        install_hint: "Install Claude Code (npm install -g @anthropic-ai/claude-code).",
+    },
+    DriverInfo {
+        driver: Driver::Agy,
+        key: "agy",
+        label: "Antigravity",
+        long_label: "Antigravity (agy)",
+        accent_class: "accent-agy",
+        accent_hex: "#6ec8ff",
+        dot: "\u{1f535}",
+        default_command: "agy",
+        profile_name: "Agy",
+        install_hint: "Install the Antigravity CLI (agy).",
+    },
+    DriverInfo {
+        driver: Driver::Codex,
+        key: "codex",
+        label: "Codex",
+        long_label: "Codex",
+        accent_class: "accent-codex",
+        accent_hex: "#4cc38a",
+        dot: "\u{1f7e2}",
+        default_command: "codex",
+        profile_name: "Codex",
+        install_hint: "Install the Codex CLI (npm install -g @openai/codex).",
+    },
+];
+
+impl Driver {
+    /// Every driver, in the order menus and handoffs offer them.
+    pub const ALL: [Driver; 3] = [Driver::Claude, Driver::Agy, Driver::Codex];
+
+    /// The driver's description. Exhaustive: a new variant fails to compile here until it has one.
+    pub fn info(self) -> &'static DriverInfo {
+        match self {
+            Driver::Claude => &REGISTRY[0],
+            Driver::Agy => &REGISTRY[1],
+            Driver::Codex => &REGISTRY[2],
+        }
+    }
+
+    /// The driver with this [`DriverInfo::key`].
+    pub fn from_key(key: &str) -> Option<Driver> {
+        Self::ALL.into_iter().find(|d| d.info().key == key)
+    }
+}
+
 /// Approval / edit policy for a session (mapped per agent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -196,5 +280,40 @@ pub trait Adapter {
     /// give itself); Claude and agy have none.
     fn drain_outbox(&mut self) -> Outbox {
         Outbox::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_driver_is_listed_and_described_once() {
+        // Exhaustive: adding a variant fails to compile here until ALL and the registry have it.
+        for d in Driver::ALL {
+            match d {
+                Driver::Claude | Driver::Agy | Driver::Codex => {}
+            }
+            let info = d.info();
+            assert_eq!(info.driver, d, "{} points at another driver", info.key);
+            assert_eq!(Driver::from_key(info.key), Some(d));
+            assert!(!info.label.is_empty() && !info.default_command.is_empty());
+            assert!(info.accent_class.starts_with("accent-"));
+            assert!(info.accent_hex.starts_with('#') && info.accent_hex.len() == 7);
+            // The capability table covers it too.
+            let _ = Capabilities::of(d);
+        }
+        let keys: std::collections::HashSet<_> = Driver::ALL.iter().map(|d| d.info().key).collect();
+        assert_eq!(keys.len(), Driver::ALL.len(), "keys are unique");
+        assert_eq!(REGISTRY.len(), Driver::ALL.len());
+        assert_eq!(Driver::from_key("nope"), None);
+    }
+
+    #[test]
+    fn keys_match_the_serde_names_the_store_already_holds() {
+        for d in Driver::ALL {
+            let json = serde_json::to_value(d).expect("serde");
+            assert_eq!(json.as_str(), Some(d.info().key));
+        }
     }
 }

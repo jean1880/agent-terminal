@@ -32,6 +32,16 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// The capabilities of `driver`'s adapter.
+    pub fn of(driver: crate::adapter::Driver) -> Self {
+        use crate::adapter::Driver;
+        match driver {
+            Driver::Claude => Self::claude(),
+            Driver::Agy => Self::agy(),
+            Driver::Codex => Self::codex(),
+        }
+    }
+
     pub fn claude() -> Self {
         Self {
             model_switch_in_session: true,

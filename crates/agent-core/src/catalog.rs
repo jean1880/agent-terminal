@@ -92,7 +92,11 @@ pub fn parse_claude_initialize(response_json: &Value) -> Vec<CatalogModel> {
 /// Efforts are `supportedReasoningEfforts` in the server's order and `default_effort` is the one
 /// the model starts on. The id is the `model` slug `turn/start` takes.
 pub fn parse_codex_models(result: &Value) -> Vec<CatalogModel> {
-    crate::codex::parse_codex_models(result)
+    let mut models = crate::codex::parse_codex_models(result);
+    // The server's default first (stable otherwise), so "the agent's default model" is the head
+    // of the list for [`suggest_replacement`].
+    models.sort_by_key(|m| !m.is_default);
+    models
         .into_iter()
         .map(|m| CatalogModel {
             driver: Driver::Codex,
@@ -246,6 +250,130 @@ pub fn parse_agy_models(tsv: &str) -> Vec<CatalogModel> {
     out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Retired models: what a thread on a model the agent no longer offers can move to
+// ---------------------------------------------------------------------------------------------
+
+/// The numbers of a model id, in order (`claude-sonnet-5-5` is `[5, 5]`, `gemini-3.1-pro` is
+/// `[3, 1]`): newer versions compare greater.
+fn version_key(id: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut digits = String::new();
+    for c in id.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            if let Ok(n) = digits.parse() {
+                out.push(n);
+            }
+            digits.clear();
+        }
+    }
+    out
+}
+
+/// A model id without its version, its effort, a `claude` vendor prefix and bracketed suffixes:
+/// the family and tier that a newer model of the same line shares (`claude-sonnet-5-5` and
+/// `sonnet` are `sonnet`; `gemini-3.1-pro-high` is `gemini-pro`; `gpt-5-codex-mini` is
+/// `gpt-codex-mini`).
+pub fn family_of(id: &str) -> String {
+    let id = id.split('[').next().unwrap_or(id).to_lowercase();
+    id.split(['-', '.', '_', ' '])
+        .filter(|t| !t.is_empty())
+        .filter(|t| !t.chars().any(|c| c.is_ascii_digit()))
+        .filter(|t| !EFFORT_ORDER.contains(t) && !matches!(*t, "claude" | "latest" | "preview"))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+impl CatalogModel {
+    /// An alias that tracks the newest model of its line by itself (Claude's `opus`, `sonnet`,
+    /// `haiku`, `default`): no version in the id. Threads store the alias, so they follow the
+    /// agent's updates without being ported.
+    pub fn is_alias(&self) -> bool {
+        self.driver == Driver::Claude && !self.id.chars().any(|c| c.is_ascii_digit())
+    }
+}
+
+/// Where a thread on a retired model should go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// The model value to hand to a switch (agy: the composed `<base>-<effort>` id).
+    pub model: String,
+    pub display: String,
+    /// The effort to keep or start on (`None` when the model has none).
+    pub effort: Option<String>,
+}
+
+/// The model a thread on `retired` should move to, among `models` (one agent's current list).
+///
+/// The same family and tier first (the newest of `sonnet`-line models for a retired
+/// `claude-sonnet-*`), preferring an alias when there is one; else the agent's default model (the
+/// `default` alias, else the head of the list). The thread's `effort` is kept when the target
+/// offers it, else the target's own default. `None` only when the list is empty.
+pub fn suggest_replacement(
+    models: &[CatalogModel],
+    retired: &str,
+    effort: Option<&str>,
+) -> Option<Replacement> {
+    let family = family_of(retired);
+    let same_line = models
+        .iter()
+        .filter(|m| !family.is_empty() && family_of(&m.id) == family)
+        // An alias first, then the newest version.
+        .max_by(|a, b| (a.is_alias(), version_key(&a.id)).cmp(&(b.is_alias(), version_key(&b.id))));
+    let target = same_line
+        .or_else(|| models.iter().find(|m| m.id == "default"))
+        .or_else(|| models.first())?;
+    let effort = effort
+        .filter(|e| target.efforts.iter().any(|x| x == e))
+        .or_else(|| target.default_effort())
+        .filter(|_| !target.efforts.is_empty());
+    Some(Replacement {
+        model: target.model_id_for(effort),
+        display: target.display.clone(),
+        effort: effort.map(str::to_owned),
+    })
+}
+
+/// What a thread's stored model amounts to against its agent's catalogue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelNotice {
+    /// Nothing to say: the model is current, is the agent's own default, or the list is not
+    /// known well enough to tell.
+    None,
+    /// The agent no longer offers `model`; `replacement` is where it should go.
+    Retired {
+        model: String,
+        replacement: Option<Replacement>,
+    },
+}
+
+/// Decides [`ModelNotice`] for a thread on `stored` (the model it was last set to; `None` or
+/// `default` is the agent's own). `models` is the agent's list and `fresh` says it came from a
+/// fetch in this run: a cached list, or one still loading, is never grounds to call a model
+/// retired (`ModelNotice::None`), only a fresh one is.
+pub fn model_notice(
+    models: &[CatalogModel],
+    fresh: bool,
+    stored: Option<&str>,
+    effort: Option<&str>,
+) -> ModelNotice {
+    let Some(stored) = stored.filter(|m| !m.is_empty() && *m != "default") else {
+        return ModelNotice::None;
+    };
+    if !fresh || models.is_empty() {
+        return ModelNotice::None;
+    }
+    if models.iter().any(|m| m.is_model(stored)) {
+        return ModelNotice::None;
+    }
+    ModelNotice::Retired {
+        model: stored.to_owned(),
+        replacement: suggest_replacement(models, stored, effort),
+    }
+}
+
 /// The picker's rows: native Claude first, then Antigravity, then Codex, each in catalog order, filtered by
 /// a case-insensitive substring of id, display name or description (every whitespace-separated
 /// word of `query` must match somewhere). Empty groups are dropped.
@@ -265,13 +393,15 @@ pub fn group_for_picker<'a>(
         .to_lowercase();
         words.iter().all(|w| hay.contains(w))
     };
-    [Driver::Claude, Driver::Agy, Driver::Codex]
+    Driver::ALL
         .into_iter()
         .filter_map(|d| {
-            let rows: Vec<&CatalogModel> = models
+            let mut rows: Vec<&CatalogModel> = models
                 .iter()
                 .filter(|m| m.driver == d && matches(m))
                 .collect();
+            // Aliases (they follow the agent's newest model) before pinned versions.
+            rows.sort_by_key(|m| !m.is_alias());
             (!rows.is_empty()).then_some((d, rows))
         })
         .collect()
@@ -461,6 +591,142 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             g.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
             [Driver::Agy, Driver::Codex]
         );
+    }
+
+    fn m(driver: Driver, id: &str, efforts: &[&str]) -> CatalogModel {
+        CatalogModel {
+            driver,
+            id: id.into(),
+            display: id.to_uppercase(),
+            description: None,
+            efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+            default_effort: None,
+            via: None,
+        }
+    }
+
+    #[test]
+    fn families_ignore_versions_efforts_and_the_vendor_prefix() {
+        for (id, family) in [
+            ("claude-sonnet-5-5", "sonnet"),
+            ("sonnet", "sonnet"),
+            ("claude-fable-5-1[1m]", "fable"),
+            ("gemini-3.1-pro-high", "gemini-pro"),
+            ("gemini-3.8-flash", "gemini-flash"),
+            ("gpt-5-codex", "gpt-codex"),
+            ("gpt-5-codex-mini", "gpt-codex-mini"),
+            ("gpt-5.5", "gpt"),
+            ("", ""),
+        ] {
+            assert_eq!(family_of(id), family, "{id}");
+        }
+        assert_eq!(version_key("claude-sonnet-5-5"), [5, 5]);
+        assert_eq!(version_key("gemini-3.1-pro"), [3, 1]);
+        assert!(version_key("gemini-3.8-flash") > version_key("gemini-3.1-flash"));
+        assert!(version_key("sonnet").is_empty());
+    }
+
+    #[test]
+    fn a_retired_model_moves_to_the_newest_of_its_family_keeping_the_effort() {
+        let agy = vec![
+            m(Driver::Agy, "gemini-3.1-pro", &["low", "high"]),
+            m(Driver::Agy, "gemini-3.8-flash", &["low", "medium", "high"]),
+            m(Driver::Agy, "gemini-4-pro", &["low", "high"]),
+        ];
+        // gemini-2-pro -> the newest pro; its "high" is offered, so it is kept (and composed).
+        let r = suggest_replacement(&agy, "gemini-2-pro-high", Some("high")).expect("a suggestion");
+        assert_eq!(r.model, "gemini-4-pro-high");
+        assert_eq!(r.effort.as_deref(), Some("high"));
+        // An effort the target lacks falls back to the target's default.
+        let r =
+            suggest_replacement(&agy, "gemini-2-pro-high", Some("xhigh")).expect("a suggestion");
+        assert_eq!(r.effort.as_deref(), Some("low"));
+        assert_eq!(r.model, "gemini-4-pro-low");
+        // A flash stays a flash.
+        let r =
+            suggest_replacement(&agy, "gemini-2.5-flash-medium", Some("medium")).expect("flash");
+        assert_eq!(r.model, "gemini-3.8-flash-medium");
+    }
+
+    #[test]
+    fn claude_prefers_the_alias_of_the_same_line_then_the_default() {
+        let claude = vec![
+            m(Driver::Claude, "default", &[]),
+            m(Driver::Claude, "opus", &["low", "high"]),
+            m(Driver::Claude, "claude-sonnet-5-5", &["low", "high"]),
+            m(Driver::Claude, "sonnet", &["low", "high"]),
+        ];
+        // A pinned retired sonnet goes to the alias, which tracks the newest from now on.
+        let r = suggest_replacement(&claude, "claude-sonnet-4-1", Some("high")).expect("alias");
+        assert_eq!(r.model, "sonnet");
+        assert_eq!(r.effort.as_deref(), Some("high"));
+        // No family match: the agent's default model.
+        let r = suggest_replacement(&claude, "claude-haiku-3", None).expect("default");
+        assert_eq!(r.model, "default");
+        assert_eq!(r.effort, None, "the default has no effort levels");
+        // No `default` row: the head of the list.
+        let r = suggest_replacement(&claude[1..], "claude-haiku-3", None).expect("head");
+        assert_eq!(r.model, "opus");
+        assert!(suggest_replacement(&[], "x", None).is_none());
+    }
+
+    #[test]
+    fn codex_lists_its_default_first_so_it_is_the_fallback() {
+        let result = serde_json::json!({"data": [
+            {"id": "a", "model": "gpt-5-mini", "isDefault": false},
+            {"id": "b", "model": "gpt-5-codex", "isDefault": true,
+             "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}],
+             "defaultReasoningEffort": "high"}
+        ]});
+        let models = parse_codex_models(&result);
+        assert_eq!(models[0].id, "gpt-5-codex");
+        let r = suggest_replacement(&models, "o3-pro", Some("low")).expect("default");
+        assert_eq!(
+            (r.model.as_str(), r.effort.as_deref()),
+            ("gpt-5-codex", Some("low"))
+        );
+    }
+
+    #[test]
+    fn only_a_fresh_list_can_call_a_model_retired() {
+        let list = vec![
+            m(Driver::Claude, "default", &[]),
+            m(Driver::Claude, "sonnet", &[]),
+        ];
+        let notice = |fresh, stored| model_notice(&list, fresh, stored, None);
+        // Still loading, or only the cache: unknown, never "retired".
+        assert_eq!(notice(false, Some("claude-opus-3")), ModelNotice::None);
+        assert_eq!(model_notice(&[], true, Some("x"), None), ModelNotice::None);
+        // The agent's own default and listed models are fine.
+        assert_eq!(notice(true, None), ModelNotice::None);
+        assert_eq!(notice(true, Some("default")), ModelNotice::None);
+        assert_eq!(notice(true, Some("sonnet")), ModelNotice::None);
+        // Gone from a fresh list: retired, with where to go.
+        match notice(true, Some("claude-sonnet-3-7")) {
+            ModelNotice::Retired { model, replacement } => {
+                assert_eq!(model, "claude-sonnet-3-7");
+                assert_eq!(replacement.expect("replacement").model, "sonnet");
+            }
+            other => panic!("{other:?}"),
+        }
+        // An agy id at one of its efforts is the listed base model.
+        let agy = vec![m(Driver::Agy, "gemini-3.1-pro", &["low", "high"])];
+        assert_eq!(
+            model_notice(&agy, true, Some("gemini-3.1-pro-high"), None),
+            ModelNotice::None
+        );
+    }
+
+    #[test]
+    fn the_picker_lists_aliases_before_pinned_versions() {
+        let all = vec![
+            m(Driver::Claude, "claude-fable-5-1[1m]", &[]),
+            m(Driver::Claude, "opus", &[]),
+            m(Driver::Claude, "default", &[]),
+        ];
+        let g = group_for_picker(&all, "");
+        let ids: Vec<&str> = g[0].1.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["opus", "default", "claude-fable-5-1[1m]"]);
     }
 
     #[test]
