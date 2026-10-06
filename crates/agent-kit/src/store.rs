@@ -512,6 +512,17 @@ impl Store {
         Ok(out)
     }
 
+    /// Whether the user has sent this thread a message (so there is something to hand over).
+    /// A cheap existence check; it does not decode the events.
+    pub fn has_messages(&self, thread: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events
+                            WHERE thread_id = ?1 AND envelope_json LIKE '%\"user_message\"%')",
+            params![thread],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Rebuilds the thread's items with their final text: a snapshot replaces
     /// the deltas accumulated so far, later deltas append to it. Items appear
     /// in the order they first occur. `Reasoning` items are left out: a
@@ -922,6 +933,20 @@ mod tests {
         assert!(!one.archived);
         assert_eq!((one.title.as_str(), one.cwd.as_str()), ("first", "/a"));
         assert_eq!(s.thread_summary("nope").expect("none"), None);
+    }
+
+    #[test]
+    fn a_thread_has_messages_once_the_user_has_sent_one() {
+        let s = store();
+        let t = s.create_thread("/w", Some("t")).expect("thread");
+        assert!(!s.has_messages(&t).expect("empty"));
+        s.append_event(&t, None, &Envelope::new(Event::Unknown))
+            .expect("event");
+        assert!(!s.has_messages(&t).expect("only a notice"));
+        s.append_user_message(&t, None, "hello").expect("user");
+        assert!(s.has_messages(&t).expect("one message"));
+        let other = s.create_thread("/w", None).expect("other");
+        assert!(!s.has_messages(&other).expect("other thread"));
     }
 
     #[test]
