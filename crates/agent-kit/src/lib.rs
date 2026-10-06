@@ -5,6 +5,7 @@
 
 pub mod diff;
 pub mod exec;
+pub mod fsutil;
 pub mod git;
 pub mod handoff;
 pub mod paths;

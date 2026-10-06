@@ -101,6 +101,8 @@ pub struct ThreadSummary {
     pub model: Option<String>,
     /// True when events arrived after the last [`Store::mark_read`].
     pub unread: bool,
+    /// Hidden from the default list ([`Store::list_threads`] with `include_archived` false).
+    pub archived: bool,
 }
 
 /// A provider thread: one native agent session under an app thread.
@@ -263,30 +265,28 @@ impl Store {
 
     /// Newest first (by `updated_at`).
     pub fn list_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.title, t.cwd, t.updated_at,
-                    p.driver, p.model,
-                    EXISTS (SELECT 1 FROM events e WHERE e.thread_id = t.id AND e.seq > t.read_seq)
-             FROM threads t
-             LEFT JOIN provider_threads p ON p.id = COALESCE(
-                 t.active_provider_thread,
-                 (SELECT id FROM provider_threads q WHERE q.thread_id = t.id
-                  ORDER BY q.created_at DESC, q.rowid DESC LIMIT 1))
-             WHERE (?1 OR t.archived = 0)
-             ORDER BY t.updated_at DESC, t.rowid DESC",
-        )?;
-        let rows = stmt.query_map(params![include_archived], |r| {
-            Ok(ThreadSummary {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                cwd: r.get(2)?,
-                updated_at: r.get(3)?,
-                driver: r.get(4)?,
-                model: r.get(5)?,
-                unread: r.get(6)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{SUMMARY_SQL} WHERE (?1 OR t.archived = 0) ORDER BY t.updated_at DESC, t.rowid DESC"
+        ))?;
+        let rows = stmt.query_map(params![include_archived], summary_row)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// One thread's summary, archived or not; `None` when it does not exist.
+    pub fn thread_summary(&self, thread: &str) -> Result<Option<ThreadSummary>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SUMMARY_SQL} WHERE t.id = ?1"))?;
+        Ok(stmt.query_row(params![thread], summary_row).optional()?)
+    }
+
+    /// Deletes a thread and, by foreign-key cascade, its events and provider threads. Only this
+    /// store's rows go: the agents' own session files (`native_id` references) are never touched.
+    pub fn delete_thread(&self, thread: &str) -> Result<()> {
+        let n = self
+            .conn
+            .execute("DELETE FROM threads WHERE id = ?1", params![thread])?;
+        require_row(n, thread)
     }
 
     // ---- app state ----
@@ -609,6 +609,30 @@ fn status_name(status: ItemStatus) -> &'static str {
     }
 }
 
+/// The columns of a [`ThreadSummary`], before its `WHERE` / `ORDER BY`.
+const SUMMARY_SQL: &str = "SELECT t.id, t.title, t.cwd, t.updated_at,
+            p.driver, p.model,
+            EXISTS (SELECT 1 FROM events e WHERE e.thread_id = t.id AND e.seq > t.read_seq),
+            t.archived
+     FROM threads t
+     LEFT JOIN provider_threads p ON p.id = COALESCE(
+         t.active_provider_thread,
+         (SELECT id FROM provider_threads q WHERE q.thread_id = t.id
+          ORDER BY q.created_at DESC, q.rowid DESC LIMIT 1))";
+
+fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
+    Ok(ThreadSummary {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        cwd: r.get(2)?,
+        updated_at: r.get(3)?,
+        driver: r.get(4)?,
+        model: r.get(5)?,
+        unread: r.get(6)?,
+        archived: r.get(7)?,
+    })
+}
+
 fn require_row(changed: usize, what: &str) -> Result<()> {
     if changed == 0 {
         Err(StoreError::NotFound(what.to_string()))
@@ -883,6 +907,59 @@ mod tests {
         assert_eq!(s.list_threads(true).expect("list").len(), 2);
         s.set_archived(&a, false).expect("unarchive");
         assert_eq!(s.list_threads(false).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn archived_threads_carry_their_flag_and_a_single_summary_can_be_fetched() {
+        let s = store();
+        let a = s.create_thread("/a", Some("first")).expect("a");
+        s.set_archived(&a, true).expect("archive");
+        let all = s.list_threads(true).expect("list");
+        assert!(all.iter().find(|t| t.id == a).expect("a").archived);
+        assert!(s.thread_summary(&a).expect("one").expect("some").archived);
+        s.set_archived(&a, false).expect("unarchive");
+        let one = s.thread_summary(&a).expect("one").expect("some");
+        assert!(!one.archived);
+        assert_eq!((one.title.as_str(), one.cwd.as_str()), ("first", "/a"));
+        assert_eq!(s.thread_summary("nope").expect("none"), None);
+    }
+
+    #[test]
+    fn delete_removes_a_thread_with_its_events_and_provider_threads_only() {
+        let s = store();
+        let keep = s.create_thread("/keep", Some("keep")).expect("keep");
+        let gone = s.create_thread("/gone", Some("gone")).expect("gone");
+        for t in [&keep, &gone] {
+            let pt = s.add_provider_thread(t, "claude", "opus").expect("pt");
+            s.set_active_provider_thread(t, &pt).expect("active");
+            s.set_native_id(&pt, "native-session").expect("native");
+            s.append_user_message(t, Some(&pt), "hello").expect("user");
+            s.append_event(t, Some(&pt), &Envelope::new(Event::Unknown))
+                .expect("event");
+        }
+        let count = |table: &str, thread: &str| -> i64 {
+            s.conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = ?1"),
+                    params![thread],
+                    |r| r.get(0),
+                )
+                .expect("count")
+        };
+        assert!(count("events", &gone) > 0 && count("provider_threads", &gone) == 1);
+
+        s.delete_thread(&gone).expect("delete");
+        assert_eq!(count("events", &gone), 0);
+        assert_eq!(count("provider_threads", &gone), 0);
+        assert_eq!(s.thread_summary(&gone).expect("query"), None);
+        // The other thread is untouched.
+        assert!(count("events", &keep) > 0);
+        assert_eq!(count("provider_threads", &keep), 1);
+        assert_eq!(s.list_threads(true).expect("list").len(), 1);
+        assert!(matches!(
+            s.delete_thread(&gone),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]
