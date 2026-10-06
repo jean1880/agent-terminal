@@ -215,7 +215,8 @@ fn terminate(shared: &Rc<Shared>) {
     }
     shared.signal(SIGTERM);
     let shared = shared.clone();
-    glib::timeout_add_local_once(TERM_GRACE, move || {
+    glib::spawn_future_local(async move {
+        glib::timeout_future(TERM_GRACE).await;
         if !shared.exited.get() {
             warn!(program = %shared.name, "agent ignored SIGTERM; killing it");
             shared.signal(SIGKILL);
