@@ -474,6 +474,9 @@ pub struct TerminalConfig {
     /// the buttons. See [`DiffTool`] for the argv template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_tool: Option<DiffTool>,
+    /// 3.0: a file-change card opens its diff as soon as the edit completes, instead of
+    /// waiting for "View diff". Off by default; cards replayed from history stay collapsed.
+    pub diffs_expanded: bool,
     /// Environment variables removed from a spawned session's environment.
     /// A trailing `*` matches by prefix. See [`default_clear_env`].
     pub clear_env: Vec<String>,
@@ -687,6 +690,7 @@ impl Default for TerminalConfig {
             indicators: Vec::new(),
             turn_command: None,
             diff_tool: None,
+            diffs_expanded: false,
             clear_env: default_clear_env(),
             default_agent: None,
             sidebar_collapsed: false,

@@ -11,6 +11,7 @@ pub mod filediff;
 pub mod fsutil;
 pub mod git;
 pub mod handoff;
+pub mod native;
 pub mod paths;
 pub mod restore;
 pub mod sessions;

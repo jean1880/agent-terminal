@@ -389,6 +389,15 @@ impl Inner {
             } => {
                 if !native_id.is_empty() {
                     let pt = self.provider_thread.borrow().clone();
+                    // A resume that started a new native session leaves the old one behind:
+                    // it is this thread's history now, never a separate session to list.
+                    let previous = self.state.borrow().native_id.clone();
+                    if let Some(old) = previous.filter(|old| old != native_id) {
+                        let driver = driver_name(self.adapter.borrow().driver());
+                        if let Err(e) = self.store.dismiss_native(driver, &old) {
+                            warn!(error = %e, "could not record the replaced native session");
+                        }
+                    }
                     if let Err(e) = self.store.set_native_id(&pt, native_id) {
                         warn!(error = %e, "could not record the native session id");
                     }

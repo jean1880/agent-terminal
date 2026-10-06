@@ -592,18 +592,34 @@ impl ReasoningRow {
     }
 
     fn update(&self, text: &str, streaming: bool, expanded: bool) {
+        let text = text.trim();
+        // Claude often withholds its reasoning: the thinking block arrives (signature only) but
+        // no text ever streams. Say so rather than open onto nothing.
+        let withheld = !streaming && text.is_empty();
         self.title.set_text(if streaming {
             "Thinking…"
+        } else if withheld {
+            "Thought process (not shared by the model)"
         } else {
             "Thought process"
         });
-        self.text.set_text(text.trim());
-        self.revealer.set_reveal_child(expanded);
+        self.text.set_text(text);
+        self.revealer.set_reveal_child(expanded && !withheld);
+        self.chevron.set_visible(!withheld);
+        if let Some(toggle) = self.chevron.parent().and_then(|head| head.parent()) {
+            toggle.set_sensitive(!withheld);
+        }
         self.chevron.set_icon_name(Some(if expanded {
             "at-pan-down-symbolic"
         } else {
             "at-pan-end-symbolic"
         }));
+    }
+
+    /// The card's title and whether it can be opened (tests).
+    #[cfg(test)]
+    pub(super) fn reasoning_state(&self) -> (String, bool) {
+        (self.title.text().to_string(), self.chevron.is_visible())
     }
 }
 
@@ -937,11 +953,21 @@ impl ToolCard {
             self.diff.revealer.set_reveal_child(false);
         }
         if self.last_status.get() != Some(tool.status) {
-            if let Some(prev) = self.last_status.get() {
+            let prev = self.last_status.get();
+            if let Some(prev) = prev {
                 self.root.remove_css_class(status_class(prev));
             }
             self.root.add_css_class(status_class(tool.status));
             self.last_status.set(Some(tool.status));
+            // Live edits only: a card replayed from history is built already completed, so
+            // reopening a thread never loads a diff for every old edit.
+            if is_edit
+                && prev == Some(ToolStatus::Running)
+                && tool.status == ToolStatus::Completed
+                && DiffTools::shared().expand_by_default()
+            {
+                self.diff.toggle.set_active(true);
+            }
         }
         let running = tool.status == ToolStatus::Running;
         self.spinner.set_spinning(running);

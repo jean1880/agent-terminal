@@ -526,11 +526,14 @@ impl Inner {
                     .mark_approval_sent(&request, decision);
                 self.handle(changes);
                 self.backend.respond_approval(&request, decision);
+                // The decision is made: typing goes back to the composer, not the spent card.
+                self.composer.grab_focus();
             }
             RowEvent::Answer { request, answers } => {
                 let changes = self.model.borrow_mut().mark_questions_sent(&request);
                 self.handle(changes);
                 self.backend.answer_questions(&request, answers);
+                self.composer.grab_focus();
             }
             RowEvent::LoadDiff { id } => self.load_diff(&id),
             RowEvent::OpenDiff { id } => {
@@ -891,6 +894,13 @@ pub(crate) mod tests {
             status: RefCell::new(status_of(Driver::Claude)),
         });
         let view = ChatView::new(backend.clone());
+        // A focus-chasing viewport scrolled back up to a spent card and let go of the bottom.
+        assert!(
+            !view
+                .inner()
+                .is_some_and(|i| i.transcript.scrolls_to_focus()),
+            "the transcript must not scroll to keyboard focus"
+        );
         let hint = || {
             view.inner()
                 .map(|i| i.composer.placeholder_text())
@@ -942,6 +952,65 @@ pub(crate) mod tests {
         fn open_external(&self, ask: DiffAsk) {
             self.opened.borrow_mut().push(ask);
         }
+    }
+
+    /// A thinking block whose text never streams (the model withheld it) must not end as an
+    /// empty, openable "Thought process"; one with text stays openable.
+    pub(crate) fn reasoning_ui_checks() {
+        use agent_core::event::{Event, ItemKind, ItemStatus, StreamKind};
+
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let sink = view.sink();
+        let think = |id: &str, text: Option<&str>| {
+            sink(
+                &Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::Reasoning,
+                    title: "Thinking".into(),
+                    input: None,
+                    parent: None,
+                })
+                .item(id),
+            );
+            if let Some(text) = text {
+                sink(
+                    &Envelope::new(Event::ContentDelta {
+                        stream: StreamKind::Reasoning,
+                        text: text.into(),
+                    })
+                    .item(id),
+                );
+            }
+            sink(
+                &Envelope::new(Event::ItemCompleted {
+                    status: ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item(id),
+            );
+        };
+        think("withheld", None);
+        think("shared", Some("weighing two options"));
+        // Row updates are flushed on idle, as a frame would.
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+        let state = |id: &str| {
+            view.inner().and_then(|i| {
+                i.transcript.with_row(id, |row| match row {
+                    cards::Row::Reasoning(r) => Some(r.reasoning_state()),
+                    _ => None,
+                })
+            })
+        };
+        let (title, openable) = state("withheld").flatten().expect("withheld row");
+        assert!(title.contains("not shared"), "{title}");
+        assert!(!openable, "nothing to open");
+        let (title, openable) = state("shared").flatten().expect("shared row");
+        assert_eq!(title, "Thought process");
+        assert!(openable);
     }
 
     /// GTK checks of the diff viewer: the card's toggle, its buttons, the approval's diff.

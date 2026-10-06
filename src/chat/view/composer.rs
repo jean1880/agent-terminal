@@ -84,6 +84,9 @@ impl Composer {
 
         let buffer = sourceview5::Buffer::new(None);
         buffer.set_highlight_matching_brackets(false);
+        // Without the app's dark scheme, GtkSourceView's default draws its caret dark on our
+        // dark background, so there is no visible cursor (the CSS caret-color backs this up).
+        super::cards::apply_scheme(&buffer);
         let view = sourceview5::View::with_buffer(&buffer);
         view.set_wrap_mode(gtk4::WrapMode::WordChar);
         view.set_accepts_tab(false);

@@ -34,17 +34,6 @@ pub struct Snapshot {
     pub updated_at: Option<i64>,
 }
 
-impl Snapshot {
-    /// The window with the highest usage (what the compact indicator shows).
-    pub fn most_used(&self) -> Option<&QuotaWindow> {
-        self.windows.iter().max_by(|a, b| {
-            a.used
-                .partial_cmp(&b.used)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    }
-}
-
 /// Merges an update in: a new account replaces the old one (`None` keeps it), and windows are
 /// matched by (group, label): known ones are replaced in place, new ones appended, windows the
 /// update does not mention are kept (a per-turn event carries only two of the plan's windows).
@@ -321,7 +310,10 @@ mod tests {
             14
         ));
         assert_eq!(s.windows.len(), 4);
-        assert_eq!(s.most_used().unwrap().used, 0.9);
+        assert!(s
+            .windows
+            .iter()
+            .any(|w| w.group.as_deref() == Some("Gemini") && w.used == 0.9));
     }
 
     #[test]

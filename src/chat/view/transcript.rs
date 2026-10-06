@@ -85,6 +85,11 @@ impl TranscriptView {
         // transcript fell outside the scrollable range.
         let viewport = gtk4::Viewport::new(None::<&gtk4::Adjustment>, None::<&gtk4::Adjustment>);
         viewport.set_vscroll_policy(gtk4::ScrollablePolicy::Natural);
+        // Never chase keyboard focus. A clicked card button keeps focus; when its card resolves,
+        // GTK moves focus to another widget in the card and a focus-scrolling viewport jumps up
+        // to it. That reads as the user scrolling up, so stick-to-bottom let go and every later
+        // card (approvals above all) landed below the fold.
+        viewport.set_scroll_to_focus(false);
         viewport.set_child(Some(&clamp));
         scroller.set_child(Some(&viewport));
         scroller.add_css_class("transcript-scroller");
@@ -133,6 +138,15 @@ impl TranscriptView {
         });
         view.connect_scrolling();
         view
+    }
+
+    /// Whether the viewport scrolls to keyboard focus (tests: it must not).
+    #[cfg(test)]
+    pub fn scrolls_to_focus(&self) -> bool {
+        self.scroller
+            .child()
+            .and_then(|c| c.downcast::<gtk4::Viewport>().ok())
+            .is_none_or(|v| v.is_scroll_to_focus())
     }
 
     pub fn widget(&self) -> &gtk4::Overlay {

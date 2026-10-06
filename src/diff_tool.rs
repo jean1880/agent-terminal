@@ -7,7 +7,7 @@
 //! repository ([`agent_kit::filediff::resolve`]). Logging names the tool, never a file's content
 //! or path.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,8 @@ use crate::probe::ListenerSet;
 #[derive(Default)]
 pub struct DiffTools {
     current: RefCell<Option<DiffTool>>,
+    /// Settings → Diff Tool "Expand diffs": a completed edit opens its diff on its own.
+    expand_by_default: Cell<bool>,
     listeners: ListenerSet,
 }
 
@@ -49,6 +51,15 @@ impl DiffTools {
         }
         *self.current.borrow_mut() = tool;
         self.listeners.notify();
+    }
+
+    /// Whether a file-change card opens its diff when its edit completes.
+    pub fn expand_by_default(&self) -> bool {
+        self.expand_by_default.get()
+    }
+
+    pub fn set_expand_by_default(&self, on: bool) {
+        self.expand_by_default.set(on);
     }
 
     /// Calls `f` (on the main thread) whenever the tool changes; the id disconnects it.

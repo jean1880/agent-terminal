@@ -381,10 +381,103 @@ fn load_provider(store: &Store, thread: &str) -> Option<agent_kit::store::Provid
         })
 }
 
-fn load_thread(store: &Store, thread: &str) -> LoadedThread {
-    LoadedThread {
-        history: read_history(store, thread),
-        provider: load_provider(store, thread),
+/// Reads a thread for its page. A thread that points at an agent's own session but holds no
+/// events yet (a resumed session, or one listed from the agent's history) first gets that
+/// session's transcript imported, so the conversation shows. Runs on a store worker.
+fn load_thread(store: &Store, thread: &str, home: Option<&std::path::Path>) -> LoadedThread {
+    let provider = load_provider(store, thread);
+    let mut history = read_history(store, thread);
+    if history.is_empty() {
+        if let (Some(home), Some(pt)) = (home, provider.as_ref()) {
+            if import_native_history(store, thread, pt, home) {
+                history = read_history(store, thread);
+            }
+        }
+    }
+    LoadedThread { history, provider }
+}
+
+/// How many of the agents' own recent sessions are listed as threads.
+const RECENT_SESSIONS: usize = 20;
+
+/// Gives each recent native session a thread, unless one already holds it or the user deleted
+/// that thread. The thread is dated with the session's time and titled after it; its history is
+/// imported when it is first opened ([`load_thread`]). Returns how many were added.
+fn link_recent_sessions(
+    store: &Store,
+    sessions: &[agent_kit::native::NativeSession],
+    fallback_cwd: &str,
+) -> usize {
+    let mut added = 0;
+    for s in sessions {
+        let key = driver_key(s.driver);
+        let known = store
+            .thread_with_native_id(key, &s.native_id)
+            .map(|t| t.is_some())
+            .unwrap_or(true);
+        let dismissed = store.native_dismissed(key, &s.native_id).unwrap_or(true);
+        if known || dismissed {
+            continue;
+        }
+        let cwd = s.cwd.as_deref().unwrap_or(fallback_cwd);
+        let made = store.link_native_thread(
+            cwd,
+            s.title.as_deref(),
+            s.modified.saturating_mul(1000),
+            key,
+            &s.native_id,
+        );
+        match made {
+            Ok(_) => added += 1,
+            Err(e) => warn!("Cannot list a {} session: {e}", driver_label(s.driver)),
+        }
+    }
+    added
+}
+
+/// Imports `pt`'s native session into the store; whether anything was stored. A transcript that
+/// cannot be read leaves a notice instead (so it is not retried on every open).
+fn import_native_history(
+    store: &Store,
+    thread: &str,
+    pt: &agent_kit::store::ProviderThread,
+    home: &std::path::Path,
+) -> bool {
+    let (Some(native_id), Some(driver)) = (pt.native_id.clone(), Driver::from_key(&pt.driver))
+    else {
+        return false;
+    };
+    let session = agent_kit::native::NativeSession {
+        driver,
+        native_id,
+        cwd: None,
+        title: None,
+        modified: 0,
+    };
+    let envs = match agent_kit::native::read_native_history(home, &session) {
+        Ok(envs) => envs,
+        Err(e) => {
+            warn!(
+                "Cannot import {} session history: {e}",
+                driver_label(driver)
+            );
+            vec![Envelope::new(Event::Notice {
+                text: format!("The earlier conversation could not be loaded: {e}"),
+            })]
+        }
+    };
+    if envs.is_empty() {
+        return false;
+    }
+    match store.import_events(thread, Some(&pt.id), &envs) {
+        Ok(n) => {
+            info!("Imported {n} events of a {} session", driver_label(driver));
+            true
+        }
+        Err(e) => {
+            warn!("Cannot store the imported history: {e}");
+            false
+        }
     }
 }
 
@@ -1414,6 +1507,7 @@ impl AgentTerminalWindow {
         if CHAT_RESTORED.with(|done| done.replace(true)) || try_app_store().is_err() {
             return;
         }
+        self.list_recent_sessions();
         let obj = self.obj().downgrade();
         let before = self.tabs.borrow().len();
         glib::MainContext::default().spawn_local(async move {
@@ -1450,6 +1544,37 @@ impl AgentTerminalWindow {
             }
             if let Some(id) = selected_to_restore(&value, &open) {
                 imp.open_thread(&id, true);
+            }
+        });
+    }
+
+    /// Lists the agents' own recent sessions (Claude Code and agy, newest [`RECENT_SESSIONS`])
+    /// as threads in the sidebar, once per run. The scan reads only file metadata and the tail
+    /// of each transcript, off the main thread; a session's history is imported when opened.
+    fn list_recent_sessions(&self) {
+        // Tests never read the real home's agent histories (`link_recent_sessions` is tested on
+        // its own).
+        // Nor does the memory-only fallback store: its jobs run in place on the main thread,
+        // and what it would list is gone at exit anyway.
+        if cfg!(test) || !store_is_async() {
+            return;
+        }
+        let Some(home) = env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let added = store_job(move |store| {
+                let sessions = agent_kit::native::recent_native_sessions(&home, RECENT_SESSIONS);
+                link_recent_sessions(store, &sessions, &home.to_string_lossy())
+            })
+            .await
+            .unwrap_or(0);
+            if added > 0 {
+                info!("Listed {added} recent agent session(s) as threads");
+                if let Some(obj) = obj.upgrade() {
+                    obj.imp().refresh_sidebar();
+                }
             }
         });
     }
@@ -1710,7 +1835,12 @@ impl AgentTerminalWindow {
                 // replay into the view happens here.
                 let loaded = store_job({
                     let thread = thread.clone();
-                    move |store| load_thread(store, &thread)
+                    // Importing reads the agent's transcript; only where store jobs really run
+                    // off the main thread (never with the memory-only fallback, or under test).
+                    let home = (store_is_async() && !cfg!(test))
+                        .then(|| env::var_os("HOME").map(std::path::PathBuf::from))
+                        .flatten();
+                    move |store| load_thread(store, &thread, home.as_deref())
                 })
                 .await
                 .unwrap_or_default();
@@ -2887,6 +3017,107 @@ fn forget_stale_resolutions() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native(
+        driver: Driver,
+        id: &str,
+        cwd: Option<&str>,
+        modified: i64,
+    ) -> agent_kit::native::NativeSession {
+        agent_kit::native::NativeSession {
+            driver,
+            native_id: id.into(),
+            cwd: cwd.map(str::to_owned),
+            title: Some(format!("session {id}")),
+            modified,
+        }
+    }
+
+    #[test]
+    fn opening_a_thread_on_a_native_session_imports_its_history_once() {
+        const TRANSCRIPT: &str = include_str!(
+            "../../../crates/agent-core/tests/fixtures/claude-transcript-synthetic.jsonl"
+        );
+        let home = tempfile::tempdir().expect("home");
+        let project = home.path().join(".claude/projects/-repo");
+        std::fs::create_dir_all(&project).expect("projects");
+        let id = "0b3c6c1e-5d2a-4f0e-9a1b-2c3d4e5f6a7b";
+        std::fs::write(project.join(format!("{id}.jsonl")), TRANSCRIPT).expect("transcript");
+
+        let store = Store::open_in_memory().expect("store");
+        let thread = store
+            .link_native_thread("/repo", None, 1_000, "claude", id)
+            .expect("link");
+        let first = load_thread(&store, &thread, Some(home.path()));
+        assert!(
+            first.history.iter().any(|e| matches!(
+                e.event,
+                Event::ItemStarted {
+                    kind: ItemKind::UserMessage,
+                    ..
+                }
+            )),
+            "the conversation shows"
+        );
+        // Opened again: read from the store, never imported twice.
+        let again = load_thread(&store, &thread, Some(home.path()));
+        assert_eq!(again.history.len(), first.history.len());
+        // No home (the memory-only store, tests): nothing is read from disk.
+        let other = store
+            .link_native_thread(
+                "/repo",
+                None,
+                1_000,
+                "claude",
+                "1b3c6c1e-5d2a-4f0e-9a1b-2c3d4e5f6a7b",
+            )
+            .expect("link");
+        assert!(load_thread(&store, &other, None).history.is_empty());
+
+        // A transcript that is not there: one notice, stored, so it is not retried every open.
+        let missing = load_thread(&store, &other, Some(home.path()));
+        assert!(matches!(
+            missing.history.as_slice(),
+            [e] if matches!(&e.event, Event::Notice { text } if text.contains("could not be loaded"))
+        ));
+        assert_eq!(
+            load_thread(&store, &other, Some(home.path())).history.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_sessions_become_threads_once_in_session_order_and_never_return_after_a_delete() {
+        let store = Store::open_in_memory().expect("store");
+        let sessions = [
+            native(Driver::Claude, "c-new", Some("/w/new"), 2_000),
+            native(Driver::Agy, "a-old", None, 1_000),
+        ];
+        assert_eq!(link_recent_sessions(&store, &sessions, "/home/u"), 2);
+        let threads = store.list_threads(false).expect("list");
+        let titles: Vec<_> = threads.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["session c-new", "session a-old"],
+            "newest session first"
+        );
+        assert_eq!(threads[0].cwd, "/w/new");
+        assert_eq!(
+            threads[1].cwd, "/home/u",
+            "no recorded folder: the fallback"
+        );
+        assert_eq!(threads[1].driver.as_deref(), Some("agy"));
+        // The thread resumes the session: its provider thread carries the native id.
+        let pt = load_provider(&store, &threads[0].id).expect("provider");
+        assert_eq!(pt.native_id.as_deref(), Some("c-new"));
+
+        // A second scan adds nothing.
+        assert_eq!(link_recent_sessions(&store, &sessions, "/home/u"), 0);
+        // A deleted one stays gone.
+        store.delete_thread(&threads[1].id).expect("delete");
+        assert_eq!(link_recent_sessions(&store, &sessions, "/home/u"), 0);
+        assert_eq!(store.list_threads(true).expect("list").len(), 1);
+    }
 
     #[test]
     fn a_rescan_keeps_found_binaries_that_still_exist_and_looks_again_for_the_rest() {

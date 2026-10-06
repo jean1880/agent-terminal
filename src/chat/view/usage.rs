@@ -1,5 +1,6 @@
-//! The usage indicator: per agent, an accent dot, the most-used plan window as a thin bar and
-//! its percentage (amber from 75 %, red from 90 %); a popover lists the account and every window.
+//! The usage indicator: per agent, an accent dot and two thin bars with their percentages, the
+//! short (5-hour) window and the weekly one, each the most used of its kind (amber from 75 %, red
+//! from 90 %); a popover lists the account and every window.
 //!
 //! It reads [`AccountStatus`] and repaints whenever that changes. One widget serves both the
 //! chat header (filtered to the thread's current agent) and an unfiltered sidebar footer.
@@ -64,6 +65,23 @@ pub fn window_title(w: &QuotaWindow) -> String {
 pub fn resets_text(w: &QuotaWindow, now: i64) -> Option<String> {
     let at = parse_rfc3339(w.resets_at.as_deref()?)?;
     Some(resets_in_text(at - now))
+}
+
+/// The windows the compact meter shows: the most-used short window (the 5-hour one) and the
+/// most-used weekly one (a per-model week such as "Weekly (Fable)" counts as weekly). Labels come
+/// from the adapters, which name every weekly window "Weekly…".
+pub fn split_windows(windows: &[QuotaWindow]) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
+    let most = |weekly: bool| {
+        windows
+            .iter()
+            .filter(|w| w.label.starts_with("Weekly") == weekly)
+            .max_by(|a, b| {
+                a.used
+                    .partial_cmp(&b.used)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    };
+    (most(false), most(true))
 }
 
 fn now_epoch() -> i64 {
@@ -199,27 +217,33 @@ impl UsageIndicator {
     }
 }
 
-/// Accent dot + the most-used window's bar and percentage.
+/// Accent dot + one thin row per window kind: `5h` and `wk`, each with its bar and percentage.
 fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     b.add_css_class(accent_class(driver));
     b.append(&brand_image(driver));
-    match snap.most_used() {
-        Some(w) => {
-            b.append(&bar(w.used, 56));
-            b.append(&label(
-                &percent_text(w.used),
-                &["usage-text", severity(w.used).css_class()],
-            ));
-            b.set_tooltip_text(Some(&format!(
-                "{} · {} {}",
-                driver_name(driver),
-                window_title(w),
-                percent_text(w.used)
-            )));
-        }
-        None => b.append(&label("-", &["usage-text"])),
+    let (short, weekly) = split_windows(&snap.windows);
+    if short.is_none() && weekly.is_none() {
+        b.append(&label("-", &["usage-text"]));
+        return b;
     }
+    let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+    rows.set_valign(gtk4::Align::Center);
+    let mut tips = vec![driver_name(driver).to_owned()];
+    for (tag, window) in [("5h", short), ("wk", weekly)] {
+        let Some(w) = window else { continue };
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
+        row.append(&label(tag, &["usage-text", "usage-tag"]));
+        row.append(&bar(w.used, 48));
+        row.append(&label(
+            &percent_text(w.used),
+            &["usage-text", severity(w.used).css_class()],
+        ));
+        rows.append(&row);
+        tips.push(format!("{} {}", window_title(w), percent_text(w.used)));
+    }
+    b.append(&rows);
+    b.set_tooltip_text(Some(&tips.join(" · ")));
     b
 }
 
@@ -283,6 +307,34 @@ mod tests {
             used: 0.5,
             resets_at: resets.map(str::to_owned),
         }
+    }
+
+    fn named(label: &str, used: f64) -> QuotaWindow {
+        QuotaWindow {
+            group: None,
+            label: label.into(),
+            used,
+            resets_at: None,
+        }
+    }
+
+    #[test]
+    fn the_meter_keeps_the_five_hour_and_weekly_windows_apart() {
+        // Claude's shape: a 5-hour window, the weekly one and a per-model week.
+        let w = [
+            named("5-hour", 0.56),
+            named("Weekly", 0.18),
+            named("Weekly (Fable)", 0.40),
+        ];
+        let (short, weekly) = split_windows(&w);
+        assert_eq!(short.map(|w| w.label.as_str()), Some("5-hour"));
+        // The busiest week is the one that bites first.
+        assert_eq!(weekly.map(|w| w.label.as_str()), Some("Weekly (Fable)"));
+        // Only one kind known: the other is absent, not borrowed.
+        let only_week = [named("Weekly", 0.3)];
+        assert_eq!(split_windows(&only_week).0, None);
+        assert!(split_windows(&only_week).1.is_some());
+        assert_eq!(split_windows(&[]), (None, None));
     }
 
     #[test]

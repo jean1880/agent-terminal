@@ -60,6 +60,7 @@
 .usage-bar.usage-warn progress { background-color: #ffc46b; }
 .usage-bar.usage-crit progress { background-color: #ff7878; }
 .usage-text { font-family: monospace; font-size: 0.85em; color: #918bbd; }
+.usage-text.usage-tag { font-size: 0.75em; color: #6d6794; min-width: 2.2em; }
 .usage-text.usage-warn { color: #ffc46b; }
 .usage-text.usage-crit { color: #ff7878; }
 .usage-agent { font-weight: 700; color: #ebe9ff; }
@@ -356,6 +357,7 @@ togglebutton.option-button, button.option-button {
 textview.composer-view, textview.composer-view text {
     background-color: transparent;
     color: #ebe9ff;
+    caret-color: #b49bff;
     font-size: 1.02em;
 }
 .composer-placeholder { color: #6d6794; }

@@ -229,7 +229,7 @@ pub fn read_agy_history(path: &str) -> Result<Vec<AgyRow>, String> {
 ///
 /// The title is a session's first prompt in the window — AGY records no title
 /// of its own — and the directory its latest `workspace`.
-fn list_agy_sessions(path: &str) -> Result<Vec<SessionSummary>, String> {
+pub(crate) fn list_agy_sessions(path: &str) -> Result<Vec<SessionSummary>, String> {
     let rows = read_agy_history(path)?;
 
     // Rows are oldest first, so the first row seen for an ID holds its
@@ -273,7 +273,7 @@ fn list_agy_sessions(path: &str) -> Result<Vec<SessionSummary>, String> {
 }
 
 /// Collapses whitespace and caps the length, for a one-line list row.
-fn one_line_title(text: &str) -> Option<String> {
+pub(crate) fn one_line_title(text: &str) -> Option<String> {
     let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!title.is_empty()).then(|| title.chars().take(MAX_TITLE_CHARS).collect())
 }
@@ -300,7 +300,7 @@ pub const MAX_LISTED_SESSIONS: usize = 200;
 /// working directory is in the first records; the latest title is near the
 /// end, since titles are re-recorded as a session goes. Transcripts reach
 /// several MiB, so neither end justifies reading the middle.
-const SUMMARY_WINDOW: u64 = 256 * 1024;
+pub(crate) const SUMMARY_WINDOW: u64 = 256 * 1024;
 
 /// Longest title shown; titles are one line in a list row.
 const MAX_TITLE_CHARS: usize = 120;
@@ -356,7 +356,7 @@ pub fn list_sessions(
 }
 
 /// Reads the working directory and latest title from a transcript's two ends.
-fn summarize_session(
+pub(crate) fn summarize_session(
     path: &std::path::Path,
     id: String,
     modified: std::time::SystemTime,

@@ -734,6 +734,8 @@ impl ObjectImpl for AgentTerminalWindow {
         self.parent_constructed();
         // Before any card is built, so its "Open in …" button starts right.
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
+        crate::diff_tool::DiffTools::shared()
+            .set_expand_by_default(self.config.borrow().diffs_expanded);
         self.setup_ui();
         self.setup_actions();
         self.start_quota_watch();
@@ -911,6 +913,8 @@ impl AgentTerminalWindow {
         };
         *self.config.borrow_mut() = *new;
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
+        crate::diff_tool::DiffTools::shared()
+            .set_expand_by_default(self.config.borrow().diffs_expanded);
 
         let (theme, scrollback, scale) = {
             let config = self.config.borrow();
@@ -5401,6 +5405,7 @@ mod tests {
         diff_panel_shows_each_outcome();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
+        crate::chat::view::tests::reasoning_ui_checks();
         thread_menu::tests::gtk_checks();
         chat_shell_opens_threads_and_lists_them(&window);
     }

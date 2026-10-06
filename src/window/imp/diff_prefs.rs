@@ -122,6 +122,17 @@ impl AgentTerminalWindow {
                     .unwrap_or_default(),
             )
             .build();
+        let expand_row = adw::SwitchRow::builder()
+            .title("Expand Diffs")
+            .subtitle("Show a file edit's diff as soon as the edit completes")
+            .active(self.config.borrow().diffs_expanded)
+            .build();
+        expand_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| obj.imp().set_diffs_expanded(row.is_active())
+        ));
+        group.add(&expand_row);
         group.add(&preset_row);
         group.add(&command_row);
         page.add(&group);
@@ -242,6 +253,16 @@ impl AgentTerminalWindow {
         }
         self.config.borrow_mut().diff_tool = tool.clone();
         DiffTools::shared().set(tool);
+        self.schedule_config_save();
+    }
+
+    /// Settings → "Expand Diffs": applies to the next edit that completes, and is saved.
+    pub(super) fn set_diffs_expanded(&self, on: bool) {
+        if self.config.borrow().diffs_expanded == on {
+            return;
+        }
+        self.config.borrow_mut().diffs_expanded = on;
+        DiffTools::shared().set_expand_by_default(on);
         self.schedule_config_save();
     }
 }

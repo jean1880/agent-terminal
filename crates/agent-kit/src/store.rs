@@ -30,6 +30,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`].
 const SCHEMA_VERSION: i64 = 3;
+/// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
+/// `driver:native_id`).
+const DISMISSED_KEY: &str = "dismissed_natives";
+const MAX_DISMISSED_NATIVES: usize = 500;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -253,14 +257,56 @@ impl Store {
     // ---- threads ----
 
     pub fn create_thread(&self, cwd: &str, title: Option<&str>) -> Result<ThreadId> {
-        let id = self.new_id()?;
         let now = self.now();
+        self.create_thread_at(cwd, title, now)
+    }
+
+    /// A thread for a session that already exists elsewhere (an agent's own history), dated
+    /// `at_ms` (epoch milliseconds) so it sorts where that session does, not as brand new.
+    pub fn create_thread_at(&self, cwd: &str, title: Option<&str>, at_ms: i64) -> Result<ThreadId> {
+        let id = self.new_id()?;
         self.conn.execute(
             "INSERT INTO threads (id, title, cwd, created_at, updated_at, archived, read_seq)
              VALUES (?1, ?2, ?3, ?4, ?4, 0, 0)",
-            params![id, redact(title.unwrap_or("")), cwd, now],
+            params![id, redact(title.unwrap_or("")), cwd, at_ms],
         )?;
         Ok(id)
+    }
+
+    /// A thread for an agent's existing session (`driver`, `native_id`), dated `at_ms` (epoch
+    /// milliseconds) so it sorts where that session does, with its provider thread already
+    /// active. All or nothing: a failure part-way leaves no orphan thread behind.
+    pub fn link_native_thread(
+        &self,
+        cwd: &str,
+        title: Option<&str>,
+        at_ms: i64,
+        driver: &str,
+        native_id: &str,
+    ) -> Result<ThreadId> {
+        let tx = self.conn.unchecked_transaction()?;
+        let thread = self.create_thread_at(cwd, title, at_ms)?;
+        let pt = self.add_provider_thread(&thread, driver, "default")?;
+        self.set_native_id(&pt, native_id)?;
+        self.set_active_provider_thread(&thread, &pt)?;
+        // Linking bumped the time to now; the thread sorts by the session's own.
+        self.touch(&thread, at_ms)?;
+        tx.commit()?;
+        Ok(thread)
+    }
+
+    /// The thread (archived or not) that already holds `driver`'s native session `native_id`,
+    /// so a session is never listed twice.
+    pub fn thread_with_native_id(&self, driver: &str, native_id: &str) -> Result<Option<ThreadId>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM provider_threads WHERE driver = ?1 AND native_id = ?2
+                 ORDER BY created_at LIMIT 1",
+                params![driver, native_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Newest first (by `updated_at`).
@@ -282,11 +328,67 @@ impl Store {
 
     /// Deletes a thread and, by foreign-key cascade, its events and provider threads. Only this
     /// store's rows go: the agents' own session files (`native_id` references) are never touched.
+    ///
+    /// The native sessions it held are remembered as dismissed ([`Store::native_dismissed`]), so
+    /// listing the agents' recent sessions does not bring a deleted thread straight back.
     pub fn delete_thread(&self, thread: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let natives: Vec<(String, String)> = self
+            .provider_threads(thread)?
+            .into_iter()
+            .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
+            .collect();
+        self.add_dismissed(&natives)?;
         let n = self
             .conn
             .execute("DELETE FROM threads WHERE id = ?1", params![thread])?;
-        require_row(n, thread)
+        require_row(n, thread)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remembers a native session as no longer the thread's to list again (its thread moved on
+    /// to another session, e.g. a resume that started a new one).
+    pub fn dismiss_native(&self, driver: &str, native_id: &str) -> Result<()> {
+        self.add_dismissed(&[(driver.to_owned(), native_id.to_owned())])
+    }
+
+    fn add_dismissed(&self, natives: &[(String, String)]) -> Result<()> {
+        if natives.is_empty() {
+            return Ok(());
+        }
+        let mut dismissed = self.dismissed_natives()?;
+        for (driver, native) in natives {
+            let key = format!("{driver}:{native}");
+            if !dismissed.contains(&key) {
+                dismissed.push(key);
+            }
+        }
+        // Bounded: only the newest few hundred matter, the lister looks at the latest sessions.
+        let excess = dismissed.len().saturating_sub(MAX_DISMISSED_NATIVES);
+        dismissed.drain(..excess);
+        self.set_meta(DISMISSED_KEY, &serde_json::to_string(&dismissed)?)
+    }
+
+    /// Whether the user deleted the thread that held `driver`'s native session `native_id`.
+    pub fn native_dismissed(&self, driver: &str, native_id: &str) -> Result<bool> {
+        Ok(self
+            .dismissed_natives()?
+            .contains(&format!("{driver}:{native_id}")))
+    }
+
+    fn dismissed_natives(&self) -> Result<Vec<String>> {
+        let Some(value) = self.meta(DISMISSED_KEY)? else {
+            return Ok(Vec::new());
+        };
+        match serde_json::from_str(&value) {
+            Ok(list) => Ok(list),
+            Err(e) => {
+                // Starting over only means a deleted session may be listed once more.
+                tracing::warn!(error = %e, "the dismissed-sessions list was unreadable; starting over");
+                Ok(Vec::new())
+            }
+        }
     }
 
     // ---- app state ----
@@ -466,6 +568,47 @@ impl Store {
         let seq = self.conn.last_insert_rowid();
         self.touch(thread, now)?;
         Ok(seq)
+    }
+
+    /// Stores an imported conversation (an agent's own transcript) in one transaction: every
+    /// envelope scrubbed like [`Store::append_event`]'s, but the thread's `updated_at` is left
+    /// alone (opening an old session must not move it to the top of the list) and the imported
+    /// events count as read. Only into a thread with no events yet (checked inside the
+    /// transaction, so two openers cannot both import); returns how many were stored, 0 when the
+    /// thread already had history. All or none.
+    pub fn import_events(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        envs: &[Envelope],
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE thread_id = ?1",
+            params![thread],
+            |r| r.get(0),
+        )?;
+        if existing > 0 {
+            return Ok(0);
+        }
+        let at = self.now();
+        for env in envs {
+            let json = serde_json::to_string(&scrub_envelope(env.clone())?)?;
+            self.conn
+                .execute(
+                    "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![thread, provider_thread, at, json],
+                )
+                .map_err(|e| fk_or(e, thread))?;
+        }
+        self.conn.execute(
+            "UPDATE threads SET read_seq =
+               (SELECT COALESCE(MAX(seq), 0) FROM events WHERE thread_id = ?1) WHERE id = ?1",
+            params![thread],
+        )?;
+        tx.commit()?;
+        Ok(envs.len())
     }
 
     /// Stores a user prompt as `ItemStarted{UserMessage}` + `ContentSnapshot`;
@@ -934,6 +1077,85 @@ mod tests {
         assert_eq!(s.list_threads(true).expect("list").len(), 2);
         s.set_archived(&a, false).expect("unarchive");
         assert_eq!(s.list_threads(false).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn an_imported_session_keeps_its_own_time_is_found_by_native_id_and_reads_as_seen() {
+        let s = store();
+        let fresh = s.create_thread("/new", None).expect("fresh");
+        // A session from last week, imported now: it sorts under the new thread, not above.
+        let old = s
+            .create_thread_at("/old", Some("old session"), 1_000)
+            .expect("old");
+        let ids: Vec<_> = s
+            .list_threads(false)
+            .expect("list")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![fresh.clone(), old.clone()]);
+
+        let pt = s
+            .add_provider_thread(&old, "claude", "default")
+            .expect("pt");
+        s.set_native_id(&pt, "native-7").expect("native");
+        assert_eq!(
+            s.thread_with_native_id("claude", "native-7").expect("q"),
+            Some(old.clone())
+        );
+        assert_eq!(s.thread_with_native_id("agy", "native-7").expect("q"), None);
+
+        let envs = [
+            started("u1", ItemKind::UserMessage),
+            delta("u1", "hello"),
+            started("a1", ItemKind::AssistantMessage),
+        ];
+        assert_eq!(s.import_events(&old, Some(&pt), &envs).expect("import"), 3);
+        assert_eq!(s.events(&old, None, 10).expect("events").len(), 3);
+        assert_eq!(
+            s.import_events(&old, Some(&pt), &envs).expect("again"),
+            0,
+            "never into a thread that has history"
+        );
+        assert_eq!(s.events(&old, None, 10).expect("events").len(), 3);
+        let summary = s.thread_summary(&old).expect("summary").expect("exists");
+        assert_eq!(
+            summary.updated_at, 1_000,
+            "an import does not touch the thread"
+        );
+        assert!(!summary.unread, "imported history counts as seen");
+
+        // Deleting it remembers the session, so the recent-sessions scan does not bring it back.
+        assert!(!s.native_dismissed("claude", "native-7").expect("q"));
+        s.delete_thread(&old).expect("delete");
+        assert!(s.native_dismissed("claude", "native-7").expect("q"));
+        assert_eq!(
+            s.thread_with_native_id("claude", "native-7").expect("q"),
+            None
+        );
+        assert!(
+            s.delete_thread(&old).is_err(),
+            "a missing thread is still an error"
+        );
+        assert_eq!(s.list_threads(true).expect("list").len(), 1);
+
+        // Linking is one step: a thread with its active provider thread, at the session's time.
+        let linked = s
+            .link_native_thread("/w", Some("t"), 500, "agy", "conv-1")
+            .expect("link");
+        assert_eq!(
+            s.thread_with_native_id("agy", "conv-1").expect("q"),
+            Some(linked.clone())
+        );
+        assert_eq!(
+            s.thread_summary(&linked)
+                .expect("s")
+                .expect("exists")
+                .updated_at,
+            500
+        );
+        s.dismiss_native("agy", "conv-0").expect("dismiss");
+        assert!(s.native_dismissed("agy", "conv-0").expect("q"));
     }
 
     #[test]
