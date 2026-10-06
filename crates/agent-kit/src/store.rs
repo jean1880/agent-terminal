@@ -357,6 +357,17 @@ impl Store {
         Ok(id)
     }
 
+    /// Records the model a provider thread was last set to: what a reopened thread resumes on.
+    /// Store an alias when the agent offers one (it follows the agent's newest model); the
+    /// resolved id an event reports is for display only.
+    pub fn set_provider_model(&self, provider_thread: &str, model: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE provider_threads SET model = ?2, updated_at = ?3 WHERE id = ?1",
+            params![provider_thread, model, self.now()],
+        )?;
+        require_row(n, provider_thread)
+    }
+
     pub fn provider_threads(&self, thread: &str) -> Result<Vec<ProviderThread>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, thread_id, driver, model, native_id FROM provider_threads
@@ -1015,6 +1026,26 @@ mod tests {
             matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
             "{id}"
         );
+    }
+
+    #[test]
+    fn a_provider_threads_model_is_what_it_was_last_set_to() {
+        let s = store();
+        let t = s.create_thread("/p", Some("t")).expect("t");
+        let p = s
+            .add_provider_thread(&t, "claude", "claude-opus-4")
+            .expect("p");
+        s.set_active_provider_thread(&t, &p).expect("active");
+        s.set_provider_model(&p, "opus").expect("set");
+        assert_eq!(s.provider_threads(&t).expect("pts")[0].model, "opus");
+        assert_eq!(
+            s.list_threads(false).expect("l")[0].model.as_deref(),
+            Some("opus")
+        );
+        assert!(matches!(
+            s.set_provider_model("nope", "x"),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]
