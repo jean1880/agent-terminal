@@ -33,8 +33,31 @@ use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{run_side, AgentProcess, SpawnSpec};
 use crate::approval_server::ApprovalHandle;
 
-/// Builds the adapter for another driver (the window knows how; this crate does not).
-pub type AdapterFactory = Rc<dyn Fn(Driver) -> Box<dyn Adapter>>;
+/// Process environment the adapter does not own: what the agent's profile adds (its env file)
+/// and what the app removes (`clear_env`, a launching agent session's markers).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchEnv {
+    pub env: Vec<(String, String)>,
+    pub unset: Vec<String>,
+}
+
+/// Everything a switch to another agent starts with. The window builds it from that agent's
+/// profile; this module does not know profiles.
+pub struct AgentLaunch {
+    pub adapter: Box<dyn Adapter>,
+    /// The binary, resolved from the profile (absolute when detection found it).
+    pub program: String,
+    /// The profile's own arguments.
+    pub extra_args: Vec<String>,
+    /// The agent's configured default model, used when the switch names none.
+    pub default_model: Option<String>,
+    pub env: LaunchEnv,
+    /// agy: the approval socket for the new process. `None` runs it read-only (plan mode).
+    pub approval: Option<ApprovalHandle>,
+}
+
+/// Builds what another driver starts with (the window knows how; this module does not).
+pub type AdapterFactory = Rc<dyn Fn(Driver) -> AgentLaunch>;
 
 /// How long a state-changing tool step may run before its hook query must have arrived.
 const CANARY_GRACE: Duration = Duration::from_secs(3);
@@ -86,6 +109,7 @@ struct Inner {
     /// How long a tool step may wait for its hook query to show up.
     canary_grace: Cell<Duration>,
     factory: RefCell<Option<AdapterFactory>>,
+    launch_env: RefCell<LaunchEnv>,
     proc: RefCell<Option<AgentProcess>>,
     state: RefCell<State>,
     /// A rendered, redacted handoff waiting for the next user prompt.
@@ -126,11 +150,32 @@ impl ChatSession {
     ///   through this session.
     pub fn new(
         adapter: Box<dyn Adapter>,
+        open: OpenSession,
+        store: Rc<Store>,
+        thread: ThreadId,
+        sink: EnvelopeSink,
+        approval: Option<ApprovalHandle>,
+    ) -> Rc<Self> {
+        Self::with_env(
+            adapter,
+            open,
+            store,
+            thread,
+            sink,
+            approval,
+            LaunchEnv::default(),
+        )
+    }
+
+    /// [`Self::new`] with the profile's environment applied to every process it starts.
+    pub fn with_env(
+        adapter: Box<dyn Adapter>,
         mut open: OpenSession,
         store: Rc<Store>,
         thread: ThreadId,
         sink: EnvelopeSink,
         approval: Option<ApprovalHandle>,
+        env: LaunchEnv,
     ) -> Rc<Self> {
         let driver = adapter.driver();
         open.approval_hook = approval.is_some();
@@ -167,6 +212,7 @@ impl ChatSession {
             approval: RefCell::new(approval),
             canary_grace: Cell::new(CANARY_GRACE),
             factory: RefCell::new(None),
+            launch_env: RefCell::new(env),
             proc: RefCell::new(None),
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
@@ -174,24 +220,9 @@ impl ChatSession {
             local_seq: Cell::new(0),
             generation: Cell::new(0),
         });
-        if let Some(handle) = inner.approval() {
-            let weak = Rc::downgrade(&inner);
-            handle.attach(move |env| {
-                if let Some(inner) = weak.upgrade() {
-                    inner.emit(env);
-                }
-            });
-            handle.set_mode(inner.state.borrow().mode);
-        }
+        inner.attach_approval();
         if hookless_agy {
-            inner.emit(Envelope::new(Event::Notice {
-                text: format!(
-                    "Antigravity is running read-only (plan mode): the approval hook is not \
-                     available. To let it edit files and run commands after asking you, add \
-                     this top-level entry to ~/.gemini/config/hooks.json:\n{}",
-                    crate::hook_config::install_entry_json()
-                ),
-            }));
+            inner.hookless_notice();
         }
         inner.start_process();
         Rc::new(Self { inner })
@@ -226,6 +257,30 @@ fn create_provider_thread(
 }
 
 impl Inner {
+    /// Routes the current approval handle's envelopes through this session.
+    fn attach_approval(self: &Rc<Self>) {
+        if let Some(handle) = self.approval() {
+            let weak = Rc::downgrade(self);
+            handle.attach(move |env| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.emit(env);
+                }
+            });
+            handle.set_mode(self.state.borrow().mode);
+        }
+    }
+
+    fn hookless_notice(&self) {
+        self.emit(Envelope::new(Event::Notice {
+            text: format!(
+                "Antigravity is running read-only (plan mode): the approval hook is not \
+                 available. To let it edit files and run commands after asking you, add \
+                 this top-level entry to ~/.gemini/config/hooks.json:\n{}",
+                crate::hook_config::install_entry_json()
+            ),
+        }));
+    }
+
     // ---- events ----
 
     /// Persists (under the current provider thread), updates the status, then delivers.
@@ -306,10 +361,15 @@ impl Inner {
         self.open.borrow_mut().approval_hook = approval.is_some();
         let open = self.open.borrow();
         let argv = self.adapter.borrow().argv(&open);
+        let launch = self.launch_env.borrow();
+        // The profile's environment first, so it can never override the approval socket.
+        let mut env = launch.env.clone();
+        env.extend(approval.map(|a| a.env()).unwrap_or_default());
         SpawnSpec {
             argv,
             cwd: (!open.cwd.is_empty()).then(|| open.cwd.clone()),
-            env: approval.map(|a| a.env()).unwrap_or_default(),
+            env,
+            unset: launch.unset.clone(),
         }
     }
 
@@ -789,6 +849,8 @@ impl Inner {
             &format!("{} thread {}", driver_label(from), self.thread),
         );
 
+        let launch = factory(driver);
+        let model = model.or(launch.default_model);
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
         let new_pt =
             match create_provider_thread(&self.store, &self.thread, driver, model.as_deref()) {
@@ -798,21 +860,27 @@ impl Inner {
                     return;
                 }
             };
-        // The old process's closing events still belong to the old provider thread.
+        // The old process's closing events still belong to the old provider thread, and its
+        // pending approvals expire on the old socket.
         self.stop_current();
         *self.provider_thread.borrow_mut() = new_pt;
-        *self.adapter.borrow_mut() = factory(driver);
+        *self.adapter.borrow_mut() = launch.adapter;
+        *self.launch_env.borrow_mut() = launch.env;
+        *self.approval.borrow_mut() = launch.approval;
+        // agy without its hook is read-only whatever the thread was in.
+        let hookless_agy = driver == Driver::Agy && self.approval().is_none();
         {
             let mut open = self.open.borrow_mut();
-            // The profile's program and arguments belong to the old agent; the binary is looked
-            // up on PATH. Ceiling: a custom profile path for the new agent is not carried over;
-            // the window can replace this through the factory's adapter `argv`.
-            open.program = driver_name(driver).to_owned();
-            open.extra_args.clear();
+            // The new agent's own binary and arguments, from its profile.
+            open.program = launch.program;
+            open.extra_args = launch.extra_args;
             open.model = model.clone();
             open.resume = None;
             open.new_session_id =
                 (driver == Driver::Claude).then(|| glib::uuid_string_random().to_string());
+            if hookless_agy {
+                open.mode = Mode::Plan;
+            }
         }
         {
             let mut state = self.state.borrow_mut();
@@ -820,7 +888,11 @@ impl Inner {
             state.native_id = None;
             state.commands.clear();
             state.running_turn = false;
+            if hookless_agy {
+                state.mode = Mode::Plan;
+            }
         }
+        self.attach_approval();
         *self.pending_handoff.borrow_mut() = (carried > 0).then_some(summary);
         self.emit(Envelope::new(Event::Notice {
             text: format!(
@@ -830,6 +902,10 @@ impl Inner {
         }));
         if let Some(m) = model {
             self.emit(Envelope::new(Event::ModelChanged { model: m }));
+        }
+        if hookless_agy {
+            self.emit(Envelope::new(Event::ModeChanged { mode: Mode::Plan }));
+            self.hookless_notice();
         }
         self.start_process();
     }
@@ -1336,6 +1412,128 @@ mod tests {
         }
     }
 
+    fn launch_of(adapter: Box<dyn Adapter>) -> AgentLaunch {
+        AgentLaunch {
+            adapter,
+            program: "unused".into(),
+            extra_args: Vec::new(),
+            default_model: None,
+            env: LaunchEnv::default(),
+            approval: None,
+        }
+    }
+
+    #[test]
+    fn a_cross_agent_switch_starts_the_profiles_binary_on_the_chosen_or_default_model() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                OpenSession {
+                    program: "/usr/bin/agy".into(),
+                    extra_args: vec!["--agy-only".into()],
+                    cwd: "/".into(),
+                    model: Some("gemini-3.1-pro-high".into()),
+                    mode: Mode::Plan,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store,
+                thread,
+                sink,
+                None,
+            );
+            let made: Rc<Cell<usize>> = Rc::default();
+            let count = made.clone();
+            let agy_log = log.clone();
+            session.set_adapter_factory(Rc::new(move |d| {
+                count.set(count.get() + 1);
+                AgentLaunch {
+                    adapter: match d {
+                        Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
+                        Driver::Agy => FakeAdapter::boxed(Driver::Agy, &agy_log),
+                    },
+                    program: "/bin/true".into(),
+                    extra_args: vec!["--profile-arg".into()],
+                    default_model: (d == Driver::Claude).then(|| "claude-sonnet-5-5".into()),
+                    env: LaunchEnv {
+                        env: vec![("FROM_ENV_FILE".into(), "1".into())],
+                        unset: vec!["CLAUDECODE".into()],
+                    },
+                    approval: None,
+                }
+            }));
+
+            // No model named: the agent's configured default.
+            session.switch(Driver::Claude, None);
+            assert_eq!(made.get(), 1);
+            let spec = session.launch_spec();
+            assert_eq!(spec.argv[0], "/bin/true");
+            assert!(spec.argv.contains(&"--profile-arg".to_owned()));
+            assert!(!spec.argv.contains(&"--agy-only".to_owned()));
+            assert!(spec
+                .argv
+                .windows(2)
+                .any(|w| w == ["--model", "claude-sonnet-5-5"]));
+            assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
+            assert_eq!(spec.unset, ["CLAUDECODE"]);
+            assert_eq!(session.status().model.as_deref(), Some("claude-sonnet-5-5"));
+
+            // A model picked from the catalogue wins over the default.
+            session.switch(Driver::Agy, Some("gemini-3.1-pro-high".into()));
+            session.switch(Driver::Claude, Some("claude-opus-5-5".into()));
+            let spec = session.launch_spec();
+            assert!(spec
+                .argv
+                .windows(2)
+                .any(|w| w == ["--model", "claude-opus-5-5"]));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ModelChanged { model } if model == "claude-opus-5-5")
+            ));
+        });
+    }
+
+    #[test]
+    fn switching_to_agy_without_its_hook_lands_read_only() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: Vec::new(),
+                    cwd: "/".into(),
+                    model: None,
+                    mode: Mode::AcceptEdits,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store,
+                thread,
+                sink,
+                None,
+            );
+            let log2 = log.clone();
+            session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
+            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            assert_eq!(session.status().driver, Driver::Agy);
+            assert_eq!(session.status().mode, Mode::Plan);
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("read-only"))
+            ));
+        });
+    }
+
     fn prompts(log: &Log) -> Vec<String> {
         log.borrow()
             .iter()
@@ -1409,7 +1607,7 @@ mod tests {
             assert_eq!(store.provider_threads(&thread).expect("pts").len(), 1);
 
             let log = log_claude.clone();
-            session.set_adapter_factory(Rc::new(move |d| FakeAdapter::boxed(d, &log)));
+            session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log))));
             session.switch(Driver::Claude, Some("opus".into()));
 
             let status = session.status();
@@ -1649,7 +1847,9 @@ mod tests {
                 sink,
                 None,
             );
-            session.set_adapter_factory(Rc::new(move |d| FakeAdapter::boxed(d, &Log::default())));
+            session.set_adapter_factory(Rc::new(move |d| {
+                launch_of(FakeAdapter::boxed(d, &Log::default()))
+            }));
             assert!(session.status().alive);
             session.switch(Driver::Claude, Some("opus".into()));
             assert!(has(

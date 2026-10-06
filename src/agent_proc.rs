@@ -37,6 +37,9 @@ pub struct SpawnSpec {
     pub cwd: Option<String>,
     /// Added to the user's own environment (which is inherited), overriding on conflict.
     pub env: Vec<(String, String)>,
+    /// Removed from the inherited environment before `env` is applied (a launching agent
+    /// session's own markers, the config's `clear_env`).
+    pub unset: Vec<String>,
 }
 
 type ExitCallback = Box<dyn FnOnce(Option<i32>)>;
@@ -131,6 +134,9 @@ impl AgentProcess {
                 libc::setsid();
             }
         });
+        for key in &spec.unset {
+            launcher.unsetenv(key);
+        }
         for (key, value) in &spec.env {
             launcher.setenv(key, value, true);
         }
