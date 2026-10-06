@@ -159,6 +159,7 @@ pub fn parse_driver(arg: &str) -> Option<Driver> {
     match arg.trim().to_lowercase().as_str() {
         "claude" => Some(Driver::Claude),
         "agy" | "antigravity" | "gemini" => Some(Driver::Agy),
+        "codex" | "openai" => Some(Driver::Codex),
         _ => None,
     }
 }
@@ -301,7 +302,8 @@ mod tests {
         assert_eq!(parse_mode("yolo"), None);
         assert_eq!(parse_driver("Antigravity"), Some(Driver::Agy));
         assert_eq!(parse_driver("claude"), Some(Driver::Claude));
-        assert_eq!(parse_driver("codex"), None);
+        assert_eq!(parse_driver("Codex"), Some(Driver::Codex));
+        assert_eq!(parse_driver("nope"), None);
     }
 
     #[test]

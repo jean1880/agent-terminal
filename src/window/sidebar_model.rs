@@ -146,18 +146,23 @@ pub fn stored_model(model: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The agent a chat thread can hand over to.
-pub fn other_driver(driver: Driver) -> Driver {
-    match driver {
-        Driver::Claude => Driver::Agy,
-        Driver::Agy => Driver::Claude,
-    }
+/// Every chat agent, in the order handoffs and menus offer them.
+pub const DRIVERS: [Driver; 3] = [Driver::Claude, Driver::Agy, Driver::Codex];
+
+/// The agent a handoff with no named target goes to: the next one after `from` in
+/// [`DRIVERS`] order (wrapping) that `usable` accepts. `None` when there is no other usable agent.
+pub fn handoff_target(from: Driver, usable: impl Fn(Driver) -> bool) -> Option<Driver> {
+    let at = DRIVERS.iter().position(|d| *d == from)?;
+    (1..DRIVERS.len())
+        .map(|step| DRIVERS[(at + step) % DRIVERS.len()])
+        .find(|d| usable(*d))
 }
 
 pub fn driver_label(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "Claude",
         Driver::Agy => "Antigravity",
+        Driver::Codex => "Codex",
     }
 }
 
@@ -165,6 +170,7 @@ pub fn driver_key(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "claude",
         Driver::Agy => "agy",
+        Driver::Codex => "codex",
     }
 }
 
@@ -172,6 +178,7 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
     match name {
         "claude" => Some(Driver::Claude),
         "agy" => Some(Driver::Agy),
+        "codex" => Some(Driver::Codex),
         _ => None,
     }
 }
@@ -275,9 +282,29 @@ mod tests {
         assert_eq!(resume_as(None, "abc"), ResumeAs::Terminal);
         assert_eq!(stored_model(Some("default")), None);
         assert_eq!(stored_model(Some("opus")).as_deref(), Some("opus"));
-        for d in [Driver::Claude, Driver::Agy] {
+        for d in DRIVERS {
             assert_eq!(parse_driver(driver_key(d)), Some(d));
-            assert_ne!(other_driver(d), d);
+            // Exhaustive: a new driver fails to compile until it is in DRIVERS.
+            match d {
+                Driver::Claude | Driver::Agy | Driver::Codex => {}
+            }
+            assert_ne!(handoff_target(d, |_| true), Some(d));
         }
+        assert_eq!(driver_label(Driver::Codex), "Codex");
+    }
+
+    #[test]
+    fn the_default_handoff_target_cycles_to_the_next_usable_agent() {
+        use Driver::{Agy, Claude, Codex};
+        let all = |_| true;
+        assert_eq!(handoff_target(Claude, all), Some(Agy));
+        assert_eq!(handoff_target(Agy, all), Some(Codex));
+        assert_eq!(handoff_target(Codex, all), Some(Claude));
+        // Skips an agent that is off or not installed, and wraps.
+        assert_eq!(handoff_target(Claude, |d| d == Codex), Some(Codex));
+        assert_eq!(handoff_target(Codex, |d| d == Agy), Some(Agy));
+        // Never itself, and nothing when it is the only one.
+        assert_eq!(handoff_target(Claude, |d| d == Claude), None);
+        assert_eq!(handoff_target(Agy, |_| false), None);
     }
 }

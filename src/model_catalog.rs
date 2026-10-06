@@ -1,9 +1,13 @@
 //! The live model catalog behind the unified model picker.
 //!
-//! Two sources feed it, both asynchronously on the GTK main loop and never blocking it:
+//! Three sources feed it, all asynchronously on the GTK main loop and never blocking it:
 //! - agy: `agy models` through [`run_side`] (`id<TAB>Display` lines);
 //! - Claude: the shared [`crate::claude_probe`] (an `initialize` control request and no prompt,
-//!   so no turn and no cost); the `models` of its response are read.
+//!   so no turn and no cost); the `models` of its response are read;
+//! - Codex: the shared [`crate::codex_probe`] (`initialize` then `model/list` on a throwaway
+//!   `codex app-server`; no thread or turn is ever started).
+//!
+//! Every probe runs in the environment its agent's threads get (see [`ProbeTargets`]).
 //!
 //! The last good lists are persisted at `$XDG_CACHE_HOME/agent-terminal/models.json` (0600,
 //! atomic write) so the picker is populated the instant the app starts. A failed refresh keeps
@@ -12,7 +16,6 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
 
 use agent_core::adapter::Driver;
 use agent_core::catalog::{parse_agy_models, CatalogModel};
@@ -20,12 +23,10 @@ use gtk4::glib;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::agent_proc::run_side;
+use crate::agent_proc::{run_side, AGY_TIMEOUT};
 use crate::chat::ModelSource;
-use crate::claude_probe::probe_shared;
-
-/// How long `agy models` may take.
-const AGY_TIMEOUT: Duration = Duration::from_secs(20);
+use crate::probe::{join_n, ProbeTargets};
+use crate::{claude_probe, codex_probe};
 
 // ---------------------------------------------------------------------------------------------
 // Pure pieces
@@ -46,6 +47,8 @@ struct CacheFile {
     claude: Vec<CatalogModel>,
     #[serde(default)]
     agy: Vec<CatalogModel>,
+    #[serde(default)]
+    codex: Vec<CatalogModel>,
 }
 
 fn decode_cache(text: &str) -> CacheFile {
@@ -88,6 +91,7 @@ type Listener = Rc<dyn Fn()>;
 pub struct ModelCatalog {
     claude: RefCell<Vec<CatalogModel>>,
     agy: RefCell<Vec<CatalogModel>>,
+    codex: RefCell<Vec<CatalogModel>>,
     listeners: RefCell<Vec<Listener>>,
     cache: Option<PathBuf>,
     refreshing: Cell<bool>,
@@ -117,16 +121,19 @@ impl ModelCatalog {
         Self {
             claude: RefCell::new(loaded.claude),
             agy: RefCell::new(loaded.agy),
+            codex: RefCell::new(loaded.codex),
             listeners: RefCell::new(Vec::new()),
             cache,
             refreshing: Cell::new(false),
         }
     }
 
-    /// The current snapshot, Claude's models first. Empty until the cache or a refresh lands.
+    /// The current snapshot, Claude's models first, then agy's, then Codex's. Empty until the
+    /// cache or a refresh lands.
     pub fn models(&self) -> Vec<CatalogModel> {
         let mut all = self.claude.borrow().clone();
         all.extend(self.agy.borrow().iter().cloned());
+        all.extend(self.codex.borrow().iter().cloned());
         all
     }
 
@@ -144,6 +151,7 @@ impl ModelCatalog {
         let slot = match driver {
             Driver::Claude => &self.claude,
             Driver::Agy => &self.agy,
+            Driver::Codex => &self.codex,
         };
         if *slot.borrow() == models {
             return;
@@ -162,6 +170,7 @@ impl ModelCatalog {
         let file = CacheFile {
             claude: self.claude.borrow().clone(),
             agy: self.agy.borrow().clone(),
+            codex: self.codex.borrow().clone(),
         };
         let result = serde_json::to_vec(&file)
             .map_err(std::io::Error::other)
@@ -171,51 +180,66 @@ impl ModelCatalog {
         }
     }
 
-    /// Re-fetches both lists in the background. Returns at once; a refresh already in flight
-    /// makes this a no-op. Neither program is given a prompt.
-    pub fn refresh(self: &Rc<Self>, claude_program: &str, agy_program: &str) {
+    /// Re-fetches every agent's list in the background. Returns at once; a refresh already in
+    /// flight makes this a no-op. No program is given a prompt, and each runs in the environment
+    /// its threads get.
+    pub fn refresh(self: &Rc<Self>, targets: &ProbeTargets) {
         if self.refreshing.replace(true) {
             debug!("model catalog refresh already running");
             return;
         }
-        let pending = Rc::new(Cell::new(2u8));
         let finish = {
             let me = self.clone();
-            move || {
-                pending.set(pending.get() - 1);
-                if pending.get() == 0 {
-                    me.refreshing.set(false);
-                }
-            }
+            join_n(targets.count(), move || me.refreshing.set(false))
         };
 
-        let (me, done, program) = (self.clone(), finish.clone(), agy_program.to_owned());
+        let (me, done, agy) = (self.clone(), finish.clone(), targets.agy.clone());
         glib::spawn_future_local(async move {
-            let fetch = run_side(vec![program, "models".to_owned()], None);
-            match glib::future_with_timeout(AGY_TIMEOUT, fetch).await {
-                Ok((out, true)) => {
-                    let models = parse_agy_models(&out);
-                    if models.is_empty() {
-                        warn!("agy models listed nothing");
-                    }
-                    info!(count = models.len(), "agy model list fetched");
-                    me.set(Driver::Agy, models);
+            let (out, ok) = run_side(
+                vec![agy.program, "models".to_owned()],
+                None,
+                &agy.env,
+                AGY_TIMEOUT,
+            )
+            .await;
+            if ok {
+                let models = parse_agy_models(&out);
+                if models.is_empty() {
+                    warn!("agy models listed nothing");
                 }
-                Ok((_, false)) => warn!("agy models failed"),
-                Err(_) => warn!("agy models timed out"),
+                info!(count = models.len(), "agy model list fetched");
+                me.set(Driver::Agy, models);
+            } else {
+                warn!("agy models failed or timed out");
             }
             done();
         });
 
         // One Claude process serves this and the usage indicator (see `claude_probe`).
-        let me = self.clone();
-        probe_shared(claude_program, move |result| {
-            if let Ok(probe) = result {
-                info!(count = probe.models.len(), "claude model list fetched");
-                me.set(Driver::Claude, probe.models.clone());
-            }
-            finish();
-        });
+        let (me, done) = (self.clone(), finish.clone());
+        claude_probe::probe_shared(
+            &targets.claude.program,
+            &targets.claude.env,
+            move |result| {
+                if let Ok(probe) = result {
+                    info!(count = probe.models.len(), "claude model list fetched");
+                    me.set(Driver::Claude, probe.models.clone());
+                }
+                done();
+            },
+        );
+
+        // Likewise one `codex app-server`, asked for models and the account, never for a turn.
+        if let Some(codex) = &targets.codex {
+            let me = self.clone();
+            codex_probe::probe_shared(&codex.program, &codex.env, move |result| {
+                if let Ok(probe) = result {
+                    info!(count = probe.models.len(), "codex model list fetched");
+                    me.set(Driver::Codex, probe.models.clone());
+                }
+                finish();
+            });
+        }
     }
 }
 
@@ -242,6 +266,7 @@ mod tests {
             display: id.into(),
             description: None,
             efforts: vec![],
+            default_effort: None,
             via: None,
         }
     }
@@ -276,6 +301,7 @@ mod tests {
         let file = CacheFile {
             claude: vec![model(Driver::Claude, "opus")],
             agy: vec![model(Driver::Agy, "gemini-3.1-pro-high")],
+            codex: vec![model(Driver::Codex, "gpt-5-codex")],
         };
         let text = serde_json::to_string(&file).unwrap();
         assert_eq!(decode_cache(&text), file);
@@ -312,17 +338,18 @@ mod tests {
 
         cat.set(Driver::Agy, vec![model(Driver::Agy, "g")]);
         cat.set(Driver::Claude, vec![model(Driver::Claude, "opus")]);
-        assert_eq!(hits.get(), 2);
+        cat.set(Driver::Codex, vec![model(Driver::Codex, "gpt")]);
+        assert_eq!(hits.get(), 3);
         // Unchanged and empty (failed) lists neither notify nor clobber.
         cat.set(Driver::Agy, vec![model(Driver::Agy, "g")]);
         cat.set(Driver::Agy, vec![]);
-        assert_eq!(hits.get(), 2);
+        assert_eq!(hits.get(), 3);
         let ids: Vec<_> = cat.models().into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["opus", "g"], "Claude first");
+        assert_eq!(ids, ["opus", "g", "gpt"], "Claude first, Codex last");
 
         // A fresh catalog is populated from the file straight away.
         let again = ModelCatalog::with_cache(Some(path));
         let ids: Vec<_> = again.models().into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["opus", "g"]);
+        assert_eq!(ids, ["opus", "g", "gpt"]);
     }
 }

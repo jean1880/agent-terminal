@@ -29,6 +29,7 @@ pub fn driver_name(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "Claude",
         Driver::Agy => "Antigravity",
+        Driver::Codex => "Codex",
     }
 }
 
@@ -37,6 +38,7 @@ pub fn accent_class(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "accent-claude",
         Driver::Agy => "accent-agy",
+        Driver::Codex => "accent-codex",
     }
 }
 

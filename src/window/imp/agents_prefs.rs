@@ -25,11 +25,18 @@ const MODES: [(Mode, &str); 3] = [
 const FALLBACK_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
 /// The "default agent" dropdown, by index both ways.
-const DEFAULT_AGENTS: [(Option<Driver>, &str); 3] = [
+const DEFAULT_AGENTS: [(Option<Driver>, &str); 4] = [
     (None, "Automatic"),
     (Some(Driver::Claude), "Claude"),
     (Some(Driver::Agy), "Antigravity (agy)"),
+    (Some(Driver::Codex), "Codex"),
 ];
+
+/// Whether a command field is acceptable: non-empty, one line, and not something an exec would
+/// read as an option.
+fn command_ok(text: &str) -> bool {
+    !text.is_empty() && !text.contains('\n') && !text.starts_with('-')
+}
 
 /// Splits an arguments field as a shell would. `Err` is the reason to show.
 pub(super) fn parse_args(text: &str) -> Result<Vec<String>, String> {
@@ -123,7 +130,7 @@ impl AgentTerminalWindow {
         general.add(&default_row);
         page.add(&general);
 
-        for driver in [Driver::Claude, Driver::Agy] {
+        for driver in [Driver::Claude, Driver::Agy, Driver::Codex] {
             page.add(&self.agent_group(driver));
         }
         dialog.add(&page);
@@ -136,6 +143,7 @@ impl AgentTerminalWindow {
             .title(match driver {
                 Driver::Claude => "Claude",
                 Driver::Agy => "Antigravity (agy)",
+                Driver::Codex => "Codex",
             })
             .description(format!("Profile “{}”", profile.name))
             .build();
@@ -204,11 +212,13 @@ impl AgentTerminalWindow {
             detect,
             move |row| {
                 let text = row.text().trim().to_owned();
-                if text.is_empty() || text.contains('\n') {
+                if !command_ok(&text) {
                     row.add_css_class("error");
+                    row.set_tooltip_text(Some("Enter a command name or a path (not an option)"));
                     return;
                 }
                 row.remove_css_class("error");
+                row.set_tooltip_text(None);
                 let imp = obj.imp();
                 if imp.agent_profile_now(driver).command == text {
                     return;
@@ -567,9 +577,22 @@ mod tests {
             }
             assert_eq!(MODES.iter().position(|(m, _)| m == mode), Some(i));
         }
-        for d in [None, Some(Driver::Claude), Some(Driver::Agy)] {
+        for d in [
+            None,
+            Some(Driver::Claude),
+            Some(Driver::Agy),
+            Some(Driver::Codex),
+        ] {
             assert!(DEFAULT_AGENTS.iter().any(|(x, _)| *x == d));
         }
+        // Exhaustive: a new driver fails to compile until it has a dropdown row.
+        for d in [Driver::Claude, Driver::Agy, Driver::Codex] {
+            match d {
+                Driver::Claude | Driver::Agy | Driver::Codex => {}
+            }
+        }
+        assert!(command_ok("codex") && command_ok("/opt/bin/claude"));
+        assert!(!command_ok("") && !command_ok("--help") && !command_ok("a\nb"));
         assert!(env_file_ok(""));
         assert!(!env_file_ok("/definitely/not/here.env"));
     }

@@ -2,16 +2,17 @@
 //!
 //! Fed two ways: [`AccountStatus::observe`] ingests the `QuotaUpdated` envelopes a thread's
 //! adapter emits (Claude: every turn; agy: after the host requests `Control::Usage` once a turn
-//! completes), and [`AccountStatus::refresh`] probes both agents without a prompt so the
-//! indicator is filled before any thread has run (Claude through the shared
-//! [`crate::claude_probe`], agy through `-p /usage` plus its signed-in account file).
+//! completes; Codex: `account/rateLimits/updated`), and [`AccountStatus::refresh`] probes the
+//! agents without a prompt so the indicator is filled before any thread has run (Claude through
+//! the shared [`crate::claude_probe`], Codex through [`crate::codex_probe`], agy through
+//! `-p /usage` plus its signed-in account file).
 //!
 //! The email address is shown in the UI only and is never logged.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::adapter::Driver;
 use agent_core::event::{Account, Envelope, Event, QuotaWindow};
@@ -20,10 +21,9 @@ use gtk4::{gio, glib};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::agent_proc::run_side;
-use crate::claude_probe::probe_shared;
-
-const AGY_TIMEOUT: Duration = Duration::from_secs(20);
+use crate::agent_proc::{run_side, AGY_TIMEOUT};
+use crate::probe::{join_n, ProbeTargets};
+use crate::{claude_probe, codex_probe};
 
 /// One agent's account and quota windows.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -104,6 +104,7 @@ type Listener = Rc<dyn Fn()>;
 pub struct AccountStatus {
     claude: RefCell<Snapshot>,
     agy: RefCell<Snapshot>,
+    codex: RefCell<Snapshot>,
     listeners: RefCell<Vec<Listener>>,
     refreshing: Cell<bool>,
 }
@@ -117,6 +118,7 @@ impl AccountStatus {
         Self {
             claude: RefCell::default(),
             agy: RefCell::default(),
+            codex: RefCell::default(),
             listeners: RefCell::default(),
             refreshing: Cell::new(false),
         }
@@ -131,6 +133,7 @@ impl AccountStatus {
         match driver {
             Driver::Claude => &self.claude,
             Driver::Agy => &self.agy,
+            Driver::Codex => &self.codex,
         }
     }
 
@@ -171,56 +174,63 @@ impl AccountStatus {
         }
     }
 
-    /// Probes both agents in the background and returns at once (a probe already running makes
-    /// this a no-op). Neither agent is sent a prompt.
-    pub fn refresh(self: &Rc<Self>, claude_program: &str, agy_program: &str) {
+    /// Probes every agent in the background and returns at once (a probe already running makes
+    /// this a no-op). No agent is sent a prompt, and each runs in the environment its threads
+    /// get, so the account shown is the one a thread would use.
+    pub fn refresh(self: &Rc<Self>, targets: &ProbeTargets) {
         if self.refreshing.replace(true) {
             debug!("account status refresh already running");
             return;
         }
-        let pending = Rc::new(Cell::new(2u8));
         let finish = {
             let me = self.clone();
-            move || {
-                pending.set(pending.get() - 1);
-                if pending.get() == 0 {
-                    me.refreshing.set(false);
-                }
-            }
+            join_n(targets.count(), move || me.refreshing.set(false))
         };
 
         let (me, done) = (self.clone(), finish.clone());
-        probe_shared(claude_program, move |result| {
-            if let Ok(probe) = result {
-                me.update(Driver::Claude, probe.account.clone(), probe.windows.clone());
-            }
-            done();
-        });
+        claude_probe::probe_shared(
+            &targets.claude.program,
+            &targets.claude.env,
+            move |result| {
+                if let Ok(probe) = result {
+                    me.update(Driver::Claude, probe.account.clone(), probe.windows.clone());
+                }
+                done();
+            },
+        );
 
-        let (me, program) = (self.clone(), agy_program.to_owned());
+        if let Some(codex) = &targets.codex {
+            let (me, done) = (self.clone(), finish.clone());
+            codex_probe::probe_shared(&codex.program, &codex.env, move |result| {
+                if let Ok(probe) = result {
+                    me.update(Driver::Codex, probe.account.clone(), probe.windows.clone());
+                }
+                done();
+            });
+        }
+
+        let (me, agy) = (self.clone(), targets.agy.clone());
         glib::spawn_future_local(async move {
-            let usage = run_side(
+            let (out, ok) = run_side(
                 vec![
-                    program,
+                    agy.program,
                     "-p".to_owned(),
                     "/usage".to_owned(),
                     "--output-format".to_owned(),
                     "json".to_owned(),
                 ],
                 None,
-            );
-            let windows = match glib::future_with_timeout(AGY_TIMEOUT, usage).await {
-                Ok((out, true)) => serde_json::from_str::<Value>(out.trim())
+                &agy.env,
+                AGY_TIMEOUT,
+            )
+            .await;
+            let windows = if ok {
+                serde_json::from_str::<Value>(out.trim())
                     .map(|v| agy_usage(&v))
-                    .unwrap_or_default(),
-                Ok((_, false)) => {
-                    warn!("agy /usage failed");
-                    Vec::new()
-                }
-                Err(_) => {
-                    warn!("agy /usage timed out");
-                    Vec::new()
-                }
+                    .unwrap_or_default()
+            } else {
+                warn!("agy /usage failed or timed out");
+                Vec::new()
             };
             // A few hundred bytes of JSON, read off the main thread like all file I/O here.
             let account = match google_accounts_path(std::env::var("HOME").ok().as_deref()) {
@@ -325,6 +335,8 @@ mod tests {
             &Envelope::new(Event::Notice { text: "x".into() }),
         );
         assert_eq!(hits.get(), 2);
+        st.observe(Driver::Codex, &quota(0.7));
+        assert_eq!(st.snapshot(Driver::Codex).windows[0].used, 0.7);
         assert_eq!(st.snapshot(Driver::Agy).windows[0].used, 0.3);
         assert_eq!(st.snapshot(Driver::Claude).windows[0].used, 0.5);
     }

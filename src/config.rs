@@ -133,6 +133,7 @@ pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> 
     match name.as_str() {
         "claude" => Some(Driver::Claude),
         "agy" => Some(Driver::Agy),
+        "codex" => Some(Driver::Codex),
         _ => None,
     }
 }
@@ -144,6 +145,7 @@ pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
     let (name, command) = match driver {
         Driver::Claude => ("Claude", "claude"),
         Driver::Agy => ("Agy", "agy"),
+        Driver::Codex => ("Codex", "codex"),
     };
     let mut profile = Profile {
         name: name.to_string(),
@@ -171,6 +173,7 @@ pub fn choose_default_agent(
         default_profile,
         Some(Driver::Claude),
         Some(Driver::Agy),
+        Some(Driver::Codex),
     ]
     .into_iter()
     .flatten()
@@ -2003,7 +2006,7 @@ mod tests {
 
     #[test]
     fn the_default_agent_follows_the_choice_then_the_profile_then_what_is_installed() {
-        use agent_core::adapter::Driver::{Agy, Claude};
+        use agent_core::adapter::Driver::{self, Agy, Claude};
         let all = |_| true;
         assert_eq!(
             choose_default_agent(Some(Agy), Some(Claude), all),
@@ -2018,5 +2021,26 @@ mod tests {
             Some(Agy)
         );
         assert_eq!(choose_default_agent(None, None, |_| false), None);
+        // Codex is the last resort, and is picked when it is all that is usable.
+        assert_eq!(
+            choose_default_agent(None, None, |d| d == Driver::Codex),
+            Some(Driver::Codex)
+        );
+    }
+
+    #[test]
+    fn a_codex_profile_is_recognised_by_its_binary_and_created_on_demand() {
+        use agent_core::adapter::Driver;
+        let profile = new_agent_profile(Driver::Codex);
+        assert_eq!(
+            (profile.name.as_str(), profile.command.as_str()),
+            ("Codex", "codex")
+        );
+        assert_eq!(profile_driver(&profile), Some(Driver::Codex));
+        let wrapped = Profile {
+            command: "/opt/bin/Codex".into(),
+            ..Profile::default()
+        };
+        assert_eq!(profile_driver(&wrapped), Some(Driver::Codex));
     }
 }

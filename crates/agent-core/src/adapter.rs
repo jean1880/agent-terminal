@@ -19,6 +19,7 @@ use crate::event::{Decision, Envelope};
 pub enum Driver {
     Claude,
     Agy,
+    Codex,
 }
 
 /// Approval / edit policy for a session (mapped per agent).
@@ -129,6 +130,19 @@ pub enum Action {
     SideProcess { id: String, argv: Vec<String> },
 }
 
+/// What an adapter has to say outside a call's return value (see [`Adapter::drain_outbox`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Outbox {
+    pub actions: Vec<Action>,
+    pub events: Vec<Envelope>,
+}
+
+impl Outbox {
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty() && self.events.is_empty()
+    }
+}
+
 /// Fields to change on the current [`OpenSession`] before respawning.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenSessionDelta {
@@ -174,4 +188,13 @@ pub trait Adapter {
     fn feed_side(&mut self, id: &str, stdout: &str, success: bool) -> Vec<Envelope>;
     /// The process exited: close open items as interrupted, expire live approvals.
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope>;
+    /// Output the adapter produced on its own initiative: actions to carry out like
+    /// [`Adapter::encode`]'s, and events to dispatch like [`Adapter::feed`]'s. The transport
+    /// calls it after every `encode`, `feed` and `feed_side`, and empties it each time. Needed by
+    /// agents whose protocol is a two-way RPC (Codex: prompts queued until the thread exists,
+    /// replies to server requests the app does not handle, answers to controls the adapter can
+    /// give itself); Claude and agy have none.
+    fn drain_outbox(&mut self) -> Outbox {
+        Outbox::default()
+    }
 }

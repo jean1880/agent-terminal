@@ -697,6 +697,8 @@ pub struct AgentTerminalWindow {
     quota_poll_running: std::cell::Cell<bool>,
     /// Wraps the tab view, for short confirmations that need no dialog.
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
+    /// The header's "New Thread With" submenu, refilled when agent detection finishes.
+    new_with_menu: RefCell<Option<gtk4::gio::Menu>>,
     /// The thread sidebar beside the pages.
     split_view: RefCell<Option<adw::OverlaySplitView>>,
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
@@ -1789,16 +1791,17 @@ impl AgentTerminalWindow {
         self.refresh_sidebar();
     }
 
-    /// The header's New menu: threads first, then resume and hand-off, then terminal pages.
-    fn build_new_menu(&self) -> gtk4::gio::Menu {
-        let menu = gtk4::gio::Menu::new();
-        let threads = gtk4::gio::Menu::new();
-        threads.append(Some("New Thread"), Some("win.new-tab"));
-        let with = gtk4::gio::Menu::new();
-        for driver in [
-            agent_core::adapter::Driver::Claude,
-            agent_core::adapter::Driver::Agy,
-        ] {
+    /// (Re)fills "New Thread With" with the agents that are installed and enabled. Detection is
+    /// asynchronous, so this runs again when it finishes.
+    pub(super) fn fill_new_with_menu(&self) {
+        let Some(with) = self.new_with_menu.borrow().clone() else {
+            return;
+        };
+        with.remove_all();
+        for driver in crate::window::sidebar_model::DRIVERS
+            .into_iter()
+            .filter(|d| self.agent_usable(*d))
+        {
             let item = gtk4::gio::MenuItem::new(
                 Some(crate::window::sidebar_model::driver_label(driver)),
                 None,
@@ -1809,6 +1812,16 @@ impl AgentTerminalWindow {
             );
             with.append_item(&item);
         }
+    }
+
+    /// The header's New menu: threads first, then resume and hand-off, then terminal pages.
+    fn build_new_menu(&self) -> gtk4::gio::Menu {
+        let menu = gtk4::gio::Menu::new();
+        let threads = gtk4::gio::Menu::new();
+        threads.append(Some("New Thread"), Some("win.new-tab"));
+        let with = gtk4::gio::Menu::new();
+        *self.new_with_menu.borrow_mut() = Some(with.clone());
+        self.fill_new_with_menu();
         threads.append_submenu(Some("New Thread With"), &with);
         threads.append(Some("New Thread in Folder…"), Some("win.new-tab-folder"));
         threads.append(

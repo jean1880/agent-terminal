@@ -12,6 +12,7 @@ pub mod approval;
 pub mod caps;
 pub mod catalog;
 pub mod claude;
+pub mod codex;
 pub mod commands;
 pub mod event;
 pub mod handoff_budget;

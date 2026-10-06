@@ -204,7 +204,6 @@ impl AgentProcess {
     }
 
     /// SIGTERM, then SIGKILL if it is still there after a short grace.
-    #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn terminate(&self) {
         terminate(&self.shared);
     }
@@ -306,21 +305,56 @@ fn pump(shared: &Rc<Shared>) {
     });
 }
 
+/// How long `agy models` / `agy -p /usage` may take (shared by the catalogue and the usage probe).
+pub const AGY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The environment an agent's processes get beyond the user's own: what its profile adds (the env
+/// file) and what the app removes (`clear_env`, an approval socket inherited from a launching
+/// session). Threads, side processes and the background probes all use the same value, so the
+/// model list and usage indicator come from the account a thread would use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentEnv {
+    pub env: Vec<(String, String)>,
+    pub unset: Vec<String>,
+}
+
+impl AgentEnv {
+    fn apply(&self, launcher: &gio::SubprocessLauncher) {
+        for key in &self.unset {
+            launcher.unsetenv(key);
+        }
+        for (key, value) in &self.env {
+            launcher.setenv(key, value, true);
+        }
+    }
+}
+
 /// Runs a one-shot side process (agy `-p /model --output-format json`, `agy models`) and returns
 /// its stdout and whether it exited with status 0. A failure to start is `("<reason>", false)`.
-pub async fn run_side(argv: Vec<String>, cwd: Option<String>) -> (String, bool) {
+///
+/// Its stdin is `/dev/null` (never the app's), and it is killed when `timeout` passes: dropping
+/// the `communicate` future would leave the child running, so the kill is explicit. The result is
+/// then `("timed out", false)`.
+pub async fn run_side(
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: &AgentEnv,
+    timeout: Duration,
+) -> (String, bool) {
     let Some(program) = argv.first() else {
         return ("empty command line".to_owned(), false);
     };
     let name = Path::new(program)
         .file_name()
         .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+    // Neither STDIN_PIPE nor STDIN_INHERIT: GIO gives the child /dev/null.
     let launcher = gio::SubprocessLauncher::new(
         gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
     );
     if let Some(cwd) = &cwd {
         launcher.set_cwd(cwd);
     }
+    env.apply(&launcher);
     let args: Vec<&OsStr> = argv.iter().map(|a| OsStr::new(a.as_str())).collect();
     let subprocess = match launcher.spawn(&args) {
         Ok(s) => s,
@@ -329,14 +363,20 @@ pub async fn run_side(argv: Vec<String>, cwd: Option<String>) -> (String, bool) 
             return (format!("could not start {name}: {}", e.message()), false);
         }
     };
-    match subprocess.communicate_utf8_future(None).await {
-        Ok((stdout, _)) => (
+    let finished = glib::future_with_timeout(timeout, subprocess.communicate_utf8_future(None));
+    match finished.await {
+        Ok(Ok((stdout, _))) => (
             stdout.map(|s| s.to_string()).unwrap_or_default(),
             subprocess.is_successful(),
         ),
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(program = %name, error = %e.message(), "side process failed");
             (e.message().to_owned(), false)
+        }
+        Err(_) => {
+            warn!(program = %name, "side process timed out; killing it");
+            subprocess.force_exit();
+            ("timed out".to_owned(), false)
         }
     }
 }
@@ -480,6 +520,70 @@ mod tests {
         });
     }
 
+    fn side(script: &str, env: AgentEnv, timeout: Duration) -> (String, bool) {
+        let script = script.to_owned();
+        in_loop(|ctx| {
+            let out: Rc<RefCell<Option<(String, bool)>>> = Rc::default();
+            let o = out.clone();
+            glib::spawn_future_local(async move {
+                let got = run_side(
+                    vec!["/bin/sh".into(), "-c".into(), script],
+                    None,
+                    &env,
+                    timeout,
+                )
+                .await;
+                *o.borrow_mut() = Some(got);
+            });
+            assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
+            let got = out.borrow_mut().take().expect("result");
+            got
+        })
+    }
+
+    #[test]
+    fn a_side_process_that_outlives_its_timeout_is_killed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+        let started = std::time::Instant::now();
+        let (text, ok) = side(&script, AgentEnv::default(), Duration::from_millis(400));
+        assert!(!ok);
+        assert_eq!(text, "timed out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        // The kill is asynchronous (SIGKILL, then the reaper): give it a moment.
+        let mut gone = false;
+        for _ in 0..50 {
+            if is_gone(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(gone, "the timed-out child kept running");
+    }
+
+    #[test]
+    fn a_side_process_reads_end_of_file_not_the_apps_stdin_and_gets_the_agent_env() {
+        let env = AgentEnv {
+            env: vec![("AT_SIDE_VAR".into(), "set".into())],
+            unset: vec!["HOME".into()],
+        };
+        // `read` returns at once only when stdin is closed or null.
+        let (out, ok) = side(
+            "read x; echo \"eof:$AT_SIDE_VAR:${HOME-unset}\"",
+            env,
+            Duration::from_secs(10),
+        );
+        assert!(ok, "{out}");
+        assert_eq!(out.trim(), "eof:set:unset");
+    }
+
     #[test]
     fn run_side_captures_stdout_and_success() {
         in_loop(|ctx| {
@@ -487,14 +591,25 @@ mod tests {
             for script in ["echo hi; exit 0", "echo oops; exit 2"] {
                 let r = result.clone();
                 glib::spawn_future_local(async move {
-                    let got =
-                        run_side(vec!["/bin/sh".into(), "-c".into(), script.into()], None).await;
+                    let got = run_side(
+                        vec!["/bin/sh".into(), "-c".into(), script.into()],
+                        None,
+                        &AgentEnv::default(),
+                        Duration::from_secs(10),
+                    )
+                    .await;
                     r.borrow_mut().push(got);
                 });
             }
             let r = result.clone();
             glib::spawn_future_local(async move {
-                let got = run_side(vec!["/nonexistent/x".into()], None).await;
+                let got = run_side(
+                    vec!["/nonexistent/x".into()],
+                    None,
+                    &AgentEnv::default(),
+                    Duration::from_secs(10),
+                )
+                .await;
                 r.borrow_mut().push(got);
             });
             assert!(pump_until(ctx, 10, || result.borrow().len() == 3));

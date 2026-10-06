@@ -90,6 +90,7 @@ impl DemoModels {
             display: display.into(),
             description: Some(desc.into()),
             efforts,
+            default_effort: None,
             via: None,
         };
         let mut models = vec![
@@ -280,6 +281,7 @@ impl DemoBackend {
                     s.capabilities = match driver {
                         Driver::Claude => Capabilities::claude(),
                         Driver::Agy => Capabilities::agy(),
+                        Driver::Codex => Capabilities::codex(),
                     };
                 }
                 Some(Step::SetRunning(r)) => self.status.borrow_mut().running_turn = r,
@@ -361,6 +363,9 @@ impl DemoBackend {
                     {"id": "gemini-3.1-pro", "display": "Gemini 3.1 Pro"},
                     {"id": "gemini-3.1-pro-low", "display": "Gemini 3.1 Pro (low)"},
                     {"id": "gemini-3-flash", "display": "Gemini 3 Flash"}
+                ]),
+                Driver::Codex => json!([
+                    {"id": "gpt-5-codex", "display": "GPT-5 Codex"}
                 ]),
             },
             Control::McpStatus => {
@@ -501,6 +506,7 @@ impl ChatBackend for DemoBackend {
                 Some(match driver {
                     Driver::Claude => "claude-opus-5-5".into(),
                     Driver::Agy => "gemini-3.1-pro-high".into(),
+                    Driver::Codex => "gpt-5-codex".into(),
                 })
             });
             self.status.borrow_mut().effort = effort;

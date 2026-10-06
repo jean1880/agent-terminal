@@ -37,6 +37,8 @@
 .accent-agy .accent-dot { color: #6ec8ff; }
 .agent-chip.accent-claude { border-color: alpha(#f0a37a, 0.45); }
 .agent-chip.accent-agy { border-color: alpha(#6ec8ff, 0.45); }
+.accent-codex .accent-dot { color: #4cc38a; }
+.agent-chip.accent-codex { border-color: alpha(#4cc38a, 0.45); }
 
 .mode-dropdown > button {
     border-radius: 999px;
@@ -103,10 +105,12 @@ levelbar.context-level block.empty { background-color: transparent; }
 }
 .assistant-row.accent-claude { border-left-color: alpha(#f0a37a, 0.75); }
 .assistant-row.accent-agy { border-left-color: alpha(#6ec8ff, 0.75); }
+.assistant-row.accent-codex { border-left-color: alpha(#4cc38a, 0.75); }
 .assistant-head .agent-name { color: #918bbd; font-weight: 700; font-size: 0.85em; letter-spacing: 0.02em; }
 .stream-caret { color: #b49bff; }
 .accent-claude .stream-caret { color: #f0a37a; }
 .accent-agy .stream-caret { color: #6ec8ff; }
+.accent-codex .stream-caret { color: #4cc38a; }
 
 .md-text { color: #dcdaf5; line-height: 1.45; }
 .md-heading { color: #ebe9ff; margin-top: 4px; }
@@ -312,6 +316,8 @@ togglebutton.option-button, button.option-button {
 .switch-divider.accent-agy .divider-pill { border-color: alpha(#6ec8ff, 0.6); background-color: alpha(#6ec8ff, 0.08); }
 .switch-divider.accent-claude separator { background-color: alpha(#f0a37a, 0.35); }
 .switch-divider.accent-agy separator { background-color: alpha(#6ec8ff, 0.35); }
+.switch-divider.accent-codex .divider-pill { border-color: alpha(#4cc38a, 0.6); background-color: alpha(#4cc38a, 0.08); }
+.switch-divider.accent-codex separator { background-color: alpha(#4cc38a, 0.35); }
 .switch-divider .divider-text { color: #ebe9ff; font-weight: 600; }
 .compaction-divider .divider-text { font-style: italic; }
 

@@ -156,6 +156,7 @@ fn group_title(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "Claude",
         Driver::Agy => "Antigravity (agy)",
+        Driver::Codex => "Codex",
     }
 }
 
@@ -170,6 +171,7 @@ fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Ve
             display: m.label,
             description: m.description,
             efforts: Vec::new(),
+            default_effort: None,
             via: None,
         })
         .collect()
@@ -212,6 +214,8 @@ fn choice(
             let send = touched || status.effort.is_some();
             (m.id.clone(), effort.filter(|_| send).map(str::to_owned))
         }
+        // The effort rides on every turn, so sending it never restarts anything.
+        Driver::Codex => (m.id.clone(), effort.map(str::to_owned)),
     }
 }
 
@@ -742,6 +746,7 @@ mod tests {
             display: "G".into(),
             description: None,
             efforts: vec![],
+            default_effort: None,
             via: None,
         };
         assert!(is_current(
@@ -755,6 +760,19 @@ mod tests {
         assert!(!is_current(&m, &status(Driver::Agy, None)));
         assert_eq!(group_title(Driver::Claude), "Claude");
         assert_eq!(group_title(Driver::Agy), "Antigravity (agy)");
+        assert_eq!(group_title(Driver::Codex), "Codex");
+    }
+
+    #[test]
+    fn a_codex_row_always_sends_its_effort_and_starts_on_the_models_default() {
+        let mut gpt = model(Driver::Codex, "gpt-5-codex", &["low", "high"]);
+        gpt.default_effort = Some("high".into());
+        let st = status(Driver::Claude, Some("opus"));
+        assert_eq!(initial_effort(&gpt, &st).as_deref(), Some("high"));
+        assert_eq!(
+            choice(&gpt, Some("low"), false, &st),
+            ("gpt-5-codex".to_owned(), Some("low".to_owned()))
+        );
     }
 
     fn model(driver: Driver, id: &str, efforts: &[&str]) -> CatalogModel {
@@ -764,6 +782,7 @@ mod tests {
             display: id.into(),
             description: None,
             efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+            default_effort: None,
             via: None,
         }
     }

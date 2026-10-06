@@ -146,7 +146,7 @@ impl UsageIndicator {
     }
 
     fn shown(&self) -> Vec<(Driver, Snapshot)> {
-        [Driver::Claude, Driver::Agy]
+        [Driver::Claude, Driver::Agy, Driver::Codex]
             .into_iter()
             .filter(|d| self.filter.get().is_none_or(|f| f == *d))
             .map(|d| (d, self.status.snapshot(d)))

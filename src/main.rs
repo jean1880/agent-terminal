@@ -16,9 +16,11 @@ mod approval_hook;
 mod approval_server;
 mod chat;
 mod claude_probe;
+mod codex_probe;
 pub mod config;
 mod hook_config;
 mod model_catalog;
+mod probe;
 #[cfg(test)]
 mod testutil;
 mod theme;
@@ -444,6 +446,7 @@ fn load_css() {
         }
         .thread-dot.dot-claude { color: #f0a37a; }
         .thread-dot.dot-agy { color: #6ec8ff; }
+        .thread-dot.dot-codex { color: #4cc38a; }
         .thread-term { color: #a0a0ff; }
         .thread-badge.badge-approval { color: #ffcc66; }
         .thread-badge.badge-limited { color: #ff7878; }

@@ -30,16 +30,12 @@ use gtk4::glib;
 use tracing::{debug, info, warn};
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
-use crate::agent_proc::{run_side, AgentProcess, SpawnSpec};
+use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
 use crate::approval_server::ApprovalHandle;
 
 /// Process environment the adapter does not own: what the agent's profile adds (its env file)
 /// and what the app removes (`clear_env`, a launching agent session's markers).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LaunchEnv {
-    pub env: Vec<(String, String)>,
-    pub unset: Vec<String>,
-}
+pub type LaunchEnv = AgentEnv;
 
 /// Everything a switch to another agent starts with. The window builds it from that agent's
 /// profile; this module does not know profiles.
@@ -133,6 +129,7 @@ fn driver_name(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "claude",
         Driver::Agy => "agy",
+        Driver::Codex => "codex",
     }
 }
 
@@ -140,6 +137,7 @@ fn driver_label(driver: Driver) -> &'static str {
     match driver {
         Driver::Claude => "Claude",
         Driver::Agy => "Antigravity (agy)",
+        Driver::Codex => "Codex",
     }
 }
 
@@ -454,6 +452,7 @@ impl Inner {
                 return; // the process was replaced while handling this envelope
             }
         }
+        self.drain_outbox();
     }
 
     // ---- hook canary ----
@@ -569,12 +568,31 @@ impl Inner {
         match result {
             Ok(actions) => {
                 self.execute(actions);
+                self.drain_outbox();
                 true
             }
             Err(e) => {
                 self.report(&e);
                 false
             }
+        }
+    }
+
+    /// Carries out what the adapter produced on its own initiative (Codex: prompts queued until
+    /// its thread exists, replies to server requests, answers it can give itself): its actions
+    /// like an `encode`'s, its events like a `feed`'s. Called after every `encode`, `feed` and
+    /// `feed_side`. Bounded, because executing an action may make the adapter say more.
+    fn drain_outbox(self: &Rc<Self>) {
+        for _ in 0..8 {
+            let outbox = self.adapter.borrow_mut().drain_outbox();
+            if outbox.is_empty() {
+                return;
+            }
+            for env in outbox.events {
+                self.emit(env.clone());
+                self.watch_tool_step(&env);
+            }
+            self.execute(outbox.actions);
         }
     }
 
@@ -611,14 +629,16 @@ impl Inner {
 
     fn spawn_side(self: &Rc<Self>, id: String, argv: Vec<String>) {
         let cwd = Some(self.open.borrow().cwd.clone()).filter(|c| !c.is_empty());
+        let env = self.launch_env.borrow().clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let (stdout, ok) = run_side(argv, cwd).await;
+            let (stdout, ok) = run_side(argv, cwd, &env, AGY_TIMEOUT).await;
             let Some(inner) = weak.upgrade() else { return };
             let envelopes = inner.adapter.borrow_mut().feed_side(&id, &stdout, ok);
             for env in envelopes {
                 inner.emit(env);
             }
+            inner.drain_outbox();
         });
     }
 
@@ -762,7 +782,10 @@ impl Inner {
             control,
         });
         match result {
-            Ok(actions) => self.execute(actions),
+            Ok(actions) => {
+                self.execute(actions);
+                self.drain_outbox();
+            }
             Err(e) => {
                 self.report(&e);
                 // The panel is waiting on this id.
@@ -832,9 +855,11 @@ impl Inner {
         match transition {
             Transition::Reuse => {}
             Transition::SwitchModelInSession => {
+                // The plan only picks this when the effort is unchanged, so passing the target's
+                // is the same as keeping it.
                 self.command(Command::SetModel {
                     model: target_model,
-                    effort: None,
+                    effort,
                 });
             }
             Transition::RestartAndResume => {
@@ -846,7 +871,17 @@ impl Inner {
                 // which borrows the state mutably.
                 let native = self.state.borrow().native_id.clone();
                 match result {
-                    Ok(actions) => self.execute(actions),
+                    Ok(actions) => {
+                        // An adapter that applies the effort in session (Codex, per turn) asks
+                        // for no respawn; the status and the next launch still follow it.
+                        let respawns = actions.iter().any(|a| matches!(a, Action::Respawn(_)));
+                        if let (false, Some(e)) = (respawns, &effort) {
+                            self.open.borrow_mut().effort = Some(e.clone());
+                            self.state.borrow_mut().effort = Some(e.clone());
+                        }
+                        self.execute(actions);
+                        self.drain_outbox();
+                    }
                     Err(AdapterError::Unsupported(_)) => self.respawn(&OpenSessionDelta {
                         model: Some(target_model),
                         effort,
@@ -1408,6 +1443,7 @@ mod tests {
                 caps: match driver {
                     Driver::Claude => Capabilities::claude(),
                     Driver::Agy => Capabilities::agy(),
+                    Driver::Codex => Capabilities::codex(),
                 },
                 log: log.clone(),
                 refuse_set_model: false,
@@ -1451,6 +1487,106 @@ mod tests {
                 expected: true,
             })]
         }
+    }
+
+    /// An adapter over `cat` whose outbox writes a line on every prompt and, when it sees that
+    /// line come back on stdout, another one: what Codex's queued prompts and replies need.
+    struct OutboxAdapter {
+        caps: Capabilities,
+        outbox: agent_core::adapter::Outbox,
+    }
+
+    impl Adapter for OutboxAdapter {
+        fn driver(&self) -> Driver {
+            Driver::Codex
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn argv(&self, _: &OpenSession) -> Vec<String> {
+            vec!["/bin/cat".into()]
+        }
+        fn handshake(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+        fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
+            if matches!(command, Command::Prompt { .. }) {
+                self.outbox
+                    .actions
+                    .push(Action::Write(vec!["from-encode".into()]));
+                self.outbox.events.push(Envelope::new(Event::Notice {
+                    text: "evt-encode".into(),
+                }));
+            }
+            Ok(Vec::new())
+        }
+        fn feed(&mut self, line: &str) -> Vec<Envelope> {
+            if line == "from-encode" {
+                self.outbox
+                    .actions
+                    .push(Action::Write(vec!["from-feed".into()]));
+            }
+            vec![Envelope::new(Event::Notice {
+                text: format!("fed:{line}"),
+            })]
+        }
+        fn feed_stderr(&mut self, _: &str) -> Vec<Envelope> {
+            Vec::new()
+        }
+        fn feed_side(&mut self, _: &str, _: &str, _: bool) -> Vec<Envelope> {
+            Vec::new()
+        }
+        fn on_exit(&mut self, _: Option<i32>) -> Vec<Envelope> {
+            Vec::new()
+        }
+        fn drain_outbox(&mut self) -> agent_core::adapter::Outbox {
+            std::mem::take(&mut self.outbox)
+        }
+    }
+
+    #[test]
+    fn the_adapters_outbox_is_executed_and_dispatched_after_encode_and_feed() {
+        in_loop(|ctx| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(OutboxAdapter {
+                    caps: Capabilities::codex(),
+                    outbox: agent_core::adapter::Outbox::default(),
+                }),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: Vec::new(),
+                    cwd: "/".into(),
+                    model: None,
+                    effort: None,
+                    mode: Mode::Ask,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.send_prompt("hello");
+            let notice = |want: &str| {
+                has(
+                    &seen,
+                    |e| matches!(e, Event::Notice { text } if text == want),
+                )
+            };
+            // The encode's outbox event is dispatched at once; its write reaches `cat`, which
+            // echoes it back through `feed`, whose own outbox write is then carried out too.
+            assert!(notice("evt-encode"));
+            assert!(
+                pump_until(ctx, 10, || notice("fed:from-feed")),
+                "the write queued by a feed never reached the process"
+            );
+            assert!(notice("fed:from-encode"));
+        });
     }
 
     fn launch_of(adapter: Box<dyn Adapter>) -> AgentLaunch {
@@ -1498,7 +1634,7 @@ mod tests {
                 AgentLaunch {
                     adapter: match d {
                         Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
-                        Driver::Agy => FakeAdapter::boxed(Driver::Agy, &agy_log),
+                        Driver::Agy | Driver::Codex => FakeAdapter::boxed(d, &agy_log),
                     },
                     program: "/bin/true".into(),
                     extra_args: vec!["--profile-arg".into()],

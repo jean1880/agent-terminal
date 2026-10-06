@@ -24,6 +24,10 @@ pub struct CatalogModel {
     pub description: Option<String>,
     /// Effort levels the model supports; empty when it has none.
     pub efforts: Vec<String>,
+    /// The effort the agent itself starts the model on (Codex reports one); `None` leaves the
+    /// choice to [`CatalogModel::default_effort`]'s own rule.
+    #[serde(default)]
+    pub default_effort: Option<String>,
     /// Set when the model is reached through another vendor's route, e.g. `Antigravity` for a
     /// `claude-*` model listed by agy.
     pub via: Option<String>,
@@ -77,8 +81,31 @@ pub fn parse_claude_initialize(response_json: &Value) -> Vec<CatalogModel> {
                 display: text("displayName").unwrap_or_else(|| id.to_owned()),
                 description: text("description"),
                 efforts,
+                default_effort: None,
                 via: None,
             })
+        })
+        .collect()
+}
+
+/// Codex's models from the `model/list` result (`{data: [...]}`; hidden models are left out).
+/// Efforts are `supportedReasoningEfforts` in the server's order and `default_effort` is the one
+/// the model starts on. The id is the `model` slug `turn/start` takes.
+pub fn parse_codex_models(result: &Value) -> Vec<CatalogModel> {
+    crate::codex::parse_codex_models(result)
+        .into_iter()
+        .map(|m| CatalogModel {
+            driver: Driver::Codex,
+            display: if m.display.trim().is_empty() {
+                m.id.clone()
+            } else {
+                m.display
+            },
+            id: m.id,
+            description: Some(m.description).filter(|d| !d.trim().is_empty()),
+            efforts: m.efforts,
+            default_effort: m.default_effort,
+            via: None,
         })
         .collect()
 }
@@ -116,6 +143,11 @@ impl CatalogModel {
     /// The effort a row starts on when nothing says otherwise: `medium` if offered, else the
     /// first (lowest) one; `None` when the model has no efforts.
     pub fn default_effort(&self) -> Option<&str> {
+        if let Some(own) = self.default_effort.as_deref() {
+            if self.efforts.iter().any(|e| e == own) {
+                return Some(own);
+            }
+        }
         if self.efforts.iter().any(|e| e == "medium") {
             Some("medium")
         } else {
@@ -197,6 +229,7 @@ pub fn parse_agy_models(tsv: &str) -> Vec<CatalogModel> {
                     display,
                     description: None,
                     efforts: Vec::new(),
+                    default_effort: None,
                     via,
                 });
                 out.len() - 1
@@ -213,7 +246,7 @@ pub fn parse_agy_models(tsv: &str) -> Vec<CatalogModel> {
     out
 }
 
-/// The picker's rows: native Claude first, then Antigravity, each in catalog order, filtered by
+/// The picker's rows: native Claude first, then Antigravity, then Codex, each in catalog order, filtered by
 /// a case-insensitive substring of id, display name or description (every whitespace-separated
 /// word of `query` must match somewhere). Empty groups are dropped.
 pub fn group_for_picker<'a>(
@@ -232,7 +265,7 @@ pub fn group_for_picker<'a>(
         .to_lowercase();
         words.iter().all(|w| hay.contains(w))
     };
-    [Driver::Claude, Driver::Agy]
+    [Driver::Claude, Driver::Agy, Driver::Codex]
         .into_iter()
         .filter_map(|d| {
             let rows: Vec<&CatalogModel> = models
@@ -399,6 +432,35 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             .map(|m| (m.id.as_str(), m.display.as_str()))
             .collect();
         assert_eq!(got, [("ok-1", "OK One"), ("bare", "bare")]);
+    }
+
+    #[test]
+    fn codex_models_map_onto_the_catalog_with_their_default_effort() {
+        let result = serde_json::json!({"data": [
+            {"id": "a", "model": "gpt-5-codex", "displayName": "GPT-5 Codex", "description": "d",
+             "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}],
+             "defaultReasoningEffort": "high", "hidden": false, "isDefault": true},
+            {"id": "b", "model": "old", "hidden": true},
+            {"id": "c", "displayName": " "}
+        ]});
+        let m = parse_codex_models(&result);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].driver, Driver::Codex);
+        assert_eq!(m[0].id, "gpt-5-codex");
+        assert_eq!(m[0].efforts, ["low", "high"]);
+        assert_eq!(m[0].default_effort(), Some("high"));
+        assert_eq!(m[0].model_id_for(Some("low")), "gpt-5-codex");
+        assert_eq!((m[1].id.as_str(), m[1].display.as_str()), ("c", "c"));
+        assert_eq!(m[1].description, None);
+        assert!(parse_codex_models(&serde_json::json!({"x": 1})).is_empty());
+
+        let mut all = vec![m[0].clone()];
+        all.extend(parse_agy_models(TSV));
+        let g = group_for_picker(&all, "");
+        assert_eq!(
+            g.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            [Driver::Agy, Driver::Codex]
+        );
     }
 
     #[test]

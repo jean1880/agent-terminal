@@ -18,6 +18,7 @@ use agent_kit::store::Store;
 
 use super::*;
 use crate::account_status::AccountStatus;
+use crate::agent_proc::AgentEnv;
 use crate::approval_server::ApprovalHandle;
 use crate::chat::session::{build_handoff, AgentLaunch, ChatSession, LaunchEnv};
 use crate::chat::view::usage::UsageIndicator;
@@ -25,8 +26,9 @@ use crate::chat::view::{ChatView, ViewAction};
 use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::ModelCatalog;
+use crate::probe::{ProbeTarget, ProbeTargets};
 use crate::window::sidebar_model::{
-    badge_for, driver_key, driver_label, group_rows, other_driver, parse_driver, relative_time,
+    badge_for, driver_key, driver_label, group_rows, handoff_target, parse_driver, relative_time,
     resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
@@ -142,6 +144,7 @@ impl ChatBackend for SessionSlot {
                 capabilities: match self.driver {
                     Driver::Claude => agent_core::caps::Capabilities::claude(),
                     Driver::Agy => agent_core::caps::Capabilities::agy(),
+                    Driver::Codex => agent_core::caps::Capabilities::codex(),
                 },
                 commands: Vec::new(),
             },
@@ -253,7 +256,10 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
 /// What the app removes from an agent's environment: the configured `clear_env` (a launching
 /// agent session's markers) and any inherited approval socket, which only the app may set.
 fn unset_list(patterns: &[String]) -> Vec<String> {
-    let mut env: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+    // `vars_os`, lossy: one non-UTF-8 variable in the user's environment must not panic here.
+    let mut env: Vec<String> = std::env::vars_os()
+        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+        .collect();
     let mut names = crate::utils::strip_env(&mut env, patterns);
     for own in [
         agent_core::approval::ENV_SOCKET,
@@ -291,12 +297,10 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
         .program
         .clone()
         .unwrap_or_else(|| profile.command.clone());
-    let adapter: std::boxed::Box<dyn Adapter> = match driver {
-        Driver::Claude => std::boxed::Box::new(agent_core::claude::ClaudeAdapter::new()),
-        Driver::Agy => std::boxed::Box::new(agent_core::agy::AgyAdapter::new(program.clone())),
-    };
+    let adapter = make_adapter(driver, &program);
     let approval = match driver {
-        Driver::Claude => None,
+        // Claude and Codex raise approvals over their own protocol, not the hook socket.
+        Driver::Claude | Driver::Codex => None,
         Driver::Agy => bind_approval(thread, cwd, profile.default_mode.unwrap_or_default()),
     };
     AgentLaunch {
@@ -310,6 +314,17 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> AgentLaunch {
             unset: unset_list(&clear),
         },
         approval,
+    }
+}
+
+/// The adapter for `driver`. Codex reports this app's version in `initialize`'s `clientInfo`.
+fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
+    match driver {
+        Driver::Claude => std::boxed::Box::new(agent_core::claude::ClaudeAdapter::new()),
+        Driver::Agy => std::boxed::Box::new(agent_core::agy::AgyAdapter::new(program.to_owned())),
+        Driver::Codex => std::boxed::Box::new(
+            agent_core::codex::CodexAdapter::new().client_version(env!("CARGO_PKG_VERSION")),
+        ),
     }
 }
 
@@ -1248,12 +1263,9 @@ impl AgentTerminalWindow {
             resume,
             approval_hook: false,
         };
-        let adapter: std::boxed::Box<dyn Adapter> = match driver {
-            Driver::Claude => std::boxed::Box::new(agent_core::claude::ClaudeAdapter::new()),
-            Driver::Agy => std::boxed::Box::new(agent_core::agy::AgyAdapter::new(program)),
-        };
+        let adapter = make_adapter(driver, &program);
         let approval = match driver {
-            Driver::Claude => None,
+            Driver::Claude | Driver::Codex => None,
             Driver::Agy => bind_approval(thread, dir, mode),
         };
         let clear = self.config.borrow().clear_env.clone();
@@ -1435,9 +1447,13 @@ impl AgentTerminalWindow {
                 self.refresh_sidebar();
             }
             After::RateLimited(banner, driver) => {
-                let other = other_driver(driver);
                 banner.set_title(&format!("{} hit its rate limit", driver_label(driver)));
-                banner.set_button_label(Some(&format!("Continue in {}", driver_label(other))));
+                // With no other usable agent there is nothing to continue in: no button.
+                match handoff_target(driver, |d| self.agent_usable(d)) {
+                    Some(other) => banner
+                        .set_button_label(Some(&format!("Continue in {}", driver_label(other)))),
+                    None => banner.set_button_label(None),
+                }
                 banner.set_revealed(true);
                 self.refresh_sidebar();
             }
@@ -1495,8 +1511,10 @@ impl AgentTerminalWindow {
     /// The rate-limit banner's button: hand the thread to the other agent.
     fn continue_rate_limited(&self, thread: &str) {
         if let Some(slot) = self.slot_of(thread) {
-            let target = other_driver(slot.driver());
-            slot.switch(target, None, None);
+            match handoff_target(slot.driver(), |d| self.agent_usable(d)) {
+                Some(target) => slot.switch(target, None, None),
+                None => self.show_toast("No other agent is installed and enabled"),
+            }
         }
     }
 
@@ -1514,8 +1532,10 @@ impl AgentTerminalWindow {
         match action {
             ViewAction::NewThread => self.new_chat_thread(Some(slot.driver()), dir, None),
             ViewAction::Handoff { target } => {
-                let target = target.unwrap_or_else(|| other_driver(slot.driver()));
-                slot.switch(target, None, None);
+                match target.or_else(|| handoff_target(slot.driver(), |d| self.agent_usable(d))) {
+                    Some(target) => slot.switch(target, None, None),
+                    None => self.show_toast("No other agent is installed and enabled"),
+                }
             }
             ViewAction::Fork | ViewAction::CompactByHandoff => {
                 self.fork_thread(thread, slot.driver(), dir);
@@ -1637,16 +1657,32 @@ impl AgentTerminalWindow {
     // New threads
     // -----------------------------------------------------------------------------------------
 
+    /// Whether `driver` can take a thread: enabled, and its binary not known to be missing.
+    /// Codex has no profile until the user edits it, so it must be known to be installed.
+    pub(super) fn agent_usable(&self, driver: Driver) -> bool {
+        let config = self.config.borrow();
+        let profile = config
+            .agent_profile(driver)
+            .cloned()
+            .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+        let found = crate::utils::cached_command_available(&profile.command);
+        !profile.disabled
+            && match driver {
+                Driver::Codex => found == Some(true),
+                Driver::Claude | Driver::Agy => found != Some(false),
+            }
+    }
+
     /// The agent new threads start on: see [`crate::config::choose_default_agent`].
     pub(super) fn default_agent(&self) -> Option<Driver> {
-        let config = self.config.borrow();
-        let usable = |d: Driver| {
-            config.agent_profile(d).is_some_and(|p| {
-                !p.disabled && crate::utils::cached_command_available(&p.command) != Some(false)
-            })
+        let (explicit, profile_driver) = {
+            let config = self.config.borrow();
+            (
+                config.default_agent,
+                config.selected_profile().and_then(profile_driver),
+            )
         };
-        let profile_driver = config.selected_profile().and_then(profile_driver);
-        crate::config::choose_default_agent(config.default_agent, profile_driver, usable)
+        crate::config::choose_default_agent(explicit, profile_driver, |d| self.agent_usable(d))
     }
 
     /// Creates a thread in `dir` (the starting folder when `None`) on `driver` (the default
@@ -1661,7 +1697,7 @@ impl AgentTerminalWindow {
             present_message(
                 &self.obj(),
                 "No Chat Agent Available",
-                "Neither Claude nor Antigravity (agy) is installed and enabled. Install one, \
+                "None of Claude, Antigravity (agy) or Codex is installed and enabled. Install one, \
                  or enable it in Settings → Agents. Terminal threads still work from the New \
                  Thread menu.",
             );
@@ -1864,25 +1900,53 @@ impl AgentTerminalWindow {
     }
 
     pub(super) fn refresh_agent_data(&self) {
-        let profiles: Vec<Profile> = [Driver::Claude, Driver::Agy]
-            .into_iter()
-            .map(|d| {
-                self.config
-                    .borrow()
-                    .agent_profile(d)
-                    .cloned()
-                    .unwrap_or_else(|| crate::config::new_agent_profile(d))
-            })
-            .collect();
+        let (profiles, clear): (Vec<Profile>, Vec<String>) = {
+            let config = self.config.borrow();
+            (
+                [Driver::Claude, Driver::Agy, Driver::Codex]
+                    .into_iter()
+                    .map(|d| {
+                        config
+                            .agent_profile(d)
+                            .cloned()
+                            .unwrap_or_else(|| crate::config::new_agent_profile(d))
+                    })
+                    .collect(),
+                config.clear_env.clone(),
+            )
+        };
+        let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let mut programs = Vec::new();
-            for profile in profiles {
-                let resolved = resolve_agent(profile.clone()).await;
-                programs.push(resolved.program.unwrap_or(profile.command));
+            let mut resolved = Vec::new();
+            for profile in &profiles {
+                resolved.push(resolve_agent(profile.clone()).await);
             }
-            if let [claude, agy] = programs.as_slice() {
-                ModelCatalog::shared().refresh(claude, agy);
-                AccountStatus::shared().refresh(claude, agy);
+            // Detection is done: the New Thread With menu can list what is installed.
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().fill_new_with_menu();
+            }
+            // Probes run where the threads run: the profile's env file and the `clear_env` list.
+            let target = |profile: &Profile, agent: &ResolvedAgent| ProbeTarget {
+                program: agent
+                    .program
+                    .clone()
+                    .unwrap_or_else(|| profile.command.clone()),
+                env: AgentEnv {
+                    env: agent.env.clone(),
+                    unset: unset_list(&clear),
+                },
+            };
+            if let [(claude, c), (agy, a), (codex, x)] =
+                &profiles.iter().zip(resolved.iter()).collect::<Vec<_>>()[..]
+            {
+                let targets = ProbeTargets {
+                    claude: target(claude, c),
+                    agy: target(agy, a),
+                    // Not installed (no binary found) or switched off: nothing is spawned.
+                    codex: (x.program.is_some() && !codex.disabled).then(|| target(codex, x)),
+                };
+                ModelCatalog::shared().refresh(&targets);
+                AccountStatus::shared().refresh(&targets);
             }
         });
     }

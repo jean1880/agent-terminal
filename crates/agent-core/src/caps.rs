@@ -69,4 +69,33 @@ impl Capabilities {
             plan_mode: true,
         }
     }
+
+    /// Verified against the upstream `app-server-protocol` source (see `codex.rs`), not a
+    /// recording: Codex is not installed on the development machine yet.
+    pub fn codex() -> Self {
+        Self {
+            // `turn/start` takes `model` and applies it to that turn and later ones.
+            model_switch_in_session: true,
+            // Approvals are server requests answered over the live connection.
+            live_approvals: true,
+            // `turn/interrupt` ends the turn, not the `app-server` process.
+            interrupt_keeps_process: true,
+            file_suggestions: false,
+            mcp_panel: false,
+            settings_panel: false,
+            // `model/list`.
+            model_list: true,
+            // `thread/tokenUsage/updated` carries the window size and occupancy.
+            context_usage: true,
+            usage: false,
+            // `thread/compact/start`: the adapter encodes a `/compact` prompt as that request.
+            compact_command: Some("/compact".to_owned()),
+            streams_text: true,
+            // Reasoning *summaries* (`item/reasoning/summaryTextDelta`), requested per turn.
+            streams_reasoning: true,
+            questions: false,
+            // Plan = read-only sandbox and never escalate (`codex.rs`, "Modes").
+            plan_mode: true,
+        }
+    }
 }

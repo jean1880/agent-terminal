@@ -149,6 +149,89 @@ pub fn agy_account(google_accounts: &Value) -> Option<Account> {
     })
 }
 
+/// Codex's `account/read` result: `account {type: chatgpt, email, planType}` or `{type: apiKey}`
+/// (`null` when signed out). The label is the email, or "API key".
+pub fn codex_account(result: &Value) -> Option<Account> {
+    let account = result.get("account").filter(|a| a.is_object())?;
+    match account.get("type").and_then(Value::as_str)? {
+        "chatgpt" => Some(Account {
+            label: text(account, "email").unwrap_or_else(|| "ChatGPT".to_owned()),
+            plan: text(account, "planType"),
+            provider: Some("ChatGPT".to_owned()),
+        }),
+        "apiKey" => Some(Account {
+            label: "API key".to_owned(),
+            plan: None,
+            provider: Some("OpenAI".to_owned()),
+        }),
+        _ => None,
+    }
+}
+
+/// A window's label from its length: 300 min is the "5-hour" window, a week is "Weekly".
+fn codex_window_label(mins: Option<i64>, fallback: &str) -> String {
+    match mins {
+        Some(300) => "5-hour".to_owned(),
+        Some(10_080) => "Weekly".to_owned(),
+        Some(m) if m > 0 && m % 1440 == 0 => format!("{}-day", m / 1440),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{}-hour", m / 60),
+        Some(m) if m > 0 => format!("{m}-min"),
+        _ => fallback.to_owned(),
+    }
+}
+
+fn codex_snapshot_windows(snapshot: &Value, group: Option<String>) -> Vec<QuotaWindow> {
+    [("primary", "Primary"), ("secondary", "Secondary")]
+        .into_iter()
+        .filter_map(|(key, fallback)| {
+            let w = snapshot.get(key).filter(|w| w.is_object())?;
+            Some(QuotaWindow {
+                group: group.clone(),
+                label: codex_window_label(
+                    w.get("windowDurationMins").and_then(Value::as_i64),
+                    fallback,
+                ),
+                used: clamp01(w.get("usedPercent")?.as_f64()? / 100.0),
+                resets_at: w
+                    .get("resetsAt")
+                    .and_then(Value::as_i64)
+                    .map(epoch_to_rfc3339),
+            })
+        })
+        .collect()
+}
+
+/// Codex's plan windows from an `account/rateLimits/read` result, or from the params of an
+/// `account/rateLimits/updated` notification (`{rateLimits: snapshot}`). The multi-bucket view
+/// wins when present, one group per metered limit (the plain `codex` bucket has no group);
+/// otherwise the single-bucket `rateLimits` is used. `usedPercent` is 0-100.
+pub fn codex_rate_limits(result: &Value) -> Vec<QuotaWindow> {
+    if let Some(buckets) = result
+        .get("rateLimitsByLimitId")
+        .and_then(Value::as_object)
+        .filter(|b| !b.is_empty())
+    {
+        let mut keys: Vec<&String> = buckets.keys().collect();
+        keys.sort();
+        return keys
+            .into_iter()
+            .flat_map(|key| {
+                let snapshot = &buckets[key];
+                let group = if key == "codex" {
+                    None
+                } else {
+                    Some(text(snapshot, "limitName").unwrap_or_else(|| key.clone()))
+                };
+                codex_snapshot_windows(snapshot, group)
+            })
+            .collect();
+    }
+    result
+        .get("rateLimits")
+        .map(|s| codex_snapshot_windows(s, None))
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Time helpers (no chrono: the UI needs only epoch seconds and an "in 3 h 47 min" phrase)
 // ---------------------------------------------------------------------------------------------
@@ -251,6 +334,57 @@ pub fn resets_in_text(secs_left: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn codex_account_reads_chatgpt_and_api_key_and_signed_out() {
+        let a = codex_account(
+            &json!({"account": {"type": "chatgpt", "email": "u@example.com",
+            "planType": "plus"}, "requiresOpenaiAuth": true}),
+        )
+        .expect("account");
+        assert_eq!(
+            (a.label.as_str(), a.plan.as_deref(), a.provider.as_deref()),
+            ("u@example.com", Some("plus"), Some("ChatGPT"))
+        );
+        let k = codex_account(&json!({"account": {"type": "apiKey"}})).expect("key");
+        assert_eq!(k.label, "API key");
+        assert_eq!(codex_account(&json!({"account": null})), None);
+        assert_eq!(codex_account(&json!({})), None);
+        assert_eq!(codex_account(&json!({"account": {"type": "other"}})), None);
+    }
+
+    #[test]
+    fn codex_rate_limits_label_windows_by_length_and_scale_percent() {
+        let single = json!({"rateLimits": {
+            "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1_790_000_000},
+            "secondary": {"usedPercent": 140, "windowDurationMins": 10080, "resetsAt": null}}});
+        let w = codex_rate_limits(&single);
+        assert_eq!(w.len(), 2);
+        assert_eq!((w[0].label.as_str(), w[0].used), ("5-hour", 0.25));
+        assert!(w[0].resets_at.as_deref().is_some_and(|r| r.ends_with('Z')));
+        assert_eq!((w[1].label.as_str(), w[1].used), ("Weekly", 1.0));
+        assert_eq!(w[1].resets_at, None);
+
+        // The notification shape is the same snapshot; a missing length falls back to the slot.
+        let note = json!({"rateLimits": {"primary": {"usedPercent": 5}}});
+        assert_eq!(codex_rate_limits(&note)[0].label, "Primary");
+
+        // Buckets win over the single view; the `codex` bucket has no group.
+        let multi = json!({
+            "rateLimits": {"primary": {"usedPercent": 1, "windowDurationMins": 300}},
+            "rateLimitsByLimitId": {
+                "codex": {"primary": {"usedPercent": 10, "windowDurationMins": 300}},
+                "codex_x": {"limitName": "GPT-X", "secondary": {"usedPercent": 50,
+                    "windowDurationMins": 2880}}}});
+        let w = codex_rate_limits(&multi);
+        assert_eq!(w.len(), 2);
+        assert_eq!((w[0].group.clone(), w[0].used), (None, 0.1));
+        assert_eq!(
+            (w[1].group.as_deref(), w[1].label.as_str()),
+            (Some("GPT-X"), "2-day")
+        );
+        assert!(codex_rate_limits(&json!({})).is_empty());
+    }
 
     const TURN: &str = include_str!("../tests/fixtures/claude-turn-approval.ndjson");
     const CONTROLS: &str = include_str!("../tests/fixtures/claude-controls-slash.ndjson");

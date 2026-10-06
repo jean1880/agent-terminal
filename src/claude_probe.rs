@@ -18,7 +18,8 @@ use gtk4::glib;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::agent_proc::{AgentProcess, SpawnSpec};
+use crate::agent_proc::{AgentEnv, AgentProcess, SpawnSpec};
+use crate::probe::InFlight;
 
 const INIT_ID: &str = "catalog-1";
 const USAGE_ID: &str = "catalog-usage";
@@ -70,12 +71,15 @@ fn response_id(frame: &Value) -> Option<&str> {
 }
 
 /// Spawns Claude and runs the two requests. See the module docs.
-pub async fn probe_claude(program: &str) -> ProbeResult {
+pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
     let init: Rc<RefCell<Option<Value>>> = Rc::default();
     let usage: Rc<RefCell<Option<Value>>> = Rc::default();
     let exited = Rc::new(Cell::new(false));
+    // The same environment a Claude thread runs in, so the account shown is the thread's.
     let spec = SpawnSpec {
         argv: argv(program),
+        env: env.env.clone(),
+        unset: env.unset.clone(),
         ..SpawnSpec::default()
     };
     let on_line = {
@@ -137,45 +141,25 @@ pub async fn probe_claude(program: &str) -> ProbeResult {
     })
 }
 
-type Waiter = Box<dyn FnOnce(&ProbeResult)>;
-
 thread_local! {
-    /// `Some` while a probe is running: the callers waiting for its result.
-    static IN_FLIGHT: RefCell<Option<Vec<Waiter>>> = const { RefCell::new(None) };
+    /// The callers waiting for the probe that is running, if any.
+    static IN_FLIGHT: InFlight<ProbeResult> = const { InFlight::new() };
 }
 
 /// Runs [`probe_claude`], or joins the one already running; `done` gets the result on the main
 /// loop. The model catalog and the usage indicator both call this, so one refresh costs one
 /// Claude process.
-pub fn probe_shared(program: &str, done: impl FnOnce(&ProbeResult) + 'static) {
-    let start = IN_FLIGHT.with(|f| {
-        let mut f = f.borrow_mut();
-        match f.as_mut() {
-            Some(waiters) => {
-                waiters.push(Box::new(done));
-                false
-            }
-            None => {
-                *f = Some(vec![Box::new(done)]);
-                true
-            }
-        }
-    });
-    if !start {
+pub fn probe_shared(program: &str, env: &AgentEnv, done: impl FnOnce(&ProbeResult) + 'static) {
+    if !IN_FLIGHT.with(|f| f.join(done)) {
         return;
     }
-    let program = program.to_owned();
+    let (program, env) = (program.to_owned(), env.clone());
     glib::spawn_future_local(async move {
-        let result = probe_claude(&program).await;
+        let result = probe_claude(&program, &env).await;
         if let Err(why) = &result {
             warn!(why, "claude probe failed");
         }
-        let waiters = IN_FLIGHT
-            .with(|f| f.borrow_mut().take())
-            .unwrap_or_default();
-        for w in waiters {
-            w(&result);
-        }
+        IN_FLIGHT.with(|f| f.finish(&result));
     });
 }
 
@@ -217,7 +201,7 @@ pub(crate) mod tests {
             let out = Rc::new(RefCell::new(None));
             let o = out.clone();
             glib::spawn_future_local(async move {
-                *o.borrow_mut() = Some(probe_claude(&program).await);
+                *o.borrow_mut() = Some(probe_claude(&program, &AgentEnv::default()).await);
             });
             assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
             let r = out.borrow_mut().take().unwrap();
@@ -247,6 +231,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_probe_runs_in_the_agents_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        // Answers only when the profile's variable is set and the cleared one is gone.
+        let body = format!(
+            "read line\n[ \"$AT_PROBE_ON\" = 1 ] && [ -z \"${{AT_PROBE_CLEARED+x}}\" ] && echo '{INIT_REPLY}'\nexit 0"
+        );
+        let program = fake_claude(dir.path(), &body);
+        let env = AgentEnv {
+            env: vec![("AT_PROBE_ON".into(), "1".into())],
+            unset: vec!["AT_PROBE_CLEARED".into()],
+        };
+        let run = |env: AgentEnv| {
+            let program = program.clone();
+            in_loop(|ctx| {
+                let out = Rc::new(RefCell::new(None));
+                let o = out.clone();
+                glib::spawn_future_local(async move {
+                    *o.borrow_mut() = Some(probe_claude(&program, &env).await);
+                });
+                assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
+                let r = out.borrow_mut().take().unwrap();
+                r
+            })
+        };
+        assert_eq!(run(env).expect("probe").models.len(), 1);
+        assert!(
+            run(AgentEnv::default()).is_err(),
+            "without the env it is silent"
+        );
+    }
+
+    #[test]
     fn a_process_that_dies_or_is_missing_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -270,7 +286,7 @@ pub(crate) mod tests {
             let got = Rc::new(Cell::new(0));
             for _ in 0..3 {
                 let got = got.clone();
-                probe_shared(&program, move |r| {
+                probe_shared(&program, &AgentEnv::default(), move |r| {
                     assert!(r.is_ok());
                     got.set(got.get() + 1);
                 });
