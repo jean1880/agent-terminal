@@ -4,7 +4,7 @@ version = "3.0.0"
 
 edition = "2021"
 authors = ["jdesroches"]
-description = "A standalone GTK4 terminal for driving an AI coding CLI"
+description = "A native GTK4 chat front end for Claude, Antigravity and Codex"
 
 [workspace]
 # The root package is the GTK app; the pure and git logic live in crates/.
@@ -85,10 +85,12 @@ provides = "antigravity-terminal"
 # Without this, cargo-deb uses README.md as the extended description and the whole
 # document — markdown, code fences and all — lands in the control file.
 extended-description = """
-A standalone GTK4/VTE terminal purpose-built for driving an AI coding CLI
-(Claude, Antigravity/agy, or Gemini) in a focused, tabbed window. Provides
-tabbed sessions rooted per-directory, selectable colour themes, sixel image
-rendering, hyperlink support, and journald logging."""
+A native GTK4/libadwaita front end for AI coding agents. Chat threads drive
+Claude, Antigravity (agy) and Codex headless: one model picker across agents,
+switching model or agent mid-thread with a redacted handoff, approval cards
+with the proposed diff, per-turn file diffs, slash-command typeahead, usage
+and account indicators, and checkpoints with undo. A VTE terminal drawer and
+terminal threads remain for any other CLI."""
 section = "utils"
 priority = "optional"
 assets = [
