@@ -10,6 +10,8 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
+#[allow(dead_code)] // Wired into the window in wave 3.
+mod chat;
 pub mod config;
 mod theme;
 mod utils;

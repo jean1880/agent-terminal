@@ -1,0 +1,48 @@
+//! Chat threads: the primary 3.0 surface.
+//!
+//! Layering (no cycles):
+//! - `agent_core` adapters translate one agent CLI ⇄ canonical [`Envelope`]s (pure);
+//! - [`crate::agent_proc`] runs the agent process on the GTK main loop (gio);
+//! - [`session::ChatSession`] owns one thread: adapter + process + store + switching/handoff,
+//!   and implements [`ChatBackend`];
+//! - [`view::ChatView`] renders a thread from [`Envelope`]s and calls [`ChatBackend`] for every
+//!   user action. It never touches a process, the store or an adapter directly.
+//!
+//! Both sides run on the GTK main thread, so the backend is shared as `Rc<dyn ChatBackend>`.
+
+use agent_core::adapter::{Control, Driver, Mode};
+use agent_core::event::{Decision, Envelope};
+
+pub mod session;
+pub mod view;
+
+/// What the view can ask of a thread. Results come back as envelopes through the sink given
+/// to the backend at construction (including `ControlResult` for `control`).
+pub trait ChatBackend {
+    fn send_prompt(&self, text: &str);
+    fn interrupt(&self);
+    fn respond_approval(&self, request: &str, decision: Decision);
+    fn answer_questions(&self, request: &str, answers: serde_json::Value);
+    /// Switch model and/or agent. Same agent: in-session or restart per capabilities;
+    /// other agent: budgeted, redacted handoff into a new provider thread.
+    fn switch(&self, driver: Driver, model: Option<String>);
+    fn set_mode(&self, mode: Mode);
+    /// Returns the request id the `ControlResult` will carry.
+    fn control(&self, control: Control) -> String;
+    /// Current agent, model, mode and capabilities for the header and typeahead.
+    fn status(&self) -> SessionStatus;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionStatus {
+    pub driver: Driver,
+    pub model: Option<String>,
+    pub mode: Mode,
+    pub running_turn: bool,
+    pub alive: bool,
+    pub capabilities: agent_core::caps::Capabilities,
+    pub commands: Vec<agent_core::event::AgentCommand>,
+}
+
+/// Where a backend delivers envelopes (the view's `apply`). Called on the main thread.
+pub type EnvelopeSink = std::rc::Rc<dyn Fn(&Envelope)>;
