@@ -91,7 +91,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Whether a stdout line is the `initialize` response this module asked for.
 fn is_catalog_response(frame: &Value) -> bool {
     frame.get("type").and_then(Value::as_str) == Some("control_response")
-        && frame.pointer("/response/request_id").and_then(Value::as_str) == Some(REQUEST_ID)
+        && frame
+            .pointer("/response/request_id")
+            .and_then(Value::as_str)
+            == Some(REQUEST_ID)
 }
 
 fn initialize_request() -> String {
@@ -283,8 +286,8 @@ async fn fetch_claude(program: &str) -> Result<Vec<CatalogModel>, &'static str> 
         let exited = exited.clone();
         move |_| exited.set(true)
     };
-    let proc = AgentProcess::spawn(&spec, on_line, |_| {}, on_exit)
-        .map_err(|_| "claude did not start")?;
+    let proc =
+        AgentProcess::spawn(&spec, on_line, |_| {}, on_exit).map_err(|_| "claude did not start")?;
     proc.write_line(&initialize_request());
 
     // Poll on the main loop (no channel crate): the answer is one line, so 50 ms is plenty.
@@ -426,8 +429,8 @@ mod tests {
 
     /// A stand-in for `claude` (never the real one): answers the first stdin line.
     fn fake_claude(dir: &Path, body: &str) -> String {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let path = dir.join("fake-claude");
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -436,7 +439,8 @@ mod tests {
             .mode(0o755)
             .open(&path)
             .unwrap();
-        f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
+        f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
         path.display().to_string()
     }
 

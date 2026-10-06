@@ -36,12 +36,12 @@ use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-use super::{ChatBackend, EnvelopeSink};
+use super::{ChatBackend, EnvelopeSink, ModelSource};
 use cards::{RowEvent, RowSink};
 use composer::{Composer, ComposerHost};
 use header::{Header, MODES};
 use model::{Change, Tone, Transcript};
-use panels::{PanelCtx, Requests};
+use panels::{ModelListener, PanelCtx, Requests};
 use transcript::TranscriptView;
 
 /// Something the view cannot do itself; the window (wave 3) connects to these.
@@ -127,6 +127,10 @@ pub(crate) struct Inner {
     header: Header,
     plan: PlanPanel,
     requests: Rc<Requests>,
+    /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
+    models: RefCell<Option<Rc<dyn ModelSource>>>,
+    /// The open model picker's refresh hook (see [`PanelCtx::model_listener`]).
+    model_listener: ModelListener,
     actions: RefCell<Vec<ActionHandler>>,
     /// Items changed since the last flush (streaming deltas are coalesced per frame).
     dirty: RefCell<Vec<String>>,
@@ -157,6 +161,8 @@ impl ChatView {
                 header: Header::new(),
                 plan: PlanPanel::new(),
                 requests: Rc::new(Requests::default()),
+                models: RefCell::new(None),
+                model_listener: ModelListener::default(),
                 actions: RefCell::new(Vec::new()),
                 dirty: RefCell::new(Vec::new()),
                 flush_queued: Cell::new(false),
@@ -249,6 +255,22 @@ impl ChatView {
         }
     }
 
+    /// Feeds the model picker both agents' full model lists. Without a source the picker asks
+    /// the backend (`Control::ListModels`), which lists only the current agent.
+    pub fn set_model_source(&self, source: Rc<dyn ModelSource>) {
+        let Some(inner) = self.inner() else { return };
+        // One connection per source; the open picker (if any) is the listener. The hook is
+        // cloned out of its cell first, so it may re-register or clear itself.
+        let listener = inner.model_listener.clone();
+        source.connect_changed(Box::new(move || {
+            let hook = listener.borrow().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }));
+        *inner.models.borrow_mut() = Some(source);
+    }
+
     pub fn focus_composer(&self) {
         if let Some(inner) = self.inner() {
             inner.composer.grab_focus();
@@ -273,6 +295,8 @@ impl Inner {
             backend: self.backend.clone(),
             requests: self.requests.clone(),
             parent: self.view()?.upcast(),
+            models: self.models.borrow().clone(),
+            model_listener: self.model_listener.clone(),
         })
     }
 

@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use agent_core::adapter::{Control, Driver};
+use agent_core::catalog::{group_for_picker, CatalogModel};
 use gtk4::glib;
 use serde_json::Value;
 
@@ -15,7 +16,7 @@ use super::cards::{driver_name, label};
 use super::header::gauge_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
-use crate::chat::ChatBackend;
+use crate::chat::{ChatBackend, ModelSource, SessionStatus};
 
 type Reply = Box<dyn FnOnce(Result<Value, String>)>;
 
@@ -75,7 +76,14 @@ pub struct PanelCtx {
     pub backend: Rc<dyn ChatBackend>,
     pub requests: Rc<Requests>,
     pub parent: gtk4::Widget,
+    /// Where the model picker gets both agents' lists (`None`: ask the backend).
+    pub models: Option<Rc<dyn ModelSource>>,
+    /// The open picker's refresh hook, called when the source changes. The view connects to the
+    /// source once and forwards here, so closed pickers leave nothing behind.
+    pub model_listener: ModelListener,
 }
+
+pub type ModelListener = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
 fn dialog(title: &str, width: i32, height: i32) -> (adw::Dialog, gtk4::Stack) {
     let d = adw::Dialog::new();
@@ -143,23 +151,128 @@ fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
 // Model picker
 // ---------------------------------------------------------------------------------------------
 
+/// The group heading for an agent's models.
+fn group_title(driver: Driver) -> &'static str {
+    match driver {
+        Driver::Claude => "Claude",
+        Driver::Agy => "Antigravity (agy)",
+    }
+}
+
+/// The fallback list, when there is no [`ModelSource`]: the backend's own `ListModels` answer,
+/// all attributed to the current agent.
+fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Vec<CatalogModel> {
+    entries
+        .into_iter()
+        .map(|m| CatalogModel {
+            driver,
+            id: m.id,
+            display: m.label,
+            description: m.description,
+            efforts: Vec::new(),
+            via: None,
+        })
+        .collect()
+}
+
+/// Whether `m` is the model the thread is on now.
+fn is_current(m: &CatalogModel, status: &SessionStatus) -> bool {
+    m.driver == status.driver && status.model.as_deref() == Some(m.id.as_str())
+}
+
+type Pick = Rc<dyn Fn(Driver, String)>;
+
+/// The grouped, filtered rows for `query`.
+///
+/// Choosing a row calls `pick(driver, id)`. The effort dropdown on a row is shown for models
+/// that list efforts, but Claude takes effort separately from the model id (it is not part of
+/// `--model`), so the chosen level is not sent yet: it is wired through the mode/settings path
+/// later. agy bakes the level into the id (`...-high`), so its rows have no dropdown.
+fn model_list(
+    models: &[CatalogModel],
+    query: &str,
+    status: &SessionStatus,
+    pick: &Pick,
+) -> gtk4::Widget {
+    let groups = group_for_picker(models, query);
+    if groups.is_empty() {
+        let page = adw::StatusPage::new();
+        page.add_css_class("compact");
+        page.set_icon_name(Some("system-search-symbolic"));
+        page.set_title(if models.is_empty() {
+            "No models yet"
+        } else {
+            "No models match"
+        });
+        page.set_description(Some(if models.is_empty() {
+            "The model lists are fetched in the background and appear here when they arrive."
+        } else {
+            "Try a different search."
+        }));
+        return page.upcast();
+    }
+    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    for (driver, rows) in groups {
+        let heading = label(&group_title(driver).to_uppercase(), &["model-group"]);
+        heading.set_halign(gtk4::Align::Start);
+        heading.set_margin_top(6);
+        heading.set_margin_start(6);
+        column.append(&heading);
+        let list = boxed_list();
+        for m in rows {
+            let row = adw::ActionRow::new();
+            row.set_use_markup(false);
+            row.set_title(&m.display);
+            let sub = match &m.description {
+                Some(desc) => format!("{} · {desc}", m.id),
+                None => m.id.clone(),
+            };
+            row.set_subtitle(&sub);
+            row.set_activatable(true);
+            if let Some(via) = &m.via {
+                let tag = label(&format!("via {via}"), &["model-via"]);
+                tag.set_valign(gtk4::Align::Center);
+                row.add_suffix(&tag);
+            }
+            if !m.efforts.is_empty() {
+                let efforts: Vec<&str> = m.efforts.iter().map(String::as_str).collect();
+                let dropdown = gtk4::DropDown::from_strings(&efforts);
+                dropdown.set_valign(gtk4::Align::Center);
+                dropdown.set_tooltip_text(Some(
+                    "Effort level (applied from the settings, not yet sent with the model)",
+                ));
+                row.add_suffix(&dropdown);
+            }
+            if is_current(m, status) {
+                row.add_css_class("current-model");
+                let check = gtk4::Image::from_icon_name("object-select-symbolic");
+                check.add_css_class("accent");
+                row.add_suffix(&check);
+            }
+            let (pick, driver, id) = (pick.clone(), m.driver, m.id.clone());
+            row.connect_activated(move |_| pick(driver, id.clone()));
+            list.append(&row);
+        }
+        column.append(&list);
+    }
+    column.upcast()
+}
+
+/// The model picker: ONE searchable list of every model of both agents, so a thread can jump
+/// from an agy Gemini to a Claude model (or back) in a single click. Picking a row of the other
+/// agent is a handoff, which the backend's `switch` performs.
 pub fn model_picker(ctx: &PanelCtx) {
     let status = ctx.backend.status();
-    let (d, stack) = dialog("Model", 480, 560);
+    let (d, stack) = dialog("Model", 520, 640);
 
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    let switch = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    switch.add_css_class("linked");
-    switch.add_css_class("agent-switch");
-    switch.set_halign(gtk4::Align::Center);
-    switch.set_margin_top(12);
-    let claude = gtk4::ToggleButton::with_label(driver_name(Driver::Claude));
-    let agy = gtk4::ToggleButton::with_label(driver_name(Driver::Agy));
-    agy.set_group(Some(&claude));
-    switch.append(&claude);
-    switch.append(&agy);
-    outer.append(&switch);
-    // The stack moves from the toolbar into `outer`, under the agent switch.
+    let search = gtk4::SearchEntry::new();
+    search.set_placeholder_text(Some("Search models"));
+    search.set_margin_top(12);
+    search.set_margin_start(18);
+    search.set_margin_end(18);
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    outer.append(&search);
+    // The stack moves from the toolbar into `outer`, under the search entry.
     if let Some(toolbar) = d.child().and_downcast::<adw::ToolbarView>() {
         toolbar.set_content(None::<&gtk4::Widget>);
         outer.append(&stack);
@@ -167,149 +280,78 @@ pub fn model_picker(ctx: &PanelCtx) {
     }
     stack.set_vexpand(true);
 
-    // Page for the other agent: a handoff, not a list we can query from here.
-    let handoff_page = |target: Driver| {
-        let page = adw::StatusPage::new();
-        page.add_css_class("compact");
-        page.set_icon_name(Some("system-switch-user-symbolic"));
-        page.set_title(&format!("Continue in {}", driver_name(target)));
-        page.set_description(Some(
-            "The thread is handed over with a budgeted, redacted summary of the conversation. \
-             You can switch back at any time.",
-        ));
-        let go = gtk4::Button::with_label(&format!("Switch to {}", driver_name(target)));
-        go.add_css_class("suggested-action");
-        go.add_css_class("pill");
-        go.set_halign(gtk4::Align::Center);
-        page.set_child(Some(&go));
-        (page, go)
-    };
-
-    let current = status.driver;
-    let other = match current {
-        Driver::Claude => Driver::Agy,
-        Driver::Agy => Driver::Claude,
-    };
-    let (other_page, go) = handoff_page(other);
-    stack.add_named(&other_page, Some("other"));
-    let backend = ctx.backend.clone();
-    go.connect_clicked(glib::clone!(
-        #[weak]
-        d,
-        move |_| {
-            backend.switch(other, None);
-            d.close();
-        }
-    ));
-
-    match current {
-        Driver::Claude => claude.set_active(true),
-        Driver::Agy => agy.set_active(true),
-    }
-    let on_toggle = glib::clone!(
-        #[weak]
-        stack,
-        #[weak]
-        claude,
-        move |_: &gtk4::ToggleButton| {
-            let picked = if claude.is_active() {
-                Driver::Claude
-            } else {
-                Driver::Agy
-            };
-            if picked == current {
-                let name = if stack.child_by_name("models").is_some() {
-                    "models"
-                } else if stack.child_by_name("error").is_some() {
-                    "error"
-                } else {
-                    "loading"
-                };
-                stack.set_visible_child_name(name);
-            } else {
-                stack.set_visible_child_name("other");
-            }
-        }
-    );
-    claude.connect_toggled(on_toggle.clone());
-    agy.connect_toggled(on_toggle);
-
-    if status.capabilities.model_list {
+    let models: Rc<RefCell<Vec<CatalogModel>>> = Rc::default();
+    let pick: Pick = {
         let backend = ctx.backend.clone();
-        let current_model = status.model.clone();
-        ctx.requests.ask(
-            ctx.backend.as_ref(),
-            Control::ListModels,
-            glib::clone!(
-                #[weak]
-                stack,
-                #[weak]
-                d,
-                #[weak]
-                claude,
-                move |result| {
-                    let models = match result {
-                        Ok(v) => payload::models(&v),
-                        Err(e) => {
-                            show_error(&stack, &e);
-                            return;
+        let d = d.downgrade();
+        Rc::new(move |driver, id| {
+            backend.switch(driver, Some(id));
+            if let Some(d) = d.upgrade() {
+                d.close();
+            }
+        })
+    };
+    let render: Rc<dyn Fn()> = {
+        let (models, backend) = (models.clone(), ctx.backend.clone());
+        let (stack, search) = (stack.downgrade(), search.downgrade());
+        Rc::new(move || {
+            let (Some(stack), Some(search)) = (stack.upgrade(), search.upgrade()) else {
+                return;
+            };
+            let list = model_list(&models.borrow(), &search.text(), &backend.status(), &pick);
+            replace_page(&stack, "models", &scrolled(&padded(&list)));
+        })
+    };
+    search.connect_search_changed({
+        let render = render.clone();
+        move |_| render()
+    });
+
+    match &ctx.models {
+        Some(source) => {
+            *models.borrow_mut() = source.models();
+            render();
+            // Keep the list live while the picker is open; the view owns the single connection
+            // to the source and forwards to whoever is registered here.
+            let live = {
+                let (source, models, render) = (source.clone(), models.clone(), render.clone());
+                Rc::new(move || {
+                    *models.borrow_mut() = source.models();
+                    render();
+                }) as Rc<dyn Fn()>
+            };
+            *ctx.model_listener.borrow_mut() = Some(live);
+            let slot = ctx.model_listener.clone();
+            d.connect_closed(move |_| {
+                slot.borrow_mut().take();
+            });
+        }
+        None if status.capabilities.model_list => {
+            let driver = status.driver;
+            ctx.requests.ask(
+                ctx.backend.as_ref(),
+                Control::ListModels,
+                glib::clone!(
+                    #[weak]
+                    stack,
+                    move |result| match result {
+                        Ok(v) => {
+                            *models.borrow_mut() =
+                                catalog_from_payload(driver, payload::models(&v));
+                            render();
                         }
-                    };
-                    if models.is_empty() {
-                        show_error(&stack, "The agent returned no models.");
-                        return;
+                        Err(e) => show_error(&stack, &e),
                     }
-                    let list = boxed_list();
-                    for m in models {
-                        let row = adw::ActionRow::new();
-                        row.set_use_markup(false);
-                        row.set_title(&m.label);
-                        let sub = match &m.description {
-                            Some(desc) => format!("{} · {desc}", m.id),
-                            None => m.id.clone(),
-                        };
-                        row.set_subtitle(&sub);
-                        row.set_activatable(true);
-                        if current_model.as_deref() == Some(m.id.as_str()) {
-                            let check = gtk4::Image::from_icon_name("object-select-symbolic");
-                            check.add_css_class("accent");
-                            row.add_suffix(&check);
-                        }
-                        let backend = backend.clone();
-                        let id = m.id.clone();
-                        row.connect_activated(glib::clone!(
-                            #[weak]
-                            d,
-                            move |_| {
-                                backend.switch(current, Some(id.clone()));
-                                d.close();
-                            }
-                        ));
-                        list.append(&row);
-                    }
-                    let page = scrolled(&padded(&list));
-                    if let Some(old) = stack.child_by_name("models") {
-                        stack.remove(&old);
-                    }
-                    stack.add_named(&page, Some("models"));
-                    let picked = if claude.is_active() {
-                        Driver::Claude
-                    } else {
-                        Driver::Agy
-                    };
-                    if picked == current {
-                        stack.set_visible_child_name("models");
-                    }
-                }
-            ),
-        );
-    } else {
-        show_error(
+                ),
+            );
+        }
+        None => show_error(
             &stack,
-            &format!("{} cannot list its models.", driver_name(current)),
-        );
+            &format!("{} cannot list its models.", driver_name(status.driver)),
+        ),
     }
     d.present(Some(&ctx.parent));
+    search.grab_focus();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -601,6 +643,54 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(driver: Driver, model: Option<&str>) -> SessionStatus {
+        SessionStatus {
+            driver,
+            model: model.map(str::to_owned),
+            mode: agent_core::adapter::Mode::Ask,
+            running_turn: false,
+            alive: true,
+            capabilities: agent_core::caps::Capabilities::claude(),
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fallback_catalog_is_attributed_to_the_current_agent() {
+        let entries = payload::models(&serde_json::json!({"models": [
+            {"value": "opus", "displayName": "Opus", "description": "Big"}]}));
+        let m = catalog_from_payload(Driver::Claude, entries);
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            (m[0].driver, m[0].id.as_str(), m[0].display.as_str()),
+            (Driver::Claude, "opus", "Opus")
+        );
+        assert_eq!(m[0].description.as_deref(), Some("Big"));
+    }
+
+    #[test]
+    fn current_model_needs_the_same_agent_and_id() {
+        let m = CatalogModel {
+            driver: Driver::Agy,
+            id: "gemini-3.1-pro-high".into(),
+            display: "G".into(),
+            description: None,
+            efforts: vec![],
+            via: None,
+        };
+        assert!(is_current(
+            &m,
+            &status(Driver::Agy, Some("gemini-3.1-pro-high"))
+        ));
+        assert!(!is_current(
+            &m,
+            &status(Driver::Claude, Some("gemini-3.1-pro-high"))
+        ));
+        assert!(!is_current(&m, &status(Driver::Agy, None)));
+        assert_eq!(group_title(Driver::Claude), "Claude");
+        assert_eq!(group_title(Driver::Agy), "Antigravity (agy)");
+    }
 
     #[test]
     fn mcp_status_classes() {

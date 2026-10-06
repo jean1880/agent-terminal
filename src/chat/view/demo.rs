@@ -24,7 +24,8 @@ use gtk4::prelude::*;
 use serde_json::{json, Value};
 
 use super::ChatView;
-use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
+use crate::chat::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
+use agent_core::catalog::CatalogModel;
 
 /// One script step.
 enum Step {
@@ -71,6 +72,66 @@ pub fn demo_backend() -> Rc<DemoBackend> {
     });
     *b.me.borrow_mut() = Rc::downgrade(&b);
     b
+}
+
+/// A fixed model list for `--chat-demo`: both agents, with an agy route to Claude models.
+pub struct DemoModels;
+
+impl DemoModels {
+    pub fn list() -> Vec<CatalogModel> {
+        let efforts = || ["low", "medium", "high"].map(str::to_owned).to_vec();
+        let claude = |id: &str, display: &str, desc: &str, efforts| CatalogModel {
+            driver: Driver::Claude,
+            id: id.into(),
+            display: display.into(),
+            description: Some(desc.into()),
+            efforts,
+            via: None,
+        };
+        let agy = |id: &str, display: &str| CatalogModel {
+            driver: Driver::Agy,
+            id: id.into(),
+            display: display.into(),
+            description: None,
+            efforts: Vec::new(),
+            via: (id.starts_with("claude-") || id.starts_with("gpt-"))
+                .then(|| "Antigravity".into()),
+        };
+        vec![
+            claude(
+                "claude-opus-5-5",
+                "Opus 5.5",
+                "Most capable, for complex work",
+                efforts(),
+            ),
+            claude(
+                "claude-sonnet-5-5",
+                "Sonnet 5.5",
+                "Fast and capable for everyday tasks",
+                efforts(),
+            ),
+            claude(
+                "claude-haiku-5",
+                "Haiku 5",
+                "Fastest, for quick answers",
+                Vec::new(),
+            ),
+            agy("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+            agy("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"),
+            agy("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)"),
+            agy("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+            agy("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+            agy("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+        ]
+    }
+}
+
+impl ModelSource for DemoModels {
+    fn models(&self) -> Vec<CatalogModel> {
+        Self::list()
+    }
+
+    fn connect_changed(&self, _f: Box<dyn Fn()>) {}
 }
 
 fn demo_commands() -> Vec<AgentCommand> {
@@ -938,6 +999,7 @@ pub fn run() -> glib::ExitCode {
         let backend = demo_backend();
         let view = ChatView::new(backend.clone());
         backend.connect(view.sink());
+        view.set_model_source(Rc::new(DemoModels));
         view.connect_action(|action| tracing::info!(?action, "chat demo: view action"));
 
         let toolbar = adw::ToolbarView::new();
@@ -975,4 +1037,20 @@ pub fn run() -> glib::ExitCode {
         .next()
         .unwrap_or_else(|| "agent-terminal".into());
     app.run_with_args(&[argv0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_models_cover_both_agents_and_a_via_route() {
+        let m = DemoModels.models();
+        assert!(m.iter().any(|m| m.driver == Driver::Claude));
+        assert!(m.iter().any(|m| m.driver == Driver::Agy));
+        let via: Vec<_> = m.iter().filter(|m| m.via.is_some()).collect();
+        assert_eq!(via.len(), 3);
+        assert!(via.iter().all(|m| m.driver == Driver::Agy));
+        assert!(m.iter().any(|m| !m.efforts.is_empty()));
+    }
 }

@@ -383,7 +383,9 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel list.boxed-list row { color: #ebe9ff; }
 .chat-panel list.boxed-list row .subtitle { color: #918bbd; }
 .chat-panel list.boxed-list row:hover { background-color: alpha(#b49bff, 0.08); }
-.chat-panel .agent-switch button:checked { background-color: alpha(#b49bff, 0.3); color: #ebe9ff; }
+.chat-panel .model-group { color: #918bbd; font-weight: 700; font-size: 0.85em; letter-spacing: 0.06em; }
+.chat-panel .model-via { color: #ffc46b; font-size: 0.8em; }
+.chat-panel list.boxed-list row.current-model { background-color: alpha(#b49bff, 0.18); }
 .chat-panel statuspage .title { color: #ebe9ff; }
 .chat-panel image.accent { color: #b49bff; }
 .chat-panel button.suggested-action { background-color: #b49bff; color: #181425; font-weight: 700; }
@@ -394,6 +396,5 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel .mcp-pending { color: #ffc46b; }
 .chat-panel .mcp-off { color: #6d6794; }
 .chat-panel .mcp-bad { color: #ff7878; }
-.chat-panel .agent-switch button { padding: 4px 18px; }
 .chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: #ebe9ff; font-family: monospace; }
 .chat-panel .json-row .subtitle { font-family: monospace; }
