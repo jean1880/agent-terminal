@@ -4,7 +4,10 @@
 //! parts through `gio::spawn_blocking`. Redaction is in `agent-core`.
 
 pub mod diff;
+pub mod difftool;
+pub mod editdiff;
 pub mod exec;
+pub mod filediff;
 pub mod fsutil;
 pub mod git;
 pub mod handoff;
