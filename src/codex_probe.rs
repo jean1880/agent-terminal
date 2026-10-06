@@ -61,18 +61,28 @@ fn initialize() -> String {
     )
 }
 
-/// The `result` of a JSON-RPC response frame, by id (`None` for errors, requests and
-/// notifications).
-fn response(frame: &Value) -> Option<(u64, &Value)> {
+/// A JSON-RPC response frame by id: its `result`, or its `error` (the reply, so a refusal ends a
+/// wait at once). `None` for requests and notifications.
+fn response(frame: &Value) -> Option<(u64, Result<&Value, String>)> {
     if frame.get("method").is_some() {
         return None;
     }
-    Some((frame.get("id")?.as_u64()?, frame.get("result")?))
+    let id = frame.get("id")?.as_u64()?;
+    if let Some(result) = frame.get("result") {
+        return Some((id, Ok(result)));
+    }
+    let message = frame
+        .get("error")?
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("error")
+        .to_owned();
+    Some((id, Err(message)))
 }
 
 /// Spawns `codex app-server` and runs the requests. See the module docs.
 pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
-    let replies: Rc<RefCell<HashMap<u64, Value>>> = Rc::default();
+    let replies: Rc<RefCell<HashMap<u64, Result<Value, String>>>> = Rc::default();
     let exited = Rc::new(Cell::new(false));
     // The same environment a Codex thread runs in, so the account shown is the thread's.
     let spec = SpawnSpec {
@@ -88,7 +98,7 @@ pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
                 return;
             };
             if let Some((id, result)) = response(&frame) {
-                replies.borrow_mut().insert(id, result.clone());
+                replies.borrow_mut().insert(id, result.cloned());
             }
         }
     };
@@ -114,6 +124,12 @@ pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
         }
     };
     wait(&[INIT_ID], MODELS_TIMEOUT).await;
+    // An error reply to `initialize` is the answer: fail now, not after the timeout.
+    let init_refused = matches!(replies.borrow().get(&INIT_ID), Some(Err(_)));
+    if init_refused {
+        proc.terminate();
+        return Err("codex refused initialize");
+    }
     if replies.borrow().contains_key(&INIT_ID) {
         proc.write_line(&json!({"method": "initialized"}).to_string());
         proc.write_line(&request(MODELS_ID, "model/list", json!({"limit": 100})));
@@ -126,20 +142,22 @@ pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
     proc.terminate();
 
     let mut replies = replies.borrow_mut();
-    let Some(models) = replies.remove(&MODELS_ID) else {
-        return Err(if exited.get() {
-            "codex exited without answering"
-        } else {
-            "codex timed out"
-        });
+    let models = match replies.remove(&MODELS_ID) {
+        Some(Ok(models)) => models,
+        Some(Err(_)) => return Err("codex refused model/list"),
+        None => {
+            return Err(if exited.get() {
+                "codex exited without answering"
+            } else {
+                "codex timed out"
+            });
+        }
     };
+    let ok = |id: u64| replies.get(&id).and_then(|r| r.as_ref().ok());
     Ok(CodexProbe {
         models: parse_codex_models(&models),
-        account: replies.get(&ACCOUNT_ID).and_then(codex_account),
-        windows: replies
-            .get(&LIMITS_ID)
-            .map(codex_rate_limits)
-            .unwrap_or_default(),
+        account: ok(ACCOUNT_ID).and_then(codex_account),
+        windows: ok(LIMITS_ID).map(codex_rate_limits).unwrap_or_default(),
     })
 }
 
@@ -248,6 +266,22 @@ mod tests {
     }
 
     #[test]
+    fn an_error_reply_to_initialize_fails_at_once_not_after_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Answers initialize with an error and then stays alive: only the reply can end the wait.
+        let body = "while read line; do\ncase \"$line\" in\n*'\"initialize\"'*) echo '{\"id\":1,\"error\":{\"code\":-1,\"message\":\"no\"}}';;\nesac\ndone";
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_probe(fake_codex(dir.path(), body)),
+            Err("codex refused initialize")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited out the timeout"
+        );
+    }
+
+    #[test]
     fn a_process_that_dies_or_is_missing_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -291,11 +325,14 @@ mod tests {
         assert_eq!(v["params"]["clientInfo"]["name"], "agent-terminal");
         let f: Value = serde_json::from_str(MODELS).unwrap();
         assert_eq!(response(&f).map(|(id, _)| id), Some(2));
+        let refused: Value = serde_json::from_str(r#"{"id":1,"error":{"message":"no"}}"#).unwrap();
+        assert_eq!(response(&refused), Some((1, Err("no".to_owned()))));
         let note = json!({"method": "x", "id": 5, "params": {}});
         assert_eq!(response(&note), None, "a server request is not a response");
+        // An error reply is a reply (the wait ends), carrying its message.
         assert_eq!(
             response(&json!({"id": 5, "error": {"message": "no"}})),
-            None
+            Some((5, Err("no".to_owned())))
         );
     }
 }

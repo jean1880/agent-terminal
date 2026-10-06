@@ -524,7 +524,12 @@ impl Store {
     }
 
     /// Whether the user has sent this thread a message (so there is something to hand over).
-    /// A cheap existence check; it does not decode the events.
+    /// Does not decode the events: it walks this thread's rows through the `(thread_id, seq)`
+    /// index and stops at the first one whose JSON mentions a user message. That is quick when
+    /// the user has written (the first prompt is early); a thread with no user message at all is
+    /// scanned in full (JSON text, no decoding). The kind is not a column, so this is a
+    /// substring test; adding an indexed `kind` column would make it constant, and is the upgrade
+    /// path if a thread's event count ever makes the empty case slow.
     pub fn has_messages(&self, thread: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM events

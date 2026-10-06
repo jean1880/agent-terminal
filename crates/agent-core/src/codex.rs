@@ -140,6 +140,9 @@ struct PendingApproval {
     /// The JSON-RPC id to put in the response, verbatim (number or string).
     rpc_id: Value,
     item: String,
+    /// The decisions the server offered (`availableDecisions`, or all of ours when it named
+    /// none we know). A decision outside this is refused rather than sent.
+    options: Vec<Decision>,
 }
 
 pub struct CodexAdapter {
@@ -722,6 +725,7 @@ impl CodexAdapter {
             PendingApproval {
                 rpc_id: id.clone(),
                 item: item.clone(),
+                options: options.clone(),
             },
         );
         out.push(
@@ -948,6 +952,21 @@ impl Adapter for CodexAdapter {
             Command::Approve {
                 request, decision, ..
             } => {
+                // Checked before it is removed: a refused decision leaves the request answerable.
+                match self.approvals.get(&request) {
+                    None => {
+                        return Err(AdapterError::Invalid(format!(
+                            "no pending approval {request}"
+                        )));
+                    }
+                    Some(pending) if !pending.options.contains(&decision) => {
+                        return Err(AdapterError::Invalid(format!(
+                            "Codex did not offer {} for approval {request}",
+                            decision_wire(decision)
+                        )));
+                    }
+                    Some(_) => {}
+                }
                 let Some(approval) = self.approvals.remove(&request) else {
                     return Err(AdapterError::Invalid(format!(
                         "no pending approval {request}"
@@ -1894,6 +1913,27 @@ mod tests {
             matches!(&ev[0].event, Event::ApprovalRequested { options, .. }
             if options == &vec![Decision::Allow, Decision::Cancel])
         );
+    }
+
+    #[test]
+    fn a_decision_the_server_did_not_offer_is_refused_and_the_request_stays_open() {
+        let mut a = started(Mode::Ask);
+        a.feed(
+            r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["accept","cancel"]}}"#,
+        );
+        let approve = |decision| Command::Approve {
+            request: "5".into(),
+            decision,
+            updated_input: None,
+            message: None,
+        };
+        assert!(matches!(
+            a.encode(approve(Decision::AllowForSession)),
+            Err(AdapterError::Invalid(m)) if m.contains("acceptForSession")
+        ));
+        // Still pending: an offered decision goes through.
+        let w = one_write(a.encode(approve(Decision::Allow)).expect("offered"));
+        assert_eq!(w, json!({"id": 5, "result": {"decision": "accept"}}));
     }
 
     #[test]
