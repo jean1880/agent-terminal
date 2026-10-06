@@ -29,7 +29,7 @@ pub type ProviderThreadId = String;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -704,6 +704,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     if schema_version(conn)? == SCHEMA_VERSION {
         return Ok(()); // the common case takes no write lock
     }
+    // A table rebuild (v2) must not fire `ON DELETE` actions of the tables that point at the
+    // dropped one, and the pragma is a no-op inside a transaction, so it is switched off around
+    // the whole migration and restored whatever the outcome. `migrate_locked` checks
+    // `foreign_key_check` before it commits.
+    let fk_was_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+    let result = migrate_in_txn(conn);
+    if fk_was_on {
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+    }
+    result
+}
+
+fn migrate_in_txn(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     match migrate_locked(conn) {
         Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
@@ -733,37 +747,7 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
     // Another process may have migrated while this one waited for the lock.
     let current = schema_version(conn)?;
     if current < 1 {
-        conn.execute_batch(
-            "CREATE TABLE threads (
-                 id TEXT PRIMARY KEY,
-                 title TEXT NOT NULL,
-                 cwd TEXT NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 archived INTEGER NOT NULL DEFAULT 0,
-                 active_provider_thread TEXT,
-                 read_seq INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE provider_threads (
-                 id TEXT PRIMARY KEY,
-                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-                 driver TEXT NOT NULL CHECK (driver IN ('claude', 'agy')),
-                 model TEXT NOT NULL,
-                 native_id TEXT,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-             CREATE INDEX provider_threads_thread ON provider_threads(thread_id);
-             CREATE TABLE events (
-                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-                 provider_thread_id TEXT REFERENCES provider_threads(id) ON DELETE SET NULL,
-                 at INTEGER NOT NULL,
-                 envelope_json TEXT NOT NULL
-             );
-             CREATE INDEX events_thread_seq ON events(thread_id, seq);
-             INSERT INTO schema_version (version) VALUES (1);",
-        )?;
+        conn.execute_batch(SCHEMA_V1)?;
     }
     if current < 2 {
         // Small app state that belongs with the threads (the open-thread list).
@@ -775,8 +759,77 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
              INSERT INTO schema_version (version) VALUES (2);",
         )?;
     }
+    if current < 3 {
+        // SQLite cannot alter a CHECK constraint, so the table is rebuilt (the documented
+        // create-new, copy, drop, rename sequence) to allow the 'codex' driver. Rows keep their
+        // ids, so `events.provider_thread_id` and `threads.active_provider_thread` stay valid.
+        conn.execute_batch(
+            "CREATE TABLE provider_threads_v3 (
+                 id TEXT PRIMARY KEY,
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 driver TEXT NOT NULL CHECK (driver IN ('claude', 'agy', 'codex')),
+                 model TEXT NOT NULL,
+                 native_id TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO provider_threads_v3
+                 (id, thread_id, driver, model, native_id, created_at, updated_at)
+                 SELECT id, thread_id, driver, model, native_id, created_at, updated_at
+                 FROM provider_threads;
+             DROP TABLE provider_threads;
+             ALTER TABLE provider_threads_v3 RENAME TO provider_threads;
+             CREATE INDEX provider_threads_thread ON provider_threads(thread_id);
+             INSERT INTO schema_version (version) VALUES (3);",
+        )?;
+        let broken: Option<String> = conn
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(table) = broken {
+            return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some(format!("schema v3 left a dangling foreign key in {table}")),
+            )));
+        }
+    }
     Ok(())
 }
+
+/// The first schema. Kept verbatim: databases created before v2 are upgraded from it, and the
+/// migration test builds one.
+const SCHEMA_V1: &str = "CREATE TABLE threads (
+         id TEXT PRIMARY KEY,
+         title TEXT NOT NULL,
+         cwd TEXT NOT NULL,
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL,
+         archived INTEGER NOT NULL DEFAULT 0,
+         active_provider_thread TEXT,
+         read_seq INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE TABLE provider_threads (
+         id TEXT PRIMARY KEY,
+         thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+         driver TEXT NOT NULL CHECK (driver IN ('claude', 'agy')),
+         model TEXT NOT NULL,
+         native_id TEXT,
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL
+     );
+     CREATE INDEX provider_threads_thread ON provider_threads(thread_id);
+     CREATE TABLE events (
+         seq INTEGER PRIMARY KEY AUTOINCREMENT,
+         thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+         provider_thread_id TEXT REFERENCES provider_threads(id) ON DELETE SET NULL,
+         at INTEGER NOT NULL,
+         envelope_json TEXT NOT NULL
+     );
+     CREATE INDEX events_thread_seq ON events(thread_id, seq);
+     INSERT INTO schema_version (version) VALUES (1);";
 
 #[cfg(test)]
 mod tests {
@@ -1230,6 +1283,101 @@ mod tests {
             migrate(&s.conn),
             Err(StoreError::SchemaTooNew { found: 99, .. })
         ));
+    }
+
+    #[test]
+    fn a_v1_database_migrates_to_v3_keeping_rows_and_allowing_codex() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            .expect("version table");
+        conn.execute_batch(SCHEMA_V1).expect("v1 schema");
+        conn.execute_batch(
+            "INSERT INTO threads (id, title, cwd, created_at, updated_at, active_provider_thread)
+                 VALUES ('t1', 'old', '/w', 1, 2, 'p1');
+             INSERT INTO provider_threads (id, thread_id, driver, model, native_id, created_at, updated_at)
+                 VALUES ('p1', 't1', 'claude', 'opus', 'n1', 1, 2),
+                        ('p2', 't1', 'agy', 'gemini', NULL, 3, 4);
+             INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
+                 VALUES ('t1', 'p1', 5, '{}'), ('t1', 'p1', 6, '{}'), ('t1', NULL, 7, '{}');",
+        )
+        .expect("v1 rows");
+        assert!(conn
+            .execute(
+                "INSERT INTO provider_threads (id, thread_id, driver, model, created_at, updated_at)
+                 VALUES ('p3', 't1', 'codex', 'm', 0, 0)",
+                []
+            )
+            .is_err());
+
+        migrate(&conn).expect("migrate");
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 3);
+        let rows: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT id, driver, native_id FROM provider_threads ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("p1".into(), "claude".into(), Some("n1".into())),
+                ("p2".into(), "agy".into(), None)
+            ]
+        );
+        let links: Vec<Option<String>> = conn
+            .prepare("SELECT provider_thread_id FROM events ORDER BY seq")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("links");
+        assert_eq!(links, vec![Some("p1".into()), Some("p1".into()), None]);
+        let active: String = conn
+            .query_row(
+                "SELECT active_provider_thread FROM threads WHERE id = 't1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("active");
+        assert_eq!(active, "p1");
+
+        // Foreign keys are back on, the new CHECK allows codex and still refuses others.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("fk");
+        assert_eq!(fk, 1);
+        let insert = |id: &str, driver: &str| {
+            conn.execute(
+                "INSERT INTO provider_threads (id, thread_id, driver, model, created_at, updated_at)
+                 VALUES (?1, 't1', ?2, 'm', 0, 0)",
+                params![id, driver],
+            )
+        };
+        insert("p3", "codex").expect("codex allowed");
+        assert!(insert("p4", "gpt").is_err());
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'provider_threads_thread'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("index");
+        assert_eq!(index, 1);
+
+        // The cascade from threads still reaches the rebuilt table, and a second run is a no-op.
+        migrate(&conn).expect("again");
+        conn.execute("DELETE FROM threads WHERE id = 't1'", [])
+            .expect("delete");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM provider_threads", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(left, 0);
     }
 
     #[test]
