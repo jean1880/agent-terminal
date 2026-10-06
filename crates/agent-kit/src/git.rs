@@ -855,6 +855,11 @@ pub struct TabDiff {
     /// What Undo would restore the working tree to: the diff's left side,
     /// for the checkpoint bases only.
     pub undo_to: Option<String>,
+    /// The diff's left side: what an external tool's `{old}` is read from.
+    pub from: String,
+    /// The right side when it is a checkpoint (the "last turn" base); `None` when it is the
+    /// working tree as it is now.
+    pub to_checkpoint: Option<String>,
 }
 
 /// What the panel can show for a tab.
@@ -923,6 +928,7 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
     // Undo goes back to the diff's left side. Not offered for Uncommitted,
     // where that would be "throw away everything since HEAD".
     let undo_to = (base != DiffBase::Uncommitted).then(|| from.clone());
+    let to_checkpoint = (base == DiffBase::LastTurn).then(|| to.clone());
     let (_, added, deleted) = crate::diff::totals(&stats);
     if added + deleted > MAX_FETCHED_DIFF_LINES {
         return Ok(DiffOutcome::Ready(TabDiff {
@@ -931,6 +937,8 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
             omitted_lines: 0,
             too_large: true,
             undo_to,
+            from,
+            to_checkpoint,
         }));
     }
     let raw = git_raw(
@@ -951,6 +959,8 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
         omitted_lines,
         too_large: false,
         undo_to,
+        from,
+        to_checkpoint,
     }))
 }
 

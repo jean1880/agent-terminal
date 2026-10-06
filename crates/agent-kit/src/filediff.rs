@@ -241,6 +241,82 @@ pub fn turn_file_diff(base: &TurnBase, file: &RepoFile) -> Result<FileDiff, Stri
 }
 
 // ---------------------------------------------------------------------------------------------
+// What a file-change card shows
+// ---------------------------------------------------------------------------------------------
+
+/// Where a shown diff came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The working files against the checkpoint taken before the turn.
+    Checkpoint,
+    /// The edit as the agent described it (its own `old_string`/`new_string` or diff): no
+    /// checkpoint was available, or git could not answer.
+    AgentEdit,
+}
+
+/// A diff ready for a card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    /// Capped at [`crate::diff::MAX_DIFF_BYTES`] / [`crate::diff::MAX_DIFF_LINES`].
+    pub text: String,
+    pub origin: Origin,
+    /// Lines left out by the cap.
+    pub omitted_lines: usize,
+    /// The files the edit names, as the agent named them.
+    pub files: Vec<String>,
+}
+
+/// The diff of a file-change item whose tool input is `input`. With a `base`, each named file is
+/// compared against it; when there is none, or git cannot answer for one of the files, the whole
+/// diff is the agent's own edit instead. `Err` when the input names no file edit at all.
+/// Blocking when a base is given.
+pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Result<Shown, String> {
+    let preview = editdiff::preview_from_input(input);
+    if preview.is_empty() {
+        return Err("This edit carries no file diff to show.".to_owned());
+    }
+    let files: Vec<String> = preview.iter().map(|e| e.path.clone()).collect();
+    let from_checkpoint = base.and_then(|base| {
+        let mut text = String::new();
+        for edit in &preview {
+            let file = resolve(&base.toplevel, &edit.path).ok()?;
+            match turn_file_diff(base, &file).ok()? {
+                FileDiff::Text(d) => text.push_str(&d.diff),
+                FileDiff::Binary => {
+                    text.push_str(&format!("# {}: binary file, not shown\n", edit.path));
+                }
+                FileDiff::Unchanged => text.push_str(&format!(
+                    "# {}: no changes since the turn started\n",
+                    edit.path
+                )),
+                FileDiff::TooLarge => {
+                    text.push_str(&format!("# {}: too large to show\n", edit.path));
+                }
+            }
+        }
+        Some(text)
+    });
+    let (text, origin) = match from_checkpoint {
+        Some(text) => (text, Origin::Checkpoint),
+        None => (
+            preview.iter().map(|e| e.diff.as_str()).collect::<String>(),
+            Origin::AgentEdit,
+        ),
+    };
+    let (kept, omitted_lines) = crate::diff::truncate(
+        &text,
+        crate::diff::MAX_DIFF_BYTES,
+        crate::diff::MAX_DIFF_LINES,
+    );
+    Ok(Shown {
+        text: kept.to_owned(),
+        origin,
+        omitted_lines,
+        files,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
 // Temp files for an external tool
 // ---------------------------------------------------------------------------------------------
 
@@ -306,6 +382,20 @@ pub fn sweep_temp(root: &Path, max_age: Duration) -> usize {
         }
     }
     removed
+}
+
+/// Removes the temp directories this process made (named `<pid>-<n>`). Run at exit: another
+/// instance's files, which a tool of its own may have open, are left to the age sweep.
+pub fn remove_own_temp(root: &Path) -> usize {
+    let prefix = format!("{}-", std::process::id());
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .filter(|e| std::fs::remove_dir_all(e.path()).is_ok())
+        .count()
 }
 
 #[cfg(test)]
@@ -459,6 +549,80 @@ mod tests {
     }
 
     #[test]
+    fn a_card_shows_the_checkpoint_diff_and_falls_back_to_the_agents_own_edit() {
+        use serde_json::json;
+        let Some(dir) = repo() else { return };
+        let p = dir.path();
+        let base = take_turn_base(p, 6001, "test", true)
+            .expect("base")
+            .expect("repo");
+        std::fs::write(p.join("a.txt"), "one\nTWO\nthree\n").expect("edit");
+        let input = json!({"file_path": p.join("a.txt"), "old_string": "two", "new_string": "TWO"});
+
+        let shown = shown_for_item(Some(&base), &input).expect("shown");
+        assert_eq!(shown.origin, Origin::Checkpoint);
+        assert!(
+            shown
+                .text
+                .starts_with("--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n"),
+            "{}",
+            shown.text
+        );
+        assert!(shown.text.contains("-two\n+TWO\n"));
+        assert_eq!(shown.omitted_lines, 0);
+
+        // No baseline: the agent's own old/new strings, as an `@@ edit @@` fragment.
+        let fallback = shown_for_item(None, &input).expect("fallback");
+        assert_eq!(fallback.origin, Origin::AgentEdit);
+        assert!(
+            fallback.text.contains("@@ edit @@\n-two\n+TWO\n"),
+            "{}",
+            fallback.text
+        );
+
+        // A path outside the repository cannot be compared: the agent's edit is shown instead.
+        let outside = json!({"file_path": "/etc/hostname", "old_string": "a", "new_string": "b"});
+        assert_eq!(
+            shown_for_item(Some(&base), &outside).expect("shown").origin,
+            Origin::AgentEdit
+        );
+
+        // A binary file says so; an untouched one says so.
+        std::fs::write(p.join("bin.dat"), [7u8, 0]).expect("bin");
+        let bin = json!({"file_path": "bin.dat", "content": "ignored"});
+        assert!(shown_for_item(Some(&base), &bin)
+            .expect("shown")
+            .text
+            .contains("bin.dat: binary file"));
+        let quiet = json!({"file_path": "my file.txt", "old_string": "x", "new_string": "x"});
+        assert!(shown_for_item(Some(&base), &quiet)
+            .expect("shown")
+            .text
+            .contains("no changes since the turn"));
+
+        // Not an edit at all.
+        assert!(shown_for_item(None, &json!({"command": "ls"})).is_err());
+    }
+
+    #[test]
+    fn a_codex_unified_diff_is_shown_as_given_and_a_huge_one_is_cut() {
+        use serde_json::json;
+        let input =
+            json!([{"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-o\n+n\n"}]);
+        let shown = shown_for_item(None, &input).expect("shown");
+        assert_eq!(shown.origin, Origin::AgentEdit);
+        assert_eq!(shown.text, "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-o\n+n\n");
+
+        let big: String = (0..crate::diff::MAX_DIFF_LINES + 50)
+            .map(|i| format!("+line {i}\n"))
+            .collect();
+        let input = json!({"file_path": "big.txt", "content": big});
+        let shown = shown_for_item(None, &input).expect("shown");
+        assert!(shown.omitted_lines > 0);
+        assert!(shown.text.lines().count() <= crate::diff::MAX_DIFF_LINES);
+    }
+
+    #[test]
     fn a_directory_that_is_not_a_repository_has_no_baseline() {
         if !git_installed() {
             return;
@@ -538,8 +702,11 @@ mod tests {
             .expect("age");
         assert_eq!(sweep_temp(&root, TEMP_MAX_AGE), 1);
         assert!(!file.exists() && second.exists());
-        // At exit everything goes.
+        // At exit this process's own directories go; another instance's stay.
+        let foreign = root.join("1-0");
+        std::fs::create_dir(&foreign).expect("foreign");
+        assert_eq!(remove_own_temp(&root), 1);
+        assert!(!second.exists() && foreign.exists());
         assert_eq!(sweep_temp(&root, Duration::ZERO), 1);
-        assert!(!second.exists());
     }
 }
