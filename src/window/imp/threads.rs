@@ -1351,6 +1351,21 @@ impl AgentTerminalWindow {
             .css_classes(["thread-age", "dim-label", "caption"])
             .build();
         line.append(&age);
+        if let RowKey::Thread(thread_id) = &row.key {
+            let delete = Button::builder()
+                .icon_name("at-user-trash-symbolic")
+                .tooltip_text("Delete thread…")
+                .css_classes(["flat", "circular", "thread-delete"])
+                .valign(Align::Center)
+                .build();
+            let thread = thread_id.clone();
+            delete.connect_clicked(glib::clone!(
+                #[weak]
+                obj,
+                move |_| obj.imp().confirm_delete(&thread)
+            ));
+            line.append(&delete);
+        }
         if row.open {
             let close = Button::builder()
                 .icon_name("at-window-close-symbolic")

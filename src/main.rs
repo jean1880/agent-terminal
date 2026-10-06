@@ -464,10 +464,22 @@ fn load_css() {
         .thread-badge.badge-approval { color: #ffcc66; }
         .thread-badge.badge-limited { color: #ff7878; }
         .thread-badge.badge-unread { color: #b49bff; }
-        .thread-close {
+        .thread-close, .thread-delete {
             min-width: 20px;
             min-height: 20px;
             padding: 0;
+            opacity: 0.45;
+        }
+        .thread-row:hover .thread-close,
+        .thread-row:hover .thread-delete {
+            opacity: 0.85;
+        }
+        .thread-close:hover {
+            opacity: 1.0;
+        }
+        .thread-delete:hover {
+            opacity: 1.0;
+            color: #ff7878;
         }
         .sidebar-footer {
             border-top: 1px solid #2d2444;
