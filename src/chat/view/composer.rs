@@ -104,6 +104,9 @@ impl Composer {
         scroller.set_min_content_height(24);
         scroller.set_child(Some(&view));
         scroller.set_hexpand(true);
+        // Clip to the field's rounded corners (its tint is drawn by the view, see style.css).
+        scroller.set_overflow(gtk4::Overflow::Hidden);
+        scroller.add_css_class("composer-field");
 
         let placeholder = label("", &["composer-placeholder"]);
         placeholder.set_can_target(false);

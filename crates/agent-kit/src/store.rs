@@ -662,6 +662,20 @@ impl Store {
     }
 
     /// Events after `after_seq` (exclusive), oldest first, at most `limit`.
+    /// The `seq` just before the newest `n` events of `thread`, to pass as `after_seq` to
+    /// [`Store::events`]; `None` when the thread has `n` or fewer events (so all of it fits).
+    pub fn tail_after(&self, thread: &str, n: usize) -> Result<Option<i64>> {
+        let offset = i64::try_from(n).unwrap_or(i64::MAX);
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seq FROM events WHERE thread_id = ?1 ORDER BY seq DESC LIMIT 1 OFFSET ?2",
+                params![thread, offset],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn events(
         &self,
         thread: &str,

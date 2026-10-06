@@ -169,6 +169,12 @@ impl TranscriptView {
             .is_none_or(|v| v.is_scroll_to_focus())
     }
 
+    /// The jump button and the scroll position, for realised-window tests.
+    #[cfg(test)]
+    pub fn scroll_parts(&self) -> (gtk4::Button, gtk4::Adjustment) {
+        (self.jump.clone(), self.scroller.vadjustment())
+    }
+
     pub fn widget(&self) -> &gtk4::Overlay {
         &self.root
     }
@@ -245,10 +251,13 @@ impl TranscriptView {
             let Some(view) = weak.upgrade() else {
                 return;
             };
-            if let Some(from_end) = view.anchor.take() {
-                view.move_to((adj.upper() - from_end).max(0.0));
-            } else if view.stick.get() {
+            let anchor = view.anchor.take();
+            if view.stick.get() {
+                // Following the bottom wins over a pending "keep my place" from loading older
+                // rows: restoring it after a jump threw the view back to the top.
                 view.move_to(adj.upper() - adj.page_size());
+            } else if let Some(from_end) = anchor {
+                view.move_to((adj.upper() - from_end).max(0.0));
             } else {
                 // Not following: just note the new heights, so the next move is judged against
                 // them.
@@ -279,7 +288,13 @@ impl TranscriptView {
                 return;
             };
             // Defer: changing children inside the scroll handler re-enters allocation.
-            glib::idle_add_local_once(move || view.load_older(&model.borrow()));
+            glib::idle_add_local_once(move || {
+                // Only for a user reading upward: a view following the bottom (a jump or a send
+                // since) never loads older rows, which would re-anchor it away from the end.
+                if !view.stick.get() {
+                    view.load_older(&model.borrow());
+                }
+            });
         });
         let weak = Rc::downgrade(self);
         let weak_model = Rc::downgrade(&model);
@@ -300,6 +315,7 @@ impl TranscriptView {
 
     pub fn scroll_to_end(&self) {
         self.stick.set(true);
+        self.anchor.set(None);
         self.jump.set_visible(false);
         let adj = self.scroller.vadjustment();
         self.move_to(adj.upper() - adj.page_size());

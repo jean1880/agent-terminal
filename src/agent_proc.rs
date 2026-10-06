@@ -28,6 +28,13 @@ const SIGKILL: i32 = 9;
 const TERM_GRACE: Duration = Duration::from_secs(3);
 /// After the process exits, how long a pipe held open by a grandchild may delay the exit report.
 const EXIT_DRAIN: Duration = Duration::from_secs(2);
+/// How long quitting the app waits for its agents to leave after SIGTERM.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+thread_local! {
+    /// Process groups of the agents not yet seen to exit, for [`terminate_all`].
+    static LIVE: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// What to run.
 #[derive(Debug, Clone, Default)]
@@ -159,6 +166,9 @@ impl AgentProcess {
             .identifier()
             .and_then(|id| id.parse::<i32>().ok())
             .filter(|p| *p > 1);
+        if let Some(pid) = pid {
+            LIVE.with(|l| l.borrow_mut().push(pid));
+        }
         let shared = Rc::new(Shared {
             pid,
             stdin: subprocess.stdin_pipe(),
@@ -230,6 +240,56 @@ fn terminate(shared: &Rc<Shared>) {
     });
 }
 
+/// Stops every agent this app started, for its shutdown: SIGTERM to each process group, a wait of
+/// at most [`SHUTDOWN_GRACE`], then SIGKILL to the groups whose agent is still running. Blocks:
+/// the main loop is over by then, so [`terminate`]'s timer would never fire (and agents run in
+/// their own session, so nothing else would stop them).
+///
+/// A group is signalled only while its leader is unreaped (running, or a zombie no one reaps once
+/// the loop is over), so a reused pid is never hit. Ceiling: a tool child that left the group
+/// (`setsid`) is not reached; see [`Shared::signal`].
+pub fn terminate_all() {
+    let groups = LIVE.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    let signal_group = |pid: i32, signal: i32| {
+        // SAFETY: kill(2) with a negative pid signals that process group; no memory is touched.
+        unsafe { libc::kill(-pid, signal) };
+    };
+    let groups: Vec<i32> = groups
+        .into_iter()
+        .filter(|pid| leader_state(*pid).is_some())
+        .collect();
+    if groups.is_empty() {
+        return;
+    }
+    info!(count = groups.len(), "stopping agents on quit");
+    for pid in &groups {
+        signal_group(*pid, SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+    let running = |pid: &i32| leader_state(*pid).is_some_and(|s| s != 'Z');
+    while groups.iter().any(running) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for pid in &groups {
+        match leader_state(*pid) {
+            None => {}
+            Some(state) => {
+                if state != 'Z' {
+                    warn!(pid, "agent ignored SIGTERM on quit; killing it");
+                }
+                // Also takes any tool child still in the group with it.
+                signal_group(*pid, SIGKILL);
+            }
+        }
+    }
+}
+
+/// The state letter (`R`, `S`, `Z`, …) of `pid` from `/proc`; `None` once it has been reaped.
+fn leader_state(pid: i32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit(')').next()?.trim_start().chars().next()
+}
+
 fn spawn_reader(
     shared: Rc<Shared>,
     stream: gio::InputStream,
@@ -266,6 +326,9 @@ fn spawn_waiter(shared: Rc<Shared>) {
             }
         };
         info!(program = %shared.name, code = ?code, "agent process exited");
+        if let Some(pid) = shared.pid {
+            LIVE.with(|l| l.borrow_mut().retain(|p| *p != pid));
+        }
         shared.exited.set(true);
         shared.queue.borrow_mut().clear();
         shared.exit_code.set(Some(code));
@@ -460,13 +523,36 @@ mod tests {
 
     /// Whether `pid` is gone (or only a zombie waiting to be reaped).
     fn is_gone(pid: i32) -> bool {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Err(_) => true,
-            Ok(stat) => stat
-                .rsplit(')')
-                .next()
-                .is_some_and(|rest| rest.trim_start().starts_with('Z')),
-        }
+        leader_state(pid).is_none_or(|s| s == 'Z')
+    }
+
+    #[test]
+    fn quitting_stops_every_agent_even_one_that_ignores_sigterm() {
+        in_loop(|ctx| {
+            let (polite, out, _, _) = start(&sh("echo $$; exec sleep 30"));
+            // SIGTERM ignored, inherited by its sleep too: only the SIGKILL ends it.
+            let (stubborn, out2, _, _) =
+                start(&sh("trap '' TERM; echo $$; while :; do sleep 1; done"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()
+                && !out2.borrow().is_empty()));
+            let pids: Vec<i32> = [&out, &out2]
+                .iter()
+                .map(|o| o.borrow()[0].parse().expect("pid"))
+                .collect();
+            let started = std::time::Instant::now();
+            // The main loop is not running here, as at shutdown.
+            terminate_all();
+            assert!(started.elapsed() < SHUTDOWN_GRACE + Duration::from_secs(1));
+            for pid in pids {
+                assert!(
+                    pump_until(ctx, 10, || is_gone(pid)),
+                    "agent {pid} outlived quit"
+                );
+            }
+            // Nothing is left to stop.
+            assert!(LIVE.with(|l| l.borrow().is_empty()));
+            drop((polite, stubborn));
+        });
     }
 
     #[test]

@@ -38,6 +38,11 @@ use crate::approval_server::ApprovalHandle;
 /// and what the app removes (`clear_env`, a launching agent session's markers).
 pub type LaunchEnv = AgentEnv;
 
+/// agy's approval socket, or why it has none: `Err(None)` when the hook is not installed (and
+/// for Claude and Codex, which never use one); `Err(Some(reason))` when it is installed but the
+/// socket could not be bound (say, the package was upgraded under the running app).
+pub type Approval = Result<ApprovalHandle, Option<String>>;
+
 /// Everything a switch to another agent starts with. The window builds it from that agent's
 /// profile; this module does not know profiles.
 pub struct AgentLaunch {
@@ -51,9 +56,9 @@ pub struct AgentLaunch {
     /// The agent's configured default effort, used when the switch names none.
     pub default_effort: Option<String>,
     pub env: LaunchEnv,
-    /// agy: the approval socket for the new process. `None`: no hook, so agy cannot ask (Ask runs
-    /// as Plan; see [`effective_mode`]).
-    pub approval: Option<ApprovalHandle>,
+    /// agy: the approval socket for the new process. Without one agy cannot ask (Ask runs as
+    /// Plan; see [`effective_mode`]).
+    pub approval: Approval,
 }
 
 /// `Continued on <new model> (<old> was retired)`.
@@ -125,6 +130,9 @@ struct Inner {
     sink: EnvelopeSink,
     /// Cleared (never re-set) when the canary proves the hook is not gating agy.
     approval: RefCell<Option<ApprovalHandle>>,
+    /// Why agy has no socket although its hook is installed (see [`Approval`]); said in the
+    /// notice instead of "install the hook".
+    unbound: RefCell<Option<String>>,
     /// How long a tool step may wait for its hook query to show up.
     canary_grace: Cell<Duration>,
     factory: RefCell<Option<AdapterFactory>>,
@@ -156,6 +164,26 @@ fn effective_mode(hookless_agy: bool, wanted: Mode) -> Mode {
         Mode::Plan
     } else {
         wanted
+    }
+}
+
+/// The notice for agy running without its approval socket: why (`unbound`, when the hook is
+/// installed but the socket could not be used; else the hook is missing), and what it still does.
+fn hookless_text(unbound: Option<&str>) -> String {
+    const STILL: &str = "It refuses shell commands, but applies file edits on its own in every \
+                         mode (in Plan it writes a plan first, then edits). Ask before edits is \
+                         not available.";
+    match unbound {
+        Some(reason) => format!(
+            "Antigravity cannot ask you before acting in this thread: its approval hook is \
+             installed, but {reason}. {STILL}"
+        ),
+        None => format!(
+            "Antigravity cannot ask you before acting: the approval hook is not installed. \
+             {STILL} To have it ask you first, add this top-level entry to \
+             ~/.gemini/config/hooks.json:\n{}",
+            crate::hook_config::install_entry_json()
+        ),
     }
 }
 
@@ -196,22 +224,27 @@ impl ChatSession {
             store,
             thread,
             sink,
-            approval,
+            approval.ok_or(None),
             LaunchEnv::default(),
         )
     }
 
-    /// [`Self::new`] with the profile's environment applied to every process it starts.
+    /// [`Self::new`] with the profile's environment applied to every process it starts, and
+    /// agy's approval as an [`Approval`] (so a socket that could not be bound says why).
     pub fn with_env(
         adapter: Box<dyn Adapter>,
         mut open: OpenSession,
         store: Rc<Store>,
         thread: ThreadId,
         sink: EnvelopeSink,
-        approval: Option<ApprovalHandle>,
+        approval: Approval,
         env: LaunchEnv,
     ) -> Rc<Self> {
         let driver = adapter.driver();
+        let (approval, unbound) = match approval {
+            Ok(handle) => (Some(handle), None),
+            Err(reason) => (None, reason),
+        };
         open.approval_hook = approval.is_some();
         let hookless_agy = driver == Driver::Agy && approval.is_none();
         let wanted_mode = open.mode;
@@ -244,6 +277,7 @@ impl ChatSession {
             provider_thread: RefCell::new(provider_thread),
             sink,
             approval: RefCell::new(approval),
+            unbound: RefCell::new(unbound),
             canary_grace: Cell::new(CANARY_GRACE),
             factory: RefCell::new(None),
             launch_env: RefCell::new(env),
@@ -259,8 +293,10 @@ impl ChatSession {
         });
         inner.attach_approval();
         // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
-        // edits does not repeat it on every reopen.
-        if inner.state.borrow().mode != wanted_mode {
+        // edits does not repeat it on every reopen. An installed hook that could not be used is
+        // always said (it is fixed by a restart, not by the user's mode).
+        let unbound_agy = hookless_agy && inner.unbound.borrow().is_some();
+        if inner.state.borrow().mode != wanted_mode || unbound_agy {
             inner.hookless_notice();
         }
         inner.start_process();
@@ -341,16 +377,8 @@ impl Inner {
     }
 
     fn hookless_notice(&self) {
-        self.emit(Envelope::new(Event::Notice {
-            text: format!(
-                "Antigravity cannot ask you before acting: the approval hook is not installed. \
-                 It refuses shell commands, but applies file edits on its own in every mode \
-                 (in Plan it writes a plan first, then edits). Ask before edits is not \
-                 available. To have it ask you first, add this top-level entry to \
-                 ~/.gemini/config/hooks.json:\n{}",
-                crate::hook_config::install_entry_json()
-            ),
-        }));
+        let text = hookless_text(self.unbound.borrow().as_deref());
+        self.emit(Envelope::new(Event::Notice { text }));
     }
 
     // ---- events ----
@@ -1065,7 +1093,12 @@ impl Inner {
         *self.provider_thread.borrow_mut() = new_pt;
         *self.adapter.borrow_mut() = launch.adapter;
         *self.launch_env.borrow_mut() = launch.env;
-        *self.approval.borrow_mut() = launch.approval;
+        let (approval, unbound) = match launch.approval {
+            Ok(handle) => (Some(handle), None),
+            Err(reason) => (None, reason),
+        };
+        *self.approval.borrow_mut() = approval;
+        *self.unbound.borrow_mut() = unbound;
         // The user's own mode, as far as the new agent can honour it (agy without its hook
         // cannot ask). A thread that went through hookless agy gets its Ask back here.
         let hookless_agy = driver == Driver::Agy && self.approval().is_none();
@@ -1921,7 +1954,7 @@ mod tests {
             default_model: None,
             default_effort: None,
             env: LaunchEnv::default(),
-            approval: None,
+            approval: Err(None),
         })
     }
 
@@ -1968,7 +2001,7 @@ mod tests {
                         env: vec![("FROM_ENV_FILE".into(), "1".into())],
                         unset: vec!["CLAUDECODE".into()],
                     },
-                    approval: None,
+                    approval: Err(None),
                 })
             }));
 
@@ -2314,6 +2347,16 @@ mod tests {
             assert_eq!(lines(tmp.path().join("args.log")).len(), 1, "not restarted");
             assert_eq!(session.status().mode, Mode::Ask);
         });
+    }
+
+    #[test]
+    fn an_installed_hook_that_could_not_bind_says_why_not_how_to_install() {
+        let missing = hookless_text(None);
+        assert!(missing.contains("not installed") && missing.contains("hooks.json"));
+        let unbound = hookless_text(Some("the running binary was replaced on disk; restart"));
+        assert!(unbound.contains("installed, but the running binary was replaced"));
+        assert!(!unbound.contains("hooks.json"), "{unbound}");
+        assert!(unbound.contains("applies file edits"));
     }
 
     #[test]

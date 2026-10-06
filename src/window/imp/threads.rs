@@ -26,7 +26,7 @@ use crate::availability::{
     classify, probe_targets, unavailable_banner, AgentAvailability, Availability,
 };
 use crate::chat::session::{
-    build_handoff, retired_notice, AgentLaunch, ChatSession, LaunchEnv, RetiredModel,
+    build_handoff, retired_notice, AgentLaunch, Approval, ChatSession, LaunchEnv, RetiredModel,
 };
 use crate::chat::view::usage::UsageIndicator;
 use crate::chat::view::{ChatView, ViewAction};
@@ -367,34 +367,40 @@ struct LoadedThread {
     provider: Option<agent_kit::store::ProviderThread>,
 }
 
-fn load_provider(store: &Store, thread: &str) -> Option<agent_kit::store::ProviderThread> {
-    store
-        .active_provider_thread(thread)
-        .ok()
-        .flatten()
-        .and_then(|id| {
-            store
-                .provider_threads(thread)
-                .ok()?
-                .into_iter()
-                .find(|p| p.id == id)
-        })
+fn load_provider(
+    store: &Store,
+    thread: &str,
+) -> agent_kit::store::Result<Option<agent_kit::store::ProviderThread>> {
+    let Some(id) = store.active_provider_thread(thread)? else {
+        return Ok(None);
+    };
+    Ok(store
+        .provider_threads(thread)?
+        .into_iter()
+        .find(|p| p.id == id))
 }
 
 /// Reads a thread for its page. A thread that points at an agent's own session but holds no
 /// events yet (a resumed session, or one listed from the agent's history) first gets that
 /// session's transcript imported, so the conversation shows. Runs on a store worker.
-fn load_thread(store: &Store, thread: &str, home: Option<&std::path::Path>) -> LoadedThread {
-    let provider = load_provider(store, thread);
-    let mut history = read_history(store, thread);
+///
+/// A store error fails the whole load: a thread read as empty with no provider would start a
+/// fresh session and re-point the thread at it, losing the one it had.
+fn load_thread(
+    store: &Store,
+    thread: &str,
+    home: Option<&std::path::Path>,
+) -> agent_kit::store::Result<LoadedThread> {
+    let provider = load_provider(store, thread)?;
+    let mut history = read_history(store, thread)?;
     if history.is_empty() {
         if let (Some(home), Some(pt)) = (home, provider.as_ref()) {
             if import_native_history(store, thread, pt, home) {
-                history = read_history(store, thread);
+                history = read_history(store, thread)?;
             }
         }
     }
-    LoadedThread { history, provider }
+    Ok(LoadedThread { history, provider })
 }
 
 /// How many of the agents' own recent sessions are listed as threads.
@@ -556,27 +562,47 @@ fn selected_to_restore(saved: &serde_json::Value, open: &[String]) -> Option<Str
         .map(str::to_owned)
 }
 
-/// A thread's stored events, oldest first, at most [`REPLAY_LIMIT`] (read in batches).
-fn read_history(store: &Store, thread: &str) -> Vec<Envelope> {
+/// The thread's history for the view, oldest first (read in batches): all of it, or for a very
+/// long thread its newest [`REPLAY_LIMIT`] events, cut to start at a turn so no step arrives
+/// without its start, behind a notice saying earlier messages are not shown. (Reading the oldest
+/// window showed a long thread's beginning and none of its recent turns.)
+fn read_history(store: &Store, thread: &str) -> agent_kit::store::Result<Vec<Envelope>> {
+    read_history_within(store, thread, REPLAY_LIMIT)
+}
+
+fn read_history_within(
+    store: &Store,
+    thread: &str,
+    limit: usize,
+) -> agent_kit::store::Result<Vec<Envelope>> {
+    let start = store.tail_after(thread, limit)?;
     let mut history = Vec::new();
-    let mut after = None;
+    let mut after = start;
     loop {
-        match store.events(thread, after, 2_000) {
-            Ok(batch) if !batch.is_empty() => {
-                after = batch.last().map(|(seq, _)| *seq);
-                history.extend(batch.into_iter().map(|(_, env)| env));
-                if history.len() >= REPLAY_LIMIT {
-                    break;
-                }
-            }
-            Ok(_) => break,
-            Err(e) => {
-                warn!("Cannot read thread history: {e}");
-                break;
-            }
+        let batch = store.events(thread, after, 2_000)?;
+        let Some((last, _)) = batch.last() else {
+            break;
+        };
+        after = Some(*last);
+        history.extend(batch.into_iter().map(|(_, env)| env));
+        if history.len() >= limit {
+            break;
         }
     }
-    history
+    if start.is_some() {
+        let turn = history
+            .iter()
+            .position(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .unwrap_or(0);
+        history.drain(..turn);
+        history.insert(
+            0,
+            Envelope::new(Event::Notice {
+                text: "This thread is long: only its most recent part is shown here.".to_owned(),
+            }),
+        );
+    }
+    Ok(history)
 }
 
 /// Tests never touch the real `~/.local/state`.
@@ -698,7 +724,7 @@ fn agent_launch_with(
     let adapter = make_adapter(driver, &program);
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
-        Driver::Claude | Driver::Codex => None,
+        Driver::Claude | Driver::Codex => Err(None),
         Driver::Agy => bind_approval(
             cached_hook_verdict(),
             thread,
@@ -742,21 +768,15 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
 }
 
 /// agy's approval socket, only once its hooks file is proven to install the hook (`hook` is the
-/// verdict of [`check_hook`]). `None`: agy runs without the skip flag, cannot ask before acting,
-/// and the session explains how to install it.
-fn bind_approval(
-    hook: Result<(), String>,
-    thread: &str,
-    cwd: &str,
-    mode: Mode,
-) -> Option<ApprovalHandle> {
-    match ApprovalHandle::bind_checked(hook, thread, std::path::Path::new(cwd), mode) {
-        Ok(handle) => Some(handle),
-        Err(reason) => {
-            info!("agy runs without its approval hook in this thread: {reason}");
-            None
-        }
-    }
+/// verdict of [`check_hook`]). Without one agy runs without the skip flag and cannot ask before
+/// acting; the session says why: how to install the hook (`Err(None)`), or, when it is installed
+/// but the socket failed, the reason (`Err(Some(_))`, such as a binary replaced by an upgrade).
+fn bind_approval(hook: Result<(), String>, thread: &str, cwd: &str, mode: Mode) -> Approval {
+    let installed = hook.is_ok();
+    ApprovalHandle::bind_checked(hook, thread, std::path::Path::new(cwd), mode).map_err(|reason| {
+        info!("agy runs without its approval hook in this thread: {reason}");
+        installed.then_some(reason)
+    })
 }
 
 thread_local! {
@@ -1842,8 +1862,19 @@ impl AgentTerminalWindow {
                         .flatten();
                     move |store| load_thread(store, &thread, home.as_deref())
                 })
-                .await
-                .unwrap_or_default();
+                .await;
+                // A thread that cannot be read is not built (an empty one would start a fresh
+                // session and re-point the thread at it); selecting it again retries.
+                let loaded = match loaded {
+                    Some(Ok(loaded)) => loaded,
+                    failed => {
+                        if let Some(Err(e)) = failed {
+                            warn!("Cannot read thread {thread}: {e}");
+                        }
+                        obj.imp().thread_load_failed(&page);
+                        return;
+                    }
+                };
                 // agy's hooks file is read off the main thread too; the verdict gates the socket.
                 let hook = match driver {
                     Driver::Agy => check_hook().await,
@@ -1868,6 +1899,20 @@ impl AgentTerminalWindow {
                 );
             }
         ));
+    }
+
+    /// A thread's page whose store read failed: left unbuilt, so showing it again retries.
+    fn thread_load_failed(&self, page: &adw::TabPage) {
+        if let Some(chat) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .and_then(|t| t.chat.as_mut())
+        {
+            chat.building = false;
+        }
+        self.show_toast("Could not read this thread from the store. Select it again to retry.");
     }
 
     fn build_thread(&self, page: &adw::TabPage, job: BuildJob) {
@@ -2020,7 +2065,12 @@ impl AgentTerminalWindow {
                 .or_else(|| profile.default_model.clone()),
             effort,
         );
-        let mode = profile.default_mode.unwrap_or_default();
+        // The thread's own last mode (what its picker shows), else the profile's: starting in
+        // the profile's left the picker showing one mode while the agent ran in another.
+        let mode = view
+            .replayed_mode()
+            .or(profile.default_mode)
+            .unwrap_or_default();
         let program = resolved
             .program
             .clone()
@@ -2039,7 +2089,7 @@ impl AgentTerminalWindow {
         };
         let adapter = make_adapter(driver, &program);
         let approval = match driver {
-            Driver::Claude | Driver::Codex => None,
+            Driver::Claude | Driver::Codex => Err(None),
             Driver::Agy => bind_approval(hook, thread, dir, mode),
         };
         let clear = self.config.borrow().clear_env.clone();
@@ -2954,12 +3004,21 @@ impl AgentTerminalWindow {
             let obj = self.obj().downgrade();
             glib::MainContext::default().spawn_local(async move {
                 let resolved = resolve_agent(profile.clone()).await;
-                let provider = store_job({
+                // A store that cannot be read starts nothing: a session started without the
+                // thread's provider would re-point the thread at a fresh session.
+                let provider = match store_job({
                     let thread = thread.clone();
                     move |store| load_provider(store, &thread)
                 })
                 .await
-                .unwrap_or_default();
+                {
+                    Some(Ok(provider)) => Some(provider),
+                    Some(Err(e)) => {
+                        warn!("Cannot read thread {thread} to start its session: {e}");
+                        None
+                    }
+                    None => None,
+                };
                 let hook = match driver {
                     Driver::Agy => check_hook().await,
                     Driver::Claude | Driver::Codex => Ok(()),
@@ -2970,8 +3029,8 @@ impl AgentTerminalWindow {
                 let Some(obj) = obj.upgrade() else { return };
                 let ready =
                     AgentAvailability::shared().is_ready(driver) && resolved.program.is_some();
-                if !ready {
-                    // Gone again while resolving: wait for the next change.
+                let Some(provider) = provider.filter(|_| ready) else {
+                    // Gone again while resolving, or the store failed: wait for the next change.
                     if let Some(chat) = obj
                         .imp()
                         .tabs
@@ -2983,7 +3042,7 @@ impl AgentTerminalWindow {
                         chat.starting = false;
                     }
                     return;
-                }
+                };
                 obj.imp().start_session(
                     &page,
                     StartJob {
@@ -3048,7 +3107,10 @@ mod tests {
         let thread = store
             .link_native_thread("/repo", None, 1_000, "claude", id)
             .expect("link");
-        let first = load_thread(&store, &thread, Some(home.path()));
+        let load = |thread: &str, home: Option<&std::path::Path>| {
+            load_thread(&store, thread, home).expect("load")
+        };
+        let first = load(&thread, Some(home.path()));
         assert!(
             first.history.iter().any(|e| matches!(
                 e.event,
@@ -3060,7 +3122,7 @@ mod tests {
             "the conversation shows"
         );
         // Opened again: read from the store, never imported twice.
-        let again = load_thread(&store, &thread, Some(home.path()));
+        let again = load(&thread, Some(home.path()));
         assert_eq!(again.history.len(), first.history.len());
         // No home (the memory-only store, tests): nothing is read from disk.
         let other = store
@@ -3072,18 +3134,15 @@ mod tests {
                 "1b3c6c1e-5d2a-4f0e-9a1b-2c3d4e5f6a7b",
             )
             .expect("link");
-        assert!(load_thread(&store, &other, None).history.is_empty());
+        assert!(load(&other, None).history.is_empty());
 
         // A transcript that is not there: one notice, stored, so it is not retried every open.
-        let missing = load_thread(&store, &other, Some(home.path()));
+        let missing = load(&other, Some(home.path()));
         assert!(matches!(
             missing.history.as_slice(),
             [e] if matches!(&e.event, Event::Notice { text } if text.contains("could not be loaded"))
         ));
-        assert_eq!(
-            load_thread(&store, &other, Some(home.path())).history.len(),
-            1
-        );
+        assert_eq!(load(&other, Some(home.path())).history.len(), 1);
     }
 
     #[test]
@@ -3108,7 +3167,9 @@ mod tests {
         );
         assert_eq!(threads[1].driver.as_deref(), Some("agy"));
         // The thread resumes the session: its provider thread carries the native id.
-        let pt = load_provider(&store, &threads[0].id).expect("provider");
+        let pt = load_provider(&store, &threads[0].id)
+            .expect("read")
+            .expect("provider");
         assert_eq!(pt.native_id.as_deref(), Some("c-new"));
 
         // A second scan adds nothing.
@@ -3259,7 +3320,17 @@ mod tests {
             .as_ref()
             .is_err_and(|e| e.contains("not been checked")));
         // And it stays closed through the binding: no socket, so agy runs without the skip flag.
-        assert!(bind_approval(before, "t", "/tmp", Mode::Ask).is_none());
+        // The hook is not known to be installed, so the notice explains how to install it.
+        assert!(matches!(
+            bind_approval(before, "t", "/tmp", Mode::Ask),
+            Err(None)
+        ));
+        // Installed, but the socket cannot be used (a relative workspace is refused before
+        // anything is created): the notice carries that reason instead.
+        assert!(matches!(
+            bind_approval(Ok(()), "t", "relative", Mode::Ask),
+            Err(Some(reason)) if !reason.is_empty()
+        ));
         HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Err("not installed".into())));
         assert_eq!(cached_hook_verdict(), Err("not installed".to_owned()));
         HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Ok(())));
@@ -3295,9 +3366,47 @@ mod tests {
                 .expect("event");
         }
         // More than one batch of 2,000, in order, nothing lost.
-        let history = read_history(&store, &thread);
+        let history = read_history(&store, &thread).expect("read");
         assert_eq!(history.len(), 2_500);
-        assert!(read_history(&store, "nope").is_empty());
+        assert!(read_history(&store, "nope").expect("read").is_empty());
+    }
+
+    #[test]
+    fn a_long_thread_replays_its_newest_turns_behind_a_notice() {
+        let store = Store::open_in_memory().expect("store");
+        let thread = store.create_thread("/w", Some("t")).expect("thread");
+        let note = |text: String| Envelope::new(Event::Notice { text });
+        for turn in 0..10 {
+            store
+                .append_event(
+                    &thread,
+                    None,
+                    &Envelope::new(Event::TurnStarted {
+                        model: Some(format!("t{turn}")),
+                    }),
+                )
+                .expect("event");
+            for step in 0..4 {
+                store
+                    .append_event(&thread, None, &note(format!("{turn}.{step}")))
+                    .expect("event");
+            }
+        }
+        let text = |e: &Envelope| match &e.event {
+            Event::Notice { text } => text.clone(),
+            Event::TurnStarted { model } => model.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        // 50 events, limit 12: the newest 12 start mid-turn 7, so the cut moves on to turn 8.
+        let history = read_history_within(&store, &thread, 12).expect("read");
+        let got: Vec<String> = history.iter().map(text).collect();
+        assert!(got[0].contains("only its most recent part"), "{got:?}");
+        assert_eq!(got[1], "t8");
+        assert_eq!(got.last().map(String::as_str), Some("9.3"));
+        assert_eq!(got.len(), 1 + 10);
+        // A thread that fits is replayed whole, with no notice.
+        let whole = read_history_within(&store, &thread, 50).expect("read");
+        assert_eq!(whole.len(), 50);
     }
 
     #[test]

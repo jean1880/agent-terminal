@@ -80,6 +80,13 @@ pub struct ClaudeAdapter {
     context_requests: HashSet<String>,
     /// `get_usage` requests in flight, whose replies also become `QuotaUpdated`.
     usage_requests: HashSet<String>,
+    /// `set_permission_mode` requests in flight: Claude's success reply is the only sign the mode
+    /// changed, so it becomes `ModeChanged` (without it the picker snapped back on the next
+    /// status refresh).
+    mode_requests: HashMap<String, Mode>,
+    /// The permission mode Claude last reported in `init` (it changes it itself too, as when
+    /// a plan is accepted).
+    mode: Option<Mode>,
     /// `--effort` of the running process (set by `argv`, which takes `&self`).
     current_effort: std::cell::RefCell<Option<String>>,
 }
@@ -115,6 +122,8 @@ impl ClaudeAdapter {
             pending_controls: HashSet::new(),
             context_requests: HashSet::new(),
             usage_requests: HashSet::new(),
+            mode_requests: HashMap::new(),
+            mode: None,
             current_effort: std::cell::RefCell::new(None),
         }
     }
@@ -257,6 +266,16 @@ impl ClaudeAdapter {
                 self.model = Some(m.clone());
                 out.push(Envelope::new(Event::ModelChanged { model: m.clone() }));
             }
+        }
+
+        // Claude reports its permission mode in every `init`; a change it made itself (leaving
+        // plan mode once a plan is accepted) shows here. The first one is what it was started
+        // with, which the host already knows.
+        if let Some(mode) = str_of(v, "permissionMode").and_then(mode_from_name) {
+            if self.mode.is_some_and(|m| m != mode) {
+                out.push(Envelope::new(Event::ModeChanged { mode }));
+            }
+            self.mode = Some(mode);
         }
 
         // `init` is re-emitted at the start of every turn.
@@ -632,6 +651,7 @@ impl ClaudeAdapter {
         let body = resp.get("response").cloned();
         let mut out = Vec::new();
 
+        let mode_set = self.mode_requests.remove(id);
         if str_of(resp, "subtype") == Some("error") {
             self.usage_requests.remove(id);
             let error = str_of(resp, "error")
@@ -651,6 +671,10 @@ impl ClaudeAdapter {
             })
             .request(id),
         );
+        if let Some(mode) = mode_set {
+            self.mode = Some(mode);
+            out.push(Envelope::new(Event::ModeChanged { mode }));
+        }
         let body = body.unwrap_or(Value::Null);
         if self.init_id.as_deref() == Some(id) {
             if let Some(account) = crate::quota::claude_account(&body) {
@@ -872,6 +896,7 @@ impl Adapter for ClaudeAdapter {
             }
             Command::SetMode { mode } => {
                 let id = self.next_id("mode");
+                self.mode_requests.insert(id.clone(), mode);
                 self.control_line(
                     &id,
                     json!({"subtype": "set_permission_mode", "mode": mode_name(mode)}),
@@ -1107,6 +1132,17 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
+/// [`mode_name`] backwards; `None` for Claude's modes the picker has no entry for
+/// (`bypassPermissions`, `dontAsk`).
+fn mode_from_name(name: &str) -> Option<Mode> {
+    match name {
+        "default" => Some(Mode::Ask),
+        "acceptEdits" => Some(Mode::AcceptEdits),
+        "plan" => Some(Mode::Plan),
+        _ => None,
+    }
+}
+
 fn control_request_body(control: &Control) -> Value {
     match control {
         Control::McpStatus => json!({"subtype": "mcp_status"}),
@@ -1314,6 +1350,49 @@ mod tests {
 
     fn events(out: &[Envelope]) -> Vec<&Event> {
         out.iter().map(|e| &e.event).collect()
+    }
+
+    #[test]
+    fn a_mode_claude_accepts_or_reports_becomes_mode_changed() {
+        let mut a = ClaudeAdapter::new();
+        let init = |mode: &str| {
+            json!({"type": "system", "subtype": "init", "model": "m", "session_id": "s",
+                   "permissionMode": mode})
+            .to_string()
+        };
+        let changed = |out: &[Envelope]| -> Vec<Mode> {
+            out.iter()
+                .filter_map(|e| match e.event {
+                    Event::ModeChanged { mode } => Some(mode),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The first init is the mode it was started with: nothing new.
+        assert!(changed(&a.feed(&init("default"))).is_empty());
+        // The picker asks; Claude's success reply is the change.
+        let req = written(
+            &mut a,
+            Command::SetMode {
+                mode: Mode::AcceptEdits,
+            },
+        );
+        let id = req["request_id"].as_str().expect("id").to_owned();
+        let ok = json!({"type": "control_response",
+                        "response": {"subtype": "success", "request_id": id}});
+        assert_eq!(changed(&a.feed(&ok.to_string())), [Mode::AcceptEdits]);
+        // Reported again as it already is: nothing.
+        assert!(changed(&a.feed(&init("acceptEdits"))).is_empty());
+        // A refused request changes nothing.
+        let req = written(&mut a, Command::SetMode { mode: Mode::Plan });
+        let id = req["request_id"].as_str().expect("id").to_owned();
+        let err = json!({"type": "control_response",
+                         "response": {"subtype": "error", "request_id": id, "error": "no"}});
+        assert!(changed(&a.feed(&err.to_string())).is_empty());
+        // Claude changing it itself (a plan accepted) shows at the next turn.
+        assert_eq!(changed(&a.feed(&init("default"))), [Mode::Ask]);
+        // A mode the picker has no entry for is not forced onto it.
+        assert!(changed(&a.feed(&init("bypassPermissions"))).is_empty());
     }
 
     #[test]

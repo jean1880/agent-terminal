@@ -179,8 +179,12 @@ fn main() -> glib::ExitCode {
         }
     });
 
-    // The old side of any file opened in an external diff tool is deleted with the app.
-    app.connect_shutdown(|_| diff_tool::remove_own());
+    // The old side of any file opened in an external diff tool is deleted with the app, and no
+    // agent outlives it.
+    app.connect_shutdown(|_| {
+        diff_tool::remove_own();
+        agent_proc::terminate_all();
+    });
 
     app.connect_activate(|app| {
         info!("Application activated: creating window");

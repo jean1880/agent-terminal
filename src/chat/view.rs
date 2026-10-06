@@ -347,6 +347,12 @@ impl ChatView {
         }
     }
 
+    /// The thread's mode as its replayed history last set it (what the picker shows), so a
+    /// reopened thread's session starts in it; `None` when the history never changed it.
+    pub fn replayed_mode(&self) -> Option<Mode> {
+        self.inner().and_then(|i| i.model.borrow().mode)
+    }
+
     /// Re-reads [`ChatBackend::status`] into the header (after an external switch).
     pub fn refresh_status(&self) {
         if let Some(inner) = self.inner() {
@@ -1058,6 +1064,114 @@ pub(crate) mod tests {
 
     /// A thinking block whose text never streams (the model withheld it) must not end as an
     /// empty, openable "Thought process"; one with text stays openable.
+    /// Needs a realised window and a running main loop, so it is not part of the window smoke
+    /// test. Run it on a private display: the preview MCP's `preview_app` with the test binary
+    /// and `jump_to_latest_returns_to_the_bottom --ignored --exact --nocapture`.
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn jump_to_latest_returns_to_the_bottom() {
+        use agent_core::event::Event;
+        gtk4::init().expect("GTK init");
+        let ctx = glib::MainContext::default();
+        let settle = |ms: u64| {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < until {
+                ctx.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let window = gtk4::Window::new();
+        window.set_default_size(500, 400);
+        window.set_child(Some(&view));
+        window.present();
+        let sink = view.sink();
+        let note = |n: usize| {
+            sink(&Envelope::new(Event::Notice {
+                text: format!("message {n}\nwith a second line"),
+            }));
+        };
+        for n in 0..400 {
+            note(n);
+        }
+        settle(500);
+        let (jump, adj) = view.inner().expect("view").transcript.scroll_parts();
+        let at_end = |adj: &gtk4::Adjustment| adj.value() + adj.page_size() >= adj.upper() - 1.0;
+        assert!(
+            at_end(&adj),
+            "follows the stream: {} {} {}",
+            adj.value(),
+            adj.page_size(),
+            adj.upper()
+        );
+
+        // The user scrolls well up (then right to the top, which loads older rows), more
+        // arrives, and the jump button shows; a click must bring the bottom back each time.
+        let mut n = 400;
+        for (round, up) in [600.0, f64::INFINITY, f64::INFINITY]
+            .into_iter()
+            .enumerate()
+        {
+            for _ in 0..3 {
+                adj.set_value((adj.value() - up).max(0.0));
+                settle(150);
+            }
+            note(n);
+            n += 1;
+            settle(300);
+            eprintln!(
+                "round {round} up: value {} page {} upper {} visible {}",
+                adj.value(),
+                adj.page_size(),
+                adj.upper(),
+                jump.is_visible()
+            );
+            assert!(!at_end(&adj), "stays where the user put it");
+            assert!(jump.is_visible(), "the jump button shows");
+            // A real click goes to whatever the pointer picks: it must be the button.
+            let centre =
+                gtk4::graphene::Point::new(jump.width() as f32 / 2.0, jump.height() as f32 / 2.0);
+            let at = jump
+                .compute_point(&window, &centre)
+                .expect("button in the window");
+            let picked = window.pick(
+                f64::from(at.x()),
+                f64::from(at.y()),
+                gtk4::PickFlags::DEFAULT,
+            );
+            eprintln!(
+                "picked at the button: {:?}",
+                picked.as_ref().map(|w| w.type_().name())
+            );
+            assert!(
+                picked.is_some_and(
+                    |w| w == *jump.upcast_ref::<gtk4::Widget>() || w.is_ancestor(&jump)
+                ),
+                "a click on the button reaches it"
+            );
+
+            jump.emit_clicked();
+            settle(500);
+            eprintln!(
+                "round {round} jump: value {} page {} upper {} visible {}",
+                adj.value(),
+                adj.page_size(),
+                adj.upper(),
+                jump.is_visible()
+            );
+            assert!(at_end(&adj), "jump returns to the bottom (round {round})");
+            assert!(!jump.is_visible());
+            note(n);
+            n += 1;
+            settle(300);
+            assert!(at_end(&adj), "follows again after the jump");
+        }
+        window.destroy();
+    }
+
     pub(crate) fn reasoning_ui_checks() {
         use agent_core::event::{Event, ItemKind, ItemStatus, StreamKind};
 

@@ -355,19 +355,29 @@ togglebutton.option-button, button.option-button {
 .plan-step.step-done .step-text { color: #6d6794; }
 
 .composer {
-    padding: 6px 6px 6px 4px;
+    padding: 6px 6px 6px 6px;
     border-radius: 16px;
     background-color: #1f1a33;
     border: 1px solid #3b3160;
 }
+.composer:hover { border-color: #52467f; }
 .composer:focus-within { border-color: alpha(#b49bff, 0.7); }
-textview.composer-view, textview.composer-view text {
+/* The typing area itself is an inset field, a shade lighter than the bar around it, so it
+   reads as the place to click. */
+textview.composer-view {
+    background-color: #2a2346;
+    border-radius: 11px;
+}
+.composer-field { border-radius: 11px; }
+textview.composer-view:hover { background-color: #2f2850; }
+textview.composer-view:focus-within { background-color: #312a55; }
+textview.composer-view text {
     background-color: transparent;
     color: #ebe9ff;
     caret-color: #b49bff;
     font-size: 1.02em;
 }
-.composer-placeholder { color: #6d6794; }
+.composer-placeholder { color: #8a83b3; }
 button.send-button {
     min-width: 36px;
     min-height: 36px;
