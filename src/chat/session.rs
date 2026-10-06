@@ -12,6 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use agent_core::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
@@ -35,6 +36,32 @@ use crate::approval_server::ApprovalHandle;
 /// Builds the adapter for another driver (the window knows how; this crate does not).
 pub type AdapterFactory = Rc<dyn Fn(Driver) -> Box<dyn Adapter>>;
 
+/// How long a state-changing tool step may run before its hook query must have arrived.
+const CANARY_GRACE: Duration = Duration::from_secs(3);
+
+/// The hooked tool names a started item of this kind can be. `None`: not watched (see
+/// [`Inner::watch_tool_step`]).
+fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
+    match kind {
+        ItemKind::Command => Some(&["run_command", "send_command_input"]),
+        ItemKind::FileChange => Some(&[
+            "replace_file_content",
+            "multi_replace_file_content",
+            "write_to_file",
+            "sed_file",
+            "notebook_edit",
+        ]),
+        ItemKind::McpTool => Some(&["call_mcp_tool"]),
+        ItemKind::Subagent => Some(&["start_subagent", "invoke_subagent"]),
+        ItemKind::WebSearch => Some(&["search_web", "read_url_content"]),
+        ItemKind::FileRead
+        | ItemKind::Tool
+        | ItemKind::UserMessage
+        | ItemKind::AssistantMessage
+        | ItemKind::Reasoning => None,
+    }
+}
+
 /// Room assumed for the user's next prompt when budgeting a handoff, in budget units.
 const HANDOFF_PROMPT_ALLOWANCE: usize = 2_048;
 
@@ -54,7 +81,10 @@ struct Inner {
     thread: ThreadId,
     provider_thread: RefCell<ProviderThreadId>,
     sink: EnvelopeSink,
-    approval: Option<ApprovalHandle>,
+    /// Cleared (never re-set) when the canary proves the hook is not gating agy.
+    approval: RefCell<Option<ApprovalHandle>>,
+    /// How long a tool step may wait for its hook query to show up.
+    canary_grace: Cell<Duration>,
     factory: RefCell<Option<AdapterFactory>>,
     proc: RefCell<Option<AgentProcess>>,
     state: RefCell<State>,
@@ -134,7 +164,8 @@ impl ChatSession {
             thread,
             provider_thread: RefCell::new(provider_thread),
             sink,
-            approval,
+            approval: RefCell::new(approval),
+            canary_grace: Cell::new(CANARY_GRACE),
             factory: RefCell::new(None),
             proc: RefCell::new(None),
             state: RefCell::new(state),
@@ -143,7 +174,7 @@ impl ChatSession {
             local_seq: Cell::new(0),
             generation: Cell::new(0),
         });
-        if let Some(handle) = &inner.approval {
+        if let Some(handle) = inner.approval() {
             let weak = Rc::downgrade(&inner);
             handle.attach(move |env| {
                 if let Some(inner) = weak.upgrade() {
@@ -167,6 +198,11 @@ impl ChatSession {
     /// Lets `switch` build an adapter for the other driver (needed for `CreateWithHandoff`).
     pub fn set_adapter_factory(&self, factory: AdapterFactory) {
         *self.inner.factory.borrow_mut() = Some(factory);
+    }
+
+    #[cfg(test)]
+    fn set_canary_grace(&self, grace: Duration) {
+        self.inner.canary_grace.set(grace);
     }
 
     /// The command line, working directory and environment the next start would use.
@@ -244,7 +280,7 @@ impl Inner {
             Event::ModeChanged { mode } => {
                 self.state.borrow_mut().mode = *mode;
                 self.open.borrow_mut().mode = *mode;
-                if let Some(a) = &self.approval {
+                if let Some(a) = self.approval() {
                     a.set_mode(*mode);
                 }
             }
@@ -264,13 +300,14 @@ impl Inner {
 
     fn launch_spec(&self) -> SpawnSpec {
         // One source for the hook flag and the socket env var: both come from `approval`.
-        self.open.borrow_mut().approval_hook = self.approval.is_some();
+        let approval = self.approval();
+        self.open.borrow_mut().approval_hook = approval.is_some();
         let open = self.open.borrow();
         let argv = self.adapter.borrow().argv(&open);
         SpawnSpec {
             argv,
             cwd: (!open.cwd.is_empty()).then(|| open.cwd.clone()),
-            env: self.approval.as_ref().map(|a| a.env()).unwrap_or_default(),
+            env: approval.map(|a| a.env()).unwrap_or_default(),
         }
     }
 
@@ -317,7 +354,11 @@ impl Inner {
         }
     }
 
-    fn on_line(&self, generation: u64, line: &str, stderr: bool) {
+    fn approval(&self) -> Option<ApprovalHandle> {
+        self.approval.borrow().clone()
+    }
+
+    fn on_line(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
         if generation != self.generation.get() {
             return;
         }
@@ -327,8 +368,71 @@ impl Inner {
             self.adapter.borrow_mut().feed(line)
         };
         for env in envelopes {
-            self.emit(env);
+            self.emit(env.clone());
+            self.watch_tool_step(&env);
+            if generation != self.generation.get() {
+                return; // the process was replaced while handling this envelope
+            }
         }
+    }
+
+    // ---- hook canary ----
+
+    /// agy runs with `--dangerously-skip-permissions`, so the hook is its only gate. If the hook
+    /// entry is not really firing (edited away, a narrower matcher, a different agy build), every
+    /// tool would run unasked. So each state-changing tool step must be matched by a query the
+    /// hook sent us. The query and the step travel on different channels, hence the grace.
+    ///
+    /// Scope: command, file edit, MCP, subagent and web steps. Unclassified (`Tool`) steps are not
+    /// watched: agy's internal steps (finish, wait, task bookkeeping) are not known to be hooked,
+    /// and killing a healthy session over one would be worse than missing it.
+    fn watch_tool_step(self: &Rc<Self>, env: &Envelope) {
+        let Event::ItemStarted { kind, .. } = &env.event else {
+            return;
+        };
+        let Some(tools) = canary_tools(*kind) else {
+            return;
+        };
+        let Some(approval) = self.approval() else {
+            return;
+        };
+        if self.adapter.borrow().driver() != Driver::Agy || approval.consume_query(tools) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let generation = self.generation.get();
+        let grace = self.canary_grace.get();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(grace).await;
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.generation.get() != generation {
+                return; // that process is already gone
+            }
+            if inner.approval().is_some_and(|a| a.consume_query(tools)) {
+                return;
+            }
+            inner.trip_canary();
+        });
+    }
+
+    /// The hook is not gating agy: stop it now and carry on read-only (plan mode, no socket).
+    fn trip_canary(self: &Rc<Self>) {
+        warn!("agy ran a tool without a hook query; restarting it read-only");
+        self.error(
+            "agy ran a tool without asking agent-terminal; the approval hook is not active \u{2014} restarting read-only",
+        );
+        self.stop_current();
+        *self.approval.borrow_mut() = None; // closes the socket
+        let native = self.state.borrow().native_id.clone();
+        {
+            let mut open = self.open.borrow_mut();
+            open.mode = Mode::Plan;
+            open.resume = native.or_else(|| open.resume.take());
+            open.new_session_id = None;
+        }
+        self.state.borrow_mut().mode = Mode::Plan;
+        self.emit(Envelope::new(Event::ModeChanged { mode: Mode::Plan }));
+        self.start_process();
     }
 
     fn on_exit(&self, generation: u64, code: Option<i32>) {
@@ -352,7 +456,7 @@ impl Inner {
         for env in envelopes {
             self.emit(env);
         }
-        if let Some(a) = &self.approval {
+        if let Some(a) = self.approval() {
             a.expire_all("the agent exited");
         }
     }
@@ -442,25 +546,44 @@ impl Inner {
     /// `resume` to the native id so history carries over).
     fn respawn(self: &Rc<Self>, delta: &OpenSessionDelta) {
         self.stop_current();
+        // Without the hook agy stays read-only whatever was asked.
+        let mode = delta.mode.filter(|_| !self.forced_plan());
+        let native = self.state.borrow().native_id.clone();
         {
             let mut open = self.open.borrow_mut();
             if let Some(m) = &delta.model {
                 open.model = Some(m.clone());
             }
-            if let Some(mode) = delta.mode {
+            if let Some(mode) = mode {
                 open.mode = mode;
             }
-            let native = self.state.borrow().native_id.clone();
             open.resume = delta.resume.clone().or(native);
             open.new_session_id = None;
         }
         if let Some(m) = &delta.model {
             self.emit(Envelope::new(Event::ModelChanged { model: m.clone() }));
         }
-        if let Some(mode) = delta.mode {
+        if let Some(mode) = mode {
             self.emit(Envelope::new(Event::ModeChanged { mode }));
         }
         self.start_process();
+    }
+
+    /// agy with no approval handle: the adapter forces `--mode plan`, so the mode is not settable.
+    fn forced_plan(&self) -> bool {
+        self.approval().is_none() && self.adapter.borrow().driver() == Driver::Agy
+    }
+
+    /// A first word like `/model` or `/compact`: a command for the agent, which it only
+    /// recognises at the start of the message.
+    fn is_slash_command(text: &str) -> bool {
+        text.split_whitespace().next().is_some_and(|w| {
+            w.len() > 1
+                && w.starts_with('/')
+                && w[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+        })
     }
 
     fn next_local_id(&self, prefix: &str) -> String {
@@ -497,17 +620,25 @@ impl Inner {
             .item(item),
         );
 
-        let handoff = self.pending_handoff.borrow_mut().take();
-        let text = match handoff {
-            Some(summary) => provider_message_with_handoff(&summary, text),
+        // The handoff rides on the first real prompt: never on a slash command (it would stop
+        // being one), and it is only spent once the agent accepted the prompt.
+        let handoff = if Self::is_slash_command(text) {
+            None
+        } else {
+            self.pending_handoff.borrow().clone()
+        };
+        let sent = match &handoff {
+            Some(summary) => provider_message_with_handoff(summary, text),
             None => text.to_owned(),
         };
         self.ensure_alive();
-        self.command(Command::Prompt { text });
+        if self.command(Command::Prompt { text: sent }) && handoff.is_some() {
+            *self.pending_handoff.borrow_mut() = None;
+        }
     }
 
     fn respond_approval(self: &Rc<Self>, request: &str, decision: Decision) {
-        if let Some(handle) = &self.approval {
+        if let Some(handle) = self.approval() {
             if handle.respond(request, decision) {
                 self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
                 return;
@@ -522,8 +653,17 @@ impl Inner {
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
+        if self.forced_plan() {
+            if mode != Mode::Plan {
+                self.emit(Envelope::new(Event::Notice {
+                    text: "Antigravity stays read-only (plan mode) until the approval hook is installed."
+                        .to_owned(),
+                }));
+            }
+            return;
+        }
         if self.command(Command::SetMode { mode }) {
-            if let Some(a) = &self.approval {
+            if let Some(a) = self.approval() {
                 a.set_mode(mode);
             }
         }
@@ -610,12 +750,15 @@ impl Inner {
                 let result = self.adapter.borrow_mut().encode(Command::SetModel {
                     model: target_model.clone(),
                 });
+                // Bound first: a `Ref` temporary in the match arm would live through `respawn`,
+                // which borrows the state mutably.
+                let native = self.state.borrow().native_id.clone();
                 match result {
                     Ok(actions) => self.execute(actions),
                     Err(AdapterError::Unsupported(_)) => self.respawn(&OpenSessionDelta {
                         model: Some(target_model),
                         mode: None,
-                        resume: self.state.borrow().native_id.clone(),
+                        resume: native,
                     }),
                     Err(e) => self.report(&e),
                 }
@@ -644,7 +787,7 @@ impl Inner {
             &format!("{} thread {}", driver_label(from), self.thread),
         );
 
-        self.stop_current();
+        // The new provider thread comes first: if the store refuses, the old agent keeps running.
         let new_pt =
             match create_provider_thread(&self.store, &self.thread, driver, model.as_deref()) {
                 Ok(p) => p,
@@ -653,6 +796,8 @@ impl Inner {
                     return;
                 }
             };
+        // The old process's closing events still belong to the old provider thread.
+        self.stop_current();
         *self.provider_thread.borrow_mut() = new_pt;
         *self.adapter.borrow_mut() = factory(driver);
         {
@@ -1122,10 +1267,23 @@ mod tests {
         driver: Driver,
         caps: Capabilities,
         log: Log,
+        /// `encode(SetModel)` answers Unsupported (an adapter that cannot restart itself).
+        refuse_set_model: bool,
     }
 
     impl FakeAdapter {
         fn boxed(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Self::unboxed(driver, log)
+        }
+
+        fn refusing_set_model(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Box::new(Self {
+                refuse_set_model: true,
+                ..*Self::unboxed(driver, log)
+            })
+        }
+
+        fn unboxed(driver: Driver, log: &Log) -> Box<Self> {
             Box::new(Self {
                 driver,
                 caps: match driver {
@@ -1133,6 +1291,7 @@ mod tests {
                     Driver::Agy => Capabilities::agy(),
                 },
                 log: log.clone(),
+                refuse_set_model: false,
             })
         }
     }
@@ -1151,7 +1310,11 @@ mod tests {
             Vec::new()
         }
         fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
+            let refuse = self.refuse_set_model && matches!(command, Command::SetModel { .. });
             self.log.borrow_mut().push(command);
+            if refuse {
+                return Err(AdapterError::Unsupported("set model"));
+            }
             Ok(Vec::new())
         }
         fn feed(&mut self, _: &str) -> Vec<Envelope> {
@@ -1266,10 +1429,14 @@ mod tests {
             );
 
             // The handoff rides on the next prompt only, and the store keeps the user's words.
+            // A slash command is never wrapped and does not spend the handoff.
+            session.send_prompt("/model");
             session.send_prompt("now summarize");
             session.send_prompt("and again");
             let sent = prompts(&log_claude);
-            assert_eq!(sent.len(), 2);
+            assert_eq!(sent.len(), 3);
+            assert_eq!(sent[0], "/model");
+            let sent = &sent[1..];
             assert!(sent[0].starts_with("Context handoff:"), "{}", sent[0]);
             assert!(sent[0].contains("please list the repo"));
             assert!(sent[0].contains("Found three files"));
@@ -1284,6 +1451,259 @@ mod tests {
             let all = store.events(&thread, None, 1000).expect("events");
             assert!(all.len() > 5);
         });
+    }
+
+    // ---- canary, forced plan, ordering ----
+
+    /// A state-changing agy step, as agy prints it before (or without) any hook query.
+    const STEP: &str = r#"{"event":"step_update","conversation_id":"c1","step_update":{"conversation_id":"c1","state":"RUNNING","step_index":1,"step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"touch x"}}}}"#;
+
+    /// A shell "agent" that logs its arguments and approval env, then runs `body`.
+    fn scripted(dir: &Path, body: &str) -> OpenSession {
+        let script = dir.join("agent.sh");
+        let text = format!(
+            "D=$(dirname \"$0\")\n\
+             echo \"$@\" >> \"$D/args.log\"\n\
+             echo \"${{AGENT_TERMINAL_APPROVAL_SOCKET-unset}}\" >> \"$D/sock.log\"\n\
+             {body}\n"
+        );
+        std::fs::write(&script, text).expect("script");
+        OpenSession {
+            program: "/bin/sh".into(),
+            extra_args: vec![script.to_string_lossy().into_owned()],
+            cwd: dir.to_string_lossy().into_owned(),
+            model: None,
+            mode: Mode::Ask,
+            resume: None,
+            new_session_id: None,
+            approval_hook: false,
+        }
+    }
+
+    fn bound_handle(dir: &Path) -> ApprovalHandle {
+        ApprovalHandle::bind(
+            &dir.join("rt"),
+            "t1",
+            dir,
+            Mode::Ask,
+            Duration::from_secs(30),
+        )
+        .expect("bind")
+    }
+
+    fn hook_missing_error(seen: &Seen) -> bool {
+        has(
+            seen,
+            |e| matches!(e, Event::Error { message } if message.contains("approval hook is not active")),
+        )
+    }
+
+    #[test]
+    fn a_tool_with_no_hook_query_stops_agy_and_restarts_it_read_only() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let open = scripted(tmp.path(), &format!("echo '{STEP}'\nexec sleep 30"));
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(200));
+            assert!(
+                pump_until(ctx, 15, || hook_missing_error(&seen)),
+                "no canary"
+            );
+            assert!(pump_until(ctx, 15, || {
+                lines(tmp.path().join("args.log")).len() == 2
+            }));
+            let args = lines(tmp.path().join("args.log"));
+            assert!(
+                args[0].contains("--dangerously-skip-permissions"),
+                "{args:?}"
+            );
+            assert!(
+                !args[1].contains("--dangerously-skip-permissions"),
+                "{args:?}"
+            );
+            assert!(args[1].contains("--mode plan"), "{args:?}");
+            let socks = lines(tmp.path().join("sock.log"));
+            assert_eq!(socks[1], "unset", "the restart has no approval socket");
+            assert_eq!(session.status().mode, Mode::Plan);
+            assert!(session.status().alive);
+            assert!(!socket.exists(), "the approval socket is closed");
+        });
+    }
+
+    #[test]
+    fn a_tool_whose_hook_query_arrived_first_is_left_alone() {
+        in_loop(|ctx| {
+            use std::io::Write as _;
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            // agy prints the step only once the test has sent the hook query.
+            let body = format!(
+                "while [ ! -e \"$D/go\" ]; do sleep 0.05; done\necho '{STEP}'\nexec sleep 30"
+            );
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), &body),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(200));
+            let mut hook = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+            let query = agent_core::approval::ApprovalQuery {
+                id: "h1".into(),
+                conversation_id: "c1".into(),
+                tool: "run_command".into(),
+                args: serde_json::json!({"CommandLine": "touch x"}),
+                cwd: None,
+            };
+            writeln!(
+                hook,
+                "{}",
+                agent_core::approval::encode_query(&query).expect("enc")
+            )
+            .expect("send");
+            assert!(pump_until(ctx, 10, || has(&seen, |e| {
+                matches!(e, Event::ApprovalRequested { .. })
+            })));
+            std::fs::write(tmp.path().join("go"), "").expect("go");
+            // Long enough for the step to arrive and the grace to pass.
+            assert!(
+                !pump_until(ctx, 2, || hook_missing_error(&seen)),
+                "false positive"
+            );
+            assert_eq!(lines(tmp.path().join("args.log")).len(), 1, "not restarted");
+            assert_eq!(session.status().mode, Mode::Ask);
+        });
+    }
+
+    #[test]
+    fn hookless_agy_stays_in_plan_mode_when_asked_for_more() {
+        in_loop(|_| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            assert_eq!(session.status().mode, Mode::Plan);
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.status().mode, Mode::Plan);
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("stays read-only"))
+            ));
+            // A model switch (respawn) cannot lift it either.
+            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            assert_eq!(session.status().mode, Mode::Plan);
+            let args = lines(tmp.path().join("args.log"));
+            assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
+        });
+    }
+
+    #[test]
+    fn a_failed_new_provider_thread_leaves_the_old_agent_running() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            // A thread the store does not know: no provider thread can be created for it.
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: Vec::new(),
+                    cwd: "/".into(),
+                    model: Some("gemini-pro".into()),
+                    mode: Mode::Plan,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store,
+                "no-such-thread".into(),
+                sink,
+                None,
+            );
+            session.set_adapter_factory(Rc::new(move |d| FakeAdapter::boxed(d, &Log::default())));
+            assert!(session.status().alive);
+            session.switch(Driver::Claude, Some("opus".into()));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Error { message } if message.contains("Could not start"))
+            ));
+            let status = session.status();
+            assert_eq!(status.driver, Driver::Agy, "still the old agent");
+            assert!(status.alive, "and still running");
+        });
+    }
+
+    #[test]
+    fn an_adapter_that_cannot_set_the_model_is_respawned_without_a_borrow_panic() {
+        in_loop(|_| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::refusing_set_model(Driver::Agy, &log),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: Vec::new(),
+                    cwd: "/".into(),
+                    model: Some("gemini-pro".into()),
+                    mode: Mode::Plan,
+                    resume: Some("native-1".into()),
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.switch(Driver::Agy, Some("gemini-flash".into()));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ModelChanged { model } if model == "gemini-flash")
+            ));
+            let status = session.status();
+            assert_eq!(status.model.as_deref(), Some("gemini-flash"));
+            assert!(status.alive);
+        });
+    }
+
+    #[test]
+    fn slash_commands_are_recognised_by_their_first_word_only() {
+        for yes in ["/model", "/compact now", "  /usage", "/user:thing arg"] {
+            assert!(Inner::is_slash_command(yes), "{yes}");
+        }
+        for no in ["", "/", "/home/me/file.rs explain", "hello /model", "//x"] {
+            assert!(!Inner::is_slash_command(no), "{no}");
+        }
     }
 
     fn pt_of(store: &Store, thread: &str) -> ProviderThreadId {
