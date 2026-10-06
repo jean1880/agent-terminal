@@ -210,7 +210,6 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         };
         let l = label(&line, &["dim-label", "usage-account"]);
         l.set_halign(gtk4::Align::Start);
-        l.set_selectable(true);
         l.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         section.append(&l);
     }
