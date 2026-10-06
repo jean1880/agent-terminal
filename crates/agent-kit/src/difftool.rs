@@ -22,6 +22,15 @@
 //! starts with `-` is passed as `./-name`. The program (the first element) takes no placeholder,
 //! so repo content can never choose what runs. A template that wants `--` before a value (the
 //! `git difftool` preset has one) writes it itself.
+//!
+//! # The `git difftool` preset hands execution to git
+//!
+//! Our side stays argv-only, but `git difftool` then runs whatever `diff.tool` /
+//! `difftool.<tool>.cmd` says, from the user's config AND the repository's `.git/config`, through
+//! git's own shell. An agent that can write the repository can write that file, so this preset
+//! trusts the repo's git config; every other preset runs a fixed program on two paths. It also
+//! always compares `{rev}` with the working tree, and shows nothing for a file the turn created
+//! (untracked).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -216,7 +225,7 @@ pub fn substitute(tool: &DiffTool, values: &Values) -> Result<Vec<OsString>, Str
     absolute("old", &values.old)?;
     absolute("new", &values.new)?;
     absolute("repo", &values.repo)?;
-    if values.rev.is_empty() || !values.rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !crate::filediff::is_object_id(&values.rev) {
         return Err("{rev} is not a commit or tree id".to_owned());
     }
     // A repo-relative path that would read as an option is made explicit.

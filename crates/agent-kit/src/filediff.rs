@@ -147,8 +147,17 @@ impl Side {
     }
 }
 
-/// The content of `rel` in `rev`. Blocking.
+/// Whether `rev` is a plain object id (hex, non-empty). Anything else is refused before it can
+/// reach git, where a leading `-` would read as an option.
+pub fn is_object_id(rev: &str) -> bool {
+    !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The content of `rel` in `rev`, which must be an object id ([`is_object_id`]). Blocking.
 pub fn file_at_rev(toplevel: &Path, rev: &str, rel: &Path) -> Result<Side, String> {
+    if !is_object_id(rev) {
+        return Err("Not a commit id".to_owned());
+    }
     // `ls-tree` answers for exactly this path (no pathspec magic: `--` and a literal).
     let listing = git_raw(
         toplevel,
@@ -194,13 +203,14 @@ pub enum FileDiff {
     Binary,
     /// The file is as it was before the turn.
     Unchanged,
-    /// Either side is over [`MAX_FILE_BYTES`].
+    /// Either side is over [`MAX_FILE_BYTES`], or too big for the built-in differ
+    /// ([`editdiff::MAX_SIDE_BYTES`]).
     TooLarge,
 }
 
 /// Whether `bytes` look like binary data (git's own test: a NUL in the first 8000 bytes).
 pub fn is_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(8000).any(|b| *b == 0)
+    bytes[..bytes.len().min(8000)].contains(&0)
 }
 
 /// The working file's content.
@@ -221,7 +231,14 @@ pub fn read_working(file: &RepoFile) -> Result<Side, String> {
 pub fn turn_file_diff(base: &TurnBase, file: &RepoFile) -> Result<FileDiff, String> {
     let old = file_at_rev(&base.toplevel, &base.rev, &file.rel)?;
     let new = read_working(file)?;
-    if old == Side::TooLarge || new == Side::TooLarge {
+    // The built-in differ only sees the first `MAX_SIDE_BYTES` of a side; a bigger file would be
+    // shown as a whole-looking diff of its head, so it is called too large here (the external
+    // tool still opens it, up to `MAX_FILE_BYTES`).
+    let over = |s: &Side| {
+        s.bytes()
+            .is_some_and(|b| b.len() > editdiff::MAX_SIDE_BYTES)
+    };
+    if old == Side::TooLarge || new == Side::TooLarge || over(&old) || over(&new) {
         return Ok(FileDiff::TooLarge);
     }
     if old.bytes().is_some_and(is_binary) || new.bytes().is_some_and(is_binary) {
@@ -530,6 +547,38 @@ mod tests {
             .expect("base")
             .expect("repo");
         assert_eq!(again.rev, quiet_base.rev);
+    }
+
+    #[test]
+    fn a_rev_that_is_not_an_object_id_never_reaches_git() {
+        let Some(dir) = repo() else { return };
+        for rev in ["", "-h", "--output=/tmp/x", "HEAD", "abc def"] {
+            let err = file_at_rev(dir.path(), rev, Path::new("a.txt")).expect_err(rev);
+            assert_eq!(err, "Not a commit id", "{rev:?}");
+        }
+        let head = sh(dir.path(), &["rev-parse", "HEAD"]);
+        assert!(matches!(
+            file_at_rev(dir.path(), &head, Path::new("a.txt")),
+            Ok(Side::Bytes(_))
+        ));
+    }
+
+    #[test]
+    fn a_text_file_past_the_differs_window_is_too_large_not_a_partial_diff() {
+        let Some(dir) = repo() else { return };
+        let p = dir.path();
+        let base = take_turn_base(p, 4243, "test", true)
+            .expect("base")
+            .expect("repo");
+        // Over the built-in differ's window, under the external tool's cap.
+        let big = "line\n".repeat(editdiff::MAX_SIDE_BYTES / 5 + 10);
+        assert!(big.len() as u64 <= MAX_FILE_BYTES);
+        std::fs::write(p.join("a.txt"), big).expect("big");
+        let file = resolve(&base.toplevel, "a.txt").expect("resolve");
+        assert_eq!(
+            turn_file_diff(&base, &file).expect("diff"),
+            FileDiff::TooLarge
+        );
     }
 
     #[test]

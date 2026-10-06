@@ -96,7 +96,8 @@ impl AgentTerminalWindow {
             .description(
                 "Opened from a file edit's “Open in …” button and the diff panel. Placeholders: \
                  {old} (the file before the turn), {new}, {path}, {repo}, {rev}. Never run \
-                 through a shell.",
+                 through a shell. The git difftool preset runs whatever tool your git config \
+                 and the repository's own .git/config name.",
             )
             .build();
 

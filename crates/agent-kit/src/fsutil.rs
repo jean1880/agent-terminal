@@ -5,10 +5,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Writes `bytes` to `path` through a `0600` temp file in the same directory, `sync_all`, then a
-/// rename, so a crash leaves the old file or the new one and never a half-written one, and the
-/// contents are never readable by anyone else, even briefly. The directory is created when
-/// missing. A failure removes the temp file.
+/// Writes `bytes` to `path` through a `0600` temp file in the same directory, `sync_all`, a
+/// rename, then a sync of the directory, so a crash leaves the old file or the new one and never
+/// a half-written one, and the contents are never readable by anyone else, even briefly. The
+/// directory is created when missing. A failure removes the temp file.
 pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path
         .parent()
@@ -37,6 +37,11 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else {
+        // The rename lives in the directory entry; without this a crash can still lose it. Some
+        // filesystems refuse to sync a directory, and the file itself is already safe, so a
+        // failure here is not an error.
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     }
     result
 }

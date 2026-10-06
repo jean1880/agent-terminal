@@ -65,6 +65,8 @@ pub struct ModelCatalog {
     codex: RefCell<Vec<CatalogModel>>,
     /// The agents whose list was fetched in this run (not just read from the cache).
     fresh: RefCell<Vec<Driver>>,
+    /// The agents whose fetch in this run has finished, whether or not it succeeded.
+    attempted: RefCell<Vec<Driver>>,
     listeners: ListenerSet,
     cache: Option<PathBuf>,
     refreshing: Cell<bool>,
@@ -96,6 +98,7 @@ impl ModelCatalog {
             agy: RefCell::new(loaded.agy),
             codex: RefCell::new(loaded.codex),
             fresh: RefCell::new(Vec::new()),
+            attempted: RefCell::new(Vec::new()),
             listeners: ListenerSet::default(),
             cache,
             refreshing: Cell::new(false),
@@ -134,6 +137,19 @@ impl ModelCatalog {
     /// call a model retired: a list that has not been refreshed yet may be out of date.
     pub fn is_fresh(&self, driver: Driver) -> bool {
         self.fresh.borrow().contains(&driver)
+    }
+
+    /// Whether `driver`'s fetch in this run has finished, successfully or not: past this point
+    /// waiting longer for a fresh list gains nothing.
+    pub fn is_settled(&self, driver: Driver) -> bool {
+        self.is_fresh(driver) || self.attempted.borrow().contains(&driver)
+    }
+
+    fn mark_attempted(&self, driver: Driver) {
+        let mut attempted = self.attempted.borrow_mut();
+        if !attempted.contains(&driver) {
+            attempted.push(driver);
+        }
     }
 
     fn slot(&self, driver: Driver) -> &RefCell<Vec<CatalogModel>> {
@@ -228,6 +244,7 @@ impl ModelCatalog {
                         } else {
                             warn!("agy models failed or timed out");
                         }
+                        me.mark_attempted(Driver::Agy);
                         done();
                     });
                 }
@@ -238,6 +255,7 @@ impl ModelCatalog {
                             info!(count = probe.models.len(), "claude model list fetched");
                             me.set(Driver::Claude, probe.models.clone());
                         }
+                        me.mark_attempted(Driver::Claude);
                         done();
                     });
                 }
@@ -248,6 +266,7 @@ impl ModelCatalog {
                             info!(count = probe.models.len(), "codex model list fetched");
                             me.set(Driver::Codex, probe.models.clone());
                         }
+                        me.mark_attempted(Driver::Codex);
                         done();
                     });
                 }
@@ -381,6 +400,12 @@ mod tests {
         // A failed (empty) fetch changes nothing.
         again.set(Driver::Agy, vec![]);
         assert!(!again.is_fresh(Driver::Agy));
+        // A finished fetch settles the wait even when it failed, without making the list fresh.
+        assert!(!again.is_settled(Driver::Agy));
+        again.mark_attempted(Driver::Agy);
+        assert!(again.is_settled(Driver::Agy));
+        assert!(!again.is_fresh(Driver::Agy));
+        assert!(again.is_settled(Driver::Claude), "fresh is settled");
     }
 
     #[test]

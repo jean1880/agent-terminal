@@ -23,7 +23,7 @@ pub const MAX_EDIT_DISTANCE: usize = 1_000;
 
 /// At most this many bytes of either side are diffed: a bigger `Write` is shown cut, not read in
 /// full.
-const MAX_SIDE_BYTES: usize = 512 * 1024;
+pub const MAX_SIDE_BYTES: usize = 512 * 1024;
 
 /// One file's diff as a ready unified-diff text.
 #[derive(Debug, Clone, PartialEq, Eq)]
