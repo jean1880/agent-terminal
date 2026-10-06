@@ -468,6 +468,16 @@ fn load_css() {
         .thread-dot.dot-codex { color: #4cc38a; }
         .thread-term { color: #a0a0ff; }
         .thread-badge.badge-approval { color: #ffcc66; }
+        /* A thread waiting for approval while you are elsewhere glows until you look at it. */
+        @keyframes attention-glow {
+            from { background-color: alpha(#ffcc66, 0.06); box-shadow: inset 3px 0 0 alpha(#ffcc66, 0.5); }
+            to { background-color: alpha(#ffcc66, 0.22); box-shadow: inset 3px 0 0 #ffcc66; }
+        }
+        row.needs-attention {
+            animation: attention-glow 1.1s ease-in-out infinite alternate;
+            border-radius: 6px;
+        }
+        row.needs-attention .thread-title { color: #ffe2a3; }
         .thread-badge.badge-limited { color: #ff7878; }
         .thread-badge.badge-unread { color: #b49bff; }
         .thread-close, .thread-delete {

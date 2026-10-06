@@ -34,8 +34,8 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, driver_key, driver_label, group_rows, handoff_target, parse_driver, relative_time,
-    resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
+    badge_for, driver_key, driver_label, group_rows, handoff_target, needs_attention, parse_driver,
+    relative_time, resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
 /// The store key holding the open-thread list (`{"open": [ids], "selected": id}`).
@@ -1256,6 +1256,7 @@ impl AgentTerminalWindow {
         }
         let rows = self.sidebar_rows();
         let selected = self.selected_row_key();
+        let focused = self.obj().is_active();
         let groups = group_rows(rows, &sidebar.search.text(), self.show_archived.get());
         let home = env::var("HOME").unwrap_or_default();
         let now = now_ms();
@@ -1284,6 +1285,9 @@ impl AgentTerminalWindow {
             keys.push(None);
             for row in rows {
                 let widget = self.sidebar_row_widget(&row, now);
+                if needs_attention(&row, selected.as_ref(), focused) {
+                    widget.add_css_class("needs-attention");
+                }
                 sidebar.list.append(&widget);
                 if Some(&row.key) == selected.as_ref() {
                     select = Some(widget.clone());
@@ -1861,7 +1865,11 @@ impl AgentTerminalWindow {
             if chat.view.is_some() || chat.building {
                 if let Some(view) = &chat.view {
                     let view = view.clone();
-                    glib::idle_add_local_once(move || view.focus_composer());
+                    // Selecting a thread shows its newest messages, wherever it was left.
+                    glib::idle_add_local_once(move || {
+                        view.scroll_to_end();
+                        view.focus_composer();
+                    });
                 }
                 return;
             }
@@ -2899,6 +2907,8 @@ impl AgentTerminalWindow {
             if window.is_active() && AgentAvailability::shared().scan_is_stale() {
                 window.imp().refresh_agent_data();
             }
+            // A thread waiting for approval glows while you are away from it.
+            window.imp().refresh_sidebar();
         });
     }
 

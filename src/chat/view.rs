@@ -350,6 +350,13 @@ impl ChatView {
         }
     }
 
+    /// Goes to the newest message and follows the stream again.
+    pub fn scroll_to_end(&self) {
+        if let Some(inner) = self.inner() {
+            inner.transcript.scroll_to_end();
+        }
+    }
+
     /// The thread's mode as its replayed history last set it (what the picker shows), so a
     /// reopened thread's session starts in it; `None` when the history never changed it.
     pub fn replayed_mode(&self) -> Option<Mode> {
@@ -1093,6 +1100,74 @@ pub(crate) mod tests {
         }
         fn open_external(&self, ask: DiffAsk) {
             self.opened.borrow_mut().push(ask);
+        }
+    }
+
+    /// While following the bottom, the newest row stays in view through a whole scripted turn
+    /// (thinking, streamed markdown with code, a sub-agent, an approval, tool cards, the summary)
+    /// and through sending prompts. Measured as the user sees it: the last row's bottom edge
+    /// against the visible area, not the adjustment. A row may overflow for a frame while it
+    /// grows; it must not stay below the fold. Run like the test below.
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn the_newest_row_stays_in_view_while_following() {
+        gtk4::init().expect("GTK init");
+        let ctx = glib::MainContext::default();
+        let backend = demo::demo_backend();
+        let view = ChatView::new(backend.clone());
+        backend.connect(view.sink());
+        let window = gtk4::Window::new();
+        window.set_default_size(560, 460);
+        window.set_child(Some(&view));
+        window.present();
+        let inner = view.inner().expect("view");
+        // Samples every ~16 ms for `ms`; returns the most frames a stretch of the last row below
+        // the fold (while following) lasted, and the worst overflow. Frames, not milliseconds:
+        // a headless display draws about once a second. A row that grows is drawn below the fold
+        // for the frame it grew in at most; the next frame must show it.
+        let watch = |ms: u64, what: &str| -> (u64, f64) {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            let (mut since, mut longest, mut worst) = (None, 0u64, 0f64);
+            while std::time::Instant::now() < until {
+                while ctx.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                let frame = inner.transcript.frames();
+                match inner.transcript.last_row_overflow() {
+                    Some((over, true)) if over > 2.0 => {
+                        let start = *since.get_or_insert(frame);
+                        let spanned = frame - start;
+                        if spanned > longest {
+                            longest = spanned;
+                            eprintln!(
+                                "  {what}: below the fold for {spanned} frames, over {over:.0}: {}",
+                                inner.transcript.scroll_debug()
+                            );
+                        }
+                        worst = worst.max(over);
+                    }
+                    _ => since = None,
+                }
+            }
+            eprintln!("{what}: longest below-fold stretch {longest} frames, worst {worst:.0} px");
+            (longest, worst)
+        };
+        backend.play_script();
+        let script = watch(14_000, "scripted turn");
+        let mut sends = Vec::new();
+        for n in 0..3 {
+            inner.submit(&format!("follow-up question {n}\nwith a second line"));
+            sends.push(watch(3_500, &format!("send {n}")));
+        }
+        window.destroy();
+        assert!(
+            script.0 <= 1,
+            "scripted turn left the newest row below the fold: {script:?}"
+        );
+        for (n, s) in sends.iter().enumerate() {
+            assert!(
+                s.0 <= 1,
+                "send {n} left the newest row below the fold: {s:?}"
+            );
         }
     }
 

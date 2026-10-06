@@ -53,6 +53,12 @@ pub fn badge_for(running: bool, approval: bool, rate_limited: bool, unread: bool
     .find_map(|(on, badge)| on.then_some(badge))
 }
 
+/// Whether `row` glows: it waits for an approval and you are not looking at it (another thread
+/// is shown, or the window is not focused).
+pub fn needs_attention(row: &SidebarRow, shown: Option<&RowKey>, window_focused: bool) -> bool {
+    row.badge == Some(Badge::NeedsApproval) && (shown != Some(&row.key) || !window_focused)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
     pub key: RowKey,
@@ -487,6 +493,24 @@ mod tests {
             open: false,
             archived: false,
         }
+    }
+
+    #[test]
+    fn a_thread_waiting_for_approval_glows_only_while_you_are_away_from_it() {
+        let mut waiting = row("w", "/w", 1);
+        waiting.badge = Some(Badge::NeedsApproval);
+        let shown = |id: &str| RowKey::Thread(id.into());
+        // Another thread shown, or this one shown in an unfocused window: it glows.
+        assert!(needs_attention(&waiting, Some(&shown("other")), true));
+        assert!(needs_attention(&waiting, None, true));
+        assert!(needs_attention(&waiting, Some(&shown("w")), false));
+        // In front of you: no glow (the approval card is right there).
+        assert!(!needs_attention(&waiting, Some(&shown("w")), true));
+        // Other states never glow.
+        let mut running = row("r", "/w", 1);
+        running.badge = Some(Badge::Running);
+        assert!(!needs_attention(&running, Some(&shown("other")), false));
+        assert!(!needs_attention(&row("n", "/w", 1), None, false));
     }
 
     #[test]

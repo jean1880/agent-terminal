@@ -78,6 +78,13 @@ pub struct TranscriptView {
     last_page: Cell<f64>,
     /// Distance from the end to restore after prepending older rows.
     anchor: Cell<Option<f64>>,
+    /// The value that distance came to once the older rows were measured; applied by the tick.
+    restore_to: Cell<Option<f64>>,
+    /// A [`Self::settle`] is queued for after the current layout.
+    settle_queued: Cell<bool>,
+    /// Frames the tick callback has seen (tests read it).
+    #[cfg(test)]
+    ticks: Cell<u64>,
     sink: RowSink,
     empty: gtk4::Box,
 }
@@ -153,6 +160,10 @@ impl TranscriptView {
             last_upper: Cell::new(0.0),
             last_page: Cell::new(0.0),
             anchor: Cell::new(None),
+            restore_to: Cell::new(None),
+            settle_queued: Cell::new(false),
+            #[cfg(test)]
+            ticks: Cell::new(0),
             sink,
             empty,
         });
@@ -175,6 +186,81 @@ impl TranscriptView {
         (self.jump.clone(), self.scroller.vadjustment())
     }
 
+    /// How far (px) the last row's bottom edge is below the visible area (negative: inside it),
+    /// and whether the view is following the bottom. For realised-window tests: this is what the
+    /// user sees, where the adjustment alone can be at its end while the content is taller.
+    #[cfg(test)]
+    pub fn last_row_overflow(&self) -> Option<(f64, bool)> {
+        let last = self.list.last_child()?;
+        let bounds = last.compute_bounds(&self.scroller)?;
+        let bottom = f64::from(bounds.y() + bounds.height());
+        Some((bottom - f64::from(self.scroller.height()), self.stick.get()))
+    }
+
+    /// Frames the window's frame clock has drawn. A headless display runs it at about one frame
+    /// a second, so tests measure in frames, not milliseconds.
+    #[cfg(test)]
+    pub fn frames(&self) -> u64 {
+        self.scroller
+            .frame_clock()
+            .map_or(0, |c| u64::try_from(c.frame_counter()).unwrap_or(0))
+    }
+
+    /// The numbers behind [`Self::last_row_overflow`], for a test to print.
+    #[cfg(test)]
+    pub fn scroll_debug(&self) -> String {
+        let adj = self.scroller.vadjustment();
+        let content = self
+            .scroller
+            .child()
+            .and_then(|v| v.first_child())
+            .map(|c| c.height())
+            .unwrap_or(-1);
+        let rect = |w: &gtk4::Widget| {
+            w.compute_bounds(&self.scroller)
+                .map_or("-".to_owned(), |b| {
+                    format!("y {:.0} h {:.0}", b.y(), b.height())
+                })
+        };
+        let mut rows = Vec::new();
+        let mut child = self.list.last_child();
+        while let Some(c) = child.filter(|_| rows.len() < 3) {
+            let (_, natural, _, _) = c.measure(gtk4::Orientation::Vertical, self.list.width());
+            rows.push(format!(
+                "{} vis {} [{}] alloc h {} nat {}",
+                c.css_classes().join("."),
+                c.is_visible(),
+                rect(&c),
+                c.height(),
+                natural
+            ));
+            child = c.prev_sibling();
+        }
+        let pair = |a: &gtk4::Widget, b: &gtk4::Widget| {
+            a.compute_bounds(b)
+                .map_or("-".to_owned(), |r| format!("{:.0}", r.y()))
+        };
+        let drawn = match self.scroller.child() {
+            Some(viewport) => viewport
+                .first_child()
+                .map_or("-".to_owned(), |clamp| pair(&clamp, &viewport)),
+            None => "-".to_owned(),
+        };
+        let offsets = format!("ticks {} | content drawn at y {drawn}", self.ticks.get());
+        format!(
+            "{offsets} | value {:.0} page {:.0} upper {:.0} end {:.0} | scroller {} list {} [{}] clamp {} | {}",
+            adj.value(),
+            adj.page_size(),
+            adj.upper(),
+            adj.upper() - adj.page_size(),
+            self.scroller.height(),
+            self.list.height(),
+            rect(self.list.upcast_ref()),
+            content,
+            rows.join(" ; ")
+        )
+    }
+
     pub fn widget(&self) -> &gtk4::Overlay {
         &self.root
     }
@@ -189,6 +275,45 @@ impl TranscriptView {
         self.last_value.set(adj.value());
         self.last_upper.set(adj.upper());
         self.last_page.set(adj.page_size());
+    }
+
+    /// Moves the value where it belongs: the bottom while following, or the place to restore
+    /// after older rows were prepended. The only place (with `scroll_to_end` and the jump) that
+    /// moves the view, and never during layout.
+    ///
+    /// Not from the size notifications: GTK emits them while the viewport lays out its child,
+    /// and a value set then is not applied to the child until something else lays it out
+    /// again. The content stayed drawn at the previous value, so a sent message or a turn's
+    /// summary sat below the fold until the user scrolled up and back down (measured on
+    /// Broadway: value 3133 with the list drawn at -2911, the previous value, for seconds).
+    fn settle(&self) {
+        let adj = self.scroller.vadjustment();
+        let end = adj.upper() - adj.page_size();
+        if self.stick.get() {
+            self.restore_to.set(None);
+            if adj.value() < end - 0.5 {
+                self.move_to(end);
+            }
+        } else if let Some(target) = self.restore_to.take() {
+            self.move_to(target);
+        }
+    }
+
+    /// [`Self::settle`] right after the current layout (one idle, however many sizes changed).
+    /// A frame tick alone is not enough: the frame clock can run layouts without ticking for a
+    /// while (seen on a headless display; a throttled window is the same).
+    fn queue_settle(self: &Rc<Self>) {
+        if self.settle_queued.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
+            if let Some(view) = weak.upgrade() {
+                view.settle_queued.set(false);
+                view.settle();
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     /// Whether a value move the view did not make itself is the user scrolling up. Any device
@@ -231,19 +356,15 @@ impl TranscriptView {
                 view.jump.set_visible(false);
             }
         });
-        // While stuck, the bottom is re-pinned every frame. Size notifications alone missed
-        // content that settled after them (a late relayout), which is how a just-sent message
-        // could end up below the fold.
+        // Every frame too, as a backstop for content that settles without a size notification.
         let weak = Rc::downgrade(self);
         self.scroller.add_tick_callback(move |_, _| {
             let Some(view) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let adj = view.scroller.vadjustment();
-            let end = adj.upper() - adj.page_size();
-            if view.stick.get() && view.anchor.get().is_none() && adj.value() < end - 0.5 {
-                view.move_to(end);
-            }
+            #[cfg(test)]
+            view.ticks.set(view.ticks.get() + 1);
+            view.settle();
             glib::ControlFlow::Continue
         });
         let weak = Rc::downgrade(self);
@@ -251,19 +372,18 @@ impl TranscriptView {
             let Some(view) = weak.upgrade() else {
                 return;
             };
-            let anchor = view.anchor.take();
-            if view.stick.get() {
+            // Only note what changed; `settle` moves, once this layout is over.
+            view.queue_settle();
+            if let Some(from_end) = view.anchor.take() {
                 // Following the bottom wins over a pending "keep my place" from loading older
                 // rows: restoring it after a jump threw the view back to the top.
-                view.move_to(adj.upper() - adj.page_size());
-            } else if let Some(from_end) = anchor {
-                view.move_to((adj.upper() - from_end).max(0.0));
-            } else {
-                // Not following: just note the new heights, so the next move is judged against
-                // them.
-                view.last_upper.set(adj.upper());
-                view.last_page.set(adj.page_size());
+                if !view.stick.get() {
+                    view.restore_to.set(Some((adj.upper() - from_end).max(0.0)));
+                }
             }
+            // The next value move is judged against these heights.
+            view.last_upper.set(adj.upper());
+            view.last_page.set(adj.page_size());
         };
         adj.connect_upper_notify(on_size.clone());
         adj.connect_page_size_notify(on_size);
@@ -316,6 +436,7 @@ impl TranscriptView {
     pub fn scroll_to_end(&self) {
         self.stick.set(true);
         self.anchor.set(None);
+        self.restore_to.set(None);
         self.jump.set_visible(false);
         let adj = self.scroller.vadjustment();
         self.move_to(adj.upper() - adj.page_size());
