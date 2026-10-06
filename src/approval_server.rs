@@ -19,6 +19,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,6 +140,8 @@ fn contained(target: &Path, workspace: &Path) -> bool {
         }
         match std::fs::symlink_metadata(&current) {
             Ok(meta) if meta.file_type().is_symlink() => return false,
+            // A second hard link may name a file outside the workspace.
+            Ok(meta) if meta.is_file() && meta.nlink() > 1 => return false,
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
             Err(_) => return false,
@@ -184,9 +187,41 @@ const WRAPPERS: &[&str] = &[
     "stdbuf", "strace", "ssh", "awk", "gawk",
 ];
 
+/// Build, test and package runners: they execute files the model may have just edited
+/// (Makefile, build.rs, package.json scripts, conftest.py, Dockerfile).
+const RUNNERS: &[&str] = &[
+    "make", "cargo", "npm", "pnpm", "yarn", "pip", "pip3", "uv", "go", "pytest", "just", "rake",
+    "gradle", "gradlew", "mvn", "docker", "podman", "bundle", "tox", "poetry", "dotnet", "cmake",
+    "ninja", "bazel", "mix", "composer", "sbt", "ant", "rustc", "gcc", "g++", "cc", "tsc",
+];
+
+/// The only git subcommands remembered; the rest can run hooks, pagers, textconv or diff
+/// drivers configured in files the model can edit.
+const GIT_SAFE: &[&str] = &[
+    "status",
+    "branch",
+    "rev-parse",
+    "ls-files",
+    "remote",
+    "describe",
+];
+
 fn is_wrapper(word: &str) -> bool {
-    let name = word.rsplit('/').next().unwrap_or(word);
-    name.starts_with("python") || WRAPPERS.contains(&name)
+    word.contains('/')
+        || word.starts_with("python")
+        || WRAPPERS.contains(&word)
+        || RUNNERS.contains(&word)
+}
+
+fn git_is_safe(words: &[&str]) -> bool {
+    let mut rest = words.iter().skip(1);
+    let Some(sub) = rest.next() else { return false };
+    // Any option before the subcommand (`-c key=val`, `--exec-path`, `-C dir`) or a config
+    // override is refused outright.
+    GIT_SAFE.contains(sub)
+        && !words
+            .iter()
+            .any(|w| *w == "-c" || w.starts_with("--config"))
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -211,12 +246,20 @@ fn rememberable_command(command: &str) -> bool {
     if is_assignment(first) || is_wrapper(first) {
         return false;
     }
-    let find = first.rsplit('/').next() == Some("find");
-    !(find && words.any(|w| matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete")))
+    if first == "git" {
+        let all: Vec<&str> = command.split_whitespace().collect();
+        return git_is_safe(&all);
+    }
+    !(first == "find"
+        && words.any(|w| matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete")))
 }
 
 /// What "allow for the session" remembers, and only ever an exact match:
-/// - `run_command`: the full `CommandLine` (never a prefix) when [`rememberable_command`];
+/// - `run_command`: the working directory plus the full `CommandLine` (never a prefix) when
+///   [`rememberable_command`]. Ceiling: the exact approved string is trusted again, so a
+///   program the model rewrote between two runs of the same line still runs. Programs given by
+///   path, build/test/package runners and most git subcommands are never remembered because
+///   they run model-editable files; the upgrade path is hashing the resolved binary too;
 /// - `call_mcp_tool`: the server and tool name;
 /// - file edits: the exact target path (absolute, no `..`, symlinks resolved);
 /// - everything else (subagents, network, unknown tools, `send_command_input`): never.
@@ -229,7 +272,10 @@ pub fn session_key(query: &ApprovalQuery) -> Option<(String, String)> {
     let detail = match query.tool.as_str() {
         "run_command" => {
             let command = query.args.get("CommandLine").and_then(Value::as_str)?;
-            rememberable_command(command).then(|| command.to_owned())?
+            if !rememberable_command(command) {
+                return None;
+            }
+            format!("{}\n{command}", query.cwd.as_deref().unwrap_or_default())
         }
         "call_mcp_tool" => {
             let server = text(&["ServerName", "server_name", "server", "Server"])?;
@@ -847,6 +893,19 @@ mod tests {
             ),
             Verdict::Allow
         );
+        // A hard link to a file outside is a regular file with nlink 2: not inside.
+        let secret = outside.join("secret");
+        std::fs::write(&secret, "x").expect("write");
+        std::fs::hard_link(&secret, work.join("hl")).expect("hardlink");
+        assert_eq!(
+            policy(Mode::AcceptEdits, &target(work.join("hl")), &w),
+            Verdict::Ask
+        );
+        std::fs::write(work.join("plain"), "x").expect("write");
+        assert_eq!(
+            policy(Mode::AcceptEdits, &target(work.join("plain")), &w),
+            Verdict::Allow
+        );
         // Several path keys: ALL must be inside.
         let both = |second: String| {
             q(
@@ -871,10 +930,31 @@ mod tests {
         // Exact full command line, never a prefix.
         assert_eq!(
             key("git status --short"),
-            Some(("run_command".into(), "git status --short".into()))
+            Some(("run_command".into(), "\ngit status --short".into()))
         );
         assert_ne!(key("git status --short"), key("git status"));
+        // The working directory is part of the key.
+        let mut elsewhere = cmd("git status --short");
+        elsewhere.cwd = Some("/other".into());
+        assert_ne!(session_key(&elsewhere), key("git status --short"));
         for refused in [
+            "make test",
+            "cargo build",
+            "npm test",
+            "pytest -x",
+            "docker ps",
+            "uv run x",
+            "go test ./...",
+            "./run.sh",
+            "/usr/bin/ls",
+            "bin/tool",
+            "git diff",
+            "git log -p",
+            "git show HEAD",
+            "git difftool",
+            "git commit -m x",
+            "git -c core.pager=x status",
+            "git status -c x",
             "git status; rm -rf x",
             "a && b",
             "a | b",

@@ -185,10 +185,12 @@ impl ChatSession {
         }
         if hookless_agy {
             inner.emit(Envelope::new(Event::Notice {
-                text: "Antigravity is running read-only (plan mode): the approval hook is not \
-                       available. Install the `agent-terminal --approval-hook` PreToolUse entry \
-                       in agy's hooks.json so it can edit files and run commands after asking you."
-                    .to_owned(),
+                text: format!(
+                    "Antigravity is running read-only (plan mode): the approval hook is not \
+                     available. To let it edit files and run commands after asking you, add \
+                     this top-level entry to ~/.gemini/config/hooks.json:\n{}",
+                    crate::hook_config::install_entry_json()
+                ),
             }));
         }
         inner.start_process();

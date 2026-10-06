@@ -10,8 +10,27 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-/// What the hook command line must contain.
-const HOOK_FLAG: &str = "--approval-hook";
+/// The one hook command agent-terminal accepts. Anything else (a substring match, a bare
+/// `agent-terminal` found on PATH, an `echo --approval-hook`) proves nothing about the gate.
+/// It is a no-op when the socket variable is unset, and runs the exact binary of this app.
+pub const CANONICAL_HOOK_COMMAND: &str = r#"bash -c '[ -n "$AGENT_TERMINAL_APPROVAL_SOCKET" ] || exit 0; exec "${AGENT_TERMINAL_HOOK_BIN:-agent-terminal}" --approval-hook'"#;
+
+/// The entry to add to `hooks.json` (as a new top-level key), for the user-facing Notice.
+pub fn install_entry_json() -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "agent-terminal-approval": {
+            "PreToolUse": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": CANONICAL_HOOK_COMMAND,
+                    "timeout": 600
+                }]
+            }]
+        }
+    }))
+    .unwrap_or_default()
+}
 
 /// `$HOME/.gemini/config/hooks.json`; takes the value so tests never read the real home.
 pub fn hooks_path(home: Option<&str>) -> Option<PathBuf> {
@@ -47,7 +66,7 @@ fn entry_gates_everything(entry: &Value) -> bool {
     let runs_hook = |v: &Value| {
         v.get("command")
             .and_then(Value::as_str)
-            .is_some_and(|c| c.contains(HOOK_FLAG))
+            .is_some_and(|c| c.trim() == CANONICAL_HOOK_COMMAND)
     };
     runs_hook(entry)
         || entry
@@ -65,8 +84,9 @@ pub fn check_installed(home: Option<&str>) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{} has no PreToolUse entry running `agent-terminal --approval-hook` with matcher `.*`",
-            path.display()
+            "{} has no approval hook entry. Add this top-level key:\n{}",
+            path.display(),
+            install_entry_json()
         ))
     }
 }
@@ -85,8 +105,45 @@ mod tests {
     #[test]
     fn accepts_the_staged_entry_and_a_matcherless_one() {
         assert!(approval_hook_installed(GOOD));
-        let bare = r#"{"g":{"PreToolUse":[{"type":"command","command":"agent-terminal --approval-hook"}]}}"#;
-        assert!(approval_hook_installed(bare));
+        let bare = serde_json::json!({"g": {"PreToolUse": [
+            {"type": "command", "command": CANONICAL_HOOK_COMMAND}
+        ]}})
+        .to_string();
+        assert!(approval_hook_installed(&bare));
+        // The entry the user is told to add is itself accepted.
+        assert!(approval_hook_installed(&install_entry_json()));
+        assert!(check_message_names_the_entry());
+    }
+
+    fn check_message_names_the_entry() -> bool {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().to_string_lossy().into_owned();
+        std::fs::create_dir_all(tmp.path().join(".gemini/config")).expect("mk");
+        std::fs::write(tmp.path().join(".gemini/config/hooks.json"), "{}").expect("write");
+        check_installed(Some(&home))
+            .err()
+            .is_some_and(|m| m.contains("PreToolUse") && m.contains("--approval-hook"))
+    }
+
+    #[test]
+    fn near_misses_do_not_count() {
+        let with = |command: &str| {
+            serde_json::json!({"g": {"PreToolUse": [{"matcher": ".*", "hooks": [
+                {"type": "command", "command": command}
+            ]}]}})
+            .to_string()
+        };
+        for bad in [
+            "echo --approval-hook",
+            "agent-terminal --approval-hook",
+            "bash -c 'exec \"${AGENT_TERMINAL_HOOK_BIN:-agent-terminal}\" --approval-hook'",
+            "bash -c 'true' # --approval-hook",
+        ] {
+            assert!(!approval_hook_installed(&with(bad)), "{bad}");
+        }
+        assert!(approval_hook_installed(&with(&format!(
+            "  {CANONICAL_HOOK_COMMAND}\n"
+        ))));
     }
 
     #[test]
