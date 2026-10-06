@@ -602,9 +602,10 @@ fn kind_icon(kind: ItemKind) -> &'static str {
         ItemKind::Command => "utilities-terminal-symbolic",
         ItemKind::FileChange => "document-edit-symbolic",
         ItemKind::FileRead => "x-office-document-symbolic",
-        ItemKind::McpTool => "network-server-symbolic",
+        ItemKind::McpTool => crate::icons::MCP_ICON,
         ItemKind::WebSearch => "system-search-symbolic",
-        ItemKind::Subagent => "system-users-symbolic",
+        ItemKind::Subagent => crate::icons::SUBAGENT_ICON,
+        ItemKind::Reasoning => crate::icons::THINKING_ICON,
         _ => "applications-engineering-symbolic",
     }
 }
