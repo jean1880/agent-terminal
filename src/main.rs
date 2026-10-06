@@ -377,6 +377,12 @@ fn load_css() {
         label {
             color: #c8c8ff;
         }
+        /* A coloured button sets its own text colour; the rule above, aimed at labels, would
+           otherwise beat it (pale lavender on the lavender Allow button). */
+        button.suggested-action label,
+        button.destructive-action label {
+            color: inherit;
+        }
         .terminal-container {
             padding: 10px;
         }
@@ -501,4 +507,52 @@ fn load_css() {
         &provider,
         STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+#[cfg(test)]
+mod brand_css_tests {
+    use super::*;
+
+    /// Needs a display and the brand CSS loaded process-wide, so it is not part of the window
+    /// smoke test. Run it on a private display: the preview MCP's `preview_app` with the test
+    /// binary and `coloured_buttons_keep_their_text_colour --ignored --nocapture`.
+    #[test]
+    #[ignore = "loads the brand CSS on a display; run on a private display"]
+    fn coloured_buttons_keep_their_text_colour() {
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        load_css();
+        let window = gtk4::Window::new();
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let allow = gtk4::Button::with_label("Allow");
+        allow.add_css_class("suggested-action");
+        let plain = gtk4::Label::new(Some("text"));
+        row.append(&allow);
+        row.append(&plain);
+        window.set_child(Some(&row));
+        window.present();
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+        let label = allow
+            .child()
+            .and_then(|c| c.downcast::<gtk4::Label>().ok())
+            .expect("a label");
+        let rgb = |c: gdk::RGBA| [c.red(), c.green(), c.blue()].map(|v| (v * 255.0).round() as u8);
+        eprintln!(
+            "allow label {:?}, plain label {:?}",
+            rgb(label.color()),
+            rgb(plain.color())
+        );
+        assert_eq!(
+            rgb(label.color()),
+            [0x18, 0x14, 0x25],
+            "dark text on the Allow button"
+        );
+        assert_eq!(
+            rgb(plain.color()),
+            [0xc8, 0xc8, 0xff],
+            "other labels keep the brand colour"
+        );
+        window.destroy();
+    }
 }
