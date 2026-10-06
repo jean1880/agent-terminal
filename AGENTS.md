@@ -16,7 +16,7 @@ Architectural mandates, standards, and workflows for this codebase.
   `gtk4` re-exports (`gtk4::glib`, …). Do not add them as direct dependencies —
   that only creates a second place for versions to drift.
 - **Chat-first (3.0)**: the primary surface is a chat thread (`src/chat/`) that
-  drives Claude or agy through a structured adapter (`agent-core`) over a gio
+  drives Claude, agy or Codex through a structured adapter (`agent-core`) over a gio
   process transport (`src/agent_proc.rs`). Every new-session action opens a
   thread. Terminal pages (2.x) remain for any profile and for CLIs with no
   adapter.
@@ -62,7 +62,10 @@ Architectural mandates, standards, and workflows for this codebase.
     `SystemProbe::locate`, startup command, path resolution, indicators; it
     re-exports the kit helpers the window uses), `window/imp.rs` (GTK UI),
     `window/imp/threads.rs` (sidebar, thread pages, drawer, re-homed 2.x
-    features), `window/imp/agents_prefs.rs` (Settings → Agents),
+    features; the sidebar draws from a thread list loaded off the main thread
+    and every store read or write on the UI path goes through `store_job`),
+    `window/imp/thread_menu.rs` (the sidebar's context menu and its actions;
+    the menu itself is data in `window/sidebar_model.rs`), `window/imp/agents_prefs.rs` (Settings → Agents),
     `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
     diff panel's widgets), `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).
@@ -72,7 +75,11 @@ Architectural mandates, standards, and workflows for this codebase.
     `approval_server.rs` / `approval_hook.rs` (agy's approval socket and the
     `--approval-hook` client), `hook_config.rs` (is the hook installed in
     `~/.gemini/config/hooks.json`), `model_catalog.rs`, `account_status.rs`,
-    `claude_probe.rs` (both agents' models, usage and account).
+    `claude_probe.rs` / `codex_probe.rs` (prompt-less probes of Claude and
+    `codex app-server`: models, usage and account), `probe.rs` (probe targets,
+    coalescing, disconnectable listeners). Every probe and side process runs in
+    the environment its agent's threads get (`AgentEnv`: profile env file,
+    `clear_env`), so the indicator shows the account a thread would use.
   - Anything that needs `config.rs`, GTK or the command cache stays in the
     app; a crate never depends on the app.
 - **Undo is itself undoable, and only touches what it pinned**: a restore
