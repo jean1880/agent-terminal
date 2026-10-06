@@ -1,0 +1,303 @@
+//! The usage indicator: per agent, an accent dot, the most-used plan window as a thin bar and
+//! its percentage (amber from 75 %, red from 90 %); a popover lists the account and every window.
+//!
+//! It reads [`AccountStatus`] and repaints whenever that changes. One widget serves both the
+//! chat header (filtered to the thread's current agent) and an unfiltered sidebar footer.
+
+use std::cell::Cell;
+use std::rc::Rc;
+
+use agent_core::adapter::Driver;
+use agent_core::event::QuotaWindow;
+use agent_core::quota::{parse_rfc3339, resets_in_text};
+use gtk4::prelude::*;
+
+use super::cards::{accent_class, driver_name, label};
+use crate::account_status::{AccountStatus, Snapshot};
+
+const WARN_AT: f64 = 0.75;
+const CRITICAL_AT: f64 = 0.90;
+
+/// How alarming a used share is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Normal,
+    Warn,
+    Critical,
+}
+
+pub fn severity(used: f64) -> Severity {
+    if used >= CRITICAL_AT {
+        Severity::Critical
+    } else if used >= WARN_AT {
+        Severity::Warn
+    } else {
+        Severity::Normal
+    }
+}
+
+impl Severity {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Severity::Normal => "usage-ok",
+            Severity::Warn => "usage-warn",
+            Severity::Critical => "usage-crit",
+        }
+    }
+}
+
+/// `43 %`, rounded, never above 100.
+pub fn percent_text(used: f64) -> String {
+    format!("{} %", (used.clamp(0.0, 1.0) * 100.0).round() as u32)
+}
+
+/// `Gemini Models · Weekly` or just `Weekly`.
+pub fn window_title(w: &QuotaWindow) -> String {
+    match &w.group {
+        Some(g) => format!("{g} · {}", w.label),
+        None => w.label.clone(),
+    }
+}
+
+/// `resets in 3 h 47 min`, when the window has a parseable reset time.
+pub fn resets_text(w: &QuotaWindow, now: i64) -> Option<String> {
+    let at = parse_rfc3339(w.resets_at.as_deref()?)?;
+    Some(resets_in_text(at - now))
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+fn bar(used: f64, width: i32) -> gtk4::ProgressBar {
+    let bar = gtk4::ProgressBar::new();
+    bar.set_fraction(used.clamp(0.0, 1.0));
+    bar.set_width_request(width);
+    bar.set_valign(gtk4::Align::Center);
+    bar.add_css_class("usage-bar");
+    bar.add_css_class(severity(used).css_class());
+    bar
+}
+
+pub struct UsageIndicator {
+    root: gtk4::MenuButton,
+    compact: gtk4::Box,
+    details: gtk4::Box,
+    status: Rc<AccountStatus>,
+    filter: Cell<Option<Driver>>,
+}
+
+impl UsageIndicator {
+    /// `filter`: show only this agent (the chat header follows the thread's agent); `None`
+    /// shows both. Repaints on every [`AccountStatus`] change.
+    pub fn new(status: Rc<AccountStatus>, filter: Option<Driver>) -> Rc<Self> {
+        let root = gtk4::MenuButton::new();
+        root.add_css_class("flat");
+        root.add_css_class("usage-indicator");
+        root.set_tooltip_text(Some("Plan usage"));
+        let compact = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        root.set_child(Some(&compact));
+        let details = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        details.set_margin_top(12);
+        details.set_margin_bottom(12);
+        details.set_margin_start(14);
+        details.set_margin_end(14);
+        details.set_width_request(300);
+        let popover = gtk4::Popover::new();
+        popover.add_css_class("usage-popover");
+        popover.set_child(Some(&details));
+        root.set_popover(Some(&popover));
+
+        let this = Rc::new(Self {
+            root,
+            compact,
+            details,
+            status,
+            filter: Cell::new(filter),
+        });
+        this.repaint();
+        let weak = Rc::downgrade(&this);
+        this.status.connect_changed(move || {
+            if let Some(this) = weak.upgrade() {
+                this.repaint();
+            }
+        });
+        // "Resets in" ages while the popover is closed: rebuild it as it opens.
+        let weak = Rc::downgrade(&this);
+        popover.connect_show(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.repaint();
+            }
+        });
+        this
+    }
+
+    pub fn widget(&self) -> &gtk4::MenuButton {
+        &self.root
+    }
+
+    /// Follows the thread when it moves to the other agent.
+    pub fn set_filter(&self, filter: Option<Driver>) {
+        if self.filter.replace(filter) != filter {
+            self.repaint();
+        }
+    }
+
+    fn shown(&self) -> Vec<(Driver, Snapshot)> {
+        [Driver::Claude, Driver::Agy]
+            .into_iter()
+            .filter(|d| self.filter.get().is_none_or(|f| f == *d))
+            .map(|d| (d, self.status.snapshot(d)))
+            .filter(|(_, s)| s.account.is_some() || !s.windows.is_empty())
+            .collect()
+    }
+
+    fn repaint(&self) {
+        while let Some(child) = self.compact.first_child() {
+            self.compact.remove(&child);
+        }
+        while let Some(child) = self.details.first_child() {
+            self.details.remove(&child);
+        }
+        let shown = self.shown();
+        self.root.set_visible(!shown.is_empty());
+        let now = now_epoch();
+        for (driver, snap) in &shown {
+            self.compact.append(&compact_form(*driver, snap));
+            self.details.append(&detail_form(*driver, snap, now));
+        }
+    }
+}
+
+/// Accent dot + the most-used window's bar and percentage.
+fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
+    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    b.add_css_class(accent_class(driver));
+    b.append(&label("●", &["accent-dot"]));
+    match snap.most_used() {
+        Some(w) => {
+            b.append(&bar(w.used, 56));
+            b.append(&label(
+                &percent_text(w.used),
+                &["usage-text", severity(w.used).css_class()],
+            ));
+            b.set_tooltip_text(Some(&format!(
+                "{} · {} {}",
+                driver_name(driver),
+                window_title(w),
+                percent_text(w.used)
+            )));
+        }
+        None => b.append(&label("-", &["usage-text"])),
+    }
+    b
+}
+
+/// Account line and every window of one agent.
+fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
+    let section = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    section.add_css_class(accent_class(driver));
+    let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    head.append(&label("●", &["accent-dot"]));
+    head.append(&label(driver_name(driver), &["usage-agent"]));
+    section.append(&head);
+    if let Some(account) = &snap.account {
+        let line = match &account.plan {
+            Some(plan) => format!("{} · {plan}", account.label),
+            None => account.label.clone(),
+        };
+        let l = label(&line, &["dim-label", "usage-account"]);
+        l.set_halign(gtk4::Align::Start);
+        l.set_selectable(true);
+        l.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        section.append(&l);
+    }
+    if snap.windows.is_empty() {
+        let l = label("No usage data yet", &["dim-label"]);
+        l.set_halign(gtk4::Align::Start);
+        section.append(&l);
+    }
+    for w in &snap.windows {
+        let row = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
+        let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let title = label(&window_title(w), &["usage-window"]);
+        title.set_halign(gtk4::Align::Start);
+        title.set_hexpand(true);
+        title.set_xalign(0.0);
+        top.append(&title);
+        top.append(&label(
+            &format!("{} used", percent_text(w.used)),
+            &["usage-text", severity(w.used).css_class()],
+        ));
+        row.append(&top);
+        let b = bar(w.used, -1);
+        b.set_hexpand(true);
+        row.append(&b);
+        if let Some(text) = resets_text(w, now) {
+            let l = label(&text, &["dim-label", "usage-resets"]);
+            l.set_halign(gtk4::Align::Start);
+            row.append(&l);
+        }
+        section.append(&row);
+    }
+    section
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(group: Option<&str>, resets: Option<&str>) -> QuotaWindow {
+        QuotaWindow {
+            group: group.map(str::to_owned),
+            label: "Weekly".into(),
+            used: 0.5,
+            resets_at: resets.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn colour_thresholds() {
+        assert_eq!(severity(0.0), Severity::Normal);
+        assert_eq!(severity(0.7499), Severity::Normal);
+        assert_eq!(severity(0.75), Severity::Warn);
+        assert_eq!(severity(0.8999), Severity::Warn);
+        assert_eq!(severity(0.9), Severity::Critical);
+        assert_eq!(severity(1.0), Severity::Critical);
+        assert_eq!(Severity::Warn.css_class(), "usage-warn");
+        assert_eq!(Severity::Critical.css_class(), "usage-crit");
+        assert_eq!(Severity::Normal.css_class(), "usage-ok");
+    }
+
+    #[test]
+    fn percent_rounds_and_clamps() {
+        assert_eq!(percent_text(0.0), "0 %");
+        assert_eq!(percent_text(0.426), "43 %");
+        assert_eq!(percent_text(0.994), "99 %");
+        assert_eq!(percent_text(1.7), "100 %");
+        assert_eq!(percent_text(-1.0), "0 %");
+    }
+
+    #[test]
+    fn titles_and_reset_phrases() {
+        assert_eq!(window_title(&win(None, None)), "Weekly");
+        assert_eq!(
+            window_title(&win(Some("Gemini Models"), None)),
+            "Gemini Models · Weekly"
+        );
+        let now = parse_rfc3339("2026-10-06T13:12:00Z").unwrap();
+        let w = win(None, Some("2026-10-06T16:59:24Z"));
+        assert_eq!(
+            resets_text(&w, now).as_deref(),
+            Some("resets in 3 h 48 min")
+        );
+        assert_eq!(
+            resets_text(&win(None, Some("2026-10-06T10:00:00Z")), now).as_deref(),
+            Some("resets now")
+        );
+        assert_eq!(resets_text(&win(None, None), now), None);
+        assert_eq!(resets_text(&win(None, Some("soon")), now), None);
+    }
+}

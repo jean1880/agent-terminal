@@ -131,6 +131,11 @@ impl Header {
         }
     }
 
+    /// Puts the usage indicator just before the context gauge.
+    pub fn insert_usage(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.root.insert_child_after(widget, Some(&self.activity));
+    }
+
     pub fn set_agent(&self, driver: Driver, model: Option<&str>) {
         if let Some(prev) = self.last_driver.get() {
             self.chip.remove_css_class(accent_class(prev));

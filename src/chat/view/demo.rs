@@ -16,14 +16,17 @@ use std::time::Duration;
 use agent_core::adapter::{Control, Driver, Mode};
 use agent_core::caps::Capabilities;
 use agent_core::event::{
-    AgentCommand, AgentCommandKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
-    Question, QuestionOption, ResponseCapability, StepStatus, StreamKind, TurnState,
+    Account, AgentCommand, AgentCommandKind, Decision, Envelope, Event, ItemKind, ItemStatus,
+    PlanStep, Question, QuestionOption, QuotaWindow, ResponseCapability, StepStatus, StreamKind,
+    TurnState,
 };
+use agent_core::quota::epoch_to_rfc3339;
 use gtk4::glib;
 use gtk4::prelude::*;
 use serde_json::{json, Value};
 
 use super::ChatView;
+use crate::account_status::AccountStatus;
 use crate::chat::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
 use agent_core::catalog::{parse_agy_models, CatalogModel};
 
@@ -133,6 +136,59 @@ impl ModelSource for DemoModels {
     }
 
     fn connect_changed(&self, _f: Box<dyn Fn()>) {}
+}
+
+/// Static account and quota data for `--chat-demo`: one agent in the amber, one in the red.
+pub fn demo_account_status() -> Rc<AccountStatus> {
+    let status = Rc::new(AccountStatus::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    let window = |group: Option<&str>, label: &str, used: f64, in_secs: i64| QuotaWindow {
+        group: group.map(str::to_owned),
+        label: label.into(),
+        used,
+        resets_at: Some(epoch_to_rfc3339(now + in_secs)),
+    };
+    let account = |label: &str, plan: Option<&str>, provider: &str| Account {
+        label: label.into(),
+        plan: plan.map(str::to_owned),
+        provider: Some(provider.into()),
+    };
+    let quota = |account, windows| Envelope::new(Event::QuotaUpdated { account, windows });
+    status.observe(
+        Driver::Claude,
+        &quota(
+            Some(account(
+                "user@example.com",
+                Some("Claude Pro"),
+                "firstParty",
+            )),
+            vec![
+                window(None, "5-hour", 0.42, 3 * 3600 + 47 * 60),
+                window(None, "Weekly", 0.78, 3 * 86_400 + 10 * 3600),
+                window(None, "Weekly (Fable)", 0.0, 3 * 86_400 + 10 * 3600),
+            ],
+        ),
+    );
+    status.observe(
+        Driver::Agy,
+        &quota(
+            Some(account("user@example.com", None, "Google")),
+            vec![
+                window(
+                    Some("Gemini Models"),
+                    "Weekly",
+                    0.14,
+                    3 * 86_400 + 10 * 3600,
+                ),
+                window(Some("Gemini Models"), "5-hour", 0.93, 55 * 60),
+                window(Some("Claude and GPT models"), "Weekly", 0.0, 6 * 86_400),
+                window(Some("Claude and GPT models"), "5-hour", 0.0, 5 * 3600),
+            ],
+        ),
+    );
+    status
 }
 
 fn demo_commands() -> Vec<AgentCommand> {
@@ -1011,6 +1067,7 @@ pub fn run() -> glib::ExitCode {
         let view = ChatView::new(backend.clone());
         backend.connect(view.sink());
         view.set_model_source(Rc::new(DemoModels));
+        view.set_account_status(demo_account_status());
         view.connect_action(|action| tracing::info!(?action, "chat demo: view action"));
 
         let toolbar = adw::ToolbarView::new();

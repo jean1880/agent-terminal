@@ -24,6 +24,7 @@ mod panels;
 mod payload;
 mod transcript;
 mod typeahead;
+pub mod usage;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -37,12 +38,14 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
 use super::{ChatBackend, EnvelopeSink, ModelSource};
+use crate::account_status::AccountStatus;
 use cards::{RowEvent, RowSink};
 use composer::{Composer, ComposerHost};
 use header::{Header, MODES};
 use model::{Change, Tone, Transcript};
 use panels::{ModelListener, PanelCtx, Requests};
 use transcript::TranscriptView;
+use usage::UsageIndicator;
 
 /// Something the view cannot do itself; the window (wave 3) connects to these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +132,9 @@ pub(crate) struct Inner {
     requests: Rc<Requests>,
     /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
     models: RefCell<Option<Rc<dyn ModelSource>>>,
+    /// Account and plan usage: fed by this thread's `QuotaUpdated` events, shown in the header.
+    account: RefCell<Option<Rc<AccountStatus>>>,
+    usage: RefCell<Option<Rc<UsageIndicator>>>,
     /// The open model picker's refresh hook (see [`PanelCtx::model_listener`]).
     model_listener: ModelListener,
     actions: RefCell<Vec<ActionHandler>>,
@@ -162,6 +168,8 @@ impl ChatView {
                 plan: PlanPanel::new(),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
+                account: RefCell::new(None),
+                usage: RefCell::new(None),
                 model_listener: ModelListener::default(),
                 actions: RefCell::new(Vec::new()),
                 dirty: RefCell::new(Vec::new()),
@@ -271,6 +279,21 @@ impl ChatView {
         *inner.models.borrow_mut() = Some(source);
     }
 
+    /// Shows the usage indicator in the header, filtered to the thread's current agent, and
+    /// feeds `status` from this thread's `QuotaUpdated` events.
+    ///
+    /// Contract: Claude reports its plan windows on every turn by itself. agy reports none
+    /// during a turn, so the HOST should send `Control::Usage` after each agy `TurnCompleted`
+    /// (its reply becomes a `QuotaUpdated` that lands here).
+    pub fn set_account_status(&self, status: Rc<AccountStatus>) {
+        let Some(inner) = self.inner() else { return };
+        let driver = inner.backend.status().driver;
+        let indicator = UsageIndicator::new(status.clone(), Some(driver));
+        inner.header.insert_usage(indicator.widget());
+        *inner.account.borrow_mut() = Some(status);
+        *inner.usage.borrow_mut() = Some(indicator);
+    }
+
     pub fn focus_composer(&self) {
         if let Some(inner) = self.inner() {
             inner.composer.grab_focus();
@@ -312,6 +335,11 @@ impl Inner {
 
     fn apply(self: &Rc<Self>, env: &Envelope) {
         let driver = self.backend.status().driver;
+        // Clone out of the cell: observers repaint widgets, which must not re-enter this borrow.
+        let account = self.account.borrow().clone();
+        if let Some(account) = account {
+            account.observe(driver, env);
+        }
         let changes = self.model.borrow_mut().apply(env, driver);
         self.handle(changes);
     }
@@ -398,6 +426,10 @@ impl Inner {
             .clone()
             .or_else(|| self.model.borrow().current_model().map(str::to_owned));
         self.header.set_agent(status.driver, model.as_deref());
+        let usage = self.usage.borrow().clone();
+        if let Some(usage) = usage {
+            usage.set_filter(Some(status.driver));
+        }
     }
 
     fn connect_header(self: &Rc<Self>) {

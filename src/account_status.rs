@@ -116,7 +116,7 @@ thread_local! {
 }
 
 impl AccountStatus {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             claude: RefCell::default(),
             agy: RefCell::default(),
