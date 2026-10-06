@@ -40,8 +40,8 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         # GUI tests call gtk4::init(), which needs a display; run under Xvfb.
-        run: xvfb-run -a cargo test --all-targets
+        run: xvfb-run -a cargo test --workspace --all-targets
