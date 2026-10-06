@@ -26,20 +26,12 @@ pub enum RowEvent {
 pub type RowSink = Rc<dyn Fn(RowEvent)>;
 
 pub fn driver_name(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "Claude",
-        Driver::Agy => "Antigravity",
-        Driver::Codex => "Codex",
-    }
+    driver.info().label
 }
 
 /// The CSS class carrying an agent's accent colour.
 pub fn accent_class(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "accent-claude",
-        Driver::Agy => "accent-agy",
-        Driver::Codex => "accent-codex",
-    }
+    driver.info().accent_class
 }
 
 pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {

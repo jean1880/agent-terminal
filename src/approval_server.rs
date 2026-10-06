@@ -1324,7 +1324,10 @@ mod tests {
     fn an_unproven_hook_binds_nothing() {
         // Fail-closed: a failed or missing verdict never reaches the socket (which would also
         // read the live `XDG_RUNTIME_DIR`, so only this half is exercised here).
-        for why in ["not installed", "the approval hook has not been checked yet"] {
+        for why in [
+            "not installed",
+            "the approval hook has not been checked yet",
+        ] {
             let refused = ApprovalHandle::bind_checked(
                 Err(why.to_owned()),
                 "t1",

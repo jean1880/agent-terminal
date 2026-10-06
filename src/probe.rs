@@ -14,19 +14,28 @@ pub struct ProbeTarget {
     pub env: AgentEnv,
 }
 
-/// The probes of one refresh. Codex is `None` when it is not installed or not enabled: nothing
-/// is spawned for it then.
+/// The probes of one refresh: one per agent that is ready (see `availability::probe_targets`).
+/// A missing, disabled or not yet detected agent has none, so its binary is never spawned.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProbeTargets {
-    pub claude: ProbeTarget,
-    pub agy: ProbeTarget,
-    pub codex: Option<ProbeTarget>,
+    targets: Vec<(agent_core::adapter::Driver, ProbeTarget)>,
 }
 
 impl ProbeTargets {
+    pub fn new(targets: Vec<(agent_core::adapter::Driver, ProbeTarget)>) -> Self {
+        Self { targets }
+    }
+
+    pub fn get(&self, driver: agent_core::adapter::Driver) -> Option<&ProbeTarget> {
+        self.targets
+            .iter()
+            .find(|(d, _)| *d == driver)
+            .map(|(_, t)| t)
+    }
+
     /// How many background tasks a refresh runs.
     pub fn count(&self) -> u8 {
-        2 + u8::from(self.codex.is_some())
+        u8::try_from(self.targets.len()).unwrap_or(u8::MAX)
     }
 }
 
@@ -163,11 +172,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_is_probed_only_when_it_has_a_target() {
-        let mut t = ProbeTargets::default();
-        assert_eq!(t.count(), 2);
-        t.codex = Some(ProbeTarget::default());
-        assert_eq!(t.count(), 3);
+    fn an_agent_is_probed_only_when_it_has_a_target() {
+        use agent_core::adapter::Driver;
+        let t = ProbeTargets::default();
+        assert_eq!(t.count(), 0);
+        assert!(t.get(Driver::Codex).is_none());
+        let t = ProbeTargets::new(vec![(Driver::Codex, ProbeTarget::default())]);
+        assert_eq!(t.count(), 1);
+        assert!(t.get(Driver::Codex).is_some() && t.get(Driver::Claude).is_none());
     }
 
     #[test]

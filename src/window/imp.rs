@@ -708,6 +708,8 @@ pub struct AgentTerminalWindow {
     summaries_stale: std::cell::Cell<bool>,
     /// The sidebar's "Show archived" toggle.
     show_archived: std::cell::Cell<bool>,
+    /// A new thread asked for while agents were still being detected: (folder, prompt).
+    pending_new_thread: RefCell<Option<(Option<String>, Option<String>)>>,
     /// The latest open-thread list not yet written, and whether a writer is running.
     open_threads_pending: RefCell<Option<String>>,
     open_threads_writing: std::cell::Cell<bool>,
@@ -1810,10 +1812,20 @@ impl AgentTerminalWindow {
             return;
         };
         with.remove_all();
-        for driver in crate::window::sidebar_model::DRIVERS
+        let ready: Vec<_> = agent_core::adapter::Driver::ALL
             .into_iter()
             .filter(|d| self.agent_usable(*d))
-        {
+            .collect();
+        if ready.is_empty() {
+            // An item whose action does not exist is drawn insensitive.
+            let label = if crate::availability::AgentAvailability::shared().any_detecting() {
+                "Detecting agents…"
+            } else {
+                "No agent installed and enabled"
+            };
+            with.append_item(&gtk4::gio::MenuItem::new(Some(label), Some("win.no-agent")));
+        }
+        for driver in ready {
             let item = gtk4::gio::MenuItem::new(
                 Some(crate::window::sidebar_model::driver_label(driver)),
                 None,

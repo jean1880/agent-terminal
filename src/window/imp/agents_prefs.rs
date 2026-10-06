@@ -11,6 +11,7 @@ use std::rc::Rc;
 use agent_core::adapter::{Driver, Mode};
 
 use super::*;
+use crate::availability::AgentAvailability;
 use crate::config::Profile;
 use crate::model_catalog::ModelCatalog;
 
@@ -24,13 +25,17 @@ const MODES: [(Mode, &str); 3] = [
 /// Effort levels offered when the catalogue lists none for the agent.
 const FALLBACK_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
-/// The "default agent" dropdown, by index both ways.
-const DEFAULT_AGENTS: [(Option<Driver>, &str); 4] = [
-    (None, "Automatic"),
-    (Some(Driver::Claude), "Claude"),
-    (Some(Driver::Agy), "Antigravity (agy)"),
-    (Some(Driver::Codex), "Codex"),
-];
+/// The "default agent" dropdown, by index both ways: Automatic, then every driver in registry
+/// order.
+fn default_agent_choices() -> Vec<(Option<Driver>, &'static str)> {
+    std::iter::once((None, "Automatic"))
+        .chain(
+            Driver::ALL
+                .into_iter()
+                .map(|d| (Some(d), d.info().long_label)),
+        )
+        .collect()
+}
 
 /// Whether a command field is acceptable: non-empty, one line, and not something an exec would
 /// read as an option.
@@ -100,26 +105,20 @@ impl AgentTerminalWindow {
                 "New threads start on this agent; switch agents and models from a thread's header.",
             )
             .build();
-        let names: Vec<&str> = DEFAULT_AGENTS.iter().map(|(_, n)| *n).collect();
+        let choices = default_agent_choices();
+        let names: Vec<&str> = choices.iter().map(|(_, n)| *n).collect();
         let current = self.config.borrow().default_agent;
         let default_row = adw::ComboRow::builder()
             .title("Default Agent for New Threads")
             .subtitle("Automatic: the default profile's agent, else the first installed")
             .model(&gtk4::StringList::new(&names))
-            .selected(
-                DEFAULT_AGENTS
-                    .iter()
-                    .position(|(d, _)| *d == current)
-                    .unwrap_or(0) as u32,
-            )
+            .selected(choices.iter().position(|(d, _)| *d == current).unwrap_or(0) as u32)
             .build();
         default_row.connect_selected_notify(glib::clone!(
             #[weak]
             obj,
             move |row| {
-                let choice = DEFAULT_AGENTS
-                    .get(row.selected() as usize)
-                    .and_then(|(d, _)| *d);
+                let choice = choices.get(row.selected() as usize).and_then(|(d, _)| *d);
                 let imp = obj.imp();
                 if imp.config.borrow().default_agent != choice {
                     imp.config.borrow_mut().default_agent = choice;
@@ -130,7 +129,7 @@ impl AgentTerminalWindow {
         general.add(&default_row);
         page.add(&general);
 
-        for driver in [Driver::Claude, Driver::Agy, Driver::Codex] {
+        for driver in Driver::ALL {
             page.add(&self.agent_group(driver, dialog));
         }
         dialog.add(&page);
@@ -144,17 +143,13 @@ impl AgentTerminalWindow {
         let obj = self.obj();
         let profile = self.agent_profile_now(driver);
         let group = adw::PreferencesGroup::builder()
-            .title(match driver {
-                Driver::Claude => "Claude",
-                Driver::Agy => "Antigravity (agy)",
-                Driver::Codex => "Codex",
-            })
+            .title(driver.info().long_label)
             .description(format!("Profile “{}”", profile.name))
             .build();
 
         let enabled = adw::SwitchRow::builder()
             .title("Enabled")
-            .subtitle("Offered for new threads and switching")
+            .subtitle(AgentAvailability::shared().get(driver).describe(driver))
             .active(!profile.disabled)
             .build();
         enabled.connect_active_notify(glib::clone!(
@@ -162,10 +157,22 @@ impl AgentTerminalWindow {
             obj,
             move |row| {
                 let on = row.is_active();
-                obj.imp().edit_agent_profile(driver, |p| p.disabled = !on);
+                let imp = obj.imp();
+                imp.edit_agent_profile(driver, |p| p.disabled = !on);
+                // The scan decides what is offered: run it again with the new setting.
+                imp.refresh_agent_data();
             }
         ));
         group.add(&enabled);
+        // The row says what detection found: ready (where), missing (how to install), or off.
+        let state_id = AgentAvailability::shared().connect_changed(glib::clone!(
+            #[weak]
+            enabled,
+            move || {
+                enabled.set_subtitle(&AgentAvailability::shared().get(driver).describe(driver));
+            }
+        ));
+        dialog.connect_closed(move |_| AgentAvailability::shared().disconnect(state_id));
 
         // Command, with what detection makes of it.
         let status = adw::ActionRow::builder()
@@ -329,7 +336,16 @@ impl AgentTerminalWindow {
                     .as_ref()
                     .filter(|s| !ids.contains(&Some((*s).clone())))
                 {
-                    labels.push(saved.clone());
+                    // Not in the list: "retired" once the list is a fresh one, plain while it is
+                    // only the cache or still loading. New threads never start on a retired id.
+                    let catalog = ModelCatalog::shared();
+                    let gone = catalog.is_fresh(driver)
+                        && !catalog.models_of(driver).iter().any(|m| m.is_model(saved));
+                    labels.push(if gone {
+                        format!("{saved} (retired)")
+                    } else {
+                        saved.clone()
+                    });
                     ids.push(Some(saved.clone()));
                 }
                 let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
@@ -578,19 +594,12 @@ mod tests {
             }
             assert_eq!(MODES.iter().position(|(m, _)| m == mode), Some(i));
         }
-        for d in [
-            None,
-            Some(Driver::Claude),
-            Some(Driver::Agy),
-            Some(Driver::Codex),
-        ] {
-            assert!(DEFAULT_AGENTS.iter().any(|(x, _)| *x == d));
-        }
-        // Exhaustive: a new driver fails to compile until it has a dropdown row.
-        for d in [Driver::Claude, Driver::Agy, Driver::Codex] {
-            match d {
-                Driver::Claude | Driver::Agy | Driver::Codex => {}
-            }
+        // The default-agent dropdown is Automatic plus every registered driver, in order.
+        let choices = default_agent_choices();
+        assert_eq!(choices.len(), Driver::ALL.len() + 1);
+        assert_eq!(choices[0].0, None);
+        for (i, d) in Driver::ALL.into_iter().enumerate() {
+            assert_eq!(choices[i + 1], (Some(d), d.info().long_label));
         }
         assert!(command_ok("codex") && command_ok("/opt/bin/claude"));
         assert!(!command_ok("") && !command_ok("--help") && !command_ok("a\nb"));

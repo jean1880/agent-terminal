@@ -180,69 +180,80 @@ impl AccountStatus {
             debug!("account status refresh already running");
             return;
         }
+        if targets.count() == 0 {
+            self.refreshing.set(false);
+            return; // nothing is ready: nothing is spawned
+        }
         let finish = {
             let me = self.clone();
             join_n(targets.count(), move || me.refreshing.set(false))
         };
-
-        let (me, done) = (self.clone(), finish.clone());
-        claude_probe::probe_shared(
-            &targets.claude.program,
-            &targets.claude.env,
-            move |result| {
-                if let Ok(probe) = result {
-                    me.update(Driver::Claude, probe.account.clone(), probe.windows.clone());
-                }
-                done();
-            },
-        );
-
-        if let Some(codex) = &targets.codex {
+        for driver in Driver::ALL {
+            let Some(target) = targets.get(driver) else {
+                continue; // missing, disabled or still being detected
+            };
             let (me, done) = (self.clone(), finish.clone());
-            codex_probe::probe_shared(&codex.program, &codex.env, move |result| {
-                if let Ok(probe) = result {
-                    me.update(Driver::Codex, probe.account.clone(), probe.windows.clone());
+            match driver {
+                Driver::Claude => {
+                    claude_probe::probe_shared(&target.program, &target.env, move |result| {
+                        if let Ok(probe) = result {
+                            me.update(driver, probe.account.clone(), probe.windows.clone());
+                        }
+                        done();
+                    });
                 }
-                done();
-            });
+                Driver::Codex => {
+                    codex_probe::probe_shared(&target.program, &target.env, move |result| {
+                        if let Ok(probe) = result {
+                            me.update(driver, probe.account.clone(), probe.windows.clone());
+                        }
+                        done();
+                    });
+                }
+                Driver::Agy => {
+                    let target = target.clone();
+                    glib::spawn_future_local(async move {
+                        let (out, ok) = run_side(
+                            vec![
+                                target.program,
+                                "-p".to_owned(),
+                                "/usage".to_owned(),
+                                "--output-format".to_owned(),
+                                "json".to_owned(),
+                            ],
+                            None,
+                            &target.env,
+                            AGY_TIMEOUT,
+                        )
+                        .await;
+                        let windows = if ok {
+                            serde_json::from_str::<Value>(out.trim())
+                                .map(|v| agy_usage(&v))
+                                .unwrap_or_default()
+                        } else {
+                            warn!("agy /usage failed or timed out");
+                            Vec::new()
+                        };
+                        // A few hundred bytes of JSON, read off the main thread like all file I/O
+                        // here.
+                        let account =
+                            match google_accounts_path(std::env::var("HOME").ok().as_deref()) {
+                                Some(path) => {
+                                    gio::spawn_blocking(move || std::fs::read_to_string(path))
+                                        .await
+                                        .ok()
+                                        .and_then(Result::ok)
+                                        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                                        .and_then(|v| agy_account(&v))
+                                }
+                                None => None,
+                            };
+                        me.update(Driver::Agy, account, windows);
+                        done();
+                    });
+                }
+            }
         }
-
-        let (me, agy) = (self.clone(), targets.agy.clone());
-        glib::spawn_future_local(async move {
-            let (out, ok) = run_side(
-                vec![
-                    agy.program,
-                    "-p".to_owned(),
-                    "/usage".to_owned(),
-                    "--output-format".to_owned(),
-                    "json".to_owned(),
-                ],
-                None,
-                &agy.env,
-                AGY_TIMEOUT,
-            )
-            .await;
-            let windows = if ok {
-                serde_json::from_str::<Value>(out.trim())
-                    .map(|v| agy_usage(&v))
-                    .unwrap_or_default()
-            } else {
-                warn!("agy /usage failed or timed out");
-                Vec::new()
-            };
-            // A few hundred bytes of JSON, read off the main thread like all file I/O here.
-            let account = match google_accounts_path(std::env::var("HOME").ok().as_deref()) {
-                Some(path) => gio::spawn_blocking(move || std::fs::read_to_string(path))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                    .and_then(|v| agy_account(&v)),
-                None => None,
-            };
-            me.update(Driver::Agy, account, windows);
-            finish();
-        });
     }
 }
 

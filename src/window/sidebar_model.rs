@@ -154,32 +154,23 @@ pub fn stored_model(model: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Every chat agent, in the order handoffs and menus offer them.
-pub const DRIVERS: [Driver; 3] = [Driver::Claude, Driver::Agy, Driver::Codex];
-
 /// The agent a handoff with no named target goes to: the next one after `from` in
-/// [`DRIVERS`] order (wrapping) that `usable` accepts. `None` when there is no other usable agent.
+/// [`Driver::ALL`] order (wrapping) that `usable` accepts. `None` when there is no other usable
+/// agent.
 pub fn handoff_target(from: Driver, usable: impl Fn(Driver) -> bool) -> Option<Driver> {
-    let at = DRIVERS.iter().position(|d| *d == from)?;
-    (1..DRIVERS.len())
-        .map(|step| DRIVERS[(at + step) % DRIVERS.len()])
+    let all = Driver::ALL;
+    let at = all.iter().position(|d| *d == from)?;
+    (1..all.len())
+        .map(|step| all[(at + step) % all.len()])
         .find(|d| usable(*d))
 }
 
 pub fn driver_label(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "Claude",
-        Driver::Agy => "Antigravity",
-        Driver::Codex => "Codex",
-    }
+    driver.info().label
 }
 
 pub fn driver_key(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "claude",
-        Driver::Agy => "agy",
-        Driver::Codex => "codex",
-    }
+    driver.info().key
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -330,14 +321,31 @@ pub struct ThreadMenuInput {
     pub agents: Vec<MenuAgent>,
 }
 
+/// The agents a menu offers: every driver `usable` accepts (see `availability`), in registry
+/// order, each with the catalogue models listed for it. A cached model list of an agent that is
+/// not usable is kept in the catalogue but never shown.
+pub fn menu_agents(
+    catalog: &[agent_core::catalog::CatalogModel],
+    usable: impl Fn(Driver) -> bool,
+) -> Vec<MenuAgent> {
+    Driver::ALL
+        .into_iter()
+        .filter(|d| usable(*d))
+        .map(|driver| MenuAgent {
+            driver,
+            models: catalog
+                .iter()
+                .filter(|m| m.driver == driver)
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
+
 /// A coloured dot standing for an agent in a menu label (menus take plain text, so the colour
 /// comes from the glyph: coral for Claude, blue for agy, green for Codex).
 pub fn menu_dot(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "\u{1f7e0}",
-        Driver::Agy => "\u{1f535}",
-        Driver::Codex => "\u{1f7e2}",
-    }
+    driver.info().dot
 }
 
 /// The model and effort to hand to `switch` for a catalogue row at `effort`: agy folds the effort
@@ -467,12 +475,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
 }
 
 pub fn parse_driver(name: &str) -> Option<Driver> {
-    match name {
-        "claude" => Some(Driver::Claude),
-        "agy" => Some(Driver::Agy),
-        "codex" => Some(Driver::Codex),
-        _ => None,
-    }
+    Driver::from_key(name)
 }
 
 #[cfg(test)]
@@ -693,6 +696,22 @@ mod tests {
     }
 
     #[test]
+    fn only_usable_agents_reach_the_menu_even_when_the_catalogue_caches_their_models() {
+        let catalog = vec![
+            model(Driver::Claude, "opus", &[]),
+            model(Driver::Agy, "gemini", &[]),
+            model(Driver::Codex, "gpt", &[]),
+        ];
+        let agents = menu_agents(&catalog, |d| d != Driver::Agy);
+        assert_eq!(
+            agents.iter().map(|a| a.driver).collect::<Vec<_>>(),
+            [Driver::Claude, Driver::Codex]
+        );
+        assert!(agents.iter().all(|a| a.models.len() == 1));
+        assert!(menu_agents(&catalog, |_| false).is_empty());
+    }
+
+    #[test]
     fn continue_is_disabled_without_messages_and_empty_without_agents() {
         let menu = thread_menu(&input(false, false));
         let cont = items(&[submenu(&menu, "Continue in").clone()]);
@@ -833,9 +852,9 @@ mod tests {
         assert_eq!(resume_as(None, "abc"), ResumeAs::Terminal);
         assert_eq!(stored_model(Some("default")), None);
         assert_eq!(stored_model(Some("opus")).as_deref(), Some("opus"));
-        for d in DRIVERS {
+        for d in Driver::ALL {
             assert_eq!(parse_driver(driver_key(d)), Some(d));
-            // Exhaustive: a new driver fails to compile until it is in DRIVERS.
+            // Exhaustive: a new driver fails to compile until it is in Driver::ALL.
             match d {
                 Driver::Claude | Driver::Agy | Driver::Codex => {}
             }

@@ -589,7 +589,10 @@ mod tests {
             Some("/usr/bin/agy")
         );
         // An alias is answered with its definition, a function with its bare name.
-        assert_eq!(shell_answer_path("alias claude='npx claude --yolo'\n"), None);
+        assert_eq!(
+            shell_answer_path("alias claude='npx claude --yolo'\n"),
+            None
+        );
         assert_eq!(shell_answer_path("claude='/opt/x/claude --flag'\n"), None);
         assert_eq!(shell_answer_path("claude\n"), None);
         assert_eq!(shell_answer_path("./claude\n"), None);

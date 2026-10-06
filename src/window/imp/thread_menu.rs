@@ -21,7 +21,8 @@ use crate::chat::session::build_handoff;
 use crate::chat::ChatBackend;
 use crate::model_catalog::ModelCatalog;
 use crate::window::sidebar_model::{
-    driver_label, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction, ThreadMenuInput, DRIVERS,
+    driver_label, menu_agents, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction,
+    ThreadMenuInput,
 };
 
 /// The action every enabled menu item activates, with the encoded [`ThreadAction`] as target.
@@ -180,19 +181,7 @@ impl AgentTerminalWindow {
 
     /// The agents the menu offers: enabled and installed, each with its catalogue models.
     fn menu_agents(&self) -> Vec<MenuAgent> {
-        let catalog = ModelCatalog::shared().models();
-        DRIVERS
-            .into_iter()
-            .filter(|d| self.agent_usable(*d))
-            .map(|driver| MenuAgent {
-                driver,
-                models: catalog
-                    .iter()
-                    .filter(|m| m.driver == driver)
-                    .cloned()
-                    .collect(),
-            })
-            .collect()
+        menu_agents(&ModelCatalog::shared().models(), |d| self.agent_usable(d))
     }
 
     /// Pops the thread's menu up on `row`: at `at` (the pointer), else where GTK puts it. Whether

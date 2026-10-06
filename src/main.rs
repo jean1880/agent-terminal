@@ -14,6 +14,7 @@ mod account_status;
 mod agent_proc;
 mod approval_hook;
 mod approval_server;
+mod availability;
 mod chat;
 mod claude_probe;
 mod codex_probe;

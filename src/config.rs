@@ -130,26 +130,18 @@ pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> 
     let name = Path::new(profile.command.trim())
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())?;
-    match name.as_str() {
-        "claude" => Some(Driver::Claude),
-        "agy" => Some(Driver::Agy),
-        "codex" => Some(Driver::Codex),
-        _ => None,
-    }
+    Driver::ALL
+        .into_iter()
+        .find(|d| d.info().default_command == name)
 }
 
 /// A fresh profile for `driver`'s chat agent, with the known CLI settings filled in. Used when
 /// Preferences → Agents edits an agent the profile list has no entry for.
 pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
-    use agent_core::adapter::Driver;
-    let (name, command) = match driver {
-        Driver::Claude => ("Claude", "claude"),
-        Driver::Agy => ("Agy", "agy"),
-        Driver::Codex => ("Codex", "codex"),
-    };
+    let info = driver.info();
     let mut profile = Profile {
-        name: name.to_string(),
-        command: command.to_string(),
+        name: info.profile_name.to_string(),
+        command: info.default_command.to_string(),
         ..Profile::default()
     };
     apply_known_settings(&mut profile);
@@ -159,25 +151,19 @@ pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
 /// Picks the agent for a new chat thread.
 ///
 /// In order: the explicit "default agent" choice, the default profile's agent
-/// (when it is Claude or agy), then Claude, then agy. Only an agent `usable`
-/// accepts (enabled, and not known to be missing) is picked; `None` when
-/// neither is.
+/// (when it has a chat driver), then every driver in registry order. Only an agent
+/// `usable` accepts (detected and enabled: see `availability`) is picked; `None` when
+/// none is.
 pub fn choose_default_agent(
     explicit: Option<agent_core::adapter::Driver>,
     default_profile: Option<agent_core::adapter::Driver>,
     usable: impl Fn(agent_core::adapter::Driver) -> bool,
 ) -> Option<agent_core::adapter::Driver> {
-    use agent_core::adapter::Driver;
-    [
-        explicit,
-        default_profile,
-        Some(Driver::Claude),
-        Some(Driver::Agy),
-        Some(Driver::Codex),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|d| usable(*d))
+    [explicit, default_profile]
+        .into_iter()
+        .flatten()
+        .chain(agent_core::adapter::Driver::ALL)
+        .find(|d| usable(*d))
 }
 
 impl Profile {

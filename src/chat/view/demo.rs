@@ -282,11 +282,7 @@ impl DemoBackend {
                     let mut s = self.status.borrow_mut();
                     s.driver = driver;
                     s.model = model;
-                    s.capabilities = match driver {
-                        Driver::Claude => Capabilities::claude(),
-                        Driver::Agy => Capabilities::agy(),
-                        Driver::Codex => Capabilities::codex(),
-                    };
+                    s.capabilities = Capabilities::of(driver);
                 }
                 Some(Step::SetRunning(r)) => self.status.borrow_mut().running_turn = r,
                 Some(Step::Wait(ms)) => {

@@ -153,11 +153,7 @@ fn padded(child: &impl IsA<gtk4::Widget>) -> gtk4::Box {
 
 /// The group heading for an agent's models.
 fn group_title(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "Claude",
-        Driver::Agy => "Antigravity (agy)",
-        Driver::Codex => "Codex",
-    }
+    driver.info().long_label
 }
 
 /// The fallback list, when there is no [`ModelSource`]: the backend's own `ListModels` answer,

@@ -14,6 +14,7 @@ use gtk4::prelude::*;
 
 use super::cards::{accent_class, driver_name, label};
 use crate::account_status::{AccountStatus, Snapshot};
+use crate::availability::AgentAvailability;
 
 const WARN_AT: f64 = 0.75;
 const CRITICAL_AT: f64 = 0.90;
@@ -89,12 +90,17 @@ pub struct UsageIndicator {
     filter: Cell<Option<Driver>>,
     /// The change listener, removed again when the indicator goes away.
     listener: Cell<Option<u64>>,
+    /// Likewise for availability: an agent that stops being ready leaves the indicator.
+    availability_listener: Cell<Option<u64>>,
 }
 
 impl Drop for UsageIndicator {
     fn drop(&mut self) {
         if let Some(id) = self.listener.take() {
             self.status.disconnect(id);
+        }
+        if let Some(id) = self.availability_listener.take() {
+            AgentAvailability::shared().disconnect(id);
         }
     }
 }
@@ -127,8 +133,16 @@ impl UsageIndicator {
             status,
             filter: Cell::new(filter),
             listener: Cell::new(None),
+            availability_listener: Cell::new(None),
         });
         this.repaint();
+        let weak = Rc::downgrade(&this);
+        let id = AgentAvailability::shared().connect_changed(move || {
+            if let Some(this) = weak.upgrade() {
+                this.repaint();
+            }
+        });
+        this.availability_listener.set(Some(id));
         let weak = Rc::downgrade(&this);
         let id = this.status.connect_changed(move || {
             if let Some(this) = weak.upgrade() {
@@ -158,8 +172,10 @@ impl UsageIndicator {
     }
 
     fn shown(&self) -> Vec<(Driver, Snapshot)> {
-        [Driver::Claude, Driver::Agy, Driver::Codex]
+        let availability = AgentAvailability::shared();
+        Driver::ALL
             .into_iter()
+            .filter(|d| availability.is_ready(*d))
             .filter(|d| self.filter.get().is_none_or(|f| f == *d))
             .map(|d| (d, self.status.snapshot(d)))
             .filter(|(_, s)| s.account.is_some() || !s.windows.is_empty())

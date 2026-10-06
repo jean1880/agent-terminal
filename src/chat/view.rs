@@ -301,6 +301,13 @@ impl ChatView {
         *inner.usage.borrow_mut() = Some(indicator);
     }
 
+    /// Opens the model picker (what the header's agent chip does).
+    pub fn open_model_picker(&self) {
+        if let Some(inner) = self.inner() {
+            inner.run_action(BuiltinAction::OpenModelPicker, "");
+        }
+    }
+
     pub fn focus_composer(&self) {
         if let Some(inner) = self.inner() {
             inner.composer.grab_focus();
@@ -785,11 +792,7 @@ pub(crate) mod tests {
             mode: Mode::Ask,
             running_turn: false,
             alive: true,
-            capabilities: match driver {
-                Driver::Claude => agent_core::caps::Capabilities::claude(),
-                Driver::Agy => agent_core::caps::Capabilities::agy(),
-                Driver::Codex => agent_core::caps::Capabilities::codex(),
-            },
+            capabilities: agent_core::caps::Capabilities::of(driver),
             commands: Vec::new(),
         }
     }

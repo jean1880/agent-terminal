@@ -17,6 +17,7 @@ use std::time::Duration;
 use agent_core::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
 };
+use agent_core::catalog::Replacement;
 use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind};
 use agent_core::handoff_budget::{
     handoff_budget, handoff_coverage, provider_message_with_handoff, render_history,
@@ -52,6 +53,21 @@ pub struct AgentLaunch {
     pub env: LaunchEnv,
     /// agy: the approval socket for the new process. `None` runs it read-only (plan mode).
     pub approval: Option<ApprovalHandle>,
+}
+
+/// `Continued on <new model> (<old> was retired)`.
+pub fn retired_notice(retired: &RetiredModel) -> String {
+    format!(
+        "Continued on {} ({} was retired)",
+        retired.replacement.display, retired.model
+    )
+}
+
+/// A model its agent no longer offers, and where the thread goes instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredModel {
+    pub model: String,
+    pub replacement: Replacement,
 }
 
 /// Builds what another driver starts with (the window knows how; this module does not).
@@ -114,6 +130,11 @@ struct Inner {
     state: RefCell<State>,
     /// A rendered, redacted handoff waiting for the next user prompt.
     pending_handoff: RefCell<Option<String>>,
+    /// The thread's model was retired by its agent: the next prompt first moves to this one.
+    retired: RefCell<Option<RetiredModel>>,
+    /// The model the thread was last SET to (an alias where the agent has one), as opposed to the
+    /// resolved id its events report: what is stored and what retirement is judged on.
+    selected: RefCell<Option<String>>,
     ctl_seq: Cell<u64>,
     local_seq: Cell<u64>,
     /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
@@ -126,19 +147,11 @@ pub struct ChatSession {
 }
 
 fn driver_name(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "claude",
-        Driver::Agy => "agy",
-        Driver::Codex => "codex",
-    }
+    driver.info().key
 }
 
 fn driver_label(driver: Driver) -> &'static str {
-    match driver {
-        Driver::Claude => "Claude",
-        Driver::Agy => "Antigravity (agy)",
-        Driver::Codex => "Codex",
-    }
+    driver.info().long_label
 }
 
 impl ChatSession {
@@ -197,6 +210,7 @@ impl ChatSession {
                 }
             },
         };
+        let selected = open.model.clone();
         let state = State {
             model: open.model.clone(),
             effort: open.effort.clone(),
@@ -220,6 +234,8 @@ impl ChatSession {
             proc: RefCell::new(None),
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
+            retired: RefCell::new(None),
+            selected: RefCell::new(selected),
             ctl_seq: Cell::new(0),
             local_seq: Cell::new(0),
             generation: Cell::new(0),
@@ -247,6 +263,25 @@ impl ChatSession {
         self.inner.emit(Envelope::new(Event::Notice {
             text: format!("Continuing from {source} with {carried} earlier messages"),
         }));
+    }
+
+    /// Marks the thread's model as retired (or clears it with `None`): the next prompt moves the
+    /// thread to the replacement first, through the ordinary same-agent switch, and says so. A
+    /// switch the user makes meanwhile replaces the whole question.
+    pub fn set_retired(&self, retired: Option<RetiredModel>) {
+        *self.inner.retired.borrow_mut() = retired;
+    }
+
+    /// The model the thread was last set to (an alias where the agent has one); `None` is the
+    /// agent's own default.
+    pub fn selected_model(&self) -> Option<String> {
+        self.inner.selected.borrow().clone()
+    }
+
+    /// Adds a notice to the thread (stored and shown like any event).
+    pub fn note(&self, text: impl Into<String>) {
+        self.inner
+            .emit(Envelope::new(Event::Notice { text: text.into() }));
     }
 
     #[cfg(test)]
@@ -696,7 +731,36 @@ impl Inner {
         format!("{prefix}-{n}")
     }
 
+    /// A prompt must not start a turn on a retired model: move to its replacement first.
+    fn apply_retired(self: &Rc<Self>) {
+        let Some(retired) = self.retired.borrow_mut().take() else {
+            return;
+        };
+        let driver = self.adapter.borrow().driver();
+        self.switch(
+            driver,
+            Some(retired.replacement.model.clone()),
+            retired.replacement.effort.clone(),
+        );
+        self.emit(Envelope::new(Event::Notice {
+            text: retired_notice(&retired),
+        }));
+    }
+
+    /// Remembers the model the thread was set to, for the next time it is opened.
+    fn persist_model(&self, model: &str) {
+        *self.selected.borrow_mut() = Some(model.to_owned());
+        let pt = self.provider_thread.borrow().clone();
+        if pt.is_empty() {
+            return;
+        }
+        if let Err(e) = self.store.set_provider_model(&pt, model) {
+            warn!(error = %e, "could not record the thread's model");
+        }
+    }
+
     fn send_prompt(self: &Rc<Self>, text: &str) {
+        self.apply_retired();
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
         let item = match self.store.append_user_message(&self.thread, provider, text) {
@@ -852,6 +916,16 @@ impl Inner {
         let plan = plan_selection(&caps, &current.selection, &target.selection);
         let transition = decide_transition(Some(&current), &target, true, Some(&plan));
         debug!(?transition, "model switch");
+        // A choice made now settles any pending question about a retired model, and a model
+        // switched to on this agent is what a reopened thread resumes on.
+        *self.retired.borrow_mut() = None;
+        if matches!(
+            transition,
+            Transition::SwitchModelInSession | Transition::RestartAndResume
+        ) && !target_model.is_empty()
+        {
+            self.persist_model(&target_model);
+        }
         match transition {
             Transition::Reuse => {}
             Transition::SwitchModelInSession => {
@@ -958,6 +1032,7 @@ impl Inner {
         {
             let mut state = self.state.borrow_mut();
             state.model = model.clone();
+            *self.selected.borrow_mut() = model.clone();
             state.effort = effort.clone();
             state.native_id = None;
             state.commands.clear();
@@ -1248,6 +1323,126 @@ mod tests {
         });
     }
 
+    fn retired(old: &str, new: &str) -> RetiredModel {
+        RetiredModel {
+            model: old.into(),
+            replacement: Replacement {
+                model: new.into(),
+                display: new.to_uppercase(),
+                effort: None,
+            },
+        }
+    }
+
+    fn open_on(model: &str) -> OpenSession {
+        OpenSession {
+            program: "/bin/true".into(),
+            extra_args: Vec::new(),
+            cwd: "/".into(),
+            model: Some(model.into()),
+            effort: None,
+            mode: Mode::Ask,
+            resume: None,
+            new_session_id: None,
+            approval_hook: false,
+        }
+    }
+
+    #[test]
+    fn a_prompt_on_a_retired_model_first_moves_to_its_replacement_and_says_so() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("claude-sonnet-3-7"),
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            session.set_retired(Some(retired("claude-sonnet-3-7", "sonnet")));
+            session.send_prompt("hello");
+            let cmds = log.borrow().clone();
+            let set = cmds
+                .iter()
+                .position(|c| matches!(c, Command::SetModel { model, .. } if model == "sonnet"))
+                .expect("the replacement was set");
+            let prompt = cmds
+                .iter()
+                .position(|c| matches!(c, Command::Prompt { .. }))
+                .expect("the prompt was sent");
+            assert!(set < prompt, "the turn must not start on the dead model");
+            assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+                if text == "Continued on SONNET (claude-sonnet-3-7 was retired)")));
+            // What a reopened thread resumes on is the replacement (an alias), not the dead id.
+            let pt = store.provider_threads(&thread).expect("pts");
+            assert_eq!(pt[0].model, "sonnet");
+            // Asked once: the next prompt does not repeat it.
+            let before = log.borrow().len();
+            session.send_prompt("again");
+            assert_eq!(log.borrow().len(), before + 1, "just the prompt");
+        });
+    }
+
+    #[test]
+    fn choosing_a_model_yourself_settles_the_retired_question() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("old"),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.set_retired(Some(retired("old", "sonnet")));
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            session.send_prompt("hi");
+            assert!(!log
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, Command::SetModel { model, .. } if model == "sonnet")));
+            assert!(!has(&seen, |e| matches!(e, Event::Notice { text }
+                if text.contains("was retired"))));
+        });
+    }
+
+    #[test]
+    fn an_agy_resume_after_a_retirement_never_carries_the_retired_model() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, _seen) = make_sink();
+            let mut open = open_on("gemini-2-pro-high");
+            open.resume = Some("conv-1".into());
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.set_retired(Some(retired("gemini-2-pro-high", "gemini-4-pro-high")));
+            session.send_prompt("hello");
+            // The restart put the replacement on argv and kept the conversation.
+            let argv = session.launch_spec().argv;
+            assert!(argv.iter().any(|a| a == "gemini-4-pro-high"), "{argv:?}");
+            assert!(
+                !argv.iter().any(|a| a.contains("gemini-2-pro")),
+                "the retired model is still on argv: {argv:?}"
+            );
+            assert!(argv.iter().any(|a| a == "conv-1"), "{argv:?}");
+        });
+    }
+
     #[test]
     fn hook_flag_and_socket_env_come_from_one_value() {
         in_loop(|ctx| {
@@ -1440,11 +1635,7 @@ mod tests {
         fn unboxed(driver: Driver, log: &Log) -> Box<Self> {
             Box::new(Self {
                 driver,
-                caps: match driver {
-                    Driver::Claude => Capabilities::claude(),
-                    Driver::Agy => Capabilities::agy(),
-                    Driver::Codex => Capabilities::codex(),
-                },
+                caps: Capabilities::of(driver),
                 log: log.clone(),
                 refuse_set_model: false,
             })

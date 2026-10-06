@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
+use agent_core::catalog::{model_notice, ModelNotice};
 use agent_core::event::{Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
 
@@ -20,13 +21,17 @@ use super::*;
 use crate::account_status::AccountStatus;
 use crate::agent_proc::AgentEnv;
 use crate::approval_server::ApprovalHandle;
-use crate::chat::session::{build_handoff, AgentLaunch, ChatSession, LaunchEnv};
+use crate::availability::{
+    classify, probe_targets, unavailable_banner, AgentAvailability, Availability,
+};
+use crate::chat::session::{
+    build_handoff, retired_notice, AgentLaunch, ChatSession, LaunchEnv, RetiredModel,
+};
 use crate::chat::view::usage::UsageIndicator;
 use crate::chat::view::{ChatView, ViewAction};
 use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
-use crate::model_catalog::ModelCatalog;
-use crate::probe::{ProbeTarget, ProbeTargets};
+use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
     badge_for, driver_key, driver_label, group_rows, handoff_target, parse_driver, relative_time,
     resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
@@ -55,6 +60,8 @@ pub(super) struct ChatTab {
     drawer_paned: gtk4::Paned,
     drawer_started: bool,
     rate_banner: adw::Banner,
+    /// Shown when the thread's model is no longer offered by its agent.
+    model_banner: adw::Banner,
     running: bool,
     approval: bool,
     rate_limited: bool,
@@ -71,6 +78,8 @@ pub(super) struct ChatTab {
     /// A switch (agent, model, effort) to apply once the session exists (the thread menu's
     /// "Switch this thread to" on a thread that is not built yet).
     pub(super) pending_switch: Option<(Driver, Option<String>, Option<String>)>,
+    /// The banner is showing because the thread's agent is missing or off (not a rate limit).
+    unavailable: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -147,11 +156,7 @@ impl ChatBackend for SessionSlot {
                 mode: self.mode,
                 running_turn: false,
                 alive: false,
-                capabilities: match self.driver {
-                    Driver::Claude => agent_core::caps::Capabilities::claude(),
-                    Driver::Agy => agent_core::caps::Capabilities::agy(),
-                    Driver::Codex => agent_core::caps::Capabilities::codex(),
-                },
+                capabilities: agent_core::caps::Capabilities::of(self.driver),
                 commands: Vec::new(),
             },
         }
@@ -280,6 +285,45 @@ impl NewThread {
             handoff: None,
         }
     }
+}
+
+/// `model` and `effort` as they should be started: unchanged unless the agent's list, fetched in
+/// this run, no longer has `model`, then its replacement (and the record of the move).
+fn decide_live_model(
+    models: &[agent_core::catalog::CatalogModel],
+    fresh: bool,
+    model: Option<String>,
+    effort: Option<String>,
+) -> (Option<String>, Option<String>, Option<RetiredModel>) {
+    match model_notice(models, fresh, model.as_deref(), effort.as_deref()) {
+        ModelNotice::Retired {
+            model: old,
+            replacement: Some(replacement),
+        } => (
+            Some(replacement.model.clone()),
+            replacement.effort.clone().or(effort),
+            Some(RetiredModel {
+                model: old,
+                replacement,
+            }),
+        ),
+        _ => (model, effort, None),
+    }
+}
+
+/// [`decide_live_model`] against the app's catalogue.
+fn live_model(
+    driver: Driver,
+    model: Option<String>,
+    effort: Option<String>,
+) -> (Option<String>, Option<String>, Option<RetiredModel>) {
+    let catalog = ModelCatalog::shared();
+    decide_live_model(
+        &catalog.models_of(driver),
+        catalog.is_fresh(driver),
+        model,
+        effort,
+    )
 }
 
 /// What a thread page needs from the store to be built, read in one off-thread job.
@@ -528,11 +572,10 @@ thread_local! {
 /// awaits this; a switch to agy (which cannot wait) uses [`cached_hook_verdict`].
 pub(super) async fn check_hook() -> Result<(), String> {
     let home = env::var("HOME").ok();
-    let verdict = gtk4::gio::spawn_blocking(move || {
-        crate::hook_config::check_installed(home.as_deref())
-    })
-    .await
-    .unwrap_or_else(|_| Err("the hooks check panicked".to_owned()));
+    let verdict =
+        gtk4::gio::spawn_blocking(move || crate::hook_config::check_installed(home.as_deref()))
+            .await
+            .unwrap_or_else(|_| Err("the hooks check panicked".to_owned()));
     HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(verdict.clone()));
     verdict
 }
@@ -655,6 +698,7 @@ impl AgentTerminalWindow {
         *self.sidebar.borrow_mut() = Some(sidebar);
 
         self.wire_thread_pages(tab_view);
+        self.watch_availability();
         self.watch_account_status();
         self.refresh_sidebar();
         // Relative times age; a minute is their resolution.
@@ -1404,8 +1448,20 @@ impl AgentTerminalWindow {
                 banner.set_revealed(false);
             }
         ));
+        // Another banner for a model its agent no longer offers: "Choose…" opens the picker.
+        let model_banner = adw::Banner::builder()
+            .use_markup(false)
+            .button_label("Choose…")
+            .build();
+        let thread_id = thread.to_owned();
+        model_banner.connect_button_clicked(move |b| {
+            if let Some(obj) = window_of(b) {
+                obj.imp().choose_model(&thread_id);
+            }
+        });
         let content = Box::builder().orientation(Orientation::Vertical).build();
         content.append(&rate_banner);
+        content.append(&model_banner);
         content.append(&paned);
 
         let page = tab_view.append(&content);
@@ -1471,6 +1527,7 @@ impl AgentTerminalWindow {
                 drawer_paned,
                 drawer_started: false,
                 rate_banner,
+                model_banner,
                 running: false,
                 approval: false,
                 rate_limited: false,
@@ -1480,6 +1537,7 @@ impl AgentTerminalWindow {
                 pending_handoff: None,
                 pending_effort: None,
                 pending_switch: None,
+                unavailable: false,
             }),
         });
         if diff_panel.root.is_visible() {
@@ -1607,10 +1665,16 @@ impl AgentTerminalWindow {
             .and_then(|t| t.chat.as_mut())
             .and_then(|c| c.pending_effort.take())
             .or_else(|| profile.default_effort.clone());
-        let model = provider
-            .as_ref()
-            .and_then(|p| stored_model(Some(&p.model)))
-            .or_else(|| profile.default_model.clone());
+        // A model its agent no longer offers (judged on a list fetched in this run) is never
+        // started: the thread resumes on the replacement, and says so.
+        let (model, effort, ported) = live_model(
+            driver,
+            provider
+                .as_ref()
+                .and_then(|p| stored_model(Some(&p.model)))
+                .or_else(|| profile.default_model.clone()),
+            effort,
+        );
         let mode = profile.default_mode.unwrap_or_default();
         let program = resolved
             .program
@@ -1654,6 +1718,15 @@ impl AgentTerminalWindow {
         session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
         *slot.session.borrow_mut() = Some(session.clone());
         view.refresh_status();
+        if let Some(moved) = &ported {
+            session.note(retired_notice(moved));
+            if let Some(pt) = provider.as_ref().map(|p| p.id.clone()) {
+                let new_model = moved.replacement.model.clone();
+                self.write_store("record the replacement model", move |s| {
+                    s.set_provider_model(&pt, &new_model)
+                });
+            }
+        }
 
         let weak_obj = self.obj().downgrade();
         let thread_id = thread.to_owned();
@@ -1691,6 +1764,8 @@ impl AgentTerminalWindow {
         if let Some(prompt) = prompt {
             session.send_prompt(&prompt);
         }
+        // The thread is built: judge its model against the current catalogue too.
+        self.evaluate_models();
         if self
             .tab_view
             .borrow()
@@ -1708,6 +1783,15 @@ impl AgentTerminalWindow {
     // -----------------------------------------------------------------------------------------
 
     fn on_thread_envelope(&self, thread: &str, driver: Driver, env: &Envelope) {
+        // A model change (the user's pick, a port) may settle or raise a retirement question.
+        if matches!(env.event, Event::ModelChanged { .. }) {
+            let weak = self.obj().downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(obj) = weak.upgrade() {
+                    obj.imp().evaluate_models();
+                }
+            });
+        }
         let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
         let focused = self.obj().is_active();
         enum After {
@@ -2032,20 +2116,10 @@ impl AgentTerminalWindow {
     // New threads
     // -----------------------------------------------------------------------------------------
 
-    /// Whether `driver` can take a thread: enabled, and its binary not known to be missing.
-    /// Codex has no profile until the user edits it, so it must be known to be installed.
+    /// Whether `driver` can take a thread: only when detection found it and it is enabled
+    /// ([`Availability::Ready`]). Nothing is assumed: an agent still being detected is not usable.
     pub(super) fn agent_usable(&self, driver: Driver) -> bool {
-        let config = self.config.borrow();
-        let profile = config
-            .agent_profile(driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver));
-        let found = crate::utils::cached_command_available(&profile.command);
-        !profile.disabled
-            && match driver {
-                Driver::Codex => found == Some(true),
-                Driver::Claude | Driver::Agy => found != Some(false),
-            }
+        AgentAvailability::shared().is_ready(driver)
     }
 
     /// The agent new threads start on: see [`crate::config::choose_default_agent`].
@@ -2069,6 +2143,12 @@ impl AgentTerminalWindow {
         prompt: Option<String>,
     ) {
         let Some(driver) = driver.or_else(|| self.default_agent()) else {
+            // Still looking for the agents: wait for the scan rather than guess (or give up).
+            if AgentAvailability::shared().any_detecting() {
+                *self.pending_new_thread.borrow_mut() = Some((dir, prompt));
+                self.show_toast("Detecting agents…");
+                return;
+            }
             present_message(
                 &self.obj(),
                 "No Chat Agent Available",
@@ -2122,6 +2202,8 @@ impl AgentTerminalWindow {
                 .agent_profile(driver)
                 .and_then(|p| p.default_model.clone())
         });
+        // A profile default the agent has retired is never started: the suggestion is used.
+        let (model, effort, _) = live_model(driver, model, effort);
         if let Err(e) = store
             .add_provider_thread(
                 &thread,
@@ -2300,64 +2382,244 @@ impl AgentTerminalWindow {
         );
     }
 
+    /// Scans for the agents and refreshes everything that depends on what is there: each
+    /// driver's [`Availability`] (the one source for every menu and picker), then the model
+    /// catalogue and the account status for the agents that turned out Ready. A switched-off
+    /// agent is known at once; the others keep their last state until the scan answers.
     pub(super) fn refresh_agent_data(&self) {
         // Also what a switch to agy needs: its hook verdict, read off the main thread.
         refresh_hook_verdict();
-        let (profiles, clear): (Vec<Profile>, Vec<String>) = {
+        let availability = AgentAvailability::shared();
+        availability.mark_scan_started();
+        let (profiles, clear): (Vec<(Driver, Profile)>, Vec<String>) = {
             let config = self.config.borrow();
             (
-                [Driver::Claude, Driver::Agy, Driver::Codex]
+                Driver::ALL
                     .into_iter()
                     .map(|d| {
-                        config
+                        let profile = config
                             .agent_profile(d)
                             .cloned()
-                            .unwrap_or_else(|| crate::config::new_agent_profile(d))
+                            .unwrap_or_else(|| crate::config::new_agent_profile(d));
+                        (d, profile)
                     })
                     .collect(),
                 config.clear_env.clone(),
             )
         };
+        for (driver, profile) in &profiles {
+            if profile.disabled {
+                availability.set(*driver, Availability::Disabled);
+            } else if availability.get(*driver) == Availability::Disabled {
+                availability.set(*driver, Availability::Detecting);
+            }
+        }
+        // Agents that were missing, or whose binary has gone, are looked for again.
+        forget_stale_resolutions();
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let mut resolved = Vec::new();
-            for profile in &profiles {
-                resolved.push(resolve_agent(profile.clone()).await);
+            let availability = AgentAvailability::shared();
+            let mut envs: Vec<(Driver, AgentEnv)> = Vec::new();
+            for (driver, profile) in profiles {
+                if profile.disabled {
+                    continue;
+                }
+                let resolved = resolve_agent(profile).await;
+                // Probes run where the threads run: the profile's env file and `clear_env`.
+                envs.push((
+                    driver,
+                    AgentEnv {
+                        env: resolved.env.clone(),
+                        unset: unset_list(&clear),
+                    },
+                ));
+                availability.set(driver, classify(false, Some(resolved.program.as_deref())));
             }
-            // Detection is done: the New Thread With menu can list what is installed.
+            // Only what is Ready is probed: a missing or switched-off binary is never spawned.
+            let targets = probe_targets(&availability.all(), |d| {
+                envs.iter()
+                    .find(|(driver, _)| *driver == d)
+                    .map(|(_, env)| env.clone())
+                    .unwrap_or_default()
+            });
+            ModelCatalog::shared().refresh(&targets);
+            AccountStatus::shared().refresh(&targets);
             if let Some(obj) = obj.upgrade() {
-                obj.imp().fill_new_with_menu();
-            }
-            // Probes run where the threads run: the profile's env file and the `clear_env` list.
-            let target = |profile: &Profile, agent: &ResolvedAgent| ProbeTarget {
-                program: agent
-                    .program
-                    .clone()
-                    .unwrap_or_else(|| profile.command.clone()),
-                env: AgentEnv {
-                    env: agent.env.clone(),
-                    unset: unset_list(&clear),
-                },
-            };
-            if let [(claude, c), (agy, a), (codex, x)] =
-                &profiles.iter().zip(resolved.iter()).collect::<Vec<_>>()[..]
-            {
-                let targets = ProbeTargets {
-                    claude: target(claude, c),
-                    agy: target(agy, a),
-                    // Not installed (no binary found) or switched off: nothing is spawned.
-                    codex: (x.program.is_some() && !codex.disabled).then(|| target(codex, x)),
-                };
-                ModelCatalog::shared().refresh(&targets);
-                AccountStatus::shared().refresh(&targets);
+                obj.imp().on_availability_changed();
             }
         });
     }
+
+    /// Connects the window to [`AgentAvailability`] and re-scans when the window regains focus
+    /// and the last scan is over a minute old (a binary installed or removed meanwhile).
+    fn watch_availability(&self) {
+        let obj = self.obj();
+        AgentAvailability::shared().connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            move || obj.imp().on_availability_changed()
+        ));
+        // A fresh model list may retire a thread's model (or bring it back).
+        ModelCatalog::shared().connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            move || obj.imp().evaluate_models()
+        ));
+        obj.connect_is_active_notify(|window| {
+            if window.is_active() && AgentAvailability::shared().scan_is_stale() {
+                window.imp().refresh_agent_data();
+            }
+        });
+    }
+
+    /// An agent's availability changed (or a scan ended): everything that offers agents follows.
+    pub(super) fn on_availability_changed(&self) {
+        self.fill_new_with_menu();
+        // The picker hides agents that are not ready; an open one redraws.
+        ModelCatalog::shared().notify();
+        self.update_unavailable_banners();
+        self.evaluate_models();
+        // A "new thread" asked for while the agents were still being detected.
+        if !AgentAvailability::shared().any_detecting() {
+            let pending = self.pending_new_thread.borrow_mut().take();
+            if let Some((dir, prompt)) = pending {
+                self.new_chat_thread(None, dir, prompt);
+            }
+        }
+    }
+
+    /// Judges every built thread's model against its agent's CURRENT catalogue: one the agent no
+    /// longer offers gets a banner (with "Choose…") and, when there is a replacement, the session
+    /// is told to move to it before the next turn. A list that is only cached, or still loading,
+    /// is never grounds for calling a model retired.
+    pub(super) fn evaluate_models(&self) {
+        let catalog = ModelCatalog::shared();
+        let availability = AgentAvailability::shared();
+        let built: Vec<(adw::Banner, Rc<ChatSession>)> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .filter_map(|c| Some((c.model_banner.clone(), c.slot.get()?)))
+            .collect();
+        for (banner, session) in built {
+            let status = session.status();
+            let driver = status.driver;
+            let notice = if availability.is_ready(driver) {
+                model_notice(
+                    &catalog.models_of(driver),
+                    catalog.is_fresh(driver),
+                    session.selected_model().as_deref(),
+                    status.effort.as_deref(),
+                )
+            } else {
+                ModelNotice::None
+            };
+            match retirement_banner(driver_label(driver), &notice) {
+                Some(text) => {
+                    banner.set_title(&text);
+                    banner.set_revealed(true);
+                }
+                None => banner.set_revealed(false),
+            }
+            session.set_retired(match notice {
+                ModelNotice::Retired {
+                    model,
+                    replacement: Some(replacement),
+                } => Some(RetiredModel { model, replacement }),
+                _ => None,
+            });
+        }
+    }
+
+    /// The model banner's "Choose…": the thread's own model picker.
+    fn choose_model(&self, thread: &str) {
+        let view = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread)
+            .and_then(|c| c.view.clone());
+        if let Some(view) = view {
+            view.open_model_picker();
+        }
+    }
+
+    /// An open thread whose agent is missing or switched off says so, and offers to continue in
+    /// another agent; the banner goes away again when the agent is back.
+    fn update_unavailable_banners(&self) {
+        let availability = AgentAvailability::shared();
+        let mut tabs = self.tabs.borrow_mut();
+        for chat in tabs.iter_mut().filter_map(|t| t.chat.as_mut()) {
+            let driver = chat.slot.driver();
+            let state = availability.get(driver);
+            let other = handoff_target(driver, |d| availability.is_ready(d));
+            match unavailable_banner(driver, &state, other) {
+                Some((title, button)) => {
+                    chat.rate_banner.set_title(&title);
+                    chat.rate_banner.set_button_label(button.as_deref());
+                    chat.rate_banner.set_revealed(true);
+                    chat.unavailable = true;
+                }
+                None if chat.unavailable && state.is_ready() => {
+                    chat.rate_banner.set_revealed(false);
+                    chat.unavailable = false;
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+/// Forgets resolutions that found nothing or whose binary is gone, so the next scan looks again
+/// (the shell probe is costly, so a binary that is still there is kept).
+fn forget_stale_resolutions() {
+    RESOLVED.with(|r| {
+        r.borrow_mut().retain(|_, agent| {
+            agent
+                .program
+                .as_deref()
+                .is_some_and(|p| std::path::Path::new(p).exists())
+        });
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rescan_keeps_found_binaries_that_still_exist_and_looks_again_for_the_rest() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let present = dir.path().join("claude");
+        std::fs::write(&present, "").expect("file");
+        let agent = |program: Option<String>| ResolvedAgent {
+            program,
+            env: Vec::new(),
+        };
+        RESOLVED.with(|r| {
+            let mut r = r.borrow_mut();
+            r.clear();
+            r.insert(
+                ("claude".into(), None),
+                agent(Some(present.display().to_string())),
+            );
+            r.insert(("agy".into(), None), agent(None));
+            r.insert(
+                ("codex".into(), None),
+                agent(Some("/nonexistent/codex".into())),
+            );
+        });
+        forget_stale_resolutions();
+        let kept: Vec<String> = RESOLVED.with(|r| r.borrow().keys().map(|k| k.0.clone()).collect());
+        assert_eq!(
+            kept,
+            ["claude"],
+            "missing and vanished entries are probed again"
+        );
+        RESOLVED.with(|r| r.borrow_mut().clear());
+    }
 
     #[test]
     fn unset_list_always_drops_an_inherited_approval_socket() {
@@ -2391,10 +2653,46 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_model_is_replaced_only_on_a_fresh_list_and_the_move_is_recorded() {
+        use agent_core::catalog::CatalogModel;
+        let model = |id: &str| CatalogModel {
+            driver: Driver::Claude,
+            id: id.into(),
+            display: id.to_uppercase(),
+            description: None,
+            efforts: vec!["low".into(), "high".into()],
+            default_effort: None,
+            via: None,
+        };
+        let list = vec![model("default"), model("sonnet")];
+        let run =
+            |fresh, m: &str| decide_live_model(&list, fresh, Some(m.into()), Some("high".into()));
+        // Cached or loading: left alone, even if it looks gone.
+        assert_eq!(
+            run(false, "claude-sonnet-3-7").0.as_deref(),
+            Some("claude-sonnet-3-7")
+        );
+        // A listed model is left alone.
+        assert_eq!(run(true, "sonnet").0.as_deref(), Some("sonnet"));
+        assert!(run(true, "sonnet").2.is_none());
+        // A retired one is replaced, keeping the effort the target offers.
+        let (m, e, moved) = run(true, "claude-sonnet-3-7");
+        assert_eq!((m.as_deref(), e.as_deref()), (Some("sonnet"), Some("high")));
+        assert_eq!(moved.expect("recorded").model, "claude-sonnet-3-7");
+        // No model at all is the agent's own default: nothing to port.
+        assert_eq!(
+            decide_live_model(&list, true, None, None),
+            (None, None, None)
+        );
+    }
+
+    #[test]
     fn an_unchecked_hook_is_treated_as_not_installed() {
         HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
         let before = cached_hook_verdict();
-        assert!(before.as_ref().is_err_and(|e| e.contains("not been checked")));
+        assert!(before
+            .as_ref()
+            .is_err_and(|e| e.contains("not been checked")));
         // And it stays closed through the binding: no socket, so agy runs read-only.
         assert!(bind_approval(before, "t", "/tmp", Mode::Ask).is_none());
         HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Err("not installed".into())));
