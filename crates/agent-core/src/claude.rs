@@ -6,7 +6,8 @@
 //!
 //! Frames are read as untyped [`serde_json::Value`]s, so a field the CLI adds or drops never
 //! aborts the stream: anything this adapter does not map becomes [`Event::Unknown`] with the whole
-//! frame in `raw`. Every emitted envelope carries the parsed frame as `raw`.
+//! frame in `raw`. The first envelope produced from a frame carries it as `raw` (once, not per
+//! envelope, so the store keeps one copy).
 //!
 //! Known limits (each with its upgrade path):
 //! - Assistant snapshots carry no block index. The adapter numbers them per message in arrival
@@ -690,12 +691,30 @@ impl ClaudeAdapter {
             (TurnState::Failed, Some(failure_text(v)))
         };
         let usage = v.get("usage").map(usage_of);
-        vec![Envelope::new(Event::TurnCompleted {
+        // Anything still open never got its own close: the turn is over, so settle it.
+        let mut out: Vec<Envelope> = std::mem::take(&mut self.open_items)
+            .into_iter()
+            .map(|item| {
+                let interrupted = state == TurnState::Interrupted;
+                Envelope::new(Event::ItemCompleted {
+                    status: if interrupted {
+                        ItemStatus::Interrupted
+                    } else {
+                        ItemStatus::Failed
+                    },
+                    output: None,
+                    error: (!interrupted).then(|| "no result for this item".to_owned()),
+                })
+                .item(item)
+            })
+            .collect();
+        out.push(Envelope::new(Event::TurnCompleted {
             state,
             usage,
             cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
             error,
-        })]
+        }));
+        out
     }
 }
 
@@ -754,7 +773,9 @@ impl Adapter for ClaudeAdapter {
             })
             .to_string(),
             Command::Interrupt => {
-                self.interrupt_pending = true;
+                // Only an open turn can be interrupted; a stale flag would mislabel the next
+                // result or exit.
+                self.interrupt_pending = self.turn_open;
                 let id = self.next_id("int");
                 self.control_line(&id, json!({"subtype": "interrupt"}))
             }
@@ -807,8 +828,9 @@ impl Adapter for ClaudeAdapter {
             return vec![Envelope::new(Event::Unknown).raw(Value::String(line.to_owned()))];
         };
         let mut out = self.map_frame(&frame);
-        for env in &mut out {
-            env.raw = Some(frame.clone());
+        // One copy of the frame per line, on the first envelope only.
+        if let Some(first) = out.first_mut() {
+            first.raw = Some(frame);
         }
         out
     }
@@ -1268,8 +1290,8 @@ mod tests {
                 .count()
                 >= 1,
         );
-        // Every envelope carries the frame it came from.
-        assert!(out.iter().all(|e| e.raw.is_some()));
+        // Frames are kept raw (on the first envelope each produced).
+        assert!(out.iter().any(|e| e.raw.is_some()));
         // Usage is normalised: input includes the cache.
         let Some(Event::TurnCompleted {
             usage: Some(u),
@@ -1450,7 +1472,8 @@ mod tests {
         );
         assert_eq!(s, TurnState::Failed);
         assert_eq!(e.as_deref(), Some("API error 529"));
-        // A pending interrupt turns an error result into Interrupted.
+        // A pending interrupt (of an open turn) turns an error result into Interrupted.
+        a.feed(&json!({"type": "system", "subtype": "init", "model": "m"}).to_string());
         written(&mut a, Command::Interrupt);
         let (s, _) = turn(
             &mut a,
@@ -1647,6 +1670,87 @@ mod tests {
                 expected: false
             })
         ));
+    }
+
+    fn init_frame() -> String {
+        json!({"type": "system", "subtype": "init", "model": "m", "session_id": "s"}).to_string()
+    }
+
+    fn open_tool_frame() -> String {
+        json!({"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}}})
+        .to_string()
+    }
+
+    #[test]
+    fn result_closes_items_still_open() {
+        // Failed turn: the dangling tool fails with a reason.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&open_tool_frame());
+        let out = a.feed(&json!({"type": "result", "subtype": "success"}).to_string());
+        assert!(matches!(
+            &out[0].event,
+            Event::ItemCompleted { status: ItemStatus::Failed, error: Some(e), .. }
+                if e == "no result for this item"
+        ));
+        assert_eq!(out[0].item.as_deref(), Some("t1"));
+        assert!(matches!(out[1].event, Event::TurnCompleted { .. }));
+        // An exit afterwards has nothing left to close.
+        assert!(!a
+            .on_exit(Some(0))
+            .iter()
+            .any(|e| matches!(e.event, Event::ItemCompleted { .. })));
+
+        // Interrupted turn: the item is Interrupted.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&open_tool_frame());
+        written(&mut a, Command::Interrupt);
+        let out = a.feed(
+            &json!({"type": "result", "subtype": "error_during_execution", "is_error": true})
+                .to_string(),
+        );
+        assert!(matches!(
+            out[0].event,
+            Event::ItemCompleted {
+                status: ItemStatus::Interrupted,
+                error: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            out[1].event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interrupt_without_an_open_turn_is_not_remembered() {
+        let mut a = ClaudeAdapter::new();
+        written(&mut a, Command::Interrupt);
+        a.feed(&init_frame());
+        let out = a.on_exit(Some(1));
+        assert!(matches!(
+            out.last().map(|e| &e.event),
+            Some(Event::SessionExited {
+                expected: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_is_attached_to_the_first_envelope_only() {
+        let mut a = ClaudeAdapter::new();
+        // init yields SessionStarted, TurnStarted and CommandsChanged.
+        let out = a.feed(&init_frame());
+        assert!(out.len() > 1);
+        assert!(out[0].raw.is_some());
+        assert!(out[1..].iter().all(|e| e.raw.is_none()));
     }
 
     #[test]

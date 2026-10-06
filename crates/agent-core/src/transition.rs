@@ -128,8 +128,12 @@ pub fn decide_transition(
     if selection_changed {
         return match selection_plan {
             Some(SelectionPlan::ApplyOnNextTurn) => Transition::SwitchModelInSession,
-            // `RestartSession`; the other plans returned above and `None` is unreachable here.
-            _ => Transition::RestartAndResume,
+            Some(SelectionPlan::RestartSession) => Transition::RestartAndResume,
+            // The first match already returned for these; refuse rather than guess if that
+            // ever changes.
+            Some(SelectionPlan::CreateWithHandoff | SelectionPlan::Reject(_)) | None => {
+                Transition::Reject("The selection change was not classified.".to_owned())
+            }
         };
     }
     Transition::Reuse

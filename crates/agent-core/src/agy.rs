@@ -8,6 +8,7 @@
 //! `Answer` are unsupported on purpose.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,6 +34,12 @@ const SIDE_COMMANDS: &[&str] = &[
     "/changelog",
 ];
 
+/// Source of the per-adapter item-id prefix used until the conversation id is known.
+static ADAPTER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The flag the adapter alone decides on (it is the hook's fail-safe, see [`Adapter::argv`]).
+const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
+
 /// Fragment of the error agy puts on a step the PreToolUse hook refused.
 const HOOK_DENIAL: &str = "denied by pre-tool hook";
 
@@ -57,6 +64,10 @@ pub struct AgyAdapter {
     side_kinds: HashMap<String, SideKind>,
     /// An interrupt or respawn was requested, so the coming exit is expected.
     exit_expected: bool,
+    /// Item-id prefix used while the conversation id is unknown (unique per adapter).
+    fallback_prefix: String,
+    /// Accumulated text of each open response item, flushed as a snapshot on completion.
+    resp_text: HashMap<String, String>,
 }
 
 impl Default for AgyAdapter {
@@ -78,6 +89,37 @@ impl AgyAdapter {
             side_seq: 0,
             side_kinds: HashMap::new(),
             exit_expected: false,
+            fallback_prefix: format!("a{}", ADAPTER_SEQ.fetch_add(1, Ordering::Relaxed)),
+            resp_text: HashMap::new(),
+        }
+    }
+
+    /// Item id for step `index`: `<conv8>:<kind>-<n>` (first 8 chars of the conversation id,
+    /// so ids stay unique across conversations), else the adapter's own prefix. An item already
+    /// open under an earlier prefix keeps it.
+    fn item_id(&self, kind: &str, index: u64) -> String {
+        let suffix = format!(":{kind}-{index}");
+        if let Some(open) = self.open_items.iter().find(|i| i.ends_with(&suffix)) {
+            return open.clone();
+        }
+        let prefix: String = match &self.conversation {
+            Some(c) if !c.is_empty() => c.chars().take(8).collect(),
+            _ => self.fallback_prefix.clone(),
+        };
+        format!("{prefix}{suffix}")
+    }
+
+    /// The whole text of a response item, as a snapshot so the store scrubs it in one piece (a
+    /// secret split across deltas is only caught there).
+    fn flush_text(&mut self, out: &mut Vec<Envelope>, id: &str) {
+        if let Some(text) = self.resp_text.remove(id).filter(|t| !t.is_empty()) {
+            out.push(
+                Envelope::new(Event::ContentSnapshot {
+                    stream: StreamKind::Assistant,
+                    text,
+                })
+                .item(id),
+            );
         }
     }
 
@@ -133,6 +175,7 @@ impl AgyAdapter {
         error: Option<String>,
     ) {
         self.open_items.retain(|i| i != id);
+        self.flush_text(out, id);
         out.push(
             Envelope::new(Event::ItemCompleted {
                 status,
@@ -146,6 +189,7 @@ impl AgyAdapter {
     fn close_all(&mut self, out: &mut Vec<Envelope>) {
         let open = std::mem::take(&mut self.open_items);
         for id in open {
+            self.flush_text(out, &id);
             out.push(
                 Envelope::new(Event::ItemCompleted {
                     status: ItemStatus::Interrupted,
@@ -203,10 +247,11 @@ impl AgyAdapter {
     }
 
     fn on_response(&mut self, step: &Step, index: u64, out: &mut Vec<Envelope>) {
-        let id = format!("resp-{index}");
+        let id = self.item_id("resp", index);
         let text = step.text_delta.as_deref().filter(|t| !t.is_empty());
         if let Some(text) = text {
             self.start_item(out, &id, ItemKind::AssistantMessage, "assistant".to_owned());
+            self.resp_text.entry(id.clone()).or_default().push_str(text);
             out.push(
                 Envelope::new(Event::ContentDelta {
                     stream: StreamKind::Assistant,
@@ -227,7 +272,7 @@ impl AgyAdapter {
     }
 
     fn on_tool(&mut self, step: &Step, index: u64, out: &mut Vec<Envelope>) {
-        let id = format!("step-{index}");
+        let id = self.item_id("step", index);
         let info = step.tool_info.clone().unwrap_or_default();
         let name = step
             .tool_name
@@ -315,10 +360,21 @@ impl Adapter for AgyAdapter {
     /// Fail-safe: `--dangerously-skip-permissions` makes the app's PreToolUse hook the ONLY gate,
     /// so it is passed solely when the hook is installed (`approval_hook`). Without the hook any
     /// mode other than Plan is forced down to `--mode plan` (read-only) rather than running
-    /// ungated. Plan itself never needs the flag.
+    /// ungated. Plan itself never needs the flag. For the same reason `session.extra_args` can
+    /// never carry it (`--dangerously-skip-permissions` or `--dangerously-skip-permissions=…`):
+    /// those are dropped silently (no I/O here) and the adapter alone decides.
     fn argv(&self, session: &OpenSession) -> Vec<String> {
         let mut argv = vec![session.program.clone()];
-        argv.extend(session.extra_args.iter().cloned());
+        argv.extend(
+            session
+                .extra_args
+                .iter()
+                .filter(|a| {
+                    a.as_str() != SKIP_PERMISSIONS
+                        && !a.starts_with(&format!("{SKIP_PERMISSIONS}="))
+                })
+                .cloned(),
+        );
         argv.extend(
             [
                 "--input-format",
@@ -355,14 +411,19 @@ impl Adapter for AgyAdapter {
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match command {
             Command::Prompt { text } => {
-                let first = text.split_whitespace().next().unwrap_or("");
-                if SIDE_COMMANDS.contains(&first) {
+                // The first token is matched case-insensitively after leading whitespace. Any
+                // other `/word` is forwarded as agent text (custom commands and skills).
+                let trimmed = text.trim();
+                let first = trimmed.split_whitespace().next().unwrap_or("");
+                if SIDE_COMMANDS.contains(&first.to_ascii_lowercase().as_str()) {
                     self.side_seq += 1;
                     let id = format!("side-{}", self.side_seq);
+                    let command =
+                        format!("{}{}", first.to_ascii_lowercase(), &trimmed[first.len()..]);
                     let action = self.side(
                         id,
                         SideKind::Json,
-                        &["-p", text.trim(), "--output-format", "json"],
+                        &["-p", &command, "--output-format", "json"],
                     );
                     return Ok(vec![action]);
                 }
@@ -482,8 +543,19 @@ impl Adapter for AgyAdapter {
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         let mut out = Vec::new();
         self.close_all(&mut out);
-        self.turn_open = false;
         let expected = std::mem::take(&mut self.exit_expected);
+        if std::mem::take(&mut self.turn_open) {
+            out.push(env(Event::TurnCompleted {
+                state: if expected {
+                    TurnState::Interrupted
+                } else {
+                    TurnState::Failed
+                },
+                usage: None,
+                cost_usd: None,
+                error: (!expected).then(|| format!("agy exited unexpectedly (code {code:?})")),
+            }));
+        }
         out.push(env(Event::SessionExited { code, expected }));
         out
     }
@@ -707,6 +779,13 @@ mod tests {
         events
     }
 
+    /// True when the envelope belongs to the item `<conv8>:<tail>`.
+    fn is_item(e: &Envelope, tail: &str) -> bool {
+        e.item
+            .as_deref()
+            .is_some_and(|i| i.ends_with(&format!(":{tail}")))
+    }
+
     fn completed(events: &[Envelope]) -> Vec<(&str, &Event)> {
         events
             .iter()
@@ -738,7 +817,7 @@ mod tests {
         assert!(matches!(ev[1].event, Event::TurnStarted { .. }));
         let view = ev
             .iter()
-            .find(|e| e.item.as_deref() == Some("step-2"))
+            .find(|e| is_item(e, "step-2"))
             .expect("view_file item");
         assert!(
             matches!(&view.event, Event::ItemStarted { kind: ItemKind::FileRead, title, .. }
@@ -746,9 +825,7 @@ mod tests {
         );
         let edit = ev
             .iter()
-            .find(|e| {
-                e.item.as_deref() == Some("step-4") && matches!(e.event, Event::ItemStarted { .. })
-            })
+            .find(|e| is_item(e, "step-4") && matches!(e.event, Event::ItemStarted { .. }))
             .expect("edit item");
         assert!(matches!(
             &edit.event,
@@ -759,7 +836,7 @@ mod tests {
         ));
         let text: String = ev
             .iter()
-            .filter(|e| e.item.as_deref() == Some("resp-7"))
+            .filter(|e| is_item(e, "resp-7"))
             .filter_map(|e| match &e.event {
                 Event::ContentDelta { text, .. } => Some(text.as_str()),
                 _ => None,
@@ -768,9 +845,9 @@ mod tests {
         assert!(text.starts_with("Added [`multiply`]"));
         assert!(text.ends_with("```\n"));
         let done = completed(&ev);
-        assert!(done.iter().any(|(id, _)| *id == "resp-7"));
+        assert!(done.iter().any(|(id, _)| id.ends_with(":resp-7")));
         // user_input and thinking-only response steps produce no items.
-        assert!(!ev.iter().any(|e| e.item.as_deref() == Some("resp-1")));
+        assert!(!ev.iter().any(|e| is_item(e, "resp-1")));
         let last = ev.last().expect("events");
         match &last.event {
             Event::TurnCompleted { state, usage, .. } => {
@@ -791,7 +868,7 @@ mod tests {
         let done = completed(&ev);
         let ok = done
             .iter()
-            .find(|(id, _)| *id == "step-2")
+            .find(|(id, _)| id.ends_with(":step-2"))
             .expect("allowed command");
         assert!(
             matches!(ok.1, Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), .. }
@@ -799,16 +876,13 @@ mod tests {
         );
         let denied = done
             .iter()
-            .find(|(id, _)| *id == "step-4")
+            .find(|(id, _)| id.ends_with(":step-4"))
             .expect("denied command");
         assert!(
             matches!(denied.1, Event::ItemCompleted { status: ItemStatus::Declined, error: Some(e), .. }
             if e.contains("denied by pre-tool hook"))
         );
-        let started = ev
-            .iter()
-            .find(|e| e.item.as_deref() == Some("step-2"))
-            .expect("start");
+        let started = ev.iter().find(|e| is_item(e, "step-2")).expect("start");
         assert!(
             matches!(&started.event, Event::ItemStarted { kind: ItemKind::Command, title, .. }
             if title == "echo allow-me")
@@ -826,11 +900,17 @@ mod tests {
             })
             .collect();
         assert!(text.starts_with("Rivers are the vascular system"));
+        let text_all = text.clone();
         assert!(ev
             .iter()
             .any(|e| matches!(&e.event, Event::Error { message } if message == "interrupted")));
-        // The open response is cut short, then the turn is Interrupted.
+        // The open response is cut short (its whole text snapshotted first), then the turn is
+        // Interrupted.
         let n = ev.len();
+        assert!(matches!(
+            &ev[n - 3].event,
+            Event::ContentSnapshot { stream: StreamKind::Assistant, text } if text == &text_all
+        ));
         assert!(matches!(
             ev[n - 2].event,
             Event::ItemCompleted {
@@ -1107,5 +1187,142 @@ mod tests {
             matches!(&ev[0].event, Event::ControlResult { ok: None, error: Some(e) }
             if e == "boom")
         );
+    }
+
+    fn active_tool(index: u64, conv: &str) -> String {
+        format!(
+            r#"{{"event":"step_update","conversation_id":"{conv}","step_update":{{"conversation_id":"{conv}","state":"ACTIVE","step_index":{index},"step_type":"tool","tool_name":"run_command"}}}}"#
+        )
+    }
+
+    #[test]
+    fn extra_args_cannot_smuggle_skip_permissions() {
+        let a = AgyAdapter::default();
+        let mut s = session(Mode::Ask, false);
+        s.extra_args = vec![
+            "--dangerously-skip-permissions".into(),
+            "--dangerously-skip-permissions=true".into(),
+            "--keep".into(),
+        ];
+        let argv = a.argv(&s);
+        assert!(argv.contains(&"--keep".to_owned()));
+        assert!(
+            !argv
+                .iter()
+                .any(|x| x.starts_with("--dangerously-skip-permissions")),
+            "{argv:?}"
+        );
+        // With the hook the adapter adds exactly one itself.
+        s.approval_hook = true;
+        let n = a
+            .argv(&s)
+            .iter()
+            .filter(|x| x.starts_with("--dangerously-skip-permissions"))
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn side_commands_match_case_insensitively_and_other_slashes_forward() {
+        let mut a = AgyAdapter::new("agy");
+        for text in ["/Model", "  /MODEL  ", "\n/model"] {
+            let r = a.encode(Command::Prompt { text: text.into() }).expect("ok");
+            assert!(
+                matches!(&r[0], Action::SideProcess { argv, .. }
+                    if argv[..] == ["agy", "-p", "/model", "--output-format", "json"]),
+                "{text:?}"
+            );
+        }
+        let r = a
+            .encode(Command::Prompt {
+                text: "/Usage now".into(),
+            })
+            .expect("ok");
+        assert!(matches!(&r[0], Action::SideProcess { argv, .. } if argv[2] == "/usage now"));
+        let r = a
+            .encode(Command::Prompt {
+                text: "/my-skill go".into(),
+            })
+            .expect("ok");
+        assert!(matches!(r[0], Action::Write(_)));
+    }
+
+    #[test]
+    fn response_completion_snapshots_the_whole_text() {
+        let mut a = AgyAdapter::default();
+        let step = |state: &str, delta: &str| {
+            format!(
+                r#"{{"event":"step_update","step_update":{{"conversation_id":"abcdef123456","state":"{state}","step_index":5,"step_type":"agent_response","text_delta":"{delta}"}}}}"#
+            )
+        };
+        a.feed(&step("ACTIVE", "ghp_abcdefghij"));
+        let ev = a.feed(&step("DONE", "klmnop"));
+        let n = ev.len();
+        assert!(matches!(
+            &ev[n - 2].event,
+            Event::ContentSnapshot { stream: StreamKind::Assistant, text } if text == "ghp_abcdefghijklmnop"
+        ));
+        assert_eq!(ev[n - 2].item.as_deref(), Some("abcdef12:resp-5"));
+        assert!(matches!(
+            ev[n - 1].event,
+            Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn item_ids_are_unique_across_conversations() {
+        let ids = |conv: &str| {
+            let mut a = AgyAdapter::default();
+            a.feed(&active_tool(2, conv));
+            a.open_items.clone()
+        };
+        assert_eq!(ids("11111111-aaaa"), vec!["11111111:step-2".to_owned()]);
+        assert_ne!(ids("11111111-aaaa"), ids("22222222-bbbb"));
+        // Before any conversation id is known, two adapters still differ.
+        let bare = |_: ()| {
+            let mut a = AgyAdapter::default();
+            a.feed(
+                r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_index":2,"step_type":"tool","tool_name":"run_command"}}"#,
+            );
+            a.open_items.clone()
+        };
+        assert_ne!(bare(()), bare(()));
+    }
+
+    #[test]
+    fn on_exit_with_an_open_turn_completes_it() {
+        let mut a = AgyAdapter::default();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        let ev = a.on_exit(Some(1));
+        assert!(matches!(
+            &ev[0].event,
+            Event::TurnCompleted { state: TurnState::Failed, error: Some(e), .. } if e.contains("unexpectedly")
+        ));
+        assert!(matches!(
+            ev[1].event,
+            Event::SessionExited {
+                expected: false,
+                ..
+            }
+        ));
+
+        let mut a = AgyAdapter::default();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        a.encode(Command::Interrupt).expect("interrupt");
+        let ev = a.on_exit(Some(130));
+        assert!(matches!(
+            ev[0].event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                error: None,
+                ..
+            }
+        ));
+        // No open turn: no TurnCompleted.
+        let mut a = AgyAdapter::default();
+        assert_eq!(a.on_exit(Some(0)).len(), 1);
     }
 }
