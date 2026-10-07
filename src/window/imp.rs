@@ -706,6 +706,10 @@ pub struct AgentTerminalWindow {
     /// and never reads the store itself. Reloaded off the main thread when the store changes.
     summaries: RefCell<Option<Vec<agent_kit::store::ThreadSummary>>>,
     summaries_loading: std::cell::Cell<bool>,
+    /// The "stop running threads and close?" question is on screen.
+    close_prompt_open: std::cell::Cell<bool>,
+    /// The user agreed to stop busy threads: the next close request goes through.
+    close_confirmed: std::cell::Cell<bool>,
     /// A change arrived while a reload was running: load again when it ends.
     summaries_stale: std::cell::Cell<bool>,
     /// The sidebar's "Show archived" toggle.
@@ -751,6 +755,10 @@ impl WindowImpl for AgentTerminalWindow {
     /// Flushes any debounced config save before the window goes away, so a quick
     /// zoom-then-quit does not lose the change it was still waiting to write.
     fn close_request(&self) -> glib::Propagation {
+        // Threads mid-turn or waiting for an answer: ask before stopping them.
+        if !self.close_confirmed.get() && self.confirm_close_busy() {
+            return glib::Propagation::Stop;
+        }
         // Both before the window goes: a quick zoom-then-quit must not lose the
         // change still waiting on the debounce timer, and the tab layout is only
         // knowable while the tabs still exist.

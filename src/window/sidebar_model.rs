@@ -59,6 +59,19 @@ pub fn needs_attention(row: &SidebarRow, shown: Option<&RowKey>, window_focused:
     row.badge == Some(Badge::NeedsApproval) && (shown != Some(&row.key) || !window_focused)
 }
 
+/// Whether closing a thread would cut work short: a turn running or an answer awaited.
+pub fn is_busy(running: bool, approval: bool) -> bool {
+    running || approval
+}
+
+/// The window-close question's title for `n` busy threads.
+pub fn stop_heading(n: usize) -> String {
+    match n {
+        1 => "Stop 1 running thread and close?".to_owned(),
+        n => format!("Stop {n} running threads and close?"),
+    }
+}
+
 /// What happened to a thread that may need the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attention {
@@ -523,6 +536,15 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_means_running_or_waiting_and_the_heading_counts() {
+        assert!(!is_busy(false, false));
+        assert!(is_busy(true, false));
+        assert!(is_busy(false, true));
+        assert_eq!(stop_heading(1), "Stop 1 running thread and close?");
+        assert_eq!(stop_heading(3), "Stop 3 running threads and close?");
+    }
 
     #[test]
     fn a_request_is_announced_unless_you_are_looking_at_it() {

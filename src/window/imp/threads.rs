@@ -34,9 +34,9 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, driver_key, driver_label, group_rows, handoff_target, needs_attention, parse_driver,
-    react, relative_time, resume_as, stored_model, thread_title, Attention, Badge, ResumeAs,
-    RowKey, SidebarRow,
+    badge_for, driver_key, driver_label, group_rows, handoff_target, is_busy, needs_attention,
+    parse_driver, react, relative_time, resume_as, stop_heading, stored_model, thread_title,
+    Attention, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -63,6 +63,14 @@ fn approval_notification_id(thread: &str) -> String {
 /// threads finishing never collapse into a notification that opens only the last).
 fn turn_notification_id(thread: &str) -> String {
     format!("turn-{thread}")
+}
+
+impl ChatTab {
+    /// Whether closing this thread would cut work short. The one place the close question
+    /// (the row's X, archive, the window) decides; extend it for background work.
+    pub(super) fn busy(&self) -> bool {
+        is_busy(self.running, self.approval)
+    }
 }
 
 /// One chat thread page's state, beside its [`TabState`].
@@ -1419,7 +1427,65 @@ impl AgentTerminalWindow {
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .any(|c| &c.thread == id && (c.running || c.approval))
+            .any(|c| &c.thread == id && c.busy())
+    }
+
+    /// On a window close request: when any thread is busy, asks once and returns true (the
+    /// close is held back). "Stop and Close" lets the next close request through, which stops
+    /// every session; Cancel leaves the window open. False when nothing is busy.
+    pub(super) fn confirm_close_busy(&self) -> bool {
+        let titles: Vec<String> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .filter(|c| c.busy())
+            .map(|c| {
+                if c.title.is_empty() {
+                    "New thread".to_owned()
+                } else {
+                    c.title.clone()
+                }
+            })
+            .collect();
+        if titles.is_empty() {
+            return false;
+        }
+        if self.close_prompt_open.replace(true) {
+            return true; // one question at a time
+        }
+        let dialog = adw::AlertDialog::new(
+            Some(&stop_heading(titles.len())),
+            Some(&format!(
+                "Closing stops the agent, and any sub-agents, before they finish:\n\n{}\n\n\
+                 Edits already made stay on disk.",
+                titles
+                    .iter()
+                    .map(|t| format!("• {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("stop", "Stop and Close")]);
+        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let response = dialog
+                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
+                .await;
+            let imp = window.imp();
+            imp.close_prompt_open.set(false);
+            if response == "stop" {
+                imp.close_confirmed.set(true);
+                window.close();
+                // Still here: the close was refused somewhere else. Ask again next time.
+                imp.close_confirmed.set(false);
+            }
+        });
+        true
     }
 
     /// Runs `then` once the user agrees to stop `thread`'s running turn (closing or archiving
