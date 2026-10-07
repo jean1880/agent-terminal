@@ -294,7 +294,13 @@ const STATUS_TASKS: usize = 3;
 /// A background task as the status names it: its description's first line, else what kind of
 /// task it is.
 fn task_name(task: &BackgroundTask) -> String {
-    let first_line = |d: &str| d.lines().next().unwrap_or_default().trim().to_owned();
+    let first_line = |d: &str| {
+        d.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    };
     match task.description.as_deref().map(first_line).as_deref() {
         Some(d) if !d.is_empty() => d.to_owned(),
         _ => match task.kind {
@@ -1533,6 +1539,11 @@ mod tests {
             tool_use_id: None,
         };
         assert_eq!(task_name(&task), "Review the diff");
+        let leading = BackgroundTask {
+            description: Some("\n  \nMap the crate".into()),
+            ..task
+        };
+        assert_eq!(task_name(&leading), "Map the crate");
     }
 
     #[test]
