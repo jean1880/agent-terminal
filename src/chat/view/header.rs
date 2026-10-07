@@ -163,6 +163,12 @@ impl Header {
         self.spinner.set_spinning(running);
     }
 
+    /// Whether the header says the agent is working (tests).
+    #[cfg(test)]
+    pub fn running_shown(&self) -> bool {
+        self.activity.is_visible()
+    }
+
     pub fn set_gauge(&self, gauge: Option<&Gauge>) {
         let Some(g) = gauge else {
             self.gauge.set_visible(false);
