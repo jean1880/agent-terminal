@@ -1735,7 +1735,7 @@ impl AgentTerminalWindow {
                     // closes out (open items, approvals, the turn) instead of ending open.
                     if let Some(chat) = &tab.chat {
                         if let Some(session) = chat.slot.get() {
-                            session.shutdown();
+                            session.shutdown(!chat.unread);
                         }
                         imp.withdraw_thread_notifications(&chat.thread);
                     }

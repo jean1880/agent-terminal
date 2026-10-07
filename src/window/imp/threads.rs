@@ -86,7 +86,9 @@ pub(super) struct ChatTab {
     running: bool,
     approval: bool,
     rate_limited: bool,
-    unread: bool,
+    pub(super) unread: bool,
+    /// A "stop and close?" question is already on screen for this thread.
+    confirming_close: bool,
     /// The user message item awaiting its text, for the title of an untitled thread.
     title_item: Option<String>,
     /// Sent once the session exists (Continue In from a terminal page).
@@ -1423,6 +1425,17 @@ impl AgentTerminalWindow {
     /// Runs `then` once the user agrees to stop `thread`'s running turn (closing or archiving
     /// ends its session). Cancelling does nothing.
     pub(super) fn confirm_stop_then(&self, thread: &str, then: impl FnOnce(&Self) + 'static) {
+        // At most one question per thread: a second click on X while it is open does nothing.
+        let first = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+            .is_some_and(|c| !std::mem::replace(&mut c.confirming_close, true));
+        if !first {
+            return;
+        }
         let title = self.thread_title_of(thread);
         let dialog = adw::AlertDialog::new(
             Some("Stop the Running Turn and Close?"),
@@ -1435,12 +1448,23 @@ impl AgentTerminalWindow {
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
-        let obj = self.obj().downgrade();
+        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
         glib::MainContext::default().spawn_local(async move {
             let Some(window) = obj.upgrade() else { return };
             let response = dialog
                 .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
                 .await;
+            // Reopened for a later close; the tab may be gone already.
+            if let Some(c) = window
+                .imp()
+                .tabs
+                .borrow_mut()
+                .iter_mut()
+                .filter_map(|t| t.chat.as_mut())
+                .find(|c| c.thread == thread)
+            {
+                c.confirming_close = false;
+            }
             if response == "stop" {
                 then(window.imp());
             }
@@ -1907,8 +1931,11 @@ impl AgentTerminalWindow {
                 running: false,
                 approval: false,
                 rate_limited: false,
-                // A restored thread that was never shown keeps the store's unread mark.
+                // A restored thread that was never shown keeps the store's unread mark. Same
+                // rule as a closed row in `sidebar_rows`: an empty thread (updated_at 0) has
+                // nothing to read.
                 unread: summary.unread && summary.updated_at > 0,
+                confirming_close: false,
                 title_item: None,
                 pending_prompt: None,
                 pending_handoff: None,
@@ -2534,10 +2561,12 @@ impl AgentTerminalWindow {
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .map(|c| (c.slot.get(), c.thread.clone()))
+            .map(|c| ((c.slot.get(), !c.unread), c.thread.clone()))
             .unzip();
-        for session in sessions.into_iter().flatten() {
-            session.shutdown();
+        for (session, keep_read) in sessions {
+            if let Some(session) = session {
+                session.shutdown(keep_read);
+            }
         }
         for thread in threads {
             self.withdraw_thread_notifications(&thread);
