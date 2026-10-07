@@ -111,11 +111,7 @@ impl AgentTerminalWindow {
                     let Some(RowKey::Thread(thread)) = key_of_row(&sidebar, &row) else {
                         return;
                     };
-                    let point = list
-                        .compute_point(&row, &gtk4::graphene::Point::new(x as f32, y as f32))
-                        .map_or((x, y), |p| (f64::from(p.x()), f64::from(p.y())));
-                    obj.imp()
-                        .open_thread_menu(thread, row.upcast(), Some(point));
+                    obj.imp().open_thread_menu(thread, &row, Some((x, y)));
                 }
             )
         };
@@ -173,7 +169,7 @@ impl AgentTerminalWindow {
                 if delete {
                     obj.imp().confirm_delete(&thread);
                 } else {
-                    obj.imp().open_thread_menu(thread, row.upcast(), None);
+                    obj.imp().open_thread_menu(thread, &row, None);
                 }
                 glib::Propagation::Stop
             }
@@ -186,14 +182,34 @@ impl AgentTerminalWindow {
         menu_agents(&ModelCatalog::shared().models(), |d| self.agent_usable(d))
     }
 
-    /// Pops the thread's menu up on `row`: at `at` (the pointer), else where GTK puts it. Whether
-    /// the thread has any message is read off the main thread first.
+    /// Pops the thread's menu up by `row`: at `at` (the pointer, in the list's coordinates), else
+    /// below the row. Whether the thread has any message is read off the main thread first.
+    ///
+    /// The popover hangs off the list, never the row: the sidebar rebuilds its rows on any state
+    /// change (focus moving to the popover is one), and a row finalized under an open menu took
+    /// the menu with it.
     pub(super) fn open_thread_menu(
         &self,
         thread: String,
-        row: gtk4::Widget,
+        row: &gtk4::ListBoxRow,
         at: Option<(f64, f64)>,
     ) {
+        let Some(list) = self.sidebar.borrow().as_ref().map(|s| s.list.clone()) else {
+            return;
+        };
+        // Where to point, fixed now: the row may be gone by the time the menu opens.
+        let rect = match at {
+            Some((x, y)) => gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1),
+            None => match row.compute_bounds(&list) {
+                Some(b) => gtk4::gdk::Rectangle::new(
+                    b.x() as i32,
+                    b.y() as i32,
+                    b.width() as i32,
+                    b.height() as i32,
+                ),
+                None => return,
+            },
+        };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let has_messages = store_job({
@@ -217,10 +233,8 @@ impl AgentTerminalWindow {
             let popover = gtk4::PopoverMenu::from_model(Some(&menu));
             popover.set_has_arrow(false);
             popover.set_halign(gtk4::Align::Start);
-            popover.set_parent(&row);
-            if let Some((x, y)) = at {
-                popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            }
+            popover.set_parent(&list);
+            popover.set_pointing_to(Some(&rect));
             // Unparented once closed (not inside the signal itself).
             popover.connect_closed(|popover| {
                 let popover = popover.clone();

@@ -264,6 +264,64 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Marks the line carrying the shell's `PATH`, so whatever an rc prints first is skipped.
+const SHELL_PATH_MARKER: &str = "agent-terminal-path=";
+
+/// Only an answer is kept: a shell that timed out or said nothing is asked again next time (the
+/// agent scan re-runs on focus after a minute), so one slow login does not stick for the session.
+static SHELL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The `PATH` the user's interactive shell builds, which is the one their agents and indicator
+/// commands expect. A desktop launch inherits the session's `PATH`, which lacks what the rc adds
+/// (`~/.local/bin`, nvm), so an agent's `env-inspect` or an indicator's bare `litellm-sync` was
+/// "not found" although the user's terminal finds it. `None` when the shell could not say;
+/// callers then keep the inherited `PATH`.
+///
+/// Blocking on the first call (it sources the rc, bounded by [`SHELL_PROBE_TIMEOUT_SECS`]): call
+/// it off the main thread, and use [`known_shell_path`] there.
+pub fn shell_path() -> Option<&'static str> {
+    if let Some(path) = SHELL_PATH.get() {
+        return Some(path);
+    }
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty())?;
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args([
+        "-ic",
+        &format!("printf '\\n{SHELL_PATH_MARKER}%s\\n' \"$PATH\""),
+    ]);
+    let path = match run_command(cmd, &shell, SHELL_PROBE_TIMEOUT_SECS) {
+        Ok(output) => parse_shell_path(&String::from_utf8_lossy(&output.stdout)),
+        Err(reason) => {
+            warn!("Reading the shell's PATH gave up: {reason}; keeping the inherited one");
+            return None;
+        }
+    };
+    let Some(path) = path else {
+        warn!("{shell} did not report a PATH; keeping the inherited one");
+        return None;
+    };
+    // Two first callers may both ask; the first answer stored wins.
+    let path = SHELL_PATH.get_or_init(|| path);
+    info!("Agents and indicators run with the shell's PATH: {path}");
+    Some(path)
+}
+
+/// [`shell_path`] if it has been read already; never blocks. The agent scan reads it before any
+/// agent is Ready, so every agent spawn sees it.
+pub fn known_shell_path() -> Option<&'static str> {
+    SHELL_PATH.get().map(String::as_str)
+}
+
+/// The `PATH` in the shell's answer: the last marked line, as an rc may print a banner first.
+fn parse_shell_path(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim_end().strip_prefix(SHELL_PATH_MARKER))
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+}
+
 /// Whether `name` matches a `clear_env` pattern.
 ///
 /// Exact match, or prefix match when the pattern ends in `*`. Nothing fancier:
@@ -329,6 +387,16 @@ impl IndicatorState {
 /// Reads an indicator's source. Blocking — callers must run it off the main
 /// thread, for the same reason CLI resolution does.
 pub fn read_indicator(source: &crate::config::IndicatorSource) -> IndicatorState {
+    // The user's shell PATH, so a bare command their terminal finds is found here too.
+    let search = shell_path()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    read_indicator_with(source, &search)
+}
+
+/// [`read_indicator`], looking commands up in `search` (a `PATH` value).
+fn read_indicator_with(source: &crate::config::IndicatorSource, search: &str) -> IndicatorState {
     match source {
         crate::config::IndicatorSource::File { path } => {
             let path = &expand_tilde(path);
@@ -351,7 +419,7 @@ pub fn read_indicator(source: &crate::config::IndicatorSource) -> IndicatorState
                     reason: "Indicator command is empty".to_string(),
                 };
             };
-            run_with_timeout(command, args, *timeout_secs)
+            run_with_timeout(command, args, *timeout_secs, search)
         }
     }
 }
@@ -360,8 +428,25 @@ pub fn read_indicator(source: &crate::config::IndicatorSource) -> IndicatorState
 ///
 /// A configured command is arbitrary and may hang; without a bound it would tie
 /// up a worker thread for the life of the process.
-fn run_with_timeout(command: &str, args: &[String], timeout_secs: u64) -> IndicatorState {
-    match run_capture(command, args, None, timeout_secs) {
+fn run_with_timeout(
+    command: &str,
+    args: &[String],
+    timeout_secs: u64,
+    search: &str,
+) -> IndicatorState {
+    if !command_exists(command, search) {
+        return IndicatorState::Unknown {
+            reason: missing_command_guide(
+                command,
+                &crate::config::TerminalConfig::config_path()
+                    .display()
+                    .to_string(),
+            ),
+        };
+    }
+    let mut cmd = std::process::Command::new(command);
+    cmd.args(args).env("PATH", search);
+    match run_command(cmd, command, timeout_secs) {
         Ok(output) if output.status.success() => IndicatorState::Ok,
         Ok(output) => {
             let mut detail = String::from_utf8_lossy(&output.stdout).to_string();
@@ -377,27 +462,30 @@ fn run_with_timeout(command: &str, args: &[String], timeout_secs: u64) -> Indica
     }
 }
 
-/// Runs a command, optionally in `cwd`, and collects its output, giving up
-/// after `timeout_secs`. `Err` carries a sentence for the user.
-///
-/// Output is drained on its own threads while the command runs. Waiting first
-/// and reading after would deadlock on any command that fills the pipe buffer
-/// (64 KiB on Linux) — `git diff` on a large change, for one — which would
-/// then be reported as a timeout.
-///
-/// Blocking: call it off the main thread.
-pub fn run_capture(
-    command: &str,
-    args: &[String],
-    cwd: Option<&str>,
-    timeout_secs: u64,
-) -> Result<std::process::Output, String> {
-    let mut cmd = std::process::Command::new(command);
-    cmd.args(args);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+/// Whether `command` names an executable file: as a path when it has a `/`, else in a directory
+/// of `search`.
+fn command_exists(command: &str, search: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &std::path::Path| {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if command.contains('/') {
+        return executable(std::path::Path::new(&expand_tilde(command)));
     }
-    run_command(cmd, command, timeout_secs)
+    std::env::split_paths(search).any(|dir| executable(&dir.join(command)))
+}
+
+/// What an indicator whose command is missing shows when clicked: how to set it up, not an
+/// `os error 2`.
+fn missing_command_guide(command: &str, config_path: &str) -> String {
+    format!(
+        "{command} is not installed, or it is not on your shell's PATH.\n\n\
+         To set this indicator up, either:\n\
+         • install {command} so that `command -v {command}` finds it in a terminal, or\n\
+         • put its full path as the first `argv` entry of this indicator in {config_path}.\n\n\
+         To drop the indicator instead, remove its entry from `indicators` in that file. \
+         Restart Agent Terminal to check again."
+    )
 }
 
 /// Resolves the working directory to use, handling ~ expansion and fallback to home.
@@ -561,6 +649,12 @@ pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`super::read_indicator`] with the test process's own PATH: the real one would source
+    /// the developer's shell rc.
+    fn read_indicator(source: &crate::config::IndicatorSource) -> IndicatorState {
+        read_indicator_with(source, &std::env::var("PATH").unwrap_or_default())
+    }
     use tempfile::tempdir;
 
     fn profile(name: &str, command: &str) -> Profile {
@@ -1007,6 +1101,48 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_path_is_the_last_marked_line_whatever_the_rc_printed() {
+        let out = "Welcome!\nagent-terminal-path=/fake\n\nagent-terminal-path=/home/u/.local/bin:/usr/bin\n";
+        assert_eq!(
+            parse_shell_path(out).as_deref(),
+            Some("/home/u/.local/bin:/usr/bin")
+        );
+        assert_eq!(parse_shell_path("no marker here\n"), None);
+        assert_eq!(parse_shell_path("agent-terminal-path=\n"), None);
+    }
+
+    #[test]
+    fn a_missing_indicator_command_is_found_or_explained() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("my-probe");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let search = dir.path().display().to_string();
+        // Not executable yet: spawning it would fail, so it does not count.
+        assert!(!command_exists("my-probe", &search));
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(command_exists("my-probe", &search));
+        assert!(command_exists(&tool.display().to_string(), ""));
+        assert!(!command_exists("my-probe", "/nonexistent"));
+        assert!(!command_exists("/nonexistent/my-probe", &search));
+
+        // Unknown, with the steps to set it up, never a bare "os error 2".
+        let state = read_indicator(&crate::config::IndicatorSource::Command {
+            argv: vec!["agent-terminal-no-such-probe".to_string()],
+            timeout_secs: 5,
+        });
+        let IndicatorState::Unknown { reason } = state else {
+            panic!("a missing command is unknown, not {state:?}");
+        };
+        assert!(reason.contains("not installed"), "{reason}");
+        assert!(
+            reason.contains("command -v agent-terminal-no-such-probe"),
+            "{reason}"
+        );
+        assert!(reason.contains("config.json"), "{reason}");
+    }
+
+    #[test]
     fn indicator_command_exit_status_selects_the_state() {
         assert_eq!(
             read_indicator(&crate::config::IndicatorSource::Command {
@@ -1068,13 +1204,9 @@ mod tests {
         // its stdout. The call must come back, with what was printed, shortly
         // after the exit — not at the (here generous) overall timeout.
         let started = std::time::Instant::now();
-        let output = run_capture(
-            "sh",
-            &["-c".to_string(), "echo found; sleep 30 &".to_string()],
-            None,
-            10,
-        )
-        .expect("the command itself finished");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo found; sleep 30 &"]);
+        let output = run_command(cmd, "sh", 10).expect("the command itself finished");
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "found");
         assert!(

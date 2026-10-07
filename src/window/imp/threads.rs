@@ -38,6 +38,14 @@ use crate::window::sidebar_model::{
     relative_time, resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
+/// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
+/// `remove` refuses it, so walking `first_child` would never end.
+fn clear_rows(list: &gtk4::ListBox) {
+    while let Some(row) = list.row_at_index(0) {
+        list.remove(&row);
+    }
+}
+
 /// The store key holding the open-thread list (`{"open": [ids], "selected": id}`).
 const OPEN_THREADS_KEY: &str = "open_threads";
 /// Most events replayed into a thread's view when it opens.
@@ -1262,9 +1270,7 @@ impl AgentTerminalWindow {
         let now = now_ms();
 
         sidebar.rebuilding.set(true);
-        while let Some(child) = sidebar.list.first_child() {
-            sidebar.list.remove(&child);
-        }
+        clear_rows(&sidebar.list);
         let mut keys = Vec::new();
         let mut select = None;
         for (folder, rows) in groups {
@@ -1355,7 +1361,9 @@ impl AgentTerminalWindow {
             .css_classes(["thread-age", "dim-label", "caption"])
             .build();
         line.append(&age);
-        if let RowKey::Thread(thread_id) = &row.key {
+        // One trailing button per row: an open row closes, a closed one deletes (shown on hover).
+        // An open thread is deleted from its menu or with the Delete key.
+        if let (RowKey::Thread(thread_id), false) = (&row.key, row.open) {
             let delete = Button::builder()
                 .icon_name("at-user-trash-symbolic")
                 .tooltip_text("Delete thread…")
@@ -2854,6 +2862,12 @@ impl AgentTerminalWindow {
         forget_stale_resolutions();
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
+            // The shell's PATH, read once before any agent turns Ready: every agent spawn then
+            // runs with it (`agent_proc::use_shell_path`), never with the desktop session's.
+            let _ = gtk4::gio::spawn_blocking(|| {
+                crate::utils::shell_path();
+            })
+            .await;
             let availability = AgentAvailability::shared();
             let mut envs: Vec<(Driver, AgentEnv)> = Vec::new();
             for (driver, profile) in profiles {
@@ -3118,6 +3132,30 @@ fn forget_stale_resolutions() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread menu hangs off the sidebar list, so a rebuild while it is open must clear the
+    /// rows, return, and leave the menu where it was.
+    #[test]
+    #[ignore = "needs a display; run alone: cargo test clear_rows -- --ignored"]
+    fn clear_rows_ends_and_keeps_an_open_menu() {
+        gtk4::init().expect("GTK init");
+        let list = gtk4::ListBox::new();
+        for _ in 0..3 {
+            list.append(&gtk4::Label::new(Some("row")));
+        }
+        let menu = gtk4::PopoverMenu::from_model(None::<&gtk4::gio::MenuModel>);
+        menu.set_parent(&list);
+
+        clear_rows(&list);
+
+        assert!(list.row_at_index(0).is_none(), "every row is gone");
+        assert_eq!(
+            menu.parent().as_ref(),
+            Some(list.upcast_ref::<gtk4::Widget>()),
+            "the menu survives the rebuild"
+        );
+        menu.unparent();
+    }
 
     fn native(
         driver: Driver,

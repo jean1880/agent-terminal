@@ -486,8 +486,11 @@ fn load_css() {
             padding: 0;
             opacity: 0.45;
         }
+        /* Delete stays out of sight until you point at its row (or reach it with the keyboard). */
+        .thread-delete { opacity: 0; }
         .thread-row:hover .thread-close,
-        .thread-row:hover .thread-delete {
+        .thread-row:hover .thread-delete,
+        .thread-delete:focus-visible {
             opacity: 0.85;
         }
         .thread-close:hover {

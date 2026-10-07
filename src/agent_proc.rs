@@ -144,6 +144,7 @@ impl AgentProcess {
         for key in &spec.unset {
             launcher.unsetenv(key);
         }
+        use_shell_path(&launcher);
         for (key, value) in &spec.env {
             launcher.setenv(key, value, true);
         }
@@ -382,11 +383,20 @@ pub struct AgentEnv {
     pub unset: Vec<String>,
 }
 
+/// Gives a launch the user's shell `PATH` (when it has been read), so an agent's tools find what
+/// the user's terminal finds. Set before the profile's own variables, which win.
+fn use_shell_path(launcher: &gio::SubprocessLauncher) {
+    if let Some(path) = crate::utils::known_shell_path() {
+        launcher.setenv("PATH", path, true);
+    }
+}
+
 impl AgentEnv {
     fn apply(&self, launcher: &gio::SubprocessLauncher) {
         for key in &self.unset {
             launcher.unsetenv(key);
         }
+        use_shell_path(launcher);
         for (key, value) in &self.env {
             launcher.setenv(key, value, true);
         }
