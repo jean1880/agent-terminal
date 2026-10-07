@@ -1279,6 +1279,321 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// What the user sees of a view, for comparing a thread streamed while hidden with one
+    /// streamed in view and one replayed from its stored events.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        /// Every materialised row, nested ones included: id, shown, allocated height.
+        rows: Vec<(String, bool, i32)>,
+        /// The header's sub-agent button: shown, count text, listed ids.
+        subagents: (bool, String, Vec<String>),
+        /// The header says the agent is working.
+        running: bool,
+        /// Approval cards: id, buttons shown, buttons sensitive, outcome line.
+        approvals: Vec<(String, bool, bool, String)>,
+        /// Tool cards still showing a spinner.
+        spinning: Vec<String>,
+        /// Reasoning cards: id, title, shown.
+        reasoning: Vec<(String, String, bool)>,
+        /// The jump-to-latest button shows.
+        jump: bool,
+        /// Dividers, notices and errors (their text), and replies (the agent credited).
+        statics: Vec<(String, String)>,
+    }
+
+    fn seen(view: &ChatView) -> (Seen, Option<(f64, bool)>) {
+        let inner = view.inner().expect("view");
+        let model = inner.model.borrow();
+        let mut ids = Vec::new();
+        let mut stack: Vec<String> = model.order().iter().rev().cloned().collect();
+        while let Some(id) = stack.pop() {
+            if let Some(item) = model.get(&id) {
+                stack.extend(item.children.iter().rev().cloned());
+            }
+            ids.push(id);
+        }
+        let t = &inner.transcript;
+        let mut s = Seen {
+            rows: Vec::new(),
+            subagents: inner.subagent_button.state(),
+            running: inner.header.running_shown(),
+            approvals: Vec::new(),
+            spinning: Vec::new(),
+            reasoning: Vec::new(),
+            jump: t.scroll_parts().0.is_visible(),
+            statics: Vec::new(),
+        };
+        for id in ids {
+            t.with_row(&id, |row| {
+                let w = row.widget();
+                s.rows.push((id.clone(), w.is_visible(), w.height()));
+                match row {
+                    cards::Row::Approval(a) => {
+                        let (shown, sensitive, outcome) = a.actionable();
+                        s.approvals.push((id.clone(), shown, sensitive, outcome));
+                    }
+                    cards::Row::Tool(c) if c.spinning() => s.spinning.push(id.clone()),
+                    cards::Row::Reasoning(r) => {
+                        let (title, shown) = r.reasoning_state();
+                        s.reasoning.push((id.clone(), title, shown));
+                    }
+                    cards::Row::Assistant { root, .. } => {
+                        // The agent the reply is credited to (its name in the row's head).
+                        let mut name = String::new();
+                        let mut stack: Vec<gtk4::Widget> = vec![root.clone().upcast()];
+                        while let Some(w) = stack.pop() {
+                            if w.has_css_class("agent-name") {
+                                if let Some(l) = w.downcast_ref::<gtk4::Label>() {
+                                    name = l.text().to_string();
+                                }
+                            }
+                            let mut child = w.first_child();
+                            while let Some(c) = child {
+                                child = c.next_sibling();
+                                stack.push(c);
+                            }
+                        }
+                        s.statics.push((id.clone(), format!("reply by {name}")));
+                    }
+                    cards::Row::Static(w) => {
+                        // Dividers and notices: the text they show.
+                        let mut texts = Vec::new();
+                        let mut stack = vec![w.clone()];
+                        while let Some(w) = stack.pop() {
+                            if let Some(l) = w.downcast_ref::<gtk4::Label>() {
+                                texts.push(l.text().to_string());
+                            }
+                            let mut child = w.first_child();
+                            while let Some(c) = child {
+                                child = c.next_sibling();
+                                stack.push(c);
+                            }
+                        }
+                        s.statics.push((id.clone(), texts.join(" | ")));
+                    }
+                    _ => {}
+                }
+            });
+        }
+        (s, t.last_row_overflow())
+    }
+
+    /// A thread keeps receiving its stream while another tab is selected (its view unmapped: no
+    /// layout, no frame ticks). Streams the demo turn, three sends and a sub-agent into two views
+    /// at once: A in view the whole time, B on a tab page that is first shown (as a thread is
+    /// built) and then left for another page. Each time B is shown again it must look exactly like
+    /// A: every row's size, the newest row in view and followed, the sub-agent list, approval
+    /// cards, thinking cards, spinners, the header. C replays B's recorded stream, as a thread
+    /// opened later is built from the store, and must look the same too.
+    ///
+    /// A minimised window is not covered: neither this Wayland session nor XWayland lets a test
+    /// restore a window it minimised itself (its frame clock never resumes), so the restored
+    /// state cannot be observed.
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn a_thread_streamed_on_another_tab_shows_what_a_visible_one_does() {
+        use agent_core::event::{Event, ItemKind, ItemStatus};
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        let ctx = glib::MainContext::default();
+        let pump = |ms: u64| {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < until {
+                while ctx.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        };
+        // Each view sits in a tab view like the app's, all of one fixed width (wide enough that
+        // no card's minimum width widens it), side by side in ONE window: separate windows
+        // overlap, and the compositor stops laying out a covered one, which is not what is
+        // measured here.
+        let holder = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let scroller = gtk4::ScrolledWindow::new();
+        scroller.set_child(Some(&holder));
+        let main = gtk4::Window::new();
+        main.set_default_size(1400, 700);
+        main.set_child(Some(&scroller));
+        let tabs_with = |view: &ChatView| {
+            let tabs = adw::TabView::new();
+            tabs.set_size_request(820, 640);
+            let other = tabs.append(&gtk4::Label::new(Some("another thread")));
+            let page = tabs.append(view);
+            tabs.set_selected_page(&page);
+            (tabs, other, page)
+        };
+        let a_backend = demo::demo_backend();
+        let a = ChatView::new(a_backend.clone());
+        a_backend.connect(a.sink());
+        let b_backend = demo::demo_backend();
+        let b = ChatView::new(b_backend.clone());
+        let recorded: Rc<RefCell<Vec<Envelope>>> = Rc::default();
+        let (b_sink, rec) = (b.sink(), recorded.clone());
+        let b_stream: EnvelopeSink = Rc::new(move |env: &Envelope| {
+            rec.borrow_mut().push(env.clone());
+            b_sink(env);
+        });
+        b_backend.connect(b_stream.clone());
+        let (ta, _, _) = tabs_with(&a);
+        holder.append(&ta);
+        let (tb, b_other, b_page) = tabs_with(&b);
+        holder.append(&tb);
+        main.present();
+        pump(800);
+        let hide_b = || tb.set_selected_page(&b_other);
+        let show_b = || tb.set_selected_page(&b_page);
+        hide_b();
+        pump(300);
+        assert!(!b.is_mapped(), "B is off screen while streamed");
+
+        a_backend.play_script();
+        b_backend.play_script();
+        pump(14_000);
+        for n in 0..3 {
+            let text = format!("follow-up question {n}\nwith a second line");
+            a.inner().expect("a").submit(&text);
+            b.inner().expect("b").submit(&text);
+            pump(3_500);
+        }
+        // A sub-agent starts while B is hidden: B must list it once shown.
+        let both = |env: Envelope| {
+            a.sink()(&env);
+            b_stream(&env);
+        };
+        both(Envelope::new(Event::TurnStarted { model: None }));
+        both(
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Task".into(),
+                input: Some(
+                    serde_json::json!({"subagent_type": "Explore", "description": "Map the crate"}),
+                ),
+                parent: None,
+            })
+            .item("bg1"),
+        );
+        both(
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::FileRead,
+                title: "Read".into(),
+                input: Some(serde_json::json!({"file_path": "src/main.rs"})),
+                parent: Some("bg1".into()),
+            })
+            .item("bg1-read"),
+        );
+        pump(1_000);
+        show_b();
+        pump(2_500);
+        let (mid_a, mid_oa) = seen(&a);
+        let (mid_b, mid_ob) = seen(&b);
+        eprintln!(
+            "mid-turn A: overflow {mid_oa:?} sub-agents {:?}",
+            mid_a.subagents
+        );
+        eprintln!(
+            "mid-turn B: overflow {mid_ob:?} sub-agents {:?}",
+            mid_b.subagents
+        );
+
+        // It finishes, and the turn ends, while B is hidden again.
+        hide_b();
+        pump(300);
+        both(
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: Some("mapped".into()),
+                error: None,
+            })
+            .item("bg1-read"),
+        );
+        both(
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: Some("done".into()),
+                error: None,
+            })
+            .item("bg1"),
+        );
+        both(Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        }));
+        pump(1_000);
+        show_b();
+
+        // C: a thread opened later, built from B's stored events (as `build_thread` does:
+        // replayed before it is in a window, then shown).
+        let c_backend = demo::demo_backend();
+        let c = ChatView::new(c_backend);
+        c.replay(&recorded.borrow());
+        let (tc, _, _) = tabs_with(&c);
+        holder.append(&tc);
+        pump(2_500);
+        let (sa, oa) = seen(&a);
+        let (sb, ob) = seen(&b);
+        let (sc, oc) = seen(&c);
+        for (name, s, o) in [("A", &sa, oa), ("B", &sb, ob), ("C", &sc, oc)] {
+            eprintln!(
+                "{name}: overflow {o:?} jump {} running {} subagents {:?} spinning {:?}\n  approvals {:?}\n  reasoning {:?}\n  statics {:?}",
+                s.jump, s.running, s.subagents, s.spinning, s.approvals, s.reasoning, s.statics
+            );
+        }
+        let diff = |x: &Seen, y: &Seen| -> Vec<String> {
+            let mut out = Vec::new();
+            let (xs, ys) = (&x.rows, &y.rows);
+            if xs.len() != ys.len() {
+                out.push(format!("row count {} vs {}", xs.len(), ys.len()));
+            }
+            for (r, s) in xs.iter().zip(ys) {
+                if r != s {
+                    out.push(format!("{r:?} vs {s:?}"));
+                }
+            }
+            out
+        };
+        eprintln!("rows A vs B: {:#?}", diff(&sa, &sb));
+        eprintln!("rows A vs C: {:#?}", diff(&sa, &sc));
+        main.destroy();
+
+        let ok_overflow =
+            |o: Option<(f64, bool)>| o.is_some_and(|(over, stick)| stick && over <= 2.0);
+        assert!(
+            ok_overflow(mid_ob),
+            "B mid-turn: newest row in view {mid_ob:?}"
+        );
+        assert_eq!(mid_a, mid_b, "B mid-turn differs from A");
+        assert!(
+            mid_b.subagents.0,
+            "a sub-agent started while hidden is listed"
+        );
+        assert!(ok_overflow(oa), "A: newest row in view {oa:?}");
+        assert!(ok_overflow(ob), "B: newest row in view {ob:?}");
+        assert!(ok_overflow(oc), "C (replay): newest row in view {oc:?}");
+        assert_eq!(
+            sa, sb,
+            "the thread streamed while hidden differs from the one in view"
+        );
+        // Known gap (Hive finding): replay has no per-event agent, so it credits every reply
+        // to the thread's current agent and turns a "Continued in" divider into "Model
+        // switched". Everything else must match.
+        let without_credits = |s: &Seen| Seen {
+            statics: Vec::new(),
+            rows: s.rows.clone(),
+            subagents: s.subagents.clone(),
+            running: s.running,
+            approvals: s.approvals.clone(),
+            spinning: s.spinning.clone(),
+            reasoning: s.reasoning.clone(),
+            jump: s.jump,
+        };
+        assert_eq!(
+            without_credits(&sa),
+            without_credits(&sc),
+            "the replayed thread differs from the one in view"
+        );
+    }
+
     /// A thinking block whose text never streams (the model withheld it) must not end as an
     /// empty, openable "Thought process"; one with text stays openable.
     pub(crate) fn reasoning_ui_checks() {

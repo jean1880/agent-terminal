@@ -934,6 +934,12 @@ impl ToolCard {
     }
 
     /// Clicks "View diff" (tests).
+    /// Whether the card shows its spinner (tests).
+    #[cfg(test)]
+    pub(super) fn spinning(&self) -> bool {
+        self.status.visible_child_name().as_deref() == Some("spinner")
+    }
+
     #[cfg(test)]
     pub(super) fn click_view_diff(&self) {
         self.diff.toggle.set_active(true);
@@ -1248,6 +1254,16 @@ impl ApprovalCard {
             }
             None => self.remembers.set_visible(false),
         }
+    }
+
+    /// Whether the buttons show and can be pressed, and the outcome line (tests).
+    #[cfg(test)]
+    pub(super) fn actionable(&self) -> (bool, bool, String) {
+        (
+            self.buttons.is_visible(),
+            self.buttons.is_sensitive(),
+            self.outcome.text().to_string(),
+        )
     }
 
     /// What the card says "Always allow" saves, when it shows it (tests).
