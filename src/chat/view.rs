@@ -494,14 +494,10 @@ impl Inner {
     fn refresh_subagents(&self, changed: &[String]) {
         let model = self.model.borrow();
         let agents = model.subagents();
-        // The list is what is running now: a sub-agent that finished leaves it (its card stays
-        // in the transcript, and an open panel on it stays open).
-        let running: Vec<_> = agents
-            .iter()
-            .filter(|a| a.status == model::ToolStatus::Running)
-            .cloned()
-            .collect();
-        self.subagent_button.set(&running);
+        // Every sub-agent the thread started: the running ones first, then the finished ones
+        // with how they ended (a replayed thread, or one whose sub-agents are all done, still
+        // lists them).
+        self.subagent_button.set(&subagents::running_first(&agents));
         if let Some(panel) = self.subagent_panel.borrow().as_ref() {
             let summary = agents.iter().find(|a| a.id == panel.id());
             panel.refresh(&model, summary, changed);
@@ -1749,7 +1745,7 @@ pub(crate) mod tests {
         pump();
         let (visible, count, ids) = inner.subagent_button.state();
         assert!(visible);
-        assert_eq!(count, "1 sub-agent");
+        assert_eq!(count, "1 sub-agent · 1 running");
         assert_eq!(ids, ["agent1"]);
 
         inner.open_subagent("agent1");
@@ -1767,9 +1763,13 @@ pub(crate) mod tests {
             "existing steps are updated in place, never rebuilt"
         );
         let (_, count, ids) = inner.subagent_button.state();
-        assert_eq!((count.as_str(), ids.len()), ("1 sub-agent", 1));
+        assert_eq!((count.as_str(), ids.len()), ("1 sub-agent · 1 running", 1));
 
-        // Done: it leaves the list (the button hides), while the panel the user opened stays.
+        // A second one starts: running ones are listed first.
+        step("agent2", ItemKind::Subagent, None, None);
+        pump();
+        // Done: it stays listed, after the running one and labelled done, and the panel the
+        // user opened stays.
         sink(
             &Envelope::new(Event::ItemCompleted {
                 status: agent_core::event::ItemStatus::Completed,
@@ -1779,12 +1779,42 @@ pub(crate) mod tests {
             .item("agent1"),
         );
         pump();
-        let (visible, _, ids) = inner.subagent_button.state();
-        assert!(
-            !visible && ids.is_empty(),
-            "a finished sub-agent leaves the list"
+        let (visible, count, ids) = inner.subagent_button.state();
+        assert!(visible, "a finished sub-agent keeps the button");
+        assert_eq!(count, "2 sub-agents · 1 running");
+        assert_eq!(ids, ["agent2", "agent1"], "running first, finished after");
+        assert_eq!(
+            inner.subagent_button.statuses(),
+            ["running", "done · 2 steps"]
         );
         assert_eq!(panel().steps_shown(), 2, "the open panel keeps showing it");
+
+        // A replayed thread whose sub-agent finished long ago still lists it.
+        let replayed = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        replayed.replay(&[
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Task".into(),
+                input: Some(json!({"subagent_type": "Explore", "description": "Old work"})),
+                parent: None,
+            })
+            .item("old"),
+            Envelope::new(Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Completed,
+                output: Some("found it".into()),
+                error: None,
+            })
+            .item("old"),
+        ]);
+        pump();
+        let r = replayed.inner().expect("replayed view");
+        assert_eq!(
+            r.subagent_button.state(),
+            (true, "1 sub-agent".to_owned(), vec!["old".to_owned()])
+        );
+        assert_eq!(r.subagent_button.statuses(), ["done"]);
     }
 
     /// GTK checks of the diff viewer: the card's toggle, its buttons, the approval's diff.
