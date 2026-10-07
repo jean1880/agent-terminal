@@ -243,6 +243,12 @@ impl Composer {
         self.placeholder.text().to_string()
     }
 
+    /// Whether the send button is the stop button (tests).
+    #[cfg(test)]
+    pub fn shows_stop(&self) -> bool {
+        self.send.has_css_class("stop")
+    }
+
     fn connect_signals(self: &Rc<Self>) {
         let keys = gtk4::EventControllerKey::new();
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);

@@ -547,7 +547,9 @@ impl Inner {
     fn refresh_status(&self) {
         let status = self.backend.status();
         let running = status.running_turn || self.model.borrow().running;
-        self.header.set_running(running);
+        // The header counts background work too; the stop button follows the main turn only.
+        self.header
+            .set_activity(&self.model.borrow().activity(running));
         self.composer.set_running(running);
         self.refresh_agent_chip();
         self.header
@@ -1071,6 +1073,55 @@ pub(crate) mod tests {
             "the picker follows the agent"
         );
         assert_eq!(chosen.borrow().len(), 1, "a reported mode offers nothing");
+
+        // The header says whether the thread is still working, counting its background work;
+        // the stop button follows the main turn only.
+        {
+            use agent_core::event::{BackgroundTask, BackgroundTaskKind, Event, TurnState};
+            let inner = view.inner().expect("view");
+            let shown = || (inner.header.activity_shown(), inner.composer.shows_stop());
+            let background = |n: usize| {
+                view.sink()(&Envelope::new(Event::BackgroundTasks {
+                    tasks: (0..n)
+                        .map(|i| BackgroundTask {
+                            id: format!("t{i}"),
+                            kind: BackgroundTaskKind::Agent,
+                            description: Some(format!("Review part {i}")),
+                            tool_use_id: None,
+                        })
+                        .collect(),
+                }));
+            };
+            assert_eq!(shown(), (None, false), "a new thread says nothing");
+            view.sink()(&Envelope::new(Event::TurnStarted { model: None }));
+            assert_eq!(shown(), (Some("Working…".into()), true));
+            background(2);
+            assert_eq!(
+                shown(),
+                (Some("Working…, plus 2 in the background".into()), true)
+            );
+            view.sink()(&Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }));
+            assert_eq!(
+                shown(),
+                (
+                    Some(
+                        "Main agent done, waiting on 2 background tasks: Review part 0, \
+                         Review part 1"
+                            .into()
+                    ),
+                    false
+                ),
+                "background work keeps the thread busy, but there is no turn to stop"
+            );
+            assert!(!inner.header.running_shown());
+            background(0);
+            assert_eq!(shown(), (Some("Finished".into()), false));
+        }
 
         // The model-source listener goes away with the view.
         let source = Rc::new(CountingSource::default());

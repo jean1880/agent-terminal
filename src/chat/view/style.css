@@ -52,6 +52,10 @@
 }
 
 .activity .activity-text { color: #918bbd; font-size: 0.9em; }
+/* Only background work left (sub-agents, background commands): the sidebar's background colour. */
+.activity.activity-background spinner,
+.activity.activity-background .activity-text { color: #7cc7ff; }
+.activity.activity-finished .activity-text { color: alpha(#918bbd, 0.7); }
 
 .usage-indicator { padding: 2px 8px; border-radius: 8px; }
 .usage-bar { min-height: 4px; }

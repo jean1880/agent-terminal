@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use agent_core::adapter::{Driver, Mode};
 use agent_core::event::{
-    Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, ResponseCapability,
-    StreamKind, TurnState,
+    BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
+    Question, ResponseCapability, StreamKind, TurnState,
 };
 use serde_json::Value;
 
@@ -218,6 +218,80 @@ pub struct Gauge {
     pub auto_compact_at: Option<u64>,
 }
 
+/// What the thread is doing, counting its background work as well as the main agent's turn: the
+/// one status the view shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activity {
+    /// Nothing has run yet (a new thread): nothing to say.
+    Idle,
+    /// The main agent's turn runs; `background` more tasks run alongside it.
+    Working { background: usize },
+    /// The main agent's turn is over, but it is still waiting on these background tasks.
+    Waiting { tasks: Vec<String> },
+    /// A turn ran, and neither it nor any background work is still going.
+    Finished,
+}
+
+impl Activity {
+    /// The thread's status from the main turn and the background task list. `ran`: a turn has
+    /// run in this thread (so an idle one has finished rather than never started).
+    pub fn of(main_running: bool, background: &[BackgroundTask], ran: bool) -> Self {
+        if main_running {
+            Self::Working {
+                background: background.len(),
+            }
+        } else if !background.is_empty() {
+            Self::Waiting {
+                tasks: background.iter().map(task_name).collect(),
+            }
+        } else if ran {
+            Self::Finished
+        } else {
+            Self::Idle
+        }
+    }
+
+    /// What the header says; `None` shows nothing.
+    pub fn text(&self) -> Option<String> {
+        match self {
+            Self::Idle => None,
+            Self::Working { background: 0 } => Some("Working…".to_owned()),
+            Self::Working { background: n } => {
+                Some(format!("Working…, plus {n} in the background"))
+            }
+            Self::Waiting { tasks } => {
+                let count = match tasks.len() {
+                    1 => "1 background task".to_owned(),
+                    n => format!("{n} background tasks"),
+                };
+                Some(format!(
+                    "Main agent done, waiting on {count}: {}",
+                    tasks.join(", ")
+                ))
+            }
+            Self::Finished => Some("Finished".to_owned()),
+        }
+    }
+
+    /// Whether a spinner turns: something is still running.
+    pub fn busy(&self) -> bool {
+        matches!(self, Self::Working { .. } | Self::Waiting { .. })
+    }
+}
+
+/// A background task as the status names it: its description, else what kind of task it is.
+fn task_name(task: &BackgroundTask) -> String {
+    match task.description.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => d.to_owned(),
+        _ => match task.kind {
+            BackgroundTaskKind::Agent => "a sub-agent",
+            BackgroundTaskKind::Shell => "a shell command",
+            BackgroundTaskKind::Other => "a task",
+        }
+        .to_owned(),
+    }
+}
+
 /// What an [`Transcript::apply`] call changed, for the widget layer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
@@ -228,6 +302,7 @@ pub enum Change {
     Plan,
     Gauge,
     Mode,
+    /// What the thread is doing changed: its turn, or its background work.
     Running,
     Commands,
     /// A control reply, routed by request id to whoever asked.
@@ -248,6 +323,11 @@ pub struct Transcript {
     pub gauge: Option<Gauge>,
     pub mode: Option<Mode>,
     pub running: bool,
+    /// Background work still going (sub-agents, background commands), as the agent last listed
+    /// it: the main turn may be over while these run.
+    pub background: Vec<BackgroundTask>,
+    /// A turn has run in this thread.
+    ran: bool,
     last_driver: Option<Driver>,
     last_model: Option<String>,
     /// The assistant/reasoning item that item-less deltas belong to.
@@ -319,6 +399,12 @@ impl Transcript {
 
     pub fn current_model(&self) -> Option<&str> {
         self.last_model.as_deref()
+    }
+
+    /// The thread's status. `main_running`: the main agent's turn runs (the model's own view of
+    /// it, or the backend's).
+    pub fn activity(&self, main_running: bool) -> Activity {
+        Activity::of(main_running, &self.background, self.ran)
     }
 
     /// The input an approval card shows. A Codex file-change request names the item it is about
@@ -442,8 +528,10 @@ impl Transcript {
                 }
             }
             Event::SessionExited { code, expected } => {
-                if self.running {
+                // A dead session runs nothing in the background either.
+                if self.running || !self.background.is_empty() {
                     self.running = false;
+                    self.background.clear();
                     out.push(Change::Running);
                 }
                 self.open_text = None;
@@ -471,6 +559,7 @@ impl Transcript {
                     }
                     self.last_model = Some(m.clone());
                 }
+                self.ran = true;
                 if !self.running {
                     self.running = true;
                     out.push(Change::Running);
@@ -745,9 +834,15 @@ impl Transcript {
                     None,
                 )));
             }
-            // Quota feeds the usage indicator (app-wide service), not the transcript. Background
-            // tasks are thread state, not transcript rows.
-            Event::QuotaUpdated { .. } | Event::BackgroundTasks { .. } | Event::Unknown => {}
+            // Background tasks are thread state, not transcript rows: the full list each time.
+            Event::BackgroundTasks { tasks } => {
+                if self.background != *tasks {
+                    self.background.clone_from(tasks);
+                    out.push(Change::Running);
+                }
+            }
+            // Quota feeds the usage indicator (app-wide service), not the transcript.
+            Event::QuotaUpdated { .. } | Event::Unknown => {}
         }
         out
     }
@@ -1279,6 +1374,120 @@ mod tests {
                 message: "quota".into()
             })
         );
+    }
+
+    fn tasks(list: &[(&str, BackgroundTaskKind, Option<&str>)]) -> Envelope {
+        ev(Event::BackgroundTasks {
+            tasks: list
+                .iter()
+                .map(|(id, kind, description)| BackgroundTask {
+                    id: (*id).to_owned(),
+                    kind: *kind,
+                    description: description.map(str::to_owned),
+                    tool_use_id: None,
+                })
+                .collect(),
+        })
+    }
+
+    fn turn_done() -> Envelope {
+        ev(Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn the_thread_status_counts_background_work_until_it_finishes() {
+        let mut t = Transcript::new();
+        let now = |t: &Transcript| t.activity(t.running);
+        assert_eq!(now(&t), Activity::Idle, "a new thread says nothing");
+        assert_eq!(now(&t).text(), None);
+
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        assert_eq!(now(&t), Activity::Working { background: 0 });
+        assert_eq!(now(&t).text().as_deref(), Some("Working…"));
+
+        // A sub-agent and a shell command go to the background while the turn runs.
+        let c = t.apply(
+            &tasks(&[
+                ("t1", BackgroundTaskKind::Agent, Some("Map the crate")),
+                ("t2", BackgroundTaskKind::Shell, None),
+            ]),
+            Driver::Claude,
+        );
+        assert_eq!(c, vec![Change::Running]);
+        assert_eq!(
+            now(&t).text().as_deref(),
+            Some("Working…, plus 2 in the background")
+        );
+        // The same list again is not a change.
+        assert!(t
+            .apply(
+                &tasks(&[
+                    ("t1", BackgroundTaskKind::Agent, Some("Map the crate")),
+                    ("t2", BackgroundTaskKind::Shell, None),
+                ]),
+                Driver::Claude
+            )
+            .is_empty());
+
+        // The main turn ends: the thread is not finished, it waits on its background work.
+        t.apply(&turn_done(), Driver::Claude);
+        assert!(!t.running, "the main turn (and its stop button) is over");
+        let waiting = now(&t);
+        assert!(waiting.busy());
+        assert_eq!(
+            waiting.text().as_deref(),
+            Some("Main agent done, waiting on 2 background tasks: Map the crate, a shell command")
+        );
+
+        t.apply(
+            &tasks(&[("t1", BackgroundTaskKind::Agent, Some("Map the crate"))]),
+            Driver::Claude,
+        );
+        assert_eq!(
+            now(&t).text().as_deref(),
+            Some("Main agent done, waiting on 1 background task: Map the crate")
+        );
+
+        // The last task ends: finished.
+        t.apply(&tasks(&[]), Driver::Claude);
+        assert_eq!(now(&t), Activity::Finished);
+        assert!(!now(&t).busy());
+
+        // Claude's follow-up turn to read the results works as any turn.
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        assert_eq!(now(&t), Activity::Working { background: 0 });
+        t.apply(&turn_done(), Driver::Claude);
+        assert_eq!(now(&t), Activity::Finished);
+    }
+
+    #[test]
+    fn a_session_that_exits_leaves_no_background_work() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        t.apply(
+            &tasks(&[("t1", BackgroundTaskKind::Agent, None)]),
+            Driver::Claude,
+        );
+        t.apply(&turn_done(), Driver::Claude);
+        assert_eq!(
+            t.activity(false).text().as_deref(),
+            Some("Main agent done, waiting on 1 background task: a sub-agent")
+        );
+        let c = t.apply(
+            &ev(Event::SessionExited {
+                code: Some(0),
+                expected: true,
+            }),
+            Driver::Claude,
+        );
+        assert_eq!(c, vec![Change::Running]);
+        assert!(t.background.is_empty());
+        assert_eq!(t.activity(false), Activity::Finished);
     }
 
     #[test]
