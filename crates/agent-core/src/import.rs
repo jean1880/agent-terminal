@@ -18,11 +18,17 @@
 //! | `user`, `<local-command-stdout>` / `-stderr` | a `Notice` with the tags stripped |
 //! | `user`, `[Request interrupted…` | a `Notice`; the turn it ends is `Interrupted` |
 //! | `user`, `isCompactSummary` | a `Notice` saying the conversation was compacted (the summary is not shown) |
-//! | `user`, `tool_result` blocks | the adapter completes the matching tool item |
+//! | `user`, `tool_result` blocks | the adapter completes the matching tool item, except a backgrounded sub-agent's "launched" result (`toolUseResult.isAsync`), which leaves it open across turns |
+//! | `user`, `origin.kind: "task-notification"` | completes that task's tool item with its `<result>` (else `<summary>`); no user message, no new turn |
 //! | `user`, `isMeta` or only `<local-command-caveat>` / system reminders | skipped |
 //! | `assistant` | the adapter: `AssistantMessage`, `Reasoning`, `Command`, `FileChange`, … items |
 //! | any record with `isSidechain: true` (subagent traffic) | skipped |
 //! | `attachment`, `system`, `summary`, `ai-title`, `last-prompt`, `queue-operation`, … | skipped |
+//!
+//! Current Claude builds keep a sub-agent's own steps in `<session>/subagents/agent-<id>.jsonl`,
+//! which this importer does not read, so an imported sub-agent card has its result but no steps.
+//! A backgrounded sub-agent whose notification never arrives is settled as `Interrupted` at the
+//! end of the import.
 //!
 //! Inside text, `<system-reminder>…</system-reminder>` blocks are removed. A tool call that never
 //! got a result (the session was interrupted or the transcript ends mid-call) is settled as
@@ -44,7 +50,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::adapter::Adapter;
-use crate::claude::ClaudeAdapter;
+use crate::claude::{is_async_launch, task_status, ClaudeAdapter};
 use crate::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState};
 
 /// The newest this many items are kept from one imported conversation.
@@ -102,6 +108,9 @@ pub struct ClaudeImporter {
     known: HashSet<String>,
     /// Tool items waiting for a result, in start order.
     open_tools: Vec<String>,
+    /// Backgrounded sub-agents (their tool result was the "launched" metadata): they stay open
+    /// across turns until their `<task-notification>`.
+    background: HashSet<String>,
     turn_open: bool,
     turn_interrupted: bool,
     line_no: usize,
@@ -122,6 +131,7 @@ impl ClaudeImporter {
             dropped: 0,
             known: HashSet::new(),
             open_tools: Vec::new(),
+            background: HashSet::new(),
             turn_open: false,
             turn_interrupted: false,
             line_no: 0,
@@ -164,6 +174,8 @@ impl ClaudeImporter {
         if self.turn_open {
             self.close_turn();
         }
+        // A background sub-agent whose notification never came is not running any more.
+        self.settle_open_tools();
         let dropped = self.dropped + cap(&mut self.out, MAX_IMPORTED_ITEMS);
         finish_cap(&mut self.out, dropped);
         self.out
@@ -184,12 +196,31 @@ impl ClaudeImporter {
         if flag(record, "isMeta") {
             return;
         }
+        // Claude tells itself a background task finished with a `<task-notification>` prompt:
+        // it completes that task's item, and is neither a user message nor a new turn.
+        if record
+            .get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(Value::as_str)
+            == Some("task-notification")
+        {
+            self.task_notification(&user_text(content));
+            return;
+        }
         // Tool results go to the adapter, which completes the matching item.
         if let Value::Array(blocks) = content {
-            if blocks
+            let results: Vec<&str> = blocks
                 .iter()
-                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-            {
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+                .collect();
+            if !results.is_empty() {
+                // A backgrounded sub-agent's "launched" result: the adapter leaves it open.
+                if let [id] = results.as_slice() {
+                    if is_async_launch(record) {
+                        self.background.insert((*id).to_owned());
+                    }
+                }
                 self.ensure_turn();
                 let envs = self.adapter.feed(line);
                 self.absorb(envs);
@@ -248,9 +279,29 @@ impl ClaudeImporter {
             .push(Envelope::new(Event::TurnStarted { model: None }));
     }
 
-    /// Settles tool calls that never got a result, then ends the turn.
+    /// Settles tool calls that never got a result, then ends the turn. Background sub-agents
+    /// outlive their turn.
     fn close_turn(&mut self) {
+        let (keep, settle): (Vec<String>, Vec<String>) = std::mem::take(&mut self.open_tools)
+            .into_iter()
+            .partition(|id| self.background.contains(id));
+        self.open_tools = settle;
+        self.settle_open_tools();
+        self.open_tools = keep;
+        let state = if self.turn_interrupted {
+            TurnState::Interrupted
+        } else {
+            TurnState::Completed
+        };
+        self.out.push(turn_completed(state));
+        self.turn_open = false;
+        self.turn_interrupted = false;
+    }
+
+    /// Settles every open tool item as `Interrupted`.
+    fn settle_open_tools(&mut self) {
         for id in std::mem::take(&mut self.open_tools) {
+            self.background.remove(&id);
             self.out.push(
                 Envelope::new(Event::ItemCompleted {
                     status: ItemStatus::Interrupted,
@@ -260,14 +311,51 @@ impl ClaudeImporter {
                 .item(id),
             );
         }
-        let state = if self.turn_interrupted {
-            TurnState::Interrupted
-        } else {
-            TurnState::Completed
+    }
+
+    /// `<task-notification>…<tool-use-id>T</tool-use-id>…<status>S</status>…</task-notification>`:
+    /// completes item `T` with the task's `<result>` (its final report), else its `<summary>`.
+    /// A notification for an item this import never saw is dropped.
+    fn task_notification(&mut self, text: &str) {
+        let Some(id) = between(text, "<tool-use-id>", "</tool-use-id>").map(str::trim) else {
+            return;
         };
-        self.out.push(turn_completed(state));
-        self.turn_open = false;
-        self.turn_interrupted = false;
+        if !self.known.contains(id) {
+            return;
+        }
+        let id = id.to_owned();
+        let status = task_status(
+            between(text, "<status>", "</status>")
+                .map(str::trim)
+                .unwrap_or(""),
+        );
+        // The report is free text and the last element: its end is the LAST `</result>`.
+        let result = text.find("<result>").and_then(|start| {
+            let start = start + "<result>".len();
+            let end = text.rfind("</result>").filter(|e| *e >= start)?;
+            Some(&text[start..end])
+        });
+        let mut output = result
+            .or_else(|| between(text, "<summary>", "</summary>"))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if let Some(o) = output.as_mut() {
+            truncate_chars(o, MAX_TOOL_OUTPUT_CHARS);
+        }
+        self.open_tools.retain(|t| *t != id);
+        self.background.remove(&id);
+        self.out.push(
+            Envelope::new(Event::ItemCompleted {
+                status,
+                error: (status == ItemStatus::Failed).then(|| {
+                    output
+                        .clone()
+                        .unwrap_or_else(|| "the sub-agent failed".to_owned())
+                }),
+                output,
+            })
+            .item(id),
+        );
     }
 
     /// Keeps what the view renders from the adapter's output, without the native frames.
@@ -708,6 +796,75 @@ mod tests {
         };
         assert!(o.ends_with("(output truncated)"));
         assert!(o.chars().count() < MAX_TOOL_OUTPUT_CHARS + 40);
+    }
+
+    /// A background `Agent` call as Claude 2.1.29x records it (ids shortened): the call, the
+    /// immediate "launched" result, a reply, a later prompt, then the task-notification record.
+    fn background_agent_transcript(notify: bool) -> Vec<String> {
+        let mut lines = vec![
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"review it"}}"#.to_owned(),
+            r#"{"type":"assistant","uuid":"a1","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"toolu_bg","name":"Agent","input":{"description":"Review fixes","prompt":"Review.","run_in_background":true}}]}}"#.to_owned(),
+            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_bg","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully. (This tool result is internal metadata.)"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"ag1","description":"Review fixes"}}"#.to_owned(),
+            r#"{"type":"assistant","uuid":"a2","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"Launched."}]}}"#.to_owned(),
+            r#"{"type":"user","uuid":"u3","message":{"role":"user","content":"meanwhile, hello"}}"#.to_owned(),
+        ];
+        if notify {
+            lines.push(r#"{"type":"user","uuid":"u4","origin":{"kind":"task-notification","producer":"session-task"},"message":{"role":"user","content":"<task-notification>\n<task-id>ag1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<output-file>/tmp/t/tasks/ag1.output</output-file>\n<status>completed</status>\n<summary>Agent \"Review fixes\" finished</summary>\n<note>A task-notification fires each time this agent stops.</note>\n<result>**Verdict: PASS**</result>\n</task-notification>"}}"#.to_owned());
+            lines.push(r#"{"type":"assistant","uuid":"a3","message":{"id":"m3","role":"assistant","content":[{"type":"text","text":"It passed."}]}}"#.to_owned());
+        }
+        lines
+    }
+
+    #[test]
+    fn a_task_notification_completes_its_background_agent_without_a_prompt() {
+        let lines = background_agent_transcript(true);
+        let out = claude_transcript(lines.iter().map(String::as_str));
+        assert_eq!(user_texts(&out), ["review it", "meanwhile, hello"]);
+        let all = serde_json::to_string(&out).expect("serialize");
+        assert!(!all.contains("<task-notification>"));
+        // One completion only: the launch result and the turn end left it open.
+        let done: Vec<&Event> = out
+            .iter()
+            .filter(|e| {
+                e.item.as_deref() == Some("toolu_bg")
+                    && matches!(e.event, Event::ItemCompleted { .. })
+            })
+            .map(|e| &e.event)
+            .collect();
+        assert!(
+            matches!(
+                done.as_slice(),
+                [Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), .. }]
+                    if o == "**Verdict: PASS**"
+            ),
+            "{done:?}"
+        );
+        // No turn of its own: two prompts, two turns.
+        let starts = out
+            .iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .count();
+        let ends = out
+            .iter()
+            .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
+            .count();
+        assert_eq!((starts, ends), (2, 2));
+    }
+
+    #[test]
+    fn a_background_agent_with_no_notification_ends_interrupted() {
+        let lines = background_agent_transcript(false);
+        let out = claude_transcript(lines.iter().map(String::as_str));
+        assert!(matches!(
+            completed(&out, "toolu_bg"),
+            Some(Event::ItemCompleted {
+                status: ItemStatus::Interrupted,
+                ..
+            })
+        ));
+        assert!(!serde_json::to_string(&out)
+            .expect("serialize")
+            .contains("Async agent launched"));
     }
 
     fn many_prompts(n: usize) -> Vec<String> {
