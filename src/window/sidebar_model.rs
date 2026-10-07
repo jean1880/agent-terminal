@@ -65,16 +65,26 @@ pub fn badge_for(
     .find_map(|(on, badge)| on.then_some(badge))
 }
 
-/// A row's tooltip for its background work: "N background tasks running" and their names.
+/// Most task names a tooltip lists, and the most characters of each.
+const TOOLTIP_TASKS: usize = 5;
+const TOOLTIP_TASK_CHARS: usize = 60;
+
+/// A row's tooltip for its background work: "N background tasks running" and their names (the
+/// first few, each cut short). Empty when nothing runs.
 pub fn background_tooltip(descriptions: &[String]) -> String {
     let head = match descriptions.len() {
+        0 => return String::new(),
         1 => "1 background task running".to_owned(),
         n => format!("{n} background tasks running"),
     };
-    let names: Vec<&str> = descriptions
+    let names: Vec<String> = descriptions
         .iter()
-        .map(String::as_str)
         .filter(|d| !d.is_empty())
+        .take(TOOLTIP_TASKS)
+        .map(|d| match d.char_indices().nth(TOOLTIP_TASK_CHARS) {
+            Some((cut, _)) => format!("{}…", &d[..cut]),
+            None => d.clone(),
+        })
         .collect();
     if names.is_empty() {
         head
@@ -100,6 +110,23 @@ pub fn is_busy(running: bool, background: bool, approval: bool) -> bool {
 /// read that work's result is.
 pub fn turn_finishes_thread(background: bool) -> bool {
     !background
+}
+
+/// Whether a finish held back by [`turn_finishes_thread`] is due now: the background work is
+/// gone and no turn runs. Claude usually runs a turn to read the results (which clears the hold
+/// and finishes the thread itself), but not always: a failed or stopped turn, or a background
+/// command it does not report on, leaves only this.
+pub fn held_finish_due(held: bool, running: bool, background: bool) -> bool {
+    held && !running && !background
+}
+
+/// The tooltip of a spinning row: its badge's, plus what runs in the background.
+pub fn row_tooltip(badge: Badge, background: &[String]) -> String {
+    match (badge, background.is_empty()) {
+        (Badge::Background, _) => background_tooltip(background),
+        (_, true) => badge.tooltip().to_owned(),
+        (_, false) => format!("{}; {}", badge.tooltip(), background_tooltip(background)),
+    }
 }
 
 /// The window-close question's title for `n` busy threads.
@@ -1008,13 +1035,42 @@ mod tests {
             background_tooltip(&["Review the diff".into(), String::new()]),
             "2 background tasks running: Review the diff"
         );
-        assert_eq!(background_tooltip(&[]), "0 background tasks running");
+        assert_eq!(background_tooltip(&[]), "");
         assert_eq!(
             background_tooltip(&["a".into()]),
             "1 background task running: a"
         );
+        // Long names are cut (on a character, not a byte) and only the first few are listed.
+        let long = "é".repeat(80);
+        let tip = background_tooltip(&[long]);
+        assert!(tip.ends_with('…') && tip.chars().count() < 100, "{tip}");
+        let many: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            background_tooltip(&many),
+            "8 background tasks running: t0, t1, t2, t3, t4"
+        );
+
         assert!(!turn_finishes_thread(true));
         assert!(turn_finishes_thread(false));
+        // A held finish is released once the background work is gone and nothing runs.
+        assert!(held_finish_due(true, false, false));
+        assert!(!held_finish_due(true, true, false));
+        assert!(!held_finish_due(true, false, true));
+        assert!(!held_finish_due(false, false, false));
+    }
+
+    #[test]
+    fn a_spinning_row_says_what_is_running() {
+        let bg = vec!["Review the diff".to_owned()];
+        assert_eq!(row_tooltip(Badge::Running, &[]), "Working");
+        assert_eq!(
+            row_tooltip(Badge::Running, &bg),
+            "Working; 1 background task running: Review the diff"
+        );
+        assert_eq!(
+            row_tooltip(Badge::Background, &bg),
+            "1 background task running: Review the diff"
+        );
     }
 
     #[test]
