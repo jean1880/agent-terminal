@@ -18,6 +18,11 @@
 //! - `ApprovalResolved` is only emitted for approvals the CLI cancels or that die with the
 //!   process. The CLI never acknowledges an answer, so the session resolves the card itself once
 //!   the answer is written (`ChatSession::respond_approval`).
+//! - A backgrounded sub-agent (`task_started` with `is_backgrounded`, or an `Agent` result whose
+//!   metadata says `async_launched`) stays open past its launch result and its turn's `result`
+//!   and completes on `task_notification`. The per-turn snapshot numbering is reset by the
+//!   parent's `result`; a sub-agent message split across frames on either side of it would
+//!   reuse a block index. Upgrade path: key `snap_counts` cleanup by parent.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,8 +33,9 @@ use crate::adapter::{
 };
 use crate::caps::Capabilities;
 use crate::event::{
-    AgentCommand, AgentCommandKind, Decision, Envelope, Event, ItemKind, ItemStatus, Question,
-    QuestionOption, ResponseCapability, StreamKind, TurnState, Usage,
+    AgentCommand, AgentCommandKind, BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event,
+    ItemKind, ItemStatus, Question, QuestionOption, ResponseCapability, StreamKind, TurnState,
+    Usage,
 };
 
 /// Dedup window for replayed frames (see the module notes).
@@ -73,6 +79,15 @@ pub struct ClaudeAdapter {
     snap_counts: HashMap<String, u64>,
     started_items: HashSet<String>,
     open_items: Vec<String>,
+    /// Backgrounded sub-agents (`Agent` tool uses) still running: they outlive the turn that
+    /// launched them and finish on their `task_notification`.
+    background: HashSet<String>,
+    /// Items opened inside a backgrounded sub-agent, mapped to that sub-agent's tool-use id.
+    background_children: HashMap<String, String>,
+    /// The running background tasks last reported (`background_tasks_changed`).
+    tasks: Vec<BackgroundTask>,
+    /// Background task id → the tool call that started it (`task_started`).
+    task_tools: HashMap<String, String>,
     seen: HashSet<String>,
     // Requests in flight.
     pending: HashMap<String, PendingApproval>,
@@ -117,6 +132,10 @@ impl ClaudeAdapter {
             snap_counts: HashMap::new(),
             started_items: HashSet::new(),
             open_items: Vec::new(),
+            background: HashSet::new(),
+            background_children: HashMap::new(),
+            tasks: Vec::new(),
+            task_tools: HashMap::new(),
             seen: HashSet::new(),
             pending: HashMap::new(),
             pending_controls: HashSet::new(),
@@ -151,8 +170,140 @@ impl ClaudeAdapter {
         self.open_items.push(id.to_owned());
     }
 
+    /// [`open_item`](Self::open_item) for an item nested under `parent`: an item inside a
+    /// backgrounded sub-agent (at any depth) is remembered as that sub-agent's, so the parent
+    /// turn's end does not settle it.
+    fn open_child(&mut self, id: &str, parent: Option<&str>) {
+        self.open_item(id);
+        let Some(parent) = parent else {
+            return;
+        };
+        let root = if self.background.contains(parent) {
+            Some(parent.to_owned())
+        } else {
+            self.background_children.get(parent).cloned()
+        };
+        if let Some(root) = root {
+            self.background_children.insert(id.to_owned(), root);
+        }
+    }
+
     fn close_item(&mut self, id: &str) {
         self.open_items.retain(|i| i != id);
+    }
+
+    /// Whether `id` belongs to a backgrounded sub-agent (the `Agent` call itself or anything
+    /// inside it).
+    fn in_background(&self, id: &str) -> bool {
+        self.background.contains(id) || self.background_children.contains_key(id)
+    }
+
+    // ----- background sub-agents -----
+
+    /// `task_started`: a backgrounded `Agent` call stays open past its immediate "launched"
+    /// tool result. A foreground one keeps the usual tool-result completion, and so does a
+    /// backgrounded shell command (its "running in background" result is its answer; the
+    /// task list says it is still running). The tool-use id also fills in the task list,
+    /// which may have shown the task first.
+    fn task_started(&mut self, v: &Value) -> Vec<Envelope> {
+        let Some(tool) = str_of(v, "tool_use_id") else {
+            return Vec::new();
+        };
+        let agent =
+            str_of(v, "task_type").is_none_or(|t| task_kind(t) == BackgroundTaskKind::Agent);
+        if agent && v.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
+            self.background.insert(tool.to_owned());
+        }
+        let Some(task) = str_of(v, "task_id") else {
+            return Vec::new();
+        };
+        self.task_tools.insert(task.to_owned(), tool.to_owned());
+        match self.tasks.iter_mut().find(|t| t.id == task) {
+            Some(t) if t.tool_use_id.is_none() => {
+                t.tool_use_id = Some(tool.to_owned());
+                vec![Envelope::new(Event::BackgroundTasks {
+                    tasks: self.tasks.clone(),
+                })]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `background_tasks_changed`: the full list of running background tasks.
+    fn background_tasks(&mut self, v: &Value) -> Vec<Envelope> {
+        let tasks: Vec<BackgroundTask> = array_of(v, "tasks")
+            .iter()
+            .filter_map(|t| {
+                let id = str_of(t, "task_id")?.to_owned();
+                Some(BackgroundTask {
+                    kind: task_kind(str_of(t, "task_type").unwrap_or("")),
+                    description: str_of(t, "description").map(str::to_owned),
+                    tool_use_id: self.task_tools.get(&id).cloned(),
+                    id,
+                })
+            })
+            .collect();
+        // Forget the tool ids of tasks that ended.
+        self.task_tools.retain(|task, _| {
+            tasks.iter().any(|t| t.id == *task) || !self.tasks.iter().any(|t| t.id == *task)
+        });
+        if tasks == self.tasks {
+            return Vec::new();
+        }
+        self.tasks = tasks.clone();
+        vec![Envelope::new(Event::BackgroundTasks { tasks })]
+    }
+
+    /// `task_notification`: a backgrounded sub-agent finished. Its item completes with the
+    /// notification's summary; anything still open inside it never got a result.
+    fn task_notification(&mut self, v: &Value) -> Vec<Envelope> {
+        if let Some(task) = str_of(v, "task_id") {
+            if !self.tasks.iter().any(|t| t.id == task) {
+                self.task_tools.remove(task);
+            }
+        }
+        let Some(id) = str_of(v, "tool_use_id") else {
+            return Vec::new();
+        };
+        // A foreground sub-agent's own tool result follows and completes it.
+        if !self.background.remove(id) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let children: Vec<String> = self
+            .open_items
+            .iter()
+            .filter(|i| self.background_children.get(*i).map(String::as_str) == Some(id))
+            .cloned()
+            .collect();
+        for child in children {
+            self.close_item(&child);
+            out.push(
+                Envelope::new(Event::ItemCompleted {
+                    status: ItemStatus::Interrupted,
+                    output: None,
+                    error: None,
+                })
+                .item(child),
+            );
+        }
+        self.background_children.retain(|_, root| root != id);
+        self.close_item(id);
+        let status = task_status(str_of(v, "status").unwrap_or(""));
+        let summary = str_of(v, "summary").map(str::to_owned);
+        out.push(
+            Envelope::new(Event::ItemCompleted {
+                status,
+                error: (status == ItemStatus::Failed).then(|| {
+                    summary
+                        .clone()
+                        .unwrap_or_else(|| "the sub-agent failed".to_owned())
+                }),
+                output: summary,
+            })
+            .item(id),
+        );
+        out
     }
 
     // ----- commands -----
@@ -238,13 +389,19 @@ impl ClaudeAdapter {
                     strip_local_tags(&content_text(v.get("content").unwrap_or(&Value::Null)));
                 notice(text)
             }
-            // Progress chatter that carries nothing the UI renders.
+            "task_started" => self.task_started(v),
+            "task_notification" => self.task_notification(v),
+            "background_tasks_changed" => self.background_tasks(v),
+            // Progress chatter that carries nothing the UI renders. A sub-agent's
+            // `task_updated` status patch is repeated by its `task_notification`.
             "status"
             | "thinking_tokens"
             | "hook_started"
             | "hook_progress"
             | "hook_response"
-            | "session_state_changed" => Vec::new(),
+            | "session_state_changed"
+            | "task_updated"
+            | "task_progress" => Vec::new(),
             _ => vec![Envelope::new(Event::Unknown)],
         }
     }
@@ -404,7 +561,7 @@ impl ClaudeAdapter {
                 tool,
             },
         );
-        self.open_item(&item);
+        self.open_child(&item, parent.as_deref());
         vec![Envelope::new(Event::ItemStarted {
             kind,
             title,
@@ -511,7 +668,7 @@ impl ClaudeAdapter {
                             .item(id),
                         );
                     } else {
-                        self.open_item(id);
+                        self.open_child(id, parent.as_deref());
                         out.push(
                             Envelope::new(Event::ItemStarted {
                                 kind: tool_kind(name),
@@ -539,13 +696,24 @@ impl ClaudeAdapter {
 
         // Tool results complete their item.
         if let Value::Array(blocks) = content {
-            for b in blocks
+            let results: Vec<&Value> = blocks
                 .iter()
                 .filter(|b| str_of(b, "type") == Some("tool_result"))
-            {
+                .collect();
+            // The frame-level result metadata describes a frame's single result.
+            let async_launch = results.len() == 1 && is_async_launch(v);
+            let had_results = !results.is_empty();
+            for b in results {
                 let Some(id) = str_of(b, "tool_use_id") else {
                     continue;
                 };
+                // A backgrounded sub-agent answers its `Agent` call at once with internal
+                // "launched" metadata; the item stays open until its `task_notification`.
+                // `task_started` says so first; the structured result is the fallback.
+                if self.background.contains(id) || async_launch {
+                    self.background.insert(id.to_owned());
+                    continue;
+                }
                 let text = tool_result_text(b.get("content").unwrap_or(&Value::Null));
                 let failed = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                 self.close_item(id);
@@ -562,9 +730,9 @@ impl ClaudeAdapter {
                     .item(id),
                 );
             }
-        }
-        if !out.is_empty() {
-            return out;
+            if had_results {
+                return out;
+            }
         }
 
         let text = content_text(content);
@@ -747,6 +915,14 @@ impl ClaudeAdapter {
     }
 
     fn result(&mut self, v: &Value) -> Vec<Envelope> {
+        // A turn Claude ran itself to report a finished background task ends with a `result`
+        // whose `origin.kind` is "task-notification". It normally follows its own `init`; one
+        // with no turn open (print mode flushes both results at the end) ends nothing new.
+        let from_task =
+            v.get("origin").and_then(|o| str_of(o, "kind")) == Some("task-notification");
+        if from_task && !self.turn_open {
+            return Vec::new();
+        }
         self.turn_open = false;
         let interrupted_by_us = std::mem::take(&mut self.interrupt_pending);
         self.blocks.clear();
@@ -783,8 +959,14 @@ impl ClaudeAdapter {
             (TurnState::Failed, Some(failure_text(v)))
         };
         let usage = v.get("usage").map(usage_of);
-        // Anything still open never got its own close: the turn is over, so settle it.
-        let mut out: Vec<Envelope> = std::mem::take(&mut self.open_items)
+        // Anything still open never got its own close: the turn is over, so settle it. A
+        // backgrounded sub-agent and everything inside it outlive the turn: they finish on
+        // their `task_notification`.
+        let (keep, settle): (Vec<String>, Vec<String>) = std::mem::take(&mut self.open_items)
+            .into_iter()
+            .partition(|i| self.in_background(i));
+        self.open_items = keep;
+        let mut out: Vec<Envelope> = settle
             .into_iter()
             .map(|item| {
                 let interrupted = state == TurnState::Interrupted;
@@ -971,6 +1153,14 @@ impl Adapter for ClaudeAdapter {
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         let expected = self.interrupt_pending;
         let mut out = Vec::new();
+        // Background tasks die with the process: sub-agents are settled with everything else,
+        // and the task list empties.
+        self.background.clear();
+        self.background_children.clear();
+        self.task_tools.clear();
+        if !std::mem::take(&mut self.tasks).is_empty() {
+            out.push(Envelope::new(Event::BackgroundTasks { tasks: Vec::new() }));
+        }
         for item in std::mem::take(&mut self.open_items) {
             out.push(
                 Envelope::new(Event::ItemCompleted {
@@ -1189,6 +1379,38 @@ fn tool_kind(name: &str) -> ItemKind {
         "Task" | "Agent" => ItemKind::Subagent,
         n if n.starts_with("mcp__") => ItemKind::McpTool,
         _ => ItemKind::Tool,
+    }
+}
+
+/// Whether a `user` record holding a tool result is a backgrounded sub-agent's immediate
+/// "launched" answer. Stream-json names the metadata `tool_use_result`, the transcript
+/// `toolUseResult`; both carry `{"isAsync": true, "status": "async_launched", …}`.
+pub(crate) fn is_async_launch(record: &Value) -> bool {
+    ["tool_use_result", "toolUseResult"]
+        .iter()
+        .filter_map(|k| record.get(*k))
+        .any(|r| {
+            r.get("isAsync").and_then(Value::as_bool) == Some(true)
+                || str_of(r, "status") == Some("async_launched")
+        })
+}
+
+/// A background task's `task_type`. Seen: `local_agent`, `local_bash`, `bash`.
+fn task_kind(task_type: &str) -> BackgroundTaskKind {
+    match task_type {
+        t if t.ends_with("agent") => BackgroundTaskKind::Agent,
+        t if t.ends_with("bash") || t.ends_with("shell") => BackgroundTaskKind::Shell,
+        _ => BackgroundTaskKind::Other,
+    }
+}
+
+/// A background task's final status (`task_notification.status`) as an item status. Claude
+/// reports `completed`, `failed`, `killed` and `stopped`; an unknown one counts as a failure.
+pub(crate) fn task_status(status: &str) -> ItemStatus {
+    match status {
+        "completed" => ItemStatus::Completed,
+        "killed" | "stopped" | "cancelled" | "canceled" | "interrupted" => ItemStatus::Interrupted,
+        _ => ItemStatus::Failed,
     }
 }
 
@@ -2112,6 +2334,313 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ----- sub-agents (shapes from claude 2.1.29x stream-json captures, ids shortened) -----
+
+    fn agent_call(id: &str, background: bool) -> String {
+        json!({"type": "assistant", "uuid": format!("u-{id}"), "parent_tool_use_id": null,
+            "message": {"id": format!("m-{id}"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "Agent", "input": {
+                    "description": "Test agent", "prompt": "Reply with the single word OK.",
+                    "subagent_type": "general-purpose", "run_in_background": background}}]}})
+        .to_string()
+    }
+
+    fn task_started(task: &str, tool: &str, background: bool) -> String {
+        json!({"type": "system", "subtype": "task_started", "task_id": task, "run_id": "r1",
+            "tool_use_id": tool, "description": "Test agent", "subagent_type": "general-purpose",
+            "is_backgrounded": background, "spawn_depth": 1, "task_type": "local_agent"})
+        .to_string()
+    }
+
+    fn tasks_changed(tasks: &[&str]) -> String {
+        let tasks: Vec<Value> = tasks
+            .iter()
+            .map(|t| {
+                json!({"task_id": t, "run_id": "r1", "task_type": "local_agent",
+                            "description": "Test agent"})
+            })
+            .collect();
+        json!({"type": "system", "subtype": "background_tasks_changed", "tasks": tasks}).to_string()
+    }
+
+    fn async_launched(tool: &str) -> String {
+        json!({"type": "user", "uuid": format!("r-{tool}"), "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool,
+                "content": [{"type": "text", "text": "Async agent launched successfully. (This tool result is internal metadata.)"}]}]},
+            "tool_use_result": {"isAsync": true, "status": "async_launched", "agentId": "ag1",
+                "description": "Test agent"}})
+        .to_string()
+    }
+
+    fn text_frame(uuid: &str, parent: Option<&str>, text: &str) -> String {
+        json!({"type": "assistant", "uuid": uuid, "parent_tool_use_id": parent,
+            "message": {"id": format!("m-{uuid}"), "role": "assistant",
+                "content": [{"type": "text", "text": text}]}})
+        .to_string()
+    }
+
+    fn task_notification(task: &str, tool: &str, status: &str, summary: &str) -> String {
+        json!({"type": "system", "subtype": "task_notification", "task_id": task, "run_id": "r1",
+            "tool_use_id": tool, "status": status, "output_file": "/tmp/t/tasks/x.output",
+            "summary": summary})
+        .to_string()
+    }
+
+    fn task_updated(task: &str) -> String {
+        json!({"type": "system", "subtype": "task_updated", "task_id": task, "run_id": "r1",
+            "patch": {"status": "completed", "end_time": 1}})
+        .to_string()
+    }
+
+    fn completions<'a>(out: &'a [Envelope], id: &str) -> Vec<&'a Event> {
+        out.iter()
+            .filter(|e| {
+                e.item.as_deref() == Some(id) && matches!(e.event, Event::ItemCompleted { .. })
+            })
+            .map(|e| &e.event)
+            .collect()
+    }
+
+    fn count(out: &[Envelope], f: impl Fn(&Event) -> bool) -> usize {
+        out.iter().filter(|e| f(&e.event)).count()
+    }
+
+    fn task_lists(out: &[Envelope]) -> Vec<Vec<BackgroundTask>> {
+        out.iter()
+            .filter_map(|e| match &e.event {
+                Event::BackgroundTasks { tasks } => Some(tasks.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_background_sub_agent_runs_past_its_launch_result_and_the_turn_end() {
+        let mut a = ClaudeAdapter::new();
+        let mut out = Vec::new();
+        let mut feed = |a: &mut ClaudeAdapter, line: String| {
+            let envs = a.feed(&line);
+            out.extend(envs);
+            out.clone()
+        };
+        feed(&mut a, init_frame());
+        feed(&mut a, agent_call("toolu_bg", true));
+        feed(&mut a, tasks_changed(&["task1"]));
+        feed(&mut a, task_started("task1", "toolu_bg", true));
+        // The immediate "launched" result does not complete it.
+        let so_far = feed(&mut a, async_launched("toolu_bg"));
+        assert!(completions(&so_far, "toolu_bg").is_empty(), "{so_far:?}");
+        feed(
+            &mut a,
+            text_frame("main1", None, "Agent launched in the background."),
+        );
+        // The sub-agent's own tool call nests under it.
+        let child = json!({"type": "assistant", "uuid": "sub1", "parent_tool_use_id": "toolu_bg",
+            "message": {"id": "m-sub1", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_child", "name": "Read", "input": {"file_path": "/x"}}]}});
+        let so_far = feed(&mut a, child.to_string());
+        assert!(so_far.iter().any(|e| e.item.as_deref() == Some("toolu_child")
+            && matches!(&e.event, Event::ItemStarted { parent: Some(p), .. } if p == "toolu_bg")));
+        // The parent turn ends: neither the sub-agent nor its open child is settled.
+        let so_far = feed(
+            &mut a,
+            json!({"type": "result", "subtype": "success"}).to_string(),
+        );
+        assert!(completions(&so_far, "toolu_bg").is_empty(), "{so_far:?}");
+        assert!(completions(&so_far, "toolu_child").is_empty(), "{so_far:?}");
+        let child_result = json!({"type": "user", "uuid": "sub2", "parent_tool_use_id": "toolu_bg",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_child", "content": "x"}]}});
+        feed(&mut a, child_result.to_string());
+        feed(&mut a, text_frame("sub3", Some("toolu_bg"), "OK"));
+        feed(&mut a, task_updated("task1"));
+        let so_far = feed(
+            &mut a,
+            task_notification("task1", "toolu_bg", "completed", "OK"),
+        );
+        assert!(matches!(
+            completions(&so_far, "toolu_bg").as_slice(),
+            [Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), error: None }]
+                if o == "OK"
+        ));
+        feed(&mut a, tasks_changed(&[]));
+        // Claude then runs a turn of its own about the notification.
+        feed(&mut a, init_frame());
+        feed(&mut a, text_frame("main2", None, "DONE"));
+        let out = feed(
+            &mut a,
+            json!({"type": "result", "subtype": "success",
+                   "origin": {"kind": "task-notification", "producer": "session-task"}})
+            .to_string(),
+        );
+
+        assert_eq!(count(&out, |e| *e == Event::Unknown), 0, "{out:?}");
+        assert_eq!(
+            count(&out, |e| matches!(e, Event::SessionStarted { .. })),
+            1
+        );
+        assert_eq!(count(&out, |e| matches!(e, Event::TurnStarted { .. })), 2);
+        assert_eq!(count(&out, |e| matches!(e, Event::TurnCompleted { .. })), 2);
+        assert_eq!(completions(&out, "toolu_bg").len(), 1);
+        assert!(matches!(
+            completions(&out, "toolu_child").as_slice(),
+            [Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                ..
+            }]
+        ));
+        // The task list: shown, then given its tool call by task_started, then empty.
+        let lists = task_lists(&out);
+        assert_eq!(lists.len(), 3, "{lists:?}");
+        assert_eq!(lists[0].len(), 1);
+        assert_eq!(lists[0][0].id, "task1");
+        assert_eq!(lists[0][0].kind, BackgroundTaskKind::Agent);
+        assert_eq!(lists[0][0].description.as_deref(), Some("Test agent"));
+        assert_eq!(lists[1][0].tool_use_id.as_deref(), Some("toolu_bg"));
+        assert!(lists[2].is_empty());
+    }
+
+    #[test]
+    fn print_mode_flushing_both_results_at_the_end_ends_one_turn() {
+        // The recorded `-p` order: the second turn's init arrives before the first result, and
+        // both results come last.
+        let mut a = ClaudeAdapter::new();
+        let mut out = Vec::new();
+        for line in [
+            init_frame(),
+            agent_call("toolu_bg", true),
+            tasks_changed(&["task1"]),
+            task_started("task1", "toolu_bg", true),
+            async_launched("toolu_bg"),
+            text_frame("sub1", Some("toolu_bg"), "OK"),
+            task_notification("task1", "toolu_bg", "completed", "OK"),
+            tasks_changed(&[]),
+            init_frame(),
+            text_frame("main2", None, "DONE"),
+            json!({"type": "result", "subtype": "success"}).to_string(),
+            json!({"type": "result", "subtype": "success",
+                   "origin": {"kind": "task-notification"}})
+            .to_string(),
+        ] {
+            out.extend(a.feed(&line));
+        }
+        assert_eq!(count(&out, |e| *e == Event::Unknown), 0);
+        assert_eq!(
+            count(&out, |e| matches!(e, Event::SessionStarted { .. })),
+            1
+        );
+        assert_eq!(count(&out, |e| matches!(e, Event::TurnCompleted { .. })), 1);
+        assert!(matches!(
+            out.last().map(|e| &e.event),
+            Some(Event::TurnCompleted {
+                state: TurnState::Completed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            completions(&out, "toolu_bg").as_slice(),
+            [Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), .. }] if o == "OK"
+        ));
+    }
+
+    #[test]
+    fn a_foreground_sub_agent_completes_on_its_tool_result_with_no_unknowns() {
+        let mut a = ClaudeAdapter::new();
+        let mut out = Vec::new();
+        let prompt = json!({"type": "user", "uuid": "p1", "parent_tool_use_id": "toolu_fg",
+            "agent_id": "ag1", "subagent_type": "general-purpose", "task_description": "Test agent",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Reply with the single word OK."}]}});
+        let result = json!({"type": "user", "uuid": "r1", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fg",
+                "content": [{"type": "text", "text": "[Subagent hand-back] OK"}]}]},
+            "tool_use_result": {"status": "completed", "agentId": "ag1"}});
+        let mut notified_at = 0;
+        for line in [
+            init_frame(),
+            agent_call("toolu_fg", false),
+            task_started("task1", "toolu_fg", false),
+            prompt.to_string(),
+            task_updated("task1"),
+            task_notification("task1", "toolu_fg", "completed", "OK"),
+            result.to_string(),
+            json!({"type": "result", "subtype": "success"}).to_string(),
+        ] {
+            if line.contains("task_notification") {
+                notified_at = out.len();
+            }
+            out.extend(a.feed(&line));
+        }
+        assert_eq!(count(&out, |e| *e == Event::Unknown), 0, "{out:?}");
+        assert!(task_lists(&out).is_empty());
+        let done: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.item.as_deref() == Some("toolu_fg")
+                    && matches!(e.event, Event::ItemCompleted { .. })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(done.len(), 1);
+        // The notification itself adds nothing; the tool result after it completes the card.
+        assert!(done[0] >= notified_at, "completed by its tool result");
+        assert!(matches!(
+            &out[done[0]].event,
+            Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), .. }
+                if o.contains("OK")
+        ));
+    }
+
+    #[test]
+    fn background_task_statuses_and_exit() {
+        assert_eq!(task_status("completed"), ItemStatus::Completed);
+        assert_eq!(task_status("failed"), ItemStatus::Failed);
+        assert_eq!(task_status("killed"), ItemStatus::Interrupted);
+        assert_eq!(task_status("stopped"), ItemStatus::Interrupted);
+
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_bg", true));
+        a.feed(&task_started("task1", "toolu_bg", true));
+        a.feed(&async_launched("toolu_bg"));
+        let out = a.feed(&task_notification("task1", "toolu_bg", "failed", "boom"));
+        assert!(matches!(
+            out.as_slice(),
+            [e] if matches!(&e.event, Event::ItemCompleted { status: ItemStatus::Failed, error: Some(m), .. } if m == "boom")
+        ));
+
+        // Still running when the process exits: interrupted, and the task list empties.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_bg", true));
+        a.feed(&tasks_changed(&["task1"]));
+        a.feed(&task_started("task1", "toolu_bg", true));
+        a.feed(&async_launched("toolu_bg"));
+        a.feed(&json!({"type": "result", "subtype": "success"}).to_string());
+        let out = a.on_exit(Some(0));
+        assert!(matches!(
+            completions(&out, "toolu_bg").as_slice(),
+            [Event::ItemCompleted {
+                status: ItemStatus::Interrupted,
+                ..
+            }]
+        ));
+        assert_eq!(task_lists(&out), vec![Vec::new()]);
+    }
+
+    #[test]
+    fn the_launch_result_alone_keeps_a_sub_agent_open() {
+        // No task_started before the result: the structured result metadata is enough.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&agent_call("toolu_bg", true));
+        assert!(a.feed(&async_launched("toolu_bg")).is_empty());
+        let out = a.feed(&json!({"type": "result", "subtype": "success"}).to_string());
+        assert!(completions(&out, "toolu_bg").is_empty());
+        let out = a.feed(&task_notification("task1", "toolu_bg", "completed", "OK"));
+        assert_eq!(completions(&out, "toolu_bg").len(), 1);
     }
 
     #[test]

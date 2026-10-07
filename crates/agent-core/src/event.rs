@@ -176,6 +176,12 @@ pub enum Event {
     ModelChanged {
         model: String,
     },
+    /// Full replacement of the agent's running background tasks (sub-agents, shell commands);
+    /// empty once the last one ends. A thread with any is still working after its turn ended.
+    /// Claude only (`background_tasks_changed`).
+    BackgroundTasks {
+        tasks: Vec<BackgroundTask>,
+    },
     /// Text the CLI produced itself (local slash command output, synthetic messages).
     Notice {
         text: String,
@@ -331,6 +337,34 @@ pub struct QuotaWindow {
     pub resets_at: Option<String>,
 }
 
+/// One running background task ([`Event::BackgroundTasks`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTask {
+    /// The agent's task id (Claude `task_id`).
+    pub id: String,
+    #[serde(default)]
+    pub kind: BackgroundTaskKind,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The tool call that started it, once known (Claude names it in `task_started`, which may
+    /// arrive after the list first shows the task).
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+}
+
+/// What a background task runs. A kind this build does not know decodes as `Other`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskKind {
+    /// A sub-agent (Claude `local_agent`).
+    Agent,
+    /// A shell command (Claude `local_bash`, `bash`).
+    Shell,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
 /// A command or skill the agent itself offers (typeahead "agent" and "skill" providers).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCommand {
@@ -375,6 +409,38 @@ mod tests {
     fn unknown_event_types_from_newer_builds_decode_as_unknown() {
         let event: Event = serde_json::from_str(r#"{"type":"from_the_future"}"#).expect("decode");
         assert_eq!(event, Event::Unknown);
+    }
+
+    #[test]
+    fn background_tasks_keep_their_stored_shape() {
+        let env = Envelope::new(Event::BackgroundTasks {
+            tasks: vec![BackgroundTask {
+                id: "t1".into(),
+                kind: BackgroundTaskKind::Agent,
+                description: Some("Test agent".into()),
+                tool_use_id: Some("toolu_1".into()),
+            }],
+        });
+        let json = serde_json::to_value(&env).expect("serialize");
+        assert_eq!(
+            json["event"],
+            serde_json::json!({"type": "background_tasks", "tasks": [{
+                "id": "t1", "kind": "agent", "description": "Test agent", "tool_use_id": "toolu_1"
+            }]})
+        );
+        let back: Envelope = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(env, back);
+        // A minimal stored task and a kind from a newer build still decode.
+        let event: Event = serde_json::from_str(
+            r#"{"type":"background_tasks","tasks":[{"id":"t2"},{"id":"t3","kind":"remote_thing"}]}"#,
+        )
+        .expect("decode");
+        let Event::BackgroundTasks { tasks } = event else {
+            panic!("not background tasks: {event:?}");
+        };
+        assert_eq!(tasks[0].kind, BackgroundTaskKind::Other);
+        assert_eq!(tasks[0].tool_use_id, None);
+        assert_eq!(tasks[1].kind, BackgroundTaskKind::Other);
     }
 
     #[test]

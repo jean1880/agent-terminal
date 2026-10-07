@@ -745,8 +745,9 @@ impl Transcript {
                     None,
                 )));
             }
-            // Quota feeds the usage indicator (app-wide service), not the transcript.
-            Event::QuotaUpdated { .. } | Event::Unknown => {}
+            // Quota feeds the usage indicator (app-wide service), not the transcript. Background
+            // tasks are thread state, not transcript rows.
+            Event::QuotaUpdated { .. } | Event::BackgroundTasks { .. } | Event::Unknown => {}
         }
         out
     }
