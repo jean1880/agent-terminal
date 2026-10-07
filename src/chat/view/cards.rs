@@ -1409,6 +1409,7 @@ impl QuestionCardWidget {
             QuestionState::Sent => ("Sending…", false),
             QuestionState::Answered => ("Answered", false),
             QuestionState::Withdrawn => ("Withdrawn by the agent", false),
+            QuestionState::Expired => ("Expired: the agent that asked has exited", false),
         };
         self.status.set_text(text);
         self.submit.set_visible(open);

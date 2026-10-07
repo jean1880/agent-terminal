@@ -1,5 +1,5 @@
 //! The sub-agent explorer: a header button listing every sub-agent the thread started (nested ones
-//! included) with its live status, and a dialog that shows one of them on its own: what it was
+//! included; running ones first) with its live status, and a dialog that shows one of them on its own: what it was
 //! asked, every step it took (the same cards as the transcript) and what it reported.
 //!
 //! Both update in place, like the transcript: the list rebuilds its rows only when the set of
@@ -31,6 +31,33 @@ pub fn status_text(s: &SubagentSummary) -> String {
         0 => state.to_owned(),
         1 => format!("{state} · 1 step"),
         n => format!("{state} · {n} steps"),
+    }
+}
+
+/// The explorer's order: running sub-agents first, then the finished ones, each in the order they
+/// began.
+pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
+    let (mut running, done): (Vec<_>, Vec<_>) = agents
+        .iter()
+        .cloned()
+        .partition(|a| a.status == ToolStatus::Running);
+    running.extend(done);
+    running
+}
+
+/// The header button's text: how many sub-agents, and how many of them still run.
+pub fn count_text(agents: &[SubagentSummary]) -> String {
+    let all = match agents.len() {
+        1 => "1 sub-agent".to_owned(),
+        n => format!("{n} sub-agents"),
+    };
+    match agents
+        .iter()
+        .filter(|a| a.status == ToolStatus::Running)
+        .count()
+    {
+        0 => all,
+        n => format!("{all} · {n} running"),
     }
 }
 
@@ -144,18 +171,12 @@ impl SubagentButton {
         &self.root
     }
 
-    /// Shows the sub-agents it is given (the view passes the running ones); hidden while there
-    /// are none. Rows are rebuilt only when the set of sub-agents changes; otherwise their labels
-    /// are set in place.
+    /// Shows the sub-agents it is given, in that order (the view passes all of them, running
+    /// first); hidden while there are none. Rows are rebuilt only when the set or order of
+    /// sub-agents changes; otherwise their labels are set in place.
     pub fn set(&self, agents: &[SubagentSummary]) {
         self.root.set_visible(!agents.is_empty());
-        set_if_changed(
-            &self.count,
-            &match agents.len() {
-                1 => "1 sub-agent".to_owned(),
-                n => format!("{n} sub-agents"),
-            },
-        );
+        set_if_changed(&self.count, &count_text(agents));
         let same = {
             let rows = self.rows.borrow();
             rows.len() == agents.len() && rows.iter().zip(agents).all(|((id, _), a)| *id == a.id)
@@ -175,6 +196,16 @@ impl SubagentButton {
         for ((_, labels), agent) in self.rows.borrow().iter().zip(agents) {
             labels.set(agent);
         }
+    }
+
+    /// Each listed row's status text, in order (tests).
+    #[cfg(test)]
+    pub fn statuses(&self) -> Vec<String> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|(_, r)| r.status.text().to_string())
+            .collect()
     }
 
     /// Whether it shows, its count text and the listed ids (tests).
@@ -380,4 +411,37 @@ fn section(title: &str) -> (gtk4::Box, gtk4::Label) {
     b.append(&body);
     b.set_visible(false);
     (b, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(id: &str, status: ToolStatus) -> SubagentSummary {
+        SubagentSummary {
+            id: id.to_owned(),
+            name: "Explore".to_owned(),
+            task: String::new(),
+            status,
+            steps: 0,
+        }
+    }
+
+    #[test]
+    fn running_sub_agents_come_first_and_finished_ones_stay_listed() {
+        let all = [
+            agent("a", ToolStatus::Completed),
+            agent("b", ToolStatus::Running),
+            agent("c", ToolStatus::Failed),
+            agent("d", ToolStatus::Running),
+        ];
+        let ids: Vec<_> = running_first(&all).into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, ["b", "d", "a", "c"]);
+        assert_eq!(count_text(&all), "4 sub-agents · 2 running");
+        assert_eq!(count_text(&all[..1]), "1 sub-agent");
+        assert_eq!(count_text(&all[2..3]), "1 sub-agent");
+        assert_eq!(count_text(&all[1..2]), "1 sub-agent · 1 running");
+        assert_eq!(status_text(&all[0]), "done");
+        assert_eq!(status_text(&all[1]), "running");
+    }
 }

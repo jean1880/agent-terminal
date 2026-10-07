@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use agent_core::adapter::{Driver, Mode};
 use agent_core::event::{
-    Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, ResponseCapability,
-    StreamKind, TurnState,
+    BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
+    Question, ResponseCapability, StreamKind, TurnState,
 };
 use serde_json::Value;
 
@@ -208,6 +208,8 @@ pub enum QuestionState {
     Sent,
     Answered,
     Withdrawn,
+    /// Never answered, and the agent that asked is gone: it can no longer be answered.
+    Expired,
 }
 
 /// Context-window occupancy for the header gauge.
@@ -216,6 +218,80 @@ pub struct Gauge {
     pub used: u64,
     pub max: Option<u64>,
     pub auto_compact_at: Option<u64>,
+}
+
+/// What the thread is doing, counting its background work as well as the main agent's turn: the
+/// one status the view shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activity {
+    /// Nothing has run yet (a new thread): nothing to say.
+    Idle,
+    /// The main agent's turn runs; `background` more tasks run alongside it.
+    Working { background: usize },
+    /// The main agent's turn is over, but it is still waiting on these background tasks.
+    Waiting { tasks: Vec<String> },
+    /// A turn ran, and neither it nor any background work is still going.
+    Finished,
+}
+
+impl Activity {
+    /// The thread's status from the main turn and the background task list. `ran`: a turn has
+    /// run in this thread (so an idle one has finished rather than never started).
+    pub fn of(main_running: bool, background: &[BackgroundTask], ran: bool) -> Self {
+        if main_running {
+            Self::Working {
+                background: background.len(),
+            }
+        } else if !background.is_empty() {
+            Self::Waiting {
+                tasks: background.iter().map(task_name).collect(),
+            }
+        } else if ran {
+            Self::Finished
+        } else {
+            Self::Idle
+        }
+    }
+
+    /// What the header says; `None` shows nothing.
+    pub fn text(&self) -> Option<String> {
+        match self {
+            Self::Idle => None,
+            Self::Working { background: 0 } => Some("Working…".to_owned()),
+            Self::Working { background: n } => {
+                Some(format!("Working…, plus {n} in the background"))
+            }
+            Self::Waiting { tasks } => {
+                let count = match tasks.len() {
+                    1 => "1 background task".to_owned(),
+                    n => format!("{n} background tasks"),
+                };
+                Some(format!(
+                    "Main agent done, waiting on {count}: {}",
+                    tasks.join(", ")
+                ))
+            }
+            Self::Finished => Some("Finished".to_owned()),
+        }
+    }
+
+    /// Whether a spinner turns: something is still running.
+    pub fn busy(&self) -> bool {
+        matches!(self, Self::Working { .. } | Self::Waiting { .. })
+    }
+}
+
+/// A background task as the status names it: its description, else what kind of task it is.
+fn task_name(task: &BackgroundTask) -> String {
+    match task.description.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => d.to_owned(),
+        _ => match task.kind {
+            BackgroundTaskKind::Agent => "a sub-agent",
+            BackgroundTaskKind::Shell => "a shell command",
+            BackgroundTaskKind::Other => "a task",
+        }
+        .to_owned(),
+    }
 }
 
 /// What an [`Transcript::apply`] call changed, for the widget layer.
@@ -228,6 +304,7 @@ pub enum Change {
     Plan,
     Gauge,
     Mode,
+    /// What the thread is doing changed: its turn, or its background work.
     Running,
     Commands,
     /// A control reply, routed by request id to whoever asked.
@@ -248,6 +325,11 @@ pub struct Transcript {
     pub gauge: Option<Gauge>,
     pub mode: Option<Mode>,
     pub running: bool,
+    /// Background work still going (sub-agents, background commands), as the agent last listed
+    /// it: the main turn may be over while these run.
+    pub background: Vec<BackgroundTask>,
+    /// A turn has run in this thread.
+    ran: bool,
     last_driver: Option<Driver>,
     last_model: Option<String>,
     /// The assistant/reasoning item that item-less deltas belong to.
@@ -319,6 +401,12 @@ impl Transcript {
 
     pub fn current_model(&self) -> Option<&str> {
         self.last_model.as_deref()
+    }
+
+    /// The thread's status. `main_running`: the main agent's turn runs (the model's own view of
+    /// it, or the backend's).
+    pub fn activity(&self, main_running: bool) -> Activity {
+        Activity::of(main_running, &self.background, self.ran)
     }
 
     /// The input an approval card shows. A Codex file-change request names the item it is about
@@ -417,6 +505,47 @@ impl Transcript {
         }
     }
 
+    /// Closes out what replayed history left open when no agent is alive to finish it: a thread
+    /// stored by an older build (or cut off by a crash) can end mid-turn, with no
+    /// `TurnCompleted`. The turn stops running, streaming text ends, Running tool and sub-agent
+    /// items become Interrupted, unanswered approvals and questions expire (nothing could take
+    /// the answer), and the background list empties. A session that starts later emits its own
+    /// fresh events, so nothing here fights it. Returns whether anything changed.
+    pub fn settle_stale(&mut self) -> bool {
+        let mut changed = self.running || !self.background.is_empty();
+        self.running = false;
+        self.background.clear();
+        self.open_text = None;
+        for item in self.items.values_mut() {
+            match &mut item.body {
+                Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. }
+                    if *streaming =>
+                {
+                    *streaming = false;
+                    changed = true;
+                }
+                Body::Tool(t) if t.status == ToolStatus::Running => {
+                    t.status = ToolStatus::Interrupted;
+                    changed = true;
+                }
+                Body::Approval(a)
+                    if matches!(a.state, ApprovalState::Pending | ApprovalState::Sent(_)) =>
+                {
+                    a.state = ApprovalState::Expired;
+                    changed = true;
+                }
+                Body::Question(q)
+                    if matches!(q.state, QuestionState::Pending | QuestionState::Sent) =>
+                {
+                    q.state = QuestionState::Expired;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     pub fn set_expanded(&mut self, id: &str, expanded: bool) {
         if let Some(item) = self.items.get_mut(id) {
             item.expanded = expanded;
@@ -442,8 +571,10 @@ impl Transcript {
                 }
             }
             Event::SessionExited { code, expected } => {
-                if self.running {
+                // A dead session runs nothing in the background either.
+                if self.running || !self.background.is_empty() {
                     self.running = false;
+                    self.background.clear();
                     out.push(Change::Running);
                 }
                 self.open_text = None;
@@ -471,6 +602,7 @@ impl Transcript {
                     }
                     self.last_model = Some(m.clone());
                 }
+                self.ran = true;
                 if !self.running {
                     self.running = true;
                     out.push(Change::Running);
@@ -745,9 +877,15 @@ impl Transcript {
                     None,
                 )));
             }
-            // Quota feeds the usage indicator (app-wide service), not the transcript. Background
-            // tasks are thread state, not transcript rows.
-            Event::QuotaUpdated { .. } | Event::BackgroundTasks { .. } | Event::Unknown => {}
+            // Background tasks are thread state, not transcript rows: the full list each time.
+            Event::BackgroundTasks { tasks } => {
+                if self.background != *tasks {
+                    self.background.clone_from(tasks);
+                    out.push(Change::Running);
+                }
+            }
+            // Quota feeds the usage indicator (app-wide service), not the transcript.
+            Event::QuotaUpdated { .. } | Event::Unknown => {}
         }
         out
     }
@@ -1200,6 +1338,68 @@ mod tests {
         }
     }
 
+    /// What a reduced thread shows of its agents: who each reply is credited to, and each
+    /// divider's agent and whether it says the agent changed.
+    fn credits(t: &Transcript) -> Vec<(String, Driver, bool)> {
+        t.order()
+            .iter()
+            .filter_map(|id| match &t.get(id)?.body {
+                Body::Assistant { driver, .. } => Some((id.clone(), *driver, false)),
+                Body::Switch {
+                    driver,
+                    agent_changed,
+                    ..
+                } => Some((id.clone(), *driver, *agent_changed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_replay_with_each_events_agent_credits_replies_as_live_did() {
+        let session = |model: &str| {
+            ev(Event::SessionStarted {
+                native_id: "n".into(),
+                model: Some(model.into()),
+                cwd: None,
+            })
+        };
+        // A thread on Claude that switched to agy, each event with the agent it came from (as
+        // the store records it by provider thread).
+        let stream = [
+            (Driver::Claude, session("opus")),
+            (
+                Driver::Claude,
+                started("c1", ItemKind::AssistantMessage, None),
+            ),
+            (Driver::Agy, session("gemini")),
+            (Driver::Agy, started("a1", ItemKind::AssistantMessage, None)),
+        ];
+        let mut live = Transcript::new();
+        for (driver, env) in &stream {
+            live.apply(env, *driver);
+        }
+        let mut replayed = Transcript::new();
+        for (driver, env) in &stream {
+            replayed.apply(env, *driver);
+        }
+        assert_eq!(credits(&replayed), credits(&live));
+        assert_eq!(
+            credits(&live),
+            [
+                ("c1".to_owned(), Driver::Claude, false),
+                ("switch:1".to_owned(), Driver::Agy, true),
+                ("a1".to_owned(), Driver::Agy, false),
+            ]
+        );
+        // The old replay, every event credited to the current agent, got this wrong.
+        let mut flat = Transcript::new();
+        for (_, env) in &stream {
+            flat.apply(env, Driver::Agy);
+        }
+        assert_ne!(credits(&flat), credits(&live));
+    }
+
     #[test]
     fn provider_and_model_switches_add_dividers() {
         let mut t = Transcript::new();
@@ -1279,6 +1479,219 @@ mod tests {
                 message: "quota".into()
             })
         );
+    }
+
+    fn tasks(list: &[(&str, BackgroundTaskKind, Option<&str>)]) -> Envelope {
+        ev(Event::BackgroundTasks {
+            tasks: list
+                .iter()
+                .map(|(id, kind, description)| BackgroundTask {
+                    id: (*id).to_owned(),
+                    kind: *kind,
+                    description: description.map(str::to_owned),
+                    tool_use_id: None,
+                })
+                .collect(),
+        })
+    }
+
+    fn turn_done() -> Envelope {
+        ev(Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn the_thread_status_counts_background_work_until_it_finishes() {
+        let mut t = Transcript::new();
+        let now = |t: &Transcript| t.activity(t.running);
+        assert_eq!(now(&t), Activity::Idle, "a new thread says nothing");
+        assert_eq!(now(&t).text(), None);
+
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        assert_eq!(now(&t), Activity::Working { background: 0 });
+        assert_eq!(now(&t).text().as_deref(), Some("Working…"));
+
+        // A sub-agent and a shell command go to the background while the turn runs.
+        let c = t.apply(
+            &tasks(&[
+                ("t1", BackgroundTaskKind::Agent, Some("Map the crate")),
+                ("t2", BackgroundTaskKind::Shell, None),
+            ]),
+            Driver::Claude,
+        );
+        assert_eq!(c, vec![Change::Running]);
+        assert_eq!(
+            now(&t).text().as_deref(),
+            Some("Working…, plus 2 in the background")
+        );
+        // The same list again is not a change.
+        assert!(t
+            .apply(
+                &tasks(&[
+                    ("t1", BackgroundTaskKind::Agent, Some("Map the crate")),
+                    ("t2", BackgroundTaskKind::Shell, None),
+                ]),
+                Driver::Claude
+            )
+            .is_empty());
+
+        // The main turn ends: the thread is not finished, it waits on its background work.
+        t.apply(&turn_done(), Driver::Claude);
+        assert!(!t.running, "the main turn (and its stop button) is over");
+        let waiting = now(&t);
+        assert!(waiting.busy());
+        assert_eq!(
+            waiting.text().as_deref(),
+            Some("Main agent done, waiting on 2 background tasks: Map the crate, a shell command")
+        );
+
+        t.apply(
+            &tasks(&[("t1", BackgroundTaskKind::Agent, Some("Map the crate"))]),
+            Driver::Claude,
+        );
+        assert_eq!(
+            now(&t).text().as_deref(),
+            Some("Main agent done, waiting on 1 background task: Map the crate")
+        );
+
+        // The last task ends: finished.
+        t.apply(&tasks(&[]), Driver::Claude);
+        assert_eq!(now(&t), Activity::Finished);
+        assert!(!now(&t).busy());
+
+        // Claude's follow-up turn to read the results works as any turn.
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        assert_eq!(now(&t), Activity::Working { background: 0 });
+        t.apply(&turn_done(), Driver::Claude);
+        assert_eq!(now(&t), Activity::Finished);
+    }
+
+    /// A thread stored mid-turn by an older build (no `TurnCompleted`): an approval and a question
+    /// still waiting, a sub-agent and a reply still running, background work listed.
+    fn stale_history() -> Vec<Envelope> {
+        vec![
+            ev(Event::TurnStarted { model: None }),
+            started("m", ItemKind::AssistantMessage, None),
+            delta(Some("m"), StreamKind::Assistant, "Let me check"),
+            started("agent", ItemKind::Subagent, None),
+            started("agent-read", ItemKind::FileRead, Some("agent")),
+            started("done", ItemKind::Command, None),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("done"),
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command": "ls"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1"),
+            ev(Event::QuestionRequested { questions: vec![] }).request("q1"),
+            tasks(&[("t1", BackgroundTaskKind::Agent, Some("Map the crate"))]),
+        ]
+    }
+
+    #[test]
+    fn a_stale_stored_turn_settles_when_no_agent_is_alive() {
+        let mut t = Transcript::new();
+        for env in stale_history() {
+            t.apply(&env, Driver::Claude);
+        }
+        assert!(t.running && !t.background.is_empty(), "as stored");
+        assert!(t.settle_stale());
+        assert!(!t.running, "no phantom running turn");
+        assert!(t.background.is_empty());
+        assert_eq!(t.activity(false), Activity::Finished);
+        let tool = |id: &str| match &t.get(id).expect(id).body {
+            Body::Tool(tool) => tool.status,
+            other => panic!("not a tool: {other:?}"),
+        };
+        assert_eq!(tool("agent"), ToolStatus::Interrupted);
+        assert_eq!(tool("agent-read"), ToolStatus::Interrupted);
+        assert_eq!(
+            tool("done"),
+            ToolStatus::Completed,
+            "finished items keep theirs"
+        );
+        assert!(
+            t.subagents()
+                .iter()
+                .all(|s| s.status != ToolStatus::Running),
+            "no sub-agent listed as running forever"
+        );
+        match &t.get("approval:r1").expect("card").body {
+            Body::Approval(a) => assert_eq!(a.state, ApprovalState::Expired),
+            other => panic!("not an approval: {other:?}"),
+        }
+        match &t.get("question:q1").expect("card").body {
+            Body::Question(q) => assert_eq!(q.state, QuestionState::Expired),
+            other => panic!("not a question: {other:?}"),
+        }
+        assert!(matches!(
+            t.get("m").map(|i| &i.body),
+            Some(Body::Assistant {
+                streaming: false,
+                ..
+            })
+        ));
+        // A card that expired cannot be answered any more.
+        assert!(t.mark_approval_sent("r1", Decision::Allow).is_empty());
+        assert!(t.mark_questions_sent("q1").is_empty());
+        // Settled once, there is nothing left to settle.
+        assert!(!t.settle_stale());
+    }
+
+    #[test]
+    fn a_complete_history_has_nothing_to_settle() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
+        t.apply(
+            &Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("c"),
+            Driver::Claude,
+        );
+        t.apply(&turn_done(), Driver::Claude);
+        assert!(!t.settle_stale());
+    }
+
+    #[test]
+    fn a_session_that_exits_leaves_no_background_work() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        t.apply(
+            &tasks(&[("t1", BackgroundTaskKind::Agent, None)]),
+            Driver::Claude,
+        );
+        t.apply(&turn_done(), Driver::Claude);
+        assert_eq!(
+            t.activity(false).text().as_deref(),
+            Some("Main agent done, waiting on 1 background task: a sub-agent")
+        );
+        let c = t.apply(
+            &ev(Event::SessionExited {
+                code: Some(0),
+                expected: true,
+            }),
+            Driver::Claude,
+        );
+        assert_eq!(c, vec![Change::Running]);
+        assert!(t.background.is_empty());
+        assert_eq!(t.activity(false), Activity::Finished);
     }
 
     #[test]

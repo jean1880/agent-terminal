@@ -400,7 +400,8 @@ struct StartJob {
 /// What a thread page needs from the store to be built, read in one off-thread job.
 #[derive(Default)]
 struct LoadedThread {
-    history: Vec<Envelope>,
+    /// Stored events, each with the agent that produced it when the store knows.
+    history: Vec<(Option<Driver>, Envelope)>,
     /// The active provider thread (its native session id and model), to resume.
     provider: Option<agent_kit::store::ProviderThread>,
 }
@@ -604,25 +605,34 @@ fn selected_to_restore(saved: &serde_json::Value, open: &[String]) -> Option<Str
 /// long thread its newest [`REPLAY_LIMIT`] events, cut to start at a turn so no step arrives
 /// without its start, behind a notice saying earlier messages are not shown. (Reading the oldest
 /// window showed a long thread's beginning and none of its recent turns.)
-fn read_history(store: &Store, thread: &str) -> agent_kit::store::Result<Vec<Envelope>> {
+fn read_history(
+    store: &Store,
+    thread: &str,
+) -> agent_kit::store::Result<Vec<(Option<Driver>, Envelope)>> {
     read_history_within(store, thread, REPLAY_LIMIT)
 }
 
+/// [`read_history`] with its own limit. Each event comes with the agent that produced it (the
+/// provider thread it was stored under), so a thread that switched agents replays each reply
+/// under its own agent; `None` when the store does not know.
 fn read_history_within(
     store: &Store,
     thread: &str,
     limit: usize,
-) -> agent_kit::store::Result<Vec<Envelope>> {
+) -> agent_kit::store::Result<Vec<(Option<Driver>, Envelope)>> {
     let start = store.tail_after(thread, limit)?;
     let mut history = Vec::new();
     let mut after = start;
     loop {
-        let batch = store.events(thread, after, 2_000)?;
-        let Some((last, _)) = batch.last() else {
+        let batch = store.events_by_agent(thread, after, 2_000)?;
+        let Some(last) = batch.last() else {
             break;
         };
-        after = Some(*last);
-        history.extend(batch.into_iter().map(|(_, env)| env));
+        after = Some(last.seq);
+        history.extend(batch.into_iter().map(|e| {
+            let driver = e.driver.as_deref().and_then(Driver::from_key);
+            (driver, e.envelope)
+        }));
         if history.len() >= limit {
             break;
         }
@@ -632,7 +642,7 @@ fn read_history_within(
         // `TurnStarted`: cut at the last user message before that, else at the turn itself. A
         // window holding no turn start (one turn longer than the limit) starts at its first
         // prompt, or as it is when it has none.
-        let prompt = |e: &Envelope| {
+        let prompt = |(_, e): &(Option<Driver>, Envelope)| {
             matches!(
                 e.event,
                 Event::ItemStarted {
@@ -643,7 +653,7 @@ fn read_history_within(
         };
         let cut = match history
             .iter()
-            .position(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .position(|(_, e)| matches!(e.event, Event::TurnStarted { .. }))
         {
             Some(turn) => history[..turn].iter().rposition(prompt).unwrap_or(turn),
             None => history.iter().position(prompt).unwrap_or(0),
@@ -651,9 +661,13 @@ fn read_history_within(
         history.drain(..cut);
         history.insert(
             0,
-            Envelope::new(Event::Notice {
-                text: "This thread is long: only its most recent part is shown here.".to_owned(),
-            }),
+            (
+                None,
+                Envelope::new(Event::Notice {
+                    text: "This thread is long: only its most recent part is shown here."
+                        .to_owned(),
+                }),
+            ),
         );
     }
     Ok(history)
@@ -2183,7 +2197,7 @@ impl AgentTerminalWindow {
         view.set_model_source(ModelCatalog::shared());
         view.set_account_status(AccountStatus::shared());
         view.set_diff_source(diffs);
-        view.replay(&history);
+        view.replay_by_agent(&history);
         holder.append(&view);
         *slot.view.borrow_mut() = Some(view.downgrade());
 
@@ -3575,7 +3589,7 @@ mod tests {
         };
         let first = load(&thread, Some(home.path()));
         assert!(
-            first.history.iter().any(|e| matches!(
+            first.history.iter().any(|(_, e)| matches!(
                 e.event,
                 Event::ItemStarted {
                     kind: ItemKind::UserMessage,
@@ -3583,6 +3597,13 @@ mod tests {
                 }
             )),
             "the conversation shows"
+        );
+        assert!(
+            first
+                .history
+                .iter()
+                .all(|(driver, _)| *driver == Some(Driver::Claude)),
+            "imported events are credited to the session's agent"
         );
         // Opened again: read from the store, never imported twice.
         let again = load(&thread, Some(home.path()));
@@ -3603,7 +3624,7 @@ mod tests {
         let missing = load(&other, Some(home.path()));
         assert!(matches!(
             missing.history.as_slice(),
-            [e] if matches!(&e.event, Event::Notice { text } if text.contains("could not be loaded"))
+            [(_, e)] if matches!(&e.event, Event::Notice { text } if text.contains("could not be loaded"))
         ));
         assert_eq!(load(&other, Some(home.path())).history.len(), 1);
     }
@@ -3835,6 +3856,30 @@ mod tests {
     }
 
     #[test]
+    fn history_credits_each_event_to_the_agent_it_was_stored_under() {
+        let store = Store::open_in_memory().expect("store");
+        let thread = store.create_thread("/w", Some("t")).expect("thread");
+        let claude = store
+            .add_provider_thread(&thread, "claude", "opus")
+            .expect("pt");
+        let agy = store
+            .add_provider_thread(&thread, "agy", "gemini")
+            .expect("pt");
+        let note = |text: &str| Envelope::new(Event::Notice { text: text.into() });
+        for (pt, text) in [(Some(&claude), "a"), (Some(&agy), "b"), (None, "c")] {
+            store
+                .append_event(&thread, pt.map(String::as_str), &note(text))
+                .expect("event");
+        }
+        let drivers: Vec<_> = read_history(&store, &thread)
+            .expect("read")
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(drivers, [Some(Driver::Claude), Some(Driver::Agy), None]);
+    }
+
+    #[test]
     fn a_long_thread_replays_its_newest_turns_behind_a_notice() {
         let store = Store::open_in_memory().expect("store");
         let thread = store.create_thread("/w", Some("t")).expect("thread");
@@ -3869,7 +3914,7 @@ mod tests {
                     .expect("event");
             }
         }
-        let text = |e: &Envelope| match &e.event {
+        let text = |(_, e): &(Option<Driver>, Envelope)| match &e.event {
             Event::Notice { text } => text.clone(),
             Event::TurnStarted { model } => model.clone().unwrap_or_default(),
             Event::ItemStarted { title, .. } => title.clone(),

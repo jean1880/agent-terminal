@@ -247,17 +247,41 @@ impl ChatView {
 
     /// Bulk-loads stored history (thread open, restore): reduces every envelope into the model
     /// and then materialises only the newest window of rows, instead of building a widget per
-    /// item. Control replies in history are dropped (nobody is waiting for them).
+    /// item. Control replies in history are dropped (nobody is waiting for them). Every envelope
+    /// is credited to the thread's current agent; [`ChatView::replay_by_agent`] credits each to
+    /// its own.
     pub fn replay(&self, envs: &[Envelope]) {
+        self.replay_with(envs.iter().map(|e| (None, e)), envs.len());
+    }
+
+    /// [`ChatView::replay`] of stored history that names, per envelope, the agent that produced
+    /// it (`None`: unknown, credited to the current agent). A thread that switched agents then
+    /// shows each reply under its own agent and its "Continued in" dividers, as it did live.
+    pub fn replay_by_agent(&self, envs: &[(Option<Driver>, Envelope)]) {
+        self.replay_with(envs.iter().map(|(d, e)| (*d, e)), envs.len());
+    }
+
+    fn replay_with<'a>(
+        &self,
+        envs: impl Iterator<Item = (Option<Driver>, &'a Envelope)>,
+        count: usize,
+    ) {
         let Some(inner) = self.inner() else {
             return;
         };
         let started = std::time::Instant::now();
-        let driver = inner.backend.status().driver;
+        let status = inner.backend.status();
+        let current = status.driver;
         {
             let mut model = inner.model.borrow_mut();
-            for env in envs {
-                model.apply(env, driver);
+            for (driver, env) in envs {
+                model.apply(env, driver.unwrap_or(current));
+            }
+            // With no live agent behind the view (it is built before its session starts), what
+            // the history left open can never finish: settle it now, before any row is built. A
+            // session that starts (and resumes) afterwards emits fresh events of its own.
+            if !status.alive && model.settle_stale() {
+                tracing::info!("chat view: settled a stored turn left open");
             }
         }
         inner.dirty.borrow_mut().clear();
@@ -272,7 +296,7 @@ impl ChatView {
         inner.refresh_status();
         inner.refresh_subagents(&[]);
         tracing::info!(
-            envelopes = envs.len(),
+            envelopes = count,
             ms = started.elapsed().as_millis() as u64,
             "chat view: replayed history"
         );
@@ -494,14 +518,10 @@ impl Inner {
     fn refresh_subagents(&self, changed: &[String]) {
         let model = self.model.borrow();
         let agents = model.subagents();
-        // The list is what is running now: a sub-agent that finished leaves it (its card stays
-        // in the transcript, and an open panel on it stays open).
-        let running: Vec<_> = agents
-            .iter()
-            .filter(|a| a.status == model::ToolStatus::Running)
-            .cloned()
-            .collect();
-        self.subagent_button.set(&running);
+        // Every sub-agent the thread started: the running ones first, then the finished ones
+        // with how they ended (a replayed thread, or one whose sub-agents are all done, still
+        // lists them).
+        self.subagent_button.set(&subagents::running_first(&agents));
         if let Some(panel) = self.subagent_panel.borrow().as_ref() {
             let summary = agents.iter().find(|a| a.id == panel.id());
             panel.refresh(&model, summary, changed);
@@ -547,7 +567,9 @@ impl Inner {
     fn refresh_status(&self) {
         let status = self.backend.status();
         let running = status.running_turn || self.model.borrow().running;
-        self.header.set_running(running);
+        // The header counts background work too; the stop button follows the main turn only.
+        self.header
+            .set_activity(&self.model.borrow().activity(running));
         self.composer.set_running(running);
         self.refresh_agent_chip();
         self.header
@@ -1014,8 +1036,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// A thread stored mid-turn, reopened: replayed before its session starts (no live agent),
+    /// it must show no phantom running turn, no answerable card and no background work.
+    fn stale_replay_checks() {
+        use agent_core::event::{
+            BackgroundTask, BackgroundTaskKind, Event, ItemKind, ResponseCapability,
+        };
+        let mut dead = status_of(Driver::Claude);
+        dead.alive = false;
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(dead),
+        }));
+        view.replay(&[
+            Envelope::new(Event::TurnStarted { model: None }),
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command": "ls"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1"),
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Agent".into(),
+                input: Some(serde_json::json!({"subagent_type": "Explore"})),
+                parent: None,
+            })
+            .item("agent1"),
+            Envelope::new(Event::BackgroundTasks {
+                tasks: vec![BackgroundTask {
+                    id: "t1".into(),
+                    kind: BackgroundTaskKind::Agent,
+                    description: Some("Explore".into()),
+                    tool_use_id: Some("agent1".into()),
+                }],
+            }),
+        ]);
+        let inner = view.inner().expect("view");
+        {
+            let model = inner.model.borrow();
+            assert!(!model.running, "no phantom running turn");
+            assert!(model.background.is_empty(), "no stale background work");
+            match &model.get("approval:r1").expect("card").body {
+                model::Body::Approval(a) => {
+                    assert_eq!(a.state, model::ApprovalState::Expired);
+                }
+                other => panic!("not an approval: {other:?}"),
+            }
+            match &model.get("agent1").expect("agent").body {
+                model::Body::Tool(t) => assert_eq!(t.status, model::ToolStatus::Interrupted),
+                other => panic!("not a tool: {other:?}"),
+            }
+        }
+        assert!(!inner.header.running_shown());
+        assert_eq!(inner.header.activity_shown().as_deref(), Some("Finished"));
+        assert!(!inner.composer.shows_stop());
+        let card = inner
+            .transcript
+            .with_row("approval:r1", |row| match row {
+                cards::Row::Approval(a) => Some(a.actionable()),
+                _ => None,
+            })
+            .flatten()
+            .expect("approval row");
+        assert!(
+            !card.0 && !card.1,
+            "the stale card offers no buttons: {card:?}"
+        );
+        assert_eq!(
+            inner.subagent_button.statuses(),
+            ["stopped"],
+            "the sub-agent is not listed as running"
+        );
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
+        stale_replay_checks();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });
@@ -1071,6 +1171,55 @@ pub(crate) mod tests {
             "the picker follows the agent"
         );
         assert_eq!(chosen.borrow().len(), 1, "a reported mode offers nothing");
+
+        // The header says whether the thread is still working, counting its background work;
+        // the stop button follows the main turn only.
+        {
+            use agent_core::event::{BackgroundTask, BackgroundTaskKind, Event, TurnState};
+            let inner = view.inner().expect("view");
+            let shown = || (inner.header.activity_shown(), inner.composer.shows_stop());
+            let background = |n: usize| {
+                view.sink()(&Envelope::new(Event::BackgroundTasks {
+                    tasks: (0..n)
+                        .map(|i| BackgroundTask {
+                            id: format!("t{i}"),
+                            kind: BackgroundTaskKind::Agent,
+                            description: Some(format!("Review part {i}")),
+                            tool_use_id: None,
+                        })
+                        .collect(),
+                }));
+            };
+            assert_eq!(shown(), (None, false), "a new thread says nothing");
+            view.sink()(&Envelope::new(Event::TurnStarted { model: None }));
+            assert_eq!(shown(), (Some("Working…".into()), true));
+            background(2);
+            assert_eq!(
+                shown(),
+                (Some("Working…, plus 2 in the background".into()), true)
+            );
+            view.sink()(&Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }));
+            assert_eq!(
+                shown(),
+                (
+                    Some(
+                        "Main agent done, waiting on 2 background tasks: Review part 0, \
+                         Review part 1"
+                            .into()
+                    ),
+                    false
+                ),
+                "background work keeps the thread busy, but there is no turn to stop"
+            );
+            assert!(!inner.header.running_shown());
+            background(0);
+            assert_eq!(shown(), (Some("Finished".into()), false));
+        }
 
         // The model-source listener goes away with the view.
         let source = Rc::new(CountingSource::default());
@@ -1426,10 +1575,15 @@ pub(crate) mod tests {
         a_backend.connect(a.sink());
         let b_backend = demo::demo_backend();
         let b = ChatView::new(b_backend.clone());
-        let recorded: Rc<RefCell<Vec<Envelope>>> = Rc::default();
+        // B's stream as the store records it: each envelope with the agent B was on when it
+        // arrived (the store knows it from the provider thread the event is stored under).
+        type Credited = Vec<(Option<Driver>, Envelope)>;
+        let recorded: Rc<RefCell<Credited>> = Rc::default();
         let (b_sink, rec) = (b.sink(), recorded.clone());
+        let b_weak = Rc::downgrade(&b_backend);
         let b_stream: EnvelopeSink = Rc::new(move |env: &Envelope| {
-            rec.borrow_mut().push(env.clone());
+            let driver = b_weak.upgrade().map(|b| b.status().driver);
+            rec.borrow_mut().push((driver, env.clone()));
             b_sink(env);
         });
         b_backend.connect(b_stream.clone());
@@ -1526,7 +1680,7 @@ pub(crate) mod tests {
         // replayed before it is in a window, then shown).
         let c_backend = demo::demo_backend();
         let c = ChatView::new(c_backend);
-        c.replay(&recorded.borrow());
+        c.replay_by_agent(&recorded.borrow());
         let (tc, _, _) = tabs_with(&c);
         holder.append(&tc);
         pump(2_500);
@@ -1574,24 +1728,17 @@ pub(crate) mod tests {
             sa, sb,
             "the thread streamed while hidden differs from the one in view"
         );
-        // Known gap (Hive finding): replay has no per-event agent, so it credits every reply
-        // to the thread's current agent and turns a "Continued in" divider into "Model
-        // switched". Everything else must match.
-        let without_credits = |s: &Seen| Seen {
-            statics: Vec::new(),
-            rows: s.rows.clone(),
-            subagents: s.subagents.clone(),
-            running: s.running,
-            approvals: s.approvals.clone(),
-            spinning: s.spinning.clone(),
-            reasoning: s.reasoning.clone(),
-            jump: s.jump,
-        };
-        assert_eq!(
-            without_credits(&sa),
-            without_credits(&sc),
-            "the replayed thread differs from the one in view"
+        // Replayed with each event's own agent, every reply and "Continued in" divider is
+        // credited as it was live (C's backend is on Claude, the agent the stream began on,
+        // not the one it ended on).
+        assert!(
+            sc.statics
+                .iter()
+                .any(|(_, s)| s.starts_with("Continued in")),
+            "the agent switch divider survives the replay: {:?}",
+            sc.statics
         );
+        assert_eq!(sa, sc, "the replayed thread differs from the one in view");
     }
 
     /// A thinking block whose text never streams (the model withheld it) must not end as an
@@ -1698,7 +1845,7 @@ pub(crate) mod tests {
         pump();
         let (visible, count, ids) = inner.subagent_button.state();
         assert!(visible);
-        assert_eq!(count, "1 sub-agent");
+        assert_eq!(count, "1 sub-agent · 1 running");
         assert_eq!(ids, ["agent1"]);
 
         inner.open_subagent("agent1");
@@ -1716,9 +1863,13 @@ pub(crate) mod tests {
             "existing steps are updated in place, never rebuilt"
         );
         let (_, count, ids) = inner.subagent_button.state();
-        assert_eq!((count.as_str(), ids.len()), ("1 sub-agent", 1));
+        assert_eq!((count.as_str(), ids.len()), ("1 sub-agent · 1 running", 1));
 
-        // Done: it leaves the list (the button hides), while the panel the user opened stays.
+        // A second one starts: running ones are listed first.
+        step("agent2", ItemKind::Subagent, None, None);
+        pump();
+        // Done: it stays listed, after the running one and labelled done, and the panel the
+        // user opened stays.
         sink(
             &Envelope::new(Event::ItemCompleted {
                 status: agent_core::event::ItemStatus::Completed,
@@ -1728,12 +1879,42 @@ pub(crate) mod tests {
             .item("agent1"),
         );
         pump();
-        let (visible, _, ids) = inner.subagent_button.state();
-        assert!(
-            !visible && ids.is_empty(),
-            "a finished sub-agent leaves the list"
+        let (visible, count, ids) = inner.subagent_button.state();
+        assert!(visible, "a finished sub-agent keeps the button");
+        assert_eq!(count, "2 sub-agents · 1 running");
+        assert_eq!(ids, ["agent2", "agent1"], "running first, finished after");
+        assert_eq!(
+            inner.subagent_button.statuses(),
+            ["running", "done · 2 steps"]
         );
         assert_eq!(panel().steps_shown(), 2, "the open panel keeps showing it");
+
+        // A replayed thread whose sub-agent finished long ago still lists it.
+        let replayed = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        replayed.replay(&[
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Task".into(),
+                input: Some(json!({"subagent_type": "Explore", "description": "Old work"})),
+                parent: None,
+            })
+            .item("old"),
+            Envelope::new(Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Completed,
+                output: Some("found it".into()),
+                error: None,
+            })
+            .item("old"),
+        ]);
+        pump();
+        let r = replayed.inner().expect("replayed view");
+        assert_eq!(
+            r.subagent_button.state(),
+            (true, "1 sub-agent".to_owned(), vec!["old".to_owned()])
+        );
+        assert_eq!(r.subagent_button.statuses(), ["done"]);
     }
 
     /// GTK checks of the diff viewer: the card's toggle, its buttons, the approval's diff.

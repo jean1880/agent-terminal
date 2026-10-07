@@ -1,13 +1,13 @@
-//! The strip at the top of the chat view: agent + model chip, mode dropdown, turn activity and
-//! the context gauge.
+//! The strip at the top of the chat view: agent + model chip, mode dropdown, the thread's
+//! activity (its turn and its background work) and the context gauge.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use agent_core::adapter::{Driver, Mode};
 use gtk4::prelude::*;
 
 use super::cards::{accent_class, driver_name, label};
-use super::model::{format_tokens, Gauge};
+use super::model::{format_tokens, Activity, Gauge};
 
 /// Dropdown order of the modes. Driven by index both ways; the guard test keeps it complete.
 pub const MODES: [Mode; 3] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan];
@@ -53,7 +53,10 @@ pub struct Header {
     /// Set while the view changes the dropdown itself, so that is not taken as a user choice.
     pub mode_guard: Cell<bool>,
     activity: gtk4::Box,
+    activity_text: gtk4::Label,
     spinner: gtk4::Spinner,
+    /// The status the header shows now.
+    shown: RefCell<Activity>,
     pub gauge: gtk4::Button,
     level: gtk4::LevelBar,
     gauge_label: gtk4::Label,
@@ -97,7 +100,10 @@ impl Header {
         activity.add_css_class("activity");
         let spinner = gtk4::Spinner::new();
         activity.append(&spinner);
-        activity.append(&label("Working…", &["activity-text"]));
+        let activity_text = label("", &["activity-text"]);
+        activity_text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        activity_text.set_max_width_chars(48);
+        activity.append(&activity_text);
         activity.set_visible(false);
         root.append(&activity);
 
@@ -127,7 +133,9 @@ impl Header {
             mode,
             mode_guard: Cell::new(false),
             activity,
+            activity_text,
             spinner,
+            shown: RefCell::new(Activity::Idle),
             gauge,
             level,
             gauge_label,
@@ -158,15 +166,48 @@ impl Header {
         self.mode_guard.set(false);
     }
 
-    pub fn set_running(&self, running: bool) {
-        self.activity.set_visible(running);
-        self.spinner.set_spinning(running);
+    /// Shows what the thread is doing: the main agent working, only background work left (its
+    /// spinner in the background colour), finished, or nothing.
+    pub fn set_activity(&self, activity: &Activity) {
+        if *self.shown.borrow() == *activity {
+            return;
+        }
+        let text = activity.text();
+        self.activity.set_visible(text.is_some());
+        let text = text.unwrap_or_default();
+        self.activity_text.set_text(&text);
+        self.activity
+            .set_tooltip_text((!text.is_empty()).then_some(text.as_str()));
+        let busy = activity.busy();
+        self.spinner.set_visible(busy);
+        self.spinner.set_spinning(busy);
+        let waiting = matches!(activity, Activity::Waiting { .. });
+        let finished = matches!(activity, Activity::Finished);
+        for (class, on) in [
+            ("activity-background", waiting),
+            ("activity-finished", finished),
+        ] {
+            if on {
+                self.activity.add_css_class(class);
+            } else {
+                self.activity.remove_css_class(class);
+            }
+        }
+        *self.shown.borrow_mut() = activity.clone();
     }
 
-    /// Whether the header says the agent is working (tests).
+    /// Whether the header says the main agent is working (tests).
     #[cfg(test)]
     pub fn running_shown(&self) -> bool {
-        self.activity.is_visible()
+        matches!(*self.shown.borrow(), Activity::Working { .. }) && self.activity.is_visible()
+    }
+
+    /// The status text the header shows, if any (tests).
+    #[cfg(test)]
+    pub fn activity_shown(&self) -> Option<String> {
+        self.activity
+            .is_visible()
+            .then(|| self.activity_text.text().to_string())
     }
 
     pub fn set_gauge(&self, gauge: Option<&Gauge>) {

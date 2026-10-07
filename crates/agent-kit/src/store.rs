@@ -119,6 +119,15 @@ pub struct ProviderThread {
     pub native_id: Option<String>,
 }
 
+/// One stored event and the agent it came from ([`Store::events_by_agent`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredEvent {
+    pub seq: i64,
+    /// The driver key (`claude`, `agy`, …) of the provider thread it was stored under, when known.
+    pub driver: Option<String>,
+    pub envelope: Envelope,
+}
+
 /// A transcript item with its final text, free of `agent_core` types so the
 /// hand-off budget can consume it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -782,9 +791,27 @@ impl Store {
         after_seq: Option<i64>,
         limit: usize,
     ) -> Result<Vec<(i64, Envelope)>> {
+        Ok(self
+            .events_by_agent(thread, after_seq, limit)?
+            .into_iter()
+            .map(|e| (e.seq, e.envelope))
+            .collect())
+    }
+
+    /// [`Store::events`], each with the agent that produced it: the driver key of the provider
+    /// thread it was stored under. `None` for an event stored with no provider thread, or whose
+    /// provider thread is gone (the column is `ON DELETE SET NULL`); the caller falls back to the
+    /// thread's current agent. Reads only existing columns, so every database version has it.
+    pub fn events_by_agent(
+        &self,
+        thread: &str,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, envelope_json FROM events
-             WHERE thread_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            "SELECT e.seq, p.driver, e.envelope_json FROM events e
+             LEFT JOIN provider_threads p ON p.id = e.provider_thread_id
+             WHERE e.thread_id = ?1 AND e.seq > ?2 ORDER BY e.seq LIMIT ?3",
         )?;
         let rows = stmt.query_map(
             params![
@@ -792,12 +819,22 @@ impl Store {
                 after_seq.unwrap_or(0),
                 limit.min(i64::MAX as usize) as i64
             ],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         )?;
         let mut out = Vec::new();
         for row in rows {
-            let (seq, json) = row?;
-            out.push((seq, serde_json::from_str(&json)?));
+            let (seq, driver, json) = row?;
+            out.push(StoredEvent {
+                seq,
+                driver,
+                envelope: serde_json::from_str(&json)?,
+            });
         }
         Ok(out)
     }
@@ -1479,6 +1516,31 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].0, seqs[2]);
         assert!(s.events(&t, Some(seqs[3]), 10).expect("end").is_empty());
+    }
+
+    #[test]
+    fn each_event_carries_the_agent_it_came_from() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let claude = s.add_provider_thread(&t, "claude", "opus").expect("p1");
+        let agy = s.add_provider_thread(&t, "agy", "gemini").expect("p2");
+        let note = |n: &str| Envelope::new(Event::Notice { text: n.into() });
+        s.append_event(&t, Some(&claude), &note("a")).expect("a");
+        s.append_event(&t, None, &note("b")).expect("b");
+        s.append_event(&t, Some(&agy), &note("c")).expect("c");
+        let got: Vec<_> = s
+            .events_by_agent(&t, None, 10)
+            .expect("events")
+            .into_iter()
+            .map(|e| e.driver)
+            .collect();
+        assert_eq!(
+            got,
+            [Some("claude".to_owned()), None, Some("agy".to_owned())],
+            "an event stored without a provider thread has no agent"
+        );
+        // The plain reader returns the same events.
+        assert_eq!(s.events(&t, None, 10).expect("events").len(), 3);
     }
 
     #[test]
