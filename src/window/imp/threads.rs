@@ -35,7 +35,8 @@ use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
     badge_for, driver_key, driver_label, group_rows, handoff_target, needs_attention, parse_driver,
-    relative_time, resume_as, stored_model, thread_title, Badge, ResumeAs, RowKey, SidebarRow,
+    react, relative_time, resume_as, stored_model, thread_title, Attention, Badge, ResumeAs,
+    RowKey, SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -52,6 +53,17 @@ const OPEN_THREADS_KEY: &str = "open_threads";
 const REPLAY_LIMIT: usize = 50_000;
 /// How often the account/usage indicator refreshes while the window is focused.
 const ACCOUNT_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The desktop notification id for a thread waiting on an approval or a question.
+fn approval_notification_id(thread: &str) -> String {
+    format!("approval-{thread}")
+}
+
+/// The desktop notification id for a thread whose turn finished (one per thread, so two
+/// threads finishing never collapse into a notification that opens only the last).
+fn turn_notification_id(thread: &str) -> String {
+    format!("turn-{thread}")
+}
 
 /// One chat thread page's state, beside its [`TabState`].
 pub(super) struct ChatTab {
@@ -1381,7 +1393,7 @@ impl AgentTerminalWindow {
         if row.open {
             let close = Button::builder()
                 .icon_name("at-window-close-symbolic")
-                .tooltip_text("Close (the thread stays in the list)")
+                .tooltip_text("Close (the thread stays in the list; a running turn is stopped)")
                 .css_classes(["flat", "circular", "thread-close"])
                 .valign(Align::Center)
                 .build();
@@ -1396,7 +1408,57 @@ impl AgentTerminalWindow {
         gtk4::ListBoxRow::builder().child(&line).build()
     }
 
+    /// Whether closing `key` would cut a turn short: a thread running or awaiting an answer.
+    pub(super) fn row_is_busy(&self, key: &RowKey) -> bool {
+        let RowKey::Thread(id) = key else {
+            return false;
+        };
+        self.tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .any(|c| &c.thread == id && (c.running || c.approval))
+    }
+
+    /// Runs `then` once the user agrees to stop `thread`'s running turn (closing or archiving
+    /// ends its session). Cancelling does nothing.
+    pub(super) fn confirm_stop_then(&self, thread: &str, then: impl FnOnce(&Self) + 'static) {
+        let title = self.thread_title_of(thread);
+        let dialog = adw::AlertDialog::new(
+            Some("Stop the Running Turn and Close?"),
+            Some(&format!(
+                "“{title}” is working or waiting for you. Closing it stops the agent, and any \
+                 sub-agents, before it finishes. Edits already made stay on disk."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("stop", "Stop and Close")]);
+        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let response = dialog
+                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
+                .await;
+            if response == "stop" {
+                then(window.imp());
+            }
+        });
+    }
+
+    /// Closes the row's page, asking first when that would cut a turn short.
     pub(super) fn close_row(&self, key: &RowKey) {
+        if let (true, RowKey::Thread(thread)) = (self.row_is_busy(key), key) {
+            let key = key.clone();
+            self.confirm_stop_then(thread, move |imp| imp.close_row_now(&key));
+        } else {
+            self.close_row_now(key);
+        }
+    }
+
+    /// Closes the row's page with no question (a thread being deleted was already confirmed).
+    pub(super) fn close_row_now(&self, key: &RowKey) {
         let page = self.tabs.borrow().iter().find_map(|t| {
             let matches = match key {
                 RowKey::Thread(id) => t.chat.as_ref().is_some_and(|c| &c.thread == id),
@@ -1501,6 +1563,10 @@ impl AgentTerminalWindow {
         };
         let id = thread.clone();
         self.write_store("mark the thread read", move |s| s.mark_read(&id));
+        // Shown in a focused window means seen; an unfocused one is withdrawn on focus.
+        if self.obj().is_active() {
+            self.withdraw_thread_notifications(&thread);
+        }
         let home = env::var("HOME").unwrap_or_default();
         if let Some(window_title) = self.window_title.borrow().as_ref() {
             window_title.set_title(if title.is_empty() {
@@ -1841,7 +1907,8 @@ impl AgentTerminalWindow {
                 running: false,
                 approval: false,
                 rate_limited: false,
-                unread: false,
+                // A restored thread that was never shown keeps the store's unread mark.
+                unread: summary.unread && summary.updated_at > 0,
                 title_item: None,
                 pending_prompt: None,
                 pending_handoff: None,
@@ -2224,10 +2291,13 @@ impl AgentTerminalWindow {
         }
         let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
         let focused = self.obj().is_active();
+        // Set by the arms below, acted on after the tab borrow is released.
+        let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
+        let mut withdraw_ask = false;
         enum After {
             Nothing,
             Sidebar,
-            TurnDone { page: adw::TabPage, attention: bool },
+            TurnDone { page: adw::TabPage, notify: bool },
             Title(String),
             RateLimited(adw::Banner, Driver),
         }
@@ -2264,35 +2334,55 @@ impl AgentTerminalWindow {
                     }
                     After::Nothing
                 }
-                Event::TurnCompleted { .. } => {
+                Event::TurnCompleted { state, .. } => {
                     chat.diffs.turn_ended();
                     chat.running = false;
                     chat.approval = false;
-                    let attention = !(in_view && focused);
-                    if attention && !in_view {
-                        chat.unread = true;
-                    }
+                    withdraw_ask = true;
+                    let r = react(
+                        Attention::TurnDone,
+                        in_view,
+                        focused,
+                        self.config.borrow().notify_on_bell,
+                    );
+                    // A shown thread in an unfocused window keeps its mark until focus returns.
+                    chat.unread |= r.unread;
                     // The turn's end is "output went quiet" for the checkpoint bookkeeping.
                     last_output.set(std::time::Instant::now());
-                    After::TurnDone { page, attention }
+                    After::TurnDone {
+                        page,
+                        // An interrupted turn was stopped on purpose (a close, a quit, the stop
+                        // button): there is nothing to announce.
+                        notify: r.notify && *state != agent_core::event::TurnState::Interrupted,
+                    }
                 }
                 Event::SessionExited { .. } => {
                     chat.diffs.turn_ended();
                     chat.running = false;
                     chat.approval = false;
+                    withdraw_ask = true;
                     After::Sidebar
                 }
                 Event::ApprovalRequested { .. } | Event::QuestionRequested { .. } => {
                     chat.approval = true;
-                    if !in_view {
-                        chat.unread = true;
+                    let r = react(Attention::Asked, in_view, focused, false);
+                    chat.unread |= r.unread;
+                    if r.notify {
+                        let question = matches!(env.event, Event::QuestionRequested { .. });
+                        ask = Some((page, question));
                     }
                     After::Sidebar
                 }
-                Event::ApprovalResolved { .. }
-                | Event::ApprovalExpired
-                | Event::QuestionResolved { .. } => {
+                Event::ApprovalExpired => {
                     chat.approval = false;
+                    withdraw_ask = true;
+                    // The deadline denied it unseen: the sidebar keeps a trace.
+                    chat.unread |= react(Attention::Expired, in_view, focused, false).unread;
+                    After::Sidebar
+                }
+                Event::ApprovalResolved { .. } | Event::QuestionResolved { .. } => {
+                    chat.approval = false;
+                    withdraw_ask = true;
                     After::Sidebar
                 }
                 Event::RateLimited { .. } => {
@@ -2328,6 +2418,19 @@ impl AgentTerminalWindow {
                 other => other,
             }
         };
+        if withdraw_ask {
+            if let Some(app) = self.obj().application() {
+                app.withdraw_notification(&approval_notification_id(thread));
+            }
+        }
+        if let Some((page, question)) = ask {
+            let heading = if question {
+                "A thread has a question"
+            } else {
+                "A thread needs approval"
+            };
+            self.notify_thread(&page, &approval_notification_id(thread), heading);
+        }
         match after {
             After::Nothing => {}
             After::Sidebar => self.refresh_sidebar(),
@@ -2355,19 +2458,21 @@ impl AgentTerminalWindow {
                 banner.set_revealed(true);
                 self.refresh_sidebar();
             }
-            After::TurnDone { page, attention } => {
+            After::TurnDone { page, notify } => {
                 if self.config.borrow().checkpoints {
                     self.request_checkpoint(&page, false);
                 }
                 // The turn's events moved the thread in the list (and unread); read it again.
-                if in_view {
+                // Only looking at it reads it: in an unfocused window the mark stays until
+                // focus returns (`acknowledge_shown_thread`).
+                if in_view && focused {
                     let id = thread.to_owned();
                     self.write_store("mark the thread read", move |s| s.mark_read(&id));
                 } else {
                     self.reload_summaries();
                 }
-                if attention {
-                    self.notify_bell(&page);
+                if notify {
+                    self.notify_thread(&page, &turn_notification_id(thread), "Thread finished");
                 }
                 // agy reports no quota per turn: ask for it now, once this turn has unwound.
                 if driver == Driver::Agy {
@@ -2379,6 +2484,82 @@ impl AgentTerminalWindow {
                 }
                 self.refresh_sidebar();
             }
+        }
+    }
+
+    /// Raises a desktop notification for a thread page under its own `id`; clicking it shows
+    /// that thread (`app.show-tab`). Unlike the terminal bell it is not a setting: the caller
+    /// has already decided it is wanted.
+    fn notify_thread(&self, page: &adw::TabPage, id: &str, heading: &str) {
+        let Some(app) = self.obj().application() else {
+            return;
+        };
+        let key = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page)
+            .map(|t| t.key);
+        let notification = gtk4::gio::Notification::new(heading);
+        let title = page.title();
+        notification.set_body(Some(if title.is_empty() {
+            "New thread"
+        } else {
+            &title
+        }));
+        notification.set_priority(gtk4::gio::NotificationPriority::High);
+        // Without a default action, clicking it activates the app and opens a second window.
+        if let Some(key) = key {
+            notification
+                .set_default_action_and_target_value("app.show-tab", Some(&key.to_variant()));
+        }
+        // GApplication is called into with no tab borrowed (the borrow above is released).
+        app.send_notification(Some(id), &notification);
+    }
+
+    /// Withdraws a thread's approval and turn-done notifications.
+    pub(super) fn withdraw_thread_notifications(&self, thread: &str) {
+        if let Some(app) = self.obj().application() {
+            app.withdraw_notification(&approval_notification_id(thread));
+            app.withdraw_notification(&turn_notification_id(thread));
+        }
+    }
+
+    /// Ends every live thread session on purpose (the window is closing), so each thread's
+    /// stored history is closed out, and withdraws their notifications. Sessions are collected
+    /// first: their envelopes come back through `on_thread_envelope`, which borrows the tabs.
+    pub(super) fn shutdown_thread_sessions(&self) {
+        let (sessions, threads): (Vec<_>, Vec<_>) = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .map(|c| (c.slot.get(), c.thread.clone()))
+            .unzip();
+        for session in sessions.into_iter().flatten() {
+            session.shutdown();
+        }
+        for thread in threads {
+            self.withdraw_thread_notifications(&thread);
+        }
+    }
+
+    /// The window regained focus: the shown thread is looked at, so its unread mark and its
+    /// notifications go.
+    pub(super) fn acknowledge_shown_thread(&self) {
+        let Some(RowKey::Thread(thread)) = self.selected_row_key() else {
+            return;
+        };
+        let was_unread = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+            .is_some_and(|c| std::mem::take(&mut c.unread));
+        self.withdraw_thread_notifications(&thread);
+        if was_unread {
+            self.write_store("mark the thread read", move |s| s.mark_read(&thread));
         }
     }
 
@@ -2920,6 +3101,10 @@ impl AgentTerminalWindow {
         obj.connect_is_active_notify(|window| {
             if window.is_active() && AgentAvailability::shared().scan_is_stale() {
                 window.imp().refresh_agent_data();
+            }
+            // The thread in view is looked at again: its unread mark and notifications go.
+            if window.is_active() {
+                window.imp().acknowledge_shown_thread();
             }
             // A thread waiting for approval glows while you are away from it.
             window.imp().refresh_sidebar();

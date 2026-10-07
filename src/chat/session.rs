@@ -339,6 +339,20 @@ impl ChatSession {
             .emit(Envelope::new(Event::Notice { text: text.into() }));
     }
 
+    /// Stops the agent on purpose and closes the thread's history out: open items end
+    /// Interrupted, pending approvals are cancelled, and a turn in flight is completed as
+    /// Interrupted, followed by the session's exit. Every envelope is persisted before it reaches
+    /// the sink (`Inner::emit`), so it lands in the store even when the view and window that
+    /// would show it are already gone. Call when the thread's page closes or the app quits;
+    /// dropping the session alone only kills the process and leaves the history open-ended.
+    /// A session with no process (already exited, or stopped before) is left alone.
+    pub fn shutdown(&self) {
+        if !self.inner.state.borrow().alive && self.inner.proc.borrow().is_none() {
+            return;
+        }
+        self.inner.stop_current();
+    }
+
     #[cfg(test)]
     fn set_canary_grace(&self, grace: Duration) {
         self.inner.canary_grace.set(grace);
@@ -1784,6 +1798,8 @@ mod tests {
         log: Log,
         /// `encode(SetModel)` answers Unsupported (an adapter that cannot restart itself).
         refuse_set_model: bool,
+        /// `on_exit` reports a turn that was still running, as a real adapter does mid-turn.
+        open_turn: bool,
     }
 
     impl FakeAdapter {
@@ -1804,6 +1820,14 @@ mod tests {
                 caps: Capabilities::of(driver),
                 log: log.clone(),
                 refuse_set_model: false,
+                open_turn: false,
+            })
+        }
+
+        fn with_open_turn(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Box::new(Self {
+                open_turn: true,
+                ..*Self::unboxed(driver, log)
             })
         }
     }
@@ -1839,11 +1863,60 @@ mod tests {
             Vec::new()
         }
         fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
-            vec![Envelope::new(Event::SessionExited {
+            let mut out = Vec::new();
+            if self.open_turn {
+                out.push(Envelope::new(Event::TurnCompleted {
+                    state: TurnState::Failed,
+                    usage: None,
+                    cost_usd: None,
+                    error: Some("the agent exited mid-turn".into()),
+                }));
+            }
+            out.push(Envelope::new(Event::SessionExited {
                 code,
                 expected: true,
-            })]
+            }));
+            out
         }
+    }
+
+    #[test]
+    fn shutdown_persists_an_interrupted_turn_and_the_exit() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::with_open_turn(Driver::Claude, &log),
+                open_on("sonnet"),
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            session.send_prompt("hello");
+            session.shutdown();
+            let stored = store.events(&thread, None, 1000).expect("events");
+            let completed: Vec<_> = stored
+                .iter()
+                .filter_map(|(_, e)| match &e.event {
+                    Event::TurnCompleted { state, error, .. } => Some((*state, error.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(completed, vec![(TurnState::Interrupted, None)]);
+            assert!(stored
+                .iter()
+                .any(|(_, e)| matches!(e.event, Event::SessionExited { .. })));
+            assert!(has(&seen, |e| matches!(e, Event::SessionExited { .. })));
+            assert!(!session.status().alive && !session.status().running_turn);
+            // A second call finds nothing to stop and writes nothing more.
+            let before = store.events(&thread, None, 1000).expect("events").len();
+            session.shutdown();
+            let after = store.events(&thread, None, 1000).expect("events").len();
+            assert_eq!(before, after);
+        });
     }
 
     /// An adapter over `cat` whose outbox writes a line on every prompt and, when it sees that

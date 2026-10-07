@@ -756,6 +756,10 @@ impl WindowImpl for AgentTerminalWindow {
         // knowable while the tabs still exist.
         self.save_session();
         self.flush_pending_save();
+        // Every live thread session closes its history out before the window (and, on the last
+        // window, `terminate_all`) takes the processes down. The envelopes are stored before
+        // they reach the sink, so the view going away does not lose them.
+        self.shutdown_thread_sessions();
         // GNOME keeps a notification after its app exits, counted on the dock
         // badge until withdrawn, and nothing would be left to act on it.
         self.withdraw_notifications();
@@ -1080,12 +1084,10 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             move |_, _| {
+                // Through the same door as the sidebar's X, so a running thread asks first.
                 let imp = obj.imp();
-                let view = imp.tab_view.borrow().clone();
-                if let Some(view) = view {
-                    if let Some(page) = view.selected_page() {
-                        view.close_page(&page);
-                    }
+                if let Some(key) = imp.selected_row_key() {
+                    imp.close_row(&key);
                 }
             }
         ));
@@ -1729,6 +1731,14 @@ impl AgentTerminalWindow {
                 // nothing when clicked, and a closed tab's bell cannot be
                 // looked at any more.
                 for tab in &leaving {
+                    // A closed thread page ends its session on purpose, so the stored history
+                    // closes out (open items, approvals, the turn) instead of ending open.
+                    if let Some(chat) = &tab.chat {
+                        if let Some(session) = chat.slot.get() {
+                            session.shutdown();
+                        }
+                        imp.withdraw_thread_notifications(&chat.thread);
+                    }
                     imp.withdraw_quota_notification(tab.key);
                     if let Some(worktree) = &tab.worktree {
                         imp.offer_worktree_removal(worktree.clone());

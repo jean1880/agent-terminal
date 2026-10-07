@@ -59,6 +59,48 @@ pub fn needs_attention(row: &SidebarRow, shown: Option<&RowKey>, window_focused:
     row.badge == Some(Badge::NeedsApproval) && (shown != Some(&row.key) || !window_focused)
 }
 
+/// What happened to a thread that may need the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// An approval or a question is waiting.
+    Asked,
+    /// An approval ran out (agy denies after its deadline): the card is gone.
+    Expired,
+    /// A turn finished.
+    TurnDone,
+}
+
+/// How the window reacts to an [`Attention`] event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    /// Leave the thread unread (a sidebar mark that outlives the event).
+    pub unread: bool,
+    /// Raise a desktop notification.
+    pub notify: bool,
+}
+
+/// The reaction to `event` on a thread that is `shown` (selected) in a window that is
+/// `focused`. Looking at it means both; anything else needs a trace. A request for the user is
+/// always announced when they are not looking, a finished turn only when `notify_on_bell`.
+pub fn react(event: Attention, shown: bool, focused: bool, notify_on_bell: bool) -> Reaction {
+    let looking = shown && focused;
+    match event {
+        // The glow covers a shown thread, so unread only marks what is out of view.
+        Attention::Asked => Reaction {
+            unread: !shown,
+            notify: !looking,
+        },
+        Attention::Expired => Reaction {
+            unread: !looking,
+            notify: false,
+        },
+        Attention::TurnDone => Reaction {
+            unread: !looking,
+            notify: !looking && notify_on_bell,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
     pub key: RowKey,
@@ -481,6 +523,47 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_is_announced_unless_you_are_looking_at_it() {
+        let r = |shown, focused| react(Attention::Asked, shown, focused, false);
+        // Not gated on notify_on_bell (false here).
+        assert_eq!((r(false, true).notify, r(false, true).unread), (true, true));
+        assert_eq!(
+            (r(false, false).notify, r(false, false).unread),
+            (true, true)
+        );
+        // Shown but the window is away: announced, no unread (the glow carries it).
+        assert_eq!(
+            (r(true, false).notify, r(true, false).unread),
+            (true, false)
+        );
+        assert_eq!((r(true, true).notify, r(true, true).unread), (false, false));
+    }
+
+    #[test]
+    fn an_expired_approval_leaves_a_trace_unless_you_are_looking() {
+        for (shown, focused, unread) in [
+            (false, true, true),
+            (false, false, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let r = react(Attention::Expired, shown, focused, true);
+            assert_eq!((r.unread, r.notify), (unread, false), "{shown} {focused}");
+        }
+    }
+
+    #[test]
+    fn a_finished_turn_is_unread_when_not_looked_at_and_notifies_only_by_setting() {
+        // A shown thread in an unfocused window keeps an unread mark.
+        assert!(react(Attention::TurnDone, true, false, false).unread);
+        assert!(!react(Attention::TurnDone, true, true, true).unread);
+        assert!(!react(Attention::TurnDone, true, true, true).notify);
+        assert!(!react(Attention::TurnDone, false, true, false).notify);
+        assert!(react(Attention::TurnDone, false, true, true).notify);
+        assert!(react(Attention::TurnDone, true, false, true).notify);
+    }
 
     fn row(id: &str, folder: &str, at: i64) -> SidebarRow {
         SidebarRow {

@@ -272,7 +272,7 @@ impl AgentTerminalWindow {
     }
 
     /// What the sidebar calls the thread.
-    fn thread_title_of(&self, thread: &str) -> String {
+    pub(super) fn thread_title_of(&self, thread: &str) -> String {
         let open = self.tabs.borrow().iter().find_map(|t| {
             t.chat
                 .as_ref()
@@ -424,9 +424,25 @@ impl AgentTerminalWindow {
     /// Hides (or brings back) a thread. Archiving closes its page; the thread stays in the store
     /// and behind the sidebar's "Show archived" toggle.
     fn set_thread_archived(&self, thread: &str, archived: bool) {
-        if archived {
-            self.close_row(&RowKey::Thread(thread.to_owned()));
+        // Archiving ends a running turn like closing does: ask first, and do nothing if declined.
+        let key = RowKey::Thread(thread.to_owned());
+        if archived && self.row_is_busy(&key) {
+            let id = thread.to_owned();
+            self.confirm_stop_then(thread, move |imp| imp.archive_now(&id));
+            return;
         }
+        if archived {
+            self.close_row_now(&key);
+        }
+        self.store_archived(thread, archived);
+    }
+
+    fn archive_now(&self, thread: &str) {
+        self.close_row_now(&RowKey::Thread(thread.to_owned()));
+        self.store_archived(thread, true);
+    }
+
+    fn store_archived(&self, thread: &str, archived: bool) {
         let id = thread.to_owned();
         self.write_store("archive the thread", move |s| s.set_archived(&id, archived));
         self.show_toast(if archived {
@@ -464,7 +480,7 @@ impl AgentTerminalWindow {
 
     /// Closes the thread's page (ending its session) and removes it from the store.
     fn delete_thread_now(&self, thread: &str) {
-        self.close_row(&RowKey::Thread(thread.to_owned()));
+        self.close_row_now(&RowKey::Thread(thread.to_owned()));
         let id = thread.to_owned();
         self.write_store("delete the thread", move |s| s.delete_thread(&id));
         self.show_toast("Thread deleted");
