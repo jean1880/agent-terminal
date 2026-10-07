@@ -253,11 +253,18 @@ impl ChatView {
             return;
         };
         let started = std::time::Instant::now();
-        let driver = inner.backend.status().driver;
+        let status = inner.backend.status();
+        let driver = status.driver;
         {
             let mut model = inner.model.borrow_mut();
             for env in envs {
                 model.apply(env, driver);
+            }
+            // With no live agent behind the view (it is built before its session starts), what
+            // the history left open can never finish: settle it now, before any row is built. A
+            // session that starts (and resumes) afterwards emits fresh events of its own.
+            if !status.alive && model.settle_stale() {
+                tracing::info!("chat view: settled a stored turn left open");
             }
         }
         inner.dirty.borrow_mut().clear();
@@ -1012,8 +1019,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// A thread stored mid-turn, reopened: replayed before its session starts (no live agent),
+    /// it must show no phantom running turn, no answerable card and no background work.
+    fn stale_replay_checks() {
+        use agent_core::event::{
+            BackgroundTask, BackgroundTaskKind, Event, ItemKind, ResponseCapability,
+        };
+        let mut dead = status_of(Driver::Claude);
+        dead.alive = false;
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(dead),
+        }));
+        view.replay(&[
+            Envelope::new(Event::TurnStarted { model: None }),
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command": "ls"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1"),
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Agent".into(),
+                input: Some(serde_json::json!({"subagent_type": "Explore"})),
+                parent: None,
+            })
+            .item("agent1"),
+            Envelope::new(Event::BackgroundTasks {
+                tasks: vec![BackgroundTask {
+                    id: "t1".into(),
+                    kind: BackgroundTaskKind::Agent,
+                    description: Some("Explore".into()),
+                    tool_use_id: Some("agent1".into()),
+                }],
+            }),
+        ]);
+        let inner = view.inner().expect("view");
+        {
+            let model = inner.model.borrow();
+            assert!(!model.running, "no phantom running turn");
+            assert!(model.background.is_empty(), "no stale background work");
+            match &model.get("approval:r1").expect("card").body {
+                model::Body::Approval(a) => {
+                    assert_eq!(a.state, model::ApprovalState::Expired);
+                }
+                other => panic!("not an approval: {other:?}"),
+            }
+            match &model.get("agent1").expect("agent").body {
+                model::Body::Tool(t) => assert_eq!(t.status, model::ToolStatus::Interrupted),
+                other => panic!("not a tool: {other:?}"),
+            }
+        }
+        assert!(!inner.header.running_shown());
+        assert_eq!(inner.header.activity_shown().as_deref(), Some("Finished"));
+        assert!(!inner.composer.shows_stop());
+        let card = inner
+            .transcript
+            .with_row("approval:r1", |row| match row {
+                cards::Row::Approval(a) => Some(a.actionable()),
+                _ => None,
+            })
+            .flatten()
+            .expect("approval row");
+        assert!(
+            !card.0 && !card.1,
+            "the stale card offers no buttons: {card:?}"
+        );
+        assert_eq!(
+            inner.subagent_button.statuses(),
+            ["stopped"],
+            "the sub-agent is not listed as running"
+        );
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
+        stale_replay_checks();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });

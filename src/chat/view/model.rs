@@ -208,6 +208,8 @@ pub enum QuestionState {
     Sent,
     Answered,
     Withdrawn,
+    /// Never answered, and the agent that asked is gone: it can no longer be answered.
+    Expired,
 }
 
 /// Context-window occupancy for the header gauge.
@@ -501,6 +503,47 @@ impl Transcript {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Closes out what replayed history left open when no agent is alive to finish it: a thread
+    /// stored by an older build (or cut off by a crash) can end mid-turn, with no
+    /// `TurnCompleted`. The turn stops running, streaming text ends, Running tool and sub-agent
+    /// items become Interrupted, unanswered approvals and questions expire (nothing could take
+    /// the answer), and the background list empties. A session that starts later emits its own
+    /// fresh events, so nothing here fights it. Returns whether anything changed.
+    pub fn settle_stale(&mut self) -> bool {
+        let mut changed = self.running || !self.background.is_empty();
+        self.running = false;
+        self.background.clear();
+        self.open_text = None;
+        for item in self.items.values_mut() {
+            match &mut item.body {
+                Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. }
+                    if *streaming =>
+                {
+                    *streaming = false;
+                    changed = true;
+                }
+                Body::Tool(t) if t.status == ToolStatus::Running => {
+                    t.status = ToolStatus::Interrupted;
+                    changed = true;
+                }
+                Body::Approval(a)
+                    if matches!(a.state, ApprovalState::Pending | ApprovalState::Sent(_)) =>
+                {
+                    a.state = ApprovalState::Expired;
+                    changed = true;
+                }
+                Body::Question(q)
+                    if matches!(q.state, QuestionState::Pending | QuestionState::Sent) =>
+                {
+                    q.state = QuestionState::Expired;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
     }
 
     pub fn set_expanded(&mut self, id: &str, expanded: bool) {
@@ -1463,6 +1506,105 @@ mod tests {
         assert_eq!(now(&t), Activity::Working { background: 0 });
         t.apply(&turn_done(), Driver::Claude);
         assert_eq!(now(&t), Activity::Finished);
+    }
+
+    /// A thread stored mid-turn by an older build (no `TurnCompleted`): an approval and a question
+    /// still waiting, a sub-agent and a reply still running, background work listed.
+    fn stale_history() -> Vec<Envelope> {
+        vec![
+            ev(Event::TurnStarted { model: None }),
+            started("m", ItemKind::AssistantMessage, None),
+            delta(Some("m"), StreamKind::Assistant, "Let me check"),
+            started("agent", ItemKind::Subagent, None),
+            started("agent-read", ItemKind::FileRead, Some("agent")),
+            started("done", ItemKind::Command, None),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("done"),
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command": "ls"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1"),
+            ev(Event::QuestionRequested { questions: vec![] }).request("q1"),
+            tasks(&[("t1", BackgroundTaskKind::Agent, Some("Map the crate"))]),
+        ]
+    }
+
+    #[test]
+    fn a_stale_stored_turn_settles_when_no_agent_is_alive() {
+        let mut t = Transcript::new();
+        for env in stale_history() {
+            t.apply(&env, Driver::Claude);
+        }
+        assert!(t.running && !t.background.is_empty(), "as stored");
+        assert!(t.settle_stale());
+        assert!(!t.running, "no phantom running turn");
+        assert!(t.background.is_empty());
+        assert_eq!(t.activity(false), Activity::Finished);
+        let tool = |id: &str| match &t.get(id).expect(id).body {
+            Body::Tool(tool) => tool.status,
+            other => panic!("not a tool: {other:?}"),
+        };
+        assert_eq!(tool("agent"), ToolStatus::Interrupted);
+        assert_eq!(tool("agent-read"), ToolStatus::Interrupted);
+        assert_eq!(
+            tool("done"),
+            ToolStatus::Completed,
+            "finished items keep theirs"
+        );
+        assert!(
+            t.subagents()
+                .iter()
+                .all(|s| s.status != ToolStatus::Running),
+            "no sub-agent listed as running forever"
+        );
+        match &t.get("approval:r1").expect("card").body {
+            Body::Approval(a) => assert_eq!(a.state, ApprovalState::Expired),
+            other => panic!("not an approval: {other:?}"),
+        }
+        match &t.get("question:q1").expect("card").body {
+            Body::Question(q) => assert_eq!(q.state, QuestionState::Expired),
+            other => panic!("not a question: {other:?}"),
+        }
+        assert!(matches!(
+            t.get("m").map(|i| &i.body),
+            Some(Body::Assistant {
+                streaming: false,
+                ..
+            })
+        ));
+        // A card that expired cannot be answered any more.
+        assert!(t.mark_approval_sent("r1", Decision::Allow).is_empty());
+        assert!(t.mark_questions_sent("q1").is_empty());
+        // Settled once, there is nothing left to settle.
+        assert!(!t.settle_stale());
+    }
+
+    #[test]
+    fn a_complete_history_has_nothing_to_settle() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        t.apply(&started("c", ItemKind::Command, None), Driver::Claude);
+        t.apply(
+            &Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item("c"),
+            Driver::Claude,
+        );
+        t.apply(&turn_done(), Driver::Claude);
+        assert!(!t.settle_stale());
     }
 
     #[test]
