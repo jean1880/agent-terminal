@@ -478,6 +478,8 @@ fn load_css() {
             border-radius: 6px;
         }
         row.needs-attention .thread-title { color: #ffe2a3; }
+        /* Background work (sub-agents, background commands) the main agent is waiting on. */
+        .thread-background { color: #7cc7ff; }
         .thread-badge.badge-limited { color: #ff7878; }
         .thread-badge.badge-unread { color: #b49bff; }
         .thread-close, .thread-delete {

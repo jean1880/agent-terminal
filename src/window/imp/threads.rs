@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
 use agent_core::catalog::{model_notice, ModelNotice};
-use agent_core::event::{Decision, Envelope, Event, ItemKind};
+use agent_core::event::{BackgroundTask, Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
 
 use super::diffs::ThreadDiffs;
@@ -34,9 +34,9 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, driver_key, driver_label, group_rows, handoff_target, is_busy, needs_attention,
-    parse_driver, react, relative_time, resume_as, stop_heading, stored_model, thread_title,
-    Attention, Badge, ResumeAs, RowKey, SidebarRow,
+    background_tooltip, badge_for, driver_key, driver_label, group_rows, handoff_target, is_busy,
+    needs_attention, parse_driver, react, relative_time, resume_as, stop_heading, stored_model,
+    thread_title, turn_finishes_thread, Attention, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -69,7 +69,7 @@ impl ChatTab {
     /// Whether closing this thread would cut work short. The one place the close question
     /// (the row's X, archive, the window) decides; extend it for background work.
     pub(super) fn busy(&self) -> bool {
-        is_busy(self.running, self.approval)
+        is_busy(self.running, !self.background.is_empty(), self.approval)
     }
 }
 
@@ -92,6 +92,9 @@ pub(super) struct ChatTab {
     /// Shown when the thread's model is no longer offered by its agent.
     model_banner: adw::Banner,
     running: bool,
+    /// Background work still going (sub-agents, background commands), as the agent last listed
+    /// it. The thread is finished only when this is empty and no turn runs.
+    background: Vec<BackgroundTask>,
     approval: bool,
     rate_limited: bool,
     pub(super) unread: bool,
@@ -1165,9 +1168,15 @@ impl AgentTerminalWindow {
                     .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == s.id));
                 let chat = tab.and_then(|t| t.chat.as_ref());
                 let badge = match chat {
-                    Some(c) => badge_for(c.running, c.approval, c.rate_limited, c.unread),
+                    Some(c) => badge_for(
+                        c.running,
+                        !c.background.is_empty(),
+                        c.approval,
+                        c.rate_limited,
+                        c.unread,
+                    ),
                     // A closed thread with events nobody has seen.
-                    None => badge_for(false, false, false, s.unread && s.updated_at > 0),
+                    None => badge_for(false, false, false, false, s.unread && s.updated_at > 0),
                 };
                 let title = match chat {
                     Some(c) if !c.title.is_empty() => c.title.clone(),
@@ -1183,6 +1192,14 @@ impl AgentTerminalWindow {
                         .map(|c| c.driver)
                         .or_else(|| s.driver.as_deref().and_then(parse_driver)),
                     badge,
+                    background: chat
+                        .map(|c| {
+                            c.background
+                                .iter()
+                                .map(|t| t.description.clone().unwrap_or_default())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     open: tab.is_some(),
                     archived: s.archived,
                 }
@@ -1200,6 +1217,7 @@ impl AgentTerminalWindow {
                     .unwrap_or(0),
                 driver: None,
                 badge: tab.page.needs_attention().then_some(Badge::Unread),
+                background: Vec::new(),
                 open: true,
                 archived: false,
             });
@@ -1365,9 +1383,19 @@ impl AgentTerminalWindow {
             .build();
         line.append(&title);
         if let Some(badge) = row.badge {
-            if badge == Badge::Running {
+            // Spinning means not finished: the main agent working, or background work (sub-agents,
+            // background commands) it is still waiting on, which spins in its own colour.
+            if matches!(badge, Badge::Running | Badge::Background) {
                 let spinner = gtk4::Spinner::builder().spinning(true).build();
-                spinner.set_tooltip_text(Some(badge.tooltip()));
+                if badge == Badge::Background {
+                    spinner.add_css_class("thread-background");
+                    spinner.set_tooltip_text(Some(&background_tooltip(&row.background)));
+                } else if row.background.is_empty() {
+                    spinner.set_tooltip_text(Some(badge.tooltip()));
+                } else {
+                    let also = background_tooltip(&row.background);
+                    spinner.set_tooltip_text(Some(&format!("{}; {also}", badge.tooltip())));
+                }
                 line.append(&spinner);
             } else {
                 let mark = Label::builder()
@@ -1995,6 +2023,7 @@ impl AgentTerminalWindow {
                 rate_banner,
                 model_banner,
                 running: false,
+                background: Vec::new(),
                 approval: false,
                 rate_limited: false,
                 // A restored thread that was never shown keeps the store's unread mark. Same
@@ -2432,6 +2461,10 @@ impl AgentTerminalWindow {
                     chat.running = false;
                     chat.approval = false;
                     withdraw_ask = true;
+                    // With sub-agents or background commands still going the thread is not
+                    // finished: no mark and no "finished" yet. Claude runs another turn to read
+                    // their results, and that one finishes the thread.
+                    let finished = turn_finishes_thread(!chat.background.is_empty());
                     let r = react(
                         Attention::TurnDone,
                         in_view,
@@ -2439,19 +2472,29 @@ impl AgentTerminalWindow {
                         self.config.borrow().notify_on_bell,
                     );
                     // A shown thread in an unfocused window keeps its mark until focus returns.
-                    chat.unread |= r.unread;
+                    if finished {
+                        chat.unread |= r.unread;
+                    }
                     // The turn's end is "output went quiet" for the checkpoint bookkeeping.
                     last_output.set(std::time::Instant::now());
                     After::TurnDone {
                         page,
                         // An interrupted turn was stopped on purpose (a close, a quit, the stop
                         // button): there is nothing to announce.
-                        notify: r.notify && *state != agent_core::event::TurnState::Interrupted,
+                        notify: finished
+                            && r.notify
+                            && *state != agent_core::event::TurnState::Interrupted,
                     }
+                }
+                Event::BackgroundTasks { tasks } => {
+                    chat.background = tasks.clone();
+                    After::Sidebar
                 }
                 Event::SessionExited { .. } => {
                     chat.diffs.turn_ended();
                     chat.running = false;
+                    // A dead session runs nothing in the background either.
+                    chat.background.clear();
                     chat.approval = false;
                     withdraw_ask = true;
                     After::Sidebar

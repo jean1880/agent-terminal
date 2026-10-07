@@ -18,6 +18,9 @@ pub enum Badge {
     NeedsApproval,
     RateLimited,
     Running,
+    /// The main agent is idle but background work (sub-agents, background commands) still runs:
+    /// the thread is not finished.
+    Background,
     Unread,
 }
 
@@ -27,6 +30,7 @@ impl Badge {
             Badge::NeedsApproval => "badge-approval",
             Badge::RateLimited => "badge-limited",
             Badge::Running => "badge-running",
+            Badge::Background => "badge-background",
             Badge::Unread => "badge-unread",
         }
     }
@@ -36,21 +40,47 @@ impl Badge {
             Badge::NeedsApproval => "Needs your approval",
             Badge::RateLimited => "Rate limited",
             Badge::Running => "Working",
+            Badge::Background => "Background tasks running",
             Badge::Unread => "New activity",
         }
     }
 }
 
-/// The badge for a thread's state, or none.
-pub fn badge_for(running: bool, approval: bool, rate_limited: bool, unread: bool) -> Option<Badge> {
+/// The badge for a thread's state, or none. `background`: background tasks still run.
+pub fn badge_for(
+    running: bool,
+    background: bool,
+    approval: bool,
+    rate_limited: bool,
+    unread: bool,
+) -> Option<Badge> {
     [
         (approval, Badge::NeedsApproval),
         (rate_limited, Badge::RateLimited),
         (running, Badge::Running),
+        (background, Badge::Background),
         (unread, Badge::Unread),
     ]
     .into_iter()
     .find_map(|(on, badge)| on.then_some(badge))
+}
+
+/// A row's tooltip for its background work: "N background tasks running" and their names.
+pub fn background_tooltip(descriptions: &[String]) -> String {
+    let head = match descriptions.len() {
+        1 => "1 background task running".to_owned(),
+        n => format!("{n} background tasks running"),
+    };
+    let names: Vec<&str> = descriptions
+        .iter()
+        .map(String::as_str)
+        .filter(|d| !d.is_empty())
+        .collect();
+    if names.is_empty() {
+        head
+    } else {
+        format!("{head}: {}", names.join(", "))
+    }
 }
 
 /// Whether `row` glows: it waits for an approval and you are not looking at it (another thread
@@ -59,9 +89,17 @@ pub fn needs_attention(row: &SidebarRow, shown: Option<&RowKey>, window_focused:
     row.badge == Some(Badge::NeedsApproval) && (shown != Some(&row.key) || !window_focused)
 }
 
-/// Whether closing a thread would cut work short: a turn running or an answer awaited.
-pub fn is_busy(running: bool, approval: bool) -> bool {
-    running || approval
+/// Whether closing a thread would cut work short: a turn running, background work (sub-agents,
+/// background commands) still going, or an answer awaited.
+pub fn is_busy(running: bool, background: bool, approval: bool) -> bool {
+    running || background || approval
+}
+
+/// Whether a finished turn means the thread is finished: nothing left in the background. A
+/// turn that ends with background work still going is not announced; the turn Claude runs to
+/// read that work's result is.
+pub fn turn_finishes_thread(background: bool) -> bool {
+    !background
 }
 
 /// The window-close question's title for `n` busy threads.
@@ -125,6 +163,8 @@ pub struct SidebarRow {
     /// `None`: a terminal page.
     pub driver: Option<Driver>,
     pub badge: Option<Badge>,
+    /// What runs in the background (sub-agents, background commands), for the row's tooltip.
+    pub background: Vec<String>,
     /// Open as a page in this window.
     pub open: bool,
     /// Archived threads are hidden unless the sidebar's "Show archived" toggle is on.
@@ -539,9 +579,11 @@ mod tests {
 
     #[test]
     fn busy_means_running_or_waiting_and_the_heading_counts() {
-        assert!(!is_busy(false, false));
-        assert!(is_busy(true, false));
-        assert!(is_busy(false, true));
+        assert!(!is_busy(false, false, false));
+        assert!(is_busy(true, false, false));
+        // Sub-agents or background commands still going: closing would cut them off.
+        assert!(is_busy(false, true, false));
+        assert!(is_busy(false, false, true));
         assert_eq!(stop_heading(1), "Stop 1 running thread and close?");
         assert_eq!(stop_heading(3), "Stop 3 running threads and close?");
     }
@@ -595,6 +637,7 @@ mod tests {
             updated_ms: at,
             driver: Some(Driver::Claude),
             badge: None,
+            background: Vec::new(),
             open: false,
             archived: false,
         }
@@ -936,13 +979,42 @@ mod tests {
     #[test]
     fn the_most_urgent_badge_wins() {
         assert_eq!(
-            badge_for(true, true, true, true),
+            badge_for(true, true, true, true, true),
             Some(Badge::NeedsApproval)
         );
-        assert_eq!(badge_for(true, false, true, true), Some(Badge::RateLimited));
-        assert_eq!(badge_for(true, false, false, true), Some(Badge::Running));
-        assert_eq!(badge_for(false, false, false, true), Some(Badge::Unread));
-        assert_eq!(badge_for(false, false, false, false), None);
+        assert_eq!(
+            badge_for(true, true, false, true, true),
+            Some(Badge::RateLimited)
+        );
+        assert_eq!(
+            badge_for(true, true, false, false, true),
+            Some(Badge::Running)
+        );
+        // The main agent is done but sub-agents still run: not finished, and not "new" yet.
+        assert_eq!(
+            badge_for(false, true, false, false, true),
+            Some(Badge::Background)
+        );
+        assert_eq!(
+            badge_for(false, false, false, false, true),
+            Some(Badge::Unread)
+        );
+        assert_eq!(badge_for(false, false, false, false, false), None);
+    }
+
+    #[test]
+    fn background_work_is_named_and_holds_the_finish() {
+        assert_eq!(
+            background_tooltip(&["Review the diff".into(), String::new()]),
+            "2 background tasks running: Review the diff"
+        );
+        assert_eq!(background_tooltip(&[]), "0 background tasks running");
+        assert_eq!(
+            background_tooltip(&["a".into()]),
+            "1 background task running: a"
+        );
+        assert!(!turn_finishes_thread(true));
+        assert!(turn_finishes_thread(false));
     }
 
     #[test]
