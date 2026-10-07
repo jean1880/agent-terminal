@@ -247,18 +247,35 @@ impl ChatView {
 
     /// Bulk-loads stored history (thread open, restore): reduces every envelope into the model
     /// and then materialises only the newest window of rows, instead of building a widget per
-    /// item. Control replies in history are dropped (nobody is waiting for them).
+    /// item. Control replies in history are dropped (nobody is waiting for them). Every envelope
+    /// is credited to the thread's current agent; [`ChatView::replay_by_agent`] credits each to
+    /// its own.
     pub fn replay(&self, envs: &[Envelope]) {
+        self.replay_with(envs.iter().map(|e| (None, e)), envs.len());
+    }
+
+    /// [`ChatView::replay`] of stored history that names, per envelope, the agent that produced
+    /// it (`None`: unknown, credited to the current agent). A thread that switched agents then
+    /// shows each reply under its own agent and its "Continued in" dividers, as it did live.
+    pub fn replay_by_agent(&self, envs: &[(Option<Driver>, Envelope)]) {
+        self.replay_with(envs.iter().map(|(d, e)| (*d, e)), envs.len());
+    }
+
+    fn replay_with<'a>(
+        &self,
+        envs: impl Iterator<Item = (Option<Driver>, &'a Envelope)>,
+        count: usize,
+    ) {
         let Some(inner) = self.inner() else {
             return;
         };
         let started = std::time::Instant::now();
         let status = inner.backend.status();
-        let driver = status.driver;
+        let current = status.driver;
         {
             let mut model = inner.model.borrow_mut();
-            for env in envs {
-                model.apply(env, driver);
+            for (driver, env) in envs {
+                model.apply(env, driver.unwrap_or(current));
             }
             // With no live agent behind the view (it is built before its session starts), what
             // the history left open can never finish: settle it now, before any row is built. A
@@ -279,7 +296,7 @@ impl ChatView {
         inner.refresh_status();
         inner.refresh_subagents(&[]);
         tracing::info!(
-            envelopes = envs.len(),
+            envelopes = count,
             ms = started.elapsed().as_millis() as u64,
             "chat view: replayed history"
         );
@@ -1558,10 +1575,15 @@ pub(crate) mod tests {
         a_backend.connect(a.sink());
         let b_backend = demo::demo_backend();
         let b = ChatView::new(b_backend.clone());
-        let recorded: Rc<RefCell<Vec<Envelope>>> = Rc::default();
+        // B's stream as the store records it: each envelope with the agent B was on when it
+        // arrived (the store knows it from the provider thread the event is stored under).
+        type Credited = Vec<(Option<Driver>, Envelope)>;
+        let recorded: Rc<RefCell<Credited>> = Rc::default();
         let (b_sink, rec) = (b.sink(), recorded.clone());
+        let b_weak = Rc::downgrade(&b_backend);
         let b_stream: EnvelopeSink = Rc::new(move |env: &Envelope| {
-            rec.borrow_mut().push(env.clone());
+            let driver = b_weak.upgrade().map(|b| b.status().driver);
+            rec.borrow_mut().push((driver, env.clone()));
             b_sink(env);
         });
         b_backend.connect(b_stream.clone());
@@ -1658,7 +1680,7 @@ pub(crate) mod tests {
         // replayed before it is in a window, then shown).
         let c_backend = demo::demo_backend();
         let c = ChatView::new(c_backend);
-        c.replay(&recorded.borrow());
+        c.replay_by_agent(&recorded.borrow());
         let (tc, _, _) = tabs_with(&c);
         holder.append(&tc);
         pump(2_500);
@@ -1706,24 +1728,17 @@ pub(crate) mod tests {
             sa, sb,
             "the thread streamed while hidden differs from the one in view"
         );
-        // Known gap (Hive finding): replay has no per-event agent, so it credits every reply
-        // to the thread's current agent and turns a "Continued in" divider into "Model
-        // switched". Everything else must match.
-        let without_credits = |s: &Seen| Seen {
-            statics: Vec::new(),
-            rows: s.rows.clone(),
-            subagents: s.subagents.clone(),
-            running: s.running,
-            approvals: s.approvals.clone(),
-            spinning: s.spinning.clone(),
-            reasoning: s.reasoning.clone(),
-            jump: s.jump,
-        };
-        assert_eq!(
-            without_credits(&sa),
-            without_credits(&sc),
-            "the replayed thread differs from the one in view"
+        // Replayed with each event's own agent, every reply and "Continued in" divider is
+        // credited as it was live (C's backend is on Claude, the agent the stream began on,
+        // not the one it ended on).
+        assert!(
+            sc.statics
+                .iter()
+                .any(|(_, s)| s.starts_with("Continued in")),
+            "the agent switch divider survives the replay: {:?}",
+            sc.statics
         );
+        assert_eq!(sa, sc, "the replayed thread differs from the one in view");
     }
 
     /// A thinking block whose text never streams (the model withheld it) must not end as an

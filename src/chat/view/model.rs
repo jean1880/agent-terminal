@@ -1338,6 +1338,68 @@ mod tests {
         }
     }
 
+    /// What a reduced thread shows of its agents: who each reply is credited to, and each
+    /// divider's agent and whether it says the agent changed.
+    fn credits(t: &Transcript) -> Vec<(String, Driver, bool)> {
+        t.order()
+            .iter()
+            .filter_map(|id| match &t.get(id)?.body {
+                Body::Assistant { driver, .. } => Some((id.clone(), *driver, false)),
+                Body::Switch {
+                    driver,
+                    agent_changed,
+                    ..
+                } => Some((id.clone(), *driver, *agent_changed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_replay_with_each_events_agent_credits_replies_as_live_did() {
+        let session = |model: &str| {
+            ev(Event::SessionStarted {
+                native_id: "n".into(),
+                model: Some(model.into()),
+                cwd: None,
+            })
+        };
+        // A thread on Claude that switched to agy, each event with the agent it came from (as
+        // the store records it by provider thread).
+        let stream = [
+            (Driver::Claude, session("opus")),
+            (
+                Driver::Claude,
+                started("c1", ItemKind::AssistantMessage, None),
+            ),
+            (Driver::Agy, session("gemini")),
+            (Driver::Agy, started("a1", ItemKind::AssistantMessage, None)),
+        ];
+        let mut live = Transcript::new();
+        for (driver, env) in &stream {
+            live.apply(env, *driver);
+        }
+        let mut replayed = Transcript::new();
+        for (driver, env) in &stream {
+            replayed.apply(env, *driver);
+        }
+        assert_eq!(credits(&replayed), credits(&live));
+        assert_eq!(
+            credits(&live),
+            [
+                ("c1".to_owned(), Driver::Claude, false),
+                ("switch:1".to_owned(), Driver::Agy, true),
+                ("a1".to_owned(), Driver::Agy, false),
+            ]
+        );
+        // The old replay, every event credited to the current agent, got this wrong.
+        let mut flat = Transcript::new();
+        for (_, env) in &stream {
+            flat.apply(env, Driver::Agy);
+        }
+        assert_ne!(credits(&flat), credits(&live));
+    }
+
     #[test]
     fn provider_and_model_switches_add_dividers() {
         let mut t = Transcript::new();
