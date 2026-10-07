@@ -266,10 +266,17 @@ impl Activity {
                     1 => "1 background task".to_owned(),
                     n => format!("{n} background tasks"),
                 };
-                Some(format!(
-                    "Main agent done, waiting on {count}: {}",
-                    tasks.join(", ")
-                ))
+                // The first few names; the header is one line.
+                let mut names = tasks
+                    .iter()
+                    .take(STATUS_TASKS)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if tasks.len() > STATUS_TASKS {
+                    names.push_str(&format!(" and {} more", tasks.len() - STATUS_TASKS));
+                }
+                Some(format!("Main agent done, waiting on {count}: {names}"))
             }
             Self::Finished => Some("Finished".to_owned()),
         }
@@ -281,9 +288,14 @@ impl Activity {
     }
 }
 
-/// A background task as the status names it: its description, else what kind of task it is.
+/// Most background task names the status line lists before "and N more".
+const STATUS_TASKS: usize = 3;
+
+/// A background task as the status names it: its description's first line, else what kind of
+/// task it is.
 fn task_name(task: &BackgroundTask) -> String {
-    match task.description.as_deref().map(str::trim) {
+    let first_line = |d: &str| d.lines().next().unwrap_or_default().trim().to_owned();
+    match task.description.as_deref().map(first_line).as_deref() {
         Some(d) if !d.is_empty() => d.to_owned(),
         _ => match task.kind {
             BackgroundTaskKind::Agent => "a sub-agent",
@@ -1502,6 +1514,25 @@ mod tests {
             cost_usd: None,
             error: None,
         })
+    }
+
+    #[test]
+    fn the_waiting_status_stays_one_short_line() {
+        let many = Activity::Waiting {
+            tasks: (1..=5).map(|i| format!("t{i}")).collect(),
+        };
+        assert_eq!(
+            many.text().as_deref(),
+            Some("Main agent done, waiting on 5 background tasks: t1, t2, t3 and 2 more")
+        );
+        // A multi-line description is named by its first line.
+        let task = BackgroundTask {
+            id: "t".into(),
+            kind: BackgroundTaskKind::Agent,
+            description: Some("Review the diff\nthen report back".into()),
+            tool_use_id: None,
+        };
+        assert_eq!(task_name(&task), "Review the diff");
     }
 
     #[test]
