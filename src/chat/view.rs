@@ -2049,6 +2049,110 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn long_tool_titles_keep_user_messages_inside_the_viewport() {
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let ctx = glib::MainContext::default();
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Codex)),
+        }));
+        let command = format!("git show {}", "a".repeat(820));
+        let mut history = demo::DemoBackend::stress_history(180);
+        history.push(
+            Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::Command,
+                title: command.clone(),
+                input: Some(serde_json::json!({"command": command})),
+                parent: None,
+            })
+            .item("wide-command"),
+        );
+        history.push(
+            Envelope::new(Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Completed,
+                output: Some("done".into()),
+                error: None,
+            })
+            .item("wide-command"),
+        );
+        let path = format!("src/{}.rs", "x".repeat(820));
+        history.push(
+            Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::FileChange,
+                title: path.clone(),
+                input: Some(serde_json::json!([{
+                    "path": path, "kind": {"type": "add"}, "diff": "+example"
+                }])),
+                parent: None,
+            })
+            .item("wide-file"),
+        );
+        history.push(
+            Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::UserMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item("visible-user"),
+        );
+        history.push(
+            Envelope::new(Event::ContentSnapshot {
+                stream: agent_core::event::StreamKind::Assistant,
+                text: "Can you still see this message?".into(),
+            })
+            .item("visible-user"),
+        );
+        view.replay(&history);
+        let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        holder.append(&view);
+        let hidden = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        hidden.set_visible(false);
+        let pane = gtk4::Paned::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .start_child(&holder)
+            .end_child(&hidden)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        let window = gtk4::Window::new();
+        window.set_default_size(560, 460);
+        window.set_child(Some(&pane));
+        window.present();
+        let inner = view.inner().expect("view");
+        assert!(
+            crate::testutil::pump_until(&ctx, 8, || inner.transcript.frames() >= 3),
+            "layout frames"
+        );
+        let overflow = crate::testutil::overflowing_bins(view.upcast_ref());
+        let user = inner
+            .transcript
+            .with_row("visible-user", |row| {
+                row.widget().compute_bounds(&view).expect("user bounds")
+            })
+            .expect("user row");
+        let bottom = inner.transcript.last_row_overflow().expect("last row");
+        let report = inner.transcript.scroll_debug();
+        let width = view.width();
+        window.destroy();
+        assert!(
+            overflow.is_empty(),
+            "content exceeds its viewport: {overflow:?}\n{report}"
+        );
+        assert!(
+            user.x() >= 0.0 && user.x() + user.width() <= width as f32,
+            "user row exceeds {width}px: {user:?}\n{report}"
+        );
+        assert!(
+            bottom.0 <= 2.0 && bottom.1,
+            "newest user message below viewport: {bottom:?}\n{report}"
+        );
+    }
+
     /// Measures what a streamed thinking block costs the main loop, per delta: the view's own
     /// work (reduce + row update), the size request the next frame then pays, and the real frame
     /// times. Prints numbers; asserts nothing. Run on a private display like the tests above,

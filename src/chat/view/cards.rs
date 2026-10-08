@@ -911,7 +911,12 @@ impl ToolCard {
         let kind_icon = gtk4::Image::new();
         kind_icon.add_css_class("kind-icon");
         let title = label("", &["card-title"]);
+        // Codex command titles contain the whole command. An unconstrained title widens
+        // the viewport's content, placing right-aligned user bubbles outside the window.
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title.set_max_width_chars(32);
         let summary = label("", &["card-summary"]);
+        summary.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         summary.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         summary.set_hexpand(true);
         let badge = label("", &["status-badge"]);
@@ -1214,6 +1219,7 @@ impl ToolCard {
         self.kind_icon.set_icon_name(Some(kind_icon(tool.kind)));
         self.title
             .set_text(if is_edit { "Show changes" } else { &tool.title });
+        self.title.set_tooltip_text(Some(&tool.title));
         let summary = payload::tool_summary(tool.kind, tool.input.as_ref(), &tool.input_text);
         let paths = if is_edit {
             tool.input
