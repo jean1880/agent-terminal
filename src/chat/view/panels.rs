@@ -326,6 +326,29 @@ fn model_list(
     column.upcast()
 }
 
+/// Asks before a switch that would stop `from`'s running turn (and any approval or question
+/// waiting in it); `then` runs only on "Stop and Switch". Cancel is the default.
+fn confirm_busy_switch(parent: &adw::Dialog, from: Driver, to: Driver, then: impl Fn() + 'static) {
+    let (from, to) = (from.info().label, to.info().label);
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Switch to {to} now?")),
+        Some(&format!(
+            "{from} is still working. Switching stops this turn, and discards any approval or \
+             question waiting for your answer; the unfinished work is carried as interrupted."
+        )),
+    );
+    dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", "Stop and Switch")]);
+    dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        if response == "switch" {
+            then();
+        }
+    });
+    dialog.present(Some(parent));
+}
+
 /// The model picker: ONE searchable list of every model of both agents, so a thread can jump
 /// from an agy Gemini to a Claude model (or back) in a single click. Picking a row of the other
 /// agent is a handoff, which the backend's `switch` performs.
@@ -353,10 +376,25 @@ pub fn model_picker(ctx: &PanelCtx) {
         let backend = ctx.backend.clone();
         let d = d.downgrade();
         Rc::new(move |driver, id, effort| {
-            backend.switch(driver, Some(id), effort);
-            if let Some(d) = d.upgrade() {
-                d.close();
+            let status = backend.status();
+            if !status.running_turn {
+                backend.switch(driver, Some(id), effort);
+                if let Some(d) = d.upgrade() {
+                    d.close();
+                }
+                return;
             }
+            // Mid-turn, a switch stops the turn (and any approval or question in it): ask first.
+            let Some(picker) = d.upgrade() else { return };
+            confirm_busy_switch(&picker, status.driver, driver, {
+                let (backend, d) = (backend.clone(), d.clone());
+                move || {
+                    backend.switch(driver, Some(id.clone()), effort.clone());
+                    if let Some(d) = d.upgrade() {
+                        d.close();
+                    }
+                }
+            });
         })
     };
     let render: Rc<dyn Fn()> = {

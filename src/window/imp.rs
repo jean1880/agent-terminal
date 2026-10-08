@@ -4343,6 +4343,28 @@ impl AgentTerminalWindow {
             .iter()
             .find(|p| p.name == target_name)
             .cloned();
+        // A thread hands itself over in place: budgeted, fenced, redacted, shown as a switch
+        // divider. That needs no prompt arguments (the handoff rides on the next message), so it
+        // comes before the check a terminal tab's hand-off needs. Ceiling: the switch launches
+        // the agent's own profile (Settings → Agents), not a second profile of the same agent.
+        if let (Some(thread), Some(target)) = (self.current_thread(), target.as_ref()) {
+            match crate::config::profile_driver(target) {
+                Some(driver) => {
+                    // Mid-turn, ask first; a thread with no session continues in a new one.
+                    let id = thread.clone();
+                    self.when_not_busy(&thread, move |imp| imp.switch_or_continue(&id, driver));
+                }
+                None => present_message(
+                    &self.obj(),
+                    "Cannot Continue There",
+                    &format!(
+                        "'{}' has no chat adapter. Open it from New Terminal Thread instead.",
+                        target.name
+                    ),
+                ),
+            }
+            return;
+        }
         let Some(target) = target.filter(Profile::can_take_prompt) else {
             present_message(
                 &self.obj(),
@@ -4362,22 +4384,6 @@ impl AgentTerminalWindow {
         else {
             return;
         };
-        // A thread hands itself over in place: budgeted, redacted, shown as a switch divider.
-        if let Some(slot) = self.current_slot() {
-            use crate::chat::ChatBackend as _;
-            match crate::config::profile_driver(&target) {
-                Some(driver) => slot.switch(driver, None, None),
-                None => present_message(
-                    &self.obj(),
-                    "Cannot Continue There",
-                    &format!(
-                        "'{}' has no chat adapter. Open it from New Terminal Thread instead.",
-                        target.name
-                    ),
-                ),
-            }
-            return;
-        }
 
         let (source, dir, session_id, since_ms, screen_tail) = {
             let tabs = self.tabs.borrow();

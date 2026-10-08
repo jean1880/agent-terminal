@@ -3035,10 +3035,93 @@ impl AgentTerminalWindow {
             self.agy_cannot_ask_for(thread),
         );
         match target {
-            Some((target, false)) => slot.switch(target, None, None),
+            Some((target, false)) => self.switch_or_continue(thread, target),
             Some((target, true)) => self.confirm_unasked_switch(thread, target),
             None => self.show_toast("No other agent is installed and enabled"),
         }
+    }
+
+    /// Switches `thread` to `target` in place; a thread with no session (its agent is missing or
+    /// switched off) has nothing to switch, so it continues in a new thread on `target`, with
+    /// the same handoff a fork carries, and says so.
+    pub(super) fn switch_or_continue(&self, thread: &str, target: Driver) {
+        let Some(slot) = self.slot_of(thread) else {
+            return;
+        };
+        if slot.get().is_some() {
+            slot.switch(target, None, None);
+            return;
+        }
+        let dir = self.page_of_thread(thread).and_then(|p| {
+            self.tabs
+                .borrow()
+                .iter()
+                .find(|t| t.page == p)
+                .map(|t| t.dir.clone())
+        });
+        self.fork_thread(thread, target, dir);
+        self.show_toast(&format!(
+            "{} is not running here: continued in a new {} thread",
+            driver_label(slot.driver()),
+            driver_label(target)
+        ));
+    }
+
+    /// The thread of the page in view, if it is a chat thread.
+    pub(super) fn current_thread(&self) -> Option<String> {
+        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|t| t.page == page)
+            .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+    }
+
+    /// Runs `then` (an in-place switch of `thread`) now, or, while the thread's turn runs, once
+    /// the user agrees to stop it: the switch stops the turn, and any approval or question in
+    /// it. Every in-place switch entry (a typed `/handoff`, the sidebar's "Switch this thread
+    /// to", the 2.x Continue In) comes through here, as the header picker asks for itself. The
+    /// switch stops the turn itself, so nothing is interrupted before `then` decides to switch.
+    pub(super) fn when_not_busy(&self, thread: &str, then: impl Fn(&Self) + 'static) {
+        let busy = self
+            .slot_of(thread)
+            .and_then(|s| s.get())
+            .map(|s| s.status())
+            .filter(|s| s.running_turn)
+            .map(|s| s.driver);
+        let Some(from) = busy else {
+            then(self);
+            return;
+        };
+        if self.unasked_prompt_open.replace(true) {
+            self.show_toast("Answer the open question first");
+            return;
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Switch agents now?"),
+            Some(&format!(
+                "{} is still working. Switching stops this turn, and discards any approval or \
+                 question waiting for your answer; the unfinished work is carried as \
+                 interrupted.",
+                driver_label(from)
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", "Stop and Switch")]);
+        dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let response = dialog
+                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
+                .await;
+            let imp = window.imp();
+            imp.unasked_prompt_open.set(false);
+            if response == "switch" {
+                then(imp);
+            }
+        });
     }
 
     /// Asks before handing `thread` to `target` (agy without its hook) while the thread forbids
@@ -3069,9 +3152,7 @@ impl AgentTerminalWindow {
                 .await;
             window.imp().unasked_prompt_open.set(false);
             if response == "continue" {
-                if let Some(slot) = window.imp().slot_of(&thread) {
-                    slot.switch(target, None, None);
-                }
+                window.imp().switch_or_continue(&thread, target);
             }
         });
     }
@@ -3090,10 +3171,17 @@ impl AgentTerminalWindow {
         match action {
             ViewAction::NewThread => self.new_chat_thread(Some(slot.driver()), dir, None),
             // A named target is the user's own choice; a bare /handoff picks one like the banner.
+            // Mid-turn, either asks first (when_not_busy): the switch stops the turn.
             ViewAction::Handoff {
                 target: Some(target),
-            } => slot.switch(*target, None, None),
-            ViewAction::Handoff { target: None } => self.continue_rate_limited(thread),
+            } => {
+                let (id, target) = (thread.to_owned(), *target);
+                self.when_not_busy(thread, move |imp| imp.switch_or_continue(&id, target));
+            }
+            ViewAction::Handoff { target: None } => {
+                let id = thread.to_owned();
+                self.when_not_busy(thread, move |imp| imp.continue_rate_limited(&id));
+            }
             ViewAction::Fork | ViewAction::CompactByHandoff => {
                 self.fork_thread(thread, slot.driver(), dir);
             }

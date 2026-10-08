@@ -351,8 +351,14 @@ impl AgentTerminalWindow {
         let Some(_page) = self.open_thread(thread, true) else {
             return;
         };
-        if let Some(session) = self.slot_of(thread).and_then(|s| s.get()) {
-            session.switch(driver, model, effort);
+        if self.slot_of(thread).and_then(|s| s.get()).is_some() {
+            // Mid-turn, ask first: the switch stops the turn.
+            let id = thread.to_owned();
+            self.when_not_busy(thread, move |imp| {
+                if let Some(session) = imp.slot_of(&id).and_then(|s| s.get()) {
+                    session.switch(driver, model.clone(), effort.clone());
+                }
+            });
             return;
         }
         if let Some(chat) = self
