@@ -264,6 +264,17 @@ impl AgentTerminalWindow {
             ThreadAction::Unarchive(thread) => self.set_thread_archived(&thread, false),
             ThreadAction::Delete(thread) => self.confirm_delete(&thread),
             ThreadAction::OpenFolder(thread) => self.open_thread_folder(&thread),
+            ThreadAction::ReviewEnvironment(thread) => {
+                if let Some(summary) = self.summary_of(&thread) {
+                    let driver = self.slot_of(&thread).map(|slot| slot.driver()).or_else(|| {
+                        summary
+                            .driver
+                            .as_deref()
+                            .and_then(crate::window::sidebar_model::parse_driver)
+                    });
+                    self.confirm_environment_review(summary.cwd, driver);
+                }
+            }
             ThreadAction::CopyId(thread) => {
                 self.obj().clipboard().set_text(&thread);
                 self.show_toast("Copied the thread id");

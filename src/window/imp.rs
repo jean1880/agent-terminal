@@ -3,6 +3,7 @@
 mod agents_prefs;
 mod diff_prefs;
 mod diffs;
+mod environment_review;
 mod setup;
 mod thread_menu;
 mod threads;
@@ -1455,6 +1456,14 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&new_thread_agent);
 
+        let review = gtk4::gio::SimpleAction::new("review-environment", None);
+        review.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| obj.imp().review_current_environment()
+        ));
+        obj.add_action(&review);
+
         // New Terminal Thread as <profile>: the 2.x terminal page, for any profile.
         let new_terminal = gtk4::gio::SimpleAction::new(
             "new-terminal-profile",
@@ -2218,6 +2227,10 @@ impl AgentTerminalWindow {
         self.fill_new_with_menu();
         threads.append_submenu(Some("New Thread With"), &with);
         threads.append(Some("New Thread in Folder…"), Some("win.new-tab-folder"));
+        threads.append(
+            Some("Review Multi-Agent Environment…"),
+            Some("win.review-environment"),
+        );
         threads.append(
             Some("New Thread in Worktree…"),
             Some("win.new-tab-worktree"),
@@ -6030,6 +6043,7 @@ mod tests {
         crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
         chat_shell_opens_threads_and_lists_them(&window);
+        environment_review::tests::confirmation_preserves_target(&window);
     }
 
     /// The narrowest window that still shows the sidebar beside the thread (at 1× text scale).

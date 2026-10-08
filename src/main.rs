@@ -21,6 +21,7 @@ mod claude_probe;
 mod codex_probe;
 pub mod config;
 mod diff_tool;
+mod environment_review;
 mod hook_config;
 mod icons;
 mod model_catalog;

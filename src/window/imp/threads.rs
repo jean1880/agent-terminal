@@ -351,6 +351,8 @@ pub(super) struct NewThread {
     pub(super) driver: Driver,
     /// The folder (the agent's, else the starting directory, when `None`).
     pub(super) dir: Option<String>,
+    /// Refuse folder fallback for workflows whose prompt is bound to an exact target.
+    pub(super) require_exact_dir: bool,
     /// Sent once the session has started.
     pub(super) prompt: Option<String>,
     pub(super) model: Option<String>,
@@ -365,6 +367,7 @@ impl NewThread {
         Self {
             driver,
             dir: None,
+            require_exact_dir: false,
             prompt: None,
             model: None,
             effort: None,
@@ -3485,6 +3488,7 @@ impl AgentTerminalWindow {
             effort,
             title,
             handoff,
+            require_exact_dir,
         } = new;
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let requested = dir.unwrap_or_else(|| {
@@ -3494,7 +3498,13 @@ impl AgentTerminalWindow {
                 .and_then(|p| p.dir.clone())
                 .unwrap_or_else(|| self.config.borrow().starting_directory.clone())
         });
-        let cwd = resolve_working_directory(&requested, &home);
+        let cwd = if require_exact_dir {
+            // The review validates this folder off the UI thread before calling us.
+            // Preserve it verbatim: a later deletion must fail spawning, never fall back.
+            requested
+        } else {
+            resolve_working_directory(&requested, &home)
+        };
         let store = app_store();
         let thread = match store.create_thread(&cwd, title.as_deref()) {
             Ok(id) => id,
