@@ -788,15 +788,28 @@ impl CodexAdapter {
             }
             "serverRequest/resolved" => {
                 // Resolved by something other than our answer (the turn was interrupted).
-                let key = params.get("requestId").map(id_key).unwrap_or_default();
-                if let Some(p) = self.approvals.remove(&key) {
+                let approval = self
+                    .approvals
+                    .iter()
+                    .find(|(_, pending)| Some(&pending.rpc_id) == params.get("requestId"))
+                    .map(|(key, _)| key.clone());
+                if let Some((key, p)) = approval
+                    .and_then(|key| self.approvals.remove(&key).map(|pending| (key, pending)))
+                {
                     out.push(
                         Envelope::new(Event::ApprovalExpired)
                             .item(p.item)
-                            .request(key.clone()),
+                            .request(key),
                     );
                 }
-                if let Some(p) = self.questions.remove(&key) {
+                let question = self
+                    .questions
+                    .iter()
+                    .find(|(_, pending)| Some(&pending.rpc_id) == params.get("requestId"))
+                    .map(|(key, _)| key.clone());
+                if let Some((key, p)) = question
+                    .and_then(|key| self.questions.remove(&key).map(|pending| (key, pending)))
+                {
                     out.push(
                         Envelope::new(Event::QuestionResolved { answered: false })
                             .item(p.item)
@@ -910,6 +923,18 @@ impl CodexAdapter {
 
     // ---- server requests ----
 
+    /// RPC ids belong to one app-server connection and restart at zero. The transcript
+    /// persists across connections, so its request identity must also name the native
+    /// turn/item. Keep the original typed RPC id separately for responses and resolution.
+    fn server_request_key(&self, id: &Value, method: &str, params: &Value) -> String {
+        let thread = s(params, "threadId").or(self.thread_id.as_deref());
+        let turn = s(params, "turnId").or(self.turn_id.as_deref());
+        format!(
+            "codex:{method}:{}",
+            json!([thread, turn, s(params, "itemId"), id])
+        )
+    }
+
     fn on_server_request(
         &mut self,
         id: &Value,
@@ -918,7 +943,7 @@ impl CodexAdapter {
         out: &mut Vec<Envelope>,
     ) {
         if method == "item/tool/requestUserInput" {
-            let key = id_key(id);
+            let key = self.server_request_key(id, method, params);
             let item = s(params, "itemId").unwrap_or_default().to_owned();
             let questions: Vec<Question> = params
                 .get("questions")
@@ -1011,7 +1036,7 @@ impl CodexAdapter {
                 return;
             }
         };
-        let key = id_key(id);
+        let key = self.server_request_key(id, method, params);
         let item = s(params, "itemId").unwrap_or_default().to_owned();
         let options = match params.get("availableDecisions").and_then(Value::as_array) {
             Some(list) if all_decisions => {
@@ -1883,14 +1908,6 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A JSON-RPC id (number or string) as the request id the UI answers with.
-fn id_key(id: &Value) -> String {
-    match id {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
 fn unknown(raw: Value) -> Envelope {
     Envelope::new(Event::Unknown).raw(raw)
 }
@@ -2445,7 +2462,9 @@ mod tests {
             matches!(&ev[5].event, Event::ContentSnapshot { text, .. } if text == "**Planning** the listing")
         );
         let approval = &ev[13];
-        assert_eq!(approval.request.as_deref(), Some("0"));
+        assert!(approval.request.as_deref().is_some_and(
+            |request| request.starts_with("codex:item/commandExecution/requestApproval:")
+        ));
         assert!(matches!(&approval.event, Event::ApprovalRequested {
             tool, title: Some(t), reason: Some(r), options, response: ResponseCapability::Live, input,
             remembers: None
@@ -2742,10 +2761,11 @@ mod tests {
                 "17",
                 "item/commandExecution/requestApproval",
             ));
-            assert_eq!(ev[0].request.as_deref(), Some("17"));
+            let request = ev[0].request.clone().expect("canonical request");
+            assert_ne!(request, "17");
             let w = one_write(
                 a.encode(Command::Approve {
-                    request: "17".into(),
+                    request: request.clone(),
                     decision,
                     updated_input: None,
                     message: None,
@@ -2756,7 +2776,7 @@ mod tests {
             // Answered once: a second answer is invalid, and nothing expires at exit.
             assert!(matches!(
                 a.encode(Command::Approve {
-                    request: "17".into(),
+                    request,
                     decision,
                     updated_input: None,
                     message: None
@@ -2771,6 +2791,95 @@ mod tests {
     }
 
     #[test]
+    fn reused_rpc_ids_without_items_are_scoped_to_the_active_turn() {
+        for rpc_id in 0..4 {
+            let frame = json!({
+                "id": rpc_id,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "git fetch", "reason": "Network access"},
+            })
+            .to_string();
+            let mut old = started(Mode::Ask);
+            old.turn_id = Some("old-turn".into());
+            let old_request = old.feed(&frame)[0].request.clone().expect("old request");
+            let mut resumed = started(Mode::Ask);
+            resumed.turn_id = Some("new-turn".into());
+            let first = resumed.feed(&frame);
+            let request = first[0].request.clone().expect("new request");
+            assert_ne!(
+                request,
+                rpc_id.to_string(),
+                "historical unscoped ids differ"
+            );
+            assert_ne!(
+                request, old_request,
+                "new connections cannot hide a new turn"
+            );
+            assert_eq!(
+                resumed.feed(&frame)[0].request,
+                Some(request.clone()),
+                "a retransmitted pending request keeps its identity"
+            );
+            assert_eq!(resumed.approvals.len(), 1);
+            assert_eq!(
+                one_write(
+                    resumed
+                        .encode(Command::Approve {
+                            request,
+                            decision: Decision::Allow,
+                            updated_input: None,
+                            message: None,
+                        })
+                        .expect("approve resumed request")
+                ),
+                json!({"id": rpc_id, "result": {"decision": "accept"}}),
+            );
+        }
+    }
+
+    #[test]
+    fn request_identity_preserves_rpc_type_and_native_question_scope() {
+        let mut a = started(Mode::Ask);
+        let command = "item/commandExecution/requestApproval";
+        let params = json!({"threadId": "thread", "turnId": "turn", "itemId": "item"});
+        let numeric = a.server_request_key(&json!(0), command, &params);
+        let string = a.server_request_key(&json!("0"), command, &params);
+        assert_ne!(numeric, string);
+        assert_ne!(
+            numeric,
+            a.server_request_key(&json!(0), "item/fileChange/requestApproval", &params)
+        );
+
+        let question = |turn: &str| {
+            json!({"id": 0, "method": "item/tool/requestUserInput", "params": {
+                "threadId": "thread", "turnId": turn,
+                "questions": [{"id": "choice", "question": "Continue?",
+                    "options": [{"label": "Yes"}, {"label": "No"}]}],
+            }})
+            .to_string()
+        };
+        let old = a.feed(&question("old"))[0]
+            .request
+            .clone()
+            .expect("old question");
+        a.handshake();
+        let new = a.feed(&question("new"))[0]
+            .request
+            .clone()
+            .expect("new question");
+        assert_ne!(old, new);
+        let resolved = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":0}}"#,
+        );
+        assert_eq!(resolved[0].request.as_deref(), Some(new.as_str()));
+        assert_eq!(
+            resolved[0].event,
+            Event::QuestionResolved { answered: false }
+        );
+        assert!(a.questions.is_empty());
+    }
+
+    #[test]
     fn a_string_request_id_is_echoed_verbatim_and_file_changes_are_approvals_too() {
         let mut a = started(Mode::Ask);
         let ev = a.feed(&approval_request(
@@ -2781,10 +2890,11 @@ mod tests {
             matches!(&ev[0].event, Event::ApprovalRequested { tool, title: Some(t), .. }
             if tool == "file_change" && t == "why")
         );
-        assert_eq!(ev[0].request.as_deref(), Some("req-a"));
+        let request = ev[0].request.clone().expect("canonical request");
+        assert_ne!(request, "req-a");
         let w = one_write(
             a.encode(Command::Approve {
-                request: "req-a".into(),
+                request,
                 decision: Decision::Allow,
                 updated_input: None,
                 message: None,
@@ -2809,11 +2919,12 @@ mod tests {
     #[test]
     fn a_decision_the_server_did_not_offer_is_refused_and_the_request_stays_open() {
         let mut a = started(Mode::Ask);
-        a.feed(
+        let ev = a.feed(
             r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["accept","cancel"]}}"#,
         );
+        let request = ev[0].request.clone().expect("canonical request");
         let approve = |decision| Command::Approve {
-            request: "5".into(),
+            request: request.clone(),
             decision,
             updated_input: None,
             message: None,
@@ -2830,7 +2941,7 @@ mod tests {
     #[test]
     fn a_request_resolved_elsewhere_expires_the_approval() {
         let mut a = started(Mode::Ask);
-        a.feed(&approval_request(
+        let requested = a.feed(&approval_request(
             "3",
             "item/commandExecution/requestApproval",
         ));
@@ -2838,7 +2949,7 @@ mod tests {
             r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":3}}"#,
         );
         assert_eq!(ev[0].event, Event::ApprovalExpired);
-        assert_eq!(ev[0].request.as_deref(), Some("3"));
+        assert_eq!(ev[0].request, requested[0].request);
         assert_eq!(ev[0].item.as_deref(), Some("it-1"));
     }
 
@@ -2853,10 +2964,11 @@ mod tests {
             Event::QuestionRequested { questions }
                 if questions[0].id == "confirm" && questions[0].options[0].label == "Allow"
         ));
-        assert_eq!(ev[0].request.as_deref(), Some("9"));
+        let request = ev[0].request.clone().expect("canonical request");
+        assert_ne!(request, "9");
         let w = one_write(
             a.encode(Command::Answer {
-                request: "9".into(),
+                request: request.clone(),
                 answers: json!({"Start the preview?": "Allow"}),
             })
             .expect("answer"),
@@ -2867,7 +2979,7 @@ mod tests {
         );
         assert!(matches!(
             a.encode(Command::Answer {
-                request: "9".into(),
+                request,
                 answers: json!({"Start the preview?": "Allow"}),
             }),
             Err(AdapterError::Invalid(_))

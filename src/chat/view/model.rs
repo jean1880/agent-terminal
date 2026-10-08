@@ -2041,6 +2041,81 @@ mod tests {
     }
 
     #[test]
+    fn codex_reconnected_approval_remains_visible_after_history_replay() {
+        use agent_core::adapter::{Action, Adapter, Command};
+        use agent_core::codex::CodexAdapter;
+
+        let mut t = Transcript::new();
+        let historical = approval_for("old-command", "0");
+        t.apply(&historical, Driver::Codex);
+        t.apply(
+            &ev(Event::ApprovalResolved {
+                decision: Decision::Allow,
+            })
+            .request("0"),
+            Driver::Codex,
+        );
+        t.settle_stale();
+
+        for item in ["new-command", "reconnected-command"] {
+            let mut adapter = CodexAdapter::new();
+            let events = adapter.feed(
+                &json!({
+                    "id": 0,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": item,
+                        "itemId": item,
+                        "command": "git fetch origin --tags",
+                        "availableDecisions": ["accept", "cancel"]
+                    }
+                })
+                .to_string(),
+            );
+            let approval = events
+                .iter()
+                .find(|env| matches!(env.event, Event::ApprovalRequested { .. }))
+                .expect("approval");
+            let request = approval.request.as_ref().expect("request");
+            assert!(
+                t.apply(approval, Driver::Codex)
+                    .iter()
+                    .any(|change| matches!(change, Change::Added(_))),
+                "reused wire ID must create a fresh visible card"
+            );
+            assert!(
+                matches!(t.pending_interruption(), Some(PendingInterruption::Approval { request: pending, .. }) if pending == *request)
+            );
+            let actions = adapter
+                .encode(Command::Approve {
+                    request: request.clone(),
+                    decision: Decision::Allow,
+                    updated_input: None,
+                    message: None,
+                })
+                .expect("answer fresh approval");
+            let Action::Write(lines) = &actions[0] else {
+                panic!("wire response");
+            };
+            let response: Value = serde_json::from_str(&lines[0]).expect("JSON");
+            assert_eq!(response["id"], 0, "reply retains the original wire ID");
+            assert_eq!(response["result"]["decision"], "accept");
+            t.apply(
+                &ev(Event::ApprovalResolved {
+                    decision: Decision::Allow,
+                })
+                .request(request),
+                Driver::Codex,
+            );
+            assert_eq!(t.pending_interruption(), None);
+        }
+        assert!(
+            matches!(&t.get("approval:0").expect("history retained").body, Body::Approval(a) if a.state == ApprovalState::Resolved(Decision::Allow))
+        );
+    }
+
+    #[test]
     fn approval_lifecycle() {
         let mut t = Transcript::new();
         let req = Envelope::new(Event::ApprovalRequested {
