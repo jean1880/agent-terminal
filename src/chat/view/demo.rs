@@ -1091,7 +1091,9 @@ pub fn run() -> glib::ExitCode {
         .build();
     app.connect_activate(|app| {
         crate::icons::register();
-        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        // The app's own colours (and dark scheme), as a window gets them, so the demo looks
+        // like the app it stands in for.
+        crate::palette::apply(crate::config::ThemeChoice::default());
         let backend = demo_backend();
         let view = ChatView::new(backend.clone());
         backend.connect(view.sink());
