@@ -28,6 +28,10 @@ const LOGO_SVG: &str = include_str!("../../assets/ca.nuvek.AgentTerminal.svg");
 /// The smallest the window may be made (GNOME's minimum for adaptive apps). Every layout state
 /// the breakpoints allow fits it; `tests::small_window_fits` measures that.
 const MIN_WINDOW: (i32, i32) = (360, 294);
+/// The Settings descriptions of the two folder rows, restored once a typed path checks out.
+const STARTING_DIRECTORY_HELP: &str = "Where new tabs and threads open (blank: your home folder)";
+const WORKTREE_ROOT_HELP: &str =
+    "Where New Thread in Worktree creates worktrees, as <folder>/<repo>/<branch>";
 /// At or below this width the header drops its panel toggles ([`AgentTerminalWindow::add_narrow_breakpoint`]).
 const NARROW_SP: f64 = 480.0;
 
@@ -1677,7 +1681,8 @@ impl AgentTerminalWindow {
             .transition_type(gtk4::StackTransitionType::Crossfade)
             .transition_duration(loading::CROSSFADE_MS)
             .build();
-        boot.add_named(&loading::splash("Looking for an AI CLI…"), Some("splash"));
+        let (page, name) = self.loading_page();
+        boot.add_named(&page, Some(name));
         content.append(&boot);
         obj.set_content(Some(&content));
 
@@ -1695,14 +1700,35 @@ impl AgentTerminalWindow {
         self.detect_cli();
     }
 
+    /// What the window shows while it loads: the splash, or, with `skip_load_animation`, the
+    /// shell's skeleton straight away. With its name in the boot stack.
+    fn loading_page(&self) -> (gtk4::Widget, &'static str) {
+        let config = self.config.borrow();
+        if config.skip_load_animation {
+            (loading::shell(!config.sidebar_collapsed), "skeleton")
+        } else {
+            (loading::splash("Looking for an AI CLI…"), "splash")
+        }
+    }
+
+    /// How long to wait, `elapsed` into loading, before revealing what loaded: the rest of the
+    /// splash's minimum, or nothing when the animation is skipped.
+    fn splash_hold(&self, elapsed: std::time::Duration) -> std::time::Duration {
+        if self.config.borrow().skip_load_animation {
+            return std::time::Duration::ZERO;
+        }
+        std::time::Duration::from_millis(loading::SPLASH_MIN_MS).saturating_sub(elapsed)
+    }
+
     /// Looks for the CLI (off the main thread) behind the splash, then shows the shell, or the
-    /// welcome screen when there is none.
+    /// welcome screen when there is none, once the splash has had its minimum time.
     fn detect_cli(&self) {
         let obj = self.obj();
         let Some(boot) = self.boot.borrow().clone() else {
             return;
         };
         self.detecting.set(true);
+        let started = std::time::Instant::now();
         let show_sidebar = !self.config.borrow().sidebar_collapsed;
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(loading::SKELETON_AFTER_MS),
@@ -1733,6 +1759,9 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 *imp.active_profile.borrow_mut() = resolved.clone();
                 imp.detecting.set(false);
+                // What detection decides happens now (behind the splash); only the reveal waits
+                // for the splash's minimum.
+                let hold = imp.splash_hold(started.elapsed());
 
                 if let Some(ref profile) = resolved {
                     info!(
@@ -1740,7 +1769,14 @@ impl AgentTerminalWindow {
                         profile.name, profile.command
                     );
                     imp.finish_shell(Some(profile));
-                    imp.show_boot_page("ready");
+                    glib::timeout_add_local_once(
+                        hold,
+                        glib::clone!(
+                            #[weak]
+                            obj,
+                            move || obj.imp().reveal_shell()
+                        ),
+                    );
                 } else {
                     warn!("No compatible CLI detected, setting up welcome UI");
                     let welcome = Box::builder()
@@ -1754,7 +1790,14 @@ impl AgentTerminalWindow {
                         }
                         boot.add_named(&welcome, Some("welcome"));
                     }
-                    imp.show_boot_page("welcome");
+                    glib::timeout_add_local_once(
+                        hold,
+                        glib::clone!(
+                            #[weak]
+                            obj,
+                            move || obj.imp().show_boot_page("welcome")
+                        ),
+                    );
                 }
             }
         ));
@@ -1784,12 +1827,25 @@ impl AgentTerminalWindow {
             return;
         };
         self.no_cli.set(false);
-        if let Some(old) = boot.child_by_name("splash") {
+        let (page, name) = self.loading_page();
+        if let Some(old) = boot.child_by_name(name) {
             boot.remove(&old);
         }
-        boot.add_named(&loading::splash("Looking for an AI CLI…"), Some("splash"));
-        self.show_boot_page("splash");
+        boot.add_named(&page, Some(name));
+        self.show_boot_page(name);
         self.detect_cli();
+    }
+
+    /// Shows the finished shell (after [`Self::finish_shell`], once the splash has had its time)
+    /// and brings its header controls and the window's actions back.
+    fn reveal_shell(&self) {
+        for control in self.shell_controls.borrow().iter() {
+            control.set_sensitive(true);
+        }
+        for action in self.held_actions.take() {
+            action.set_enabled(true);
+        }
+        self.show_boot_page("ready");
     }
 
     /// Switches the window's actions (every shortcut and menu entry) off while the shell is
@@ -1982,7 +2038,8 @@ impl AgentTerminalWindow {
     }
 
     /// Detection is done and found a CLI: the 2.x terminal pages come back (they need its
-    /// profile), queued resumes open, and the shell's controls come alive. Once per window.
+    /// profile) and queued resumes open, still behind the splash ([`Self::reveal_shell`] shows
+    /// it). Once per window.
     ///
     /// A window opened *for* a resume shows that session rather than an extra blank tab beside
     /// it. Restored tabs still come back: restoring is the user's standing preference, and the
@@ -1990,12 +2047,6 @@ impl AgentTerminalWindow {
     fn finish_shell(&self, profile: Option<&Profile>) {
         if self.tab_view.borrow().is_none() || self.shell_ready.replace(true) {
             return;
-        }
-        for control in self.shell_controls.borrow().iter() {
-            control.set_sensitive(true);
-        }
-        for action in self.held_actions.take() {
-            action.set_enabled(true);
         }
         let pending: Vec<ResumeRequest> = self.pending_resumes.take();
         self.restore_previous_session(profile);
@@ -3146,6 +3197,7 @@ impl AgentTerminalWindow {
 
         let starting_directory_row = adw::ActionRow::builder()
             .title("Starting Directory")
+            .subtitle(STARTING_DIRECTORY_HELP)
             .build();
         starting_directory_row.add_suffix(&starting_directory_entry);
 
@@ -3162,7 +3214,10 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .build();
 
-        let scrollback_row = adw::ActionRow::builder().title("Scrollback Lines").build();
+        let scrollback_row = adw::ActionRow::builder()
+            .title("Scrollback Lines")
+            .subtitle("How many lines of output a terminal keeps to scroll back through")
+            .build();
         scrollback_row.add_suffix(&scroll_spin);
 
         // Built from the configured profiles. Index 0 is auto-detection, so the
@@ -3186,7 +3241,10 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .build();
 
-        let font_scale_row = adw::ActionRow::builder().title("Font Scale").build();
+        let font_scale_row = adw::ActionRow::builder()
+            .title("Font Scale")
+            .subtitle("Terminal text size relative to the font's own (Ctrl+= and Ctrl+- change it)")
+            .build();
         font_scale_row.add_suffix(&font_scale_spin);
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
@@ -3209,6 +3267,7 @@ impl AgentTerminalWindow {
             .unwrap_or(0) as u32;
         let theme_row = adw::ComboRow::builder()
             .title("Terminal Theme")
+            .subtitle("Colours of terminal pages and the drawer, and of diffs")
             .model(&theme_model)
             .selected(theme_index)
             .build();
@@ -3218,7 +3277,10 @@ impl AgentTerminalWindow {
         let font_button = gtk4::FontDialogButton::new(Some(gtk4::FontDialog::new()));
         font_button.set_font_desc(&gtk4::pango::FontDescription::from_string(&config.font));
         font_button.set_valign(gtk4::Align::Center);
-        let font_row = adw::ActionRow::builder().title("Terminal Font").build();
+        let font_row = adw::ActionRow::builder()
+            .title("Terminal Font")
+            .subtitle("Font for terminal pages and the drawer (a monospace font works best)")
+            .build();
         font_row.add_suffix(&font_button);
 
         let cursor_names: Vec<String> = crate::config::CursorShapeChoice::ALL
@@ -3228,6 +3290,7 @@ impl AgentTerminalWindow {
         let cursor_name_refs: Vec<&str> = cursor_names.iter().map(String::as_str).collect();
         let cursor_row = adw::ComboRow::builder()
             .title("Cursor Shape")
+            .subtitle("How the terminal draws its cursor")
             .model(&gtk4::StringList::new(&cursor_name_refs))
             .selected(
                 crate::config::CursorShapeChoice::ALL
@@ -3239,7 +3302,14 @@ impl AgentTerminalWindow {
 
         let blink_row = adw::SwitchRow::builder()
             .title("Blinking Cursor")
+            .subtitle("Blink the terminal cursor")
             .active(config.cursor_blink)
+            .build();
+
+        let skip_animation_row = adw::SwitchRow::builder()
+            .title("Skip Load Animation")
+            .subtitle("Show the window as soon as it is ready, without the logo intro")
+            .active(config.skip_load_animation)
             .build();
 
         let notify_row = adw::SwitchRow::builder()
@@ -3272,7 +3342,10 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .placeholder_text("Blank: a hidden folder beside the repository")
             .build();
-        let worktree_root_row = adw::ActionRow::builder().title("Worktree Folder").build();
+        let worktree_root_row = adw::ActionRow::builder()
+            .title("Worktree Folder")
+            .subtitle(WORKTREE_ROOT_HELP)
+            .build();
         worktree_root_row.add_suffix(&worktree_root_entry);
 
         group.add(&starting_directory_row);
@@ -3281,6 +3354,7 @@ impl AgentTerminalWindow {
         group.add(&font_scale_row);
         group.add(&cursor_row);
         group.add(&blink_row);
+        group.add(&skip_animation_row);
         group.add(&cli_client_row);
         group.add(&theme_row);
         group.add(&notify_row);
@@ -3395,7 +3469,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 entry.remove_css_class("error");
-                worktree_root_row.set_subtitle("");
+                worktree_root_row.set_subtitle(WORKTREE_ROOT_HELP);
                 let imp = obj.imp();
                 if imp.config.borrow().worktree_root == text {
                     return;
@@ -3411,6 +3485,16 @@ impl AgentTerminalWindow {
             move |row| {
                 let imp = obj.imp();
                 imp.config.borrow_mut().checkpoints = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
+
+        skip_animation_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().skip_load_animation = row.is_active();
                 imp.schedule_config_save();
             }
         ));
@@ -3512,7 +3596,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 entry.remove_css_class("error");
-                starting_directory_row.set_subtitle("");
+                starting_directory_row.set_subtitle(STARTING_DIRECTORY_HELP);
 
                 let imp = obj.imp();
                 if imp.config.borrow().starting_directory == text {
@@ -5673,6 +5757,23 @@ mod tests {
             "the window's actions wait for the shell"
         );
 
+        // The splash plays its minimum however fast loading was, unless the user skips it.
+        {
+            use std::time::Duration;
+            let imp = window.imp();
+            let min = Duration::from_millis(loading::SPLASH_MIN_MS);
+            assert_eq!(imp.splash_hold(Duration::ZERO), min);
+            assert_eq!(imp.splash_hold(min / 4), min - min / 4);
+            assert_eq!(
+                imp.splash_hold(min * 2),
+                Duration::ZERO,
+                "a slow load waits no more"
+            );
+            imp.config.borrow_mut().skip_load_animation = true;
+            assert_eq!(imp.splash_hold(Duration::ZERO), Duration::ZERO);
+            imp.config.borrow_mut().skip_load_animation = false;
+        }
+
         assert_eq!(window.title(), Some("Agent Terminal".into()));
         assert!(
             !config_home.path().join("agent-terminal").exists(),
@@ -5726,7 +5827,7 @@ mod tests {
         let ctx = glib::MainContext::default();
         crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
         imp.finish_shell(None);
-        imp.show_boot_page("ready");
+        imp.reveal_shell();
         let content = window
             .content()
             .and_downcast::<Box>()
@@ -5873,11 +5974,12 @@ mod tests {
         );
         imp.finish_shell(None);
         assert!(imp.shell_ready.get());
+        imp.reveal_shell();
         assert!(
             window
                 .lookup_action("new-tab")
                 .is_some_and(|a| a.is_enabled()),
-            "the shell's actions are on once it is live"
+            "the shell's actions are on once it is shown"
         );
         assert_eq!(
             imp.tabs.borrow().len(),

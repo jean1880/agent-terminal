@@ -15,6 +15,9 @@ const STYLE: &str = include_str!("loading.css");
 /// How long the splash is shown before a startup that is still waiting moves on to the skeleton:
 /// long enough for its intro (`loading.css`) to play out.
 pub(super) const SKELETON_AFTER_MS: u64 = 2200;
+/// The splash always plays this long (its intro, `loading.css`, settles by then), even when the
+/// window is ready sooner; the `skip_load_animation` setting drops it.
+pub(super) const SPLASH_MIN_MS: u64 = 2000;
 /// Every loading-to-loaded swap crossfades for this long.
 pub(super) const CROSSFADE_MS: u32 = 220;
 

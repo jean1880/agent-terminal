@@ -25,6 +25,16 @@ const MODES: [(Mode, &str); 3] = [
 /// Effort levels offered when the catalogue lists none for the agent.
 const FALLBACK_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
+/// What the agent rows hold, as their tooltips (an entry row has no subtitle). Shown again once
+/// a value checks out; an invalid one shows why instead.
+const COMMAND_HELP: &str =
+    "The agent's command name (found on PATH) or the full path to its binary";
+const ARGS_HELP: &str =
+    "Arguments added to every launch of this agent, quoted as in a shell (e.g. --verbose)";
+const ENV_FILE_HELP: &str =
+    "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
+     (an API key or account, say). Blank: none";
+
 /// The "default agent" dropdown, by index both ways: Automatic, then every driver in registry
 /// order.
 fn default_agent_choices() -> Vec<(Option<Driver>, &'static str)> {
@@ -229,6 +239,7 @@ impl AgentTerminalWindow {
             .build();
         let command = adw::EntryRow::builder()
             .title("Command or Path")
+            .tooltip_text(COMMAND_HELP)
             .text(&profile.command)
             .build();
         let generation = Rc::new(std::cell::Cell::new(0u64));
@@ -276,7 +287,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 row.remove_css_class("error");
-                row.set_tooltip_text(None);
+                row.set_tooltip_text(Some(COMMAND_HELP));
                 let imp = obj.imp();
                 if imp.agent_profile_now(driver).command == text {
                     return;
@@ -292,6 +303,7 @@ impl AgentTerminalWindow {
 
         let args = adw::EntryRow::builder()
             .title("Extra Arguments")
+            .tooltip_text(ARGS_HELP)
             .text(
                 profile
                     .args
@@ -307,7 +319,7 @@ impl AgentTerminalWindow {
             move |row| match parse_args(&row.text()) {
                 Ok(parsed) => {
                     row.remove_css_class("error");
-                    row.set_tooltip_text(None);
+                    row.set_tooltip_text(Some(ARGS_HELP));
                     let imp = obj.imp();
                     if imp.agent_profile_now(driver).args != parsed {
                         imp.edit_agent_profile(driver, |p| p.args = parsed);
@@ -323,6 +335,7 @@ impl AgentTerminalWindow {
 
         let env_file = adw::EntryRow::builder()
             .title("Environment File")
+            .tooltip_text(ENV_FILE_HELP)
             .text(profile.env_file.as_deref().unwrap_or(""))
             .build();
         env_file.connect_changed(glib::clone!(
@@ -336,7 +349,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 row.remove_css_class("error");
-                row.set_tooltip_text(None);
+                row.set_tooltip_text(Some(ENV_FILE_HELP));
                 let value = (!text.is_empty()).then_some(text);
                 let imp = obj.imp();
                 if imp.agent_profile_now(driver).env_file != value {
@@ -351,6 +364,7 @@ impl AgentTerminalWindow {
         // catalogue does not have it (yet).
         let model_row = adw::ComboRow::builder()
             .title("Default Model")
+            .subtitle("The model this agent's new threads start on")
             .use_subtitle(false)
             .build();
         let model_ids: Rc<RefCell<Vec<Option<String>>>> = Rc::default();

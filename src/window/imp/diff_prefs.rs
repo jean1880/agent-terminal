@@ -115,6 +115,9 @@ impl AgentTerminalWindow {
 
         let command_row = adw::EntryRow::builder()
             .title("Command")
+            .tooltip_text(
+                "The viewer's command line, with the placeholders above, e.g. meld {old} {new}",
+            )
             .text(
                 current
                     .as_ref()
