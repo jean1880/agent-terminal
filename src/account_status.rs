@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::adapter::Driver;
 use agent_core::event::{Account, Envelope, Event, QuotaWindow};
-use agent_core::quota::{agy_account, agy_usage};
+use agent_core::quota::{agy_account, agy_signed_out, agy_usage};
 use gtk4::{gio, glib};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -32,6 +32,9 @@ pub struct Snapshot {
     pub windows: Vec<QuotaWindow>,
     /// When a window was last updated (epoch seconds); `None` before the first update.
     pub updated_at: Option<i64>,
+    /// The agent says no one is signed in to it: installed, but its login was skipped or has
+    /// expired. Its turns fail and its usage cannot be read until the user signs in.
+    pub signed_out: bool,
 }
 
 /// Merges an update in: a new account replaces the old one (`None` keeps it), and windows are
@@ -48,6 +51,11 @@ pub fn merge(
     if let Some(account) = account {
         if snap.account.as_ref() != Some(&account) {
             snap.account = Some(account);
+            changed = true;
+        }
+        // An account the agent reports is someone signed in.
+        if snap.signed_out {
+            snap.signed_out = false;
             changed = true;
         }
     }
@@ -154,6 +162,38 @@ impl AccountStatus {
         }
     }
 
+    /// Records whether `driver` says no one is signed in. Signing out also forgets the account
+    /// and windows shown for it, which belonged to whoever was signed in before.
+    pub fn set_signed_out(&self, driver: Driver, signed_out: bool) {
+        let changed = {
+            let mut snap = self.slot(driver).borrow_mut();
+            if snap.signed_out == signed_out {
+                false
+            } else {
+                snap.signed_out = signed_out;
+                if signed_out {
+                    snap.account = None;
+                    snap.windows.clear();
+                }
+                true
+            }
+        };
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// The user signed in (or says so): forget the signed-out verdict, so the next
+    /// [`Self::refresh`] probes `driver` again, agy included. The verdict stands until then.
+    pub fn recheck(&self, driver: Driver) {
+        self.slot(driver).borrow_mut().signed_out = false;
+    }
+
+    /// Whether `driver` is known to have no one signed in.
+    pub fn is_signed_out(&self, driver: Driver) -> bool {
+        self.slot(driver).borrow().signed_out
+    }
+
     /// Ingests an envelope from `driver`'s thread; only `QuotaUpdated` matters here.
     pub fn observe(&self, driver: Driver, envelope: &Envelope) {
         if let Event::QuotaUpdated { account, windows } = &envelope.event {
@@ -164,28 +204,41 @@ impl AccountStatus {
     /// Probes every agent in the background and returns at once (a probe already running makes
     /// this a no-op). No agent is sent a prompt, and each runs in the environment its threads
     /// get, so the account shown is the one a thread would use.
+    ///
+    /// A signed-out agy is not probed again: probing it starts agy's own login, which opens a
+    /// browser each time. [`Self::recheck`] (the user's "Check again") probes it once more.
     pub fn refresh(self: &Rc<Self>, targets: &ProbeTargets) {
         if self.refreshing.replace(true) {
             debug!("account status refresh already running");
             return;
         }
-        if targets.count() == 0 {
+        let probed = |d: Driver| {
+            targets.get(d).is_some() && !(d == Driver::Agy && self.is_signed_out(Driver::Agy))
+        };
+        // At most the three agents.
+        let count =
+            u8::try_from(Driver::ALL.into_iter().filter(|d| probed(*d)).count()).unwrap_or(u8::MAX);
+        if count == 0 {
             self.refreshing.set(false);
             return; // nothing is ready: nothing is spawned
         }
         let finish = {
             let me = self.clone();
-            join_n(targets.count(), move || me.refreshing.set(false))
+            join_n(count, move || me.refreshing.set(false))
         };
         for driver in Driver::ALL {
+            if !probed(driver) {
+                continue; // missing, disabled, still being detected, or a signed-out agy
+            }
             let Some(target) = targets.get(driver) else {
-                continue; // missing, disabled or still being detected
+                continue;
             };
             let (me, done) = (self.clone(), finish.clone());
             match driver {
                 Driver::Claude => {
                     claude_probe::probe_shared(&target.program, &target.env, move |result| {
                         if let Ok(probe) = result {
+                            me.set_signed_out(driver, probe.signed_out);
                             me.update(driver, probe.account.clone(), probe.windows.clone());
                         }
                         done();
@@ -194,6 +247,7 @@ impl AccountStatus {
                 Driver::Codex => {
                     codex_probe::probe_shared(&target.program, &target.env, move |result| {
                         if let Ok(probe) = result {
+                            me.set_signed_out(driver, probe.signed_out);
                             me.update(driver, probe.account.clone(), probe.windows.clone());
                         }
                         done();
@@ -215,6 +269,13 @@ impl AccountStatus {
                             AGY_TIMEOUT,
                         )
                         .await;
+                        // Its login prompt, whether it then timed out or not.
+                        if agy_signed_out(&out) {
+                            warn!("agy is not signed in");
+                            me.set_signed_out(Driver::Agy, true);
+                            done();
+                            return;
+                        }
                         let windows = if ok {
                             serde_json::from_str::<Value>(out.trim())
                                 .map(|v| agy_usage(&v))
@@ -223,6 +284,9 @@ impl AccountStatus {
                             warn!("agy /usage failed or timed out");
                             Vec::new()
                         };
+                        if ok {
+                            me.set_signed_out(Driver::Agy, false);
+                        }
                         // A few hundred bytes of JSON, read off the main thread like all file I/O
                         // here.
                         let account =
@@ -265,6 +329,34 @@ mod tests {
             plan: None,
             provider: None,
         }
+    }
+
+    /// Signed out forgets the previous account; an account reported later is someone signed in;
+    /// a recheck clears the verdict quietly, for the next probe to settle.
+    #[test]
+    fn signed_out_follows_what_the_agent_reports() {
+        let status = AccountStatus::new();
+        status.update(
+            Driver::Codex,
+            Some(acct("a")),
+            vec![win(None, "5-hour", 0.5)],
+        );
+        status.set_signed_out(Driver::Codex, true);
+        let snap = status.snapshot(Driver::Codex);
+        assert!(snap.signed_out);
+        assert_eq!(snap.account, None, "not the old login's account");
+        assert!(snap.windows.is_empty());
+        assert!(!status.is_signed_out(Driver::Claude), "per agent");
+
+        status.update(Driver::Codex, Some(acct("b")), vec![]);
+        assert!(
+            !status.is_signed_out(Driver::Codex),
+            "an account means signed in"
+        );
+
+        status.set_signed_out(Driver::Codex, true);
+        status.recheck(Driver::Codex);
+        assert!(!status.is_signed_out(Driver::Codex));
     }
 
     #[test]

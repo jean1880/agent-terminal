@@ -25,6 +25,26 @@ const MODES: [(Mode, &str); 3] = [
 /// Effort levels offered when the catalogue lists none for the agent.
 const FALLBACK_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
+/// The Account row's text for `driver`, and whether it is signed out (which shows the button).
+fn account_text(driver: Driver, snap: &crate::account_status::Snapshot) -> (String, bool) {
+    if snap.signed_out {
+        return (
+            format!("Not signed in. {}", driver.info().sign_in_hint),
+            true,
+        );
+    }
+    match &snap.account {
+        Some(a) => match &a.plan {
+            Some(plan) => (format!("Signed in as {} ({plan})", a.label), false),
+            None => (format!("Signed in as {}", a.label), false),
+        },
+        None => (
+            "Not checked yet (it is checked while the agent is enabled)".to_owned(),
+            false,
+        ),
+    }
+}
+
 /// What the agent rows hold, as their tooltips (an entry row has no subtitle). Shown again once
 /// a value checks out; an invalid one shows why instead.
 const COMMAND_HELP: &str =
@@ -231,8 +251,51 @@ impl AgentTerminalWindow {
         ));
         dialog.connect_closed(move |_| AgentAvailability::shared().disconnect(state_id));
 
+        // Who is signed in: an installed agent nobody signed in to cannot run a turn.
+        let account = adw::ActionRow::builder()
+            .title("Account")
+            .use_markup(false)
+            .build();
+        let sign_in = gtk4::Button::builder()
+            .label("Sign In…")
+            .valign(gtk4::Align::Center)
+            .tooltip_text(driver.info().sign_in_hint)
+            .build();
+        sign_in.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| obj.imp().sign_in(driver)
+        ));
+        account.add_suffix(&sign_in);
+        let show_account = glib::clone!(
+            #[weak]
+            account,
+            #[weak]
+            sign_in,
+            move || {
+                let snap = crate::account_status::AccountStatus::shared().snapshot(driver);
+                let (text, signed_out) = account_text(driver, &snap);
+                account.set_subtitle(&text);
+                sign_in.set_visible(signed_out);
+                if signed_out {
+                    account.add_css_class("error");
+                } else {
+                    account.remove_css_class("error");
+                }
+            }
+        );
+        show_account();
+        let account_id =
+            crate::account_status::AccountStatus::shared().connect_changed(show_account);
+        dialog.connect_closed(move |_| {
+            crate::account_status::AccountStatus::shared().disconnect(account_id);
+        });
+        group.add(&account);
+
         // Command, with what detection makes of it.
+        // Shows a path: plain text, not markup (an `&` or `<` in it would blank the row).
         let status = adw::ActionRow::builder()
+            .use_markup(false)
             .title("Detected")
             .subtitle("Checking…")
             .subtitle_selectable(true)
@@ -605,6 +668,7 @@ fn always_allowed_rows() -> adw::ExpanderRow {
         .build();
     for rule in rules.rules {
         let row = adw::ActionRow::builder()
+            .use_markup(false)
             .title(rule.summary())
             .subtitle(&rule.workspace)
             .title_lines(2)

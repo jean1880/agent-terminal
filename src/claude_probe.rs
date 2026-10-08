@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use agent_core::catalog::{parse_claude_initialize, CatalogModel};
 use agent_core::event::{Account, QuotaWindow};
-use agent_core::quota::{claude_account, claude_usage};
+use agent_core::quota::{claude_account, claude_signed_out, claude_usage};
 use gtk4::glib;
 use serde_json::Value;
 use tracing::warn;
@@ -34,6 +34,8 @@ pub struct ClaudeProbe {
     pub models: Vec<CatalogModel>,
     pub account: Option<Account>,
     pub windows: Vec<QuotaWindow>,
+    /// No one is signed in (a fresh install, or a login that was removed).
+    pub signed_out: bool,
 }
 
 pub type ProbeResult = Result<ClaudeProbe, &'static str>;
@@ -138,6 +140,7 @@ pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
         models: parse_claude_initialize(&init),
         account: claude_account(&init),
         windows,
+        signed_out: claude_signed_out(&init),
     })
 }
 

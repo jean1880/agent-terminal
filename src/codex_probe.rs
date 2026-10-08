@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_core::catalog::{parse_codex_models, CatalogModel};
 use agent_core::event::{Account, QuotaWindow};
-use agent_core::quota::{codex_account, codex_rate_limits};
+use agent_core::quota::{codex_account, codex_rate_limits, codex_signed_out};
 use gtk4::glib;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -37,6 +37,8 @@ pub struct CodexProbe {
     pub models: Vec<CatalogModel>,
     pub account: Option<Account>,
     pub windows: Vec<QuotaWindow>,
+    /// No one is signed in (`codex login` has not been run, or the login expired).
+    pub signed_out: bool,
 }
 
 pub type ProbeResult = Result<CodexProbe, &'static str>;
@@ -158,6 +160,7 @@ pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
         models: parse_codex_models(&models),
         account: ok(ACCOUNT_ID).and_then(codex_account),
         windows: ok(LIMITS_ID).map(codex_rate_limits).unwrap_or_default(),
+        signed_out: ok(ACCOUNT_ID).is_some_and(codex_signed_out),
     })
 }
 

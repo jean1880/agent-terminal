@@ -367,8 +367,11 @@ pub const MAX_INDICATORS: usize = 5;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeChoice {
+    /// The app's own palette. Was named after Antigravity, the CLI the app first drove; the old
+    /// name still loads.
     #[default]
-    Antigravity,
+    #[serde(alias = "antigravity")]
+    AgentTerminal,
     Dracula,
     Nord,
     GruvboxDark,
@@ -380,7 +383,7 @@ pub enum ThemeChoice {
 impl std::fmt::Display for ThemeChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            ThemeChoice::Antigravity => "Antigravity",
+            ThemeChoice::AgentTerminal => "Agent Terminal",
             ThemeChoice::Dracula => "Dracula",
             ThemeChoice::Nord => "Nord",
             ThemeChoice::GruvboxDark => "Gruvbox Dark",
@@ -395,7 +398,7 @@ impl std::fmt::Display for ThemeChoice {
 impl ThemeChoice {
     /// All choices in display order; the index matches the settings dropdown.
     pub const ALL: [ThemeChoice; 7] = [
-        ThemeChoice::Antigravity,
+        ThemeChoice::AgentTerminal,
         ThemeChoice::Dracula,
         ThemeChoice::Nord,
         ThemeChoice::GruvboxDark,
@@ -1197,7 +1200,7 @@ mod tests {
         // here until ALL is updated to match.
         fn expected_index(theme: ThemeChoice) -> usize {
             match theme {
-                ThemeChoice::Antigravity => 0,
+                ThemeChoice::AgentTerminal => 0,
                 ThemeChoice::Dracula => 1,
                 ThemeChoice::Nord => 2,
                 ThemeChoice::GruvboxDark => 3,
@@ -1217,6 +1220,18 @@ mod tests {
                 "{theme} is not at its expected position in ALL"
             );
         }
+    }
+
+    /// The default theme's old name (after the CLI the app first drove) still loads, and is
+    /// written back under the app's own.
+    #[test]
+    fn the_old_theme_name_still_loads() {
+        let old: ThemeChoice = serde_json::from_str("\"antigravity\"").expect("the old name");
+        assert_eq!(old, ThemeChoice::AgentTerminal);
+        assert_eq!(
+            serde_json::to_string(&old).expect("serialises"),
+            "\"agent-terminal\""
+        );
     }
 
     #[test]

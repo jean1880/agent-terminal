@@ -129,6 +129,9 @@ impl UsageIndicator {
     /// `filter`: show only this agent (the chat header follows the thread's agent); `None`
     /// shows both. Repaints on every [`AccountStatus`] change.
     pub fn new(status: Rc<AccountStatus>, filter: Option<Driver>) -> Rc<Self> {
+        // Its colours (by usage, and the signed-out tag) are in the chat stylesheet, which the
+        // sidebar's indicator is built before any chat view loads.
+        super::load_style();
         let root = gtk4::MenuButton::new();
         root.add_css_class("flat");
         root.add_css_class("usage-indicator");
@@ -206,7 +209,8 @@ impl UsageIndicator {
             .filter(|d| availability.is_ready(*d))
             .filter(|d| self.filter.get().is_none_or(|f| f == *d))
             .map(|d| (d, self.status.snapshot(d)))
-            .filter(|(_, s)| s.account.is_some() || !s.windows.is_empty())
+            // Signed out shows too: hiding the agent was how a broken login went unnoticed.
+            .filter(|(_, s)| s.account.is_some() || !s.windows.is_empty() || s.signed_out)
             .collect()
     }
 
@@ -241,6 +245,15 @@ fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     b.add_css_class(accent_class(driver));
     b.append(&brand_image(driver));
+    if snap.signed_out {
+        b.append(&label("signed out", &["usage-text", "usage-crit"]));
+        b.set_tooltip_text(Some(&format!(
+            "{} is not signed in. {}",
+            driver_name(driver),
+            driver.info().sign_in_hint
+        )));
+        return b;
+    }
     let (short, weekly) = split_windows(&snap.windows);
     if short.is_none() && weekly.is_none() {
         b.append(&label("-", &["usage-text"]));
@@ -274,6 +287,17 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     head.append(&brand_image(driver));
     head.append(&label(driver_name(driver), &["usage-agent"]));
     section.append(&head);
+    if snap.signed_out {
+        let l = label("Not signed in", &["usage-text", "usage-crit"]);
+        l.set_halign(gtk4::Align::Start);
+        section.append(&l);
+        let hint = label(driver.info().sign_in_hint, &["dim-label", "usage-account"]);
+        hint.set_halign(gtk4::Align::Start);
+        hint.set_wrap(true);
+        hint.set_xalign(0.0);
+        section.append(&hint);
+        return section;
+    }
     if let Some(account) = &snap.account {
         let line = match &account.plan {
             Some(plan) => format!("{} · {plan}", account.label),

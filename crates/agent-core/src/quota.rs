@@ -168,6 +168,38 @@ pub fn codex_account(result: &Value) -> Option<Account> {
     }
 }
 
+/// Whether Claude's `initialize` reply says no one is signed in. A fresh install (Claude Code
+/// 2.1, captured live) answers `account {tokenSource: "none", apiProvider}` with no email; a
+/// signed-in one names the account and has no `tokenSource` of "none". An API key or token in
+/// the environment shows as another source, not "none".
+pub fn claude_signed_out(initialize: &Value) -> bool {
+    find_in_response(initialize, "account")
+        .and_then(|a| a.get("tokenSource"))
+        .and_then(Value::as_str)
+        == Some("none")
+}
+
+/// Whether output from agy (`agy -p /usage`) says no one is signed in. A fresh install prints
+/// "Authentication required. Please visit the URL to log in:" (captured live), then opens a
+/// browser and waits for the login, so the app must not keep probing it.
+pub fn agy_signed_out(output: &str) -> bool {
+    output
+        .to_ascii_lowercase()
+        .contains("authentication required")
+}
+
+/// Whether an `account/read` result says no one is signed in to Codex: no account, while the
+/// server needs OpenAI auth. Then every turn fails with "401 Unauthorized" and no usage can be
+/// read, so the app says so rather than hanging or hiding the agent.
+pub fn codex_signed_out(result: &Value) -> bool {
+    let no_account = result.get("account").is_none_or(Value::is_null);
+    let needs_auth = result
+        .get("requiresOpenaiAuth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    no_account && needs_auth
+}
+
 /// A window's label from its length: 300 min is the "5-hour" window, a week is "Weekly".
 fn codex_window_label(mins: Option<i64>, fallback: &str) -> String {
     match mins {
@@ -351,6 +383,49 @@ mod tests {
         assert_eq!(codex_account(&json!({"account": null})), None);
         assert_eq!(codex_account(&json!({})), None);
         assert_eq!(codex_account(&json!({"account": {"type": "other"}})), None);
+    }
+
+    /// Captured live: a fresh Claude Code's `initialize` account, and a signed-in one's shape.
+    #[test]
+    fn claude_signed_out_is_token_source_none() {
+        let fresh = json!({"type": "control_response", "response": {"subtype": "success",
+            "response": {"account": {"tokenSource": "none", "apiProvider": "firstParty"}}}});
+        assert!(claude_signed_out(&fresh));
+        let signed_in = json!({"type": "control_response", "response": {"subtype": "success",
+            "response": {"account": {"email": "u@example.com", "organization": "Org",
+            "subscriptionType": "max", "apiProvider": "firstParty"}}}});
+        assert!(!claude_signed_out(&signed_in));
+        assert!(
+            !claude_signed_out(&json!({})),
+            "no account at all is not proof"
+        );
+    }
+
+    #[test]
+    fn agy_signed_out_reads_its_login_prompt() {
+        assert!(agy_signed_out(
+            "Authentication required. Please visit the URL to log in:\n  https://accounts…"
+        ));
+        assert!(!agy_signed_out(
+            r#"{"status":"SUCCESS","response":"Gemini Models…"}"#
+        ));
+    }
+
+    /// The shape a signed-out `codex app-server` 0.160 answers `account/read` with (captured
+    /// live): no account, and auth required.
+    #[test]
+    fn codex_signed_out_is_no_account_while_auth_is_required() {
+        assert!(codex_signed_out(&json!(
+            {"account": null, "requiresOpenaiAuth": true, "workspaceRouting": null}
+        )));
+        assert!(!codex_signed_out(&json!(
+            {"account": {"type": "chatgpt", "email": "u@example.com"}, "requiresOpenaiAuth": true}
+        )));
+        assert!(
+            !codex_signed_out(&json!({"account": null, "requiresOpenaiAuth": false})),
+            "a server that needs no OpenAI auth (another provider) is not signed out"
+        );
+        assert!(!codex_signed_out(&json!({})));
     }
 
     #[test]

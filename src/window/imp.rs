@@ -31,7 +31,7 @@ const MIN_WINDOW: (i32, i32) = (360, 294);
 /// The Settings descriptions of the two folder rows, restored once a typed path checks out.
 const STARTING_DIRECTORY_HELP: &str = "Where new tabs and threads open (blank: your home folder)";
 const WORKTREE_ROOT_HELP: &str =
-    "Where New Thread in Worktree creates worktrees, as <folder>/<repo>/<branch>";
+    "Where new worktrees go, as <folder>/<repo>/<branch> (blank: a hidden folder beside the repository)";
 /// At or below this width the header drops its panel toggles ([`AgentTerminalWindow::add_narrow_breakpoint`]).
 const NARROW_SP: f64 = 480.0;
 
@@ -299,6 +299,45 @@ fn build_exit_bar() -> (Box, Label, Button, Button) {
     bar.append(&restart);
     bar.append(&close);
     (bar, label, restart, close)
+}
+
+/// The font a terminal draws `spec` with: its first family that is installed, at its size. A
+/// spec may be a fallback chain ("JetBrains Mono, Fira Code, Monospace 11", the default), which
+/// terminals take as is but the font picker cannot show: it read "None". Generic names
+/// (Monospace) are fontconfig aliases rather than installed families, so the last resort.
+fn installed_font(spec: &str, widget: &impl IsA<gtk4::Widget>) -> gtk4::pango::FontDescription {
+    let mut desc = gtk4::pango::FontDescription::from_string(spec);
+    let Some(families) = desc.family().map(|f| f.to_string()) else {
+        return desc;
+    };
+    let installed: Vec<String> = widget
+        .pango_context()
+        .font_map()
+        .map(|map| {
+            map.list_families()
+                .iter()
+                .map(|f| f.name().to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let chosen = first_installed(&families, &installed);
+    desc.set_family(&chosen);
+    desc
+}
+
+/// The first of a comma-separated `families` list found in `installed` (lower-case names), else
+/// the list's last entry (a generic family such as Monospace), else "Monospace".
+fn first_installed(families: &str, installed: &[String]) -> String {
+    let names: Vec<&str> = families
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    names
+        .iter()
+        .find(|n| installed.contains(&n.to_lowercase()))
+        .or(names.last())
+        .map_or_else(|| "Monospace".to_owned(), |n| (*n).to_owned())
 }
 
 /// Removes `stack`'s `names` pages once the crossfade away from them has finished, so loading
@@ -776,6 +815,8 @@ pub struct AgentTerminalWindow {
     thread_selected_by_restore: std::cell::Cell<bool>,
     /// The actions [`Self::hold_actions`] switched off until the shell is live.
     held_actions: RefCell<Vec<gtk4::gio::SimpleAction>>,
+    /// Agents whose sign-in tab was opened from a banner, whose button now checks again.
+    sign_in_started: RefCell<std::collections::HashSet<agent_core::adapter::Driver>>,
 }
 
 #[glib::object_subclass]
@@ -3181,18 +3222,11 @@ impl AgentTerminalWindow {
             .title("Settings")
             .build();
 
-        let page = adw::PreferencesPage::builder()
-            .title("Terminal")
-            .icon_name("at-utilities-terminal-symbolic")
-            .build();
-        let group = adw::PreferencesGroup::new();
-        group.set_title("Terminal Preferences");
-
         let starting_directory_entry = gtk4::Entry::builder()
             .text(&config.starting_directory)
             .hexpand(true)
             .valign(gtk4::Align::Center)
-            .placeholder_text("Leave blank to default to Home directory")
+            .placeholder_text("Home folder")
             .build();
 
         let starting_directory_row = adw::ActionRow::builder()
@@ -3249,8 +3283,8 @@ impl AgentTerminalWindow {
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
         let cli_client_row = adw::ComboRow::builder()
-            .title("Active CLI Client")
-            .subtitle("Used by new tabs; open tabs keep running")
+            .title("Terminal Tab CLI")
+            .subtitle("The CLI new terminal tabs run; open tabs keep theirs")
             .model(&client_model)
             .selected(selected_index)
             .build();
@@ -3275,7 +3309,7 @@ impl AgentTerminalWindow {
         // Font family and size were a hard-coded constant while the *scale* was a
         // setting, which is an odd place to have drawn the line.
         let font_button = gtk4::FontDialogButton::new(Some(gtk4::FontDialog::new()));
-        font_button.set_font_desc(&gtk4::pango::FontDescription::from_string(&config.font));
+        font_button.set_font_desc(&installed_font(&config.font, &font_button));
         font_button.set_valign(gtk4::Align::Center);
         let font_row = adw::ActionRow::builder()
             .title("Terminal Font")
@@ -3312,27 +3346,37 @@ impl AgentTerminalWindow {
             .active(config.skip_load_animation)
             .build();
 
+        // `notify_on_bell` in the file: once only a terminal's bell, now a thread's finished turn too.
         let notify_row = adw::SwitchRow::builder()
-            .title("Notify on Session Bell")
-            .subtitle("Raise a desktop notification when a background tab needs attention")
+            .title("Notify When an Agent Finishes")
+            .subtitle(
+                "A desktop notification when a thread you are not looking at finishes its turn, or \
+                 a terminal tab rings its bell. Requests for your approval always notify",
+            )
             .active(config.notify_on_bell)
             .build();
 
         let notify_quota_row = adw::SwitchRow::builder()
             .title("Notify When Out of Quota")
-            .subtitle("Raise a desktop notification offering to continue in another CLI")
+            .subtitle("A desktop notification offering to continue the work in another agent")
             .active(config.notify_on_quota)
             .build();
 
         let restore_row = adw::SwitchRow::builder()
-            .title("Restore Tabs on Launch")
-            .subtitle("Reopen the last window's tabs in their folders, as fresh sessions")
+            .title("Reopen Terminal Tabs")
+            .subtitle(
+                "Reopen the last session's terminal tabs, in their folders, as fresh sessions. \
+                 Chat threads always reopen as you left them",
+            )
             .active(config.restore_session)
             .build();
 
         let checkpoints_row = adw::SwitchRow::builder()
             .title("Checkpoint Each Turn")
-            .subtitle("Snapshot a git repository into hidden refs when a turn ends, for diffing")
+            .subtitle(
+                "When a turn ends in a git repository, snapshot the files into hidden refs, so \
+                 each turn can be diffed and undone. Your branches, index and stash are untouched",
+            )
             .active(config.checkpoints)
             .build();
 
@@ -3340,31 +3384,77 @@ impl AgentTerminalWindow {
             .text(&config.worktree_root)
             .hexpand(true)
             .valign(gtk4::Align::Center)
-            .placeholder_text("Blank: a hidden folder beside the repository")
+            .placeholder_text("Beside the repository")
             .build();
+        // Plain text: the description's <folder>/<repo> read as (broken) Pango markup, and the
+        // whole subtitle silently vanished.
         let worktree_root_row = adw::ActionRow::builder()
             .title("Worktree Folder")
             .subtitle(WORKTREE_ROOT_HELP)
+            .use_markup(false)
             .build();
         worktree_root_row.add_suffix(&worktree_root_entry);
 
-        group.add(&starting_directory_row);
-        group.add(&scrollback_row);
-        group.add(&font_row);
-        group.add(&font_scale_row);
-        group.add(&cursor_row);
-        group.add(&blink_row);
-        group.add(&skip_animation_row);
-        group.add(&cli_client_row);
-        group.add(&theme_row);
-        group.add(&notify_row);
-        group.add(&notify_quota_row);
-        group.add(&restore_row);
-        group.add(&checkpoints_row);
-        group.add(&worktree_root_row);
-        page.add(&group);
-        self.add_diff_tool_group(&page);
-        dialog.add(&page);
+        // Pages by what a setting touches: the app as a whole, the agents (added below), git, and
+        // the terminal pages and drawer.
+        let general = adw::PreferencesPage::builder()
+            .title("General")
+            .icon_name("at-document-properties-symbolic")
+            .build();
+        let startup = adw::PreferencesGroup::builder().title("Startup").build();
+        startup.add(&starting_directory_row);
+        startup.add(&restore_row);
+        startup.add(&skip_animation_row);
+        general.add(&startup);
+        let notifications = adw::PreferencesGroup::builder()
+            .title("Notifications")
+            .build();
+        notifications.add(&notify_row);
+        notifications.add(&notify_quota_row);
+        general.add(&notifications);
+        dialog.add(&general);
+
+        self.add_agents_page(&dialog);
+
+        let git = adw::PreferencesPage::builder()
+            .title("Git")
+            .icon_name("agent-checkpoint-symbolic")
+            .build();
+        let history = adw::PreferencesGroup::builder()
+            .title("Checkpoints and Worktrees")
+            .description(
+                "A worktree is a second checkout of a repository, on its own branch, in its own \
+                 folder. New Thread in Worktree (Ctrl+Shift+G) makes one, so an agent can work \
+                 without touching the checkout you are using. The starting directory (General) \
+                 is only where new threads open by default.",
+            )
+            .build();
+        history.add(&checkpoints_row);
+        history.add(&worktree_root_row);
+        git.add(&history);
+        self.add_diff_tool_group(&git);
+        dialog.add(&git);
+
+        let terminal = adw::PreferencesPage::builder()
+            .title("Terminal")
+            .icon_name("at-utilities-terminal-symbolic")
+            .description(
+                "Terminal tabs and the terminal drawer (Ctrl+`). Chat threads follow the app's \
+                 own style.",
+            )
+            .build();
+        let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+        appearance.add(&font_row);
+        appearance.add(&font_scale_row);
+        appearance.add(&theme_row);
+        appearance.add(&cursor_row);
+        appearance.add(&blink_row);
+        terminal.add(&appearance);
+        let behaviour = adw::PreferencesGroup::builder().title("Behaviour").build();
+        behaviour.add(&cli_client_row);
+        behaviour.add(&scrollback_row);
+        terminal.add(&behaviour);
+        dialog.add(&terminal);
 
         font_button.connect_font_desc_notify(glib::clone!(
             #[weak]
@@ -3607,7 +3697,6 @@ impl AgentTerminalWindow {
             }
         ));
 
-        self.add_agents_page(&dialog);
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
     }
 
@@ -4043,6 +4132,7 @@ impl AgentTerminalWindow {
                     let title = session.title.as_deref().unwrap_or(&session.id);
 
                     let row = adw::ActionRow::builder()
+                        .use_markup(false)
                         .title(title)
                         .subtitle(format!("{dir} · {age}"))
                         // Titles and paths are data; & or < must not be
@@ -5600,6 +5690,25 @@ mod tests {
         if !gtk4::is_initialized_main_thread() {
             gtk4::init().expect("GTK init failed");
         }
+    }
+
+    /// The font picker shows one installed family of a fallback chain, never the chain (which
+    /// it rendered as "None").
+    #[test]
+    fn font_picker_shows_the_first_installed_family() {
+        let installed = ["fira code".to_owned(), "dejavu sans mono".to_owned()];
+        let chain = "JetBrains Mono, Fira Code, Monospace";
+        assert_eq!(first_installed(chain, &installed), "Fira Code");
+        assert_eq!(
+            first_installed(chain, &[]),
+            "Monospace",
+            "none installed: the generic last resort"
+        );
+        assert_eq!(
+            first_installed("DejaVu Sans Mono", &installed),
+            "DejaVu Sans Mono"
+        );
+        assert_eq!(first_installed("", &installed), "Monospace");
     }
 
     #[test]

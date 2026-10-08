@@ -95,6 +95,8 @@ pub(super) struct ChatTab {
     rate_banner: adw::Banner,
     /// Shown when the thread's model is no longer offered by its agent.
     model_banner: adw::Banner,
+    /// Shown while the thread's agent is installed but no one is signed in to it.
+    sign_in_banner: adw::Banner,
     running: bool,
     /// Background work still going (sub-agents, background commands), as the agent last listed
     /// it. The thread is finished only when this is empty and no turn runs.
@@ -2051,7 +2053,17 @@ impl AgentTerminalWindow {
                 obj.imp().choose_model(&thread_id);
             }
         });
+        // And one for an agent nobody is signed in to: "Sign In…" opens its login in a terminal
+        // tab, then "Check Again" looks once more.
+        let sign_in_banner = adw::Banner::builder().use_markup(false).build();
+        let thread_id = thread.to_owned();
+        sign_in_banner.connect_button_clicked(move |b| {
+            if let Some(obj) = window_of(b) {
+                obj.imp().sign_in_from_thread(&thread_id);
+            }
+        });
         let content = Box::builder().orientation(Orientation::Vertical).build();
+        content.append(&sign_in_banner);
         content.append(&rate_banner);
         content.append(&model_banner);
         content.append(&paned);
@@ -2135,6 +2147,7 @@ impl AgentTerminalWindow {
                 drawer_started: false,
                 rate_banner,
                 model_banner,
+                sign_in_banner,
                 running: false,
                 background: Vec::new(),
                 finish_held: false,
@@ -2158,6 +2171,7 @@ impl AgentTerminalWindow {
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);
         }
+        self.update_sign_in_banners();
         self.refresh_sidebar();
         Some(page)
     }
@@ -3314,6 +3328,12 @@ impl AgentTerminalWindow {
     fn watch_account_status(&self) {
         self.refresh_agent_data();
         let obj = self.obj();
+        // An agent found signed out (or signed in again) re-shows its threads' banners.
+        AccountStatus::shared().connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            move || obj.imp().update_sign_in_banners()
+        ));
         glib::timeout_add_local(
             ACCOUNT_REFRESH,
             glib::clone!(
@@ -3451,6 +3471,7 @@ impl AgentTerminalWindow {
         // The picker hides agents that are not ready; an open one redraws.
         ModelCatalog::shared().notify();
         self.update_unavailable_banners();
+        self.update_sign_in_banners();
         self.start_pending_sessions();
         self.evaluate_models();
         // A "new thread" asked for while the agents were still being detected.
@@ -3518,6 +3539,78 @@ impl AgentTerminalWindow {
         if let Some(view) = view {
             view.open_model_picker();
         }
+    }
+
+    /// Every open thread whose agent is installed and switched on, but has no one signed in,
+    /// says so, with the button to sign in (or, once a sign-in tab was opened, to check again).
+    /// Only the threads of that agent: an agent the user does not use never nags.
+    pub(super) fn update_sign_in_banners(&self) {
+        let (availability, accounts) = (AgentAvailability::shared(), AccountStatus::shared());
+        let tabs = self.tabs.borrow();
+        for chat in tabs.iter().filter_map(|t| t.chat.as_ref()) {
+            let driver = chat.slot.driver();
+            if !(availability.is_ready(driver) && accounts.is_signed_out(driver)) {
+                chat.sign_in_banner.set_revealed(false);
+                continue;
+            }
+            let info = driver.info();
+            chat.sign_in_banner.set_title(&format!(
+                "{} is not signed in. {}",
+                info.label, info.sign_in_hint
+            ));
+            let started = self.sign_in_started.borrow().contains(&driver);
+            chat.sign_in_banner.set_button_label(Some(if started {
+                "Check Again"
+            } else {
+                "Sign In…"
+            }));
+            chat.sign_in_banner.set_revealed(true);
+        }
+    }
+
+    /// The sign-in banner's button for `thread`'s agent: the first press opens a terminal tab
+    /// running the agent's sign-in; after that it checks again (the agent is probed afresh).
+    fn sign_in_from_thread(&self, thread: &str) {
+        let Some(driver) = self.slot_of(thread).map(|s| s.driver()) else {
+            return;
+        };
+        if self.sign_in_started.borrow().contains(&driver) {
+            self.check_sign_in(driver);
+        } else {
+            self.sign_in(driver);
+        }
+    }
+
+    /// Opens a terminal tab running `driver`'s sign-in (its own command and environment file,
+    /// with the sign-in arguments), in the home folder.
+    pub(super) fn sign_in(&self, driver: Driver) {
+        let info = driver.info();
+        let base = self
+            .config
+            .borrow()
+            .agent_profile(driver)
+            .cloned()
+            .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+        let profile = crate::config::Profile {
+            name: format!("Sign in to {}", info.label),
+            command: base.command,
+            args: info.sign_in_args.iter().map(|a| (*a).to_owned()).collect(),
+            env_file: base.env_file,
+            ..crate::config::Profile::default()
+        };
+        info!("Opening a sign-in tab for {}", info.label);
+        let home = env::var("HOME").ok();
+        self.add_terminal_tab(Some(&profile), home.as_deref());
+        self.sign_in_started.borrow_mut().insert(driver);
+        self.update_sign_in_banners();
+    }
+
+    /// Forgets `driver`'s signed-out verdict and probes the agents again.
+    pub(super) fn check_sign_in(&self, driver: Driver) {
+        AccountStatus::shared().recheck(driver);
+        self.sign_in_started.borrow_mut().remove(&driver);
+        self.refresh_agent_data();
+        self.update_sign_in_banners();
     }
 
     /// An open thread whose agent is missing or switched off says so, and offers to continue in

@@ -369,6 +369,18 @@ fn load_css() {
         @define-color accent_bg_color #b49bff;
         @define-color window_bg_color #181425;
         @define-color headerbar_bg_color #120f1d;
+        /* libadwaita 1.6+ reads these instead of the names above: without them switches and
+           selections took the desktop's accent, and dialogs Adwaita's grey. */
+        :root {
+            --accent-color: #b49bff;
+            --accent-bg-color: #b49bff;
+            --accent-fg-color: #181425;
+            --window-bg-color: #181425;
+            --headerbar-bg-color: #120f1d;
+            --dialog-bg-color: #1d1830;
+            --popover-bg-color: #1d1830;
+            --card-bg-color: alpha(#c8c8ff, 0.05);
+        }
 
         window {
             background-color: @window_bg_color;

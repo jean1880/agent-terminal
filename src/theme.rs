@@ -60,7 +60,7 @@ impl Theme {
 
     fn for_choice(choice: ThemeChoice) -> Self {
         match choice {
-            ThemeChoice::Antigravity => Self::antigravity(),
+            ThemeChoice::AgentTerminal => Self::agent_terminal(),
             ThemeChoice::Dracula => Self::scheme(
                 0x282a36,
                 0xf8f8f2,
@@ -138,8 +138,8 @@ impl Theme {
         }
     }
 
-    /// The hand-tuned Antigravity brand theme (the default).
-    fn antigravity() -> Self {
+    /// The app's own hand-tuned palette, matching its window chrome (the default).
+    fn agent_terminal() -> Self {
         let foreground = rgb(200, 200, 255);
         let bold = rgb(180, 155, 255); // accent violet, reused for cursor + magenta
 
