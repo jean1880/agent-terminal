@@ -2142,13 +2142,32 @@ impl AgentTerminalWindow {
         let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             NARROW_SP,
-            adw::LengthUnit::Sp,
+            adw::LengthUnit::Px,
         ));
         narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
         for button in panel_buttons {
             narrow.add_setter(button, "visible", Some(&false.to_value()));
         }
         self.obj().add_breakpoint(narrow);
+
+        // See the sidebar equivalent in `threads::setup_shell`: a live resize can retain the
+        // window breakpoint's initial state. Keep the optional-panel buttons out of the titlebar
+        // from the actual allocation so the window controls remain reachable at 360 px.
+        let buttons = panel_buttons.to_vec();
+        let obj = self.obj();
+        let update_visibility = {
+            let obj = obj.downgrade();
+            move || {
+                if let Some(obj) = obj.upgrade() {
+                    let visible = obj.width() as f64 > NARROW_SP;
+                    for button in &buttons {
+                        button.set_visible(visible);
+                    }
+                }
+            }
+        };
+        update_visibility();
+        obj.connect_notify_local(Some("width"), move |_, _| update_visibility());
     }
 
     /// (Re)fills "New Thread With" with the agents that are installed and enabled. Detection is
@@ -4745,7 +4764,7 @@ impl AgentTerminalWindow {
         let fit = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             DIFF_HIDE_SP,
-            adw::LengthUnit::Sp,
+            adw::LengthUnit::Px,
         ));
         fit.add_setter(&panel.root, "visible", Some(&false.to_value()));
         self.obj().add_breakpoint(fit);

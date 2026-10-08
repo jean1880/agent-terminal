@@ -54,8 +54,10 @@ const OPEN_THREADS_KEY: &str = "open_threads";
 const REPLAY_LIMIT: usize = 50_000;
 /// How often the account/usage indicator refreshes while the window is focused.
 const ACCOUNT_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
-/// Below this window width the sidebar is overlaid on the thread rather than beside it, so from
-/// it up the sidebar and the thread together must fit it.
+/// At or below this window width the sidebar is overlaid on the thread rather than beside it.
+/// Drive it from the allocated window width: `AdwApplicationWindow` breakpoints do not reliably
+/// re-evaluate after a live Broadway/native resize, which can otherwise leave both panes side by
+/// side and push the thread out of view.
 pub(super) const SIDEBAR_COLLAPSE_SP: f64 = 720.0;
 
 /// The desktop notification id for a thread waiting on an approval or a question.
@@ -1006,10 +1008,25 @@ impl AgentTerminalWindow {
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             SIDEBAR_COLLAPSE_SP,
-            adw::LengthUnit::Sp,
+            adw::LengthUnit::Px,
         ));
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         obj.add_breakpoint(breakpoint);
+
+        // Keep this in step with an actual resize as well as the declarative breakpoint above.
+        // In particular this covers a restored or Broadway-hosted window, where the window-level
+        // breakpoint can retain its initial state after the allocation changes.
+        let update_collapsed = {
+            let split = split.downgrade();
+            let obj = obj.downgrade();
+            move || {
+                if let (Some(split), Some(obj)) = (split.upgrade(), obj.upgrade()) {
+                    split.set_collapsed(obj.width() as f64 <= SIDEBAR_COLLAPSE_SP);
+                }
+            }
+        };
+        update_collapsed();
+        obj.connect_notify_local(Some("width"), move |_, _| update_collapsed());
 
         if let Some(header) = self.header.borrow().as_ref() {
             let toggle = gtk4::ToggleButton::builder()
@@ -2060,7 +2077,9 @@ impl AgentTerminalWindow {
             .end_child(&diff_panel.root)
             .resize_start_child(true)
             .resize_end_child(false)
-            .shrink_start_child(false)
+            // The chat's transcript and composer scroll internally. Let the pane itself shrink
+            // at the window minimum rather than setting a larger minimum for the whole window.
+            .shrink_start_child(true)
             .shrink_end_child(true)
             .vexpand(true)
             .build();

@@ -47,7 +47,9 @@ pub fn gauge_text(g: &Gauge) -> String {
 /// fits the thread at any window size: the usage meter (also in the sidebar), then the context
 /// gauge, then the sub-agents button and the model's name, with tighter spacing.
 const HIDE_USAGE_BELOW: f64 = 880.0;
-const HIDE_GAUGE_BELOW: f64 = 700.0;
+// The complete strip measures 741 px with a thread sidebar open. Hide the gauge before the
+// content pane reaches that size so its parent never has to expand beyond the window.
+const HIDE_GAUGE_BELOW: f64 = 760.0;
 const COMPACT_BELOW: f64 = 500.0;
 /// The narrowest the strip supports: the whole window at its minimum.
 const MIN_WIDTH: i32 = 340;
