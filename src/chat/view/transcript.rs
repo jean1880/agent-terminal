@@ -503,8 +503,29 @@ impl TranscriptView {
         }
     }
 
-    /// A new item was reduced. Top-level items are appended; nested ones go into their parent
-    /// card when that card is materialised (otherwise they appear when it is).
+    /// Puts `widget` (the row for `id`) into `container` where `id` sits among `siblings`: after
+    /// the row of the item before it, else first. A new item is usually the last; an approval goes
+    /// just before the step it asks about, so its outcome reads before the step's result.
+    fn place(&self, container: &gtk4::Box, siblings: &[String], id: &str, widget: &gtk4::Widget) {
+        let pos = siblings.iter().position(|s| s == id);
+        if pos.is_none_or(|p| p + 1 == siblings.len()) {
+            container.append(widget);
+            return;
+        }
+        let before = pos
+            .and_then(|p| p.checked_sub(1))
+            .and_then(|p| siblings.get(p))
+            .and_then(|p| self.rows.borrow().get(p).map(Row::widget))
+            .filter(|w| w.parent().as_ref() == Some(container.upcast_ref()));
+        match before {
+            Some(before) => container.insert_child_after(widget, Some(&before)),
+            None => container.prepend(widget),
+        }
+    }
+
+    /// A new item was reduced, usually at the end; it goes where the model placed it. Nested
+    /// items go into their parent card when that card is materialised (otherwise they appear
+    /// when it is).
     pub fn added(&self, model: &Transcript, id: &str) {
         let Some(item) = model.get(id) else {
             return;
@@ -519,14 +540,26 @@ impl TranscriptView {
                     .and_then(|r| r.children_box().cloned());
                 if let Some(children) = parent_box {
                     if let Some(w) = self.build_tree(model, id) {
-                        children.append(&w);
+                        let siblings = model
+                            .get(parent)
+                            .map(|p| p.children.clone())
+                            .unwrap_or_default();
+                        self.place(&children, &siblings, id, &w);
                     }
                     self.updated(model, parent);
                 }
             }
             None => {
+                let order = model.order();
+                let pos = order.iter().position(|o| o == id).unwrap_or(order.len());
+                if pos < self.first.get() {
+                    // Above the materialised window: it appears when older rows load. The window
+                    // still starts at the same item, now one further down.
+                    self.first.set(self.first.get() + 1);
+                    return;
+                }
                 if let Some(w) = self.build_tree(model, id) {
-                    self.list.append(&w);
+                    self.place(&self.list, order, id, &w);
                 }
                 if self.stick.get() {
                     // Keep the window bounded while following the stream.

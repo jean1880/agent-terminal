@@ -503,6 +503,29 @@ impl Transcript {
         format!("{prefix}:{}", self.seq)
     }
 
+    /// Inserts a top-level item just before `anchor` when that is a known top-level item; else at
+    /// the end, like [`Self::insert`]. An approval goes before the step it asks about: that step's
+    /// card usually started first, so its result (a failure, say) read above the approval that
+    /// let it run. A step inside a sub-agent is not an anchor: approvals stay top-level, where
+    /// the shelf above the composer finds the pending one.
+    fn insert_before(&mut self, id: ItemId, body: Body, anchor: Option<&str>) -> ItemId {
+        let anchor = anchor
+            .and_then(|a| self.items.get(a))
+            .filter(|a| a.parent.is_none())
+            .map(|a| a.id.clone());
+        let id = self.insert(id, body, None);
+        if let Some(anchor) = anchor {
+            self.order.retain(|s| *s != id);
+            let at = self
+                .order
+                .iter()
+                .position(|s| *s == anchor)
+                .unwrap_or(self.order.len());
+            self.order.insert(at, id.clone());
+        }
+        id
+    }
+
     /// Inserts an item (nested under `parent` when that item exists) and returns its id.
     fn insert(&mut self, id: ItemId, body: Body, parent: Option<ItemId>) -> ItemId {
         let expanded = matches!(&body, Body::Tool(t) if t.kind == ItemKind::Subagent)
@@ -823,7 +846,8 @@ impl Transcript {
                     remembers: remembers.clone(),
                 });
                 self.requests.insert(request, id.clone());
-                out.push(Change::Added(self.insert(id, body, None)));
+                let step = env.item.clone();
+                out.push(Change::Added(self.insert_before(id, body, step.as_deref())));
             }
             Event::ApprovalResolved { decision } => {
                 out.extend(self.update_approval(env, |a| {
@@ -1102,6 +1126,50 @@ mod tests {
 
     fn ev(e: Event) -> Envelope {
         Envelope::new(e)
+    }
+
+    fn approval_for(step: &str, request: &str) -> Envelope {
+        Envelope::new(Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: None,
+            input: json!({"command": "cargo test"}),
+            reason: None,
+            options: vec![Decision::Allow, Decision::Deny],
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .item(step)
+        .request(request)
+    }
+
+    /// The approval reads before the step it let run, so a failure lands below "Allowed", not
+    /// above it. A step inside a sub-agent keeps its approval top-level, where the shelf finds it.
+    #[test]
+    fn approvals_read_before_the_step_they_ask_about() {
+        let mut t = Transcript::new();
+        t.apply(&started("u1", ItemKind::UserMessage, None), Driver::Claude);
+        t.apply(&started("t1", ItemKind::Command, None), Driver::Claude);
+        t.apply(&approval_for("t1", "r1"), Driver::Claude);
+        assert_eq!(t.order(), ["u1", "approval:r1", "t1"]);
+
+        t.apply(&started("s1", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(
+            &started("c1", ItemKind::Command, Some("s1")),
+            Driver::Claude,
+        );
+        t.apply(&approval_for("c1", "r2"), Driver::Claude);
+        assert_eq!(
+            t.order(),
+            ["u1", "approval:r1", "t1", "s1", "approval:r2"],
+            "a sub-agent's step is not an anchor"
+        );
+        assert!(matches!(
+            t.pending_interruption(),
+            Some(PendingInterruption::Approval { request, .. }) if request == "r2"
+        ));
+
+        t.apply(&approval_for("nope", "r3"), Driver::Claude);
+        assert_eq!(t.order().last().map(String::as_str), Some("approval:r3"));
     }
 
     fn started(id: &str, kind: ItemKind, parent: Option<&str>) -> Envelope {

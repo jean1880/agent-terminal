@@ -1126,6 +1126,52 @@ pub(crate) mod tests {
         );
     }
 
+    /// An approval's card sits right above the command it let run (whose card started first),
+    /// so the command's result reads after "Allowed", not before it.
+    fn approval_row_precedes_its_step() {
+        use agent_core::event::{Event, ItemKind, ResponseCapability};
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        view.apply(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "Bash".into(),
+                input: Some(serde_json::json!({"command": "cargo test"})),
+                parent: None,
+            })
+            .item("t1"),
+        );
+        view.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command": "cargo test"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .item("t1")
+            .request("r1"),
+        );
+        let inner = view.inner().expect("a built view");
+        let step = inner
+            .transcript
+            .with_row("t1", |r| r.widget())
+            .expect("the command's row");
+        let next = inner
+            .transcript
+            .with_row("approval:r1", |r| r.widget().next_sibling())
+            .flatten();
+        assert_eq!(
+            next.as_ref(),
+            Some(&step),
+            "the approval sits right above its step"
+        );
+    }
+
     /// The dots above the composer show while a turn runs, name the agent, and go when it ends.
     fn thinking_strip_follows_the_turn() {
         use agent_core::event::{Event, TurnState};
@@ -1154,6 +1200,7 @@ pub(crate) mod tests {
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();
         thinking_strip_follows_the_turn();
+        approval_row_precedes_its_step();
         subagent_shelf::tests::shelf_follows_running_subagents();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
