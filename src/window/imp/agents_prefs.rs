@@ -52,6 +52,63 @@ const ENV_FILE_HELP: &str =
     "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
 
+fn validation_row() -> adw::ActionRow {
+    adw::ActionRow::builder()
+        .title("Not Saved")
+        .use_markup(false)
+        .subtitle_lines(0)
+        .css_classes(["error"])
+        .visible(false)
+        .build()
+}
+
+/// Invalid drafts remain in the entry so they can be corrected, while the saved value stays
+/// in use. Say that visibly and expose the reason alongside the native invalid state.
+fn show_validation(
+    entry: &adw::EntryRow,
+    feedback: &adw::ActionRow,
+    help: &str,
+    error: Option<&str>,
+) {
+    // EntryRow delegates text editing to an inner GtkText. Expose the error on the settings
+    // row and on the editable field that actually receives keyboard focus.
+    let delegate = entry
+        .delegate()
+        .and_then(|editable| editable.dynamic_cast::<gtk4::Widget>().ok());
+    let targets = [Some(entry.upcast_ref::<gtk4::Widget>()), delegate.as_ref()];
+    match error {
+        Some(reason) => {
+            let message = format!("{reason}. The previous saved value is still in use.");
+            entry.add_css_class("error");
+            entry.set_tooltip_text(Some(reason));
+            feedback.set_subtitle(&message);
+            feedback.set_visible(true);
+            for widget in targets.into_iter().flatten() {
+                widget.update_property(&[gtk4::accessible::Property::Description(&message)]);
+                widget.update_state(&[gtk4::accessible::State::Invalid(
+                    gtk4::AccessibleInvalidState::True,
+                )]);
+                widget.update_relation(&[gtk4::accessible::Relation::ErrorMessage(&[feedback
+                    .upcast_ref::<gtk4::Widget>()
+                    .upcast_ref()])]);
+            }
+        }
+        None => {
+            entry.remove_css_class("error");
+            entry.set_tooltip_text(Some(help));
+            for widget in targets.into_iter().flatten() {
+                widget.update_property(&[gtk4::accessible::Property::Description(help)]);
+                widget.update_state(&[gtk4::accessible::State::Invalid(
+                    gtk4::AccessibleInvalidState::False,
+                )]);
+                widget.reset_relation(gtk4::AccessibleRelation::ErrorMessage);
+            }
+            feedback.set_visible(false);
+            feedback.set_subtitle("");
+        }
+    }
+}
+
 /// The "default agent" dropdown, by index both ways: Automatic, then every driver in registry
 /// order.
 fn default_agent_choices() -> Vec<(Option<Driver>, &'static str)> {
@@ -350,6 +407,8 @@ impl AgentTerminalWindow {
             .tooltip_text(COMMAND_HELP)
             .text(&profile.command)
             .build();
+        let command_error = validation_row();
+        show_validation(&command, &command_error, COMMAND_HELP, None);
         let generation = Rc::new(std::cell::Cell::new(0u64));
         let detect = Rc::new(glib::clone!(
             #[weak]
@@ -387,15 +446,20 @@ impl AgentTerminalWindow {
             obj,
             #[strong]
             detect,
+            #[weak]
+            command_error,
             move |row| {
                 let text = row.text().trim().to_owned();
                 if !command_ok(&text) {
-                    row.add_css_class("error");
-                    row.set_tooltip_text(Some("Enter a command name or a path (not an option)"));
+                    show_validation(
+                        row,
+                        &command_error,
+                        COMMAND_HELP,
+                        Some("Enter a command name or a path (not an option)"),
+                    );
                     return;
                 }
-                row.remove_css_class("error");
-                row.set_tooltip_text(Some(COMMAND_HELP));
+                show_validation(row, &command_error, COMMAND_HELP, None);
                 let imp = obj.imp();
                 if imp.agent_profile_now(driver).command == text {
                     return;
@@ -407,6 +471,7 @@ impl AgentTerminalWindow {
             }
         ));
         group.add(&command);
+        group.add(&command_error);
         group.add(&status);
 
         let args = adw::EntryRow::builder()
@@ -421,43 +486,53 @@ impl AgentTerminalWindow {
                     .join(" "),
             )
             .build();
+        let args_error = validation_row();
+        show_validation(&args, &args_error, ARGS_HELP, None);
         args.connect_changed(glib::clone!(
             #[weak]
             obj,
+            #[weak]
+            args_error,
             move |row| match parse_args(&row.text()) {
                 Ok(parsed) => {
-                    row.remove_css_class("error");
-                    row.set_tooltip_text(Some(ARGS_HELP));
+                    show_validation(row, &args_error, ARGS_HELP, None);
                     let imp = obj.imp();
                     if imp.agent_profile_now(driver).args != parsed {
                         imp.edit_agent_profile(driver, |p| p.args = parsed);
                     }
                 }
                 Err(reason) => {
-                    row.add_css_class("error");
-                    row.set_tooltip_text(Some(&reason));
+                    show_validation(row, &args_error, ARGS_HELP, Some(&reason));
                 }
             }
         ));
         group.add(&args);
+        group.add(&args_error);
 
         let env_file = adw::EntryRow::builder()
             .title("Environment File")
             .tooltip_text(ENV_FILE_HELP)
             .text(profile.env_file.as_deref().unwrap_or(""))
             .build();
+        let env_error = validation_row();
+        show_validation(&env_file, &env_error, ENV_FILE_HELP, None);
         env_file.connect_changed(glib::clone!(
             #[weak]
             obj,
+            #[weak]
+            env_error,
             move |row| {
                 let text = row.text().trim().to_owned();
                 if !env_file_ok(&text) {
-                    row.add_css_class("error");
-                    row.set_tooltip_text(Some("That file does not exist"));
+                    show_validation(
+                        row,
+                        &env_error,
+                        ENV_FILE_HELP,
+                        Some("That file does not exist"),
+                    );
                     return;
                 }
-                row.remove_css_class("error");
-                row.set_tooltip_text(Some(ENV_FILE_HELP));
+                show_validation(row, &env_error, ENV_FILE_HELP, None);
                 let value = (!text.is_empty()).then_some(text);
                 let imp = obj.imp();
                 if imp.agent_profile_now(driver).env_file != value {
@@ -467,6 +542,7 @@ impl AgentTerminalWindow {
             }
         ));
         group.add(&env_file);
+        group.add(&env_error);
 
         // Default model, from the live catalogue; the saved one stays listed even when the
         // catalogue does not have it (yet).
@@ -794,8 +870,83 @@ fn detect_agent(command: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    /// Called by the window smoke test on GTK's thread. Invalid text must give a lasting
+    /// correction reason and must not change the profile used to launch the agent.
+    pub(crate) fn invalid_agent_drafts_are_not_saved(imp: &AgentTerminalWindow) {
+        let saved = imp.agent_profile_now(Driver::Codex);
+        let group = adw::PreferencesGroup::new();
+        let dialog = adw::PreferencesDialog::new();
+        imp.add_agent_detail_rows(&group, Driver::Codex, &saved, &dialog);
+        let mut stack = vec![group.upcast::<gtk4::Widget>()];
+        let mut fields = Vec::new();
+        let mut feedback = Vec::new();
+        while let Some(widget) = stack.pop() {
+            if let Some(row) = widget.downcast_ref::<adw::EntryRow>() {
+                fields.push(row.clone());
+            }
+            if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
+                if row.title() == "Not Saved" {
+                    feedback.push(row.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                stack.push(widget);
+            }
+        }
+        for (title, bad) in [
+            ("Command or Path", "--invalid-command"),
+            ("Extra Arguments", "'unfinished"),
+            (
+                "Environment File",
+                "/definitely/not/here/agent-terminal-validation.env",
+            ),
+        ] {
+            let field = fields
+                .iter()
+                .find(|row| row.title() == title)
+                .expect("entry row");
+            let original = field.text();
+            field.set_text(bad);
+            assert!(field.has_css_class("error"));
+            assert!(gtk4::test_accessible_has_relation(
+                field.upcast_ref::<gtk4::Widget>(),
+                gtk4::AccessibleRelation::ErrorMessage
+            ));
+            let editable = field
+                .delegate()
+                .and_then(|delegate| delegate.dynamic_cast::<gtk4::Widget>().ok())
+                .expect("editable field");
+            assert!(gtk4::test_accessible_has_relation(
+                &editable,
+                gtk4::AccessibleRelation::ErrorMessage
+            ));
+            assert!(feedback.iter().any(|row| row.is_visible()
+                && row
+                    .subtitle()
+                    .is_some_and(|s| s.contains("previous saved value"))));
+            assert_eq!(
+                imp.agent_profile_now(Driver::Codex),
+                saved,
+                "invalid {title} was persisted"
+            );
+            field.set_text(&original);
+            assert!(!field.has_css_class("error"));
+            assert!(!gtk4::test_accessible_has_relation(
+                field.upcast_ref::<gtk4::Widget>(),
+                gtk4::AccessibleRelation::ErrorMessage
+            ));
+            assert!(!gtk4::test_accessible_has_relation(
+                &editable,
+                gtk4::AccessibleRelation::ErrorMessage
+            ));
+            assert!(feedback.iter().all(|row| !row.is_visible()));
+        }
+    }
 
     #[test]
     fn the_default_mode_dropdown_lists_every_mode_once() {

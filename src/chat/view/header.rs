@@ -2,6 +2,7 @@
 //! activity (its turn and its background work) and the context gauge.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
@@ -46,7 +47,9 @@ pub fn gauge_text(g: &Gauge) -> String {
 /// The header's own width breakpoints (sp), widest first. Each drops more of the strip, so it
 /// fits the thread at any window size: the usage meter (also in the sidebar), then the context
 /// gauge, then the sub-agents button and the model's name, with tighter spacing.
-const HIDE_USAGE_BELOW: f64 = 880.0;
+// With explicit active/history counts the complete strip measures 956 px.
+// Drop the duplicated compact meter before that width; its comparison stays in the sidebar.
+const HIDE_USAGE_BELOW: f64 = 976.0;
 // The complete strip measures 741 px with a thread sidebar open. Hide the gauge before the
 // content pane reaches that size so its parent never has to expand beyond the window.
 const HIDE_GAUGE_BELOW: f64 = 760.0;
@@ -63,8 +66,10 @@ pub struct Header {
     agent: gtk4::Label,
     model: gtk4::Label,
     pub mode: gtk4::DropDown,
+    pending_mode: gtk4::Label,
     /// Set while the view changes the dropdown itself, so that is not taken as a user choice.
-    pub mode_guard: Cell<bool>,
+    pub mode_guard: Rc<Cell<bool>>,
+    breakpoints: [adw::Breakpoint; 3],
     pub reload: gtk4::Button,
     activity: gtk4::Box,
     /// Where [`Self::set_usage`] and [`Self::set_subagents`] put their widgets, so the
@@ -88,6 +93,14 @@ fn fit_height(bin: &adw::BreakpointBin, root: &gtk4::Box) {
     if needed > bin.height_request() {
         bin.set_height_request(needed);
     }
+}
+
+fn set_mode_names(mode: &gtk4::DropDown, guard: &Cell<bool>, names: &[&str]) {
+    let selected = mode.selected();
+    guard.set(true);
+    mode.set_model(Some(&gtk4::StringList::new(names)));
+    mode.set_selected(selected);
+    guard.set(false);
 }
 
 impl Header {
@@ -131,9 +144,18 @@ impl Header {
 
         let names: Vec<&str> = MODES.iter().map(|m| mode_label(*m)).collect();
         let mode = gtk4::DropDown::from_strings(&names);
+        let mode_guard = Rc::new(Cell::new(false));
         mode.add_css_class("mode-dropdown");
         mode.set_tooltip_text(Some("Interaction mode (/mode)"));
-        root.append(&mode);
+        let mode_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        mode_box.set_valign(gtk4::Align::Center);
+        mode_box.append(&mode);
+        let pending_mode = label("", &["dim-label"]);
+        pending_mode.set_wrap(true);
+        pending_mode.set_max_width_chars(18);
+        pending_mode.set_visible(false);
+        mode_box.append(&pending_mode);
+        root.append(&mode_box);
 
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -227,6 +249,7 @@ impl Header {
             gauge_slot.upcast_ref(),
             subagent_slot.upcast_ref(),
             model.upcast_ref(),
+            agent.upcast_ref(),
         ] {
             compact.add_setter(slot, "visible", Some(&hidden));
         }
@@ -234,17 +257,28 @@ impl Header {
         // A class, not a `css-classes` setter: that would replace GTK's own (`horizontal`).
         compact.connect_apply({
             let root = root.downgrade();
+            let mode = mode.downgrade();
+            let guard = mode_guard.clone();
             move |_| {
                 if let Some(root) = root.upgrade() {
                     root.add_css_class("compact");
+                }
+                if let Some(mode) = mode.upgrade() {
+                    set_mode_names(&mode, &guard, &["Ask", "Accept", "Plan"]);
                 }
             }
         });
         compact.connect_unapply({
             let root = root.downgrade();
+            let mode = mode.downgrade();
+            let guard = mode_guard.clone();
             move |_| {
                 if let Some(root) = root.upgrade() {
                     root.remove_css_class("compact");
+                }
+                if let Some(mode) = mode.upgrade() {
+                    let names: Vec<_> = MODES.iter().map(|m| mode_label(*m)).collect();
+                    set_mode_names(&mode, &guard, &names);
                 }
             }
         });
@@ -258,7 +292,9 @@ impl Header {
             agent,
             model,
             mode,
-            mode_guard: Cell::new(false),
+            pending_mode,
+            mode_guard,
+            breakpoints: [usage, gauge_off, compact],
             reload,
             activity,
             usage_slot,
@@ -298,6 +334,15 @@ impl Header {
             .set_from_gicon(&crate::icons::driver_icon(driver));
         self.agent.set_text(driver_name(driver));
         self.model.set_text(model.unwrap_or("default model"));
+        let name = format!(
+            "{} · {}",
+            driver_name(driver),
+            model.unwrap_or("default model")
+        );
+        self.chip
+            .update_property(&[gtk4::accessible::Property::Label(&name)]);
+        self.chip
+            .set_tooltip_text(Some(&format!("{name} · Switch model or agent (/model)")));
         self.fit_height();
     }
 
@@ -305,6 +350,41 @@ impl Header {
         self.mode_guard.set(true);
         self.mode.set_selected(mode_index(mode));
         self.mode_guard.set(false);
+        self.mode
+            .update_property(&[gtk4::accessible::Property::Label(mode_label(mode))]);
+    }
+
+    pub fn set_text_scale(&self, scale: f64) {
+        for (breakpoint, width) in
+            self.breakpoints
+                .iter()
+                .zip([HIDE_USAGE_BELOW, HIDE_GAUGE_BELOW, COMPACT_BELOW])
+        {
+            breakpoint.set_condition(Some(&adw::BreakpointCondition::new_length(
+                adw::BreakpointConditionLengthType::MaxWidth,
+                width * scale,
+                adw::LengthUnit::Sp,
+            )));
+        }
+        self.fit_height();
+    }
+
+    pub fn set_pending_mode(&self, pending: Option<Mode>) {
+        let hint = pending.map(|mode| format!("Next turn: {}", mode_label(mode)));
+        let effective = MODES
+            .get(self.mode.selected() as usize)
+            .copied()
+            .unwrap_or(Mode::Ask);
+        let effective_hint = format!("{} (/mode)", mode_label(effective));
+        self.pending_mode.set_text(hint.as_deref().unwrap_or(""));
+        self.pending_mode.set_visible(pending.is_some());
+        self.mode
+            .set_tooltip_text(hint.as_deref().or(Some(&effective_hint)));
+        self.mode
+            .update_property(&[gtk4::accessible::Property::Description(
+                hint.as_deref().unwrap_or("Effective interaction mode"),
+            )]);
+        self.fit_height();
     }
 
     /// The session control stops an active turn, or reloads an idle session so its next agent
@@ -334,8 +414,14 @@ impl Header {
         let busy = activity.busy();
         self.spinner.set_visible(busy);
         self.spinner.set_spinning(busy);
-        let waiting = matches!(activity, Activity::Waiting { .. });
-        let finished = matches!(activity, Activity::Finished);
+        let waiting = matches!(
+            activity,
+            Activity::Waiting { .. } | Activity::WaitingForWorkers { .. }
+        );
+        let finished = matches!(
+            activity,
+            Activity::Finished | Activity::Failed | Activity::Stopped
+        );
         for (class, on) in [
             ("activity-background", waiting),
             ("activity-finished", finished),

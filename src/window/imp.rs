@@ -1061,6 +1061,11 @@ impl AgentTerminalWindow {
         // An open Settings dialog's font-scale spin follows too; its other
         // rows show the old values until reopened.
         self.for_each_window(|window| {
+            for tab in window.tabs.borrow().iter() {
+                if let Some(view) = tab.chat.as_ref().and_then(|chat| chat.view.as_ref()) {
+                    view.set_text_scale(scale);
+                }
+            }
             if let Some(spin) = window.font_scale_spin.borrow().upgrade() {
                 spin.set_value(scale);
             }
@@ -1723,7 +1728,7 @@ impl AgentTerminalWindow {
             .build();
 
         let settings_btn = gtk4::Button::builder()
-            .icon_name("at-document-properties-symbolic")
+            .icon_name("at-applications-engineering-symbolic")
             .tooltip_text("Settings")
             .build();
         settings_btn.connect_clicked(glib::clone!(
@@ -2987,6 +2992,13 @@ impl AgentTerminalWindow {
         self.config.borrow_mut().font_scale = scale;
         self.for_each_window(|window| {
             window.for_each_terminal(|term| term.set_font_scale(scale));
+            for tab in window.tabs.borrow().iter() {
+                if let Some(chat) = &tab.chat {
+                    if let Some(view) = &chat.view {
+                        view.set_text_scale(scale);
+                    }
+                }
+            }
             // Setting an unchanged value emits nothing, so the spin's own
             // handler calling back in here ends the round trip.
             if let Some(spin) = window.font_scale_spin.borrow().upgrade() {
@@ -3329,8 +3341,8 @@ impl AgentTerminalWindow {
             .build();
 
         let font_scale_row = adw::ActionRow::builder()
-            .title("Font Scale")
-            .subtitle("Terminal text size relative to the font's own (Ctrl+= and Ctrl+- change it)")
+            .title("Text Scale")
+            .subtitle("Chat and terminal text size (Ctrl+= and Ctrl+- change it)")
             .build();
         font_scale_row.add_suffix(&font_scale_spin);
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
@@ -5804,6 +5816,9 @@ mod tests {
 
     fn init_gtk() {
         if !gtk4::is_initialized_main_thread() {
+            // These GTK checks run in one dedicated test on a private display.
+            // The test backend exposes the accessible properties and relations.
+            std::env::set_var("GTK_A11Y", "test");
             gtk4::init().expect("GTK init failed");
         }
     }
@@ -6007,6 +6022,7 @@ mod tests {
 
         // Here rather than in a test of its own: GTK belongs to the one
         // thread that initialised it, and tests run on several.
+        agents_prefs::tests::invalid_agent_drafts_are_not_saved(window.imp());
         diff_panel_shows_each_outcome();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
@@ -6081,6 +6097,44 @@ mod tests {
         let mut history = crate::chat::view::demo::DemoBackend::stress_history(40);
         history.extend(crate::chat::view::demo::DemoBackend::script_envelopes());
         view.replay(&history);
+        view.sink()(&agent_core::event::Envelope::new(
+            agent_core::event::Event::TurnStarted { model: None },
+        ));
+        view.sink()(&agent_core::event::Envelope::new(
+            agent_core::event::Event::WorkersUpdated {
+                workers: vec![
+                    agent_core::event::WorkerSnapshot {
+                        id: "layout-worker".into(),
+                        name: Some(
+                            "A worker reviewing a deliberately long application flow".into(),
+                        ),
+                        task: Some("Check layout at enlarged text sizes".into()),
+                        state: agent_core::event::WorkerState::Running,
+                        activity: None,
+                    },
+                    agent_core::event::WorkerSnapshot {
+                        id: "layout-unknown".into(),
+                        name: None,
+                        task: None,
+                        state: agent_core::event::WorkerState::Unknown,
+                        activity: None,
+                    },
+                ],
+                waiting_for: vec!["layout-worker".into()],
+            },
+        ));
+        let mode_picks = std::rc::Rc::new(std::cell::Cell::new(0));
+        view.sink()(&agent_core::event::Envelope::new(
+            agent_core::event::Event::ModeChanged {
+                mode: agent_core::adapter::Mode::AcceptEdits,
+            },
+        ));
+        let seen = mode_picks.clone();
+        view.connect_action(move |action| {
+            if matches!(action, crate::chat::view::ViewAction::ModeChosen { .. }) {
+                seen.set(seen.get() + 1);
+            }
+        });
         // Both agents found, with plan usage: the sidebar footer and the header at their
         // fullest. After the window's own scan, which would otherwise mark them missing again.
         let availability = crate::availability::AgentAvailability::shared();
@@ -6119,6 +6173,16 @@ mod tests {
         // choosing the layout, at the smallest height it may have. Whatever the layout, its
         // content must fit the window.
         let (_, height) = MIN_WINDOW;
+        // Native runners may cap windows to the monitor (Broadway defaults to 1024 px).
+        // Verify every reachable breakpoint without mistaking that cap for an app failure.
+        let display_width = window
+            .surface()
+            .and_then(|surface| {
+                gtk4::prelude::WidgetExt::display(&window).monitor_at_surface(&surface)
+            })
+            .map(|monitor| monitor.geometry().width())
+            .filter(|width| *width > 0)
+            .unwrap_or(window.width());
         let widths = [
             MIN_WINDOW.0,
             NARROW_SP as i32,
@@ -6132,43 +6196,55 @@ mod tests {
             if diff_shown {
                 imp.toggle_diff_panel();
             }
-            for width in widths {
-                window.set_default_size(width, height);
-                let sized = crate::testutil::pump_until(&ctx, 3, || {
-                    window.width() == width && window.height() == height
-                });
-                // Let the breakpoint the new size selects apply.
-                crate::testutil::pump_until(&ctx, 1, || false);
-                assert!(
-                    sized,
-                    "the window took {width}×{height} (it is {}×{})",
-                    window.width(),
-                    window.height()
-                );
-                let state = format!(
-                    "{width}×{height}, sidebar {}, diff panel {}",
-                    if split.is_collapsed() {
-                        "overlaid"
-                    } else {
-                        "beside"
-                    },
-                    if diff_shown { "shown" } else { "hidden" }
-                );
-                for overflow in crate::testutil::overflowing_bins(&root) {
-                    report.push_str(&format!("== {state}: {overflow}\n"));
-                    failures.push(format!("{state}: {overflow}"));
+            for scale in [2.0, 1.0] {
+                view.set_text_scale(scale);
+                let mut scaled_widths = widths.to_vec();
+                for threshold in [500.0, 760.0, 976.0] {
+                    let edge = (threshold * scale) as i32;
+                    scaled_widths.extend([edge - 1, edge + 1]);
                 }
-                for (what, orientation, limit, threshold) in [
-                    ("width", Horizontal, width, 120),
-                    ("height", Vertical, height, 40),
-                ] {
-                    let min = min_size(&root, orientation);
-                    report.push_str(&format!(
-                        "== {state}: minimum {what} {min} px (limit {limit})\n{}\n",
-                        min_size_report(&root, orientation, threshold)
-                    ));
-                    if min > limit {
-                        failures.push(format!("{state}: minimum {what} {min} px > {limit}"));
+                scaled_widths.sort_unstable();
+                scaled_widths.dedup();
+                scaled_widths.retain(|width| *width <= display_width);
+                for width in scaled_widths {
+                    window.set_default_size(width, height);
+                    let sized = crate::testutil::pump_until(&ctx, 3, || {
+                        window.width() == width && window.height() == height
+                    });
+                    // Let the breakpoint the new size selects apply.
+                    crate::testutil::pump_until(&ctx, 1, || false);
+                    assert!(
+                        sized,
+                        "the window took {width}×{height} (it is {}×{})",
+                        window.width(),
+                        window.height()
+                    );
+                    let state = format!(
+                        "{width}×{height}, text {scale}×, sidebar {}, diff panel {}",
+                        if split.is_collapsed() {
+                            "overlaid"
+                        } else {
+                            "beside"
+                        },
+                        if diff_shown { "shown" } else { "hidden" }
+                    );
+                    for overflow in crate::testutil::overflowing_bins(&root) {
+                        eprintln!("layout overflow at {state}: {overflow}");
+                        report.push_str(&format!("== {state}: {overflow}\n"));
+                        failures.push(format!("{state}: {overflow}"));
+                    }
+                    for (what, orientation, limit, threshold) in [
+                        ("width", Horizontal, width, 120),
+                        ("height", Vertical, height, 40),
+                    ] {
+                        let min = min_size(&root, orientation);
+                        report.push_str(&format!(
+                            "== {state}: minimum {what} {min} px (limit {limit})\n{}\n",
+                            min_size_report(&root, orientation, threshold)
+                        ));
+                        if min > limit {
+                            failures.push(format!("{state}: minimum {what} {min} px > {limit}"));
+                        }
                     }
                 }
             }
@@ -6180,6 +6256,11 @@ mod tests {
         }
         eprintln!("{report}");
         window.destroy();
+        assert_eq!(
+            mode_picks.get(),
+            0,
+            "layout changes must not change permission mode"
+        );
         assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
@@ -6224,6 +6305,7 @@ mod tests {
         let rows = imp.sidebar_rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.open && r.folder == dir_s));
+        threads::tests::sidebar_focus_survives_refresh(window);
 
         // Archive and delete go through the store; the sidebar follows the loaded list.
         let ids: Vec<String> = rows

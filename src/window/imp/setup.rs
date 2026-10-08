@@ -65,7 +65,7 @@ impl AgentTerminalWindow {
         let status = adw::StatusPage::builder()
             .title("Welcome to Agent Terminal")
             .description(
-                "Chat with Claude, agy and Codex in threads, with a terminal a keystroke away.\n\n\
+                "Chat with Claude, Antigravity and Codex in threads, with a terminal a keystroke away.\n\n\
                  Setup takes a minute: choose the agents you use and check you are signed in. \
                  Everything here can be changed later in Settings.",
             )
@@ -114,7 +114,7 @@ impl AgentTerminalWindow {
         let threads = adw::PreferencesGroup::builder()
             .title("New Threads")
             .description(
-                "Commands, models, modes and agy's approval hook are in Settings → Agents.",
+                "Commands, models, modes and Antigravity's approval hook are in Settings → Agents.",
             )
             .build();
         threads.add(&self.default_agent_row());

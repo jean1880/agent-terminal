@@ -174,6 +174,13 @@ impl Composer {
         view.set_right_margin(14);
         view.add_css_class("composer-view");
         view.set_hexpand(true);
+        view.update_property(&[
+            gtk4::accessible::Property::Label("Prompt"),
+            gtk4::accessible::Property::MultiLine(true),
+            gtk4::accessible::Property::Autocomplete(gtk4::AccessibleAutocomplete::List),
+            gtk4::accessible::Property::HasPopup(true),
+        ]);
+        view.update_state(&[gtk4::accessible::State::Expanded(Some(false))]);
 
         let scroller = gtk4::ScrolledWindow::new();
         scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
@@ -209,12 +216,16 @@ impl Composer {
         list.set_selection_mode(gtk4::SelectionMode::Single);
         list.add_css_class("typeahead-list");
         list.set_can_focus(false);
+        list.update_property(&[gtk4::accessible::Property::Label("Prompt suggestions")]);
+        view.update_relation(&[gtk4::accessible::Relation::Controls(&[list.upcast_ref()])]);
         let pop_scroller = gtk4::ScrolledWindow::new();
-        pop_scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        pop_scroller.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
         pop_scroller.set_propagate_natural_height(true);
         pop_scroller.set_max_content_height(300);
-        // Width comes from the list: `min_content_width` is ignored under PolicyType::Never.
-        list.set_size_request(480, -1);
+        pop_scroller.set_propagate_natural_width(true);
+        pop_scroller.set_min_content_width(160);
+        pop_scroller.set_max_content_width(480);
+        list.set_size_request(320, -1);
         pop_scroller.set_child(Some(&list));
         let popover = gtk4::Popover::new();
         popover.set_autohide(false);
@@ -319,6 +330,33 @@ impl Composer {
             }
         }
         self.placeholder.set_visible(self.buffer.char_count() == 0);
+        self.refresh_accessibility();
+    }
+
+    /// Keep the editable field's name stable, and expose its changing hint and completion
+    /// without moving keyboard focus out of the prompt.
+    fn refresh_accessibility(&self) {
+        let mut description = format!(
+            "{} Enter sends; Shift+Enter adds a line.",
+            self.placeholder.text()
+        );
+        let popup = self.popup.borrow();
+        if popup.is_open() {
+            if let Some(entry) = self.entries.borrow().get(popup.selected()) {
+                description.push_str(&format!(
+                    " Suggestion {} of {}: {}. Up and Down choose; Tab or Enter accepts; Escape dismisses.",
+                    popup.selected() + 1,
+                    self.entries.borrow().len(),
+                    entry_description(entry)
+                ));
+            }
+        }
+        self.view.update_property(&[
+            gtk4::accessible::Property::Description(&description),
+            gtk4::accessible::Property::Placeholder(&self.placeholder.text()),
+        ]);
+        self.view
+            .update_state(&[gtk4::accessible::State::Expanded(Some(popup.is_open()))]);
     }
 
     /// What the placeholder currently says.
@@ -369,7 +407,7 @@ impl Composer {
             let Some(host) = c.host() else {
                 return;
             };
-            if host.running() && c.text().trim().is_empty() {
+            if host.running() {
                 host.interrupt();
             } else {
                 c.submit();
@@ -431,8 +469,7 @@ impl Composer {
                     return glib::Propagation::Stop;
                 }
                 KeyOutcome::Dismiss => {
-                    self.popover.popdown();
-                    self.files.borrow_mut().cancel();
+                    self.close_popup();
                     return glib::Propagation::Stop;
                 }
             }
@@ -586,11 +623,20 @@ impl Composer {
     }
 
     fn show_entries(&self, entries: Vec<Entry>, token: &str) {
+        self.view
+            .reset_relation(gtk4::AccessibleRelation::ActiveDescendant);
         while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
         }
-        for e in &entries {
-            self.list.append(&entry_row(e));
+        for (i, e) in entries.iter().enumerate() {
+            let row = entry_row(e);
+            row.update_relation(&[
+                gtk4::accessible::Relation::PosInSet(i32::try_from(i + 1).unwrap_or(i32::MAX)),
+                gtk4::accessible::Relation::SetSize(
+                    i32::try_from(entries.len()).unwrap_or(i32::MAX),
+                ),
+            ]);
+            self.list.append(&row);
         }
         let open = self.popup.borrow_mut().set_items(entries.len(), token);
         *self.entries.borrow_mut() = entries;
@@ -599,11 +645,23 @@ impl Composer {
             self.place_popover();
             self.popover.popup();
         } else {
-            self.popover.popdown();
+            self.close_popup();
         }
     }
 
     fn place_popover(&self) {
+        // A fixed 480 px popup overflowed small windows. Its labels can shrink (their complete
+        // text is still exposed accessibly); cap the list by the actual window allocation.
+        let available = self
+            .view
+            .root()
+            .and_then(|root| root.dynamic_cast::<gtk4::Widget>().ok())
+            .map(|root| root.width() - 32)
+            .filter(|width| *width > 0)
+            .unwrap_or(320);
+        let width = available.clamp(160, 480);
+        self.list.set_size_request(width, -1);
+        self.pop_scroller.set_max_content_width(width);
         let range_start = self.trigger.borrow().as_ref().map_or(0, |t| t.range.start);
         let text = self.text();
         let char_offset = text.get(..range_start).map_or(0, |s| s.chars().count());
@@ -622,6 +680,11 @@ impl Composer {
         let index = i32::try_from(i).unwrap_or(0);
         if let Some(row) = self.list.row_at_index(index) {
             self.list.select_row(Some(&row));
+            self.view
+                .update_relation(&[gtk4::accessible::Relation::ActiveDescendant(
+                    row.upcast_ref(),
+                )]);
+            self.refresh_accessibility();
             // Keep the selected row in view without moving focus off the text view.
             if let Some(bounds) = row.compute_bounds(&self.list) {
                 let adj = self.pop_scroller.vadjustment();
@@ -638,6 +701,9 @@ impl Composer {
     fn close_popup(&self) {
         self.popup.borrow_mut().close();
         self.popover.popdown();
+        self.view
+            .reset_relation(gtk4::AccessibleRelation::ActiveDescendant);
+        self.refresh_accessibility();
         self.files.borrow_mut().cancel();
         self.cancel_file_timer();
     }
@@ -701,6 +767,7 @@ impl Composer {
 fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::new();
     row.set_can_focus(false);
+    row.update_property(&[gtk4::accessible::Property::Label(&entry_description(entry))]);
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
     b.add_css_class("typeahead-row");
     match entry {
@@ -713,12 +780,16 @@ fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
             let badge = label(badge, &["kind-badge", &format!("badge-{badge}")]);
             badge.set_valign(gtk4::Align::Center);
             b.append(&badge);
-            b.append(&label(
-                &format!("{sigil}{}", item.name),
-                &["typeahead-name"],
-            ));
+            let name = label(&format!("{sigil}{}", item.name), &["typeahead-name"]);
+            name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            name.set_max_width_chars(18);
+            b.append(&name);
             if let Some(h) = &item.hint {
-                b.append(&label(h, &["typeahead-hint"]));
+                let hint = label(h, &["typeahead-hint"]);
+                hint.set_wrap(true);
+                hint.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                hint.set_max_width_chars(18);
+                b.append(&hint);
             }
             let d = label(&item.description, &["typeahead-desc"]);
             d.set_hexpand(true);
@@ -740,6 +811,16 @@ fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
     row
 }
 
+fn entry_description(entry: &Entry) -> String {
+    match entry {
+        Entry::Command(item) => {
+            let hint = item.hint.as_deref().unwrap_or("");
+            format!("{} {hint}: {}", item.insert_text, item.description)
+        }
+        Entry::File(path) => format!("File {path}"),
+    }
+}
+
 /// Candidates for a `/` or `$` trigger (wraps `completion_items` so the host stays small).
 pub fn items_for(
     trigger: &Trigger,
@@ -747,4 +828,99 @@ pub fn items_for(
     caps: &agent_core::caps::Capabilities,
 ) -> Vec<CompletionItem> {
     completion_items(builtins(), commands, caps, trigger)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Host {
+        running: Cell<bool>,
+        interrupts: Cell<usize>,
+        submitted: RefCell<Vec<String>>,
+    }
+
+    impl ComposerHost for Host {
+        fn submit(&self, text: &str) {
+            self.submitted.borrow_mut().push(text.to_owned());
+        }
+        fn interrupt(&self) {
+            self.interrupts.set(self.interrupts.get() + 1);
+        }
+        fn running(&self) -> bool {
+            self.running.get()
+        }
+        fn run_builtin(&self, _name: &str) {}
+        fn command_items(&self, _trigger: &Trigger) -> Vec<CompletionItem> {
+            Vec::new()
+        }
+        fn request_files(&self, _query: &str) -> Option<String> {
+            None
+        }
+        fn placeholder(&self) -> String {
+            "Message Codex".to_owned()
+        }
+    }
+
+    /// Runs on the window smoke test's GTK thread. Exercise the actual button callback: a
+    /// non-empty draft previously made the visually labelled Stop button submit another turn.
+    pub(crate) fn stop_preserves_a_draft_and_completions_stay_in_the_field() {
+        let host = Rc::new(Host::default());
+        host.running.set(true);
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        composer.set_running(true);
+        composer.set_text("Keep this unfinished draft 📝");
+        composer.send.emit_clicked();
+        assert_eq!(host.interrupts.get(), 1, "Stop interrupts the running turn");
+        assert!(
+            host.submitted.borrow().is_empty(),
+            "Stop never submits a draft"
+        );
+        assert_eq!(composer.text(), "Keep this unfinished draft 📝");
+
+        let window = gtk4::Window::new();
+        window.set_child(Some(composer.widget()));
+        window.present();
+        composer.grab_focus();
+        composer.show_entries(
+            vec![
+                Entry::File("src/one.rs".into()),
+                Entry::File("src/two.rs".into()),
+            ],
+            "@",
+        );
+        assert!(gtk4::test_accessible_has_property(
+            &composer.view,
+            gtk4::AccessibleProperty::Label
+        ));
+        assert!(gtk4::test_accessible_has_relation(
+            &composer.view,
+            gtk4::AccessibleRelation::Controls
+        ));
+        assert!(gtk4::test_accessible_has_relation(
+            &composer.view,
+            gtk4::AccessibleRelation::ActiveDescendant
+        ));
+        assert_eq!(
+            composer.on_key(gdk::Key::Down, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(composer.list.selected_row().map(|row| row.index()), Some(1));
+        assert_eq!(
+            gtk4::prelude::GtkWindowExt::focus(&window).as_ref(),
+            Some(composer.view.upcast_ref::<gtk4::Widget>())
+        );
+        composer.close_popup();
+        assert!(!gtk4::test_accessible_has_relation(
+            &composer.view,
+            gtk4::AccessibleRelation::ActiveDescendant
+        ));
+        composer.dispose();
+        window.set_child(None::<&gtk4::Widget>);
+        drop(composer);
+        window.destroy();
+    }
 }

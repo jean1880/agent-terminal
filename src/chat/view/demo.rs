@@ -32,7 +32,9 @@ use serde_json::{json, Value};
 
 use super::ChatView;
 use crate::account_status::AccountStatus;
-use crate::chat::{ChatBackend, EnvelopeSink, ModelSource, SessionStatus};
+use crate::chat::{
+    ChatBackend, DiffAsk, DiffReply, DiffSource, EnvelopeSink, ModelSource, SessionStatus,
+};
 use agent_core::catalog::{parse_agy_models, CatalogModel};
 
 /// One script step.
@@ -83,6 +85,45 @@ pub fn demo_backend() -> Rc<DemoBackend> {
     });
     *b.me.borrow_mut() = Rc::downgrade(&b);
     b
+}
+
+struct DemoDiffs;
+
+impl DiffSource for DemoDiffs {
+    fn load(&self, ask: DiffAsk, done: Box<dyn FnOnce(DiffReply)>) {
+        // The fixture's proposed edit is sufficient; never read or alter a live checkout.
+        done(agent_kit::filediff::shown_for_item(None, &ask.input));
+    }
+
+    fn open_external(&self, _ask: DiffAsk) {
+        tracing::info!("chat demo: external diff requested; no process launched");
+    }
+}
+
+/// Supplies in-memory diffs and optional deterministic review disclosures. A scene is part
+/// of the fixture, not interaction with a real session: `diff`, `workers`, or `usage`.
+pub fn configure_demo_view(view: &ChatView) {
+    view.set_diff_source(Rc::new(DemoDiffs));
+    let Ok(scene) = std::env::var("AGENT_TERMINAL_DEMO_SCENE") else {
+        return;
+    };
+    let weak = view.downgrade();
+    glib::timeout_add_local_once(Duration::from_secs(3), move || {
+        let Some(view) = weak.upgrade() else { return };
+        let Some(inner) = view.inner() else { return };
+        match scene.as_str() {
+            "usage" => {
+                if let Some(usage) = inner.usage.borrow().as_ref() {
+                    usage.widget().popup();
+                }
+            }
+            "workers" => inner.subagent_shelf.set_expanded(true),
+            "diff" => {
+                inner.transcript.expand_demo_changes("demo-edit");
+            }
+            _ => {}
+        }
+    });
 }
 
 /// A fixed model list for `--chat-demo`: both agents, with an agy route to Claude models.
@@ -313,7 +354,16 @@ impl DemoBackend {
 
     /// Plays the full demo script.
     pub fn play_script(&self) {
-        self.push(script());
+        let scene = std::env::var("AGENT_TERMINAL_DEMO_SCENE").unwrap_or_default();
+        self.push(if scene == "diff" {
+            diff_review_script()
+        } else if matches!(scene.as_str(), "workers" | "usage")
+            || std::env::var("AGENT_TERMINAL_DEMO_CODEX_WORKERS").as_deref() == Ok("1")
+        {
+            codex_worker_script()
+        } else {
+            script()
+        });
     }
 
     /// Every envelope the script emits, in order and at once (for replay): a thread with a
@@ -847,7 +897,7 @@ fn script() -> Vec<Step> {
         "t-edit",
         ItemKind::FileChange,
         "Edit",
-        json!({"file_path": "src/config.rs"}),
+        json!({"file_path": "src/config.rs", "old_string": "fs::write(&path, toml)?;", "new_string": "write_atomic(&path, toml.as_bytes())?;"}),
         None,
         ItemStatus::Completed,
         Some("@@ -409,7 +409,7 @@\n-    fs::write(&path, toml)?;\n+    write_atomic(&path, toml.as_bytes())?;"),
@@ -1064,6 +1114,68 @@ fn script() -> Vec<Step> {
     s
 }
 
+/// Reproducible worker-wait scene with no processes, accounts or filesystem changes.
+fn diff_review_script() -> Vec<Step> {
+    vec![
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        Step::Emit(started("demo-diff-intro", ItemKind::AssistantMessage, "", None, None)),
+        Step::Emit(snapshot("demo-diff-intro", StreamKind::Assistant, "The two edits below use one **Show changes** disclosure. Raw tool details remain separate.")),
+        Step::Emit(completed("demo-diff-intro", ItemStatus::Completed, None, None)),
+        Step::Emit(started("demo-edit", ItemKind::FileChange, "src/config.rs (+1 more)", Some(json!([
+            {"path":"src/config.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-fs::write(&path, toml)?;\n+write_atomic(&path, toml.as_bytes())?;\n"},
+            {"path":"src/config_test.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-assert!(path.exists());\n+assert_eq!(read_config(&path)?, expected);\n"}
+        ])), None)),
+        Step::Emit(completed("demo-edit", ItemStatus::Completed, None, None)),
+        Step::Emit(Envelope::new(Event::TurnCompleted { state: TurnState::Completed, error: None, usage: None, cost_usd: None })),
+    ]
+}
+
+fn codex_worker_script() -> Vec<Step> {
+    use agent_core::event::{WorkerSnapshot, WorkerState};
+    let workers = vec![
+        WorkerSnapshot {
+            id: "demo-designer".into(),
+            name: Some("Mira".into()),
+            task: Some("Review composer controls and spacing".into()),
+            state: WorkerState::Running,
+            activity: Some("Inspecting the file-change card".into()),
+        },
+        WorkerSnapshot {
+            id: "demo-accessibility".into(),
+            name: Some("Ellis".into()),
+            task: Some("Check keyboard focus and readable text".into()),
+            state: WorkerState::Running,
+            activity: None,
+        },
+        WorkerSnapshot {
+            id: "demo-engineer".into(),
+            name: Some("Rowan".into()),
+            task: Some("Trace Codex worker events".into()),
+            state: WorkerState::Completed,
+            activity: Some("Worker IDs and lifecycle verified".into()),
+        },
+        WorkerSnapshot {
+            id: "demo-closed".into(),
+            name: Some("Previous reviewer".into()),
+            task: Some("Review the earlier implementation".into()),
+            state: WorkerState::Closed,
+            activity: None,
+        },
+    ];
+    vec![
+        Step::SetDriver(Driver::Codex, Some("demo-model".into())),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::SessionStarted { native_id: "demo-codex".into(), model: Some("demo-model".into()), cwd: Some("~/projects/demo".into()) })),
+        Step::Emit(Envelope::new(Event::TurnStarted { model: Some("demo-model".into()) })),
+        Step::Emit(started("worker-demo-prompt", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot("worker-demo-prompt", StreamKind::Assistant, "Review the application with the designer leading.")),
+        Step::Emit(started("worker-demo-response", ItemKind::AssistantMessage, "", None, None)),
+        Step::Emit(snapshot("worker-demo-response", StreamKind::Assistant, "I’m waiting for **Mira** and **Ellis** to finish their reviews. **Rowan** has completed the protocol check; the earlier reviewer is closed.")),
+        Step::Emit(completed("worker-demo-response", ItemStatus::Completed, None, None)),
+        Step::Emit(Envelope::new(Event::WorkersUpdated { workers, waiting_for: vec!["demo-designer".into(), "demo-accessibility".into()] })),
+    ]
+}
+
 /// One stress item (several envelopes): user, assistant, tool and reasoning in rotation.
 fn stress_item(i: usize) -> Vec<Envelope> {
     let id = format!("s{i}");
@@ -1119,6 +1231,7 @@ pub fn run() -> glib::ExitCode {
         backend.connect(view.sink());
         view.set_model_source(Rc::new(DemoModels));
         view.set_account_status(demo_account_status());
+        configure_demo_view(&view);
         view.connect_action(|action| tracing::info!(?action, "chat demo: view action"));
 
         let toolbar = adw::ToolbarView::new();
@@ -1256,6 +1369,34 @@ pub fn play_demo(backend: Rc<DemoBackend>, sink: EnvelopeSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_diff_scene_contains_real_in_memory_changes() {
+        let mut found = false;
+        for step in diff_review_script() {
+            if let Step::Emit(Envelope {
+                event:
+                    Event::ItemStarted {
+                        kind: ItemKind::FileChange,
+                        input: Some(input),
+                        ..
+                    },
+                ..
+            }) = step
+            {
+                let shown =
+                    agent_kit::filediff::shown_for_item(None, &input).expect("fixture diff");
+                assert_eq!(shown.files, ["src/config.rs", "src/config_test.rs"]);
+                assert!(shown.text.contains("-fs::write") && shown.text.contains("+write_atomic"));
+                assert_eq!(shown.origin, agent_kit::filediff::Origin::AgentEdit);
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "review scene must exercise the actual changes loader"
+        );
+    }
 
     /// The demo store lists every demo thread, newest first, with the scripted one on top (it
     /// plays live, so it stores nothing); folders sit under the given home.

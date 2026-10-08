@@ -70,12 +70,20 @@ impl ThinkingStrip {
 /// What the strip says for `activity`; `None` hides it.
 fn status_text(activity: &Activity, agent: &str) -> Option<String> {
     match activity {
-        Activity::Working { .. } => Some(format!("{agent} is thinking…")),
+        Activity::Working { background: 0 } => Some(format!("{agent} is working…")),
+        Activity::Working { background } => {
+            Some(format!("{agent} is working · {background} tasks active"))
+        }
+        Activity::Thinking => Some(format!("{agent} is thinking…")),
+        Activity::Tool { .. }
+        | Activity::WaitingForWorkers { .. }
+        | Activity::NeedsApproval
+        | Activity::NeedsAnswer => activity.text(),
         Activity::Waiting { tasks } => Some(match tasks.len() {
             1 => "Waiting on 1 background task…".to_owned(),
             n => format!("Waiting on {n} background tasks…"),
         }),
-        Activity::Idle | Activity::Finished => None,
+        Activity::Idle | Activity::Finished | Activity::Failed | Activity::Stopped => None,
     }
 }
 
@@ -87,7 +95,7 @@ mod tests {
     fn says_who_is_working_and_hides_when_settled() {
         assert_eq!(
             status_text(&Activity::Working { background: 2 }, "Claude").as_deref(),
-            Some("Claude is thinking…")
+            Some("Claude is working · 2 tasks active")
         );
         assert_eq!(
             status_text(

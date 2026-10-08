@@ -17,8 +17,8 @@ use super::payload;
 /// The card's one-line summary.
 pub fn title_text(running: usize) -> String {
     match running {
-        1 => "1 sub-agent running".to_owned(),
-        n => format!("{n} sub-agents running"),
+        1 => "1 worker active".to_owned(),
+        n => format!("{n} workers active"),
     }
 }
 
@@ -66,6 +66,8 @@ impl Row {
         top.append(&spinner);
         let name = label("", &["subagent-name"]);
         name.set_xalign(0.0);
+        name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        name.set_max_width_chars(20);
         top.append(&name);
         let task = label("", &["subagent-task", "dim-label"]);
         task.set_xalign(0.0);
@@ -92,18 +94,41 @@ impl Row {
     }
 
     fn set(&self, agent: &SubagentSummary, now: Option<&str>) {
-        if self.name.text() != agent.name {
-            // What a screen reader says for the row (the tooltip is not announced).
-            self.row
-                .update_property(&[gtk4::accessible::Property::Description(&format!(
-                    "Open the {} sub-agent",
-                    agent.name
-                ))]);
-        }
+        let activity = agent.activity.as_deref().or(now);
+        let now = activity
+            .map(|s| format!("Last reported activity: {s}"))
+            .unwrap_or_else(|| "Activity unavailable".to_owned());
+        self.row.set_tooltip_text(Some(&format!(
+            "{}\n{}\n{now}\nOpen this worker",
+            agent.name,
+            if agent.task.is_empty() {
+                "No task reported"
+            } else {
+                &agent.task
+            }
+        )));
+        self.row.update_property(&[
+            gtk4::accessible::Property::Label(&agent.name),
+            gtk4::accessible::Property::Description(&format!(
+                "{}; {}; {now}",
+                agent.state_label(),
+                if agent.task.is_empty() {
+                    "No task reported"
+                } else {
+                    &agent.task
+                }
+            )),
+        ]);
         set_if_changed(&self.name, &agent.name);
-        set_if_changed(&self.task, &agent.task);
-        self.task.set_visible(!agent.task.is_empty());
-        set_if_changed(&self.now, now.unwrap_or("Starting…"));
+        set_if_changed(
+            &self.task,
+            if agent.task.is_empty() {
+                "No task reported"
+            } else {
+                &agent.task
+            },
+        );
+        set_if_changed(&self.now, &now);
     }
 }
 
@@ -178,10 +203,7 @@ impl SubagentShelf {
     /// Follows the thread's sub-agents: shown while any runs, one row per running one with its
     /// current step. Rows are rebuilt only when the set of running sub-agents changes.
     pub fn set(&self, model: &Transcript, agents: &[SubagentSummary]) {
-        let running: Vec<&SubagentSummary> = agents
-            .iter()
-            .filter(|a| a.status == ToolStatus::Running)
-            .collect();
+        let running: Vec<&SubagentSummary> = agents.iter().filter(|a| a.active()).collect();
         self.revealer.set_reveal_child(!running.is_empty());
         if running.is_empty() {
             return;
@@ -208,6 +230,13 @@ impl SubagentShelf {
         }
     }
 
+    /// Opens the worker activity disclosure, including deterministic demo scenes.
+    pub(crate) fn set_expanded(&self, expanded: bool) {
+        if self.fold.body.reveals_child() != expanded {
+            self.fold.toggle.emit_clicked();
+        }
+    }
+
     /// Whether the card shows, whether it is open, and each row's current step (tests).
     #[cfg(test)]
     pub fn state(&self) -> (bool, bool, Vec<String>) {
@@ -231,8 +260,8 @@ pub(crate) mod tests {
 
     #[test]
     fn titles_count_the_running_ones() {
-        assert_eq!(title_text(1), "1 sub-agent running");
-        assert_eq!(title_text(3), "3 sub-agents running");
+        assert_eq!(title_text(1), "1 worker active");
+        assert_eq!(title_text(3), "3 workers active");
     }
 
     fn start(
@@ -358,7 +387,11 @@ pub(crate) mod tests {
         shelf.set(&t, &t.subagents());
         assert_eq!(
             shelf.state(),
-            (true, false, vec!["$ rg write_atomic".to_owned()]),
+            (
+                true,
+                false,
+                vec!["Last reported activity: $ rg write_atomic".to_owned()]
+            ),
             "shown, collapsed by default, with the running command"
         );
         shelf.fold.toggle.emit_clicked();
@@ -376,10 +409,13 @@ pub(crate) mod tests {
             subagent("s2", "general-purpose"),
         ]);
         shelf.set(&two, &two.subagents());
-        assert_eq!(shelf.title.text(), "2 sub-agents running");
+        assert_eq!(shelf.title.text(), "2 workers active");
         assert_eq!(
             shelf.state().2,
-            ["$ rg write_atomic", "Starting…"],
+            [
+                "Last reported activity: $ rg write_atomic",
+                "Activity unavailable"
+            ],
             "a row each, in order"
         );
 

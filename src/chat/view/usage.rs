@@ -3,7 +3,8 @@
 //! from 90 %); a popover lists the account and every window.
 //!
 //! It reads [`AccountStatus`] and repaints whenever that changes. One widget serves both the
-//! chat header (filtered to the thread's current agent) and an unfiltered sidebar footer.
+//! chat header (compact meter filtered to the current agent) and the sidebar footer. Both
+//! detail popovers show every available agent from the same shared snapshots.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -207,25 +208,34 @@ impl UsageIndicator {
         Driver::ALL
             .into_iter()
             .filter(|d| availability.is_ready(*d))
-            .filter(|d| self.filter.get().is_none_or(|f| f == *d))
             .map(|d| (d, self.status.snapshot(d)))
-            // Signed out shows too: hiding the agent was how a broken login went unnoticed.
-            .filter(|(_, s)| s.account.is_some() || !s.windows.is_empty() || s.signed_out)
             .collect()
     }
 
     fn repaint(&self) {
+        self.render_snapshots(&self.shown());
+    }
+
+    fn render_snapshots(&self, shown: &[(Driver, Snapshot)]) {
         while let Some(child) = self.compact.first_child() {
             self.compact.remove(&child);
         }
         while let Some(child) = self.details.first_child() {
             self.details.remove(&child);
         }
-        let shown = self.shown();
         self.root.set_visible(!shown.is_empty());
+        let label = match self.filter.get() {
+            Some(driver) => format!("Usage for {}; show all agents", driver_name(driver)),
+            None => "Agent usage; show all agents".to_owned(),
+        };
+        self.root
+            .update_property(&[gtk4::accessible::Property::Label(&label)]);
+        self.root.set_tooltip_text(Some(&label));
         let now = now_epoch();
-        for (driver, snap) in &shown {
-            self.compact.append(&compact_form(*driver, snap));
+        for (driver, snap) in shown {
+            if self.filter.get().is_none_or(|f| f == *driver) {
+                self.compact.append(&compact_form(*driver, snap));
+            }
             self.details.append(&detail_form(*driver, snap, now));
         }
         for f in self.on_repaint.borrow().iter() {
@@ -256,7 +266,7 @@ fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
     }
     let (short, weekly) = split_windows(&snap.windows);
     if short.is_none() && weekly.is_none() {
-        b.append(&label("-", &["usage-text"]));
+        b.append(&label("Unknown", &["usage-text"]));
         return b;
     }
     let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
@@ -340,8 +350,70 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn compact_scope_does_not_filter_provider_comparison() {
+        let usage = UsageIndicator::new(Rc::new(AccountStatus::new()), Some(Driver::Codex));
+        let mut zero = Snapshot::default();
+        zero.windows.push(named("5-hour", 0.0));
+        let snapshots = [
+            (Driver::Claude, zero),
+            (Driver::Agy, Snapshot::default()),
+            (Driver::Codex, Snapshot::default()),
+        ];
+        usage.render_snapshots(&snapshots);
+        fn children(widget: &impl IsA<gtk4::Widget>) -> usize {
+            let mut n = 0;
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                n += 1;
+                child = w.next_sibling();
+            }
+            n
+        }
+        fn labels(widget: &gtk4::Widget) -> String {
+            let mut text = widget
+                .downcast_ref::<gtk4::Label>()
+                .map(|l| l.text().to_string())
+                .unwrap_or_default();
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                text.push_str(&labels(&w));
+                text.push('\n');
+                child = w.next_sibling();
+            }
+            text
+        }
+        assert_eq!(
+            children(&usage.compact),
+            1,
+            "header remains current-provider only"
+        );
+        assert_eq!(
+            children(&usage.details),
+            3,
+            "comparison includes all providers"
+        );
+        assert!(labels(usage.compact.upcast_ref()).contains("Unknown"));
+        let details = labels(usage.details.upcast_ref());
+        assert!(
+            details.contains("0 % used"),
+            "reported zero remains a real value"
+        );
+        assert!(
+            details.contains("No usage data yet"),
+            "unknown is distinct from zero"
+        );
+        usage.filter.set(Some(Driver::Claude));
+        usage.render_snapshots(&snapshots);
+        assert_eq!(
+            children(&usage.details),
+            3,
+            "switching retains the comparison scope"
+        );
+        assert!(labels(usage.compact.upcast_ref()).contains("0 %"));
+    }
 
     fn win(group: Option<&str>, resets: Option<&str>) -> QuotaWindow {
         QuotaWindow {

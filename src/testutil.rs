@@ -34,7 +34,8 @@ pub fn min_size(widget: &gtk4::Widget, orientation: gtk4::Orientation) -> i32 {
 
 /// Every mapped `AdwBreakpointBin` under `root` whose child needs more room than the bin was
 /// given. A bin with breakpoints reports only its size request as its minimum, so its overflow
-/// never shows in `root`'s: each must be checked at its own allocation.
+/// never shows in `root`'s: each must be checked at its own allocation. Also check clamp widths,
+/// since scroll containers can conceal an unbounded row's horizontal minimum.
 pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
     use gtk4::prelude::*;
     let mut out = Vec::new();
@@ -42,6 +43,25 @@ pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
     while let Some(widget) = stack.pop() {
         if !widget.is_mapped() {
             continue;
+        }
+        if widget.is::<gtk4::Button>() && widget.has_css_class("pill") {
+            let mut parent = widget.parent();
+            let mut interruption = false;
+            while let Some(ancestor) = parent {
+                interruption |= ancestor.has_css_class("interruption-shelf");
+                parent = ancestor.parent();
+            }
+            if interruption {
+                if let Some(bounds) = widget.compute_bounds(&widget) {
+                    if bounds.width() < 44.0 || bounds.height() < 44.0 {
+                        out.push(format!(
+                            "permission target is {}×{}; needs 44×44",
+                            bounds.width(),
+                            bounds.height()
+                        ));
+                    }
+                }
+            }
         }
         if let Some(bin) = widget.downcast_ref::<adw::BreakpointBin>() {
             if let Some(child) = adw::prelude::BreakpointBinExt::child(bin) {
@@ -56,6 +76,18 @@ pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
                         child.css_classes().join("."),
                         w,
                         h
+                    ));
+                }
+            }
+        }
+        if let Some(clamp) = widget.downcast_ref::<adw::Clamp>() {
+            if let Some(child) = clamp.child() {
+                let needed = min_size(&child, gtk4::Orientation::Horizontal);
+                if needed > clamp.width() {
+                    out.push(format!(
+                        "clamp {} px holds a child needing {needed} px\n{}",
+                        clamp.width(),
+                        min_size_report(&child, gtk4::Orientation::Horizontal, 100)
                     ));
                 }
             }

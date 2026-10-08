@@ -81,7 +81,7 @@
 //!   `applyNetworkPolicyAmendment`) are not offered; the four plain decisions are.
 //! - stderr (Codex's tracing output) is ignored.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
 use serde_json::{json, Map, Value};
@@ -92,7 +92,7 @@ use crate::adapter::{
 use crate::caps::Capabilities;
 use crate::event::{
     Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, QuestionOption,
-    ResponseCapability, StepStatus, StreamKind, TurnState, Usage,
+    ResponseCapability, StepStatus, StreamKind, TurnState, Usage, WorkerSnapshot, WorkerState,
 };
 
 /// Page size asked of `model/list`.
@@ -101,8 +101,6 @@ const MODEL_PAGE: u32 = 200;
 /// Notifications that carry nothing the UI renders (bookkeeping, or covered by another frame):
 /// dropped without an [`Event::Unknown`], which would only add noise to every turn.
 const QUIET: &[&str] = &[
-    "thread/started",
-    "thread/status/changed",
     "thread/name/updated",
     "thread/settings/updated",
     "thread/compacted",
@@ -173,6 +171,8 @@ pub struct CodexAdapter {
     /// (per turn: no respawn).
     effort: Option<String>,
     mode: Mode,
+    /// Policy sent for the active or pending turn. Selecting a new default cannot mutate it.
+    effective_mode: Option<Mode>,
     cwd: Option<String>,
     /// Prompts encoded before the thread id arrived.
     queued: VecDeque<String>,
@@ -185,6 +185,10 @@ pub struct CodexAdapter {
     texts: HashMap<String, String>,
     /// Accumulated reasoning summary per open reasoning item.
     reasoning: HashMap<String, String>,
+    /// Worker identity is a thread id, independent of collaboration operation/item ids.
+    workers: BTreeMap<String, WorkerSnapshot>,
+    /// Open explicit wait operations, keyed by item id (several can target one worker).
+    worker_waits: BTreeMap<String, Vec<String>>,
     /// Latest cumulative thread usage, and the cumulative usage when the last turn ended.
     usage_total: Option<Usage>,
     usage_base: Usage,
@@ -215,6 +219,7 @@ impl CodexAdapter {
             model: None,
             effort: None,
             mode: Mode::default(),
+            effective_mode: None,
             cwd: None,
             queued: VecDeque::new(),
             outbox: Outbox::default(),
@@ -223,6 +228,8 @@ impl CodexAdapter {
             open_items: Vec::new(),
             texts: HashMap::new(),
             reasoning: HashMap::new(),
+            workers: BTreeMap::new(),
+            worker_waits: BTreeMap::new(),
             usage_total: None,
             usage_base: Usage::default(),
             context: None,
@@ -243,6 +250,197 @@ impl CodexAdapter {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn worker(&mut self, id: &str) -> &mut WorkerSnapshot {
+        self.workers
+            .entry(id.to_owned())
+            .or_insert_with(|| WorkerSnapshot {
+                id: id.to_owned(),
+                name: None,
+                task: None,
+                state: WorkerState::Unknown,
+                activity: None,
+            })
+    }
+
+    fn waiting_for(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self.worker_waits.values().flatten().cloned().collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn emit_workers(&self, out: &mut Vec<Envelope>) {
+        out.push(Envelope::new(Event::WorkersUpdated {
+            workers: self.workers.values().cloned().collect(),
+            waiting_for: self.waiting_for(),
+        }));
+    }
+
+    fn clear_worker_waits(&mut self, out: &mut Vec<Envelope>) {
+        if !self.worker_waits.is_empty() {
+            self.worker_waits.clear();
+            self.emit_workers(out);
+        }
+    }
+
+    fn finish_effective_mode(&mut self, out: &mut Vec<Envelope>) {
+        if self
+            .effective_mode
+            .take()
+            .is_some_and(|mode| mode != self.mode)
+        {
+            out.push(Envelope::new(Event::ModeChanged { mode: self.mode }));
+        }
+    }
+
+    /// Verified against the installed app-server schema: operation statuses and agent statuses
+    /// are different enums. Preserve worker ids/statuses even when no nickname was reported.
+    fn track_collaboration(&mut self, item: &Value, completed: bool, out: &mut Vec<Envelope>) {
+        if s(item, "type") != Some("collabAgentToolCall") {
+            return;
+        }
+        let before = (self.workers.clone(), self.worker_waits.clone());
+        let tool = s(item, "tool").unwrap_or_default();
+        let receivers: Vec<String> = strings(item, "receiverThreadIds")
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            .collect();
+        let prompt = s(item, "prompt").filter(|p| !p.trim().is_empty());
+        for id in &receivers {
+            let worker = self.worker(id);
+            // A message is not necessarily a new task. These operations actually assign work.
+            if matches!(tool, "spawnAgent" | "sendInput" | "followupTask") {
+                if let Some(prompt) = prompt {
+                    if worker.task.as_deref() != Some(prompt) {
+                        worker.activity = None;
+                    }
+                    worker.task = Some(prompt.to_owned());
+                }
+            }
+        }
+        if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+            for (id, state) in states {
+                if id.is_empty() {
+                    continue;
+                }
+                let worker = self.worker(id);
+                set_worker_state(worker, collab_worker_state(s(state, "status")));
+                if let Some(message) = s(state, "message").filter(|m| !m.trim().is_empty()) {
+                    worker.activity = Some(message.to_owned());
+                }
+            }
+        }
+        if let Some(id) = s(item, "id") {
+            if tool == "wait" && !completed && s(item, "status") == Some("inProgress") {
+                self.worker_waits.insert(id.to_owned(), receivers);
+            } else {
+                self.worker_waits.remove(id);
+            }
+        }
+        if before != (self.workers.clone(), self.worker_waits.clone()) {
+            self.emit_workers(out);
+        }
+    }
+
+    /// Child notifications cannot change the main thread's turn id, reasoning or quota. Scope
+    /// child metadata by a verified parent id (including nested workers) or a known receiver.
+    fn worker_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+        out: &mut Vec<Envelope>,
+    ) -> bool {
+        if method == "thread/started" {
+            let thread = params.get("thread").unwrap_or(&Value::Null);
+            let Some(id) = s(thread, "id") else {
+                return true;
+            };
+            let spawn = thread
+                .get("source")
+                .and_then(|s| s.get("subAgent"))
+                .and_then(|s| s.get("thread_spawn"));
+            let parent = s(thread, "parentThreadId").or_else(|| {
+                spawn
+                    .and_then(|s| s.get("parent_thread_id"))
+                    .and_then(Value::as_str)
+            });
+            let ours = self.workers.contains_key(id)
+                || parent.is_some_and(|p| {
+                    self.thread_id.as_deref() == Some(p) || self.workers.contains_key(p)
+                });
+            if ours {
+                let before = self.workers.clone();
+                let worker = self.worker(id);
+                let nickname = s(thread, "agentNickname").or_else(|| {
+                    spawn
+                        .and_then(|s| s.get("agent_nickname"))
+                        .and_then(Value::as_str)
+                });
+                let role = s(thread, "agentRole").or_else(|| {
+                    spawn
+                        .and_then(|s| s.get("agent_role"))
+                        .and_then(Value::as_str)
+                });
+                if let Some(name) = nickname
+                    .filter(|n| !n.trim().is_empty())
+                    .or_else(|| role.filter(|r| worker.name.is_none() && !r.trim().is_empty()))
+                {
+                    worker.name = Some(name.to_owned());
+                }
+                set_worker_state(worker, thread_worker_state(thread.get("status")));
+                if before != self.workers {
+                    self.emit_workers(out);
+                }
+            }
+            return true;
+        }
+        let Some(id) = s(params, "threadId") else {
+            return false;
+        };
+        if self.thread_id.as_deref() == Some(id) {
+            if method == "thread/closed" {
+                self.clear_worker_waits(out);
+                return true;
+            }
+            return method == "thread/status/changed";
+        }
+        if !self.workers.contains_key(id) {
+            // Notifications about unrelated threads share this transport on newer servers.
+            return self.thread_id.is_some();
+        }
+        let before = (self.workers.clone(), self.worker_waits.clone());
+        match method {
+            "thread/status/changed" => {
+                set_worker_state(self.worker(id), thread_worker_state(params.get("status")));
+            }
+            "thread/closed" => self.worker(id).state = WorkerState::Closed,
+            "turn/started" => self.worker(id).state = WorkerState::Running,
+            "turn/completed" => {
+                let turn = params.get("turn").unwrap_or(&Value::Null);
+                let state = match s(turn, "status") {
+                    Some("completed") => WorkerState::Completed,
+                    Some("interrupted") => WorkerState::Stopped,
+                    Some("failed") => WorkerState::Failed,
+                    _ => WorkerState::Unknown,
+                };
+                set_worker_state(self.worker(id), state);
+            }
+            "item/started" | "item/completed" => {
+                let item = params.get("item").unwrap_or(&Value::Null);
+                self.track_collaboration(item, method == "item/completed", out);
+                let (kind, title, _) = item_info(item);
+                if !matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
+                    self.worker(id).activity = Some(title);
+                }
+            }
+            _ => {}
+        }
+        if before != (self.workers.clone(), self.worker_waits.clone()) {
+            self.emit_workers(out);
+        }
+        true
+    }
+
     /// Records a request and returns its line.
     fn request(&mut self, pending: Pending, method: &str, params: Value) -> String {
         self.next_id += 1;
@@ -260,6 +458,10 @@ impl CodexAdapter {
     }
 
     fn turn_start_line(&mut self, thread: &str, text: &str) -> String {
+        // Capture before writing: the user can change the picker before turn/started arrives.
+        if self.effective_mode.is_none() {
+            self.effective_mode = Some(self.mode);
+        }
         let (approval, sandbox) = mode_policy(self.mode);
         let mut params = Map::new();
         params.insert("threadId".into(), json!(thread));
@@ -301,20 +503,6 @@ impl CodexAdapter {
                 kind,
                 title,
                 input,
-                parent: None,
-            })
-            .item(id),
-        );
-    }
-
-    /// Some web-search items start before Codex has chosen the action. Its completed snapshot
-    /// refines just that card; other started items retain their normal deduplicated sequence.
-    fn refine_web_search(&self, out: &mut Vec<Envelope>, id: &str, title: String, input: Value) {
-        out.push(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::WebSearch,
-                title,
-                input: Some(input),
                 parent: None,
             })
             .item(id),
@@ -375,6 +563,7 @@ impl CodexAdapter {
         if is_silent_item(item) {
             return;
         }
+        self.track_collaboration(item, false, out);
         let (kind, title, input) = item_info(item);
         self.start_item(out, id, kind, title, input);
     }
@@ -399,13 +588,22 @@ impl CodexAdapter {
         if is_silent_item(item) {
             return;
         }
+        self.track_collaboration(item, true, out);
         let (kind, title, input) = item_info(item);
-        if kind == ItemKind::WebSearch && self.open_items.iter().any(|open| open == id) {
-            if let Some(input) = input {
-                self.refine_web_search(out, id, title, input);
-            } else {
-                self.start_item(out, id, kind, title, None);
-            }
+        if matches!(kind, ItemKind::WebSearch | ItemKind::FileChange)
+            && self.open_items.iter().any(|open| open == id)
+        {
+            // Completed metadata is authoritative: file changes can start with no patch.
+            // The reducer refines a matching ItemStarted without creating another card.
+            out.push(
+                Envelope::new(Event::ItemStarted {
+                    kind,
+                    title,
+                    input,
+                    parent: None,
+                })
+                .item(id),
+            );
         } else {
             self.start_item(out, id, kind, title, input);
         }
@@ -473,8 +671,15 @@ impl CodexAdapter {
     // ---- notifications ----
 
     fn on_notification(&mut self, method: &str, params: &Value, out: &mut Vec<Envelope>) {
+        if self.worker_notification(method, params, out) {
+            return;
+        }
         match method {
             "turn/started" => {
+                self.clear_worker_waits(out);
+                if self.effective_mode.is_none() {
+                    self.effective_mode = Some(self.mode);
+                }
                 self.turn_open = true;
                 self.interrupt_sent = false;
                 if let Some(turn) = s(params.get("turn").unwrap_or(&Value::Null), "id") {
@@ -619,6 +824,7 @@ impl CodexAdapter {
                         text: format!("Codex is retrying: {message}"),
                     }));
                 } else {
+                    self.clear_worker_waits(out);
                     out.push(Envelope::new(Event::Error { message }));
                 }
             }
@@ -635,6 +841,7 @@ impl CodexAdapter {
 
     fn on_turn_completed(&mut self, params: &Value, out: &mut Vec<Envelope>) {
         let turn = params.get("turn").unwrap_or(&Value::Null);
+        self.clear_worker_waits(out);
         // Anything still open when the turn ends was cut short.
         self.close_all(out);
         let message = turn
@@ -677,6 +884,7 @@ impl CodexAdapter {
             cost_usd: None,
             error,
         }));
+        self.finish_effective_mode(out);
     }
 
     fn on_token_usage(&mut self, params: &Value, out: &mut Vec<Envelope>) {
@@ -728,6 +936,9 @@ impl CodexAdapter {
                         .flatten()
                         .filter_map(|option| {
                             let label = s(option, "label")?.to_owned();
+                            if label.trim().is_empty() {
+                                return None;
+                            }
                             Some(QuestionOption {
                                 label,
                                 description: s(option, "description").map(str::to_owned),
@@ -738,16 +949,16 @@ impl CodexAdapter {
                 })
                 .filter(|question| !question.id.is_empty() && !question.question.is_empty())
                 .collect();
-            if questions.is_empty() {
+            if questions.is_empty() || questions.iter().any(|q| q.options.is_empty()) {
                 self.write(
                     json!({"id": id, "error": {
                         "code": -32602,
-                        "message": "requestUserInput did not contain a usable question",
+                        "message": "requestUserInput must contain usable questions with selectable options; free-text-only questions are not supported",
                     }})
                     .to_string(),
                 );
                 out.push(Envelope::new(Event::Notice {
-                    text: "Codex requested user input without a usable question; it was refused."
+                    text: "Codex requested user input without usable questions and selectable options; it was refused because free-text-only questions cannot be answered here."
                         .to_owned(),
                 }));
                 return;
@@ -895,6 +1106,7 @@ impl CodexAdapter {
                         cost_usd: None,
                         error: Some(message),
                     }));
+                    self.finish_effective_mode(out);
                 }
             }
             (Pending::Initialize | Pending::ThreadStart | Pending::Compact, None, error) => {
@@ -961,12 +1173,25 @@ impl Adapter for CodexAdapter {
         self.thread_id = None;
         self.turn_id = None;
         self.turn_open = false;
+        self.effective_mode = None;
         self.interrupt_sent = false;
         self.approvals.clear();
         self.questions.clear();
         self.open_items.clear();
         self.texts.clear();
         self.reasoning.clear();
+        // Reconnecting the same thread forgets live certainty, not its worker history. A newly
+        // constructed adapter knows only workers observed on this connection; replaying UI
+        // consumers preserve previously stored identities absent from these snapshots.
+        for worker in self.workers.values_mut() {
+            if matches!(
+                worker.state,
+                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+            ) {
+                worker.state = WorkerState::Unknown;
+            }
+        }
+        self.worker_waits.clear();
         self.usage_total = None;
         self.usage_base = Usage::default();
         self.context = None;
@@ -1042,6 +1267,9 @@ impl Adapter for CodexAdapter {
                 }
             }
             Command::Interrupt => {
+                let mut updates = Vec::new();
+                self.clear_worker_waits(&mut updates);
+                self.outbox.events.extend(updates);
                 let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone())
                 else {
                     return Ok(Vec::new()); // nothing running: a no-op, like Esc at an idle prompt
@@ -1122,8 +1350,24 @@ impl Adapter for CodexAdapter {
                 Ok(Vec::new())
             }
             Command::SetMode { mode } => {
+                if self.mode == mode {
+                    return Ok(Vec::new());
+                }
                 self.mode = mode;
-                self.emit(Event::ModeChanged { mode });
+                if let Some(effective) = self.effective_mode.filter(|effective| *effective != mode)
+                {
+                    self.emit(Event::ModeChangeDeferred {
+                        requested: mode,
+                        effective,
+                    });
+                    self.emit(Event::Notice { text: format!(
+                        "{} applies to the next turn. This turn keeps {}; its pending approvals still need an answer.",
+                        codex_mode_label(mode), codex_mode_label(effective)
+                    ) });
+                } else {
+                    // Selecting the effective mode cancels any deferred selection.
+                    self.emit(Event::ModeChanged { mode });
+                }
                 Ok(Vec::new())
             }
             Command::Control { id, control } => match control {
@@ -1192,6 +1436,21 @@ impl Adapter for CodexAdapter {
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         let expected = self.interrupt_sent;
         let mut out = Vec::new();
+        self.clear_worker_waits(&mut out);
+        let mut changed = false;
+        for worker in self.workers.values_mut() {
+            if matches!(
+                worker.state,
+                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+            ) {
+                // Losing this connection is not evidence that the child was closed.
+                worker.state = WorkerState::Unknown;
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit_workers(&mut out);
+        }
         self.close_all(&mut out);
         let mut approvals: Vec<_> = std::mem::take(&mut self.approvals).into_iter().collect();
         approvals.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1243,6 +1502,7 @@ impl Adapter for CodexAdapter {
         }
         self.thread_id = None;
         self.turn_id = None;
+        self.finish_effective_mode(&mut out);
         self.interrupt_sent = false;
         self.outbox.actions.clear(); // writes to a dead process
         out.push(Envelope::new(Event::SessionExited { code, expected }));
@@ -1267,6 +1527,14 @@ fn mode_policy(mode: Mode) -> (&'static str, Value) {
         Mode::Ask => ("untrusted", json!({"type": "readOnly"})),
         Mode::AcceptEdits => ("on-request", json!({"type": "workspaceWrite"})),
         Mode::Plan => ("never", json!({"type": "readOnly"})),
+    }
+}
+
+fn codex_mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ask => "Ask before edits",
+        Mode::AcceptEdits => "Accept edits",
+        Mode::Plan => "Plan",
     }
 }
 
@@ -1342,11 +1610,15 @@ fn item_info(item: &Value) -> (ItemKind, String, Option<Value>) {
             (ItemKind::WebSearch, title, input)
         }
         "collabAgentToolCall" => (
-            ItemKind::Subagent,
+            ItemKind::Tool,
             s(item, "tool").unwrap_or("subagent").to_owned(),
-            item.get("prompt").cloned(),
+            Some(
+                json!({"prompt": item.get("prompt"), "receiverThreadIds": item.get("receiverThreadIds")}),
+            ),
         ),
-        "subAgentActivity" => (ItemKind::Subagent, "subagent".to_owned(), None),
+        // Legacy activity cards lack verified worker identity/lifecycle; never count the card
+        // as a worker. Current workers are tracked from thread ids and agentsStates instead.
+        "subAgentActivity" => (ItemKind::Tool, "subagent activity".to_owned(), None),
         "imageView" => (
             ItemKind::FileRead,
             s(item, "path").unwrap_or("image").to_owned(),
@@ -1439,6 +1711,7 @@ fn item_result(item: &Value) -> (ItemStatus, Option<String>, Option<String>) {
             let error = (status == ItemStatus::Failed).then(|| "patch failed to apply".to_owned());
             (status, None, error)
         }
+        Some("collabAgentToolCall") => (status, None, None),
         Some("mcpToolCall") => {
             let output = item
                 .get("result")
@@ -1467,6 +1740,53 @@ fn item_result(item: &Value) -> (ItemStatus, Option<String>, Option<String>) {
             None,
             None,
         ),
+    }
+}
+
+fn collab_worker_state(status: Option<&str>) -> WorkerState {
+    match status {
+        Some("pendingInit") => WorkerState::Starting,
+        Some("running") => WorkerState::Running,
+        Some("interrupted") => WorkerState::Stopped,
+        Some("completed") => WorkerState::Completed,
+        Some("errored") => WorkerState::Failed,
+        Some("shutdown") => WorkerState::Closed,
+        _ => WorkerState::Unknown,
+    }
+}
+
+fn thread_worker_state(status: Option<&Value>) -> WorkerState {
+    let Some(status) = status else {
+        return WorkerState::Unknown;
+    };
+    match s(status, "type") {
+        Some("active") => {
+            if strings(status, "activeFlags")
+                .iter()
+                .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
+            {
+                WorkerState::Waiting
+            } else {
+                WorkerState::Running
+            }
+        }
+        Some("systemError") => WorkerState::Failed,
+        // idle/notLoaded neither prove task success nor explicit worker closure.
+        _ => WorkerState::Unknown,
+    }
+}
+
+fn set_worker_state(worker: &mut WorkerSnapshot, state: WorkerState) {
+    if state != WorkerState::Unknown
+        || !matches!(
+            worker.state,
+            WorkerState::Completed
+                | WorkerState::Failed
+                | WorkerState::Stopped
+                | WorkerState::Closed
+        )
+    {
+        worker.state = state;
     }
 }
 
@@ -1622,6 +1942,375 @@ mod tests {
         let mut w = writes(&actions);
         assert_eq!(w.len(), 1, "{w:?}");
         w.remove(0)
+    }
+
+    /// Frames follow the installed app-server JSON schema; no provider prompt is needed.
+    #[test]
+    fn collaboration_frames_publish_workers_and_explicit_waits() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(&json!({"method":"item/started", "params":{
+            "threadId":"th-1", "turnId":"tu-1", "item":{
+                "type":"collabAgentToolCall", "id":"spawn-1", "tool":"spawnAgent",
+                "status":"inProgress", "senderThreadId":"th-1", "receiverThreadIds":["worker-1"],
+                "prompt":"Review configuration", "agentsStates":{"worker-1":{"status":"pendingInit"}}
+            }
+        }}).to_string());
+        let workers = out
+            .iter()
+            .map(|e| serde_json::to_value(&e.event).expect("json"))
+            .find(|e| e["type"] == "workers_updated")
+            .expect("worker snapshot");
+        assert_eq!(workers["workers"][0]["id"], "worker-1");
+        assert_eq!(workers["workers"][0]["task"], "Review configuration");
+        assert_eq!(workers["workers"][0]["state"], "starting");
+    }
+
+    #[test]
+    fn completed_file_change_refines_its_initial_empty_changes() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"item/started","params":{"threadId":"th-1","turnId":"tu","item":{"type":"fileChange","id":"edit","status":"inProgress","changes":[]}}}"#);
+        let changes = json!([{"path":"src/a.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]);
+        let out = a.feed(&json!({"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","item":{"type":"fileChange","id":"edit","status":"completed","changes":changes}}}).to_string());
+        assert!(out.iter().any(|e| matches!(&e.event, Event::ItemStarted {kind: ItemKind::FileChange, input: Some(input), ..} if *input == changes)), "completed changes must replace the empty start");
+    }
+
+    #[test]
+    fn a_question_without_options_is_refused_instead_of_stranding_the_user() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(r#"{"id":"question-1","method":"item/tool/requestUserInput","params":{"threadId":"th-1","turnId":"tu","itemId":"q","questions":[{"id":"q1","header":"Choice","question":"What should change?","options":[]}]}}"#);
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e.event, Event::QuestionRequested { .. })));
+        let wire = writes(&a.drain_outbox().actions);
+        assert_eq!(wire[0]["error"]["code"], -32602);
+        assert!(wire[0]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("options"));
+    }
+
+    const WORKERS: &str = include_str!("../tests/fixtures/codex-schema-workers.ndjson");
+
+    #[test]
+    fn schema_workers_keep_identity_across_operations_and_close_only_explicitly() {
+        let mut a = started(Mode::Ask);
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"parent-turn"}}}"#,
+        );
+        let mut snapshots = Vec::new();
+        for (i, line) in WORKERS.lines().enumerate() {
+            let out = a.feed(line);
+            snapshots.extend(out.iter().filter_map(|e| match &e.event {
+                Event::WorkersUpdated {
+                    workers,
+                    waiting_for,
+                } => Some((workers.clone(), waiting_for.clone())),
+                _ => None,
+            }));
+            assert!(
+                !out.iter().any(|e| matches!(
+                    e.event,
+                    Event::ItemStarted {
+                        kind: ItemKind::Subagent,
+                        ..
+                    }
+                )),
+                "operations must not count as workers"
+            );
+            let worker = a.workers.get("worker-1").expect("worker");
+            match i {
+                1 => assert_eq!(worker.name.as_deref(), Some("Mira")),
+                2 => assert_eq!(
+                    worker.state,
+                    WorkerState::Running,
+                    "spawn call complete is not worker complete"
+                ),
+                3 => assert_eq!(a.waiting_for(), ["worker-1"]),
+                4 => assert!(
+                    out.is_empty(),
+                    "child reasoning must not enter the parent's transcript"
+                ),
+                5 => assert_eq!(worker.state, WorkerState::Waiting),
+                6 => {
+                    assert_eq!(worker.state, WorkerState::Completed);
+                    assert_eq!(a.turn_id.as_deref(), Some("parent-turn"));
+                    assert!(a.turn_open, "worker turn must not end the parent turn");
+                }
+                7 => {
+                    assert_eq!(worker.state, WorkerState::Completed);
+                    assert!(a.waiting_for().is_empty());
+                }
+                8 => {
+                    assert_eq!(worker.task.as_deref(), Some("Review settings"));
+                    assert_eq!(
+                        worker.activity, None,
+                        "new assignment clears the old result"
+                    );
+                }
+                9 | 11 => assert_eq!(
+                    worker.state,
+                    WorkerState::Running,
+                    "operation completion is not closure"
+                ),
+                12 | 13 => assert_eq!(worker.state, WorkerState::Closed),
+                14 => assert_eq!(a.turn_id.as_deref(), Some("parent-turn")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            a.workers.len(),
+            2,
+            "one entry per worker thread, not per operation"
+        );
+        assert_eq!(a.workers["worker-2"].state, WorkerState::Unknown);
+        // Canonical snapshots replay by replacement; no native frames are needed to recover
+        // identities/history, and future builds can add metadata without breaking the store.
+        let mut replay = BTreeMap::new();
+        for (workers, _) in snapshots {
+            let env = Envelope::new(Event::WorkersUpdated {
+                workers,
+                waiting_for: Vec::new(),
+            });
+            let encoded = serde_json::to_string(&env).expect("serialize");
+            let decoded: Envelope = serde_json::from_str(&encoded).expect("decode");
+            if let Event::WorkersUpdated { workers, .. } = decoded.event {
+                replay = workers.into_iter().map(|w| (w.id.clone(), w)).collect();
+            }
+        }
+        assert_eq!(replay, a.workers);
+    }
+
+    fn waiting_adapter() -> CodexAdapter {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        for line in WORKERS.lines().take(4) {
+            a.feed(line);
+        }
+        assert_eq!(a.waiting_for(), ["worker-1"]);
+        a
+    }
+
+    #[test]
+    fn explicit_waits_clear_on_cancellation_failure_interrupt_and_exit() {
+        for status in ["completed", "failed", "interrupted"] {
+            let mut a = waiting_adapter();
+            let out = a.feed(&json!({"method":"item/completed","params":{"threadId":"th-1","turnId":"tu-1","item":{
+                "type":"collabAgentToolCall","id":"wait-1","tool":"wait","status":status,
+                "senderThreadId":"th-1","receiverThreadIds":["worker-1"],"prompt":null,"agentsStates":{}
+            }}}).to_string());
+            assert!(a.waiting_for().is_empty());
+            assert!(out.iter().any(|e| matches!(&e.event, Event::WorkersUpdated { waiting_for, .. } if waiting_for.is_empty())));
+            assert_eq!(a.workers["worker-1"].state, WorkerState::Running);
+        }
+        let mut a = waiting_adapter();
+        a.encode(Command::Interrupt).expect("interrupt");
+        assert!(a.waiting_for().is_empty());
+        assert!(a.drain_outbox().events.iter().any(|e| matches!(&e.event, Event::WorkersUpdated { waiting_for, .. } if waiting_for.is_empty())));
+        let mut a = waiting_adapter();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"failed","error":{"message":"quota"}}}}"#);
+        assert!(a.waiting_for().is_empty());
+        let mut a = waiting_adapter();
+        a.on_exit(Some(1));
+        assert!(a.waiting_for().is_empty());
+        assert_eq!(
+            a.workers["worker-1"].state,
+            WorkerState::Unknown,
+            "connection loss does not close the child"
+        );
+    }
+
+    #[test]
+    fn worker_schema_states_and_nested_metadata_have_safe_fallbacks() {
+        for (wire, state) in [
+            ("pendingInit", WorkerState::Starting),
+            ("running", WorkerState::Running),
+            ("interrupted", WorkerState::Stopped),
+            ("completed", WorkerState::Completed),
+            ("errored", WorkerState::Failed),
+            ("shutdown", WorkerState::Closed),
+            ("notFound", WorkerState::Unknown),
+            ("future-state", WorkerState::Unknown),
+        ] {
+            assert_eq!(collab_worker_state(Some(wire)), state);
+        }
+        let mut a = waiting_adapter();
+        a.feed(r#"{"method":"thread/started","params":{"thread":{"id":"nested","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"worker-1","depth":2,"agent_nickname":null,"agent_role":"reviewer"}}},"status":{"type":"notLoaded"}}}}"#);
+        assert_eq!(a.workers["nested"].name.as_deref(), Some("reviewer"));
+        assert_eq!(a.workers["nested"].state, WorkerState::Unknown);
+        a.feed(r#"{"method":"thread/closed","params":{"threadId":"th-1"}}"#);
+        assert!(a.waiting_for().is_empty());
+        assert_eq!(
+            a.workers["worker-1"].state,
+            WorkerState::Running,
+            "closing parent isn't proof child closed"
+        );
+    }
+
+    #[test]
+    fn partially_unanswerable_question_batch_is_refused_whole() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(&json!({"id":55,"method":"item/tool/requestUserInput","params":{
+            "threadId":"th-1","turnId":"tu","itemId":"q","questions":[
+                {"id":"a","header":"A","question":"One?","options":[{"label":"Yes","description":"Continue"}]},
+                {"id":"b","header":"B","question":"Two?","options":[{"label":" "},{"description":"No label"}]}
+            ]}}).to_string());
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e.event, Event::QuestionRequested { .. })));
+        assert!(a.questions.is_empty());
+        assert_eq!(writes(&a.drain_outbox().actions)[0]["id"], 55);
+    }
+
+    #[test]
+    fn changing_mode_mid_turn_does_not_claim_the_current_sandbox_changed() {
+        let mut a = started(Mode::Ask);
+        let first = one_write(
+            a.encode(Command::Prompt {
+                text: "Review".into(),
+            })
+            .expect("prompt"),
+        );
+        assert_eq!(first["params"]["sandboxPolicy"]["type"], "readOnly");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        let out = a.drain_outbox().events;
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e.event, Event::ModeChanged { .. })),
+            "running mode cannot change without a policy write"
+        );
+        let deferred = out
+            .iter()
+            .map(|e| serde_json::to_value(&e.event).expect("json"))
+            .find(|e| e["type"] == "mode_change_deferred")
+            .expect("deferred");
+        assert_eq!(deferred["effective"], "ask");
+        assert_eq!(deferred["requested"], "accept_edits");
+        let ended = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed"}}}"#);
+        assert!(ended.iter().any(|e| matches!(
+            e.event,
+            Event::ModeChanged {
+                mode: Mode::AcceptEdits
+            }
+        )));
+        let next = one_write(
+            a.encode(Command::Prompt {
+                text: "Edit".into(),
+            })
+            .expect("prompt"),
+        );
+        assert_eq!(next["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(next["params"]["approvalPolicy"], "on-request");
+    }
+
+    #[test]
+    fn deferred_modes_preserve_accept_edits_cancel_and_apply_only_to_the_next_turn() {
+        let mut a = started(Mode::AcceptEdits);
+        a.encode(Command::Prompt {
+            text: "Edit".into(),
+        })
+        .expect("prompt");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("mode");
+        assert_eq!(a.effective_mode, Some(Mode::AcceptEdits));
+        assert!(a.drain_outbox().events.iter().any(|e| matches!(
+            e.event,
+            Event::ModeChangeDeferred {
+                requested: Mode::Plan,
+                effective: Mode::AcceptEdits
+            }
+        )));
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("repeat");
+        assert!(
+            a.drain_outbox().events.is_empty(),
+            "no repeated notice for unchanged request"
+        );
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("cancel");
+        assert_eq!(
+            a.drain_outbox().events,
+            [Envelope::new(Event::ModeChanged {
+                mode: Mode::AcceptEdits
+            })]
+        );
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("plan");
+        a.drain_outbox();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"interrupted"}}}"#);
+        assert_eq!(a.effective_mode, None);
+        let next = one_write(
+            a.encode(Command::Prompt {
+                text: "Plan".into(),
+            })
+            .expect("prompt"),
+        );
+        assert_eq!(next["params"]["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(next["params"]["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn mode_change_during_pending_start_is_deferred_and_failed_start_clears_it() {
+        let mut a = started(Mode::Ask);
+        let start = one_write(
+            a.encode(Command::Prompt {
+                text: "Review".into(),
+            })
+            .expect("prompt"),
+        );
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        assert_eq!(a.effective_mode, Some(Mode::Ask));
+        assert!(a.drain_outbox().events.iter().any(|e| matches!(
+            e.event,
+            Event::ModeChangeDeferred {
+                effective: Mode::Ask,
+                ..
+            }
+        )));
+        let out = a.feed(&json!({"id":start["id"],"error":{"message":"start failed"}}).to_string());
+        assert_eq!(a.effective_mode, None);
+        assert!(out.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        )));
+        assert!(
+            out.iter().any(|e| matches!(
+                e.event,
+                Event::ModeChanged {
+                    mode: Mode::AcceptEdits
+                }
+            )),
+            "now idle: selected next-turn default is available"
+        );
+    }
+
+    #[test]
+    fn reconnect_preserves_worker_history_without_claiming_live_activity() {
+        let mut a = waiting_adapter();
+        let closed = WorkerSnapshot {
+            id: "closed".into(),
+            name: Some("Finished reviewer".into()),
+            task: None,
+            state: WorkerState::Closed,
+            activity: None,
+        };
+        a.workers.insert(closed.id.clone(), closed.clone());
+        a.handshake();
+        assert!(a.waiting_for().is_empty());
+        assert_eq!(a.workers["worker-1"].state, WorkerState::Unknown);
+        assert_eq!(a.workers["closed"], closed);
     }
 
     /// Short, comparable name of an envelope.

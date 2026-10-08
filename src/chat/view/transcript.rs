@@ -96,8 +96,10 @@ impl TranscriptView {
         list.set_valign(gtk4::Align::End);
         // A readable measure: centred column, capped width.
         let clamp = adw::Clamp::new();
-        clamp.set_maximum_size(860);
-        clamp.set_tightening_threshold(640);
+        // This list owns 24px padding on each edge; the bottom puts the same padding outside
+        // its 860px clamp. Include it here so cards and composer share an outer grid.
+        clamp.set_maximum_size(908);
+        clamp.set_tightening_threshold(688);
         clamp.set_child(Some(&list));
 
         let scroller = gtk4::ScrolledWindow::new();
@@ -327,6 +329,27 @@ impl TranscriptView {
     }
 
     fn connect_scrolling(self: &Rc<Self>) {
+        // Only deliberate keyboard navigation reveals focus. Automatic focus changes when a
+        // resolved card removes buttons must retain the existing stick-to-bottom behaviour.
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if matches!(key, gtk4::gdk::Key::Tab | gtk4::gdk::Key::ISO_Left_Tab) {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(view) = weak.upgrade() {
+                        if let Some(focus) = view.scroller.root().and_then(|r| r.focus()) {
+                            if focus.is_ancestor(&view.list) {
+                                view.reveal_widget(&focus);
+                            }
+                        }
+                    }
+                });
+            }
+            glib::Propagation::Proceed
+        });
+        self.scroller.add_controller(keys);
         let adj = self.scroller.vadjustment();
         // The view leaves the bottom only when the user scrolls up, and comes back when they
         // scroll down into it, jump, or send. Every move it makes itself goes through
@@ -457,6 +480,53 @@ impl TranscriptView {
             }
         }
         self.scroll_to_end();
+    }
+
+    /// An explicit question/approval jump reveals and focuses its first pending choice.
+    /// Returns false when the card has expired, disappeared, or has no actionable answer.
+    pub fn focus_pending_card(&self, id: &str) -> bool {
+        self.scroll_to_card(id);
+        let focused = self
+            .rows
+            .borrow()
+            .get(id)
+            .is_some_and(Row::focus_pending_action);
+        if focused {
+            if let Some(focus) = self.scroller.root().and_then(|r| r.focus()) {
+                self.reveal_widget(&focus);
+            }
+        }
+        focused
+    }
+
+    /// Opens the changes region in a deterministic in-memory demo fixture.
+    pub(crate) fn expand_demo_changes(&self, id: &str) {
+        if let Some(Row::Tool(card)) = self.rows.borrow().get(id) {
+            card.set_changes_expanded(true);
+        }
+    }
+
+    fn reveal_widget(&self, widget: &gtk4::Widget) {
+        let Some(bounds) = widget.compute_bounds(&self.scroller) else {
+            return;
+        };
+        let adj = self.scroller.vadjustment();
+        let top = f64::from(bounds.y());
+        let bottom = top + f64::from(bounds.height());
+        let target = if top < 0.0 {
+            Some(adj.value() + top)
+        } else if bottom > adj.page_size() {
+            Some(adj.value() + bottom - adj.page_size())
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            self.stick.set(false);
+            self.move_to(target.clamp(
+                adj.lower(),
+                (adj.upper() - adj.page_size()).max(adj.lower()),
+            ));
+        }
     }
 
     /// Rebuilds everything from the model (initial load, or a thread swap).

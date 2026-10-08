@@ -938,6 +938,30 @@ pub(super) struct Sidebar {
     _usage: Rc<UsageIndicator>,
 }
 
+fn sidebar_focus_target(
+    sidebar: &Sidebar,
+    focus: &gtk4::Widget,
+) -> Option<(RowKey, Option<&'static str>)> {
+    let mut widget = Some(focus.clone());
+    let mut control = None;
+    while let Some(current) = widget {
+        for class in ["thread-close", "thread-delete"] {
+            if current.has_css_class(class) {
+                control = Some(class);
+            }
+        }
+        if let Some(row) = current.downcast_ref::<gtk4::ListBoxRow>() {
+            if row.parent().as_ref() == Some(sidebar.list.upcast_ref()) {
+                let index = usize::try_from(row.index()).ok()?;
+                let key = sidebar.keys.borrow().get(index)?.clone()?;
+                return Some((key, control));
+            }
+        }
+        widget = current.parent();
+    }
+    None
+}
+
 impl AgentTerminalWindow {
     /// Builds the chat-first shell into `container`: the sidebar beside the (tab-bar-less) tab
     /// view, with an empty state when no page is open.
@@ -983,7 +1007,7 @@ impl AgentTerminalWindow {
         let toast_overlay = adw::ToastOverlay::new();
         let pages = gtk4::Stack::new();
         pages.add_named(tab_view, Some("threads"));
-        pages.add_named(&self.build_empty_state(), Some("empty"));
+        pages.add_named(&self.build_empty_state(&split), Some("empty"));
         // Threads from the last session are about to reopen: hold their space with a thread's
         // skeleton rather than flash the empty state first. Only for as long as that lasts
         // (`settle_pages` removes it): a stack is as large as its largest page.
@@ -1091,7 +1115,7 @@ impl AgentTerminalWindow {
         }
     }
 
-    fn build_empty_state(&self) -> gtk4::Widget {
+    fn build_empty_state(&self, split: &adw::OverlaySplitView) -> gtk4::Widget {
         let obj = self.obj();
         let page = adw::StatusPage::builder()
             .title("No thread open")
@@ -1116,7 +1140,35 @@ impl AgentTerminalWindow {
             obj,
             move |_| obj.imp().new_tab()
         ));
-        page.set_child(Some(&new));
+        let actions = Box::new(gtk4::Orientation::Vertical, 8);
+        actions.append(&new);
+        let show = Button::builder()
+            .label("Show Threads")
+            .halign(Align::Center)
+            .tooltip_text("Show existing threads (F9, Ctrl+B)")
+            .build();
+        split
+            .bind_property("show-sidebar", &show, "visible")
+            .invert_boolean()
+            .sync_create()
+            .build();
+        show.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            split,
+            move |_| {
+                split.set_show_sidebar(true);
+                if !split.is_collapsed() {
+                    obj.imp().remember_sidebar(true);
+                }
+                if let Some(sidebar) = obj.imp().sidebar.borrow().as_ref() {
+                    sidebar.search.grab_focus();
+                }
+            }
+        ));
+        actions.append(&show);
+        page.set_child(Some(&actions));
         page.upcast()
     }
 
@@ -1414,6 +1466,11 @@ impl AgentTerminalWindow {
         let home = env::var("HOME").unwrap_or_default();
         let now = now_ms();
 
+        // A refresh replaces widgets, but it must not replace the keyboard user's place.
+        // Remember the thread identity and trailing control before removing the old rows.
+        let sidebar_focus = gtk4::prelude::GtkWindowExt::focus(&*self.obj())
+            .and_then(|focus| sidebar_focus_target(&sidebar, &focus));
+
         sidebar.rebuilding.set(true);
         clear_rows(&sidebar.list);
         let mut keys = Vec::new();
@@ -1449,6 +1506,34 @@ impl AgentTerminalWindow {
         *sidebar.keys.borrow_mut() = keys;
         sidebar.list.select_row(select.as_ref());
         sidebar.rebuilding.set(false);
+        if let Some((key, control)) = sidebar_focus {
+            let index = sidebar
+                .keys
+                .borrow()
+                .iter()
+                .position(|k| k.as_ref() == Some(&key));
+            let row = index
+                .and_then(|i| i32::try_from(i).ok())
+                .and_then(|i| sidebar.list.row_at_index(i));
+            if let Some(row) = row {
+                let target = control.and_then(|class| {
+                    let line = row.child()?;
+                    let mut child = line.first_child();
+                    while let Some(widget) = child {
+                        child = widget.next_sibling();
+                        if widget.has_css_class(class) {
+                            return Some(widget);
+                        }
+                    }
+                    None
+                });
+                target.unwrap_or_else(|| row.upcast()).grab_focus();
+            } else if let Some(row) = sidebar.list.selected_row() {
+                row.grab_focus();
+            } else {
+                sidebar.search.grab_focus();
+            }
+        }
     }
 
     fn sidebar_row_widget(&self, row: &SidebarRow, now: i64) -> gtk4::ListBoxRow {
@@ -1543,7 +1628,16 @@ impl AgentTerminalWindow {
             ));
             line.append(&close);
         }
-        gtk4::ListBoxRow::builder().child(&line).build()
+        let widget = gtk4::ListBoxRow::builder().child(&line).build();
+        let state = row
+            .badge
+            .map(|b| row_tooltip(b, &row.background))
+            .unwrap_or_else(|| if row.open { "Open" } else { "Closed" }.to_owned());
+        widget.update_property(&[
+            gtk4::accessible::Property::Label(&row.title),
+            gtk4::accessible::Property::Description(&format!("{}, {state}", row.folder)),
+        ]);
+        widget
     }
 
     /// Whether closing `key` would cut a turn short: a thread running or awaiting an answer.
@@ -2380,10 +2474,14 @@ impl AgentTerminalWindow {
             None => slot.clone(),
         };
         let view = ChatView::new(backend);
+        view.set_text_scale(self.config.borrow().font_scale);
         view.set_vexpand(true);
         view.set_model_source(ModelCatalog::shared());
         view.set_account_status(AccountStatus::shared());
         view.set_diff_source(diffs);
+        if demo.is_some() {
+            crate::chat::view::demo::configure_demo_view(&view);
+        }
         view.replay_by_agent(&history);
         // The loading skeleton (see `add_thread_page`) gives way to the view.
         if let Some(skeleton) = holder.first_child() {
@@ -4014,8 +4112,62 @@ fn forget_stale_resolutions() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(crate) fn sidebar_focus_survives_refresh(window: &crate::window::AgentTerminalWindow) {
+        let imp = window.imp();
+        let sidebar = imp.sidebar.borrow().clone().expect("sidebar");
+        let key = sidebar
+            .keys
+            .borrow()
+            .iter()
+            .find_map(Clone::clone)
+            .expect("a thread row");
+        let close_for_key = || {
+            let index = sidebar
+                .keys
+                .borrow()
+                .iter()
+                .position(|row| row.as_ref() == Some(&key))?;
+            let row = sidebar.list.row_at_index(i32::try_from(index).ok()?)?;
+            row.child()?
+                .last_child()
+                .filter(|button| button.has_css_class("thread-close"))
+        };
+        window.set_default_size(950, 650);
+        window.present();
+        if !imp
+            .split_view
+            .borrow()
+            .as_ref()
+            .is_some_and(|split| split.shows_sidebar())
+        {
+            imp.toggle_sidebar();
+        }
+        let ctx = glib::MainContext::default();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || {
+                close_for_key().is_some_and(|button| button.is_mapped() && button.is_sensitive())
+            }),
+            "the shown sidebar's close button must map before focusing it"
+        );
+        // State and time callbacks can rebuild the list during mapping. Resolve the control
+        // by thread identity after the bounded wait, never focus a widget from an old row.
+        let close = close_for_key().expect("mapped close button");
+        assert!(close.grab_focus());
+        let focus = gtk4::prelude::GtkWindowExt::focus(window).expect("focused control");
+        assert_eq!(
+            sidebar_focus_target(&sidebar, &focus),
+            Some((key.clone(), Some("thread-close")))
+        );
+        imp.refresh_sidebar();
+        let focus = gtk4::prelude::GtkWindowExt::focus(window).expect("focus after refresh");
+        assert_eq!(
+            sidebar_focus_target(&sidebar, &focus),
+            Some((key, Some("thread-close")))
+        );
+    }
 
     /// A thread menu hangs off the sidebar list, so a rebuild while it is open must clear the
     /// rows, return, and leave the menu where it was.

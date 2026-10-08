@@ -38,6 +38,7 @@ use std::rc::{Rc, Weak};
 use adw::subclass::prelude::*;
 use agent_core::adapter::{Control, Driver, Mode};
 use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
+use agent_core::event::Event;
 use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
@@ -103,6 +104,7 @@ mod imp {
     #[derive(Default)]
     pub struct ChatView {
         pub(super) inner: RefCell<Option<Rc<Inner>>>,
+        pub(super) text_style: RefCell<Option<(gdk::Display, gtk4::CssProvider, String)>>,
     }
 
     #[glib::object_subclass]
@@ -114,6 +116,9 @@ mod imp {
 
     impl ObjectImpl for ChatView {
         fn dispose(&self) {
+            if let Some((display, provider, _)) = self.text_style.borrow_mut().take() {
+                gtk4::style_context_remove_provider_for_display(&display, &provider);
+            }
             if let Some(inner) = self.inner.borrow_mut().take() {
                 inner.composer.dispose();
                 inner.disconnect_models();
@@ -200,7 +205,7 @@ impl ChatView {
             let w = weak.clone();
             let interruption = interruption::InterruptionShelf::new(sink.clone(), move |id| {
                 if let Some(inner) = w.upgrade() {
-                    inner.transcript.scroll_to_card(&id);
+                    inner.transcript.focus_pending_card(&id);
                 }
             });
             Inner {
@@ -320,6 +325,7 @@ impl ChatView {
         if let Some(mode) = model.mode {
             inner.header.set_mode(mode);
         }
+        inner.header.set_pending_mode(model.pending_mode);
         inner.composer.set_history(model.user_messages());
         drop(model);
         inner.refresh_status();
@@ -423,6 +429,34 @@ impl ChatView {
             inner.refresh_status();
         }
     }
+
+    /// Scale chat content and controls without changing the desktop theme or other windows.
+    pub fn set_text_scale(&self, scale: f64) {
+        let scale = if scale.is_finite() {
+            scale.clamp(0.5, 3.0)
+        } else {
+            1.0
+        };
+        let display = self.display();
+        let mut style = self.imp().text_style.borrow_mut();
+        let (_, provider, class) = style.get_or_insert_with(|| {
+            static NEXT_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = NEXT_SCALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let class = format!("chat-scale-{id}");
+            self.add_css_class(&class);
+            let provider = gtk4::CssProvider::new();
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
+            );
+            (display, provider, class)
+        });
+        provider.load_from_data(&format!(".{class} {{ font-size: {scale}em; }}"));
+        if let Some(inner) = self.inner() {
+            inner.header.set_text_scale(scale);
+        }
+    }
 }
 
 impl Inner {
@@ -468,6 +502,19 @@ impl Inner {
         }
         let changes = self.model.borrow_mut().apply(env, driver);
         self.handle(changes);
+        // Phase changes are discrete events: never walk the transcript for each text delta.
+        if matches!(
+            env.event,
+            Event::ItemStarted { .. }
+                | Event::ItemCompleted { .. }
+                | Event::ApprovalRequested { .. }
+                | Event::ApprovalResolved { .. }
+                | Event::ApprovalExpired
+                | Event::QuestionRequested { .. }
+                | Event::QuestionResolved { .. }
+        ) {
+            self.refresh_status();
+        }
     }
 
     fn handle(self: &Rc<Self>, changes: Vec<Change>) {
@@ -509,8 +556,21 @@ impl Inner {
                     if let Some(mode) = self.model.borrow().mode {
                         self.header.set_mode(mode);
                     }
+                    self.header
+                        .set_pending_mode(self.model.borrow().pending_mode);
                 }
                 Change::Running => self.refresh_status(),
+                Change::Workers => {
+                    let ids: Vec<_> = self
+                        .model
+                        .borrow()
+                        .subagents()
+                        .into_iter()
+                        .filter(|a| a.lifecycle.is_some())
+                        .map(|a| a.id)
+                        .collect();
+                    self.refresh_subagents(&ids);
+                }
                 // The hint names the `$ skills` trigger only once the agent lists skills.
                 Change::Commands => self.composer.refresh_placeholder(),
                 Change::Control { request, result } => self.control_result(&request, result),
@@ -609,6 +669,8 @@ impl Inner {
         self.refresh_agent_chip();
         self.header
             .set_mode(self.model.borrow().mode.unwrap_or(status.mode));
+        self.header
+            .set_pending_mode(self.model.borrow().pending_mode);
         self.header
             .gauge
             .set_sensitive(status.capabilities.context_usage);
@@ -966,6 +1028,8 @@ fn step_glyph(s: StepStatus) -> (&'static str, &'static str) {
 impl PlanPanel {
     fn new() -> Self {
         let title = cards::label("Plan", &["plan-title"]);
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title.set_hexpand(true);
         let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         steps.add_css_class("plan-steps");
         let card = cards::collapsible(
@@ -994,8 +1058,9 @@ impl PlanPanel {
             .iter()
             .filter(|s| s.status == StepStatus::Completed)
             .count();
-        self.title
-            .set_text(&format!("Plan  ·  {done} of {} done", plan.len()));
+        let summary = format!("Plan  ·  {done} of {} done", plan.len());
+        self.title.set_text(&summary);
+        self.title.set_tooltip_text(Some(&summary));
         for step in plan {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
             row.add_css_class("plan-step");
@@ -1120,7 +1185,7 @@ pub(crate) mod tests {
             }
         }
         assert!(!inner.header.running_shown());
-        assert_eq!(inner.header.activity_shown().as_deref(), Some("Finished"));
+        assert_eq!(inner.header.activity_shown().as_deref(), Some("Stopped"));
         assert!(!inner.composer.shows_stop());
         let card = inner
             .transcript
@@ -1199,7 +1264,7 @@ pub(crate) mod tests {
         view.apply(&Envelope::new(Event::TurnStarted { model: None }));
         assert_eq!(
             inner.thinking.shown().as_deref(),
-            Some("Claude is thinking…")
+            Some("Claude is working…")
         );
         view.apply(&Envelope::new(Event::TurnCompleted {
             state: TurnState::Completed,
@@ -1215,8 +1280,13 @@ pub(crate) mod tests {
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();
         thinking_strip_follows_the_turn();
+        composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
+        panels::tests::changing_effort_does_not_switch_until_row_activation();
+        usage::tests::compact_scope_does_not_filter_provider_comparison();
+        cards::tests::file_changes_and_permission_details_have_distinct_actions();
         approval_row_precedes_its_step();
         subagent_shelf::tests::shelf_follows_running_subagents();
+        subagents::tests::worker_group_updates_without_rebuilding_its_row();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });
@@ -1272,6 +1342,28 @@ pub(crate) mod tests {
             "the picker follows the agent"
         );
         assert_eq!(chosen.borrow().len(), 1, "a reported mode offers nothing");
+        view.sink()(&Envelope::new(Event::ModeChangeDeferred {
+            requested: Mode::AcceptEdits,
+            effective: Mode::Ask,
+        }));
+        assert_eq!(picker.selected(), index(Mode::Ask));
+        assert_eq!(
+            picker.tooltip_text().as_deref(),
+            Some("Next turn: Accept edits")
+        );
+        view.sink()(&Envelope::new(Event::ModeChanged {
+            mode: Mode::AcceptEdits,
+        }));
+        assert_eq!(picker.selected(), index(Mode::AcceptEdits));
+        assert_eq!(
+            picker.tooltip_text().as_deref(),
+            Some("Accept edits (/mode)")
+        );
+        assert_eq!(
+            chosen.borrow().len(),
+            1,
+            "deferred adoption is not another user choice"
+        );
 
         // The header says whether the thread is still working, counting its background work;
         // the stop button follows the main turn only.
@@ -1319,7 +1411,7 @@ pub(crate) mod tests {
             );
             assert!(!inner.header.running_shown());
             background(0);
-            assert_eq!(shown(), (Some("Finished".into()), false));
+            assert_eq!(shown(), (Some("Completed".into()), false));
         }
 
         // The model-source listener goes away with the view.
@@ -2204,7 +2296,7 @@ pub(crate) mod tests {
         pump();
         let (visible, count, ids) = inner.subagent_button.state();
         assert!(visible);
-        assert_eq!(count, "1 sub-agent · 1 running");
+        assert_eq!(count, "1 active · 0 finished");
         assert_eq!(ids, ["agent1"]);
 
         inner.open_subagent("agent1");
@@ -2222,7 +2314,7 @@ pub(crate) mod tests {
             "existing steps are updated in place, never rebuilt"
         );
         let (_, count, ids) = inner.subagent_button.state();
-        assert_eq!((count.as_str(), ids.len()), ("1 sub-agent · 1 running", 1));
+        assert_eq!((count.as_str(), ids.len()), ("1 active · 0 finished", 1));
 
         // A second one starts: running ones are listed first.
         step("agent2", ItemKind::Subagent, None, None);
@@ -2240,11 +2332,11 @@ pub(crate) mod tests {
         pump();
         let (visible, count, ids) = inner.subagent_button.state();
         assert!(visible, "a finished sub-agent keeps the button");
-        assert_eq!(count, "2 sub-agents · 1 running");
+        assert_eq!(count, "1 active · 1 finished");
         assert_eq!(ids, ["agent2", "agent1"], "running first, finished after");
         assert_eq!(
             inner.subagent_button.statuses(),
-            ["running", "done · 2 steps"]
+            ["running", "completed · 2 steps"]
         );
         assert_eq!(panel().steps_shown(), 2, "the open panel keeps showing it");
 
@@ -2271,9 +2363,13 @@ pub(crate) mod tests {
         let r = replayed.inner().expect("replayed view");
         assert_eq!(
             r.subagent_button.state(),
-            (true, "1 sub-agent".to_owned(), vec!["old".to_owned()])
+            (
+                true,
+                "0 active · 1 finished".to_owned(),
+                vec!["old".to_owned()]
+            )
         );
-        assert_eq!(r.subagent_button.statuses(), ["done"]);
+        assert_eq!(r.subagent_button.statuses(), ["completed"]);
     }
 
     /// GTK checks of the diff viewer: the card's toggle, its buttons, the approval's diff.

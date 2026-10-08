@@ -219,8 +219,8 @@ fn choice(
 type Pick = Rc<dyn Fn(Driver, String, Option<String>)>;
 
 /// The grouped, filtered rows for `query`. Every row has the same UX for both agents: the name
-/// and, when the model offers efforts, an effort dropdown; choosing the row or changing its
-/// effort calls `pick`.
+/// and, when the model offers efforts, an effort dropdown. Effort is staged; activating the
+/// row calls `pick` with that choice.
 fn model_list(
     models: &[CatalogModel],
     query: &str,
@@ -280,21 +280,16 @@ fn model_list(
                 let efforts: Vec<&str> = m.efforts.iter().map(String::as_str).collect();
                 let dropdown = gtk4::DropDown::from_strings(&efforts);
                 dropdown.set_valign(gtk4::Align::Center);
-                dropdown.set_tooltip_text(Some("Effort"));
+                dropdown.set_tooltip_text(Some("Effort; applied when you choose this model"));
                 let at = effort
                     .borrow()
                     .as_deref()
                     .and_then(|e| m.efforts.iter().position(|x| x == e));
                 dropdown.set_selected(at.and_then(|i| u32::try_from(i).ok()).unwrap_or(0));
-                // Changing the effort switches straight away, like choosing the row.
+                // Stage the effort until the row is chosen; browsing another model must not
+                // hand the thread to it before the user activates the row.
                 dropdown.connect_selected_notify({
-                    let (m, effort, touched, pick, status) = (
-                        m.clone(),
-                        effort.clone(),
-                        touched.clone(),
-                        pick.clone(),
-                        status.clone(),
-                    );
+                    let (m, effort, touched) = (m.clone(), effort.clone(), touched.clone());
                     move |dd| {
                         let chosen = m.efforts.get(dd.selected() as usize).cloned();
                         if *effort.borrow() == chosen {
@@ -302,8 +297,6 @@ fn model_list(
                         }
                         *effort.borrow_mut() = chosen;
                         touched.set(true);
-                        let (id, e) = choice(&m, effort.borrow().as_deref(), true, &status);
-                        pick(m.driver, id, e);
                     }
                 });
                 row.add_suffix(&dropdown);
@@ -354,7 +347,7 @@ fn confirm_busy_switch(parent: &adw::Dialog, from: Driver, to: Driver, then: imp
 /// agent is a handoff, which the backend's `switch` performs.
 pub fn model_picker(ctx: &PanelCtx) {
     let status = ctx.backend.status();
-    let (d, stack) = dialog("Model", 520, 640);
+    let (d, stack) = dialog("Model and Agent", 520, 640);
 
     let search = gtk4::SearchEntry::new();
     search.set_placeholder_text(Some("Search models"));
@@ -747,8 +740,48 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn changing_effort_does_not_switch_until_row_activation() {
+        let picks = Rc::new(RefCell::new(Vec::new()));
+        let picked = picks.clone();
+        let pick: Pick =
+            Rc::new(move |driver, model, effort| picked.borrow_mut().push((driver, model, effort)));
+        let models = [model(Driver::Codex, "codex-other", &["low", "high"])];
+        let list = model_list(&models, "", &status(Driver::Claude, Some("opus")), &pick);
+        fn find<T: IsA<gtk4::Widget> + glib::types::StaticType + Clone>(
+            widget: &gtk4::Widget,
+        ) -> Option<T> {
+            if let Ok(value) = widget.clone().downcast::<T>() {
+                return Some(value);
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                if let Some(found) = find::<T>(&w) {
+                    return Some(found);
+                }
+                child = w.next_sibling();
+            }
+            None
+        }
+        let row = find::<adw::ActionRow>(&list).expect("model row");
+        let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        dropdown.set_selected(1);
+        assert!(
+            picks.borrow().is_empty(),
+            "browsing effort does not select another provider"
+        );
+        row.emit_by_name::<()>("activated", &[]);
+        assert_eq!(
+            *picks.borrow(),
+            [(
+                Driver::Codex,
+                "codex-other".to_owned(),
+                Some("high".to_owned())
+            )]
+        );
+    }
 
     fn status(driver: Driver, model: Option<&str>) -> SessionStatus {
         SessionStatus {

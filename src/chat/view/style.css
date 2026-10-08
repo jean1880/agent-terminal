@@ -76,7 +76,7 @@
 .subagent-shelf .subagent-list { background-color: transparent; }
 .subagent-now { font-family: monospace; font-size: 0.85em; color: @at_fg_soft; margin-left: 24px; }
 .approval-remembers { font-size: 0.85em; }
-.usage-text.usage-tag { font-size: 0.75em; color: @at_fg_faint; min-width: 2.2em; }
+.usage-text.usage-tag { font-size: 0.75em; color: @at_fg_dim; min-width: 2.2em; }
 .usage-text.usage-warn { color: @at_warning; }
 .usage-text.usage-crit { color: @at_danger; }
 .usage-agent { font-weight: 700; color: @at_fg_strong; }
@@ -104,7 +104,7 @@ levelbar.context-level block.empty { background-color: transparent; }
 .transcript { padding: 24px 24px 18px 24px; }
 
 .transcript-empty .empty-title { font-size: 1.4em; font-weight: 700; color: @at_fg_strong; }
-.transcript-empty .empty-hint { color: @at_fg_faint; }
+.transcript-empty .empty-hint { color: @at_fg_dim; }
 
 .jump-button { min-width: 36px; min-height: 36px; }
 
@@ -154,7 +154,7 @@ separator.md-rule { background-color: @at_border; margin: 4px 0; }
     border-bottom: 1px solid @at_surface_raised;
     border-radius: 10px 10px 0 0;
 }
-.code-lang { color: @at_fg_faint; font-family: monospace; font-size: 0.8em; }
+.code-lang { color: @at_fg_dim; font-family: monospace; font-size: 0.8em; }
 .code-copy { min-height: 24px; min-width: 24px; padding: 2px; color: @at_fg_dim; }
 textview.code-view, textview.code-view text {
     background-color: @at_bg_deep;
@@ -165,11 +165,11 @@ textview.code-view, textview.code-view text {
 .code-block scrolledwindow { border-radius: 0 0 10px 10px; }
 
 /* reasoning */
-.reasoning-toggle { padding: 2px 8px; border-radius: 8px; color: @at_fg_faint; }
+.reasoning-toggle { padding: 2px 8px; border-radius: 8px; color: @at_fg_dim; }
 .reasoning-toggle:hover { color: @at_fg_dim; }
-.reasoning-title { color: @at_fg_faint; font-style: italic; }
+.reasoning-title { color: @at_fg_dim; font-style: italic; }
 .reasoning-text {
-    color: mix(@at_fg_dim, @at_fg_faint, 0.5);
+    color: @at_fg_dim;
     font-style: italic;
     padding: 6px 12px 4px 30px;
 }
@@ -211,8 +211,10 @@ textview.code-view, textview.code-view text {
 .status-interrupted .status-badge { background-color: alpha(@at_fg_dim, 0.15); color: @at_fg_soft; }
 
 .card-body { padding: 4px 14px 14px 14px; }
+.diff-bar { padding: 0 12px 8px 12px; }
+.diff-section { padding: 0 14px 14px 14px; }
 .card-section .section-title {
-    color: @at_fg_faint;
+    color: @at_fg_dim;
     font-size: 0.75em;
     font-weight: 700;
     letter-spacing: 0.06em;
@@ -288,7 +290,7 @@ button.pill { padding: 6px 16px; border-radius: 999px; }
     color: mix(@at_info, @at_fg_strong, 0.4);
 }
 .question-text { color: mix(@at_fg_strong, @at_fg, 0.4); }
-.question-hint { color: @at_fg_faint; font-size: 0.85em; }
+.question-hint { color: @at_fg_dim; font-size: 0.85em; }
 togglebutton.option-button, button.option-button {
     padding: 8px 14px;
     border-radius: 10px;
@@ -382,7 +384,7 @@ togglebutton.option-button, button.option-button {
 .plan-step.step-active .step-glyph { color: @at_accent; }
 .plan-step.step-active .step-text { color: @at_fg_strong; font-weight: 600; }
 .plan-step.step-done .step-glyph { color: @at_success; }
-.plan-step.step-done .step-text { color: @at_fg_faint; }
+.plan-step.step-done .step-text { color: @at_fg_dim; }
 
 /* sticky interruption shelf */
 .interruption-shelf {
@@ -392,6 +394,10 @@ togglebutton.option-button, button.option-button {
     border: 1px solid alpha(@at_warning, 0.45);
     background-image: linear-gradient(180deg, alpha(@at_warning, 0.10), alpha(@at_warning, 0.02) 100%);
     box-shadow: 0 4px 12px alpha(#000000, 0.35);
+}
+.chat-bottom .small .interruption-shelf button.pill {
+    padding: 6px 8px;
+    min-height: 32px;
 }
 .interruption-shelf.is-question {
     border-color: alpha(@at_info, 0.45);
@@ -438,7 +444,7 @@ textview.composer-view text {
     caret-color: @at_accent;
     font-size: 1.02em;
 }
-.composer-placeholder { color: mix(@at_fg_dim, @at_fg_faint, 0.3); }
+.composer-placeholder { color: @at_fg_soft; }
 button.send-button {
     min-width: 36px;
     min-height: 36px;

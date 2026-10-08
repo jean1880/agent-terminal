@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use agent_core::adapter::{Driver, Mode};
 use agent_core::event::{
     BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
-    Question, ResponseCapability, StreamKind, TurnState,
+    Question, ResponseCapability, StreamKind, TurnState, WorkerSnapshot, WorkerState,
 };
 use serde_json::Value;
 
@@ -95,9 +95,51 @@ pub struct SubagentSummary {
     pub status: ToolStatus,
     /// How many steps (direct children) it has taken so far.
     pub steps: usize,
+    /// Provider-confirmed worker lifecycle; legacy nested tool calls have no separate lifecycle.
+    pub lifecycle: Option<WorkerState>,
+    /// Latest provider-reported activity, which is not necessarily still running.
+    pub activity: Option<String>,
 }
 
 impl SubagentSummary {
+    pub fn active(&self) -> bool {
+        match self.lifecycle {
+            Some(state) => matches!(
+                state,
+                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+            ),
+            None => self.status == ToolStatus::Running,
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        match self.lifecycle {
+            Some(WorkerState::Unknown) => false,
+            Some(_) => !self.active(),
+            None => self.status != ToolStatus::Running,
+        }
+    }
+
+    pub fn state_label(&self) -> &'static str {
+        match self.lifecycle {
+            Some(WorkerState::Starting) => "starting",
+            Some(WorkerState::Running) => "running",
+            Some(WorkerState::Waiting) => "waiting",
+            Some(WorkerState::Completed) => "completed",
+            Some(WorkerState::Failed) => "failed",
+            Some(WorkerState::Stopped) => "stopped",
+            Some(WorkerState::Closed) => "closed",
+            Some(WorkerState::Unknown) => "status unknown",
+            None => match self.status {
+                ToolStatus::Running => "running",
+                ToolStatus::Completed => "completed",
+                ToolStatus::Failed => "failed",
+                ToolStatus::Declined => "declined",
+                ToolStatus::Interrupted => "stopped",
+            },
+        }
+    }
+
     fn of(item: &Item, tool: &Tool) -> Self {
         // A live Claude sub-agent's input is not known when its card starts: it streams in as
         // JSON text after. Read the structured input when there is one, else the streamed text,
@@ -130,6 +172,11 @@ impl SubagentSummary {
             task,
             status: tool.status,
             steps: item.children.len(),
+            lifecycle: streamed
+                .as_ref()
+                .and_then(|i| i.get("worker_state"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            activity: field("activity"),
         }
     }
 }
@@ -247,9 +294,25 @@ pub enum Activity {
     /// Nothing has run yet (a new thread): nothing to say.
     Idle,
     /// The main agent's turn runs; `background` more tasks run alongside it.
-    Working { background: usize },
+    Working {
+        background: usize,
+    },
+    Thinking,
+    Tool {
+        title: String,
+        background: usize,
+    },
+    WaitingForWorkers {
+        names: Vec<String>,
+    },
+    NeedsApproval,
+    NeedsAnswer,
+    Failed,
+    Stopped,
     /// The main agent's turn is over, but it is still waiting on these background tasks.
-    Waiting { tasks: Vec<String> },
+    Waiting {
+        tasks: Vec<String>,
+    },
     /// A turn ran, and neither it nor any background work is still going.
     Finished,
 }
@@ -281,6 +344,25 @@ impl Activity {
             Self::Working { background: n } => {
                 Some(format!("Working…, plus {n} in the background"))
             }
+            Self::Thinking => Some("Thinking…".to_owned()),
+            Self::Tool { title, background } => Some(if *background == 0 {
+                format!("Running {title}…")
+            } else {
+                format!("Running {title} · {background} background tasks active")
+            }),
+            Self::WaitingForWorkers { names } => Some(format!(
+                "Waiting for {}…",
+                names
+                    .iter()
+                    .take(STATUS_TASKS)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Self::NeedsApproval => Some("Needs approval".to_owned()),
+            Self::NeedsAnswer => Some("Needs your answer".to_owned()),
+            Self::Failed => Some("Failed".to_owned()),
+            Self::Stopped => Some("Stopped".to_owned()),
             Self::Waiting { tasks } => {
                 let count = match tasks.len() {
                     1 => "1 background task".to_owned(),
@@ -298,13 +380,20 @@ impl Activity {
                 }
                 Some(format!("Main agent done, waiting on {count}: {names}"))
             }
-            Self::Finished => Some("Finished".to_owned()),
+            Self::Finished => Some("Completed".to_owned()),
         }
     }
 
     /// Whether a spinner turns: something is still running.
     pub fn busy(&self) -> bool {
-        matches!(self, Self::Working { .. } | Self::Waiting { .. })
+        matches!(
+            self,
+            Self::Working { .. }
+                | Self::Thinking
+                | Self::Tool { .. }
+                | Self::WaitingForWorkers { .. }
+                | Self::Waiting { .. }
+        )
     }
 }
 
@@ -344,6 +433,7 @@ pub enum Change {
     Mode,
     /// What the thread is doing changed: its turn, or its background work.
     Running,
+    Workers,
     Commands,
     /// A control reply, routed by request id to whoever asked.
     Control {
@@ -362,10 +452,15 @@ pub struct Transcript {
     pub plan: Vec<PlanStep>,
     pub gauge: Option<Gauge>,
     pub mode: Option<Mode>,
+    pub pending_mode: Option<Mode>,
     pub running: bool,
     /// Background work still going (sub-agents, background commands), as the agent last listed
     /// it: the main turn may be over while these run.
     pub background: Vec<BackgroundTask>,
+    /// Synthetic worker items live in `items` for detail panels, outside transcript order.
+    worker_ids: Vec<ItemId>,
+    waiting_for: Vec<ItemId>,
+    last_outcome: Option<TurnState>,
     /// A turn has run in this thread.
     ran: bool,
     last_driver: Option<Driver>,
@@ -467,6 +562,13 @@ impl Transcript {
             }
             stack.extend(item.children.iter().rev());
         }
+        for id in &self.worker_ids {
+            if let Some(item) = self.items.get(id) {
+                if let Body::Tool(tool) = &item.body {
+                    out.push(SubagentSummary::of(item, tool));
+                }
+            }
+        }
         out
     }
 
@@ -487,7 +589,214 @@ impl Transcript {
     /// The thread's status. `main_running`: the main agent's turn runs (the model's own view of
     /// it, or the backend's).
     pub fn activity(&self, main_running: bool) -> Activity {
-        Activity::of(main_running, &self.background, self.ran)
+        if let Some(pending) = self.pending_interruption() {
+            return match pending {
+                PendingInterruption::Approval { .. } => Activity::NeedsApproval,
+                PendingInterruption::Question { .. } => Activity::NeedsAnswer,
+            };
+        }
+        let agents = self.subagents();
+        if main_running && !self.waiting_for.is_empty() {
+            return Activity::WaitingForWorkers {
+                names: self
+                    .waiting_for
+                    .iter()
+                    .map(|id| {
+                        agents
+                            .iter()
+                            .find(|a| &a.id == id)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| "a sub-agent".to_owned())
+                    })
+                    .collect(),
+            };
+        }
+        let mut background = self.background.clone();
+        for worker in agents
+            .iter()
+            .filter(|a| a.lifecycle.is_some() && a.active())
+        {
+            background.push(BackgroundTask {
+                id: worker.id.clone(),
+                kind: BackgroundTaskKind::Agent,
+                description: Some(worker.name.clone()),
+                tool_use_id: None,
+            });
+        }
+        if main_running {
+            for id in self.order.iter().rev() {
+                match self.items.get(id).map(|item| &item.body) {
+                    Some(Body::Tool(tool))
+                        if tool.status == ToolStatus::Running
+                            && tool.kind != ItemKind::Subagent =>
+                    {
+                        return Activity::Tool {
+                            title: tool.title.clone(),
+                            background: background.len(),
+                        }
+                    }
+                    Some(Body::Reasoning {
+                        streaming: true, ..
+                    }) => return Activity::Thinking,
+                    _ => {}
+                }
+            }
+        }
+        let activity = Activity::of(main_running, &background, self.ran);
+        if activity == Activity::Finished {
+            return match self.last_outcome {
+                Some(TurnState::Failed) => Activity::Failed,
+                Some(TurnState::Interrupted) => Activity::Stopped,
+                _ => activity,
+            };
+        }
+        activity
+    }
+
+    fn worker_item_id(driver: Driver, id: &str) -> String {
+        format!("worker:{}:{id}", driver.info().key)
+    }
+
+    fn update_workers(
+        &mut self,
+        driver: Driver,
+        workers: &[WorkerSnapshot],
+        waiting_for: &[String],
+    ) {
+        let prefix = format!("worker:{}:", driver.info().key);
+        for id in self.worker_ids.iter().filter(|id| id.starts_with(&prefix)) {
+            if !workers
+                .iter()
+                .any(|w| Self::worker_item_id(driver, &w.id) == *id)
+            {
+                if let Some(Item {
+                    body: Body::Tool(tool),
+                    ..
+                }) = self.items.get_mut(id)
+                {
+                    if tool.status == ToolStatus::Running {
+                        tool.status = ToolStatus::Interrupted;
+                        if let Some(input) = tool.input.as_mut().and_then(Value::as_object_mut) {
+                            input.insert(
+                                "worker_state".to_owned(),
+                                serde_json::json!(WorkerState::Unknown),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for worker in workers {
+            let id = Self::worker_item_id(driver, &worker.id);
+            if !self.worker_ids.contains(&id) {
+                self.worker_ids.push(id.clone());
+            }
+            let previous = self.items.get(&id).and_then(|item| match &item.body {
+                Body::Tool(tool) => tool.input.as_ref(),
+                _ => None,
+            });
+            let known_field = |new: &Option<String>, key: &str| {
+                new.as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        previous
+                            .and_then(|input| input.get(key))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                    })
+                    .map(str::to_owned)
+            };
+            let task = known_field(&worker.task, "prompt");
+            let activity = known_field(&worker.activity, "activity");
+            let previous_state = previous
+                .and_then(|input| input.get("worker_state"))
+                .and_then(|state| serde_json::from_value::<WorkerState>(state.clone()).ok());
+            let state = match (worker.state, previous_state) {
+                (
+                    WorkerState::Unknown,
+                    Some(
+                        known @ (WorkerState::Completed
+                        | WorkerState::Failed
+                        | WorkerState::Stopped
+                        | WorkerState::Closed),
+                    ),
+                ) => known,
+                (state, _) => state,
+            };
+            let name = known_field(&worker.name, "agent").unwrap_or_else(|| {
+                format!(
+                    "{} worker {}",
+                    driver.info().label,
+                    worker.id.chars().take(8).collect::<String>()
+                )
+            });
+            let status = match state {
+                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting => {
+                    ToolStatus::Running
+                }
+                WorkerState::Completed | WorkerState::Closed => ToolStatus::Completed,
+                WorkerState::Failed => ToolStatus::Failed,
+                WorkerState::Stopped | WorkerState::Unknown => ToolStatus::Interrupted,
+            };
+            let tool = Tool {
+                kind: ItemKind::Subagent,
+                title: name.clone(),
+                input: Some(
+                    serde_json::json!({ "agent": name, "prompt": task, "worker_state": state, "activity": activity }),
+                ),
+                input_text: String::new(),
+                output: if matches!(state, WorkerState::Completed | WorkerState::Failed) {
+                    activity.unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                error: None,
+                status,
+            };
+            if let Some(item) = self.items.get_mut(&id) {
+                item.body = Body::Tool(tool);
+            } else {
+                self.items.insert(
+                    id.clone(),
+                    Item {
+                        id,
+                        body: Body::Tool(tool),
+                        expanded: true,
+                        parent: None,
+                        children: Vec::new(),
+                    },
+                );
+            }
+        }
+        self.waiting_for = waiting_for
+            .iter()
+            .map(|id| Self::worker_item_id(driver, id))
+            .collect();
+    }
+
+    /// Disconnected/replayed active workers have unknown live state, never an invented closure.
+    fn settle_workers(&mut self) -> bool {
+        let mut changed = !self.waiting_for.is_empty();
+        self.waiting_for.clear();
+        for id in &self.worker_ids {
+            if let Some(Item {
+                body: Body::Tool(tool),
+                ..
+            }) = self.items.get_mut(id)
+            {
+                if tool.status == ToolStatus::Running {
+                    tool.status = ToolStatus::Interrupted;
+                    if let Some(input) = tool.input.as_mut().and_then(Value::as_object_mut) {
+                        input.insert(
+                            "worker_state".to_owned(),
+                            serde_json::json!(WorkerState::Unknown),
+                        );
+                    }
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// The input an approval card shows. A Codex file-change request names the item it is about
@@ -617,6 +926,14 @@ impl Transcript {
     /// fresh events, so nothing here fights it. Returns whether anything changed.
     pub fn settle_stale(&mut self) -> bool {
         let mut changed = self.running || !self.background.is_empty();
+        if let Some(mode) = self.pending_mode.take() {
+            self.mode = Some(mode);
+            changed = true;
+        }
+        if self.running {
+            self.last_outcome = Some(TurnState::Interrupted);
+        }
+        changed |= self.settle_workers();
         self.running = false;
         self.background.clear();
         self.open_text = None;
@@ -663,6 +980,10 @@ impl Transcript {
         match &env.event {
             Event::SessionStarted { model, .. } => {
                 let agent_changed = self.last_driver.is_some_and(|d| d != driver);
+                if agent_changed && self.settle_workers() {
+                    out.push(Change::Workers);
+                    out.push(Change::Running);
+                }
                 let model_changed = model.is_some()
                     && self.last_model.is_some()
                     && model.as_deref() != self.last_model.as_deref();
@@ -676,6 +997,14 @@ impl Transcript {
                 }
             }
             Event::SessionExited { code, expected } => {
+                if let Some(mode) = self.pending_mode.take() {
+                    self.mode = Some(mode);
+                    out.push(Change::Mode);
+                }
+                if self.settle_workers() {
+                    out.push(Change::Workers);
+                    out.push(Change::Running);
+                }
                 // A dead session runs nothing in the background either.
                 if self.running || !self.background.is_empty() {
                     self.running = false;
@@ -698,6 +1027,7 @@ impl Transcript {
             }
             Event::CommandsChanged { .. } => out.push(Change::Commands),
             Event::TurnStarted { model } => {
+                self.last_outcome = None;
                 if self.last_driver.is_none() {
                     self.on_driver(driver);
                 }
@@ -714,8 +1044,14 @@ impl Transcript {
                 }
             }
             Event::TurnCompleted { state, error, .. } => {
+                let outcome_changed =
+                    self.last_outcome != Some(*state) || !self.waiting_for.is_empty();
+                self.last_outcome = Some(*state);
+                self.waiting_for.clear();
                 if self.running {
                     self.running = false;
+                    out.push(Change::Running);
+                } else if outcome_changed {
                     out.push(Change::Running);
                 }
                 if let Some(id) = self.open_text.take() {
@@ -746,6 +1082,14 @@ impl Transcript {
                 input,
                 parent,
             } => {
+                // Older Codex history labelled collaboration calls as subagents.
+                // Those calls do not establish a worker identity or lifecycle.
+                let restored_kind = if driver == Driver::Codex && *kind == ItemKind::Subagent {
+                    ItemKind::Tool
+                } else {
+                    *kind
+                };
+                let kind = &restored_kind;
                 let id = env.item.clone().unwrap_or_else(|| self.next_id("item"));
                 if let Some(item) = self.items.get_mut(&id) {
                     // Codex can start a tool before it knows the full action, then repeat the
@@ -921,6 +1265,15 @@ impl Transcript {
             }
             Event::ModeChanged { mode } => {
                 self.mode = Some(*mode);
+                self.pending_mode = None;
+                out.push(Change::Mode);
+            }
+            Event::ModeChangeDeferred {
+                requested,
+                effective,
+            } => {
+                self.mode = Some(*effective);
+                self.pending_mode = Some(*requested);
                 out.push(Change::Mode);
             }
             Event::UsageUpdated {
@@ -1001,6 +1354,14 @@ impl Transcript {
                     self.background.clone_from(tasks);
                     out.push(Change::Running);
                 }
+            }
+            Event::WorkersUpdated {
+                workers,
+                waiting_for,
+            } => {
+                self.update_workers(driver, workers, waiting_for);
+                out.push(Change::Workers);
+                out.push(Change::Running);
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
             Event::QuotaUpdated { .. } | Event::Unknown => {}
@@ -1165,6 +1526,229 @@ mod tests {
 
     fn ev(e: Event) -> Envelope {
         Envelope::new(e)
+    }
+
+    fn worker_state(state: WorkerState, waiting: bool) -> Envelope {
+        ev(Event::WorkersUpdated {
+            workers: vec![WorkerSnapshot {
+                id: "child-1".into(),
+                name: Some("Mira".into()),
+                task: Some("Review the composer".into()),
+                state,
+                activity: Some("Inspecting controls".into()),
+            }],
+            waiting_for: if waiting {
+                vec!["child-1".into()]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    #[test]
+    fn deferred_mode_keeps_current_policy_until_adoption() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::ModeChanged { mode: Mode::Ask }), Driver::Codex);
+        t.apply(
+            &ev(Event::ModeChangeDeferred {
+                requested: Mode::AcceptEdits,
+                effective: Mode::Ask,
+            }),
+            Driver::Codex,
+        );
+        assert_eq!(t.mode, Some(Mode::Ask));
+        assert_eq!(t.pending_mode, Some(Mode::AcceptEdits));
+        t.apply(
+            &ev(Event::ModeChanged {
+                mode: Mode::AcceptEdits,
+            }),
+            Driver::Codex,
+        );
+        assert_eq!(t.mode, Some(Mode::AcceptEdits));
+        assert_eq!(t.pending_mode, None);
+    }
+
+    #[test]
+    fn stale_or_exited_session_adopts_deferred_mode_as_the_idle_default() {
+        let mut stale = Transcript::new();
+        let deferred = ev(Event::ModeChangeDeferred {
+            requested: Mode::AcceptEdits,
+            effective: Mode::Ask,
+        });
+        stale.apply(&deferred, Driver::Codex);
+        let mut exited = Transcript::new();
+        exited.apply(&deferred, Driver::Codex);
+        assert!(stale.settle_stale());
+        assert_eq!(stale.mode, Some(Mode::AcceptEdits));
+        assert_eq!(stale.pending_mode, None);
+        assert!(!stale.settle_stale(), "settlement is idempotent");
+        let changes = exited.apply(
+            &ev(Event::SessionExited {
+                code: Some(0),
+                expected: true,
+            }),
+            Driver::Codex,
+        );
+        assert_eq!(exited.mode, Some(Mode::AcceptEdits));
+        assert_eq!(exited.pending_mode, None);
+        assert!(changes.iter().any(|change| matches!(change, Change::Mode)));
+    }
+
+    #[test]
+    fn old_codex_collaboration_calls_are_not_counted_as_workers() {
+        let mut t = Transcript::new();
+        t.apply(
+            &started("old-spawn", ItemKind::Subagent, None),
+            Driver::Codex,
+        );
+        assert!(t.subagents().is_empty());
+        assert!(
+            matches!(t.get("old-spawn").map(|i| &i.body), Some(Body::Tool(tool)) if tool.kind == ItemKind::Tool)
+        );
+        t.apply(&worker_state(WorkerState::Running, false), Driver::Codex);
+        assert_eq!(t.subagents().len(), 1);
+    }
+
+    #[test]
+    fn worker_wait_is_visible_during_a_turn_and_results_do_not_close_workers() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        assert_eq!(t.activity(true), Activity::Working { background: 0 });
+        t.apply(&worker_state(WorkerState::Running, true), Driver::Codex);
+        assert_eq!(
+            t.activity(true),
+            Activity::WaitingForWorkers {
+                names: vec!["Mira".into()]
+            }
+        );
+        let first_id = t.subagents()[0].id.clone();
+        assert!(t.subagents()[0].active());
+        t.apply(&worker_state(WorkerState::Completed, false), Driver::Codex);
+        let done = t.subagents();
+        assert_eq!(done.len(), 1, "follow-up operations update the same worker");
+        assert_eq!(done[0].id, first_id);
+        assert_eq!(done[0].task, "Review the composer");
+        assert_eq!(done[0].state_label(), "completed");
+        assert!(done[0].finished());
+        assert!(!done[0].active());
+        t.apply(&worker_state(WorkerState::Closed, false), Driver::Codex);
+        assert_eq!(t.subagents()[0].state_label(), "closed");
+        assert_eq!(
+            t.order().len(),
+            0,
+            "worker details are not duplicate operation transcript cards"
+        );
+    }
+
+    #[test]
+    fn sparse_worker_snapshots_preserve_known_metadata_and_terminal_state() {
+        for state in [
+            WorkerState::Completed,
+            WorkerState::Failed,
+            WorkerState::Stopped,
+            WorkerState::Closed,
+        ] {
+            let mut t = Transcript::new();
+            t.apply(&worker_state(state, false), Driver::Codex);
+            t.apply(
+                &ev(Event::WorkersUpdated {
+                    workers: vec![WorkerSnapshot {
+                        id: "child-1".into(),
+                        name: Some("  ".into()),
+                        task: None,
+                        state: WorkerState::Unknown,
+                        activity: Some(String::new()),
+                    }],
+                    waiting_for: Vec::new(),
+                }),
+                Driver::Codex,
+            );
+            let workers = t.subagents();
+            assert_eq!(workers.len(), 1);
+            assert_eq!(workers[0].name, "Mira");
+            assert_eq!(workers[0].task, "Review the composer");
+            assert_eq!(workers[0].activity.as_deref(), Some("Inspecting controls"));
+            assert_eq!(workers[0].lifecycle, Some(state));
+        }
+    }
+
+    #[test]
+    fn explicit_worker_restart_replaces_terminal_state_and_retains_last_metadata() {
+        let mut t = Transcript::new();
+        t.apply(&worker_state(WorkerState::Closed, false), Driver::Codex);
+        t.apply(
+            &ev(Event::WorkersUpdated {
+                workers: vec![WorkerSnapshot {
+                    id: "child-1".into(),
+                    name: None,
+                    task: Some("Review the new task".into()),
+                    state: WorkerState::Running,
+                    activity: None,
+                }],
+                waiting_for: Vec::new(),
+            }),
+            Driver::Codex,
+        );
+        let workers = t.subagents();
+        assert_eq!(workers[0].name, "Mira");
+        assert_eq!(workers[0].task, "Review the new task");
+        assert_eq!(workers[0].activity.as_deref(), Some("Inspecting controls"));
+        assert_eq!(workers[0].lifecycle, Some(WorkerState::Running));
+        assert!(workers[0].active());
+    }
+
+    #[test]
+    fn active_workers_survive_main_completion_but_replay_settles_their_live_state() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        t.apply(&worker_state(WorkerState::Running, false), Driver::Codex);
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+            Driver::Codex,
+        );
+        assert_eq!(
+            t.activity(false),
+            Activity::Waiting {
+                tasks: vec!["Mira".into()]
+            }
+        );
+        assert!(t.settle_stale());
+        assert!(!t.subagents()[0].active());
+        assert_eq!(t.subagents()[0].state_label(), "status unknown");
+        assert_eq!(t.activity(false), Activity::Finished);
+    }
+
+    #[test]
+    fn failed_turn_is_not_reported_as_success_and_reasoning_is_explicit() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        assert_eq!(t.activity(true), Activity::Working { background: 0 });
+        t.apply(
+            &ev(Event::ItemStarted {
+                kind: ItemKind::Reasoning,
+                title: "reasoning".into(),
+                input: None,
+                parent: None,
+            })
+            .item("r1"),
+            Driver::Codex,
+        );
+        assert_eq!(t.activity(true), Activity::Thinking);
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Failed,
+                usage: None,
+                cost_usd: None,
+                error: Some("test failure".into()),
+            }),
+            Driver::Codex,
+        );
+        assert_eq!(t.activity(false), Activity::Failed);
     }
 
     fn approval_for(step: &str, request: &str) -> Envelope {
@@ -1843,7 +2427,7 @@ mod tests {
         assert!(t.settle_stale());
         assert!(!t.running, "no phantom running turn");
         assert!(t.background.is_empty());
-        assert_eq!(t.activity(false), Activity::Finished);
+        assert_eq!(t.activity(false), Activity::Stopped);
         let tool = |id: &str| match &t.get(id).expect(id).body {
             Body::Tool(tool) => tool.status,
             other => panic!("not a tool: {other:?}"),

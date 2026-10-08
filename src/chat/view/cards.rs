@@ -487,6 +487,37 @@ impl Row {
         }
     }
 
+    /// Focuses a pending answer after an explicit user jump. Historical/expired cards never
+    /// take focus; approval buttons are ordered with Deny/Cancel before permission grants.
+    pub fn focus_pending_action(&self) -> bool {
+        let area = match self {
+            Self::Approval(a) if a.buttons.is_visible() && a.buttons.is_sensitive() => {
+                a.buttons.clone().upcast::<gtk4::Widget>()
+            }
+            Self::Question(q) if q.submit.is_visible() && q.options.is_sensitive() => {
+                q.options.clone().upcast::<gtk4::Widget>()
+            }
+            _ => return false,
+        };
+        fn focus_button(widget: &gtk4::Widget) -> bool {
+            if !widget.is_visible() || !widget.is_sensitive() {
+                return false;
+            }
+            if widget.is::<gtk4::Button>() && widget.is_focusable() {
+                return widget.grab_focus();
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if focus_button(&widget) {
+                    return true;
+                }
+            }
+            false
+        }
+        focus_button(&area)
+    }
+
     /// Where nested (subagent) rows go.
     pub fn children_box(&self) -> Option<&gtk4::Box> {
         match self {
@@ -762,6 +793,9 @@ impl ReasoningRow {
 
 pub struct ToolCard {
     root: gtk4::Box,
+    header: gtk4::Button,
+    is_edit: Rc<Cell<bool>>,
+    details_guard: Rc<Cell<bool>>,
     status: gtk4::Stack,
     spinner: gtk4::Spinner,
     status_icon: gtk4::Image,
@@ -786,6 +820,7 @@ pub struct ToolCard {
 struct FileDiffUi {
     bar: gtk4::Box,
     toggle: gtk4::ToggleButton,
+    details: gtk4::ToggleButton,
     // Held so the widgets live as long as the card; read by the GTK checks.
     #[cfg_attr(not(test), allow(dead_code))]
     open: gtk4::Button,
@@ -895,6 +930,11 @@ impl ToolCard {
         let diff = Self::build_diff_ui(id, sink);
         root.append(&diff.bar);
         root.append(&diff.revealer);
+        header.update_relation(&[gtk4::accessible::Relation::Controls(&[diff
+            .revealer
+            .upcast_ref()])]);
+        let is_edit = Rc::new(Cell::new(false));
+        let details_guard = Rc::new(Cell::new(false));
 
         let body = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
         body.add_css_class("card-body");
@@ -918,18 +958,53 @@ impl ToolCard {
 
         let id = id.to_owned();
         let sink = sink.clone();
+        let (detail_id, detail_sink) = (id.to_owned(), sink.clone());
+        let edit = is_edit.clone();
+        let diff_toggle = diff.toggle.clone();
         header.connect_clicked(glib::clone!(
             #[weak]
             revealer,
             move |_| {
+                if edit.get() {
+                    diff_toggle.set_active(!diff_toggle.is_active());
+                    return;
+                }
                 sink(RowEvent::Toggle {
                     id: id.clone(),
                     expanded: !revealer.reveals_child(),
                 });
             }
         ));
+        let guard = details_guard.clone();
+        diff.details.connect_toggled(move |button| {
+            if guard.get() {
+                return;
+            }
+            detail_sink(RowEvent::Toggle {
+                id: detail_id.clone(),
+                expanded: button.is_active(),
+            });
+        });
+        diff.toggle.connect_toggled(glib::clone!(
+            #[weak]
+            header,
+            #[weak]
+            chevron,
+            move |toggle| {
+                let open = toggle.is_active();
+                header.update_state(&[gtk4::accessible::State::Expanded(Some(open))]);
+                chevron.set_icon_name(Some(if open {
+                    "at-pan-down-symbolic"
+                } else {
+                    "at-pan-end-symbolic"
+                }));
+            }
+        ));
         Self {
             root,
+            header,
+            is_edit,
+            details_guard,
             status,
             spinner,
             status_icon,
@@ -954,7 +1029,9 @@ impl ToolCard {
         let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         bar.add_css_class("diff-bar");
         bar.set_visible(false);
-        let toggle = gtk4::ToggleButton::with_label("View diff");
+        // The file header is the primary changes disclosure. This toggle holds its state and
+        // loading signal; raw protocol details are a separate, explicitly named action.
+        let toggle = gtk4::ToggleButton::with_label("Show changes");
         toggle.add_css_class("flat");
         toggle.add_css_class("diff-toggle");
         let open = gtk4::Button::new();
@@ -965,7 +1042,10 @@ impl ToolCard {
         let open_label = label("", &[]);
         open_row.append(&open_label);
         open.set_child(Some(&open_row));
-        bar.append(&toggle);
+        let details = gtk4::ToggleButton::with_label("Raw details");
+        details.add_css_class("flat");
+        details.set_visible(false);
+        bar.append(&details);
         bar.append(&open);
 
         let status = label("", &["diff-status", "dim-label"]);
@@ -1012,6 +1092,7 @@ impl ToolCard {
         FileDiffUi {
             bar,
             toggle,
+            details,
             open,
             open_label,
             revealer,
@@ -1021,6 +1102,10 @@ impl ToolCard {
     }
 
     /// Shows the diff the host computed for this card.
+    pub(crate) fn set_changes_expanded(&self, expanded: bool) {
+        self.diff.toggle.set_active(expanded);
+    }
+
     pub fn show_diff(&self, reply: &DiffReply) {
         let ui = &self.diff;
         if !ui.toggle.is_active() {
@@ -1087,6 +1172,7 @@ impl ToolCard {
             return;
         };
         let is_edit = tool.kind == ItemKind::FileChange;
+        self.is_edit.set(is_edit);
         self.diff.bar.set_visible(is_edit);
         if !is_edit {
             self.diff.revealer.set_reveal_child(false);
@@ -1126,9 +1212,42 @@ impl ToolCard {
         });
         self.badge.set_visible(!self.badge.text().is_empty());
         self.kind_icon.set_icon_name(Some(kind_icon(tool.kind)));
-        self.title.set_text(&tool.title);
+        self.title
+            .set_text(if is_edit { "Show changes" } else { &tool.title });
         let summary = payload::tool_summary(tool.kind, tool.input.as_ref(), &tool.input_text);
-        self.summary.set_text(summary.as_deref().unwrap_or(""));
+        let paths = if is_edit {
+            tool.input
+                .as_ref()
+                .map(agent_kit::editdiff::preview_from_input)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|edit| edit.path)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let files = if paths.is_empty() {
+            tool.title.clone()
+        } else {
+            paths.join(", ")
+        };
+        self.summary.set_text(if is_edit {
+            &files
+        } else {
+            summary.as_deref().unwrap_or("")
+        });
+        self.summary.set_wrap(is_edit);
+        self.summary.set_ellipsize(if is_edit {
+            gtk4::pango::EllipsizeMode::None
+        } else {
+            gtk4::pango::EllipsizeMode::End
+        });
+        self.header
+            .update_property(&[gtk4::accessible::Property::Label(&if is_edit {
+                format!("Show changes for {files}")
+            } else {
+                format!("{} {}", tool.title, summary.as_deref().unwrap_or(""))
+            })]);
         let input = payload::tool_input_text(tool.kind, tool.input.as_ref(), &tool.input_text);
         self.input_box.set_visible(!input.trim().is_empty());
         self.input
@@ -1144,8 +1263,45 @@ impl ToolCard {
             _ => self.error.set_visible(false),
         }
         self.children.set_visible(!item.children.is_empty());
-        self.revealer.set_reveal_child(item.expanded);
-        self.chevron.set_icon_name(Some(if item.expanded {
+        let useful_details = !input.trim().is_empty()
+            || !tool.output.trim().is_empty()
+            || tool.error.as_ref().is_some_and(|e| !e.trim().is_empty())
+            || !item.children.is_empty();
+        self.diff.details.set_visible(is_edit && useful_details);
+        self.header.set_sensitive(is_edit || useful_details);
+        self.chevron.set_visible(is_edit || useful_details);
+        self.diff
+            .details
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Raw details for {files}"
+            ))]);
+        self.details_guard.set(true);
+        self.diff.details.set_active(item.expanded);
+        self.details_guard.set(false);
+        self.diff
+            .details
+            .update_state(&[gtk4::accessible::State::Expanded(Some(item.expanded))]);
+        self.diff
+            .details
+            .update_relation(&[gtk4::accessible::Relation::Controls(&[self
+                .revealer
+                .upcast_ref()])]);
+        self.header
+            .update_relation(&[gtk4::accessible::Relation::Controls(&[if is_edit {
+                self.diff.revealer.upcast_ref()
+            } else {
+                self.revealer.upcast_ref()
+            }])]);
+        self.revealer
+            .set_reveal_child(item.expanded && useful_details);
+        let expanded = if is_edit {
+            self.diff.toggle.is_active()
+        } else {
+            item.expanded
+        };
+        self.header
+            .update_state(&[gtk4::accessible::State::Expanded(Some(expanded))]);
+        self.chevron.set_icon_name(Some(if expanded {
             "at-pan-down-symbolic"
         } else {
             "at-pan-end-symbolic"
@@ -1340,6 +1496,20 @@ impl ApprovalCard {
                 Decision::AllowForSession => 3,
                 Decision::Allow => 4,
             });
+            let extra = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+            extra.set_margin_top(6);
+            extra.set_margin_bottom(6);
+            extra.set_margin_start(6);
+            extra.set_margin_end(6);
+            let more = gtk4::MenuButton::new();
+            more.set_label("More");
+            more.set_tooltip_text(Some("More permission options"));
+            more.update_property(&[gtk4::accessible::Property::Label("More permission options")]);
+            more.add_css_class("pill");
+            let popover = gtk4::Popover::new();
+            popover.set_child(Some(&extra));
+            more.set_popover(Some(&popover));
+            let mut added_more = false;
             for d in order {
                 let b = gtk4::Button::with_label(decision_label(d));
                 b.add_css_class("pill");
@@ -1350,13 +1520,23 @@ impl ApprovalCard {
                 }
                 let sink = self.sink.clone();
                 let request = a.request.clone();
+                let popover = popover.clone();
                 b.connect_clicked(move |_| {
+                    popover.popdown();
                     sink(RowEvent::Approve {
                         request: request.clone(),
                         decision: d,
                     });
                 });
-                self.buttons.append(&b);
+                if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
+                    if !added_more {
+                        self.buttons.append(&more);
+                        added_more = true;
+                    }
+                    extra.append(&b);
+                } else {
+                    self.buttons.append(&b);
+                }
             }
         }
 
@@ -1558,8 +1738,111 @@ impl QuestionCardWidget {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn file_changes_and_permission_details_have_distinct_actions() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let sink: RowSink = Rc::new(move |event| received.borrow_mut().push(event));
+        let item = Item {
+            id: "edit".into(),
+            body: Body::Tool(super::super::model::Tool {
+                kind: ItemKind::FileChange,
+                title: "a.rs (+1 more)".into(),
+                input: Some(serde_json::json!([
+                    {"path":"a.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new\n"},
+                    {"path":"b.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-before\n+after\n"}
+                ])),
+                input_text: String::new(),
+                output: String::new(),
+                error: None,
+                status: ToolStatus::Completed,
+            }),
+            expanded: false,
+            parent: None,
+            children: Vec::new(),
+        };
+        let card = ToolCard::new(&item.id, &sink);
+        card.update(&item);
+        assert!(card.summary.text().contains("a.rs") && card.summary.text().contains("b.rs"));
+        card.header.emit_clicked();
+        assert!(card.diff.revealer.reveals_child());
+        assert!(matches!(events.borrow().last(), Some(RowEvent::LoadDiff { id }) if id == "edit"));
+        assert!(
+            !card.revealer.reveals_child(),
+            "showing changes does not expand raw details"
+        );
+        card.diff.details.set_active(true);
+        assert!(
+            matches!(events.borrow().last(), Some(RowEvent::Toggle { id, expanded: true }) if id == "edit")
+        );
+
+        let mut transcript = super::super::model::Transcript::new();
+        transcript.apply(
+            &agent_core::event::Envelope::new(agent_core::event::Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command":"cargo test"}),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowAlways,
+                    Decision::AllowForSession,
+                    Decision::Deny,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: Some("cargo test in this folder".into()),
+            })
+            .request("approval"),
+            Driver::Claude,
+        );
+        let approval = ApprovalCard::new(&sink);
+        approval.update(transcript.get("approval:approval").expect("approval card"));
+        let deny = approval
+            .buttons
+            .first_child()
+            .expect("deny")
+            .downcast::<gtk4::Button>()
+            .expect("direct deny");
+        assert_eq!(deny.label().as_deref(), Some("Deny"));
+        let more = deny
+            .next_sibling()
+            .expect("more")
+            .downcast::<gtk4::MenuButton>()
+            .expect("advanced choices");
+        let allow = more
+            .next_sibling()
+            .expect("allow")
+            .downcast::<gtk4::Button>()
+            .expect("direct allow");
+        assert_eq!(allow.label().as_deref(), Some("Allow"));
+        assert!(
+            allow.next_sibling().is_none(),
+            "long-lived grants do not widen direct controls"
+        );
+        let extra = more
+            .popover()
+            .expect("advanced menu")
+            .child()
+            .expect("choices");
+        let always = extra
+            .first_child()
+            .expect("always allow")
+            .downcast::<gtk4::Button>()
+            .expect("grant");
+        always.emit_clicked();
+        assert!(
+            matches!(events.borrow().last(), Some(RowEvent::Approve { request, decision: Decision::AllowAlways }) if request == "approval")
+        );
+        assert!(
+            approval
+                .remembers
+                .text()
+                .contains("cargo test in this folder"),
+            "scope explanation is retained"
+        );
+    }
 
     #[test]
     fn divider_texts() {

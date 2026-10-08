@@ -141,6 +141,11 @@ pub enum Event {
     ModeChanged {
         mode: crate::adapter::Mode,
     },
+    /// The next turn's mode was selected, while the active turn retains its original policy.
+    ModeChangeDeferred {
+        requested: crate::adapter::Mode,
+        effective: crate::adapter::Mode,
+    },
     /// Structured questions (Claude AskUserQuestion).
     QuestionRequested {
         questions: Vec<Question>,
@@ -181,6 +186,15 @@ pub enum Event {
     /// Claude only (`background_tasks_changed`).
     BackgroundTasks {
         tasks: Vec<BackgroundTask>,
+    },
+    /// Full registry of known provider workers, including finished and explicitly closed ones.
+    /// `waiting_for` names workers an open, explicit wait operation currently targets; it is
+    /// independent of whether the main turn remains open. Call completion is not worker closure.
+    WorkersUpdated {
+        #[serde(default)]
+        workers: Vec<WorkerSnapshot>,
+        #[serde(default)]
+        waiting_for: Vec<String>,
     },
     /// Text the CLI produced itself (local slash command output, synthetic messages).
     Notice {
@@ -368,6 +382,37 @@ pub struct BackgroundTask {
     pub tool_use_id: Option<String>,
 }
 
+/// Provider-reported identity and last known state of a worker (not a collaboration tool call).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSnapshot {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub state: WorkerState,
+    /// Latest reported activity or result; absence is unknown, never inferred from silence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    Starting,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Stopped,
+    /// Explicit shutdown/closed signal; a completed task leaves its worker open.
+    Closed,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 /// What a background task runs. A kind this build does not know decodes as `Other`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -463,5 +508,25 @@ mod tests {
     fn event_tag_is_snake_case() {
         let json = serde_json::to_value(Event::Unknown).expect("serialize");
         assert_eq!(json["type"], "unknown");
+    }
+
+    #[test]
+    fn worker_snapshot_defaults_missing_or_future_state_to_unknown() {
+        let event: Event = serde_json::from_str(
+            r#"{"type":"workers_updated","workers":[{"id":"a"},{"id":"b","state":"future"}]}"#,
+        )
+        .expect("decode");
+        let Event::WorkersUpdated {
+            workers,
+            waiting_for,
+        } = event
+        else {
+            panic!("workers");
+        };
+        assert!(waiting_for.is_empty());
+        assert!(workers.iter().all(|w| w.state == WorkerState::Unknown
+            && w.name.is_none()
+            && w.task.is_none()
+            && w.activity.is_none()));
     }
 }

@@ -16,17 +16,13 @@ use adw::prelude::AdwDialogExt;
 use gtk4::prelude::*;
 
 use super::cards::{label, wrapping, Row, RowSink};
-use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
+#[cfg(test)]
+use super::model::ToolStatus;
+use super::model::{Body, SubagentSummary, Transcript};
 
 /// `running`, `done · 12 steps`.
 pub fn status_text(s: &SubagentSummary) -> String {
-    let state = match s.status {
-        ToolStatus::Running => "running",
-        ToolStatus::Completed => "done",
-        ToolStatus::Failed => "failed",
-        ToolStatus::Declined => "declined",
-        ToolStatus::Interrupted => "stopped",
-    };
+    let state = s.state_label();
     match s.steps {
         0 => state.to_owned(),
         1 => format!("{state} · 1 step"),
@@ -37,32 +33,35 @@ pub fn status_text(s: &SubagentSummary) -> String {
 /// The explorer's order: running sub-agents first, then the finished ones, each in the order they
 /// began.
 pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
-    let (mut running, done): (Vec<_>, Vec<_>) = agents
-        .iter()
-        .cloned()
-        .partition(|a| a.status == ToolStatus::Running);
-    running.extend(done);
-    running
+    let mut ordered = agents.to_vec();
+    ordered.sort_by_key(|a| {
+        if a.active() {
+            0
+        } else if a.finished() {
+            2
+        } else {
+            1
+        }
+    });
+    ordered
 }
 
 /// The header button's text: how many sub-agents, and how many of them still run.
 pub fn count_text(agents: &[SubagentSummary]) -> String {
-    let all = match agents.len() {
-        1 => "1 sub-agent".to_owned(),
-        n => format!("{n} sub-agents"),
-    };
-    match agents
-        .iter()
-        .filter(|a| a.status == ToolStatus::Running)
-        .count()
-    {
-        0 => all,
-        n => format!("{all} · {n} running"),
+    let active = agents.iter().filter(|a| a.active()).count();
+    let finished = agents.iter().filter(|a| a.finished()).count();
+    let unknown = agents.len().saturating_sub(active + finished);
+    let known = format!("{active} active · {finished} finished");
+    if unknown == 0 {
+        known
+    } else {
+        format!("{known} · {unknown} unknown")
     }
 }
 
 /// The labels of one list row, set in place.
 struct ListRow {
+    row: gtk4::ListBoxRow,
     name: gtk4::Label,
     status: gtk4::Label,
     task: gtk4::Label,
@@ -80,6 +79,9 @@ impl ListRow {
         let name = label("", &["subagent-name"]);
         name.set_hexpand(true);
         name.set_xalign(0.0);
+        name.set_wrap(true);
+        name.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        name.set_max_width_chars(30);
         top.append(&name);
         let status = label("", &["subagent-status", "dim-label"]);
         top.append(&status);
@@ -90,14 +92,49 @@ impl ListRow {
         b.append(&task);
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&b));
-        (row, Self { name, status, task })
+        (
+            row.clone(),
+            Self {
+                row,
+                name,
+                status,
+                task,
+            },
+        )
     }
 
     fn set(&self, agent: &SubagentSummary) {
         set_if_changed(&self.name, &agent.name);
         set_if_changed(&self.status, &status_text(agent));
-        set_if_changed(&self.task, &agent.task);
-        self.task.set_visible(!agent.task.is_empty());
+        set_if_changed(
+            &self.task,
+            if agent.task.is_empty() {
+                "No task reported"
+            } else {
+                &agent.task
+            },
+        );
+        let short_id: String = agent
+            .id
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        self.row.update_property(&[
+            gtk4::accessible::Property::Label(&format!("{}; worker {short_id}", agent.name)),
+            gtk4::accessible::Property::Description(&format!(
+                "{}; {}",
+                status_text(agent),
+                if agent.task.is_empty() {
+                    "No task reported"
+                } else {
+                    &agent.task
+                }
+            )),
+        ]);
     }
 }
 
@@ -128,6 +165,8 @@ impl SubagentButton {
         let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         inner.append(&gtk4::Image::from_icon_name(crate::icons::SUBAGENT_ICON));
         let count = label("", &["subagent-count"]);
+        count.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        count.set_max_width_chars(22);
         inner.append(&count);
         root.set_child(Some(&inner));
         root.set_visible(false);
@@ -139,7 +178,6 @@ impl SubagentButton {
         scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scroller.set_propagate_natural_height(true);
         scroller.set_max_content_height(420);
-        scroller.set_min_content_width(340);
         scroller.set_child(Some(&list));
         let popover = gtk4::Popover::new();
         popover.add_css_class("subagent-popover");
@@ -176,12 +214,29 @@ impl SubagentButton {
     /// sub-agents changes; otherwise their labels are set in place.
     pub fn set(&self, agents: &[SubagentSummary]) {
         self.root.set_visible(!agents.is_empty());
-        set_if_changed(&self.count, &count_text(agents));
+        let counts = count_text(agents);
+        set_if_changed(&self.count, &counts);
+        self.root
+            .set_tooltip_text(Some(&format!("Workers: {counts}; show all workers")));
+        self.root
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Workers: {counts}; show all workers"
+            ))]);
         let same = {
             let rows = self.rows.borrow();
             rows.len() == agents.len() && rows.iter().zip(agents).all(|((id, _), a)| *id == a.id)
         };
         if !same {
+            let focused = self.list.root().and_then(|r| r.focus()).and_then(|focus| {
+                self.rows
+                    .borrow()
+                    .iter()
+                    .find(|(_, labels)| {
+                        focus.is_ancestor(&labels.row)
+                            || focus == labels.row.clone().upcast::<gtk4::Widget>()
+                    })
+                    .map(|(id, _)| id.clone())
+            });
             while let Some(child) = self.list.first_child() {
                 self.list.remove(&child);
             }
@@ -192,9 +247,47 @@ impl SubagentButton {
                 rows.push((agent.id.clone(), labels));
             }
             *self.rows.borrow_mut() = rows;
+            if let Some(id) = focused {
+                if let Some((_, row)) = self.rows.borrow().iter().find(|(key, _)| *key == id) {
+                    row.row.grab_focus();
+                } else {
+                    self.root.grab_focus();
+                }
+            }
         }
+        let mut previous_group = None;
         for ((_, labels), agent) in self.rows.borrow().iter().zip(agents) {
             labels.set(agent);
+            let group = if agent.active() {
+                "Active"
+            } else if agent.finished() {
+                "History"
+            } else {
+                "Status unknown"
+            };
+            if previous_group != Some(group) {
+                if let Some(heading) = labels
+                    .row
+                    .header()
+                    .and_then(|w| w.downcast::<gtk4::Label>().ok())
+                {
+                    set_if_changed(&heading, group);
+                } else {
+                    let heading = gtk4::Label::builder()
+                        .label(group)
+                        .accessible_role(gtk4::AccessibleRole::Heading)
+                        .xalign(0.0)
+                        .css_classes(["heading"])
+                        .margin_top(10)
+                        .margin_bottom(6)
+                        .margin_start(10)
+                        .build();
+                    labels.row.set_header(Some(&heading));
+                }
+            } else {
+                labels.row.set_header(None::<&gtk4::Widget>);
+            }
+            previous_group = Some(group);
         }
     }
 
@@ -344,6 +437,12 @@ impl SubagentPanel {
         for child in &item.children {
             self.sync(model, child, &self.steps, changed);
         }
+        self.empty
+            .set_text(if summary.is_some_and(|s| s.lifecycle.is_some()) {
+                "Step telemetry unavailable."
+            } else {
+                "No steps yet."
+            });
         self.empty.set_visible(item.children.is_empty());
 
         let report = tool.output.trim();
@@ -414,8 +513,37 @@ fn section(title: &str) -> (gtk4::Box, gtk4::Label) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn worker_group_updates_without_rebuilding_its_row() {
+        let button = SubagentButton::new(|_| {});
+        let mut worker = agent("same-worker", ToolStatus::Running);
+        button.set(&[worker.clone()]);
+        let first = button.list.row_at_index(0).expect("worker row");
+        let header = || {
+            first
+                .header()
+                .expect("group heading")
+                .downcast::<gtk4::Label>()
+                .expect("heading")
+                .text()
+                .to_string()
+        };
+        assert_eq!(header(), "Active");
+        worker.lifecycle = Some(agent_core::event::WorkerState::Completed);
+        button.set(&[worker]);
+        assert_eq!(
+            button.list.row_at_index(0).as_ref(),
+            Some(&first),
+            "the same worker retains its widget"
+        );
+        assert_eq!(
+            header(),
+            "History",
+            "completion updates grouping even when order is unchanged"
+        );
+    }
 
     fn agent(id: &str, status: ToolStatus) -> SubagentSummary {
         SubagentSummary {
@@ -424,6 +552,8 @@ mod tests {
             task: String::new(),
             status,
             steps: 0,
+            lifecycle: None,
+            activity: None,
         }
     }
 
@@ -437,11 +567,33 @@ mod tests {
         ];
         let ids: Vec<_> = running_first(&all).into_iter().map(|a| a.id).collect();
         assert_eq!(ids, ["b", "d", "a", "c"]);
-        assert_eq!(count_text(&all), "4 sub-agents · 2 running");
-        assert_eq!(count_text(&all[..1]), "1 sub-agent");
-        assert_eq!(count_text(&all[2..3]), "1 sub-agent");
-        assert_eq!(count_text(&all[1..2]), "1 sub-agent · 1 running");
-        assert_eq!(status_text(&all[0]), "done");
+        assert_eq!(count_text(&all), "2 active · 2 finished");
+        assert_eq!(count_text(&all[..1]), "0 active · 1 finished");
+        assert_eq!(count_text(&all[2..3]), "0 active · 1 finished");
+        assert_eq!(count_text(&all[1..2]), "1 active · 0 finished");
+        assert_eq!(status_text(&all[0]), "completed");
         assert_eq!(status_text(&all[1]), "running");
+    }
+
+    #[test]
+    fn counts_follow_worker_lifecycle_instead_of_a_completed_collaboration_call() {
+        use agent_core::event::WorkerState;
+        let mut worker = agent("worker", ToolStatus::Completed);
+        worker.lifecycle = Some(WorkerState::Waiting);
+        assert_eq!(count_text(&[worker.clone()]), "1 active · 0 finished");
+        worker.lifecycle = Some(WorkerState::Unknown);
+        assert_eq!(
+            count_text(&[worker.clone()]),
+            "0 active · 0 finished · 1 unknown"
+        );
+        worker.lifecycle = Some(WorkerState::Completed);
+        assert_eq!(status_text(&worker), "completed");
+        assert_eq!(count_text(&[worker.clone()]), "0 active · 1 finished");
+        worker.lifecycle = Some(WorkerState::Closed);
+        assert_eq!(
+            status_text(&worker),
+            "closed",
+            "completion and closure stay distinct"
+        );
     }
 }
