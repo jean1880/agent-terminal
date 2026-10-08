@@ -38,10 +38,7 @@ fn account_text(driver: Driver, snap: &crate::account_status::Snapshot) -> (Stri
             Some(plan) => (format!("Signed in as {} ({plan})", a.label), false),
             None => (format!("Signed in as {}", a.label), false),
         },
-        None => (
-            "Not checked yet (it is checked while the agent is enabled)".to_owned(),
-            false,
-        ),
+        None => ("Not checked yet".to_owned(), false),
     }
 }
 
@@ -261,22 +258,28 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .tooltip_text(driver.info().sign_in_hint)
             .build();
-        sign_in.connect_clicked(glib::clone!(
-            #[weak]
-            obj,
-            move |_| obj.imp().sign_in(driver)
-        ));
         account.add_suffix(&sign_in);
         let show_account = glib::clone!(
+            #[weak]
+            obj,
             #[weak]
             account,
             #[weak]
             sign_in,
             move || {
+                // Only an agent in use has an account worth showing: one switched off or not
+                // installed never says "signed out".
+                account.set_visible(AgentAvailability::shared().is_ready(driver));
                 let snap = crate::account_status::AccountStatus::shared().snapshot(driver);
                 let (text, signed_out) = account_text(driver, &snap);
                 account.set_subtitle(&text);
                 sign_in.set_visible(signed_out);
+                // The same two steps as a thread's banner: open the sign-in, then check.
+                sign_in.set_label(if obj.imp().sign_in_was_started(driver) {
+                    "Check Again"
+                } else {
+                    "Sign In…"
+                });
                 if signed_out {
                     account.add_css_class("error");
                 } else {
@@ -284,10 +287,22 @@ impl AgentTerminalWindow {
                 }
             }
         );
+        sign_in.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            show_account,
+            move |_| {
+                obj.imp().sign_in_or_check(driver);
+                show_account();
+            }
+        ));
         show_account();
+        let ready_id = AgentAvailability::shared().connect_changed(show_account.clone());
         let account_id =
             crate::account_status::AccountStatus::shared().connect_changed(show_account);
         dialog.connect_closed(move |_| {
+            AgentAvailability::shared().disconnect(ready_id);
             crate::account_status::AccountStatus::shared().disconnect(account_id);
         });
         group.add(&account);

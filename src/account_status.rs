@@ -21,7 +21,7 @@ use gtk4::{gio, glib};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::agent_proc::{run_side, AGY_TIMEOUT};
+use crate::agent_proc::{run_side_full, AGY_TIMEOUT};
 use crate::probe::{join_n, ListenerSet, ProbeTargets};
 use crate::{claude_probe, codex_probe};
 
@@ -102,6 +102,12 @@ pub struct AccountStatus {
     codex: RefCell<Snapshot>,
     listeners: ListenerSet,
     refreshing: Cell<bool>,
+    /// Agents the user asked to check again ([`Self::recheck`]): probed by the next refresh even
+    /// if signed out (agy is otherwise skipped then).
+    forced: RefCell<Vec<Driver>>,
+    /// A refresh asked for while one ran: run again with these targets once it ends, so a
+    /// "Check again" is never dropped.
+    queued: RefCell<Option<ProbeTargets>>,
 }
 
 thread_local! {
@@ -116,6 +122,8 @@ impl AccountStatus {
             codex: RefCell::default(),
             listeners: ListenerSet::default(),
             refreshing: Cell::new(false),
+            forced: RefCell::default(),
+            queued: RefCell::default(),
         }
     }
 
@@ -183,10 +191,19 @@ impl AccountStatus {
         }
     }
 
-    /// The user signed in (or says so): forget the signed-out verdict, so the next
-    /// [`Self::refresh`] probes `driver` again, agy included. The verdict stands until then.
+    /// The user signed in (or says so): the next [`Self::refresh`] probes `driver` again, agy
+    /// included. The verdict stands until that probe answers, so nothing claims "signed in"
+    /// before anything checked.
     pub fn recheck(&self, driver: Driver) {
-        self.slot(driver).borrow_mut().signed_out = false;
+        let mut forced = self.forced.borrow_mut();
+        if !forced.contains(&driver) {
+            forced.push(driver);
+        }
+    }
+
+    /// Whether a check the user asked for is still waiting for its probe.
+    pub fn is_rechecking(&self, driver: Driver) -> bool {
+        self.forced.borrow().contains(&driver)
     }
 
     /// Whether `driver` is known to have no one signed in.
@@ -201,38 +218,44 @@ impl AccountStatus {
         }
     }
 
-    /// Probes every agent in the background and returns at once (a probe already running makes
-    /// this a no-op). No agent is sent a prompt, and each runs in the environment its threads
-    /// get, so the account shown is the one a thread would use.
+    /// Probes every agent in the background and returns at once. No agent is sent a prompt, and
+    /// each runs in the environment its threads get, so the account shown is the one a thread
+    /// would use. Asked again while a refresh runs, it runs once more when that one ends.
     ///
     /// A signed-out agy is not probed again: probing it starts agy's own login, which opens a
     /// browser each time. [`Self::recheck`] (the user's "Check again") probes it once more.
     pub fn refresh(self: &Rc<Self>, targets: &ProbeTargets) {
         if self.refreshing.replace(true) {
-            debug!("account status refresh already running");
+            debug!("account status refresh already running; queued another");
+            *self.queued.borrow_mut() = Some(targets.clone());
             return;
         }
-        let probed = |d: Driver| {
-            targets.get(d).is_some() && !(d == Driver::Agy && self.is_signed_out(Driver::Agy))
-        };
-        // At most the three agents.
-        let count =
-            u8::try_from(Driver::ALL.into_iter().filter(|d| probed(*d)).count()).unwrap_or(u8::MAX);
-        if count == 0 {
+        // Missing, disabled and still-detecting agents have no target; a signed-out agy is
+        // skipped unless the user asked to check it.
+        let jobs: Vec<(Driver, crate::probe::ProbeTarget)> = Driver::ALL
+            .into_iter()
+            .filter(|d| !(*d == Driver::Agy && self.is_signed_out(*d) && !self.is_rechecking(*d)))
+            .filter_map(|d| targets.get(d).map(|t| (d, t.clone())))
+            .collect();
+        // Each probed agent's own check is answered by this refresh.
+        self.forced
+            .borrow_mut()
+            .retain(|d| !jobs.iter().any(|(j, _)| j == d));
+        if jobs.is_empty() {
             self.refreshing.set(false);
             return; // nothing is ready: nothing is spawned
         }
         let finish = {
             let me = self.clone();
-            join_n(count, move || me.refreshing.set(false))
+            join_n(jobs.len() as u8, move || {
+                me.refreshing.set(false);
+                let again = me.queued.borrow_mut().take();
+                if let Some(targets) = again {
+                    me.refresh(&targets);
+                }
+            })
         };
-        for driver in Driver::ALL {
-            if !probed(driver) {
-                continue; // missing, disabled, still being detected, or a signed-out agy
-            }
-            let Some(target) = targets.get(driver) else {
-                continue;
-            };
+        for (driver, target) in jobs {
             let (me, done) = (self.clone(), finish.clone());
             match driver {
                 Driver::Claude => {
@@ -256,7 +279,7 @@ impl AccountStatus {
                 Driver::Agy => {
                     let target = target.clone();
                     glib::spawn_future_local(async move {
-                        let (out, ok) = run_side(
+                        let side = run_side_full(
                             vec![
                                 target.program,
                                 "-p".to_owned(),
@@ -269,8 +292,10 @@ impl AccountStatus {
                             AGY_TIMEOUT,
                         )
                         .await;
-                        // Its login prompt, whether it then timed out or not.
-                        if agy_signed_out(&out) {
+                        let (out, ok) = (side.stdout, side.ok);
+                        // Its login prompt (stderr), or the error it ends with (stdout): it
+                        // waits for a browser login, so this is usually a timeout.
+                        if agy_signed_out(&side.stderr) || agy_signed_out(&out) {
                             warn!("agy is not signed in");
                             me.set_signed_out(Driver::Agy, true);
                             done();
@@ -332,7 +357,7 @@ mod tests {
     }
 
     /// Signed out forgets the previous account; an account reported later is someone signed in;
-    /// a recheck clears the verdict quietly, for the next probe to settle.
+    /// a recheck keeps the verdict until the probe it queues answers.
     #[test]
     fn signed_out_follows_what_the_agent_reports() {
         let status = AccountStatus::new();
@@ -355,8 +380,14 @@ mod tests {
         );
 
         status.set_signed_out(Driver::Codex, true);
+        assert!(!status.is_rechecking(Driver::Codex));
         status.recheck(Driver::Codex);
-        assert!(!status.is_signed_out(Driver::Codex));
+        assert!(
+            status.is_signed_out(Driver::Codex),
+            "nothing has checked yet"
+        );
+        assert!(status.is_rechecking(Driver::Codex));
+        assert!(!status.is_rechecking(Driver::Claude), "per agent");
     }
 
     #[test]

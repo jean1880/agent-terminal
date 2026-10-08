@@ -105,8 +105,8 @@ impl Shared {
 
 /// This process's id, read before forking for [`die_with_app`].
 fn app_pid() -> libc::pid_t {
-    // SAFETY: getpid(2) takes no arguments and cannot fail.
-    unsafe { libc::getpid() }
+    // A pid fits pid_t (the kernel's own type); never 0 for a running process.
+    libc::pid_t::try_from(std::process::id()).unwrap_or(0)
 }
 
 /// Runs in the forked child, before exec (so async-signal-safe calls only): the child is sent
@@ -121,7 +121,7 @@ fn die_with_app(parent: libc::pid_t) {
     #[cfg(target_os = "linux")]
     // SAFETY: prctl, getppid and _exit are async-signal-safe and touch no shared memory.
     unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
         // The app died between the fork and here: no signal will come, so do not start.
         if libc::getppid() != parent {
             libc::_exit(1);
@@ -434,26 +434,60 @@ impl AgentEnv {
 }
 
 /// Runs a one-shot side process (agy `-p /model --output-format json`, `agy models`) and returns
-/// its stdout and whether it exited with status 0. A failure to start is `("<reason>", false)`.
-///
-/// Its stdin is `/dev/null` (never the app's), and it is killed when `timeout` passes: dropping
-/// the `communicate` future would leave the child running, so the kill is explicit. The result is
-/// then `("timed out", false)`.
+/// its stdout and whether it exited with status 0. A failure to start is `("<reason>", false)`; a
+/// timeout with nothing printed is `("timed out", false)`. See [`run_side_full`].
 pub async fn run_side(
     argv: Vec<String>,
     cwd: Option<String>,
     env: &AgentEnv,
     timeout: Duration,
 ) -> (String, bool) {
+    let out = run_side_full(argv, cwd, env, timeout).await;
+    if out.timed_out && out.stdout.trim().is_empty() {
+        return ("timed out".to_owned(), false);
+    }
+    (out.stdout, out.ok)
+}
+
+/// What a side process printed, and how it ended.
+#[derive(Debug, Default)]
+pub struct SideOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// It exited with status 0 (never after a timeout).
+    pub ok: bool,
+    /// It was still running at the timeout, and was killed.
+    pub timed_out: bool,
+}
+
+/// How long a killed side process's pipes may stay open (a helper it started holding them).
+const PIPE_GRACE: Duration = Duration::from_secs(1);
+/// The most of each stream a side process keeps; the rest is read and dropped.
+const SIDE_OUTPUT_CAP: usize = 1 << 20;
+
+/// [`run_side`] with both streams, read as they arrive: a process killed at `timeout` still
+/// leaves what it printed. agy, signed out, prints its login prompt on stderr and then waits for
+/// a browser login; that prompt is the only sign of it.
+///
+/// Its stdin is `/dev/null` (never the app's), and it is killed when `timeout` passes.
+pub async fn run_side_full(
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: &AgentEnv,
+    timeout: Duration,
+) -> SideOutput {
     let Some(program) = argv.first() else {
-        return ("empty command line".to_owned(), false);
+        return SideOutput {
+            stdout: "empty command line".to_owned(),
+            ..SideOutput::default()
+        };
     };
     let name = Path::new(program)
         .file_name()
         .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
     // Neither STDIN_PIPE nor STDIN_INHERIT: GIO gives the child /dev/null.
     let launcher = gio::SubprocessLauncher::new(
-        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
     );
     let parent = app_pid();
     launcher.set_child_setup(move || die_with_app(parent));
@@ -466,24 +500,63 @@ pub async fn run_side(
         Ok(s) => s,
         Err(e) => {
             warn!(program = %name, error = %e.message(), "side process did not start");
-            return (format!("could not start {name}: {}", e.message()), false);
+            return SideOutput {
+                stdout: format!("could not start {name}: {}", e.message()),
+                ..SideOutput::default()
+            };
         }
     };
-    let finished = glib::future_with_timeout(timeout, subprocess.communicate_utf8_future(None));
-    match finished.await {
-        Ok(Ok((stdout, _))) => (
-            stdout.map(|s| s.to_string()).unwrap_or_default(),
-            subprocess.is_successful(),
-        ),
+    // Both pipes drain at once (one left full would stall the child); each ends at EOF. What
+    // arrives goes straight into a shared buffer, so a pipe a helper holds open past the grace
+    // still yields what was printed before.
+    let read = |pipe: Option<gio::InputStream>| {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&buf);
+        let handle = glib::spawn_future_local(async move {
+            let Some(pipe) = pipe else { return };
+            while let Ok(chunk) = pipe.read_bytes_future(8192, glib::Priority::DEFAULT).await {
+                if chunk.is_empty() {
+                    break;
+                }
+                let mut sink = sink.borrow_mut();
+                let room = SIDE_OUTPUT_CAP.saturating_sub(sink.len());
+                sink.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+        });
+        (handle, buf)
+    };
+    let stdout = read(subprocess.stdout_pipe());
+    let stderr = read(subprocess.stderr_pipe());
+    let timed_out = match glib::future_with_timeout(timeout, subprocess.wait_future()).await {
+        Err(_) => true,
         Ok(Err(e)) => {
-            warn!(program = %name, error = %e.message(), "side process failed");
-            (e.message().to_owned(), false)
+            warn!(program = %name, error = %e.message(), "waiting for a side process failed");
+            false
         }
-        Err(_) => {
-            warn!(program = %name, "side process timed out; killing it");
-            subprocess.force_exit();
-            ("timed out".to_owned(), false)
+        Ok(Ok(())) => false,
+    };
+    if timed_out {
+        warn!(program = %name, "side process timed out; killing it");
+        subprocess.force_exit();
+    }
+    // A reader still waiting after the grace is stopped (which cancels its read), not left to
+    // run for as long as the helper lives.
+    let collect = |(mut handle, buf): (glib::JoinHandle<()>, Rc<RefCell<Vec<u8>>>)| async move {
+        if glib::future_with_timeout(PIPE_GRACE, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
         }
+        let text = String::from_utf8_lossy(&buf.borrow()).into_owned();
+        text
+    };
+    let (stdout, stderr) = (collect(stdout).await, collect(stderr).await);
+    SideOutput {
+        stdout,
+        stderr,
+        ok: !timed_out && subprocess.is_successful(),
+        timed_out,
     }
 }
 
@@ -711,6 +784,70 @@ mod tests {
         );
         assert!(ok, "{out}");
         assert_eq!(out.trim(), "eof:set:unset");
+    }
+
+    /// agy, signed out, prints its login prompt on stderr and waits: killed at the timeout, the
+    /// prompt must survive (it is the only sign the agent needs a login).
+    #[test]
+    fn a_timed_out_side_process_keeps_what_it_printed() {
+        in_loop(|ctx| {
+            let got: Rc<RefCell<Option<SideOutput>>> = Rc::default();
+            let g = got.clone();
+            glib::spawn_future_local(async move {
+                let out = run_side_full(
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "echo 'Authentication required.' >&2; echo partial; exec sleep 30".into(),
+                    ],
+                    None,
+                    &AgentEnv::default(),
+                    Duration::from_millis(800),
+                )
+                .await;
+                *g.borrow_mut() = Some(out);
+            });
+            assert!(pump_until(ctx, 10, || got.borrow().is_some()));
+            let out = got.borrow_mut().take().unwrap();
+            assert!(out.timed_out && !out.ok);
+            assert_eq!(out.stderr.trim(), "Authentication required.");
+            assert_eq!(out.stdout.trim(), "partial");
+        });
+    }
+
+    /// The browser agy opens to sign in inherits its pipes and outlives it: the output must
+    /// still come back, after the grace rather than when the helper exits.
+    #[test]
+    fn a_helper_holding_the_pipes_neither_hides_the_output_nor_holds_the_result() {
+        in_loop(|ctx| {
+            let got: Rc<RefCell<Option<SideOutput>>> = Rc::default();
+            let g = got.clone();
+            let started = std::time::Instant::now();
+            glib::spawn_future_local(async move {
+                let out = run_side_full(
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "echo 'Authentication required.' >&2; echo partial; sleep 6 & exec sleep 30"
+                            .into(),
+                    ],
+                    None,
+                    &AgentEnv::default(),
+                    Duration::from_millis(500),
+                )
+                .await;
+                *g.borrow_mut() = Some(out);
+            });
+            assert!(pump_until(ctx, 10, || got.borrow().is_some()));
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "waited for the helper"
+            );
+            let out = got.borrow_mut().take().unwrap();
+            assert!(out.timed_out && !out.ok);
+            assert_eq!(out.stderr.trim(), "Authentication required.");
+            assert_eq!(out.stdout.trim(), "partial");
+        });
     }
 
     #[test]

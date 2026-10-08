@@ -3328,12 +3328,14 @@ impl AgentTerminalWindow {
     fn watch_account_status(&self) {
         self.refresh_agent_data();
         let obj = self.obj();
-        // An agent found signed out (or signed in again) re-shows its threads' banners.
-        AccountStatus::shared().connect_changed(glib::clone!(
+        // An agent found signed out (or signed in again) re-shows its threads' banners. The
+        // listener goes with the window (the status is app-wide).
+        let listener = AccountStatus::shared().connect_changed(glib::clone!(
             #[weak]
             obj,
             move || obj.imp().update_sign_in_banners()
         ));
+        obj.connect_destroy(move |_| AccountStatus::shared().disconnect(listener));
         glib::timeout_add_local(
             ACCOUNT_REFRESH,
             glib::clone!(
@@ -3546,6 +3548,10 @@ impl AgentTerminalWindow {
     /// Only the threads of that agent: an agent the user does not use never nags.
     pub(super) fn update_sign_in_banners(&self) {
         let (availability, accounts) = (AgentAvailability::shared(), AccountStatus::shared());
+        // Signed in since: the next sign-out starts again from "Sign In…".
+        self.sign_in_started
+            .borrow_mut()
+            .retain(|d| accounts.is_signed_out(*d));
         let tabs = self.tabs.borrow();
         for chat in tabs.iter().filter_map(|t| t.chat.as_ref()) {
             let driver = chat.slot.driver();
@@ -3571,13 +3577,8 @@ impl AgentTerminalWindow {
     /// The sign-in banner's button for `thread`'s agent: the first press opens a terminal tab
     /// running the agent's sign-in; after that it checks again (the agent is probed afresh).
     fn sign_in_from_thread(&self, thread: &str) {
-        let Some(driver) = self.slot_of(thread).map(|s| s.driver()) else {
-            return;
-        };
-        if self.sign_in_started.borrow().contains(&driver) {
-            self.check_sign_in(driver);
-        } else {
-            self.sign_in(driver);
+        if let Some(driver) = self.slot_of(thread).map(|s| s.driver()) {
+            self.sign_in_or_check(driver);
         }
     }
 
@@ -3605,12 +3606,26 @@ impl AgentTerminalWindow {
         self.update_sign_in_banners();
     }
 
-    /// Forgets `driver`'s signed-out verdict and probes the agents again.
+    /// Probes `driver` again (agy too, which a refresh otherwise skips while it is signed out).
+    /// The banner stays until the probe answers.
     pub(super) fn check_sign_in(&self, driver: Driver) {
         AccountStatus::shared().recheck(driver);
-        self.sign_in_started.borrow_mut().remove(&driver);
         self.refresh_agent_data();
-        self.update_sign_in_banners();
+        self.show_toast(&format!("Checking {}…", driver.info().label));
+    }
+
+    /// Sign In, or Check Again once a sign-in tab was opened: the banner's and Settings' button.
+    pub(super) fn sign_in_or_check(&self, driver: Driver) {
+        if self.sign_in_started.borrow().contains(&driver) {
+            self.check_sign_in(driver);
+        } else {
+            self.sign_in(driver);
+        }
+    }
+
+    /// Whether `driver`'s sign-in tab was opened, so its button now checks again.
+    pub(super) fn sign_in_was_started(&self, driver: Driver) -> bool {
+        self.sign_in_started.borrow().contains(&driver)
     }
 
     /// An open thread whose agent is missing or switched off says so, and offers to continue in

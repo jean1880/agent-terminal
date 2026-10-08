@@ -180,12 +180,15 @@ pub fn claude_signed_out(initialize: &Value) -> bool {
 }
 
 /// Whether output from agy (`agy -p /usage`) says no one is signed in. A fresh install prints
-/// "Authentication required. Please visit the URL to log in:" (captured live), then opens a
-/// browser and waits for the login, so the app must not keep probing it.
+/// "Authentication required. Please visit the URL to log in:" on stderr (captured live), opens
+/// a browser and waits for the login; stopped meanwhile, it ends with a JSON error on stdout,
+/// "authentication failed or timed out". The app must not keep probing it. That error is the
+/// login flow's own (a signed-in agy never starts one), so a plain network timeout does not
+/// match it; and a false verdict costs only a "Check Again".
 pub fn agy_signed_out(output: &str) -> bool {
-    output
-        .to_ascii_lowercase()
-        .contains("authentication required")
+    let output = output.to_ascii_lowercase();
+    output.contains("authentication required")
+        || output.contains("authentication failed or timed out")
 }
 
 /// Whether an `account/read` result says no one is signed in to Codex: no account, while the
@@ -405,6 +408,10 @@ mod tests {
     fn agy_signed_out_reads_its_login_prompt() {
         assert!(agy_signed_out(
             "Authentication required. Please visit the URL to log in:\n  https://accounts…"
+        ));
+        // Its stdout once stopped while waiting for the login (captured live).
+        assert!(agy_signed_out(
+            r#"{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out"}"#
         ));
         assert!(!agy_signed_out(
             r#"{"status":"SUCCESS","response":"Gemini Models…"}"#
