@@ -139,8 +139,12 @@ struct Inner {
     launch_env: RefCell<LaunchEnv>,
     proc: RefCell<Option<AgentProcess>>,
     state: RefCell<State>,
-    /// A rendered, redacted handoff waiting for the next user prompt.
+    /// A rendered, redacted handoff the new agent has not confirmed yet. Stored as
+    /// `Event::HandoffSeeded` too, so a restart re-arms it; spent only by a completed turn.
     pending_handoff: RefCell<Option<Handoff>>,
+    /// The pending handoff went out with the prompt now running: not sent again unless that turn
+    /// ends without completing.
+    handoff_in_flight: Cell<bool>,
     /// The thread's model was retired by its agent: the next prompt first moves to this one.
     retired: RefCell<Option<RetiredModel>>,
     /// The model the thread was last SET to (an alias where the agent has one), as opposed to the
@@ -284,6 +288,7 @@ impl ChatSession {
             proc: RefCell::new(None),
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
+            handoff_in_flight: Cell::new(false),
             retired: RefCell::new(None),
             selected: RefCell::new(selected),
             ctl_seq: Cell::new(0),
@@ -315,10 +320,22 @@ impl ChatSession {
             return;
         }
         let carried = handoff.carried;
-        *self.inner.pending_handoff.borrow_mut() = Some(handoff);
+        self.inner.arm_handoff(handoff);
         self.inner.emit(Envelope::new(Event::Notice {
             text: format!("Continuing from {source} with {carried} earlier messages"),
         }));
+    }
+
+    /// Re-arms a handoff found stored and undelivered in the thread's history (see
+    /// [`undelivered_handoff`]), as the thread reopens. Already stored and announced, so neither
+    /// is done again. A stored fence that is not one this app draws is not trusted: dropped.
+    pub fn restore_handoff(&self, handoff: Handoff) {
+        if !agent_core::handoff_budget::is_valid_fence(&handoff.fence) {
+            warn!("ignoring a stored handoff with an invalid fence");
+            return;
+        }
+        self.inner.handoff_in_flight.set(false);
+        *self.inner.pending_handoff.borrow_mut() = Some(handoff);
     }
 
     /// Marks the thread's model as retired (or clears it with `None`): the next prompt moves the
@@ -466,7 +483,14 @@ impl Inner {
                 }
                 self.state.borrow_mut().running_turn = true;
             }
-            Event::TurnCompleted { .. } => self.state.borrow_mut().running_turn = false,
+            Event::TurnCompleted { state, .. } => {
+                self.state.borrow_mut().running_turn = false;
+                // A completed turn is the proof the new agent read the handoff it carried; any
+                // other end (failed, interrupted, the process died) leaves it for the next prompt.
+                if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
+                    *self.pending_handoff.borrow_mut() = None;
+                }
+            }
             Event::ModelChanged { model } => self.set_model(model),
             Event::ModeChanged { mode } => {
                 self.state.borrow_mut().mode = *mode;
@@ -545,6 +569,8 @@ impl Inner {
             }
             Err(e) => {
                 self.state.borrow_mut().alive = false;
+                // Nothing will complete a turn: a pending handoff goes out with the next prompt.
+                self.handoff_in_flight.set(false);
                 self.error(e);
             }
         }
@@ -656,6 +682,9 @@ impl Inner {
             state.alive = false;
             state.running_turn = false;
         }
+        // A dead process completed nothing: a pending handoff goes out with the next prompt,
+        // even when the exit raised no turn of its own (it died before one opened).
+        self.handoff_in_flight.set(false);
         for env in envelopes {
             self.emit(env);
         }
@@ -880,9 +909,11 @@ impl Inner {
             .item(item),
         );
 
-        // The handoff rides on the first real prompt: never on a slash command (it would stop
-        // being one), and it is only spent once the agent accepted the prompt.
-        let handoff = if Self::is_slash_command(text) {
+        // The handoff rides on the next real prompt: never on a slash command (it would stop
+        // being one), nor twice while the turn that carries it runs. It is spent only when that
+        // turn completes (`apply`): a prompt that never reached the agent, or a turn the agent
+        // died in, leaves it pending for the next one.
+        let handoff = if Self::is_slash_command(text) || self.handoff_in_flight.get() {
             None
         } else {
             self.pending_handoff.borrow().clone()
@@ -893,8 +924,21 @@ impl Inner {
         };
         self.ensure_alive();
         if self.command(Command::Prompt { text: sent }) && handoff.is_some() {
-            *self.pending_handoff.borrow_mut() = None;
+            self.handoff_in_flight.set(true);
         }
+    }
+
+    /// Arms `handoff` for the next prompt and stores it (under the current provider thread), so
+    /// a restart before it is delivered re-arms it.
+    fn arm_handoff(&self, handoff: Handoff) {
+        self.emit(Envelope::new(Event::HandoffSeeded {
+            summary: handoff.summary.clone(),
+            fence: handoff.fence.clone(),
+            carried: handoff.carried,
+            total: handoff.total,
+        }));
+        self.handoff_in_flight.set(false);
+        *self.pending_handoff.borrow_mut() = Some(handoff);
     }
 
     fn respond_approval(self: &Rc<Self>, request: &str, decision: Decision) {
@@ -1153,7 +1197,12 @@ impl Inner {
             state.mode = new_mode;
         }
         self.attach_approval();
-        *self.pending_handoff.borrow_mut() = (carried > 0).then_some(handoff);
+        if carried > 0 {
+            self.arm_handoff(handoff);
+        } else {
+            self.handoff_in_flight.set(false);
+            *self.pending_handoff.borrow_mut() = None;
+        }
         self.emit(Envelope::new(Event::Notice {
             text: if carried == 0 {
                 format!("Switched to {}", driver_label(driver))
@@ -1202,6 +1251,41 @@ pub(crate) struct Handoff {
     /// Messages carried, of `total` in the thread.
     pub carried: usize,
     pub total: usize,
+}
+
+/// The handoff a thread still owes its current agent, from its stored history: the latest
+/// `HandoffSeeded` with no completed turn after it. `None` once a turn completed after it (the
+/// agent had it), or when there is none.
+///
+/// Judged by a completed turn, not by a native session id (agy reports one at spawn, before any
+/// prompt) nor by the prompt having been written (the agent may have died reading it).
+pub(crate) fn undelivered_handoff<'a>(
+    events: impl IntoIterator<Item = &'a Envelope>,
+) -> Option<Handoff> {
+    let mut pending = None;
+    for env in events {
+        match &env.event {
+            Event::HandoffSeeded {
+                summary,
+                fence,
+                carried,
+                total,
+            } => {
+                pending = Some(Handoff {
+                    summary: summary.clone(),
+                    fence: fence.clone(),
+                    carried: *carried,
+                    total: *total,
+                });
+            }
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                ..
+            } => pending = None,
+            _ => {}
+        }
+    }
+    pending
 }
 
 /// A fresh handoff fence: a random UUID without its dashes (32 hex digits), so carried text cannot
@@ -2331,7 +2415,11 @@ mod tests {
             assert_eq!(sent.len(), 3);
             assert_eq!(sent[0], "/model");
             let sent = &sent[1..];
-            assert!(sent[0].starts_with("Context handoff (HANDOFF-"), "{}", sent[0]);
+            assert!(
+                sent[0].starts_with("Context handoff (HANDOFF-"),
+                "{}",
+                sent[0]
+            );
             assert!(sent[0].contains("please list the repo"));
             assert!(sent[0].contains("Found three files"));
             // The user's own words come last, after the fenced user marker.
@@ -2346,7 +2434,104 @@ mod tests {
             // New events belong to the new provider thread.
             let all = store.events(&thread, None, 1000).expect("events");
             assert!(all.len() > 5);
+
+            // Council #249/#253: the handoff is stored, so a restart now (nothing completed yet)
+            // re-arms the very same one.
+            let stored = |store: &Store| {
+                let events = store.events(&thread, None, 10_000).expect("events");
+                undelivered_handoff(events.iter().map(|(_, e)| e))
+            };
+            let before = stored(&store).expect("stored and undelivered");
+            assert!(sent[0].contains(&format!("HANDOFF-{}", before.fence)));
+
+            let turn_ends = |state| {
+                session.inner.emit(Envelope::new(Event::TurnCompleted {
+                    state,
+                    usage: None,
+                    cost_usd: None,
+                    error: None,
+                }));
+            };
+            // The turn that carried it failed (the agent died reading it): it goes out again.
+            turn_ends(TurnState::Failed);
+            session.send_prompt("try once more");
+            let sent = prompts(&log_claude);
+            assert!(
+                sent[3].starts_with("Context handoff (HANDOFF-"),
+                "{}",
+                sent[3]
+            );
+            assert!(sent[3].ends_with("):\ntry once more"));
+            assert!(stored(&store).is_some());
+
+            // The process dies before that turn even opened (no TurnCompleted at all): the
+            // handoff is not stuck "in flight", it goes out again with the next prompt.
+            session.inner.finish_process(Some(1), false);
+            session.send_prompt("after the crash");
+            let sent = prompts(&log_claude);
+            assert!(
+                sent[4].starts_with("Context handoff (HANDOFF-"),
+                "{}",
+                sent[4]
+            );
+
+            // A completed turn spends it, in the session and in the store.
+            turn_ends(TurnState::Completed);
+            session.send_prompt("thanks");
+            assert_eq!(prompts(&log_claude)[5], "thanks");
+            assert!(
+                stored(&store).is_none(),
+                "delivered: not re-armed on reopen"
+            );
         });
+    }
+
+    #[test]
+    fn an_undelivered_handoff_is_the_latest_seeded_with_no_completed_turn_after_it() {
+        let seeded = |fence: &str| {
+            Envelope::new(Event::HandoffSeeded {
+                summary: format!("summary {fence}"),
+                fence: fence.to_owned(),
+                carried: 2,
+                total: 3,
+            })
+        };
+        let turn = |state| {
+            Envelope::new(Event::TurnCompleted {
+                state,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            })
+        };
+        let pending = |events: &[Envelope]| undelivered_handoff(events).map(|h| h.fence);
+
+        assert_eq!(pending(&[]), None);
+        assert_eq!(pending(&[seeded("a")]).as_deref(), Some("a"));
+        assert_eq!(pending(&[seeded("a"), turn(TurnState::Completed)]), None);
+        // A turn that did not complete proves nothing.
+        assert_eq!(
+            pending(&[
+                seeded("a"),
+                turn(TurnState::Failed),
+                turn(TurnState::Interrupted)
+            ])
+            .as_deref(),
+            Some("a")
+        );
+        // Switched again before anything completed: the newer handoff is the one owed.
+        assert_eq!(pending(&[seeded("a"), seeded("b")]).as_deref(), Some("b"));
+        // A completed turn before the switch says nothing about the handoff after it.
+        assert_eq!(
+            pending(&[turn(TurnState::Completed), seeded("c")]).as_deref(),
+            Some("c")
+        );
+        // The full value comes back, not only the fence.
+        let h = undelivered_handoff(&[seeded("d")]).expect("pending");
+        assert_eq!(
+            (h.summary.as_str(), h.carried, h.total),
+            ("summary d", 2, 3)
+        );
     }
 
     // ---- canary, forced plan, ordering ----

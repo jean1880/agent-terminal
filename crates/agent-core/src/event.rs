@@ -186,6 +186,16 @@ pub enum Event {
     Notice {
         text: String,
     },
+    /// The app handed this thread's history to a new agent session (a switch, a fork). Stored so
+    /// the handoff survives a restart: it is pending until a turn completes after it. Never shown.
+    HandoffSeeded {
+        /// The fenced, redacted history (`handoff_budget::render_history`).
+        summary: String,
+        /// The fence the summary uses; the prompt's user marker must use it too.
+        fence: String,
+        carried: usize,
+        total: usize,
+    },
     /// Reply to a control request (`Envelope::request` is the request id). Exactly one of
     /// `ok` / `error` is set; a successful reply with no payload is `ok: Some(Value::Null)`.
     ControlResult {

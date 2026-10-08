@@ -116,6 +116,9 @@ pub(super) struct ChatTab {
     pending_prompt: Option<String>,
     /// Seeded into the session once it exists (fork, compact-by-handoff), with its source.
     pending_handoff: Option<(crate::chat::session::Handoff, String)>,
+    /// A handoff found stored and undelivered when the thread was built: re-armed (not seeded
+    /// again) in whichever session starts first.
+    stored_handoff: Option<crate::chat::session::Handoff>,
     /// The reasoning effort the session starts with, overriding the profile's default (a thread
     /// continued in another agent at a chosen effort).
     pending_effort: Option<String>,
@@ -2178,6 +2181,7 @@ impl AgentTerminalWindow {
                 title_item: None,
                 pending_prompt: None,
                 pending_handoff: None,
+                stored_handoff: None,
                 pending_effort: None,
                 pending_switch: None,
                 unavailable: false,
@@ -2369,6 +2373,12 @@ impl AgentTerminalWindow {
         {
             chat.view = Some(view.clone());
             chat.building = false;
+            // A switch whose handoff never reached the new agent (a restart, or it died on its
+            // first turn): the session re-arms it once it starts. Ceiling: only the replayed
+            // window is scanned, so a handoff more than the replay limit of events back, with no
+            // completed turn since, is not re-armed (it would take that many events without one).
+            chat.stored_handoff =
+                crate::chat::session::undelivered_handoff(history.iter().map(|(_, env)| env));
         }
 
         // The demo window starts no agent session (see `start_session`): the script plays.
@@ -2538,7 +2548,7 @@ impl AgentTerminalWindow {
             }
         }
 
-        let (prompt, handoff, switch) = {
+        let (prompt, handoff, switch, stored) = {
             let mut tabs = self.tabs.borrow_mut();
             let chat = tabs
                 .iter_mut()
@@ -2549,10 +2559,14 @@ impl AgentTerminalWindow {
                     chat.pending_prompt.take(),
                     chat.pending_handoff.take(),
                     chat.pending_switch.take(),
+                    chat.stored_handoff.take(),
                 ),
-                None => (None, None, None),
+                None => (None, None, None, None),
             }
         };
+        if let Some(stored) = stored {
+            session.restore_handoff(stored);
+        }
         if let Some((handoff, source)) = handoff {
             session.seed_handoff(handoff, &source);
         }
