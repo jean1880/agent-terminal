@@ -3,49 +3,83 @@
 
 /* ---------------------------------------------------------------- splash */
 
-@keyframes splash-arrive {
-    from { opacity: 0; transform: scale(0.88); }
-    to { opacity: 1; transform: none; }
+/* The splash is a short sequence (about 2 s), then idles:
+     0–700 ms    the chat bubble bubbles up from below, overshoots and settles, then floats;
+     700–1000 ms the three cursor dots pop in, one after another;
+     from 1.1 s  the dots bounce in turn, a slow typing wave;
+     900–1600 ms the app's name folds down out of the bubble's bottom edge;
+     about 1.8 s the status line fades in, only worth reading if the wait goes on. */
+
+@keyframes splash-bubble-up {
+    0% { opacity: 0; transform: translateY(48px) scale(0.55); }
+    55% { opacity: 1; transform: translateY(-6px) scale(1.06); }
+    78% { transform: translateY(2px) scale(0.98); }
+    100% { opacity: 1; transform: none; }
 }
-@keyframes splash-rise {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: none; }
+@keyframes splash-float {
+    from { transform: none; }
+    to { transform: translateY(-4px); }
+}
+@keyframes splash-dot-pop {
+    0% { opacity: 0; transform: scale(0); }
+    70% { opacity: 1; transform: scale(1.35); }
+    100% { opacity: 1; transform: none; }
+}
+/* One bounce per dot per cycle; the delays below stagger them into a wave. */
+@keyframes splash-dot-bounce {
+    0% { transform: none; }
+    15% { transform: translateY(-9px) scale(1.12, 0.92); }
+    30% { transform: translateY(1px) scale(0.94, 1.06); }
+    40% { transform: none; }
+    100% { transform: none; }
+}
+/* Hinged at its top edge, the name swings down from flat under the bubble to face the user. */
+@keyframes splash-fold-down {
+    0% { opacity: 0; transform: perspective(420px) rotateX(-92deg); }
+    60% { opacity: 1; transform: perspective(420px) rotateX(12deg); }
+    80% { transform: perspective(420px) rotateX(-5deg); }
+    100% { opacity: 1; transform: none; }
 }
 @keyframes splash-fade {
     from { opacity: 0; }
     to { opacity: 1; }
 }
-/* The cursor dots type, one after another, like an agent composing a reply. */
-@keyframes splash-type {
-    0% { transform: none; opacity: 0.45; }
-    30% { transform: translateY(-6px); opacity: 1; }
-    60% { transform: none; opacity: 0.45; }
-    100% { transform: none; opacity: 0.45; }
-}
 
 .splash-icon {
-    animation: splash-arrive 480ms cubic-bezier(0.2, 0.9, 0.3, 1.15) both;
+    animation: splash-bubble-up 700ms cubic-bezier(0.25, 0.8, 0.35, 1) both,
+               splash-float 2600ms ease-in-out 700ms infinite alternate;
 }
 .splash-dot {
     border-radius: 9999px;
-    animation: splash-type 1300ms ease-in-out infinite both;
 }
-.splash-dot.dot-claude { background-color: #e8846b; animation-delay: 300ms; }
-.splash-dot.dot-agy { background-color: #5b9cf6; animation-delay: 450ms; }
-.splash-dot.dot-codex { background-color: #4cc38a; animation-delay: 600ms; }
+.splash-dot.dot-claude {
+    background-color: #e8846b;
+    animation: splash-dot-pop 300ms ease-out 700ms both,
+               splash-dot-bounce 1800ms ease-in-out 1100ms infinite;
+}
+.splash-dot.dot-agy {
+    background-color: #5b9cf6;
+    animation: splash-dot-pop 300ms ease-out 800ms both,
+               splash-dot-bounce 1800ms ease-in-out 1250ms infinite;
+}
+.splash-dot.dot-codex {
+    background-color: #4cc38a;
+    animation: splash-dot-pop 300ms ease-out 900ms both,
+               splash-dot-bounce 1800ms ease-in-out 1400ms infinite;
+}
 
 label.splash-name {
     font-size: 22pt;
     font-weight: 800;
     letter-spacing: 0.02em;
     color: #ebe9ff;
-    animation: splash-rise 420ms ease-out 160ms both;
+    transform-origin: top;
+    animation: splash-fold-down 700ms ease-out 900ms both;
 }
-/* Only worth reading if the wait is long, so it arrives last. */
 label.splash-status {
     font-size: 10pt;
     color: #9c97c7;
-    animation: splash-fade 500ms ease-out 650ms both;
+    animation: splash-fade 600ms ease-out 1800ms both;
 }
 
 /* ---------------------------------------------------------------- skeletons */

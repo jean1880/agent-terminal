@@ -217,8 +217,8 @@ impl ChatView {
             }
         });
 
-        inner.header.insert_usage(inner.subagent_button.widget());
-        view.append(&inner.header.root);
+        inner.header.set_subagents(inner.subagent_button.widget());
+        view.append(&inner.header.bin);
         view.append(inner.transcript.widget());
         let bottom = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         bottom.add_css_class("chat-bottom");
@@ -367,7 +367,8 @@ impl ChatView {
         let Some(inner) = self.inner() else { return };
         let driver = inner.backend.status().driver;
         let indicator = UsageIndicator::new(status.clone(), Some(driver));
-        inner.header.insert_usage(indicator.widget());
+        indicator.connect_repainted(inner.header.refitter());
+        inner.header.set_usage(indicator.widget());
         *inner.account.borrow_mut() = Some(status);
         *inner.usage.borrow_mut() = Some(indicator);
     }

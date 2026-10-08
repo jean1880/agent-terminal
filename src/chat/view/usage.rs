@@ -5,7 +5,7 @@
 //! It reads [`AccountStatus`] and repaints whenever that changes. One widget serves both the
 //! chat header (filtered to the thread's current agent) and an unfiltered sidebar footer.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use agent_core::adapter::Driver;
@@ -110,6 +110,8 @@ pub struct UsageIndicator {
     listener: Cell<Option<u64>>,
     /// Likewise for availability: an agent that stops being ready leaves the indicator.
     availability_listener: Cell<Option<u64>>,
+    /// Run after each repaint (its size may have changed): see [`Self::connect_repainted`].
+    on_repaint: RefCell<Vec<Box<dyn Fn()>>>,
 }
 
 impl Drop for UsageIndicator {
@@ -152,6 +154,7 @@ impl UsageIndicator {
             filter: Cell::new(filter),
             listener: Cell::new(None),
             availability_listener: Cell::new(None),
+            on_repaint: RefCell::new(Vec::new()),
         });
         this.repaint();
         let weak = Rc::downgrade(&this);
@@ -180,6 +183,13 @@ impl UsageIndicator {
 
     pub fn widget(&self) -> &gtk4::MenuButton {
         &self.root
+    }
+
+    /// Lists the agents one under another rather than side by side (the sidebar, which is
+    /// narrow).
+    pub fn stack_agents(&self) {
+        self.compact.set_orientation(gtk4::Orientation::Vertical);
+        self.compact.set_spacing(4);
     }
 
     /// Follows the thread when it moves to the other agent.
@@ -214,6 +224,15 @@ impl UsageIndicator {
             self.compact.append(&compact_form(*driver, snap));
             self.details.append(&detail_form(*driver, snap, now));
         }
+        for f in self.on_repaint.borrow().iter() {
+            f();
+        }
+    }
+
+    /// Calls `f` after every repaint, when the indicator may have changed size (a container
+    /// that fixes its own size, such as the chat header's, re-fits to it).
+    pub fn connect_repainted(&self, f: impl Fn() + 'static) {
+        self.on_repaint.borrow_mut().push(Box::new(f));
     }
 }
 

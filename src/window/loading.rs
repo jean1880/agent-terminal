@@ -12,8 +12,9 @@ use std::cell::Cell;
 
 const STYLE: &str = include_str!("loading.css");
 
-/// How long the splash is shown before a startup that is still waiting moves on to the skeleton.
-pub(super) const SKELETON_AFTER_MS: u64 = 900;
+/// How long the splash is shown before a startup that is still waiting moves on to the skeleton:
+/// long enough for its intro (`loading.css`) to play out.
+pub(super) const SKELETON_AFTER_MS: u64 = 2200;
 /// Every loading-to-loaded swap crossfades for this long.
 pub(super) const CROSSFADE_MS: u32 = 220;
 
@@ -55,8 +56,9 @@ fn load_style() {
     STYLE_LOADED.with(|l| l.set(true));
 }
 
-/// The splash: the app icon with its cursor dots typing, the app's name, and `status` (what it
-/// is waiting for), which fades in only once the wait is long enough to read it.
+/// The splash: the app icon bubbling up, its cursor dots popping in and bouncing, the app's
+/// name folding down beneath it, and `status` (what it is waiting for), which fades in only once
+/// the wait is long enough to read it. The choreography is in `loading.css`.
 pub(super) fn splash(status: &str) -> gtk4::Widget {
     load_style();
     let root = Box::builder()
@@ -106,7 +108,22 @@ pub(super) fn splash(status: &str) -> gtk4::Widget {
             .css_classes(["splash-status"])
             .build(),
     );
-    root.upcast()
+    clipped(&root)
+}
+
+/// `child` in a frame that asks for no size of its own: a placeholder must never be what holds
+/// the window open (or pushes the header out of it). In a window smaller than the placeholder's
+/// layout, it is clipped. It never scrolls: it is not interactive.
+fn clipped(child: &impl IsA<gtk4::Widget>) -> gtk4::Widget {
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::External)
+        .vscrollbar_policy(gtk4::PolicyType::External)
+        .hexpand(true)
+        .vexpand(true)
+        .can_target(false)
+        .child(child)
+        .build()
+        .upcast()
 }
 
 /// One skeleton block. `delay` (0–3) staggers its pulse, so the blocks shimmer as a wave down
@@ -238,7 +255,7 @@ pub(super) fn chat() -> gtk4::Widget {
         .height_request(56)
         .build();
     root.append(&clamped(&composer, false));
-    root.upcast()
+    clipped(&root)
 }
 
 fn user_bubble(width: i32, delay: u8) -> Box {
@@ -305,7 +322,7 @@ pub(super) fn shell(show_sidebar: bool) -> gtk4::Widget {
 
     split.set_sidebar(Some(&sidebar));
     split.set_content(Some(&chat()));
-    split.upcast()
+    clipped(&split)
 }
 
 /// Stops a skeleton's pulse (it is not loading any more, say a read that failed) without
@@ -328,7 +345,7 @@ pub(super) fn reveal(widget: &impl IsA<gtk4::Widget>) {
 /// `agent-terminal --loading-demo`: the startup sequence of a launch that never finishes
 /// detecting, on a loop (splash, then the shell skeleton), for screenshots and review.
 pub(crate) fn demo() -> glib::ExitCode {
-    const LOOP_MS: u64 = 6000;
+    const LOOP_MS: u64 = 7000;
     let app = adw::Application::builder()
         .application_id("com.jdesroches.AgentTerminal.LoadingDemo")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)

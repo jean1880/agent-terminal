@@ -25,6 +25,12 @@ use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 /// Static logo SVG for standalone binary.
 const LOGO_SVG: &str = include_str!("../../assets/com.jdesroches.AgentTerminal.svg");
 
+/// The smallest the window may be made (GNOME's minimum for adaptive apps). Every layout state
+/// the breakpoints allow fits it; `tests::small_window_fits` measures that.
+const MIN_WINDOW: (i32, i32) = (360, 294);
+/// At or below this width the header drops its panel toggles ([`AgentTerminalWindow::add_narrow_breakpoint`]).
+const NARROW_SP: f64 = 480.0;
+
 /// Per-tab state, tracked explicitly so terminal/directory lookups never depend
 /// on walking the tab's widget hierarchy. `dir` is the directory the tab was
 /// launched in — a running Claude/agy session cannot re-root itself, so it stays
@@ -293,7 +299,7 @@ fn build_exit_bar() -> (Box, Label, Button, Button) {
 
 /// Removes `stack`'s `names` pages once the crossfade away from them has finished, so loading
 /// screens that are out of view stop animating and are freed.
-fn drop_after_crossfade(stack: &Stack, names: &'static [&'static str]) {
+fn drop_after_crossfade(stack: &Stack, names: Vec<&'static str>) {
     glib::timeout_add_local_once(
         std::time::Duration::from_millis(u64::from(loading::CROSSFADE_MS) + 50),
         glib::clone!(
@@ -301,6 +307,10 @@ fn drop_after_crossfade(stack: &Stack, names: &'static [&'static str]) {
             stack,
             move || {
                 for name in names {
+                    // A page of that name shown again meanwhile ("Check again") stays.
+                    if stack.visible_child_name().as_deref() == Some(name) {
+                        continue;
+                    }
                     if let Some(page) = stack.child_by_name(name) {
                         stack.remove(&page);
                     }
@@ -747,6 +757,21 @@ pub struct AgentTerminalWindow {
     /// The last session's threads are still being reopened: an empty tab view shows a loading
     /// skeleton, not the empty state.
     restoring_threads: std::cell::Cell<bool>,
+    /// The content below the header: the splash and skeleton, the welcome screen, and the
+    /// shell (built at once, behind them).
+    boot: RefCell<Option<Stack>>,
+    /// CLI detection is running.
+    detecting: std::cell::Cell<bool>,
+    /// Detection found a CLI and [`Self::finish_shell`] ran: the shell is live.
+    shell_ready: std::cell::Cell<bool>,
+    /// The header controls that act on the shell, inactive until it is live.
+    shell_controls: RefCell<Vec<gtk4::Widget>>,
+    /// A resume opened a page in this window (it keeps the view over a restored thread).
+    resume_opened: std::cell::Cell<bool>,
+    /// The thread restore put its saved thread in view (it keeps the view over 2.x tabs).
+    thread_selected_by_restore: std::cell::Cell<bool>,
+    /// The actions [`Self::hold_actions`] switched off until the shell is live.
+    held_actions: RefCell<Vec<gtk4::gio::SimpleAction>>,
 }
 
 #[glib::object_subclass]
@@ -765,6 +790,7 @@ impl ObjectImpl for AgentTerminalWindow {
             .set_expand_by_default(self.config.borrow().diffs_expanded);
         self.setup_ui();
         self.setup_actions();
+        self.hold_actions();
         self.start_quota_watch();
         self.start_checkpoint_watch();
         self.watch_focus();
@@ -1611,6 +1637,8 @@ impl AgentTerminalWindow {
 
         obj.set_default_width(950);
         obj.set_default_height(650);
+        // With breakpoints, the window's own size request is its minimum, not its content's.
+        obj.set_size_request(MIN_WINDOW.0, MIN_WINDOW.1);
         obj.set_title(Some("Agent Terminal"));
 
         let content = Box::builder().orientation(Orientation::Vertical).build();
@@ -1652,6 +1680,29 @@ impl AgentTerminalWindow {
         boot.add_named(&loading::splash("Looking for an AI CLI…"), Some("splash"));
         content.append(&boot);
         obj.set_content(Some(&content));
+
+        // The chat shell is built now, behind the splash, not once detection is done: the thread
+        // list, the threads left open and the agents' scan all load while it runs, and the
+        // thread in view is read, built and its session started before the splash gives way.
+        // Detection only decides what comes after it (`finish_shell`, or the welcome screen).
+        let ready = Box::builder()
+            .orientation(Orientation::Vertical)
+            .vexpand(true)
+            .build();
+        self.build_shell(&ready);
+        boot.add_named(&ready, Some("ready"));
+        *self.boot.borrow_mut() = Some(boot);
+        self.detect_cli();
+    }
+
+    /// Looks for the CLI (off the main thread) behind the splash, then shows the shell, or the
+    /// welcome screen when there is none.
+    fn detect_cli(&self) {
+        let obj = self.obj();
+        let Some(boot) = self.boot.borrow().clone() else {
+            return;
+        };
+        self.detecting.set(true);
         let show_sidebar = !self.config.borrow().sidebar_collapsed;
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(loading::SKELETON_AFTER_MS),
@@ -1676,37 +1727,96 @@ impl AgentTerminalWindow {
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
-            #[weak]
-            boot,
             async move {
                 let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
 
                 let imp = obj.imp();
                 *imp.active_profile.borrow_mut() = resolved.clone();
+                imp.detecting.set(false);
 
-                let ready = Box::builder()
-                    .orientation(Orientation::Vertical)
-                    .vexpand(true)
-                    .build();
                 if let Some(ref profile) = resolved {
                     info!(
-                        "Profile '{}' resolved to '{}', setting up terminal UI",
+                        "Profile '{}' resolved to '{}', showing the shell",
                         profile.name, profile.command
                     );
-                    imp.setup_terminal_ui(&ready, Some(profile));
+                    imp.finish_shell(Some(profile));
+                    imp.show_boot_page("ready");
                 } else {
                     warn!("No compatible CLI detected, setting up welcome UI");
-                    imp.setup_welcome_ui(&ready);
+                    let welcome = Box::builder()
+                        .orientation(Orientation::Vertical)
+                        .vexpand(true)
+                        .build();
+                    imp.setup_welcome_ui(&welcome);
+                    if let Some(boot) = imp.boot.borrow().as_ref() {
+                        if let Some(old) = boot.child_by_name("welcome") {
+                            boot.remove(&old);
+                        }
+                        boot.add_named(&welcome, Some("welcome"));
+                    }
+                    imp.show_boot_page("welcome");
                 }
-                boot.add_named(&ready, Some("ready"));
-                boot.set_visible_child_name("ready");
-                drop_after_crossfade(&boot, &["splash", "skeleton"]);
             }
         ));
     }
 
-    /// Sets up the tabbed terminal interface, then opens the first tab.
-    fn setup_terminal_ui(&self, container: &Box, profile: Option<&Profile>) {
+    /// Crossfades the boot stack to `name` and, once the fade is over, removes the loading and
+    /// welcome pages it left (never the shell, which lives for the window).
+    fn show_boot_page(&self, name: &str) {
+        let Some(boot) = self.boot.borrow().clone() else {
+            return;
+        };
+        boot.set_visible_child_name(name);
+        let stale: Vec<&'static str> = ["splash", "skeleton", "welcome"]
+            .into_iter()
+            .filter(|page| *page != name)
+            .collect();
+        drop_after_crossfade(&boot, stale);
+    }
+
+    /// The welcome screen's "Check again": the splash, and detection once more.
+    fn check_again(&self) {
+        // A second click while the first check runs (the page fades out, still clickable).
+        if self.detecting.get() {
+            return;
+        }
+        let Some(boot) = self.boot.borrow().clone() else {
+            return;
+        };
+        self.no_cli.set(false);
+        if let Some(old) = boot.child_by_name("splash") {
+            boot.remove(&old);
+        }
+        boot.add_named(&loading::splash("Looking for an AI CLI…"), Some("splash"));
+        self.show_boot_page("splash");
+        self.detect_cli();
+    }
+
+    /// Switches the window's actions (every shortcut and menu entry) off while the shell is
+    /// hidden behind the splash or the welcome screen, so none opens a thread nobody can see.
+    /// [`Self::finish_shell`] switches back on exactly those it switched off.
+    fn hold_actions(&self) {
+        if self.shell_ready.get() {
+            return;
+        }
+        let obj = self.obj();
+        let mut held = self.held_actions.borrow_mut();
+        for name in obj.list_actions() {
+            if let Some(action) = obj
+                .lookup_action(&name)
+                .and_downcast::<gtk4::gio::SimpleAction>()
+            {
+                if action.is_enabled() {
+                    action.set_enabled(false);
+                    held.push(action);
+                }
+            }
+        }
+    }
+
+    /// Builds the chat shell into `container` (sidebar, pages, the threads left open) and starts
+    /// everything it loads. Its header controls wait for [`Self::finish_shell`].
+    fn build_shell(&self, container: &Box) {
         let obj = self.obj();
         debug!("Initializing tabbed terminal UI");
 
@@ -1716,6 +1826,7 @@ impl AgentTerminalWindow {
         // Chat-first: the sidebar navigates; the tab view is the hidden page stack, with no
         // tab bar. "New" in the header is a split button: click opens a thread on the default
         // agent in the current folder; the menu has every other way to start one.
+        let mut panel_buttons = Vec::new();
         if let Some(header) = self.header.borrow().as_ref() {
             let new_btn = adw::SplitButton::builder()
                 .icon_name("at-list-add-symbolic")
@@ -1743,8 +1854,19 @@ impl AgentTerminalWindow {
                 .build();
             header.pack_end(&diff_btn);
             header.pack_end(&drawer_btn);
+            self.shell_controls.borrow_mut().extend([
+                new_btn.upcast::<gtk4::Widget>(),
+                diff_btn.clone().upcast(),
+                drawer_btn.clone().upcast(),
+            ]);
+            panel_buttons.extend([diff_btn, drawer_btn]);
         }
         self.setup_shell(container, &tab_view);
+        self.add_narrow_breakpoint(&panel_buttons);
+        // Built behind the splash: nothing to act on until it is shown.
+        for control in self.shell_controls.borrow().iter() {
+            control.set_sensitive(false);
+        }
 
         // Immediately confirm tab closures (no unsaved-state prompt for a terminal).
         tab_view.connect_close_page(|view, page| {
@@ -1853,18 +1975,54 @@ impl AgentTerminalWindow {
             }
         ));
 
-        // A window opened *for* a resume shows that session rather than an
-        // extra blank tab beside it. Restored tabs still come back: restoring is
-        // the user's standing preference, and the resume is added to it.
-        // 2.x terminal pages come back as before; threads open as they were left. Nothing
-        // restored shows the empty state rather than a blank thread nobody asked for.
+        // Threads open as they were left, read while detection runs. Nothing restored shows the
+        // empty state rather than a blank thread nobody asked for.
+        self.restore_open_threads();
+        self.refresh_sidebar();
+    }
+
+    /// Detection is done and found a CLI: the 2.x terminal pages come back (they need its
+    /// profile), queued resumes open, and the shell's controls come alive. Once per window.
+    ///
+    /// A window opened *for* a resume shows that session rather than an extra blank tab beside
+    /// it. Restored tabs still come back: restoring is the user's standing preference, and the
+    /// resume is added to it.
+    fn finish_shell(&self, profile: Option<&Profile>) {
+        if self.tab_view.borrow().is_none() || self.shell_ready.replace(true) {
+            return;
+        }
+        for control in self.shell_controls.borrow().iter() {
+            control.set_sensitive(true);
+        }
+        for action in self.held_actions.take() {
+            action.set_enabled(true);
+        }
         let pending: Vec<ResumeRequest> = self.pending_resumes.take();
         self.restore_previous_session(profile);
-        self.restore_open_threads();
         for request in pending {
             self.open_resume_tab(request);
         }
         self.refresh_sidebar();
+    }
+
+    /// The narrowest windows (down to [`MIN_WINDOW`]): the sidebar overlaid, as below the collapse
+    /// breakpoint, and the header's panel toggles (drawer, diff) hidden so the header fits. Both
+    /// panels stay on their shortcuts. Added after the collapse breakpoint, so it wins where
+    /// both match.
+    fn add_narrow_breakpoint(&self, panel_buttons: &[Button]) {
+        let Some(split) = self.split_view.borrow().clone() else {
+            return;
+        };
+        let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            NARROW_SP,
+            adw::LengthUnit::Sp,
+        ));
+        narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+        for button in panel_buttons {
+            narrow.add_setter(button, "visible", Some(&false.to_value()));
+        }
+        self.obj().add_breakpoint(narrow);
     }
 
     /// (Re)fills "New Thread With" with the agents that are installed and enabled. Detection is
@@ -2071,12 +2229,12 @@ impl AgentTerminalWindow {
             }
         ));
         // The terminal and, beside it, the tab's diff panel. The panel keeps
-        // its width as the window resizes; the terminal takes the rest.
+        // its width as the window resizes; the terminal takes the rest, and
+        // the panel narrows once the terminal is down to its minimum.
         let (diff_panel, paned) = {
             let config = self.config.borrow();
             let panel = DiffPanel::new(&Theme::diff_colours(config.theme));
             panel.set_shown(config.diff_panel_visible);
-            stack.set_size_request(440, -1);
             let paned = gtk4::Paned::builder()
                 .orientation(Orientation::Horizontal)
                 .start_child(&stack)
@@ -2084,7 +2242,7 @@ impl AgentTerminalWindow {
                 .resize_start_child(true)
                 .resize_end_child(false)
                 .shrink_start_child(false)
-                .shrink_end_child(false)
+                .shrink_end_child(true)
                 .vexpand(true)
                 .build();
             (panel, paned)
@@ -2338,6 +2496,22 @@ impl AgentTerminalWindow {
             state.tabs.len()
         );
         let profiles = self.config.borrow().profiles.clone();
+        let first_page = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .map_or(0, |v| v.n_pages() as usize);
+        // Each tab added below takes the selection; a thread the restore put in view gets it back.
+        let thread_in_view = self
+            .thread_selected_by_restore
+            .get()
+            .then(|| {
+                self.tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|v| v.selected_page())
+            })
+            .flatten();
         let mut missing = Vec::new();
         for tab in &state.tabs {
             let profile = tab
@@ -2369,8 +2543,13 @@ impl AgentTerminalWindow {
         }
 
         if let Some(view) = self.tab_view.borrow().as_ref() {
-            if state.selected < view.n_pages() as usize {
-                view.set_selected_page(&view.nth_page(state.selected as i32));
+            // Its position counts its own tabs, which follow any thread already reopened. A
+            // thread the restore put in view keeps it, as when threads reopened after them.
+            let position = first_page + state.selected;
+            if let Some(page) = &thread_in_view {
+                view.set_selected_page(page);
+            } else if position < view.n_pages() as usize {
+                view.set_selected_page(&view.nth_page(position as i32));
             }
         }
         true
@@ -2382,12 +2561,19 @@ impl AgentTerminalWindow {
             return;
         }
 
+        // Among the tabs saved (terminal pages only), as `restore_previous_session` reads it.
         let selected = self
             .tab_view
             .borrow()
             .as_ref()
             .and_then(|view| view.selected_page())
-            .and_then(|page| self.tabs.borrow().iter().position(|t| t.page == page))
+            .and_then(|page| {
+                self.tabs
+                    .borrow()
+                    .iter()
+                    .filter(|t| t.chat.is_none())
+                    .position(|t| t.page == page)
+            })
             .unwrap_or(0);
 
         let tabs: Vec<crate::config::SessionTab> = self
@@ -2928,10 +3114,7 @@ impl AgentTerminalWindow {
         refresh_button.connect_clicked(glib::clone!(
             #[weak]
             obj,
-            move |_| {
-                let imp = obj.imp();
-                imp.setup_ui();
-            }
+            move |_| obj.imp().check_again()
         ));
 
         status_page.set_child(Some(&refresh_button));
@@ -3396,10 +3579,10 @@ impl AgentTerminalWindow {
     /// Opens a tab resuming a session, or queues it until the window can.
     ///
     /// The entry point for the command line and the Resume dialog. A new window
-    /// has no tab view until profile resolution finishes; the queue is drained
-    /// by [`Self::setup_terminal_ui`] (or reported by the welcome screen).
+    /// cannot resume until profile resolution finishes; the queue is drained
+    /// by [`Self::finish_shell`] (or reported by the welcome screen).
     pub fn request_resume(&self, request: ResumeRequest) {
-        if self.tab_view.borrow().is_some() {
+        if self.shell_ready.get() {
             self.open_resume_tab(request);
         } else if self.no_cli.get() {
             warn!(
@@ -3459,6 +3642,7 @@ impl AgentTerminalWindow {
     /// sessions per project cannot find one from any other directory, and it
     /// says so only inside the tab, so a failed lookup is reported here.
     fn open_resume_tab(&self, request: ResumeRequest) {
+        self.resume_opened.set(true);
         let ResumeRequest {
             session_id,
             dir,
@@ -5480,6 +5664,14 @@ mod tests {
         app.register(None::<&gtk4::gio::Cancellable>)
             .expect("registering a non-unique application");
         let window = super::super::AgentTerminalWindow::new(&app);
+        // Before anything turns the main loop (detection would then end): the shell is hidden
+        // behind the splash, and no shortcut can open a thread in it.
+        assert!(
+            window
+                .lookup_action("new-tab")
+                .is_some_and(|a| !a.is_enabled()),
+            "the window's actions wait for the shell"
+        );
 
         assert_eq!(window.title(), Some("Agent Terminal".into()));
         assert!(
@@ -5498,6 +5690,173 @@ mod tests {
         chat_shell_opens_threads_and_lists_them(&window);
     }
 
+    /// The narrowest window that still shows the sidebar beside the thread (at 1× text scale).
+    const COLLAPSE_BELOW: i32 = threads::SIDEBAR_COLLAPSE_SP as i32;
+
+    /// The window, with a thread open and full of history and the sidebar shown, fits itself at
+    /// every size from [`MIN_WINDOW`] up: in whichever layout the breakpoints pick, nothing
+    /// (header buttons, composer, transcript) is pushed out of view. Prints what holds it open
+    /// when it fails. Needs the brand CSS on a display, so it runs on a private one: the preview
+    /// MCP's `preview_app` with the test binary and `small_window_fits --ignored --nocapture`.
+    #[test]
+    #[ignore = "measures the real UI with the brand CSS; run on a private display"]
+    fn small_window_fits() {
+        use crate::testutil::{min_size, min_size_report};
+        use agent_core::adapter::Driver;
+        use gtk4::Orientation::{Horizontal, Vertical};
+        init_gtk();
+        adw::init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.SmallWindow")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>)
+            .expect("registering a non-unique application");
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        // The shell, built behind the splash, shown as once detection finds a CLI (whatever this
+        // machine's detection said).
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.show_boot_page("ready");
+        let content = window
+            .content()
+            .and_downcast::<Box>()
+            .expect("the window's content box");
+
+        let dir = tempfile::tempdir().unwrap();
+        imp.new_chat_thread(
+            Some(Driver::Claude),
+            Some(dir.path().to_string_lossy().into_owned()),
+            None,
+        );
+        let built = crate::testutil::pump_until(&ctx, 30, || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .any(|t| t.chat.as_ref().is_some_and(|c| c.view.is_some()))
+        });
+        assert!(built, "the thread's view was built");
+        let view = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find_map(|t| t.chat.as_ref().and_then(|c| c.view.clone()))
+            .expect("a thread view");
+        // A long history, then the demo session: gauge, sub-agents, plan, an open approval.
+        let mut history = crate::chat::view::demo::DemoBackend::stress_history(40);
+        history.extend(crate::chat::view::demo::DemoBackend::script_envelopes());
+        view.replay(&history);
+        // Both agents found, with plan usage: the sidebar footer and the header at their
+        // fullest. After the window's own scan, which would otherwise mark them missing again.
+        let availability = crate::availability::AgentAvailability::shared();
+        crate::testutil::pump_until(&ctx, 20, || !availability.any_detecting());
+        for driver in [Driver::Claude, Driver::Agy] {
+            availability.set(
+                driver,
+                crate::availability::Availability::Ready("/bin/true".into()),
+            );
+        }
+        crate::chat::view::demo::observe_demo_quota(&crate::account_status::AccountStatus::shared());
+        window.present();
+        let root: gtk4::Widget = content.clone().upcast();
+        let mut failures = Vec::new();
+        let mut report = String::new();
+        // As it opens, at its default size: nothing in the first frames may want more either.
+        while ctx.iteration(false) {}
+        let opened = min_size(&root, Horizontal);
+        report.push_str(&format!(
+            "== as opened, {} px wide: minimum width {opened} px\n{}\n",
+            window.width(),
+            min_size_report(&root, Horizontal, 120)
+        ));
+        if opened > window.width() {
+            failures.push(format!(
+                "as opened: minimum width {opened} px > {}",
+                window.width()
+            ));
+        }
+        // Long enough for timers (the restore skeleton's removal) to run.
+        crate::testutil::pump_until(&ctx, 1, || false);
+
+        let split = imp.split_view.borrow().clone().expect("the split view");
+        split.set_show_sidebar(true);
+        // The window at each width either side of every breakpoint, the real breakpoints
+        // choosing the layout, at the smallest height it may have. Whatever the layout, its
+        // content must fit the window.
+        let (_, height) = MIN_WINDOW;
+        let widths = [
+            MIN_WINDOW.0,
+            NARROW_SP as i32,
+            NARROW_SP as i32 + 1,
+            COLLAPSE_BELOW,
+            // The narrowest window with the sidebar beside the thread (the condition is max-width).
+            COLLAPSE_BELOW + 1,
+            950,
+        ];
+        for diff_shown in [false, true] {
+            if diff_shown {
+                imp.toggle_diff_panel();
+            }
+            for width in widths {
+                window.set_default_size(width, height);
+                let sized = crate::testutil::pump_until(&ctx, 3, || {
+                    window.width() == width && window.height() == height
+                });
+                // Let the breakpoint the new size selects apply.
+                crate::testutil::pump_until(&ctx, 1, || false);
+                assert!(
+                    sized,
+                    "the window took {width}×{height} (it is {}×{})",
+                    window.width(),
+                    window.height()
+                );
+                let state = format!(
+                    "{width}×{height}, sidebar {}, diff panel {}",
+                    if split.is_collapsed() {
+                        "overlaid"
+                    } else {
+                        "beside"
+                    },
+                    if diff_shown { "shown" } else { "hidden" }
+                );
+                for overflow in crate::testutil::overflowing_bins(&root) {
+                    report.push_str(&format!("== {state}: {overflow}\n"));
+                    failures.push(format!("{state}: {overflow}"));
+                }
+                for (what, orientation, limit, threshold) in [
+                    ("width", Horizontal, width, 120),
+                    ("height", Vertical, height, 40),
+                ] {
+                    let min = min_size(&root, orientation);
+                    report.push_str(&format!(
+                        "== {state}: minimum {what} {min} px (limit {limit})\n{}\n",
+                        min_size_report(&root, orientation, threshold)
+                    ));
+                    if min > limit {
+                        failures.push(format!("{state}: minimum {what} {min} px > {limit}"));
+                    }
+                }
+            }
+        }
+        // Long; also kept in a file, since a display runner may keep only the tail of stderr.
+        let path = std::env::temp_dir().join("agent-terminal-small-window.txt");
+        if std::fs::write(&path, &report).is_ok() {
+            eprintln!("size report: {}", path.display());
+        }
+        eprintln!("{report}");
+        window.destroy();
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
     /// The chat-first shell, without a main loop: nothing is resolved or spawned (the agent
     /// commands point nowhere anyway), only the pages, the registry and the sidebar.
     fn chat_shell_opens_threads_and_lists_them(window: &super::super::AgentTerminalWindow) {
@@ -5506,8 +5865,20 @@ mod tests {
         for p in imp.config.borrow_mut().profiles.iter_mut() {
             p.command = format!("/nonexistent/{}", p.command);
         }
-        let container = Box::new(Orientation::Vertical, 0);
-        imp.setup_terminal_ui(&container, None);
+        // The shell exists from construction (built behind the splash); detection's end makes
+        // it live.
+        assert!(
+            imp.tab_view.borrow().is_some(),
+            "the shell is built before detection ends"
+        );
+        imp.finish_shell(None);
+        assert!(imp.shell_ready.get());
+        assert!(
+            window
+                .lookup_action("new-tab")
+                .is_some_and(|a| a.is_enabled()),
+            "the shell's actions are on once it is live"
+        );
         assert_eq!(
             imp.tabs.borrow().len(),
             0,

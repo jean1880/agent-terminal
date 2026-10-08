@@ -14,7 +14,7 @@ use gtk4::glib;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// Narrowest the panel may be dragged.
+/// Narrowest width the panel remembers being dragged to.
 pub const MIN_WIDTH: i32 = 220;
 
 const TAG_ADDED: &str = "added";
@@ -203,9 +203,10 @@ impl DiffPanel {
         stack.add_named(&status, Some("status"));
         stack.add_named(&diff_page, Some("diff"));
 
+        // No width request: the paned lets the panel narrow in a small window. MIN_WIDTH is only
+        // the floor for a width the user drags it to.
         let root = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .width_request(MIN_WIDTH)
             .build();
         root.append(&header);
         root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));

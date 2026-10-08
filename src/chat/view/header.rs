@@ -3,8 +3,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
-use gtk4::prelude::*;
 
 use super::cards::{accent_class, driver_name, label};
 use super::model::{format_tokens, Activity, Gauge};
@@ -43,8 +43,19 @@ pub fn gauge_text(g: &Gauge) -> String {
     }
 }
 
+/// The header's own width breakpoints (sp), widest first. Each drops more of the strip, so it
+/// fits the thread at any window size: the usage meter (also in the sidebar), then the context
+/// gauge, then the sub-agents button and the model's name, with tighter spacing.
+const HIDE_USAGE_BELOW: f64 = 880.0;
+const HIDE_GAUGE_BELOW: f64 = 700.0;
+const COMPACT_BELOW: f64 = 500.0;
+/// The narrowest the strip supports: the whole window at its minimum.
+const MIN_WIDTH: i32 = 340;
+
 pub struct Header {
-    pub root: gtk4::Box,
+    /// What the view packs: the strip in its breakpoint bin.
+    pub bin: adw::BreakpointBin,
+    root: gtk4::Box,
     pub chip: gtk4::Button,
     brand: gtk4::Image,
     agent: gtk4::Label,
@@ -53,6 +64,10 @@ pub struct Header {
     /// Set while the view changes the dropdown itself, so that is not taken as a user choice.
     pub mode_guard: Cell<bool>,
     activity: gtk4::Box,
+    /// Where [`Self::set_usage`] and [`Self::set_subagents`] put their widgets, so the
+    /// breakpoints can drop each.
+    usage_slot: gtk4::Box,
+    subagent_slot: gtk4::Box,
     activity_text: gtk4::Label,
     spinner: gtk4::Spinner,
     /// The status the header shows now.
@@ -63,7 +78,32 @@ pub struct Header {
     last_driver: Cell<Option<Driver>>,
 }
 
+/// Grows `bin`'s height request to `root`'s minimum height. Never shrinks it: the strip changes
+/// by a few pixels as items come and go, and a header that jumps with each would be worse.
+fn fit_height(bin: &adw::BreakpointBin, root: &gtk4::Box) {
+    let needed = root.measure(gtk4::Orientation::Vertical, -1).0;
+    if needed > bin.height_request() {
+        bin.set_height_request(needed);
+    }
+}
+
 impl Header {
+    /// Re-fits the bin to the strip after its contents changed (see [`fit_height`]).
+    pub fn fit_height(&self) {
+        fit_height(&self.bin, &self.root);
+    }
+
+    /// A callback for widgets placed in the strip that change size on their own (the usage
+    /// meter): re-fits the bin, holding it weakly.
+    pub fn refitter(&self) -> impl Fn() + 'static {
+        let (bin, root) = (self.bin.downgrade(), self.root.downgrade());
+        move || {
+            if let (Some(bin), Some(root)) = (bin.upgrade(), root.upgrade()) {
+                fit_height(&bin, &root);
+            }
+        }
+    }
+
     pub fn new() -> Self {
         let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
         root.add_css_class("chat-header");
@@ -106,6 +146,10 @@ impl Header {
         activity.append(&activity_text);
         activity.set_visible(false);
         root.append(&activity);
+        let usage_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        root.append(&usage_slot);
+        let subagent_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        root.append(&subagent_slot);
 
         let gauge = gtk4::Button::new();
         gauge.add_css_class("flat");
@@ -122,9 +166,82 @@ impl Header {
         gauge_box.append(&gauge_label);
         gauge.set_child(Some(&gauge_box));
         gauge.set_visible(false);
-        root.append(&gauge);
+        // In a slot of its own: `set_gauge` shows and hides the gauge itself.
+        let gauge_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        gauge_slot.append(&gauge);
+        root.append(&gauge_slot);
 
+        let bin = adw::BreakpointBin::new();
+        bin.set_child(Some(&root));
+        // With breakpoints, the bin's size request is its minimum, in both directions. The
+        // width is fixed; the height follows the strip, whose items change (the usage meter is
+        // two lines once it has data): see `fit_height`.
+        bin.set_width_request(MIN_WIDTH);
+        // A breakpoint can bring an item back that is taller than what was measured. Not from
+        // inside the allocation that switched it.
+        bin.connect_current_breakpoint_notify({
+            let (bin, root) = (bin.downgrade(), root.downgrade());
+            move |_| {
+                let (bin, root) = (bin.clone(), root.clone());
+                gtk4::glib::idle_add_local_once(move || {
+                    if let (Some(bin), Some(root)) = (bin.upgrade(), root.upgrade()) {
+                        fit_height(&bin, &root);
+                    }
+                });
+            }
+        });
+        let breakpoint = |below: f64| {
+            let b = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+                adw::BreakpointConditionLengthType::MaxWidth,
+                below,
+                adw::LengthUnit::Sp,
+            ));
+            bin.add_breakpoint(b.clone());
+            b
+        };
+        let hidden = false.to_value();
+        // Added widest first: where several match, the last added (the narrowest) applies, so
+        // each repeats the ones before it.
+        let usage = breakpoint(HIDE_USAGE_BELOW);
+        usage.add_setter(&usage_slot, "visible", Some(&hidden));
+        let gauge_off = breakpoint(HIDE_GAUGE_BELOW);
+        for slot in [
+            usage_slot.upcast_ref::<gtk4::Widget>(),
+            gauge_slot.upcast_ref(),
+        ] {
+            gauge_off.add_setter(slot, "visible", Some(&hidden));
+        }
+        let compact = breakpoint(COMPACT_BELOW);
+        for slot in [
+            usage_slot.upcast_ref::<gtk4::Widget>(),
+            gauge_slot.upcast_ref(),
+            subagent_slot.upcast_ref(),
+            model.upcast_ref(),
+        ] {
+            compact.add_setter(slot, "visible", Some(&hidden));
+        }
+        compact.add_setter(&root, "spacing", Some(&6.to_value()));
+        // A class, not a `css-classes` setter: that would replace GTK's own (`horizontal`).
+        compact.connect_apply({
+            let root = root.downgrade();
+            move |_| {
+                if let Some(root) = root.upgrade() {
+                    root.add_css_class("compact");
+                }
+            }
+        });
+        compact.connect_unapply({
+            let root = root.downgrade();
+            move |_| {
+                if let Some(root) = root.upgrade() {
+                    root.remove_css_class("compact");
+                }
+            }
+        });
+
+        fit_height(&bin, &root);
         Self {
+            bin,
             root,
             chip,
             brand,
@@ -133,6 +250,8 @@ impl Header {
             mode,
             mode_guard: Cell::new(false),
             activity,
+            usage_slot,
+            subagent_slot,
             activity_text,
             spinner,
             shown: RefCell::new(Activity::Idle),
@@ -143,9 +262,19 @@ impl Header {
         }
     }
 
-    /// Puts the usage indicator just before the context gauge.
-    pub fn insert_usage(&self, widget: &impl IsA<gtk4::Widget>) {
-        self.root.insert_child_after(widget, Some(&self.activity));
+    /// Puts the plan-usage indicator after the activity (dropped first as the strip narrows).
+    pub fn set_usage(&self, widget: &impl IsA<gtk4::Widget>) {
+        while let Some(old) = self.usage_slot.first_child() {
+            self.usage_slot.remove(&old);
+        }
+        self.usage_slot.append(widget);
+        self.fit_height();
+    }
+
+    /// Puts the sub-agents button before the context gauge.
+    pub fn set_subagents(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.subagent_slot.append(widget);
+        self.fit_height();
     }
 
     pub fn set_agent(&self, driver: Driver, model: Option<&str>) {
@@ -158,6 +287,7 @@ impl Header {
             .set_from_gicon(&crate::icons::driver_icon(driver));
         self.agent.set_text(driver_name(driver));
         self.model.set_text(model.unwrap_or("default model"));
+        self.fit_height();
     }
 
     pub fn set_mode(&self, mode: Mode) {
@@ -194,6 +324,7 @@ impl Header {
             }
         }
         *self.shown.borrow_mut() = activity.clone();
+        self.fit_height();
     }
 
     /// Whether the header says the main agent is working (tests).
@@ -211,6 +342,11 @@ impl Header {
     }
 
     pub fn set_gauge(&self, gauge: Option<&Gauge>) {
+        self.show_gauge(gauge);
+        self.fit_height();
+    }
+
+    fn show_gauge(&self, gauge: Option<&Gauge>) {
         let Some(g) = gauge else {
             self.gauge.set_visible(false);
             return;

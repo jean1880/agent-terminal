@@ -23,6 +23,8 @@
     background-color: #151122;
     border-bottom: 1px solid #2d2444;
 }
+/* The header's narrowest breakpoint (header.rs). */
+.chat-header.compact { padding: 8px 8px; }
 
 .agent-chip {
     padding: 4px 12px 4px 10px;
@@ -59,7 +61,9 @@
 
 .usage-indicator { padding: 2px 8px; border-radius: 8px; }
 .usage-bar { min-height: 4px; }
-.usage-bar trough { min-height: 4px; background-color: alpha(#c8c8ff, 0.15); border-radius: 2px; }
+/* min-width: Adwaita gives every progress trough 150 px, which outweighs the bar's own width
+   request and made each agent's meter (and the sidebar holding two) far wider than drawn. */
+.usage-bar trough { min-height: 4px; min-width: 24px; background-color: alpha(#c8c8ff, 0.15); border-radius: 2px; }
 .usage-bar progress { min-height: 4px; border-radius: 2px; background-color: #4ee8b0; }
 .usage-bar.usage-warn progress { background-color: #ffc46b; }
 .usage-bar.usage-crit progress { background-color: #ff7878; }

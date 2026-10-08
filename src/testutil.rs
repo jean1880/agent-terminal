@@ -25,3 +25,101 @@ pub fn pump_until(ctx: &glib::MainContext, secs: u64, mut cond: impl FnMut() -> 
     }
     true
 }
+
+/// A widget's minimum size along `orientation` (unconstrained in the other).
+pub fn min_size(widget: &gtk4::Widget, orientation: gtk4::Orientation) -> i32 {
+    use gtk4::prelude::*;
+    widget.measure(orientation, -1).0
+}
+
+/// Every mapped `AdwBreakpointBin` under `root` whose child needs more room than the bin was
+/// given. A bin with breakpoints reports only its size request as its minimum, so its overflow
+/// never shows in `root`'s: each must be checked at its own allocation.
+pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
+    use gtk4::prelude::*;
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(widget) = stack.pop() {
+        if !widget.is_mapped() {
+            continue;
+        }
+        if let Some(bin) = widget.downcast_ref::<adw::BreakpointBin>() {
+            if let Some(child) = adw::prelude::BreakpointBinExt::child(bin) {
+                let (w, h) = (bin.width(), bin.height());
+                let (cw, ch) = (
+                    min_size(&child, gtk4::Orientation::Horizontal),
+                    min_size(&child, gtk4::Orientation::Vertical),
+                );
+                if cw > w || ch > h {
+                    out.push(format!(
+                        "{} {}×{} holds a child needing {cw}×{ch}",
+                        child.css_classes().join("."),
+                        w,
+                        h
+                    ));
+                }
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c);
+        }
+    }
+    out
+}
+
+/// Why `root` needs at least `limit` px along `orientation`: every laid-out descendant that
+/// alone needs `threshold` px or more, indented by depth, with its type, CSS classes and any
+/// label text. A widget whose minimum is too big shows up with the children that make it so.
+pub fn min_size_report(
+    root: &gtk4::Widget,
+    orientation: gtk4::Orientation,
+    threshold: i32,
+) -> String {
+    use gtk4::prelude::*;
+    fn describe(widget: &gtk4::Widget) -> String {
+        let classes = widget.css_classes().join(".");
+        let text = widget
+            .downcast_ref::<gtk4::Label>()
+            .map(|l| {
+                let t: String = l.text().chars().take(40).collect();
+                format!(" {t:?}")
+            })
+            .unwrap_or_default();
+        format!(
+            "{}{}{text}",
+            widget.type_().name(),
+            if classes.is_empty() {
+                String::new()
+            } else {
+                format!(".{classes}")
+            }
+        )
+    }
+    fn walk(
+        widget: &gtk4::Widget,
+        orientation: gtk4::Orientation,
+        threshold: i32,
+        depth: usize,
+        out: &mut String,
+    ) {
+        let min = min_size(widget, orientation);
+        out.push_str(&format!(
+            "{:indent$}{min:>5} {}\n",
+            "",
+            describe(widget),
+            indent = depth * 2
+        ));
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if c.should_layout() && min_size(&c, orientation) >= threshold {
+                walk(&c, orientation, threshold, depth + 1, out);
+            }
+            child = c.next_sibling();
+        }
+    }
+    let mut out = String::new();
+    walk(root, orientation, threshold, 0, &mut out);
+    out
+}

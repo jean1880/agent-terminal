@@ -54,6 +54,9 @@ const OPEN_THREADS_KEY: &str = "open_threads";
 const REPLAY_LIMIT: usize = 50_000;
 /// How often the account/usage indicator refreshes while the window is focused.
 const ACCOUNT_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
+/// Below this window width the sidebar is overlaid on the thread rather than beside it, so from
+/// it up the sidebar and the thread together must fit it.
+pub(super) const SIDEBAR_COLLAPSE_SP: f64 = 720.0;
 
 /// The desktop notification id for a thread waiting on an approval or a question.
 fn approval_notification_id(thread: &str) -> String {
@@ -83,7 +86,7 @@ pub(super) struct ChatTab {
     /// Holds the chat view once built (the page is built the first time it is shown).
     holder: gtk4::Box,
     pub(super) slot: Rc<SessionSlot>,
-    view: Option<ChatView>,
+    pub(super) view: Option<ChatView>,
     building: bool,
     /// The drawer: the paned's end child, hidden until toggled.
     drawer: gtk4::Box,
@@ -970,7 +973,7 @@ impl AgentTerminalWindow {
         // Narrow windows overlay the sidebar instead of squeezing the thread.
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
-            720.0,
+            SIDEBAR_COLLAPSE_SP,
             adw::LengthUnit::Sp,
         ));
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
@@ -993,6 +996,7 @@ impl AgentTerminalWindow {
                 move |t| obj.imp().remember_sidebar(t.is_active())
             ));
             header.pack_start(&toggle);
+            self.shell_controls.borrow_mut().push(toggle.upcast());
         }
         *self.split_view.borrow_mut() = Some(split);
         *self.sidebar.borrow_mut() = Some(sidebar);
@@ -1135,6 +1139,8 @@ impl AgentTerminalWindow {
         footer.append(&archived);
         // Every agent's usage and account, updated on every turn.
         let usage = UsageIndicator::new(AccountStatus::shared(), None);
+        // Side by side, two agents' meters made the sidebar wider than its maximum.
+        usage.stack_agents();
         footer.append(usage.widget());
         root.append(&footer);
 
@@ -1832,7 +1838,7 @@ impl AgentTerminalWindow {
         }
         self.list_recent_sessions();
         let obj = self.obj().downgrade();
-        let before = self.tabs.borrow().len();
+        let before = self.thread_pages();
         glib::MainContext::default().spawn_local(async move {
             let loaded = store_job(|store| {
                 (
@@ -1852,8 +1858,17 @@ impl AgentTerminalWindow {
         });
     }
 
+    /// How many thread pages are open.
+    fn thread_pages(&self) -> usize {
+        self.tabs
+            .borrow()
+            .iter()
+            .filter(|t| t.chat.is_some())
+            .count()
+    }
+
     /// Reopens the saved open-thread list `saved` against the stored `threads`. `before` is how
-    /// many pages were open when the restore began.
+    /// many thread pages were open when the restore began.
     fn reopen_saved(
         &self,
         saved: Option<String>,
@@ -1869,9 +1884,10 @@ impl AgentTerminalWindow {
         if open.is_empty() {
             return;
         }
-        // Pages added since the restore began belong to something else (a resume): leave that
-        // in view.
-        let others_in_view = self.tabs.borrow().len() > before;
+        // Something else put in view since the restore began (a resume, a thread the user
+        // opened) stays there. The 2.x terminal pages, which reopen once detection is done,
+        // do not count: the saved thread is shown over them, as it always was.
+        let others_in_view = self.resume_opened.get() || self.thread_pages() > before;
         info!("Reopening {} thread(s) from the last session", open.len());
         for id in &open {
             self.open_thread(id, false);
@@ -1880,7 +1896,9 @@ impl AgentTerminalWindow {
             return;
         }
         if let Some(id) = selected_to_restore(&value, &open) {
-            self.open_thread(&id, true);
+            if self.open_thread(&id, true).is_some() {
+                self.thread_selected_by_restore.set(true);
+            }
         }
     }
 
@@ -1908,8 +1926,9 @@ impl AgentTerminalWindow {
             .unwrap_or(0);
             if added > 0 {
                 info!("Listed {added} recent agent session(s) as threads");
+                // New rows in the store: the list loaded meanwhile does not have them.
                 if let Some(obj) = obj.upgrade() {
-                    obj.imp().refresh_sidebar();
+                    obj.imp().reload_summaries();
                 }
             }
         });
@@ -1995,7 +2014,8 @@ impl AgentTerminalWindow {
 
         let diff_panel = DiffPanel::new(&Theme::diff_colours(config.theme));
         diff_panel.set_shown(config.diff_panel_visible);
-        drawer_paned.set_size_request(440, -1);
+        // No fixed sizes: the thread needs only what its view needs, and the diff panel narrows
+        // (rather than pushing the thread out of the window) when there is no room for it.
         let paned = gtk4::Paned::builder()
             .orientation(Orientation::Horizontal)
             .start_child(&drawer_paned)
@@ -2003,7 +2023,7 @@ impl AgentTerminalWindow {
             .resize_start_child(true)
             .resize_end_child(false)
             .shrink_start_child(false)
-            .shrink_end_child(false)
+            .shrink_end_child(true)
             .vexpand(true)
             .build();
         self.wire_diff_panel(&diff_panel, &paned);
@@ -3342,6 +3362,16 @@ impl AgentTerminalWindow {
             } else if availability.get(*driver) == Availability::Disabled {
                 availability.set(*driver, Availability::Detecting);
             }
+        }
+        // Tests never probe this machine's agents (nor so start one): every agent reads as
+        // missing. The window scans as it is built, so every window test would otherwise.
+        if cfg!(test) {
+            for (driver, profile) in &profiles {
+                if !profile.disabled {
+                    availability.set(*driver, Availability::Missing);
+                }
+            }
+            return;
         }
         // Agents that were missing, or whose binary has gone, are looked for again.
         forget_stale_resolutions();

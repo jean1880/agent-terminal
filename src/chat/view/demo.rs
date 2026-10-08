@@ -148,6 +148,12 @@ impl ModelSource for DemoModels {
 /// Static account and quota data for `--chat-demo`: one agent in the amber, one in the red.
 pub fn demo_account_status() -> Rc<AccountStatus> {
     let status = Rc::new(AccountStatus::new());
+    observe_demo_quota(&status);
+    status
+}
+
+/// Feeds `status` the demo's accounts and quota windows (Claude and agy).
+pub fn observe_demo_quota(status: &AccountStatus) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
@@ -195,7 +201,6 @@ pub fn demo_account_status() -> Rc<AccountStatus> {
             ],
         ),
     );
-    status
 }
 
 fn demo_commands() -> Vec<AgentCommand> {
@@ -304,6 +309,19 @@ impl DemoBackend {
     /// Plays the full demo script.
     pub fn play_script(&self) {
         self.push(script());
+    }
+
+    /// Every envelope the script emits, in order and at once (for replay): a thread with a
+    /// gauge, sub-agents, a plan, and an approval and a question left open.
+    #[cfg(test)]
+    pub fn script_envelopes() -> Vec<Envelope> {
+        script()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Emit(env) => Some(env),
+                _ => None,
+            })
+            .collect()
     }
 
     /// `n` mixed stored items for [`ChatView::replay`]: the transcript spike.
