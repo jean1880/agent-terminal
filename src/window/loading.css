@@ -1,0 +1,106 @@
+/* Startup splash and loading skeletons (src/window/loading.rs). Colours follow the brand
+   chrome in main.rs; the dots use the agent accents of the sidebar's thread dots. */
+
+/* ---------------------------------------------------------------- splash */
+
+@keyframes splash-arrive {
+    from { opacity: 0; transform: scale(0.88); }
+    to { opacity: 1; transform: none; }
+}
+@keyframes splash-rise {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+}
+@keyframes splash-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+/* The cursor dots type, one after another, like an agent composing a reply. */
+@keyframes splash-type {
+    0% { transform: none; opacity: 0.45; }
+    30% { transform: translateY(-6px); opacity: 1; }
+    60% { transform: none; opacity: 0.45; }
+    100% { transform: none; opacity: 0.45; }
+}
+
+.splash-icon {
+    animation: splash-arrive 480ms cubic-bezier(0.2, 0.9, 0.3, 1.15) both;
+}
+.splash-dot {
+    border-radius: 9999px;
+    animation: splash-type 1300ms ease-in-out infinite both;
+}
+.splash-dot.dot-claude { background-color: #e8846b; animation-delay: 300ms; }
+.splash-dot.dot-agy { background-color: #5b9cf6; animation-delay: 450ms; }
+.splash-dot.dot-codex { background-color: #4cc38a; animation-delay: 600ms; }
+
+label.splash-name {
+    font-size: 22pt;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    color: #ebe9ff;
+    animation: splash-rise 420ms ease-out 160ms both;
+}
+/* Only worth reading if the wait is long, so it arrives last. */
+label.splash-status {
+    font-size: 10pt;
+    color: #9c97c7;
+    animation: splash-fade 500ms ease-out 650ms both;
+}
+
+/* ---------------------------------------------------------------- skeletons */
+
+@keyframes bone-pulse {
+    from { opacity: 1; }
+    to { opacity: 0.4; }
+}
+
+.bone {
+    background-color: alpha(#c8c8ff, 0.09);
+    border-radius: 6px;
+    animation: bone-pulse 900ms ease-in-out infinite alternate both;
+}
+/* Staggered so the shimmer travels down the page. */
+.bone-d1 { animation-delay: 150ms; }
+.bone-d2 { animation-delay: 300ms; }
+.bone-d3 { animation-delay: 450ms; }
+
+.bone-round { border-radius: 9999px; }
+.bone-pill { border-radius: 9999px; }
+.bone-field { border-radius: 8px; }
+.bone-bubble {
+    border-radius: 14px;
+    background-color: alpha(#b49bff, 0.16);
+}
+.bone-card {
+    border-radius: 10px;
+    background-color: alpha(#c8c8ff, 0.06);
+    border: 1px solid alpha(#c8c8ff, 0.08);
+}
+.bone-composer {
+    border-radius: 16px;
+    background-color: #1f1a33;
+    border: 1px solid #3b3160;
+}
+
+/* The chat view's header strip, in its padding and colours. */
+.skeleton-thread-header {
+    padding: 8px 16px;
+    min-height: 32px;
+    background-color: #151122;
+    border-bottom: 1px solid #2d2444;
+}
+.skeleton-chat {
+    background-color: #181425;
+}
+
+/* Nothing loading any more (a read that failed): still, so it does not promise progress. */
+.skeleton-idle .bone {
+    animation: none;
+    opacity: 0.5;
+}
+
+/* What replaces a skeleton fades into the space it held. */
+.loaded-in {
+    animation: splash-fade 200ms ease-out both;
+}

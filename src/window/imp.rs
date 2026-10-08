@@ -7,6 +7,7 @@ mod thread_menu;
 mod threads;
 
 use super::diff_panel::DiffPanel;
+use super::loading;
 use crate::config::{Profile, SessionFormat};
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
@@ -288,6 +289,25 @@ fn build_exit_bar() -> (Box, Label, Button, Button) {
     bar.append(&restart);
     bar.append(&close);
     (bar, label, restart, close)
+}
+
+/// Removes `stack`'s `names` pages once the crossfade away from them has finished, so loading
+/// screens that are out of view stop animating and are freed.
+fn drop_after_crossfade(stack: &Stack, names: &'static [&'static str]) {
+    glib::timeout_add_local_once(
+        std::time::Duration::from_millis(u64::from(loading::CROSSFADE_MS) + 50),
+        glib::clone!(
+            #[weak]
+            stack,
+            move || {
+                for name in names {
+                    if let Some(page) = stack.child_by_name(name) {
+                        stack.remove(&page);
+                    }
+                }
+            }
+        ),
+    );
 }
 
 /// Builds the centered logo + text shown while a session is starting.
@@ -724,6 +744,9 @@ pub struct AgentTerminalWindow {
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
     /// The tab view, or the empty state when no page is open.
     pages_stack: RefCell<Option<gtk4::Stack>>,
+    /// The last session's threads are still being reopened: an empty tab view shows a loading
+    /// skeleton, not the empty state.
+    restoring_threads: std::cell::Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -1619,23 +1642,30 @@ impl AgentTerminalWindow {
         *self.header.borrow_mut() = Some(header);
         *self.window_title.borrow_mut() = Some(window_title);
 
-        // Show a temporary "Detecting" state. A live spinner, not a static icon:
-        // detection now runs off the main thread, so this page can actually
-        // animate rather than being a frozen placeholder.
-        let spinner = gtk4::Spinner::builder()
-            .spinning(true)
-            .width_request(32)
-            .height_request(32)
-            .build();
-        let status_page = adw::StatusPage::builder()
-            .title("Starting up…")
-            .description("Looking for an AI CLI…")
+        // While detection runs (off the main thread, so this animates): the splash, then, if it
+        // is still running, a skeleton of the shell. The real UI crossfades in over either.
+        let boot = Stack::builder()
             .vexpand(true)
-            .child(&spinner)
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .transition_duration(loading::CROSSFADE_MS)
             .build();
-
-        content.append(&status_page);
+        boot.add_named(&loading::splash("Looking for an AI CLI…"), Some("splash"));
+        content.append(&boot);
         obj.set_content(Some(&content));
+        let show_sidebar = !self.config.borrow().sidebar_collapsed;
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(loading::SKELETON_AFTER_MS),
+            glib::clone!(
+                #[weak]
+                boot,
+                move || {
+                    if boot.visible_child_name().as_deref() == Some("splash") {
+                        boot.add_named(&loading::shell(show_sidebar), Some("skeleton"));
+                        boot.set_visible_child_name("skeleton");
+                    }
+                }
+            ),
+        );
 
         let (profiles, preferred) = {
             let config = self.config.borrow();
@@ -1647,25 +1677,30 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             #[weak]
-            content,
+            boot,
             async move {
                 let resolved = resolve_active_profile(profiles, preferred, path, home, shell).await;
 
                 let imp = obj.imp();
                 *imp.active_profile.borrow_mut() = resolved.clone();
 
-                content.remove(&status_page);
-
+                let ready = Box::builder()
+                    .orientation(Orientation::Vertical)
+                    .vexpand(true)
+                    .build();
                 if let Some(ref profile) = resolved {
                     info!(
                         "Profile '{}' resolved to '{}', setting up terminal UI",
                         profile.name, profile.command
                     );
-                    imp.setup_terminal_ui(&content, Some(profile));
+                    imp.setup_terminal_ui(&ready, Some(profile));
                 } else {
                     warn!("No compatible CLI detected, setting up welcome UI");
-                    imp.setup_welcome_ui(&content);
+                    imp.setup_welcome_ui(&ready);
                 }
+                boot.add_named(&ready, Some("ready"));
+                boot.set_visible_child_name("ready");
+                drop_after_crossfade(&boot, &["splash", "skeleton"]);
             }
         ));
     }

@@ -50,6 +50,10 @@ fn main() -> glib::ExitCode {
     if std::env::args().skip(1).any(|a| a == "--chat-demo") {
         return chat::view::demo::run();
     }
+    // Hidden: the startup splash and skeleton of a launch that never finishes, on a loop.
+    if std::env::args().skip(1).any(|a| a == "--loading-demo") {
+        return window::loading_demo();
+    }
 
     info!(
         "Starting Agent Terminal (v{})...",

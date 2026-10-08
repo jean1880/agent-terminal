@@ -2,6 +2,8 @@
 
 mod diff_panel;
 mod imp;
+mod loading;
+pub(crate) use loading::demo as loading_demo;
 pub(crate) mod sidebar_model;
 
 use gtk4::gio;

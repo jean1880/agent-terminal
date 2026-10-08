@@ -27,6 +27,12 @@ pub const RESOURCE_PATH: &str = "/com/jdesroches/AgentTerminal/icons";
 
 /// The full-colour app icon, bundled as a resource for hero use (see `build.rs`).
 pub const APP_ART: &str = "/com/jdesroches/AgentTerminal/art/com.jdesroches.AgentTerminal.svg";
+/// [`APP_ART`] without its three cursor dots, which the startup splash draws (and animates) as
+/// widgets of their own.
+pub const APP_ART_BARE: &str =
+    "/com/jdesroches/AgentTerminal/art/com.jdesroches.AgentTerminal.svg#bare";
+/// Marks a hero source as [`APP_ART`]-style art with its cursor dots removed.
+const BARE_SUFFIX: &str = "#bare";
 
 /// The colour symbolic heroes are drawn in (the chrome's label colour; the app is dark-only).
 const HERO_TINT: &str = "#c8c8ff";
@@ -165,6 +171,10 @@ glib::wrapper! {
 /// name (drawn in [`HERO_TINT`]).
 fn hero_svg(source: &str) -> Option<glib::Bytes> {
     let lookup = |path: &str| gio::resources_lookup_data(path, gio::ResourceLookupFlags::NONE).ok();
+    if let Some(path) = source.strip_suffix(BARE_SUFFIX) {
+        let bare = without_cursor_dots(&String::from_utf8_lossy(&lookup(path)?));
+        return Some(glib::Bytes::from_owned(bare.into_bytes()));
+    }
     if source.starts_with('/') {
         return lookup(source);
     }
@@ -173,6 +183,26 @@ fn hero_svg(source: &str) -> Option<glib::Bytes> {
         let svg = String::from_utf8_lossy(&bytes).replace(SVG_INK, HERO_TINT);
         Some(glib::Bytes::from_owned(svg.into_bytes()))
     })
+}
+
+/// `svg` with every `<circle …/>` element removed: in the app icon those are exactly the three
+/// cursor dots (the guard test below holds it to that).
+fn without_cursor_dots(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(start) = rest.find("<circle") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("/>") {
+            Some(end) => rest = &rest[start + end + 2..],
+            None => {
+                // Malformed: keep the remainder as authored rather than cut it.
+                rest = &rest[start..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 impl HeroPaintable {
@@ -226,4 +256,39 @@ pub fn set_status_icon(page: &adw::StatusPage, source: &str) {
         128
     };
     page.set_paintable(Some(&hero_paintable(source, px, page)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ART: &str = include_str!("../assets/com.jdesroches.AgentTerminal.svg");
+
+    /// The splash lays its dots over the bare art at the authored centres (see
+    /// `window::loading`): if the icon's cursor changes, so must the splash.
+    #[test]
+    fn bare_art_drops_exactly_the_cursor_dots() {
+        assert_eq!(
+            ART.matches("<circle").count(),
+            3,
+            "the icon has three cursor dots"
+        );
+        for (cx, fill) in [(64, "#e8846b"), (80, "#5b9cf6"), (96, "#4cc38a")] {
+            assert!(
+                ART.contains(&format!(
+                    "<circle cx=\"{cx}\" cy=\"66\" r=\"5.5\" fill=\"{fill}\"/>"
+                )),
+                "dot at {cx} moved or recoloured"
+            );
+        }
+        let bare = without_cursor_dots(ART);
+        assert!(!bare.contains("<circle"));
+        assert!(bare.contains("<polyline"), "the prompt chevron stays");
+        assert!(bare.trim_end().ends_with("</svg>"));
+        assert_eq!(
+            without_cursor_dots("a<circle"),
+            "a<circle",
+            "malformed input is kept"
+        );
+    }
 }

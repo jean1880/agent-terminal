@@ -893,6 +893,10 @@ pub(super) struct Sidebar {
     pub(super) keys: RefCell<Vec<Option<RowKey>>>,
     /// Set while the list is rebuilt, so selecting the current row is not taken as a click.
     rebuilding: std::cell::Cell<bool>,
+    /// The thread list has not loaded yet, so the list shows skeleton rows (its placeholder).
+    loading: std::cell::Cell<bool>,
+    /// Those skeleton rows.
+    placeholder: gtk4::Widget,
     /// Held for the sidebar's lifetime: the footer's usage indicator.
     _usage: Rc<UsageIndicator>,
 }
@@ -943,7 +947,19 @@ impl AgentTerminalWindow {
         let pages = gtk4::Stack::new();
         pages.add_named(tab_view, Some("threads"));
         pages.add_named(&self.build_empty_state(), Some("empty"));
-        pages.set_visible_child_name("empty");
+        // Threads from the last session are about to reopen: hold their space with a thread's
+        // skeleton rather than flash the empty state first. Only for as long as that lasts
+        // (`settle_pages` removes it): a stack is as large as its largest page.
+        pages.set_transition_type(gtk4::StackTransitionType::Crossfade);
+        pages.set_transition_duration(loading::CROSSFADE_MS);
+        self.restoring_threads
+            .set(!CHAT_RESTORED.with(std::cell::Cell::get));
+        if self.restoring_threads.get() {
+            pages.add_named(&loading::chat(), Some("loading"));
+            pages.set_visible_child_name("loading");
+        } else {
+            pages.set_visible_child_name("empty");
+        }
         toast_overlay.set_child(Some(&pages));
         toast_overlay.set_vexpand(true);
         split.set_content(Some(&toast_overlay));
@@ -1087,6 +1103,9 @@ impl AgentTerminalWindow {
             .selection_mode(gtk4::SelectionMode::Single)
             .css_classes(["navigation-sidebar", "thread-list"])
             .build();
+        // Until the first load lands (`refresh_sidebar`), rows in the shape of the real ones.
+        let placeholder = loading::sidebar_rows();
+        list.set_placeholder(Some(&placeholder));
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vexpand(true)
@@ -1125,6 +1144,8 @@ impl AgentTerminalWindow {
             search: search.clone(),
             keys: RefCell::new(Vec::new()),
             rebuilding: std::cell::Cell::new(false),
+            loading: std::cell::Cell::new(true),
+            placeholder,
             _usage: usage,
         });
         search.connect_search_changed(glib::clone!(
@@ -1269,7 +1290,13 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 match loaded {
                     Some(Ok(list)) => *imp.summaries.borrow_mut() = Some(list),
-                    Some(Err(e)) => warn!("Cannot list threads: {e}"),
+                    Some(Err(e)) => {
+                        warn!("Cannot list threads: {e}");
+                        // Nothing is on its way: the skeleton rows hold still.
+                        if let Some(sidebar) = imp.sidebar.borrow().as_ref() {
+                            loading::settle(&sidebar.placeholder);
+                        }
+                    }
                     None => {}
                 }
                 if imp.summaries_stale.replace(false) {
@@ -1320,6 +1347,10 @@ impl AgentTerminalWindow {
             // The load redraws when it lands (at once when there is no file store).
             self.reload_summaries();
             return;
+        }
+        if sidebar.loading.replace(false) {
+            sidebar.list.set_placeholder(None::<&gtk4::Widget>);
+            loading::reveal(&sidebar.list);
         }
         let rows = self.sidebar_rows();
         let selected = self.selected_row_key();
@@ -1640,13 +1671,7 @@ impl AgentTerminalWindow {
                 obj,
                 move |view, _| {
                     let imp = obj.imp();
-                    if let Some(stack) = imp.pages_stack.borrow().as_ref() {
-                        stack.set_visible_child_name(if view.n_pages() == 0 {
-                            "empty"
-                        } else {
-                            "threads"
-                        });
-                    }
+                    imp.settle_pages();
                     if view.n_pages() == 0 {
                         if let Some(title) = imp.window_title.borrow().as_ref() {
                             title.set_title("Agent Terminal");
@@ -1670,6 +1695,43 @@ impl AgentTerminalWindow {
                 imp.refresh_sidebar();
             }
         ));
+    }
+
+    /// Shows the open pages, or the empty state when there are none. While the last session's
+    /// threads are still being reopened, nothing open yet keeps the loading skeleton.
+    fn settle_pages(&self) {
+        let open = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .is_some_and(|v| v.n_pages() > 0);
+        let restoring = self.restoring_threads.get();
+        if let Some(stack) = self.pages_stack.borrow().as_ref() {
+            let name = match (open, restoring) {
+                (true, _) => "threads",
+                (false, true) => "loading",
+                (false, false) => "empty",
+            };
+            stack.set_visible_child_name(name);
+            if !restoring {
+                if let Some(skeleton) = stack.child_by_name("loading") {
+                    // After the crossfade away from it, so it fades rather than vanishes.
+                    let stack = stack.downgrade();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(u64::from(loading::CROSSFADE_MS) + 50),
+                        move || {
+                            // Settling again before this ran queued a second removal.
+                            if let Some(stack) = stack
+                                .upgrade()
+                                .filter(|s| skeleton.parent().as_ref() == Some(s.upcast_ref()))
+                            {
+                                stack.remove(&skeleton);
+                            }
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// A page came into view: build a thread on first show, clear its unread state, and put
@@ -1779,34 +1841,47 @@ impl AgentTerminalWindow {
                 )
             })
             .await;
-            let (Some((saved, threads)), Some(obj)) = (loaded, obj.upgrade()) else {
-                return;
-            };
-            let Some(value) =
-                saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            else {
-                return;
-            };
-            let known: Vec<String> = threads.into_iter().map(|s| s.id).collect();
-            let open = restorable(&value, &known, crate::config::SessionState::MAX_TABS);
-            if open.is_empty() {
-                return;
-            }
+            let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
-            // Pages added since the restore began belong to something else (a resume): leave
-            // that in view.
-            let others_in_view = imp.tabs.borrow().len() > before;
-            info!("Reopening {} thread(s) from the last session", open.len());
-            for id in &open {
-                imp.open_thread(id, false);
+            if let Some((saved, threads)) = loaded {
+                imp.reopen_saved(saved, threads, before);
             }
-            if others_in_view {
-                return;
-            }
-            if let Some(id) = selected_to_restore(&value, &open) {
-                imp.open_thread(&id, true);
-            }
+            // Whatever reopened (or nothing did): the loading skeleton gives way.
+            imp.restoring_threads.set(false);
+            imp.settle_pages();
         });
+    }
+
+    /// Reopens the saved open-thread list `saved` against the stored `threads`. `before` is how
+    /// many pages were open when the restore began.
+    fn reopen_saved(
+        &self,
+        saved: Option<String>,
+        threads: Vec<agent_kit::store::ThreadSummary>,
+        before: usize,
+    ) {
+        let Some(value) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        else {
+            return;
+        };
+        let known: Vec<String> = threads.into_iter().map(|s| s.id).collect();
+        let open = restorable(&value, &known, crate::config::SessionState::MAX_TABS);
+        if open.is_empty() {
+            return;
+        }
+        // Pages added since the restore began belong to something else (a resume): leave that
+        // in view.
+        let others_in_view = self.tabs.borrow().len() > before;
+        info!("Reopening {} thread(s) from the last session", open.len());
+        for id in &open {
+            self.open_thread(id, false);
+        }
+        if others_in_view {
+            return;
+        }
+        if let Some(id) = selected_to_restore(&value, &open) {
+            self.open_thread(&id, true);
+        }
     }
 
     /// Lists the agents' own recent sessions (Claude Code and agy, newest [`RECENT_SESSIONS`])
@@ -1907,6 +1982,8 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .vexpand(true)
             .build();
+        // Its only child until `build_thread` puts the view in its place.
+        holder.append(&loading::chat());
         let drawer_paned = gtk4::Paned::builder()
             .orientation(Orientation::Vertical)
             .start_child(&holder)
@@ -2088,6 +2165,10 @@ impl AgentTerminalWindow {
                 return;
             }
             chat.building = true;
+            // A retry after a failed read: the skeleton pulses again.
+            if let Some(skeleton) = chat.holder.first_child() {
+                loading::unsettle(&skeleton);
+            }
             (chat.thread.clone(), chat.driver, dir)
         };
         let (thread, driver, dir) = job;
@@ -2164,6 +2245,10 @@ impl AgentTerminalWindow {
             .and_then(|t| t.chat.as_mut())
         {
             chat.building = false;
+            // Not loading any more: the skeleton holds still until a retry.
+            if let Some(skeleton) = chat.holder.first_child() {
+                loading::settle(&skeleton);
+            }
         }
         self.show_toast("Could not read this thread from the store. Select it again to retry.");
     }
@@ -2200,6 +2285,11 @@ impl AgentTerminalWindow {
         view.set_account_status(AccountStatus::shared());
         view.set_diff_source(diffs);
         view.replay_by_agent(&history);
+        // The loading skeleton (see `add_thread_page`) gives way to the view.
+        if let Some(skeleton) = holder.first_child() {
+            holder.remove(&skeleton);
+        }
+        loading::reveal(&view);
         holder.append(&view);
         *slot.view.borrow_mut() = Some(view.downgrade());
 
