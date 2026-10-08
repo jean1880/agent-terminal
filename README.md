@@ -33,11 +33,14 @@ and it ships as a single binary.
 
 ## Highlights
 
+- **Switch agents in the middle of a conversation.** A thread isn't tied to one agent.
+  Move it from Claude to Antigravity to Codex (and back) whenever you like, from the
+  model picker or `/model`. The new agent is handed the conversation so far, and the
+  thread keeps one history across all of them. Use the best model for each step, or
+  keep working when one agent hits its quota.
 - **One window for three agents.** Claude, Antigravity and Codex threads live in one
   sidebar, grouped by folder and searchable. Claude and agy sessions you already ran
   in those CLIs show up there too.
-- **Switch agents mid-task.** When one runs out of quota, continue the same thread in
-  another. A redacted, budgeted summary of the conversation goes with it.
 - **You stay in control.** Inline approvals for commands and edits, a plan panel, and
   questions the agent asks you as cards with answers to pick.
 - **Git safety net.** Each turn is checkpointed into hidden refs. The diff panel shows
@@ -52,7 +55,7 @@ and it ships as a single binary.
 |---|---|
 | ![Markdown, code and a table in a Claude reply](docs/screenshots/chat-markdown.png) | ![A model switch, a rate limit and a question card](docs/screenshots/chat-question.png) |
 | Replies render markdown, code and tables. | Model switches, rate limits, and questions with answers to pick. |
-| ![Settings: the theme list, Use System Theme first](docs/screenshots/settings-theme.png) | ![Settings under Use System Theme on a light desktop](docs/screenshots/settings-system-theme.png) |
+| ![Settings: the theme list, Use System Theme first](docs/screenshots/settings-theme.png) | ![The window under Use System Theme on a light desktop](docs/screenshots/system-theme.png) |
 | Themes apply to the whole app, live. | **Use System Theme** on a light desktop. |
 | ![The first-start walkthrough](docs/screenshots/setup-welcome.png) | |
 | A first start walks you through your agents. | |
@@ -123,6 +126,23 @@ Install and sign in to at least one agent CLI. Agent Terminal finds them on your
 
 ## Features
 
+### Switching agents mid-conversation
+
+A thread belongs to the work, not to an agent. At any point you can hand it to another one:
+
+- **Pick a model from any agent** in the header chip (or type `/model`). The list covers
+  every Claude, Antigravity and Codex model, with search and effort levels. A model of the
+  same agent switches in place. A model of another agent continues the thread there.
+- **The conversation comes with it.** The next message carries a summary of the thread so
+  far, built within a token budget and redacted (keys and tokens masked). A divider marks
+  where the thread changed hands, and each reply is labelled with the agent that wrote it.
+- **Switch back whenever you like.** Returning to an agent works the same way: it starts a
+  fresh session carrying the whole thread, including what the other agent did in between.
+- **Out of quota? Keep going.** When an agent hits its limit, the thread offers
+  **Continue in <other agent>**, and so does the desktop notification.
+- **Fork instead of switching**: `/fork` starts a new thread with this one's history, so
+  two agents can take the same problem in different directions.
+
 ### Chat threads
 
 - **A sidebar of threads**, grouped by folder and searchable. Each row shows the
@@ -134,17 +154,12 @@ Install and sign in to at least one agent CLI. Agent Terminal finds them on your
 - **A native transcript**: markdown, code blocks, tool cards, file-change cards with
   their diffs, inline approvals, a plan panel, sub-agent progress, questions with
   answers to pick, and a composer with typeahead.
-- **One model picker for every agent.** The header chip (or `/model`) lists each
-  agent's models, with search and effort levels. Models that agy serves on Google's
-  quota are marked *via Antigravity*. Picking a model of another agent continues the
-  thread there.
-- **Hand-offs.** When an agent runs out of quota, the thread offers **Continue in
-  <other agent>**. A budgeted, redacted summary of the conversation goes with your
-  next message, and a divider marks the switch.
+- **One model picker for every agent.** See
+  [Switching agents](#switching-agents-mid-conversation). Models that agy serves on
+  Google's quota are marked *via Antigravity*.
 - **Usage at a glance.** Each agent's quota windows sit in the thread header and at the
   foot of the sidebar, and update every turn.
-- `/rewind` undoes the last turn's changes. `/fork` starts a new thread carrying this
-  one's history.
+- `/rewind` undoes the last turn's changes.
 
 ### Git safety net
 
@@ -199,6 +214,10 @@ agent-terminal [OPTIONS]
 | `--approval-hook` | Internal: agy's approval hook runs this. Not for direct use. |
 | `--chat-demo` | Open a window showing a scripted chat, with no agent running. |
 
+To see the whole window with demo threads instead of yours (for screenshots), set
+`AGENT_TERMINAL_DEMO_THREADS=1`. It keeps the threads in memory, starts no agent, and leaves
+your real thread store alone.
+
 Agent Terminal runs as a single instance. A second launch hands its request to the
 window that is already open and exits, so `agent-terminal --resume <id>` opens the
 thread in your existing window. A bad ID or folder is reported on the terminal you
@@ -217,6 +236,7 @@ agent-terminal --resume <id> --dir ~/git/some-project
 | `XDG_CONFIG_HOME` | Where `agent-terminal/config.json` lives (default `~/.config`). Point it at a scratch folder to run an isolated copy. |
 | `XDG_STATE_HOME` | Where the thread store, hand-off briefs and agy's always-allow rules live (default `~/.local/state`). |
 | `AGENT_TERMINAL_HOOK_BIN` | The binary agy's approval hook runs (default `agent-terminal` on `PATH`). |
+| `AGENT_TERMINAL_DEMO_THREADS` | Set to `1` for demo threads in place of yours (in memory, no agents run). |
 
 ## Keyboard shortcuts
 
