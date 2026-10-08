@@ -13,6 +13,15 @@ and it ships as a single binary.
 
 > Agent Terminal is an independent project, not affiliated with Anthropic, Google or OpenAI.
 > It drives their command-line tools, which you install and sign in to yourself.
+>
+> **Antigravity notice:** Google has previously restricted Antigravity accounts for use
+> of third-party tools that bypassed Google's supplied tooling. Agent Terminal uses the
+> Google-supplied `agy` CLI rather than bypassing it, but Google has not said whether a
+> GUI that drives that CLI is exempt from its third-party-tools rule. Google controls
+> enforcement and may change its rules or restrict access at its discretion. Use it only
+> if you accept that risk; this project makes no promise that access will remain
+> available. See [Google's Antigravity Terms](https://www.antigravity.google/terms) and
+> its [account-restriction notice](https://discuss.ai.google.dev/t/update-on-antigravity-tos-ban/131424).
 
 ## Contents
 
@@ -24,6 +33,7 @@ and it ships as a single binary.
 - [Command-line options](#command-line-options)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Configuration](#configuration)
+- [Using Antigravity](#using-antigravity)
 - [agy's approval hook](#agys-approval-hook)
 - [Reference](#reference)
 - [Troubleshooting](#troubleshooting)
@@ -105,6 +115,27 @@ Install and sign in to at least one agent CLI. Agent Terminal finds them on your
 | Claude Code | `claude` | [docs.claude.com/claude-code](https://docs.claude.com/en/docs/claude-code) |
 | Antigravity | `agy` | [antigravity.google](https://antigravity.google) |
 | Codex | `codex` | [github.com/openai/codex](https://github.com/openai/codex) |
+
+## Using Antigravity
+
+Agent Terminal starts the Google-supplied `agy` executable already installed and
+authenticated on your machine. It does not reimplement the Antigravity client, proxy
+its service, or extract and reuse your Google credentials or OAuth tokens. In other
+words, it uses the official CLI rather than trying to bypass it.
+
+Google's current [Antigravity Terms](https://www.antigravity.google/terms) and
+[FAQ](https://www.antigravity.google/docs/faq/) place restrictions on using
+third-party software, tools or services to access Antigravity and say that violations
+can lead to suspension or termination. Google has previously confirmed that it
+[restricted accounts for third-party-tool use](https://discuss.ai.google.dev/t/update-on-antigravity-tos-ban/131424),
+including tools that used unauthorised OAuth access instead of the supplied CLI.
+
+This integration does **not** take that bypass route. However, Google has not published
+a statement that distinguishes a GUI which drives `agy` from a prohibited
+"third-party software, tool, or service." We cannot make that decision for Google or
+guarantee its enforcement outcome. The integration may work today, but that is not an
+approval, assurance of compliance, or guarantee of future availability. Review the
+terms yourself and do not use this integration if they do not permit your intended use.
 
 ## Quick start
 
@@ -339,10 +370,18 @@ environment file, default model, mode and effort, and whether it is enabled.
 
 ## agy's approval hook
 
-agy runs tools without asking unless it has a hook to ask with. Agent Terminal runs
-agy with `--dangerously-skip-permissions` **only** when its own approval hook is
-installed in `~/.gemini/config/hooks.json`. Each tool call then waits for your answer
-in the thread.
+`--dangerously-skip-permissions` is agy's name for bypassing its built-in terminal
+permission prompts. Agent Terminal needs that mode only because it is a GUI: agy's
+headless process cannot display and receive its own interactive prompt there. The app
+replaces that prompt path with its local approval hook, so each tool request is sent to
+the thread and waits for your explicit Allow or Deny response. It is not enabled to
+give an agent unasked access to your machine.
+
+Agent Terminal passes this flag **only** when its approval hook is installed in
+`~/.gemini/config/hooks.json` and an approval socket is live. That condition is
+deliberately strict: if the hook is absent, unavailable, or fails to ask before a tool
+step, the session is restarted without the flag. The hook is a safety boundary, not a
+way to weaken one.
 
 Without the hook, the mode picker drives agy's own `--mode` flag (Plan or Accept
 edits), and **Ask before edits is unavailable**: headless agy has nobody to ask.

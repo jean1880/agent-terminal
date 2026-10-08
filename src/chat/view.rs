@@ -320,6 +320,7 @@ impl ChatView {
         if let Some(mode) = model.mode {
             inner.header.set_mode(mode);
         }
+        inner.composer.set_history(model.user_messages());
         drop(model);
         inner.refresh_status();
         inner.refresh_subagents(&[]);
@@ -601,6 +602,7 @@ impl Inner {
         // The header counts background work too; the stop button follows the main turn only.
         let activity = self.model.borrow().activity(running);
         self.header.set_activity(&activity);
+        self.header.set_reload_running(running);
         self.thinking
             .set(&activity, cards::driver_name(status.driver));
         self.composer.set_running(running);
@@ -641,6 +643,18 @@ impl Inner {
         self.header.gauge.connect_clicked(move |_| {
             if let Some(inner) = weak.upgrade() {
                 inner.run_action(BuiltinAction::OpenContext, "");
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.header.reload.connect_clicked(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                let running = inner.backend.status().running_turn || inner.model.borrow().running;
+                if running {
+                    inner.backend.interrupt();
+                } else {
+                    inner.backend.reload_session();
+                }
+                inner.refresh_status();
             }
         });
         let weak = Rc::downgrade(self);
@@ -1040,6 +1054,7 @@ pub(crate) mod tests {
         fn switch(&self, driver: Driver, _: Option<String>, _: Option<String>) {
             *self.status.borrow_mut() = status_of(driver);
         }
+        fn reload_session(&self) {}
         fn set_mode(&self, _: Mode) {}
         fn control(&self, _: Control) -> String {
             String::new()

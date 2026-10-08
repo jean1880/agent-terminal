@@ -63,6 +63,7 @@ pub struct Header {
     pub mode: gtk4::DropDown,
     /// Set while the view changes the dropdown itself, so that is not taken as a user choice.
     pub mode_guard: Cell<bool>,
+    pub reload: gtk4::Button,
     activity: gtk4::Box,
     /// Where [`Self::set_usage`] and [`Self::set_subagents`] put their widgets, so the
     /// breakpoints can drop each.
@@ -135,6 +136,13 @@ impl Header {
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         root.append(&spacer);
+
+        let reload = gtk4::Button::from_icon_name("at-view-refresh-symbolic");
+        reload.add_css_class("flat");
+        reload.add_css_class("session-reload");
+        reload.set_valign(gtk4::Align::Center);
+        reload.set_tooltip_text(Some("Reload session"));
+        root.append(&reload);
 
         let activity = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         activity.add_css_class("activity");
@@ -249,6 +257,7 @@ impl Header {
             model,
             mode,
             mode_guard: Cell::new(false),
+            reload,
             activity,
             usage_slot,
             subagent_slot,
@@ -294,6 +303,18 @@ impl Header {
         self.mode_guard.set(true);
         self.mode.set_selected(mode_index(mode));
         self.mode_guard.set(false);
+    }
+
+    /// The session control stops an active turn, or reloads an idle session so its next agent
+    /// process picks up current launch configuration.
+    pub fn set_reload_running(&self, running: bool) {
+        let (icon, tooltip) = if running {
+            ("at-media-playback-stop-symbolic", "Stop current turn")
+        } else {
+            ("at-view-refresh-symbolic", "Reload session")
+        };
+        self.reload.set_icon_name(icon);
+        self.reload.set_tooltip_text(Some(tooltip));
     }
 
     /// Shows what the thread is doing: the main agent working, only background work left (its

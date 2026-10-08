@@ -29,6 +29,9 @@ pub trait ChatBackend {
     /// For agy the effort is already part of `model` (the composed id); Claude takes it
     /// separately, and a changed effort restarts its process.
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>);
+    /// Restarts the agent process while keeping this thread's provider conversation and settings.
+    /// A running turn, if any, is deliberately interrupted first.
+    fn reload_session(&self);
     fn set_mode(&self, mode: Mode);
     /// Returns the request id the `ControlResult` will carry.
     fn control(&self, control: Control) -> String;

@@ -34,6 +34,83 @@ use super::typeahead::{apply_completion, Key, KeyOutcome, LatestRequest, Popup};
 /// Debounce for `@file` suggestions (a round trip to the agent CLI).
 const FILE_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Per-thread prompt recall. The draft is held while browsing, so Down restores exactly what
+/// the user had typed before they pressed Up.
+#[derive(Debug, Default)]
+struct PromptHistory {
+    entries: Vec<String>,
+    index: Option<usize>,
+    draft: String,
+}
+
+impl PromptHistory {
+    fn replace(&mut self, entries: Vec<String>) {
+        self.entries = entries;
+        self.reset();
+    }
+
+    fn record(&mut self, text: &str) {
+        if !text.is_empty() && self.entries.last().is_none_or(|last| last != text) {
+            self.entries.push(text.to_owned());
+        }
+        self.reset();
+    }
+
+    fn move_up(&mut self, current: &str) -> Option<&str> {
+        let index = match self.index {
+            Some(index) => index.checked_sub(1).unwrap_or(index),
+            None => {
+                self.draft = current.to_owned();
+                self.entries.len().checked_sub(1)?
+            }
+        };
+        self.index = Some(index);
+        self.entries.get(index).map(String::as_str)
+    }
+
+    fn move_down(&mut self) -> Option<&str> {
+        let index = self.index?;
+        if index + 1 < self.entries.len() {
+            let next = index + 1;
+            self.index = Some(next);
+            return self.entries.get(next).map(String::as_str);
+        }
+        self.index = None;
+        Some(&self.draft)
+    }
+
+    fn reset(&mut self) {
+        self.index = None;
+        self.draft.clear();
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::PromptHistory;
+
+    #[test]
+    fn arrows_walk_history_and_restore_the_draft() {
+        let mut history = PromptHistory::default();
+        history.record("first");
+        history.record("second");
+
+        assert_eq!(history.move_up("unfinished"), Some("second"));
+        assert_eq!(history.move_up("second"), Some("first"));
+        assert_eq!(history.move_down(), Some("second"));
+        assert_eq!(history.move_down(), Some("unfinished"));
+        assert_eq!(history.move_down(), None);
+    }
+
+    #[test]
+    fn consecutive_duplicates_do_not_fill_history() {
+        let mut history = PromptHistory::default();
+        history.record("same");
+        history.record("same");
+        assert_eq!(history.entries, ["same"]);
+    }
+}
+
 /// One row of the popup.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
@@ -72,6 +149,7 @@ pub struct Composer {
     trigger: RefCell<Option<Trigger>>,
     files: Rc<RefCell<LatestRequest>>,
     file_timer: Rc<RefCell<Option<glib::SourceId>>>,
+    history: RefCell<PromptHistory>,
     /// Suppresses re-triggering while the composer itself edits the buffer.
     editing: Cell<bool>,
     host: RefCell<Option<std::rc::Weak<dyn ComposerHost>>>,
@@ -163,6 +241,7 @@ impl Composer {
             trigger: RefCell::new(None),
             files: Rc::new(RefCell::new(LatestRequest::default())),
             file_timer: Rc::new(RefCell::new(None)),
+            history: RefCell::default(),
             editing: Cell::new(false),
             host: RefCell::new(None),
         });
@@ -211,6 +290,11 @@ impl Composer {
     pub fn clear(&self) {
         self.set_text("");
         self.close_popup();
+    }
+
+    /// Seeds recall from a thread reopened from its persisted transcript.
+    pub fn set_history(&self, entries: Vec<String>) {
+        self.history.borrow_mut().replace(entries);
     }
 
     /// Send ⇄ stop.
@@ -354,6 +438,23 @@ impl Composer {
             }
         }
         match key {
+            Key::Up | Key::Down if !(shift || ctrl) && !self.text().contains('\n') => {
+                let current = self.text();
+                let recalled = match key {
+                    Key::Up => self
+                        .history
+                        .borrow_mut()
+                        .move_up(&current)
+                        .map(str::to_owned),
+                    Key::Down => self.history.borrow_mut().move_down().map(str::to_owned),
+                    _ => None,
+                };
+                if let Some(text) = recalled {
+                    self.set_text(&text);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
             Key::Enter if !shift => {
                 self.submit();
                 glib::Propagation::Stop
@@ -379,6 +480,7 @@ impl Composer {
             return;
         };
         let owned = trimmed.to_owned();
+        self.history.borrow_mut().record(&owned);
         self.clear();
         host.submit(&owned);
     }

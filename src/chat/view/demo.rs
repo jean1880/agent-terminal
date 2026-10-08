@@ -546,6 +546,8 @@ impl ChatBackend for DemoBackend {
         }
     }
 
+    fn reload_session(&self) {}
+
     fn set_mode(&self, mode: Mode) {
         self.status.borrow_mut().mode = mode;
         self.push([Step::Emit(Envelope::new(Event::ModeChanged { mode }))]);
@@ -740,6 +742,19 @@ fn script() -> Vec<Step> {
         None,
         None,
     )));
+    // A completed Codex-style web-search card: its action is shown as the query, not an empty
+    // search glyph. The live adapter normalises action.queries into this shape.
+    s.extend(tool(
+        "t-web",
+        ItemKind::WebSearch,
+        "Rust atomic file replace guarantees",
+        json!({"query": "Rust atomic file replace guarantees"}),
+        None,
+        ItemStatus::Completed,
+        Some("Rust documentation and platform notes found."),
+        None,
+        250,
+    ));
     s.push(Step::Emit(Envelope::new(Event::PlanUpdated {
         steps: vec![
             PlanStep {

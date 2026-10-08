@@ -74,9 +74,9 @@
 //! - The legacy `execCommandApproval` / `applyPatchApproval` server requests (turns started over
 //!   the pre-v2 API) are not served: turns here always use `turn/start`, which only raises the
 //!   v2 requests. They get a JSON-RPC error reply so the server never waits on them.
-//! - `item/permissions/requestApproval`, `item/tool/requestUserInput`,
-//!   `mcpServer/elicitation/request` and `item/tool/call` are answered with a JSON-RPC error and a
-//!   [`Event::Notice`]; map them once the UI has a place for them.
+//! - `item/permissions/requestApproval`, `mcpServer/elicitation/request` and `item/tool/call` are
+//!   answered with a JSON-RPC error and a [`Event::Notice`]; map them once the UI has a place for
+//!   them. `item/tool/requestUserInput` is mapped to the native question card.
 //! - Approval decisions that carry a payload (`acceptWithExecpolicyAmendment`,
 //!   `applyNetworkPolicyAmendment`) are not offered; the four plain decisions are.
 //! - stderr (Codex's tracing output) is ignored.
@@ -91,8 +91,8 @@ use crate::adapter::{
 };
 use crate::caps::Capabilities;
 use crate::event::{
-    Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, ResponseCapability, StepStatus,
-    StreamKind, TurnState, Usage,
+    Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, QuestionOption,
+    ResponseCapability, StepStatus, StreamKind, TurnState, Usage,
 };
 
 /// Page size asked of `model/list`.
@@ -145,6 +145,16 @@ struct PendingApproval {
     options: Vec<Decision>,
 }
 
+/// An unanswered `request_user_input` server request.
+#[derive(Debug, Clone)]
+struct PendingQuestion {
+    /// The JSON-RPC id to put in the response, verbatim (number or string).
+    rpc_id: Value,
+    item: String,
+    /// The app-server question ids, paired with the question text used by the shared card UI.
+    keys: Vec<(String, String)>,
+}
+
 pub struct CodexAdapter {
     caps: Capabilities,
     client_version: String,
@@ -168,6 +178,7 @@ pub struct CodexAdapter {
     queued: VecDeque<String>,
     outbox: Outbox,
     approvals: HashMap<String, PendingApproval>,
+    questions: HashMap<String, PendingQuestion>,
     /// Ids of items started and not yet completed, in start order.
     open_items: Vec<String>,
     /// Accumulated streamed text per open message item (snapshot fallback).
@@ -208,6 +219,7 @@ impl CodexAdapter {
             queued: VecDeque::new(),
             outbox: Outbox::default(),
             approvals: HashMap::new(),
+            questions: HashMap::new(),
             open_items: Vec::new(),
             texts: HashMap::new(),
             reasoning: HashMap::new(),
@@ -295,6 +307,20 @@ impl CodexAdapter {
         );
     }
 
+    /// Some web-search items start before Codex has chosen the action. Its completed snapshot
+    /// refines just that card; other started items retain their normal deduplicated sequence.
+    fn refine_web_search(&self, out: &mut Vec<Envelope>, id: &str, title: String, input: Value) {
+        out.push(
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::WebSearch,
+                title,
+                input: Some(input),
+                parent: None,
+            })
+            .item(id),
+        );
+    }
+
     fn complete_item(
         &mut self,
         out: &mut Vec<Envelope>,
@@ -374,7 +400,15 @@ impl CodexAdapter {
             return;
         }
         let (kind, title, input) = item_info(item);
-        self.start_item(out, id, kind, title, input);
+        if kind == ItemKind::WebSearch && self.open_items.iter().any(|open| open == id) {
+            if let Some(input) = input {
+                self.refine_web_search(out, id, title, input);
+            } else {
+                self.start_item(out, id, kind, title, None);
+            }
+        } else {
+            self.start_item(out, id, kind, title, input);
+        }
         // The completed item is authoritative: its text replaces whatever streamed.
         let streamed_text = self.texts.get(id).cloned();
         let streamed_reasoning = self.reasoning.get(id).cloned();
@@ -554,6 +588,13 @@ impl CodexAdapter {
                     out.push(
                         Envelope::new(Event::ApprovalExpired)
                             .item(p.item)
+                            .request(key.clone()),
+                    );
+                }
+                if let Some(p) = self.questions.remove(&key) {
+                    out.push(
+                        Envelope::new(Event::QuestionResolved { answered: false })
+                            .item(p.item)
                             .request(key),
                     );
                 }
@@ -668,6 +709,67 @@ impl CodexAdapter {
         params: &Value,
         out: &mut Vec<Envelope>,
     ) {
+        if method == "item/tool/requestUserInput" {
+            let key = id_key(id);
+            let item = s(params, "itemId").unwrap_or_default().to_owned();
+            let questions: Vec<Question> = params
+                .get("questions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|question| Question {
+                    id: s(question, "id").unwrap_or_default().to_owned(),
+                    header: s(question, "header").unwrap_or_default().to_owned(),
+                    question: s(question, "question").unwrap_or_default().to_owned(),
+                    options: question
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|option| {
+                            let label = s(option, "label")?.to_owned();
+                            Some(QuestionOption {
+                                label,
+                                description: s(option, "description").map(str::to_owned),
+                            })
+                        })
+                        .collect(),
+                    multi_select: false,
+                })
+                .filter(|question| !question.id.is_empty() && !question.question.is_empty())
+                .collect();
+            if questions.is_empty() {
+                self.write(
+                    json!({"id": id, "error": {
+                        "code": -32602,
+                        "message": "requestUserInput did not contain a usable question",
+                    }})
+                    .to_string(),
+                );
+                out.push(Envelope::new(Event::Notice {
+                    text: "Codex requested user input without a usable question; it was refused."
+                        .to_owned(),
+                }));
+                return;
+            }
+            self.questions.insert(
+                key.clone(),
+                PendingQuestion {
+                    rpc_id: id.clone(),
+                    item: item.clone(),
+                    keys: questions
+                        .iter()
+                        .map(|question| (question.id.clone(), question.question.clone()))
+                        .collect(),
+                },
+            );
+            out.push(
+                Envelope::new(Event::QuestionRequested { questions })
+                    .item(item)
+                    .request(key),
+            );
+            return;
+        }
         let (tool, title, all_decisions) = match method {
             "item/commandExecution/requestApproval" => (
                 "command_execution",
@@ -861,6 +963,7 @@ impl Adapter for CodexAdapter {
         self.turn_open = false;
         self.interrupt_sent = false;
         self.approvals.clear();
+        self.questions.clear();
         self.open_items.clear();
         self.texts.clear();
         self.reasoning.clear();
@@ -981,9 +1084,34 @@ impl Adapter for CodexAdapter {
                 .to_string();
                 Ok(vec![Action::Write(vec![line])])
             }
-            Command::Answer { .. } => Err(AdapterError::Unsupported(
-                "Codex questions are not supported yet",
-            )),
+            Command::Answer { request, answers } => {
+                let Some(question) = self.questions.get(&request).cloned() else {
+                    return Err(AdapterError::Invalid(format!(
+                        "no pending Codex question {request}"
+                    )));
+                };
+                let Some(selected) = answers.as_object() else {
+                    return Err(AdapterError::Invalid(
+                        "question answers must be an object".to_owned(),
+                    ));
+                };
+                let mut mapped = Map::new();
+                for (id, text) in question.keys {
+                    let Some(answer) = selected.get(&text).and_then(Value::as_str) else {
+                        return Err(AdapterError::Invalid(format!(
+                            "missing answer for Codex question {text:?}"
+                        )));
+                    };
+                    mapped.insert(id, json!({"answers": [answer]}));
+                }
+                let line = json!({
+                    "id": question.rpc_id,
+                    "result": {"answers": mapped},
+                })
+                .to_string();
+                self.questions.remove(&request);
+                Ok(vec![Action::Write(vec![line])])
+            }
             Command::SetModel { model, effort } => {
                 // Applied by the next `turn/start`; no restart. `None` keeps the effort.
                 if effort.is_some() {
@@ -1071,6 +1199,15 @@ impl Adapter for CodexAdapter {
             out.push(
                 Envelope::new(Event::ApprovalExpired)
                     .item(approval.item)
+                    .request(request),
+            );
+        }
+        let mut questions: Vec<_> = std::mem::take(&mut self.questions).into_iter().collect();
+        questions.sort_by(|a, b| a.0.cmp(&b.0));
+        for (request, question) in questions {
+            out.push(
+                Envelope::new(Event::QuestionResolved { answered: false })
+                    .item(question.item)
                     .request(request),
             );
         }
@@ -1200,11 +1337,10 @@ fn item_info(item: &Value) -> (ItemKind, String, Option<Value>) {
             s(item, "tool").unwrap_or("tool").to_owned(),
             item.get("arguments").cloned(),
         ),
-        "webSearch" => (
-            ItemKind::WebSearch,
-            s(item, "query").unwrap_or("web search").to_owned(),
-            None,
-        ),
+        "webSearch" => {
+            let (title, input) = web_search_details(item);
+            (ItemKind::WebSearch, title, input)
+        }
         "collabAgentToolCall" => (
             ItemKind::Subagent,
             s(item, "tool").unwrap_or("subagent").to_owned(),
@@ -1217,6 +1353,66 @@ fn item_info(item: &Value) -> (ItemKind, String, Option<Value>) {
             None,
         ),
         other => (ItemKind::Tool, other.to_owned(), None),
+    }
+}
+
+/// A web-search item's action moved from the legacy top-level `query` to `action` in newer
+/// Codex app-server schemas. Normalise either form so the card names the actual operation.
+fn web_search_details(item: &Value) -> (String, Option<Value>) {
+    let action = item.get("action").filter(|a| a.is_object());
+    let source = action.unwrap_or(item);
+    match action.and_then(|action| s(action, "type")) {
+        Some("search") | None => {
+            let queries: Vec<String> = source
+                .get("queries")
+                .and_then(Value::as_array)
+                .map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let query = s(source, "query")
+                .map(str::to_owned)
+                .or_else(|| queries.first().cloned());
+            let title = match (&query, queries.len()) {
+                (Some(query), 0 | 1) => query.clone(),
+                (Some(query), count) => format!("{query} (+{} more)", count - 1),
+                (None, _) => "web search".to_owned(),
+            };
+            let input = query.map(|query| json!({"query": query, "queries": queries}));
+            (title, input)
+        }
+        Some("open_page") => {
+            let url = s(source, "url").map(str::to_owned);
+            let title = url
+                .as_deref()
+                .map(|url| format!("Open {url}"))
+                .unwrap_or_else(|| "open web page".to_owned());
+            (title, url.map(|url| json!({"url": url})))
+        }
+        Some("find_in_page") => {
+            let url = s(source, "url").map(str::to_owned);
+            let pattern = s(source, "pattern").map(str::to_owned);
+            let title = match (&pattern, &url) {
+                (Some(pattern), Some(url)) => format!("Find {pattern:?} in {url}"),
+                (Some(pattern), None) => format!("Find {pattern:?}"),
+                (None, Some(url)) => format!("Find in {url}"),
+                (None, None) => "find in web page".to_owned(),
+            };
+            let mut input = Map::new();
+            if let Some(url) = url {
+                input.insert("url".to_owned(), Value::String(url));
+            }
+            if let Some(pattern) = pattern {
+                input.insert("pattern".to_owned(), Value::String(pattern));
+            }
+            let input = (!input.is_empty()).then_some(Value::Object(input));
+            (title, input)
+        }
+        Some(_) => ("web search".to_owned(), None),
     }
 }
 
@@ -1958,16 +2154,35 @@ mod tests {
     }
 
     #[test]
-    fn requests_the_app_cannot_serve_are_refused_so_the_server_never_waits() {
+    fn request_user_input_becomes_a_question_card_and_answers_with_question_ids() {
         let mut a = started(Mode::Ask);
-        let ev = a.feed(r#"{"id":9,"method":"item/tool/requestUserInput","params":{}}"#);
-        assert!(
-            matches!(&ev[0].event, Event::Notice { text } if text.contains("requestUserInput"))
+        let ev = a.feed(
+            r#"{"id":9,"method":"item/tool/requestUserInput","params":{"itemId":"ask-1","questions":[{"id":"confirm","header":"Preview","question":"Start the preview?","options":[{"label":"Allow","description":"Launch it"},{"label":"Cancel","description":"Do not launch it"}]}]}}"#,
         );
-        let outbox = a.drain_outbox();
-        let w = one_write(outbox.actions);
-        assert_eq!(w["id"], 9);
-        assert_eq!(w["error"]["code"], -32601);
+        assert!(matches!(
+            &ev[0].event,
+            Event::QuestionRequested { questions }
+                if questions[0].id == "confirm" && questions[0].options[0].label == "Allow"
+        ));
+        assert_eq!(ev[0].request.as_deref(), Some("9"));
+        let w = one_write(
+            a.encode(Command::Answer {
+                request: "9".into(),
+                answers: json!({"Start the preview?": "Allow"}),
+            })
+            .expect("answer"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 9, "result": {"answers": {"confirm": {"answers": ["Allow"]}}}})
+        );
+        assert!(matches!(
+            a.encode(Command::Answer {
+                request: "9".into(),
+                answers: json!({"Start the preview?": "Allow"}),
+            }),
+            Err(AdapterError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -2035,7 +2250,7 @@ mod tests {
                 request: "r".into(),
                 answers: Value::Null
             }),
-            Err(AdapterError::Unsupported(_))
+            Err(AdapterError::Invalid(_))
         ));
     }
 
@@ -2139,7 +2354,17 @@ mod tests {
 
         let ev = a.feed(&item("webSearch", r#","query":"rust""#));
         assert!(
-            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::WebSearch, title, .. } if title == "rust")
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::WebSearch, title, input: Some(i), .. }
+            if title == "rust" && i["query"] == "rust")
+        );
+
+        let ev = a.feed(&item(
+            "webSearch",
+            r#","action":{"type":"search","queries":["Rust 1.91","Rust release notes"]}"#,
+        ));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::WebSearch, title, input: Some(i), .. }
+            if title == "Rust 1.91 (+1 more)" && i["query"] == "Rust 1.91" && i["queries"][1] == "Rust release notes")
         );
 
         let ev = a.feed(&item("somethingNew", ""));
@@ -2149,6 +2374,32 @@ mod tests {
 
         // The app shows its own prompt; Codex's echo of it is dropped.
         assert!(a.feed(&item("userMessage", r#","content":[]"#)).is_empty());
+    }
+
+    #[test]
+    fn completed_web_search_refines_a_started_card_with_its_action() {
+        let mut a = started(Mode::Ask);
+        let started = a.feed(
+            r#"{"method":"item/started","params":{"threadId":"th-1","turnId":"tu","startedAtMs":1,"item":{"type":"webSearch","id":"ws-1","status":"inProgress"}}}"#,
+        );
+        assert!(
+            matches!(&started[0].event, Event::ItemStarted { title, input: None, .. } if title == "web search")
+        );
+
+        let done = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":2,"item":{"type":"webSearch","id":"ws-1","status":"completed","action":{"type":"open_page","url":"https://doc.rust-lang.org"}}}}"#,
+        );
+        assert!(
+            matches!(&done[0].event, Event::ItemStarted { title, input: Some(i), .. }
+            if title == "Open https://doc.rust-lang.org" && i["url"] == "https://doc.rust-lang.org")
+        );
+        assert!(matches!(
+            done[1].event,
+            Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2362,9 +2613,8 @@ mod tests {
         assert!(c.model_switch_in_session && c.live_approvals && c.interrupt_keeps_process);
         assert!(c.streams_text && c.streams_reasoning && c.plan_mode);
         assert!(c.model_list && c.context_usage);
-        assert!(
-            !c.questions && !c.file_suggestions && !c.mcp_panel && !c.settings_panel && !c.usage
-        );
+        assert!(c.questions);
+        assert!(!c.file_suggestions && !c.mcp_panel && !c.settings_panel && !c.usage);
         assert_eq!(c.compact_command.as_deref(), Some("/compact"));
     }
 }

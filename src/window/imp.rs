@@ -35,6 +35,9 @@ const WORKTREE_ROOT_HELP: &str =
     "Where new worktrees go, as <folder>/<repo>/<branch> (blank: a hidden folder beside the repository)";
 /// At or below this width the header drops its panel toggles ([`AgentTerminalWindow::add_narrow_breakpoint`]).
 const NARROW_SP: f64 = 480.0;
+/// Below this width a visible diff panel would compete with the thread sidebar for horizontal
+/// space. It is temporarily hidden by a breakpoint and returns when the window grows again.
+const DIFF_HIDE_SP: f64 = 880.0;
 
 /// Per-tab state, tracked explicitly so terminal/directory lookups never depend
 /// on walking the tab's widget hierarchy. `dir` is the directory the tab was
@@ -4736,6 +4739,17 @@ impl AgentTerminalWindow {
     /// Connects a new tab's diff panel: its refresh requests, its first
     /// placement, and remembering the width it is dragged to.
     fn wire_diff_panel(&self, panel: &DiffPanel, paned: &gtk4::Paned) {
+        // Hiding only the header toggle at small sizes left an already-open panel consuming
+        // horizontal space. Adwaita restores the panel's previous visibility when this
+        // breakpoint un-applies, so this does not overwrite the user's saved choice.
+        let fit = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            DIFF_HIDE_SP,
+            adw::LengthUnit::Sp,
+        ));
+        fit.add_setter(&panel.root, "visible", Some(&false.to_value()));
+        self.obj().add_breakpoint(fit);
+
         // Found at click time, like the exit bar's buttons: the tab may have
         // been dragged to another window since.
         let root = panel.root.clone();

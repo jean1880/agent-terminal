@@ -103,7 +103,8 @@ impl Capabilities {
             streams_text: true,
             // Reasoning *summaries* (`item/reasoning/summaryTextDelta`), requested per turn.
             streams_reasoning: true,
-            questions: false,
+            // `item/tool/requestUserInput` is a live server request answered by the question card.
+            questions: true,
             // Plan = read-only sandbox and never escalate (`codex.rs`, "Modes").
             plan_mode: true,
         }

@@ -757,6 +757,16 @@ impl Inner {
         self.start_process();
     }
 
+    /// Starts a fresh agent process for this thread without creating a new provider
+    /// conversation. This lets process-start configuration, such as MCP registrations, take
+    /// effect without losing the thread.
+    fn reload_session(self: &Rc<Self>) {
+        if self.state.borrow().alive {
+            self.stop_current();
+        }
+        self.ensure_alive();
+    }
+
     // ---- commands ----
 
     /// Encodes and carries out one command. False when the adapter refused it.
@@ -1599,6 +1609,10 @@ impl ChatBackend for ChatSession {
         self.inner.switch(driver, model, effort);
     }
 
+    fn reload_session(&self) {
+        self.inner.reload_session();
+    }
+
     fn set_mode(&self, mode: Mode) {
         self.inner.set_mode(mode);
     }
@@ -1787,6 +1801,42 @@ mod tests {
             assert!(args
                 .iter()
                 .all(|a| !a.contains("--dangerously-skip-permissions")));
+        });
+    }
+
+    #[test]
+    fn reloading_restarts_the_process_and_resumes_the_same_provider_conversation() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store,
+                thread,
+                sink,
+                None,
+            );
+
+            session.send_prompt("remember this conversation");
+            assert!(
+                pump_until(ctx, 15, || exited_count(&seen) == 1),
+                "no first exit"
+            );
+
+            session.reload_session();
+            assert!(
+                pump_until(ctx, 15, || lines(tmp.path().join("args.log")).len() == 2),
+                "reloaded process did not start"
+            );
+            assert!(session.status().alive);
+            let args = lines(tmp.path().join("args.log"));
+            assert!(
+                args[1].contains(&format!("--conversation {CONVERSATION}")),
+                "{args:?}"
+            );
         });
     }
 

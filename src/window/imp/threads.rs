@@ -204,6 +204,11 @@ impl ChatBackend for SessionSlot {
             s.switch(driver, model, effort);
         }
     }
+    fn reload_session(&self) {
+        if let Some(s) = self.get() {
+            s.reload_session();
+        }
+    }
     fn set_mode(&self, mode: Mode) {
         if let Some(s) = self.get() {
             s.set_mode(mode);

@@ -396,6 +396,18 @@ impl Transcript {
         &self.order
     }
 
+    /// User prompts in display order, for the composer's per-thread recall history.
+    pub fn user_messages(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter_map(|id| self.items.get(id))
+            .filter_map(|item| match &item.body {
+                Body::User { text } if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Returns the most recent unhandled approval or question requiring operator action, if any.
     pub fn pending_interruption(&self) -> Option<PendingInterruption> {
         for id in self.order.iter().rev() {
@@ -735,8 +747,18 @@ impl Transcript {
                 parent,
             } => {
                 let id = env.item.clone().unwrap_or_else(|| self.next_id("item"));
-                if self.items.contains_key(&id) {
-                    return out; // Replayed start (adapters dedup, but be safe).
+                if let Some(item) = self.items.get_mut(&id) {
+                    // Codex can start a tool before it knows the full action, then repeat the
+                    // item in its completed snapshot. Accept a matching tool start as a metadata
+                    // refinement; identical replayed starts remain no-ops.
+                    if let Body::Tool(tool) = &mut item.body {
+                        if tool.kind == *kind && (tool.title != *title || tool.input != *input) {
+                            tool.title.clone_from(title);
+                            tool.input.clone_from(input);
+                            out.push(Change::Updated(id));
+                        }
+                    }
+                    return out;
                 }
                 let body = match kind {
                     ItemKind::UserMessage => Body::User {
@@ -1389,6 +1411,36 @@ mod tests {
         assert_eq!(tool.output, "boom");
         assert_eq!(tool.error.as_deref(), Some("exit 1"));
         assert_eq!(tool.input_text, "{\"command\":");
+    }
+
+    #[test]
+    fn repeated_tool_start_refines_metadata_without_adding_another_card() {
+        let mut t = Transcript::new();
+        let pending = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::WebSearch,
+            title: "web search".into(),
+            input: None,
+            parent: None,
+        })
+        .item("ws");
+        t.apply(&pending, Driver::Codex);
+        let refined = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::WebSearch,
+            title: "Rust 1.91".into(),
+            input: Some(serde_json::json!({"query": "Rust 1.91"})),
+            parent: None,
+        })
+        .item("ws");
+        assert_eq!(
+            t.apply(&refined, Driver::Codex),
+            [Change::Updated("ws".into())]
+        );
+        assert_eq!(t.order(), ["ws"]);
+        let Body::Tool(tool) = &t.get("ws").expect("search").body else {
+            panic!("not a tool")
+        };
+        assert_eq!(tool.title, "Rust 1.91");
+        assert_eq!(tool.input, Some(serde_json::json!({"query": "Rust 1.91"})));
     }
 
     #[test]
