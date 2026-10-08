@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use agent_core::adapter::{Driver, Mode};
 use agent_core::event::{
     BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
-    Question, ResponseCapability, StreamKind, TurnState, WorkerSnapshot, WorkerState,
+    Question, ResponseCapability, StepStatus, StreamKind, TurnState, WorkerSnapshot, WorkerState,
 };
 use serde_json::Value;
 
@@ -63,6 +63,18 @@ pub enum Body {
     },
     Approval(Approval),
     Question(QuestionCard),
+    /// The provider's last step statuses, retained in history after the active tracker retires.
+    Plan {
+        steps: Vec<PlanStep>,
+        outcome: Option<TurnState>,
+    },
+}
+
+/// Empty plans and wholly completed plans do not occupy the active-work shelf.
+pub(super) fn plan_is_active(steps: &[PlanStep]) -> bool {
+    steps
+        .iter()
+        .any(|step| step.status != StepStatus::Completed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +462,8 @@ pub struct Transcript {
     /// Approval/question request id → item id.
     requests: HashMap<String, ItemId>,
     pub plan: Vec<PlanStep>,
+    /// The history row currently being refined by provider plan updates.
+    plan_item: Option<ItemId>,
     pub gauge: Option<Gauge>,
     pub mode: Option<Mode>,
     pub pending_mode: Option<Mode>,
@@ -633,7 +647,7 @@ impl Transcript {
                         return Activity::Tool {
                             title: tool.title.clone(),
                             background: background.len(),
-                        }
+                        };
                     }
                     Some(Body::Reasoning {
                         streaming: true, ..
@@ -926,6 +940,7 @@ impl Transcript {
     /// fresh events, so nothing here fights it. Returns whether anything changed.
     pub fn settle_stale(&mut self) -> bool {
         let mut changed = self.running || !self.background.is_empty();
+        changed |= !self.retire_plan(Some(TurnState::Interrupted)).is_empty();
         if let Some(mode) = self.pending_mode.take() {
             self.mode = Some(mode);
             changed = true;
@@ -973,6 +988,27 @@ impl Transcript {
         }
     }
 
+    /// Retire the shelf without inferring that pending work was completed.
+    fn retire_plan(&mut self, outcome: Option<TurnState>) -> Vec<Change> {
+        let mut changes = Vec::new();
+        if let Some(id) = self.plan_item.take() {
+            if let Some(Body::Plan {
+                outcome: previous, ..
+            }) = self.items.get_mut(&id).map(|item| &mut item.body)
+            {
+                if outcome.is_some() && *previous != outcome {
+                    *previous = outcome;
+                    changes.push(Change::Updated(id));
+                }
+            }
+        }
+        if !self.plan.is_empty() {
+            self.plan.clear();
+            changes.push(Change::Plan);
+        }
+        changes
+    }
+
     /// Applies one envelope. `driver` is the agent the thread is on right now (the envelope
     /// does not carry it); it colours assistant rows and detects provider switches.
     pub fn apply(&mut self, env: &Envelope, driver: Driver) -> Vec<Change> {
@@ -997,6 +1033,11 @@ impl Transcript {
                 }
             }
             Event::SessionExited { code, expected } => {
+                out.extend(self.retire_plan(Some(if *expected {
+                    TurnState::Interrupted
+                } else {
+                    TurnState::Failed
+                })));
                 if let Some(mode) = self.pending_mode.take() {
                     self.mode = Some(mode);
                     out.push(Change::Mode);
@@ -1027,6 +1068,8 @@ impl Transcript {
             }
             Event::CommandsChanged { .. } => out.push(Change::Commands),
             Event::TurnStarted { model } => {
+                // A later turn never resurrects the preceding turn's active shelf.
+                out.extend(self.retire_plan(None));
                 self.last_outcome = None;
                 if self.last_driver.is_none() {
                     self.on_driver(driver);
@@ -1044,6 +1087,7 @@ impl Transcript {
                 }
             }
             Event::TurnCompleted { state, error, .. } => {
+                out.extend(self.retire_plan(Some(*state)));
                 let outcome_changed =
                     self.last_outcome != Some(*state) || !self.waiting_for.is_empty();
                 self.last_outcome = Some(*state);
@@ -1184,7 +1228,35 @@ impl Transcript {
                 out.push(Change::Updated(id));
             }
             Event::PlanUpdated { steps } => {
+                // A terminal turn owns no active plan. Delayed provider updates must not
+                // recreate its shelf or rewrite the retained historical snapshot.
+                if !self.running {
+                    return out;
+                }
+                // Some providers start another plan in the same turn after finishing one.
+                // Keep the completed row instead of overwriting it with the next task.
+                if !self.plan.is_empty() && !plan_is_active(&self.plan) && self.plan != *steps {
+                    self.plan_item = None;
+                }
                 self.plan.clone_from(steps);
+                if !steps.is_empty() {
+                    let body = Body::Plan {
+                        steps: steps.clone(),
+                        outcome: None,
+                    };
+                    if let Some(id) = self.plan_item.as_ref() {
+                        if let Some(item) = self.items.get_mut(id) {
+                            if item.body != body {
+                                item.body = body;
+                                out.push(Change::Updated(id.clone()));
+                            }
+                        }
+                    } else {
+                        let id = self.next_id("plan");
+                        self.plan_item = Some(id.clone());
+                        out.push(Change::Added(self.insert(id, body, None)));
+                    }
+                }
                 out.push(Change::Plan);
             }
             Event::ApprovalRequested {
@@ -1526,6 +1598,220 @@ mod tests {
 
     fn ev(e: Event) -> Envelope {
         Envelope::new(e)
+    }
+
+    fn plan_steps(status: StepStatus) -> Vec<PlanStep> {
+        vec![PlanStep {
+            text: "Verify the synthetic change".into(),
+            status,
+        }]
+    }
+
+    fn finish_turn(state: TurnState) -> Envelope {
+        ev(Event::TurnCompleted {
+            state,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        })
+    }
+
+    fn plans(t: &Transcript) -> Vec<(&[PlanStep], Option<TurnState>)> {
+        t.order()
+            .iter()
+            .filter_map(|id| match &t.get(id)?.body {
+                Body::Plan { steps, outcome } => Some((steps.as_slice(), *outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completed_plans_retire_immediately_and_survive_replay_and_a_new_plan() {
+        let events = [
+            ev(Event::TurnStarted { model: None }),
+            ev(Event::PlanUpdated {
+                steps: plan_steps(StepStatus::Pending),
+            }),
+            ev(Event::PlanUpdated {
+                steps: plan_steps(StepStatus::InProgress),
+            }),
+            ev(Event::PlanUpdated {
+                steps: plan_steps(StepStatus::Completed),
+            }),
+            finish_turn(TurnState::Completed),
+        ];
+        let mut t = Transcript::new();
+        for event in &events[..3] {
+            t.apply(event, Driver::Codex);
+            if matches!(&event.event, Event::PlanUpdated { .. }) {
+                assert!(plan_is_active(&t.plan));
+            }
+        }
+        t.apply(&events[3], Driver::Codex);
+        assert!(t.running, "completion occurs before the turn ends");
+        assert!(!plan_is_active(&t.plan));
+        assert_eq!(
+            plans(&t),
+            [(plan_steps(StepStatus::Completed).as_slice(), None)]
+        );
+        // A provider can repeat its final snapshot without making another history row.
+        t.apply(&events[3], Driver::Codex);
+        assert_eq!(plans(&t).len(), 1);
+        t.apply(&events[4], Driver::Codex);
+        assert!(t.plan.is_empty());
+        let mut replayed = Transcript::new();
+        for event in &events {
+            replayed.apply(event, Driver::Codex);
+        }
+        assert!(!replayed.settle_stale());
+        assert_eq!(plans(&t), plans(&replayed));
+        replayed.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        assert!(!plan_is_active(&replayed.plan));
+        replayed.apply(
+            &ev(Event::PlanUpdated {
+                steps: plan_steps(StepStatus::Pending),
+            }),
+            Driver::Codex,
+        );
+        assert!(plan_is_active(&replayed.plan));
+        assert_eq!(plans(&replayed).len(), 2);
+        assert_eq!(plans(&replayed)[0].0[0].status, StepStatus::Completed);
+        assert_eq!(plans(&replayed)[1].0[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn failed_interrupted_and_disconnected_plans_preserve_unfinished_steps() {
+        for state in [
+            TurnState::Failed,
+            TurnState::Interrupted,
+            TurnState::Completed,
+        ] {
+            let mut t = Transcript::new();
+            t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+            t.apply(
+                &ev(Event::PlanUpdated {
+                    steps: plan_steps(StepStatus::InProgress),
+                }),
+                Driver::Codex,
+            );
+            t.apply(&finish_turn(state), Driver::Codex);
+            assert!(t.plan.is_empty());
+            assert_eq!(plans(&t)[0].0[0].status, StepStatus::InProgress);
+            assert_eq!(plans(&t)[0].1, Some(state));
+        }
+        for stale in [false, true] {
+            let mut t = Transcript::new();
+            t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+            t.apply(
+                &ev(Event::PlanUpdated {
+                    steps: plan_steps(StepStatus::Pending),
+                }),
+                Driver::Codex,
+            );
+            if stale {
+                assert!(t.settle_stale());
+                assert!(!t.settle_stale());
+            } else {
+                t.apply(
+                    &ev(Event::SessionExited {
+                        code: Some(1),
+                        expected: false,
+                    }),
+                    Driver::Codex,
+                );
+            }
+            assert!(t.plan.is_empty());
+            assert_eq!(plans(&t)[0].0[0].status, StepStatus::Pending);
+            assert_eq!(
+                plans(&t)[0].1,
+                Some(if stale {
+                    TurnState::Interrupted
+                } else {
+                    TurnState::Failed
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_replacement_plan_in_the_same_turn_keeps_completed_history() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        for status in [
+            StepStatus::InProgress,
+            StepStatus::Completed,
+            StepStatus::Pending,
+        ] {
+            t.apply(
+                &ev(Event::PlanUpdated {
+                    steps: plan_steps(status),
+                }),
+                Driver::Codex,
+            );
+        }
+        assert_eq!(plans(&t).len(), 2);
+        assert_eq!(plans(&t)[0].0[0].status, StepStatus::Completed);
+        assert_eq!(plans(&t)[1].0[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn a_late_plan_update_cannot_reopen_a_terminal_or_stale_turn() {
+        for state in [
+            TurnState::Completed,
+            TurnState::Interrupted,
+            TurnState::Failed,
+        ] {
+            let mut t = Transcript::new();
+            t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+            t.apply(
+                &ev(Event::PlanUpdated {
+                    steps: plan_steps(StepStatus::InProgress),
+                }),
+                Driver::Codex,
+            );
+            t.apply(&finish_turn(state), Driver::Codex);
+            let history = plans(&t)
+                .into_iter()
+                .map(|(steps, outcome)| (steps.to_vec(), outcome))
+                .collect::<Vec<_>>();
+            assert!(t
+                .apply(
+                    &ev(Event::PlanUpdated {
+                        steps: plan_steps(StepStatus::Pending)
+                    }),
+                    Driver::Codex,
+                )
+                .is_empty());
+            assert!(t.plan.is_empty());
+            assert_eq!(
+                plans(&t),
+                history
+                    .iter()
+                    .map(|(steps, outcome)| (steps.as_slice(), *outcome))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        t.apply(
+            &ev(Event::PlanUpdated {
+                steps: plan_steps(StepStatus::InProgress),
+            }),
+            Driver::Codex,
+        );
+        t.settle_stale();
+        assert!(t
+            .apply(
+                &ev(Event::PlanUpdated {
+                    steps: plan_steps(StepStatus::Completed)
+                }),
+                Driver::Codex
+            )
+            .is_empty());
+        assert!(t.plan.is_empty());
+        assert_eq!(plans(&t)[0].0[0].status, StepStatus::InProgress);
+        assert_eq!(plans(&t)[0].1, Some(TurnState::Interrupted));
     }
 
     fn worker_state(state: WorkerState, waiting: bool) -> Envelope {

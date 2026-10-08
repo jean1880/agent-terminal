@@ -81,7 +81,7 @@
 //!   `applyNetworkPolicyAmendment`) are not offered; the four plain decisions are.
 //! - stderr (Codex's tracing output) is ignored.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
 use serde_json::{json, Map, Value};
@@ -97,6 +97,10 @@ use crate::event::{
 
 /// Page size asked of `model/list`.
 const MODEL_PAGE: u32 = 200;
+
+// Bound retired-turn history on long-lived connections; settled active-turn requests retire
+// with their scope, so delayed frames do not require keeping the entire conversation here.
+const TURN_TOMBSTONE_LIMIT: usize = 128;
 
 /// Notifications that carry nothing the UI renders (bookkeeping, or covered by another frame):
 /// dropped without an [`Event::Unknown`], which would only add noise to every turn.
@@ -138,6 +142,7 @@ struct PendingApproval {
     /// The JSON-RPC id to put in the response, verbatim (number or string).
     rpc_id: Value,
     item: String,
+    scope: RequestScope,
     /// The decisions the server offered (`availableDecisions`, or all of ours when it named
     /// none we know). A decision outside this is refused rather than sent.
     options: Vec<Decision>,
@@ -149,8 +154,15 @@ struct PendingQuestion {
     /// The JSON-RPC id to put in the response, verbatim (number or string).
     rpc_id: Value,
     item: String,
+    scope: RequestScope,
     /// The app-server question ids, paired with the question text used by the shared card UI.
     keys: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestScope {
+    thread: Option<String>,
+    turn: Option<String>,
 }
 
 pub struct CodexAdapter {
@@ -179,6 +191,12 @@ pub struct CodexAdapter {
     outbox: Outbox,
     approvals: HashMap<String, PendingApproval>,
     questions: HashMap<String, PendingQuestion>,
+    /// Keep every settled identity until its turn ends, then retire that scope. Retention
+    /// grows with active work, not connection lifetime; evicting an active identity would
+    /// make an old answer valid again. Child scopes retire only with child terminal evidence.
+    settled_requests: HashMap<String, RequestScope>,
+    ended_turns: HashSet<RequestScope>,
+    ended_turn_order: VecDeque<RequestScope>,
     /// Ids of items started and not yet completed, in start order.
     open_items: Vec<String>,
     /// Accumulated streamed text per open message item (snapshot fallback).
@@ -187,6 +205,8 @@ pub struct CodexAdapter {
     reasoning: HashMap<String, String>,
     /// Worker identity is a thread id, independent of collaboration operation/item ids.
     workers: BTreeMap<String, WorkerSnapshot>,
+    /// Current child turn ids: unscoped child requests must never borrow the parent's id.
+    worker_turns: HashMap<String, String>,
     /// Open explicit wait operations, keyed by item id (several can target one worker).
     worker_waits: BTreeMap<String, Vec<String>>,
     /// Latest cumulative thread usage, and the cumulative usage when the last turn ended.
@@ -225,10 +245,14 @@ impl CodexAdapter {
             outbox: Outbox::default(),
             approvals: HashMap::new(),
             questions: HashMap::new(),
+            settled_requests: HashMap::new(),
+            ended_turns: HashSet::new(),
+            ended_turn_order: VecDeque::new(),
             open_items: Vec::new(),
             texts: HashMap::new(),
             reasoning: HashMap::new(),
             workers: BTreeMap::new(),
+            worker_turns: HashMap::new(),
             worker_waits: BTreeMap::new(),
             usage_total: None,
             usage_base: Usage::default(),
@@ -413,10 +437,37 @@ impl CodexAdapter {
             "thread/status/changed" => {
                 set_worker_state(self.worker(id), thread_worker_state(params.get("status")));
             }
-            "thread/closed" => self.worker(id).state = WorkerState::Closed,
-            "turn/started" => self.worker(id).state = WorkerState::Running,
+            "thread/closed" => {
+                self.retire_thread_requests(id, out);
+                self.worker_turns.remove(id);
+                self.worker(id).state = WorkerState::Closed;
+            }
+            "turn/started" => {
+                let scope = self.notification_turn_scope(params);
+                if self.ended_turns.contains(&scope) {
+                    return true;
+                }
+                if let Some(turn) = scope.turn {
+                    self.worker_turns.insert(id.to_owned(), turn);
+                }
+                self.worker(id).state = WorkerState::Running;
+            }
             "turn/completed" => {
                 let turn = params.get("turn").unwrap_or(&Value::Null);
+                let scope = self.notification_turn_scope(params);
+                if self.ended_turns.contains(&scope) {
+                    return true;
+                }
+                if self
+                    .worker_turns
+                    .get(id)
+                    .zip(scope.turn.as_ref())
+                    .is_some_and(|(active, ended)| active != ended)
+                {
+                    return true;
+                }
+                self.retire_turn_requests(scope, out);
+                self.worker_turns.remove(id);
                 let state = match s(turn, "status") {
                     Some("completed") => WorkerState::Completed,
                     Some("interrupted") => WorkerState::Stopped,
@@ -676,6 +727,10 @@ impl CodexAdapter {
         }
         match method {
             "turn/started" => {
+                let scope = self.notification_turn_scope(params);
+                if self.ended_turns.contains(&scope) {
+                    return;
+                }
                 self.clear_worker_waits(out);
                 if self.effective_mode.is_none() {
                     self.effective_mode = Some(self.mode);
@@ -757,6 +812,9 @@ impl CodexAdapter {
                 }
             }
             "turn/plan/updated" => {
+                if self.stale_explicit_turn(params) {
+                    return;
+                }
                 let steps = params
                     .get("plan")
                     .and_then(Value::as_array)
@@ -796,6 +854,7 @@ impl CodexAdapter {
                 if let Some((key, p)) = approval
                     .and_then(|key| self.approvals.remove(&key).map(|pending| (key, pending)))
                 {
+                    self.remember_settled_request(key.clone(), p.scope.clone());
                     out.push(
                         Envelope::new(Event::ApprovalExpired)
                             .item(p.item)
@@ -810,6 +869,7 @@ impl CodexAdapter {
                 if let Some((key, p)) = question
                     .and_then(|key| self.questions.remove(&key).map(|pending| (key, pending)))
                 {
+                    self.remember_settled_request(key.clone(), p.scope.clone());
                     out.push(
                         Envelope::new(Event::QuestionResolved { answered: false })
                             .item(p.item)
@@ -854,6 +914,19 @@ impl CodexAdapter {
 
     fn on_turn_completed(&mut self, params: &Value, out: &mut Vec<Envelope>) {
         let turn = params.get("turn").unwrap_or(&Value::Null);
+        let scope = self.notification_turn_scope(params);
+        if self.ended_turns.contains(&scope) {
+            return; // also protects the gap before the next turn/started supplies its id
+        }
+        if self
+            .turn_id
+            .as_deref()
+            .zip(scope.turn.as_deref())
+            .is_some_and(|(active, ended)| active != ended)
+        {
+            return; // a late terminal notification cannot close the active turn
+        }
+        self.retire_turn_requests(scope, out);
         self.clear_worker_waits(out);
         // Anything still open when the turn ends was cut short.
         self.close_all(out);
@@ -900,6 +973,65 @@ impl CodexAdapter {
         self.finish_effective_mode(out);
     }
 
+    /// Expire only this turn's unanswered requests, including requests with no item/started.
+    fn retire_turn_requests(&mut self, scope: RequestScope, out: &mut Vec<Envelope>) {
+        remember_bounded(
+            &mut self.ended_turns,
+            &mut self.ended_turn_order,
+            scope.clone(),
+            TURN_TOMBSTONE_LIMIT,
+        );
+        let mut approvals: Vec<String> = self
+            .approvals
+            .iter()
+            .filter(|(_, p)| p.scope == scope)
+            .map(|(key, _)| key.clone())
+            .collect();
+        approvals.sort();
+        for key in approvals {
+            if let Some(pending) = self.approvals.remove(&key) {
+                out.push(
+                    Envelope::new(Event::ApprovalExpired)
+                        .item(pending.item)
+                        .request(key),
+                );
+            }
+        }
+        let mut questions: Vec<String> = self
+            .questions
+            .iter()
+            .filter(|(_, p)| p.scope == scope)
+            .map(|(key, _)| key.clone())
+            .collect();
+        questions.sort();
+        for key in questions {
+            if let Some(pending) = self.questions.remove(&key) {
+                out.push(
+                    Envelope::new(Event::QuestionResolved { answered: false })
+                        .item(pending.item)
+                        .request(key),
+                );
+            }
+        }
+        self.settled_requests.retain(|_, settled| *settled != scope);
+    }
+
+    fn retire_thread_requests(&mut self, thread: &str, out: &mut Vec<Envelope>) {
+        let scopes: HashSet<RequestScope> = self
+            .approvals
+            .values()
+            .map(|p| p.scope.clone())
+            .chain(self.questions.values().map(|p| p.scope.clone()))
+            .chain(self.settled_requests.values().cloned())
+            .filter(|scope| scope.thread.as_deref() == Some(thread))
+            .collect();
+        let mut scopes: Vec<_> = scopes.into_iter().collect();
+        scopes.sort_by(|a, b| a.turn.cmp(&b.turn));
+        for scope in scopes {
+            self.retire_turn_requests(scope, out);
+        }
+    }
+
     fn on_token_usage(&mut self, params: &Value, out: &mut Vec<Envelope>) {
         let Some(usage) = params.get("tokenUsage") else {
             out.push(Envelope::new(Event::Unknown));
@@ -923,15 +1055,62 @@ impl CodexAdapter {
 
     // ---- server requests ----
 
+    fn remember_settled_request(&mut self, key: String, scope: RequestScope) {
+        self.settled_requests.insert(key, scope);
+    }
+
+    fn request_scope(&self, params: &Value) -> RequestScope {
+        let thread = s(params, "threadId").or(self.thread_id.as_deref());
+        let turn = s(params, "turnId").or_else(|| {
+            if thread == self.thread_id.as_deref() {
+                self.turn_id.as_deref()
+            } else {
+                thread.and_then(|thread| self.worker_turns.get(thread).map(String::as_str))
+            }
+        });
+        RequestScope {
+            thread: thread.map(str::to_owned),
+            turn: turn.map(str::to_owned),
+        }
+    }
+
+    fn notification_turn_scope(&self, params: &Value) -> RequestScope {
+        let mut scope = self.request_scope(params);
+        scope.turn = s(params.get("turn").unwrap_or(&Value::Null), "id")
+            .map(str::to_owned)
+            .or(scope.turn);
+        scope
+    }
+
+    fn stale_explicit_turn(&self, params: &Value) -> bool {
+        let scope = self.request_scope(params);
+        let active = if scope.thread == self.thread_id {
+            self.turn_id.as_deref()
+        } else {
+            scope
+                .thread
+                .as_deref()
+                .and_then(|thread| self.worker_turns.get(thread).map(String::as_str))
+        };
+        self.ended_turns.contains(&scope)
+            || scope.thread.as_deref().is_some_and(|thread| {
+                self.workers
+                    .get(thread)
+                    .is_some_and(|worker| worker.state == WorkerState::Closed)
+            })
+            || s(params, "turnId")
+                .zip(active)
+                .is_some_and(|(requested, active)| requested != active)
+    }
+
     /// RPC ids belong to one app-server connection and restart at zero. The transcript
     /// persists across connections, so its request identity must also name the native
     /// turn/item. Keep the original typed RPC id separately for responses and resolution.
     fn server_request_key(&self, id: &Value, method: &str, params: &Value) -> String {
-        let thread = s(params, "threadId").or(self.thread_id.as_deref());
-        let turn = s(params, "turnId").or(self.turn_id.as_deref());
+        let scope = self.request_scope(params);
         format!(
             "codex:{method}:{}",
-            json!([thread, turn, s(params, "itemId"), id])
+            json!([scope.thread, scope.turn, s(params, "itemId"), id])
         )
     }
 
@@ -942,8 +1121,14 @@ impl CodexAdapter {
         params: &Value,
         out: &mut Vec<Envelope>,
     ) {
+        if self.stale_explicit_turn(params) {
+            return; // an unseen old request must not create a live interruption
+        }
         if method == "item/tool/requestUserInput" {
             let key = self.server_request_key(id, method, params);
+            if self.settled_requests.contains_key(&key) {
+                return;
+            }
             let item = s(params, "itemId").unwrap_or_default().to_owned();
             let questions: Vec<Question> = params
                 .get("questions")
@@ -993,6 +1178,7 @@ impl CodexAdapter {
                 PendingQuestion {
                     rpc_id: id.clone(),
                     item: item.clone(),
+                    scope: self.request_scope(params),
                     keys: questions
                         .iter()
                         .map(|question| (question.id.clone(), question.question.clone()))
@@ -1037,6 +1223,9 @@ impl CodexAdapter {
             }
         };
         let key = self.server_request_key(id, method, params);
+        if self.settled_requests.contains_key(&key) {
+            return;
+        }
         let item = s(params, "itemId").unwrap_or_default().to_owned();
         let options = match params.get("availableDecisions").and_then(Value::as_array) {
             Some(list) if all_decisions => {
@@ -1063,6 +1252,7 @@ impl CodexAdapter {
             PendingApproval {
                 rpc_id: id.clone(),
                 item: item.clone(),
+                scope: self.request_scope(params),
                 options: options.clone(),
             },
         );
@@ -1202,6 +1392,9 @@ impl Adapter for CodexAdapter {
         self.interrupt_sent = false;
         self.approvals.clear();
         self.questions.clear();
+        self.settled_requests.clear();
+        self.ended_turns.clear();
+        self.ended_turn_order.clear();
         self.open_items.clear();
         self.texts.clear();
         self.reasoning.clear();
@@ -1217,6 +1410,7 @@ impl Adapter for CodexAdapter {
             }
         }
         self.worker_waits.clear();
+        self.worker_turns.clear();
         self.usage_total = None;
         self.usage_base = Usage::default();
         self.context = None;
@@ -1330,6 +1524,7 @@ impl Adapter for CodexAdapter {
                         "no pending approval {request}"
                     )));
                 };
+                self.remember_settled_request(request, approval.scope.clone());
                 let line = json!({
                     "id": approval.rpc_id,
                     "result": {"decision": decision_wire(decision)},
@@ -1363,6 +1558,7 @@ impl Adapter for CodexAdapter {
                 })
                 .to_string();
                 self.questions.remove(&request);
+                self.remember_settled_request(request, question.scope);
                 Ok(vec![Action::Write(vec![line])])
             }
             Command::SetModel { model, effort } => {
@@ -1459,6 +1655,8 @@ impl Adapter for CodexAdapter {
     }
 
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
+        self.settled_requests.clear();
+        self.worker_turns.clear();
         let expected = self.interrupt_sent;
         let mut out = Vec::new();
         self.clear_worker_waits(&mut out);
@@ -1545,6 +1743,22 @@ const ALL_DECISIONS: [Decision; 4] = [
     Decision::Deny,
     Decision::Cancel,
 ];
+
+fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
+    keys: &mut HashSet<T>,
+    order: &mut VecDeque<T>,
+    key: T,
+    limit: usize,
+) {
+    if keys.insert(key.clone()) {
+        order.push_back(key);
+        if order.len() > limit {
+            if let Some(oldest) = order.pop_front() {
+                keys.remove(&oldest);
+            }
+        }
+    }
+}
 
 /// `approvalPolicy` and `sandboxPolicy` for a mode (see the module's mode table).
 fn mode_policy(mode: Mode) -> (&'static str, Value) {
@@ -2954,6 +3168,432 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_after_answer_cannot_restore_an_approval_but_a_new_turn_can_reuse_its_id() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let frame = approval_request("0", "item/commandExecution/requestApproval");
+        let request = a.feed(&frame)[0].request.clone().expect("request");
+        let approve = |request| Command::Approve {
+            request,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        };
+        assert_eq!(
+            one_write(a.encode(approve(request.clone())).expect("answer")),
+            json!({"id": 0, "result": {"decision": "accept"}})
+        );
+        assert!(a.feed(&frame).is_empty(), "a late retransmission is inert");
+        assert!(
+            a.encode(approve(request)).is_err(),
+            "no second wire response"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        let next = a.feed(&frame.replace("tu-1", "tu-2"))[0]
+            .request
+            .clone()
+            .expect("next request");
+        assert_eq!(
+            one_write(a.encode(approve(next)).expect("new turn answer")),
+            json!({"id": 0, "result": {"decision": "accept"}})
+        );
+    }
+
+    #[test]
+    fn a_terminal_turn_expires_its_requests_and_late_frames_cannot_touch_the_next_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let approval = approval_request("0", "item/commandExecution/requestApproval");
+        let question = r#"{"id":"0","method":"item/tool/requestUserInput","params":{"threadId":"th-1","turnId":"tu-1","itemId":"q","questions":[{"id":"choice","question":"Continue?","options":[{"label":"Yes"},{"label":"No"}]}]}}"#;
+        let approval_key = a.feed(&approval)[0].request.clone().expect("approval");
+        let question_key = a.feed(question)[0].request.clone().expect("question");
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#;
+        let ended = a.feed(completed);
+        assert!(ended.iter().any(
+            |e| e.request.as_ref() == Some(&approval_key) && e.event == Event::ApprovalExpired
+        ));
+        assert!(ended
+            .iter()
+            .any(|e| e.request.as_ref() == Some(&question_key)
+                && e.event == Event::QuestionResolved { answered: false }));
+        assert!(a.feed(&approval).is_empty());
+        assert!(a.feed(question).is_empty());
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        let next_frame = approval.replace("tu-1", "tu-2");
+        let next = a.feed(&next_frame)[0].request.clone().expect("new request");
+        assert!(
+            a.feed(completed).is_empty(),
+            "old completion cannot finish the new turn"
+        );
+        assert!(a.approvals.contains_key(&next));
+        let resolved =
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":0}}"#;
+        assert_eq!(a.feed(resolved)[0].request.as_ref(), Some(&next));
+        assert!(a.feed(resolved).is_empty(), "resolution is idempotent");
+        assert!(
+            a.feed(&next_frame).is_empty(),
+            "expired duplicate cannot restore the request"
+        );
+    }
+
+    #[test]
+    fn late_unseen_requests_for_a_completed_turn_are_inert_before_and_during_the_next_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        let old_approval = approval_request("0", "item/commandExecution/requestApproval");
+        let old_question = json!({"id": "0", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "itemId": "late-question",
+            "questions": [{"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}]}],
+        }})
+        .to_string();
+        for late in [&old_approval, &old_question] {
+            assert!(
+                a.feed(late).is_empty(),
+                "an unseen request cannot revive a completed turn"
+            );
+        }
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("prompt");
+        for late in [&old_approval, &old_question] {
+            assert!(a.feed(late).is_empty(), "pending start is protected too");
+        }
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        for late in [&old_approval, &old_question] {
+            assert!(
+                a.feed(late).is_empty(),
+                "an old request cannot interrupt the new turn"
+            );
+        }
+        let next = a.feed(&old_approval.replace("tu-1", "tu-2"));
+        assert!(
+            matches!(next[0].event, Event::ApprovalRequested { .. }),
+            "raw id reuse remains valid"
+        );
+        assert_eq!(
+            one_write(
+                a.encode(Command::Approve {
+                    request: next[0].request.clone().expect("current request"),
+                    decision: Decision::Allow,
+                    updated_input: None,
+                    message: None,
+                })
+                .expect("approve current")
+            ),
+            json!({"id": 0, "result": {"decision": "accept"}})
+        );
+    }
+
+    #[test]
+    fn late_duplicate_completion_during_a_pending_start_keeps_the_next_turn_effective_policy() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
+        a.feed(completed);
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("next prompt");
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("defer mode");
+        a.drain_outbox();
+        assert!(
+            a.feed(completed).is_empty(),
+            "a duplicate cannot finish the pending turn"
+        );
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("defer again");
+        assert!(
+            a.drain_outbox().events.iter().any(|e| e.event
+                == Event::ModeChangeDeferred {
+                    requested: Mode::Plan,
+                    effective: Mode::Ask,
+                }),
+            "the pending turn retains the policy actually sent on its wire"
+        );
+    }
+
+    #[test]
+    fn request_and_turn_duplicate_protection_is_bounded_on_a_long_lived_connection() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"many-requests"}}}"#);
+        let mut last = String::new();
+        let mut first = None;
+        for item in 0..1100 {
+            last = json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": {
+                "threadId": "th-1", "turnId": "many-requests", "itemId": format!("item-{item}"), "command": "printf synthetic",
+            }}).to_string();
+            let request = a.feed(&last)[0]
+                .request
+                .clone()
+                .expect("new item uses the same raw id");
+            if item == 0 {
+                first = Some((last.clone(), request.clone()));
+            }
+            a.encode(Command::Approve {
+                request,
+                decision: Decision::Allow,
+                updated_input: None,
+                message: None,
+            })
+            .expect("approve");
+        }
+        assert_eq!(
+            a.settled_requests.len(),
+            1100,
+            "active identities cannot be evicted"
+        );
+        assert!(
+            a.feed(&last).is_empty(),
+            "settled requests stay protected throughout their active turn"
+        );
+        let (first_frame, first_key) = first.expect("first request");
+        let current = a.feed(&last.replace("item-1099", "current-item"))[0]
+            .request
+            .clone()
+            .expect("pending current item");
+        assert!(
+            a.feed(&first_frame).is_empty(),
+            "the first answered request cannot revive after 1,024 answers"
+        );
+        assert!(
+            a.encode(Command::Approve {
+                request: first_key,
+                decision: Decision::Allow,
+                updated_input: None,
+                message: None
+            })
+            .is_err(),
+            "an old answer cannot approve current wire id 0"
+        );
+        assert!(a
+            .encode(Command::Approve {
+                request: current,
+                decision: Decision::Allow,
+                updated_input: None,
+                message: None
+            })
+            .is_ok());
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"many-requests","status":"completed"}}}"#);
+        assert!(
+            a.settled_requests.is_empty(),
+            "terminal scope releases active-turn identities"
+        );
+        for turn in 0..TURN_TOMBSTONE_LIMIT + 10 {
+            let id = format!("turn-{turn}");
+            a.feed(&json!({"method": "turn/started", "params": {"threadId": "th-1", "turn": {"id": id}}}).to_string());
+            a.feed(&json!({"method": "turn/completed", "params": {"threadId": "th-1", "turn": {"id": id, "status": "completed"}}}).to_string());
+        }
+        assert_eq!(a.ended_turns.len(), TURN_TOMBSTONE_LIMIT);
+        assert_eq!(a.ended_turn_order.len(), TURN_TOMBSTONE_LIMIT);
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("next prompt");
+        let last_completed =
+            json!({"method": "turn/completed", "params": {"threadId": "th-1", "turn": {
+                "id": format!("turn-{}", TURN_TOMBSTONE_LIMIT + 9), "status": "completed",
+            }}})
+            .to_string();
+        assert!(
+            a.feed(&last_completed).is_empty(),
+            "recent terminal turns stay protected at the cap"
+        );
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"new-turn"}}}"#,
+        );
+        assert!(
+            matches!(
+                a.feed(&last.replace("many-requests", "new-turn"))[0].event,
+                Event::ApprovalRequested { .. }
+            ),
+            "the cap never turns a new scoped request into a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_child_request_survives_parent_completion_and_retires_only_its_own_scope() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.feed(r#"{"method":"thread/started","params":{"thread":{"id":"child","parentThreadId":"th-1","status":{"type":"active"}}}}"#);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"child","turn":{"id":"tu-1"}}}"#);
+        let parent = approval_request("0", "item/commandExecution/requestApproval");
+        let child =
+            approval_request("1", "item/commandExecution/requestApproval").replace("th-1", "child");
+        let parent_key = a.feed(&parent)[0].request.clone().expect("parent");
+        let child_key = a.feed(&child)[0].request.clone().expect("child");
+        assert!(
+            a.feed(&child.replace("tu-1", "unseen-old-child-turn"))
+                .is_empty(),
+            "known child active scope rejects explicit old turns too"
+        );
+        a.encode(Command::Approve {
+            request: child_key,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        })
+        .expect("answer child");
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
+        assert!(a
+            .feed(completed)
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_ref() == Some(&parent_key)));
+        assert_eq!(
+            a.settled_requests.len(),
+            1,
+            "parent terminal must retain child's settled request"
+        );
+        assert!(
+            a.feed(&child).is_empty(),
+            "child duplicate is still protected"
+        );
+        let question = json!({"id": "q", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "child", "turnId": "tu-1", "itemId": "child-q",
+            "questions": [{"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}]}],
+        }})
+        .to_string();
+        let key = a.feed(&question)[0]
+            .request
+            .clone()
+            .expect("child question remains live");
+        assert!(a
+            .encode(Command::Answer {
+                request: key,
+                answers: json!({"Continue?": "Yes"})
+            })
+            .is_ok());
+        a.feed(&completed.replace("th-1", "child"));
+        assert!(
+            a.settled_requests.is_empty(),
+            "child terminal releases only child scope"
+        );
+        assert!(
+            a.feed(&question.replace("child-q", "unseen-child-q"))
+                .is_empty(),
+            "late child request cannot revive after terminal"
+        );
+    }
+
+    #[test]
+    fn late_plan_notifications_cannot_revive_an_ended_turn_or_change_the_next_plan() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let plan = json!({"method": "turn/plan/updated", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "plan": [{"step": "Current work", "status": "pending"}],
+        }}).to_string();
+        assert!(matches!(a.feed(&plan)[0].event, Event::PlanUpdated { .. }));
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert!(a.feed(&plan).is_empty(), "ended plan remains history");
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("next prompt");
+        assert!(
+            a.feed(&plan).is_empty(),
+            "pending next turn cannot revive old plan"
+        );
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        assert!(a.feed(&plan).is_empty(), "new turn cannot receive old plan");
+        assert!(
+            a.feed(&plan.replace("tu-1", "unknown-turn")).is_empty(),
+            "explicit non-current plan is refused"
+        );
+        assert!(
+            matches!(
+                a.feed(&plan.replace("tu-1", "tu-2"))[0].event,
+                Event::PlanUpdated { .. }
+            ),
+            "current plan remains usable"
+        );
+    }
+
+    #[test]
+    fn closing_a_child_expires_its_requests_and_unscoped_ids_use_the_child_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"parent-turn"}}}"#,
+        );
+        a.feed(r#"{"method":"thread/started","params":{"thread":{"id":"child","parentThreadId":"th-1","status":{"type":"active"}}}}"#);
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}"#,
+        );
+        let parent = json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "th-1", "command": "printf parent",
+        }})
+        .to_string();
+        let parent_key = a.feed(&parent)[0].request.clone().expect("parent request");
+        let child = json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "child", "itemId": "child-item", "command": "printf child",
+        }})
+        .to_string();
+        let child_key = a.feed(&child)[0].request.clone().expect("child request");
+        assert!(child_key.contains("child-turn") && !child_key.contains("parent-turn"));
+        a.encode(Command::Approve {
+            request: child_key,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        })
+        .expect("settled child request");
+        let pending = a.feed(&child.replace("child-item", "child-pending"))[0]
+            .request
+            .clone()
+            .expect("pending child");
+        let question = json!({"id": "q", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "child", "itemId": "child-q", "questions": [{"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}]}],
+        }}).to_string();
+        let question_key = a.feed(&question)[0]
+            .request
+            .clone()
+            .expect("child question");
+        let closed = a.feed(r#"{"method":"thread/closed","params":{"threadId":"child"}}"#);
+        assert!(closed
+            .iter()
+            .any(|e| e.request.as_ref() == Some(&pending) && e.event == Event::ApprovalExpired));
+        assert!(closed
+            .iter()
+            .any(|e| e.request.as_ref() == Some(&question_key)
+                && e.event == Event::QuestionResolved { answered: false }));
+        assert!(
+            a.settled_requests.is_empty(),
+            "closed child releases its settled scopes"
+        );
+        assert!(a
+            .feed(&child.replace("child-item", "unseen-after-close"))
+            .is_empty());
+        assert!(a.feed(&question).is_empty());
+        assert!(
+            a.encode(Command::Approve {
+                request: parent_key.clone(),
+                decision: Decision::Allow,
+                updated_input: None,
+                message: None
+            })
+            .is_ok(),
+            "parent remains answerable"
+        );
+        assert!(
+            a.feed(&parent).is_empty(),
+            "unscoped parent duplicate uses its active turn"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"parent-turn","status":"completed"}}}"#);
+        assert!(a.settled_requests.is_empty());
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"next-parent-turn"}}}"#);
+        assert_ne!(
+            a.feed(&parent)[0].request.as_ref(),
+            Some(&parent_key),
+            "unscoped raw id reuse follows the next native turn"
+        );
+    }
+
+    #[test]
     fn request_user_input_becomes_a_question_card_and_answers_with_question_ids() {
         let mut a = started(Mode::Ask);
         let ev = a.feed(
@@ -3266,13 +3906,13 @@ mod tests {
             if u.input_tokens == 100 && u.output_tokens == 10)
         );
         a.feed(&usage(130, 25));
-        let second = a.feed(done);
+        let second = a.feed(&done.replace("\"tu\"", "\"tu-2\""));
         assert!(
             matches!(&second[0].event, Event::TurnCompleted { usage: Some(u), .. }
             if u.input_tokens == 30 && u.output_tokens == 15)
         );
         // No usage reported in a turn: none claimed.
-        let third = a.feed(done);
+        let third = a.feed(&done.replace("\"tu\"", "\"tu-3\""));
         assert!(matches!(
             &third[0].event,
             Event::TurnCompleted { usage: None, .. }
@@ -3327,10 +3967,9 @@ mod tests {
         a.feed(
             r#"{"method":"item/started","params":{"threadId":"th-1","turnId":"tu","startedAtMs":1,"item":{"type":"commandExecution","id":"c1","command":"sleep 9","cwd":"/w","status":"inProgress","commandActions":[]}}}"#,
         );
-        a.feed(&approval_request(
-            "4",
-            "item/commandExecution/requestApproval",
-        ));
+        a.feed(
+            &approval_request("4", "item/commandExecution/requestApproval").replace("tu-1", "tu"),
+        );
         a.encode(Command::Control {
             id: "m".into(),
             control: Control::ListModels,

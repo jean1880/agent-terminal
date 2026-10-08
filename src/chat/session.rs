@@ -1640,6 +1640,9 @@ fn as_deliberate_stop(env: &mut Envelope) {
 }
 
 #[cfg(test)]
+mod scripted_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{in_loop, pump_until};

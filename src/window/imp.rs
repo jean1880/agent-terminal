@@ -6167,6 +6167,13 @@ mod tests {
         // Long enough for timers (the restore skeleton's removal) to run.
         crate::testutil::pump_until(&ctx, 1, || false);
 
+        // GDK's toplevel size includes client-side shadows; widget allocations do not.
+        // Request the intended content size, so breakpoint neighbours are measured at their
+        // actual allocation on both X11 and Broadway rather than ten pixels below it.
+        let surface = window.surface().expect("mapped test surface");
+        let frame_width = (surface.width() - root.width()).max(0);
+        let frame_height = (surface.height() - root.height()).max(0);
+
         let split = imp.split_view.borrow().clone().expect("the split view");
         split.set_show_sidebar(true);
         // The window at each width either side of every breakpoint, the real breakpoints
@@ -6205,19 +6212,19 @@ mod tests {
                 }
                 scaled_widths.sort_unstable();
                 scaled_widths.dedup();
-                scaled_widths.retain(|width| *width <= display_width);
+                scaled_widths.retain(|width| *width + frame_width <= display_width);
                 for width in scaled_widths {
-                    window.set_default_size(width, height);
+                    window.set_default_size(width + frame_width, height + frame_height);
                     let sized = crate::testutil::pump_until(&ctx, 3, || {
-                        window.width() == width && window.height() == height
+                        root.width() == width && root.height() == height
                     });
                     // Let the breakpoint the new size selects apply.
                     crate::testutil::pump_until(&ctx, 1, || false);
                     assert!(
                         sized,
                         "the window took {width}×{height} (it is {}×{})",
-                        window.width(),
-                        window.height()
+                        root.width(),
+                        root.height()
                     );
                     let state = format!(
                         "{width}×{height}, text {scale}×, sidebar {}, diff panel {}",
@@ -6228,6 +6235,15 @@ mod tests {
                         },
                         if diff_shown { "shown" } else { "hidden" }
                     );
+                    if width == MIN_WINDOW.0 || width == 950 {
+                        crate::testutil::capture_window(
+                            window.upcast_ref(),
+                            &format!(
+                                "window-{width}-scale-{}-diff-{diff_shown}",
+                                (scale * 100.0) as u32
+                            ),
+                        );
+                    }
                     for overflow in crate::testutil::overflowing_bins(&root) {
                         eprintln!("layout overflow at {state}: {overflow}");
                         report.push_str(&format!("== {state}: {overflow}\n"));

@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential pkg-config dpkg-dev \
+    ca-certificates curl build-essential pkg-config dpkg-dev python3 \
     libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libgtksourceview-5-dev \
     libglib2.0-dev-bin
 

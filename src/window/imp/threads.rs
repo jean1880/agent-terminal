@@ -4146,16 +4146,17 @@ pub(super) mod tests {
             imp.toggle_sidebar();
         }
         let ctx = glib::MainContext::default();
+        let accepted_focus = crate::testutil::pump_until(&ctx, 5, || {
+            close_for_key().is_some_and(|button| {
+                button.is_mapped() && button.is_sensitive() && button.grab_focus()
+            })
+        });
         assert!(
-            crate::testutil::pump_until(&ctx, 5, || {
-                close_for_key().is_some_and(|button| button.is_mapped() && button.is_sensitive())
-            }),
-            "the shown sidebar's close button must map before focusing it"
+            accepted_focus,
+            "the shown sidebar's current close button must accept focus after revealing"
         );
-        // State and time callbacks can rebuild the list during mapping. Resolve the control
-        // by thread identity after the bounded wait, never focus a widget from an old row.
-        let close = close_for_key().expect("mapped close button");
-        assert!(close.grab_focus());
+        // Mapping happens before the split-view reveal finishes accepting focus. State and
+        // time callbacks can also rebuild rows; each attempt resolves the current control.
         let focus = gtk4::prelude::GtkWindowExt::focus(window).expect("focused control");
         assert_eq!(
             sidebar_focus_target(&sidebar, &focus),

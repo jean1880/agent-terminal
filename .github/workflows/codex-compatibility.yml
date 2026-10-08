@@ -1,0 +1,39 @@
+name: Opt-in Codex Linux SSH compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_version:
+        description: Exact npm @openai/codex version to probe, no inference
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install the explicitly selected Codex CLI
+        env:
+          CODEX_VERSION: ${{ inputs.codex_version }}
+        run: |
+          [[ "$CODEX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]
+          npm install --global "@openai/codex@$CODEX_VERSION"
+      - name: Parse synthetic SSH configuration inside and outside the sandbox
+        run: python3 tests/qa/codex_ssh_probe.py
+      - name: Preserve compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-ssh-compatibility
+          path: |
+            target/qa-codex-ssh/*.log
+            target/qa-codex-ssh/probe.json
+          if-no-files-found: warn

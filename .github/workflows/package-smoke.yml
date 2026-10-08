@@ -1,0 +1,63 @@
+name: Opt-in packaged identity and startup smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Release workflow run that produced package-deb
+        required: true
+        type: string
+      commit:
+        description: Exact 40-character source commit expected in that run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  smoke:
+    # A disposable hosted runner. Never a self-hosted/daily-driver install.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+      - name: Verify producer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > producer-run.json
+          python3 tests/qa/package_smoke.py verify-run producer-run.json "$EXPECTED_COMMIT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-deb
+          path: dist
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify package provenance and install on disposable runner
+        env:
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          python3 packaging/artifact-manifest.py verify dist --commit "$EXPECTED_COMMIT"
+          sudo bash packaging/smoke-install.sh dist
+      - name: Check installed executable in an isolated home
+        env:
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: python3 tests/qa/package_smoke.py installed dist "$EXPECTED_COMMIT"
+      - name: Preserve package diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-smoke-${{ inputs.run_id }}
+          path: |
+            producer-run.json
+            dist/*.identity.json
+            target/qa-package/
+          if-no-files-found: warn

@@ -28,5 +28,8 @@ desktop.ini
 **/*.rs.bk
 *.pdb
 
+# Repository-owned QA helpers use Python's standard library.
+__pycache__/
+
 # Agent overlays and local settings
 .claude/

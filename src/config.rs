@@ -549,18 +549,33 @@ pub enum DiskChange {
 }
 
 /// Why the last load fell back to defaults, for the UI to report once.
+#[cfg(not(test))]
 static LOAD_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    // Parallel config fixtures must not open a modal in the unrelated GTK window test.
+    static LOAD_PROBLEM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Takes the reason the settings could not be loaded, if they could not.
 pub fn take_load_problem() -> Option<String> {
-    LOAD_PROBLEM.lock().ok()?.take()
+    #[cfg(not(test))]
+    {
+        LOAD_PROBLEM.lock().ok()?.take()
+    }
+    #[cfg(test)]
+    LOAD_PROBLEM.with(|slot| slot.borrow_mut().take())
 }
 
 fn report_load_problem(problem: String) {
     warn!("{problem}");
+    #[cfg(not(test))]
     if let Ok(mut slot) = LOAD_PROBLEM.lock() {
         *slot = Some(problem);
     }
+    #[cfg(test)]
+    LOAD_PROBLEM.with(|slot| *slot.borrow_mut() = Some(problem));
 }
 
 /// Copies `path` to `<name>.<tag>-<nanos>` beside it, so a file about to be
@@ -1928,6 +1943,30 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, ["Claude", "Claude (3)", "Claude (2)"]);
+    }
+
+    #[test]
+    fn load_problems_stay_with_the_parallel_test_that_created_them() {
+        let ready = std::sync::Barrier::new(2);
+        let checked = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                report_load_problem("synthetic invalid config".into());
+                ready.wait();
+                checked.wait();
+                assert_eq!(
+                    take_load_problem().as_deref(),
+                    Some("synthetic invalid config")
+                );
+            });
+            ready.wait();
+            let problem = take_load_problem();
+            checked.wait();
+            assert!(
+                problem.is_none(),
+                "another test's error must not open a modal here"
+            );
+        });
     }
 
     #[test]
