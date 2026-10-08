@@ -1,0 +1,44 @@
+# Arch Linux package for Agent Terminal, built from the source tree this file sits in (the
+# release workflow and packaging/build-arch.sh run makepkg here). pkgver is set from Cargo.toml by
+# that script; the value below is only a placeholder.
+pkgname=agent-terminal
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="A native GTK4 chat front end for Claude, Antigravity and Codex"
+arch=('x86_64')
+url="https://github.com/jean1880/agent-terminal"
+license=('MIT')
+# What the binary links directly (SQLite is bundled).
+depends=('gtk4' 'libadwaita' 'vte4' 'gtksourceview5' 'glib2' 'pango' 'cairo' 'gdk-pixbuf2'
+         'graphene' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'pkgconf')
+options=('!lto' '!debug')
+
+_root() {
+    cd "$startdir/../.."
+}
+
+build() {
+    _root
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked
+}
+
+check() {
+    _root
+    export CARGO_TARGET_DIR="$srcdir/target"
+    # The pure crates only: the app's tests need a display.
+    cargo test --release --locked -p agent-core -p agent-kit
+}
+
+package() {
+    _root
+    install -Dm755 "$srcdir/target/release/agent-terminal" "$pkgdir/usr/bin/agent-terminal"
+    install -Dm644 assets/ca.nuvek.AgentTerminal.desktop \
+        "$pkgdir/usr/share/applications/ca.nuvek.AgentTerminal.desktop"
+    install -Dm644 assets/ca.nuvek.AgentTerminal.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/ca.nuvek.AgentTerminal.svg"
+    install -Dm644 assets/icons/scalable/apps/ca.nuvek.AgentTerminal-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/symbolic/apps/ca.nuvek.AgentTerminal-symbolic.svg"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

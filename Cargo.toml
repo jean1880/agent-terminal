@@ -90,3 +90,16 @@ assets = [
     ["assets/ca.nuvek.AgentTerminal.svg", "usr/share/icons/hicolor/scalable/apps/ca.nuvek.AgentTerminal.svg", "644"],
     ["assets/icons/scalable/apps/ca.nuvek.AgentTerminal-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/ca.nuvek.AgentTerminal-symbolic.svg", "644"],
 ]
+
+# Fedora/RPM, built with cargo-generate-rpm (the release workflow's rpm job). The same files as
+# the .deb; runtime requirements are derived from the built binary (auto-req), like $auto above.
+[package.metadata.generate-rpm]
+summary = "A native GTK4 chat front end for Claude, Antigravity and Codex"
+license = "MIT"
+assets = [
+    { source = "target/release/agent-terminal", dest = "/usr/bin/agent-terminal", mode = "755" },
+    { source = "assets/ca.nuvek.AgentTerminal.desktop", dest = "/usr/share/applications/ca.nuvek.AgentTerminal.desktop", mode = "644" },
+    { source = "assets/ca.nuvek.AgentTerminal.svg", dest = "/usr/share/icons/hicolor/scalable/apps/ca.nuvek.AgentTerminal.svg", mode = "644" },
+    { source = "assets/icons/scalable/apps/ca.nuvek.AgentTerminal-symbolic.svg", dest = "/usr/share/icons/hicolor/symbolic/apps/ca.nuvek.AgentTerminal-symbolic.svg", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/agent-terminal/LICENSE", mode = "644", doc = true },
+]

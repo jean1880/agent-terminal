@@ -23,6 +23,8 @@ desktop.ini
 
 # Rust build artifacts
 /target/
+# Built packages (packaging/build-*.sh, the release workflow)
+/dist/
 **/*.rs.bk
 *.pdb
 

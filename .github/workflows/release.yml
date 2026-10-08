@@ -1,0 +1,140 @@
+name: Release
+
+# A v* tag builds the Debian/Ubuntu, Fedora and Arch packages and publishes them, with checksums
+# and the release notes, as a GitHub Release. Run by hand (workflow_dispatch), it is a dry run:
+# every package is built and kept as a workflow artifact, and nothing is published.
+#
+# Each package is built by packaging/build-<kind>.sh in a clean container of its distribution,
+# the same way it can be built locally:
+#   docker run --rm -v "$PWD":/src:ro -v /tmp/out:/out -e OUT=/out fedora:42 \
+#     bash /src/packaging/build-rpm.sh
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version, and check the tag matches it
+        id: read
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            if [[ "$tag" != "v$version" ]]; then
+              echo "::error::Tag $tag does not match Cargo.toml version $version (expected v$version)"
+              exit 1
+            fi
+            notes="docs/releases/$tag.md"
+            if [[ ! -s "$notes" ]]; then
+              echo "::error::Missing release notes: $notes"
+              exit 1
+            fi
+          fi
+
+  build:
+    name: Package (${{ matrix.kind }})
+    needs: version
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: deb
+            image: ubuntu:24.04
+          - kind: rpm
+            image: fedora:42
+          - kind: arch
+            image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the ${{ matrix.kind }} package
+        run: bash packaging/build-${{ matrix.kind }}.sh
+        env:
+          OUT: ${{ github.workspace }}/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.kind }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Each package installed in a FRESH container of its distribution (not the build container,
+  # which has every development library): a missing runtime dependency fails here, not for a user.
+  smoke:
+    name: Install test (${{ matrix.kind }})
+    needs: build
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: deb
+            image: ubuntu:24.04
+          - kind: rpm
+            image: fedora:42
+          - kind: arch
+            image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-${{ matrix.kind }}
+          path: dist
+
+      - name: Install it and run it
+        run: bash packaging/smoke-install.sh dist/*
+
+  release:
+    name: Publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "Agent Terminal $VERSION" \
+            --notes-file "docs/releases/$TAG.md"

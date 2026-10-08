@@ -203,6 +203,16 @@ switch, omitted `libadwaita-1-0` entirely from every shipped package.
 The pipeline step in `debian-maintainer/config.yaml` passes `-o .` because the
 orchestrator collects artifacts with a non-recursive scan of the workspace root.
 
+**Releases** (`.github/workflows/release.yml`): a `v*` tag builds the `.deb` (Ubuntu 24.04,
+cargo-deb), the `.rpm` (Fedora 42, cargo-generate-rpm, `[package.metadata.generate-rpm]`) and the
+Arch package (`packaging/arch/PKGBUILD`, makepkg), each by `packaging/build-<kind>.sh` in a clean
+container of its distribution, and publishes them with `SHA256SUMS` as a GitHub Release. The tag
+must equal `v` + the Cargo.toml version, and `docs/releases/<tag>.md` must exist (the release
+notes): the workflow refuses otherwise. Run it by hand (workflow_dispatch) for a dry run that
+builds everything and publishes nothing. The same scripts build locally:
+`docker run --rm -v "$PWD":/src:ro -v /tmp/out:/out -e OUT=/out fedora:42 bash /src/packaging/build-rpm.sh`.
+Keep the three asset lists (deb, rpm metadata, PKGBUILD) in step.
+
 ## 🤖 AI Contribution Rules
 
 - Always prioritize the **Standalone Philosophy**.
