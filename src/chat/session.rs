@@ -145,6 +145,8 @@ struct Inner {
     /// The pending handoff went out with the prompt now running: not sent again unless that turn
     /// ends without completing.
     handoff_in_flight: Cell<bool>,
+    /// The agent a switch left, until the new one reports a session (see [`Previous`]).
+    rollback: RefCell<Option<Previous>>,
     /// The thread's model was retired by its agent: the next prompt first moves to this one.
     retired: RefCell<Option<RetiredModel>>,
     /// The model the thread was last SET to (an alias where the agent has one), as opposed to the
@@ -289,6 +291,7 @@ impl ChatSession {
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
             handoff_in_flight: Cell::new(false),
+            rollback: RefCell::new(None),
             retired: RefCell::new(None),
             selected: RefCell::new(selected),
             ctl_seq: Cell::new(0),
@@ -457,6 +460,8 @@ impl Inner {
             Event::SessionStarted {
                 native_id, model, ..
             } => {
+                // The agent is up: a switch to it can no longer roll back.
+                *self.rollback.borrow_mut() = None;
                 if !native_id.is_empty() {
                     let pt = self.provider_thread.borrow().clone();
                     // A resume that started a new native session leaves the old one behind:
@@ -478,6 +483,9 @@ impl Inner {
                 }
             }
             Event::TurnStarted { model } => {
+                // An agent that runs turns has started, whether or not it reported a session:
+                // an exit from here on is an ordinary one, not a failed switch.
+                *self.rollback.borrow_mut() = None;
                 if let Some(m) = model {
                     self.set_model(m);
                 }
@@ -571,6 +579,13 @@ impl Inner {
                 self.state.borrow_mut().alive = false;
                 // Nothing will complete a turn: a pending handoff goes out with the next prompt.
                 self.handoff_in_flight.set(false);
+                // A switch's new agent that cannot even be spawned: back to the old one. Taken
+                // first: roll_back starts a process, whose own failure lands back here.
+                let previous = self.rollback.borrow_mut().take();
+                if let Some(previous) = previous {
+                    self.roll_back(previous, &e.to_string());
+                    return;
+                }
                 self.error(e);
             }
         }
@@ -659,12 +674,22 @@ impl Inner {
         self.start_process();
     }
 
-    fn on_exit(&self, generation: u64, code: Option<i32>) {
+    fn on_exit(self: &Rc<Self>, generation: u64, code: Option<i32>) {
         if generation != self.generation.get() {
             return;
         }
         info!(code = ?code, "agent exited");
         self.finish_process(code, false);
+        // A switch's new agent that died before it ever started: back to the old one. Taken
+        // first, as in start_process.
+        let previous = self.rollback.borrow_mut().take();
+        if let Some(previous) = previous {
+            let reason = match code {
+                Some(code) => format!("it exited (code {code}) before starting"),
+                None => "it stopped before starting".to_owned(),
+            };
+            self.roll_back(previous, &reason);
+        }
     }
 
     /// Closes out the current process: adapter exit envelopes, status, pending approvals.
@@ -1146,8 +1171,8 @@ impl Inner {
                 return;
             }
         };
-        let model = model.or(launch.default_model);
-        let effort = effort.or(launch.default_effort);
+        let model = model.or_else(|| launch.default_model.clone());
+        let effort = effort.or_else(|| launch.default_effort.clone());
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
         let new_pt =
             match create_provider_thread(&self.store, &self.thread, driver, model.as_deref()) {
@@ -1157,46 +1182,33 @@ impl Inner {
                     return;
                 }
             };
+        // What this switch replaces, so a new agent that never starts can take the thread back.
+        let previous = {
+            let state = self.state.borrow();
+            Previous {
+                driver: from,
+                provider_thread: self.provider_thread.borrow().clone(),
+                native_id: state.native_id.clone(),
+                model: state.model.clone(),
+                selected: self.selected.borrow().clone(),
+                effort: state.effort.clone(),
+            }
+        };
         // The old process's closing events still belong to the old provider thread, and its
         // pending approvals expire on the old socket.
         self.stop_current();
-        *self.provider_thread.borrow_mut() = new_pt;
-        *self.adapter.borrow_mut() = launch.adapter;
-        *self.launch_env.borrow_mut() = launch.env;
-        let (approval, unbound) = match launch.approval {
-            Ok(handle) => (Some(handle), None),
-            Err(reason) => (None, reason),
-        };
-        *self.approval.borrow_mut() = approval;
-        *self.unbound.borrow_mut() = unbound;
-        // The user's own mode, as far as the new agent can honour it (agy without its hook
-        // cannot ask). A thread that went through hookless agy gets its Ask back here.
-        let hookless_agy = driver == Driver::Agy && self.approval().is_none();
-        let new_mode = effective_mode(hookless_agy, self.wanted_mode.get());
-        let mode_changed = self.state.borrow().mode != new_mode;
-        {
-            let mut open = self.open.borrow_mut();
-            // The new agent's own binary and arguments, from its profile.
-            open.program = launch.program;
-            open.extra_args = launch.extra_args;
-            open.model = model.clone();
-            open.effort = effort.clone();
-            open.resume = None;
-            open.new_session_id =
-                (driver == Driver::Claude).then(|| glib::uuid_string_random().to_string());
-            open.mode = new_mode;
-        }
-        {
-            let mut state = self.state.borrow_mut();
-            state.model = model.clone();
-            *self.selected.borrow_mut() = model.clone();
-            state.effort = effort.clone();
-            state.native_id = None;
-            state.commands.clear();
-            state.running_turn = false;
-            state.mode = new_mode;
-        }
-        self.attach_approval();
+        let (new_mode, mode_changed, hookless_agy) = self.install_agent(
+            driver,
+            new_pt,
+            launch,
+            Installed {
+                model: model.clone(),
+                selected: model.clone(),
+                effort: effort.clone(),
+                native_id: None,
+            },
+        );
+        *self.rollback.borrow_mut() = Some(previous);
         if carried > 0 {
             self.arm_handoff(handoff);
         } else {
@@ -1225,6 +1237,123 @@ impl Inner {
         self.start_process();
     }
 
+    /// Makes `driver`, launched by `launch`, the thread's agent on provider thread `pt`, with
+    /// `installed`'s model, effort and native session (resumed when there is one). Its process is
+    /// not started. Returns the mode it runs in, whether that changed, and whether it is agy
+    /// without its hook. The caller has stopped the previous process.
+    fn install_agent(
+        self: &Rc<Self>,
+        driver: Driver,
+        pt: String,
+        launch: AgentLaunch,
+        installed: Installed,
+    ) -> (Mode, bool, bool) {
+        *self.provider_thread.borrow_mut() = pt;
+        *self.adapter.borrow_mut() = launch.adapter;
+        *self.launch_env.borrow_mut() = launch.env;
+        let (approval, unbound) = match launch.approval {
+            Ok(handle) => (Some(handle), None),
+            Err(reason) => (None, reason),
+        };
+        *self.approval.borrow_mut() = approval;
+        *self.unbound.borrow_mut() = unbound;
+        // The user's own mode, as far as the new agent can honour it (agy without its hook
+        // cannot ask). A thread that went through hookless agy gets its Ask back here.
+        let hookless_agy = driver == Driver::Agy && self.approval().is_none();
+        let new_mode = effective_mode(hookless_agy, self.wanted_mode.get());
+        let mode_changed = self.state.borrow().mode != new_mode;
+        {
+            let mut open = self.open.borrow_mut();
+            // The agent's own binary and arguments, from its profile.
+            open.program = launch.program;
+            open.extra_args = launch.extra_args;
+            open.model = installed.model.clone();
+            open.effort = installed.effort.clone();
+            open.new_session_id = (installed.native_id.is_none() && driver == Driver::Claude)
+                .then(|| glib::uuid_string_random().to_string());
+            open.resume = installed.native_id.clone();
+            open.mode = new_mode;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.model = installed.model;
+            state.effort = installed.effort;
+            state.native_id = installed.native_id;
+            state.commands.clear();
+            state.running_turn = false;
+            state.mode = new_mode;
+        }
+        *self.selected.borrow_mut() = installed.selected;
+        self.attach_approval();
+        (new_mode, mode_changed, hookless_agy)
+    }
+
+    /// Takes the thread back to the agent a switch left, because the new one never started
+    /// (`reason`). The old provider thread is active again and its own session resumes, with a
+    /// fresh launch (and approval socket: the old one closed with its process). The handoff the
+    /// new agent was owed is withdrawn: the old agent has the history in its own session.
+    fn roll_back(self: &Rc<Self>, previous: Previous, reason: &str) {
+        let failed = driver_label(self.adapter.borrow().driver());
+        let back = driver_label(previous.driver);
+        let factory = self.factory.borrow().clone();
+        let launch = match factory.map(|f| f(previous.driver)) {
+            Some(Ok(launch)) => launch,
+            Some(Err(why)) => {
+                self.error(format!(
+                    "{failed} did not start: {reason}. {back} could not be restarted either: {why}"
+                ));
+                return;
+            }
+            None => {
+                self.error(format!("{failed} did not start: {reason}."));
+                return;
+            }
+        };
+        if let Err(e) = self
+            .store
+            .set_active_provider_thread(&self.thread, &previous.provider_thread)
+        {
+            self.error(format!(
+                "{failed} did not start: {reason}. Could not go back to {back}: {e}"
+            ));
+            return;
+        }
+        warn!(%failed, %back, %reason, "a switch's new agent never started; rolling back");
+        let model = previous.model.clone();
+        let (new_mode, mode_changed, hookless_agy) = self.install_agent(
+            previous.driver,
+            previous.provider_thread,
+            launch,
+            Installed {
+                model: previous.model,
+                selected: previous.selected,
+                effort: previous.effort,
+                native_id: previous.native_id,
+            },
+        );
+        // A seeded handoff with nothing carried withdraws the one stored for the failed agent,
+        // so a reopen does not feed it to this one.
+        self.handoff_in_flight.set(false);
+        *self.pending_handoff.borrow_mut() = None;
+        self.emit(Envelope::new(Event::HandoffSeeded {
+            summary: String::new(),
+            fence: String::new(),
+            carried: 0,
+            total: 0,
+        }));
+        self.error(format!("{failed} did not start: {reason}. Back on {back}."));
+        if let Some(m) = model {
+            self.emit(Envelope::new(Event::ModelChanged { model: m }));
+        }
+        if mode_changed {
+            self.emit(Envelope::new(Event::ModeChanged { mode: new_mode }));
+        }
+        if hookless_agy {
+            self.hookless_notice();
+        }
+        self.start_process();
+    }
+
     fn status(&self) -> SessionStatus {
         let adapter = self.adapter.borrow();
         let state = self.state.borrow();
@@ -1239,6 +1368,29 @@ impl Inner {
             commands: state.commands.clone(),
         }
     }
+}
+
+/// What a cross-agent switch replaced, kept until the new agent reports a session: a new agent
+/// that cannot be spawned, or exits before it ever started (signed out, a broken install), takes
+/// the thread back to this one rather than stranding it with no agent.
+struct Previous {
+    driver: Driver,
+    provider_thread: String,
+    native_id: Option<String>,
+    model: Option<String>,
+    selected: Option<String>,
+    effort: Option<String>,
+}
+
+/// The model, effort and native session an agent is installed with (see
+/// [`Inner::install_agent`]).
+struct Installed {
+    model: Option<String>,
+    /// The model as last chosen (an alias where the agent has one).
+    selected: Option<String>,
+    effort: Option<String>,
+    /// The native session to resume; `None` starts a new one.
+    native_id: Option<String>,
 }
 
 /// A handoff ready to ride on the next prompt.
@@ -1265,6 +1417,8 @@ pub(crate) fn undelivered_handoff<'a>(
     let mut pending = None;
     for env in events {
         match &env.event {
+            // One that carries nothing withdraws any earlier one (a switch rolled back).
+            Event::HandoffSeeded { carried: 0, .. } => pending = None,
             Event::HandoffSeeded {
                 summary,
                 fence,
@@ -1916,6 +2070,8 @@ mod tests {
         refuse_set_model: bool,
         /// `on_exit` reports a turn that was still running, as a real adapter does mid-turn.
         open_turn: bool,
+        /// Its binary does not exist: spawning it fails.
+        unspawnable: bool,
     }
 
     impl FakeAdapter {
@@ -1937,6 +2093,19 @@ mod tests {
                 log: log.clone(),
                 refuse_set_model: false,
                 open_turn: false,
+                unspawnable: false,
+            })
+        }
+
+        /// [`Self::boxed`], as a plain `fn` pointer.
+        fn unboxed_dyn(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Self::unboxed(driver, log)
+        }
+
+        fn unspawnable(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Box::new(Self {
+                unspawnable: true,
+                ..*Self::unboxed(driver, log)
             })
         }
 
@@ -1956,6 +2125,9 @@ mod tests {
             &self.caps
         }
         fn argv(&self, _: &OpenSession) -> Vec<String> {
+            if self.unspawnable {
+                return vec!["/nonexistent/agent-terminal-test-agent".into()];
+            }
             vec!["/bin/cat".into()]
         }
         fn handshake(&mut self) -> Vec<String> {
@@ -2483,6 +2655,140 @@ mod tests {
                 stored(&store).is_none(),
                 "delivered: not re-armed on reopen"
             );
+        });
+    }
+
+    /// An agy thread with one user message and a known native session, a sink, and logs of what
+    /// each agent was sent; the factory launches Claude with `claude` and agy with `agy`.
+    fn agy_thread_switching_to(
+        claude: fn(Driver, &Log) -> Box<dyn Adapter>,
+        agy: fn(Driver, &Log) -> Box<dyn Adapter>,
+    ) -> (
+        Rc<Store>,
+        ThreadId,
+        ProviderThreadId,
+        Rc<ChatSession>,
+        Seen,
+        Log,
+    ) {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, "/w");
+        let first = pt_of(&store, &thread);
+        store
+            .append_user_message(&thread, Some(&first), "please list the repo")
+            .expect("user");
+        let (sink, seen) = make_sink();
+        let log_agy: Log = Rc::default();
+        let log_claude: Log = Rc::default();
+        let session = ChatSession::new(
+            FakeAdapter::boxed(Driver::Agy, &log_agy),
+            OpenSession {
+                program: "unused".into(),
+                extra_args: Vec::new(),
+                cwd: "/".into(),
+                model: Some("gemini-pro".into()),
+                effort: None,
+                mode: Mode::Plan,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+            },
+            store.clone(),
+            thread.clone(),
+            sink,
+            None,
+        );
+        // agy is up, on its own native session.
+        session.inner.emit(Envelope::new(Event::SessionStarted {
+            native_id: "agy-conv-1".into(),
+            model: None,
+            cwd: None,
+        }));
+        let (ag, cl) = (log_agy.clone(), log_claude);
+        session.set_adapter_factory(Rc::new(move |d| match d {
+            Driver::Claude => launch_of(claude(d, &cl)),
+            _ => launch_of(agy(d, &ag)),
+        }));
+        (store, thread, first, session, seen, log_agy)
+    }
+
+    /// A switch whose new agent never starts takes the thread back to the old one, resuming its
+    /// own session, with nothing left owed on reopen.
+    #[test]
+    fn a_switch_whose_new_agent_cannot_spawn_goes_back_to_the_old_one() {
+        in_loop(|_| {
+            let (store, thread, first, session, seen, log_agy) =
+                agy_thread_switching_to(FakeAdapter::unspawnable, FakeAdapter::unboxed_dyn);
+            session.switch(Driver::Claude, Some("opus".into()), None);
+
+            let status = session.status();
+            assert_eq!(status.driver, Driver::Agy, "rolled back");
+            assert!(status.alive, "the old agent runs again");
+            assert_eq!(
+                store.active_provider_thread(&thread).expect("active"),
+                Some(first)
+            );
+            assert_eq!(
+                session.inner.open.borrow().resume.as_deref(),
+                Some("agy-conv-1"),
+                "its own session resumes"
+            );
+            assert!(has(&seen, |e| matches!(e, Event::Error { message }
+                if message.contains("did not start") && message.contains("Back on"))));
+            let events = store.events(&thread, None, 10_000).expect("events");
+            assert!(undelivered_handoff(events.iter().map(|(_, e)| e)).is_none());
+            session.send_prompt("go on");
+            assert_eq!(prompts(&log_agy).last().map(String::as_str), Some("go on"));
+        });
+    }
+
+    /// Neither agent can be spawned: the rollback reports both failures and stops there, with no
+    /// panic and no loop.
+    #[test]
+    fn a_rollback_whose_old_agent_fails_too_reports_it_and_stops() {
+        in_loop(|_| {
+            let (_, _, _, session, seen, _) =
+                agy_thread_switching_to(FakeAdapter::unspawnable, FakeAdapter::unspawnable);
+            session.switch(Driver::Claude, None, None);
+            assert_eq!(session.status().driver, Driver::Agy, "rolled back");
+            assert!(!session.status().alive, "and agy could not start either");
+            assert!(
+                session.inner.rollback.borrow().is_none(),
+                "no second rollback"
+            );
+            assert!(has(&seen, |e| matches!(e, Event::Error { message }
+                if message.contains("Back on"))));
+        });
+    }
+
+    #[test]
+    fn a_new_agent_that_exits_before_starting_rolls_back_but_not_once_it_started() {
+        in_loop(|_| {
+            // It spawns, then exits before reporting a session (signed out, say).
+            let (store, thread, first, session, _, _) =
+                agy_thread_switching_to(FakeAdapter::unboxed_dyn, FakeAdapter::unboxed_dyn);
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            assert_eq!(session.status().driver, Driver::Claude);
+            let generation = session.inner.generation.get();
+            session.inner.on_exit(generation, Some(1));
+            assert_eq!(session.status().driver, Driver::Agy);
+            assert_eq!(
+                store.active_provider_thread(&thread).expect("active"),
+                Some(first)
+            );
+
+            // Once the new agent reported its session, an exit is an ordinary one.
+            let (_, _, _, session, _, _) =
+                agy_thread_switching_to(FakeAdapter::unboxed_dyn, FakeAdapter::unboxed_dyn);
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            session.inner.emit(Envelope::new(Event::SessionStarted {
+                native_id: "claude-1".into(),
+                model: None,
+                cwd: None,
+            }));
+            let generation = session.inner.generation.get();
+            session.inner.on_exit(generation, Some(1));
+            assert_eq!(session.status().driver, Driver::Claude, "no rollback");
         });
     }
 
