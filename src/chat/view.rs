@@ -24,6 +24,7 @@ mod markdown;
 pub mod model;
 mod panels;
 mod payload;
+mod subagent_shelf;
 mod subagents;
 mod thinking;
 mod transcript;
@@ -161,6 +162,8 @@ pub(crate) struct Inner {
     row_sink: RowSink,
     /// The header's list of the thread's sub-agents.
     subagent_button: Rc<subagents::SubagentButton>,
+    /// The sticky card above the composer listing the sub-agents still at work.
+    subagent_shelf: Rc<subagent_shelf::SubagentShelf>,
     /// The sub-agent shown on its own, while its dialog is open.
     subagent_panel: RefCell<Option<Rc<subagents::SubagentPanel>>>,
     /// Sub-agent items (and their steps) changed since the last flush.
@@ -184,6 +187,12 @@ impl ChatView {
             });
             let w = weak.clone();
             let subagent_button = subagents::SubagentButton::new(move |id| {
+                if let Some(inner) = w.upgrade() {
+                    inner.open_subagent(id);
+                }
+            });
+            let w = weak.clone();
+            let subagent_shelf = subagent_shelf::SubagentShelf::new(move |id| {
                 if let Some(inner) = w.upgrade() {
                     inner.open_subagent(id);
                 }
@@ -216,6 +225,7 @@ impl ChatView {
                 widget: view.downgrade(),
                 row_sink: sink,
                 subagent_button,
+                subagent_shelf,
                 subagent_panel: RefCell::new(None),
                 subagent_changes: RefCell::new(Vec::new()),
             }
@@ -231,6 +241,7 @@ impl ChatView {
         clamp.set_tightening_threshold(640);
         let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         column.append(&inner.plan.revealer);
+        column.append(&inner.subagent_shelf.revealer);
         column.append(&inner.interruption.revealer);
         // Right above where the reply is typed: the one place the eye already is.
         column.append(&inner.thinking.revealer);
@@ -541,6 +552,7 @@ impl Inner {
         // with how they ended (a replayed thread, or one whose sub-agents are all done, still
         // lists them).
         self.subagent_button.set(&subagents::running_first(&agents));
+        self.subagent_shelf.set(&model, &agents);
         if let Some(panel) = self.subagent_panel.borrow().as_ref() {
             let summary = agents.iter().find(|a| a.id == panel.id());
             panel.refresh(&model, summary, changed);
@@ -939,42 +951,17 @@ fn step_glyph(s: StepStatus) -> (&'static str, &'static str) {
 
 impl PlanPanel {
     fn new() -> Self {
-        let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        card.add_css_class("plan-card");
-        let toggle = gtk4::Button::new();
-        toggle.add_css_class("flat");
-        toggle.add_css_class("plan-toggle");
-        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let icon = gtk4::Image::from_icon_name("at-view-list-bullet-symbolic");
         let title = cards::label("Plan", &["plan-title"]);
-        title.set_hexpand(true);
-        let chevron = gtk4::Image::from_icon_name("at-pan-down-symbolic");
-        head.append(&icon);
-        head.append(&title);
-        head.append(&chevron);
-        toggle.set_child(Some(&head));
-        card.append(&toggle);
         let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         steps.add_css_class("plan-steps");
-        let body = gtk4::Revealer::new();
-        body.set_reveal_child(true);
-        body.set_child(Some(&steps));
-        card.append(&body);
-        toggle.connect_clicked(glib::clone!(
-            #[weak]
-            body,
-            #[weak]
-            chevron,
-            move |_| {
-                let open = !body.reveals_child();
-                body.set_reveal_child(open);
-                chevron.set_icon_name(Some(if open {
-                    "at-pan-down-symbolic"
-                } else {
-                    "at-pan-up-symbolic"
-                }));
-            }
-        ));
+        let card = cards::collapsible(
+            "at-view-list-bullet-symbolic",
+            &title,
+            &steps,
+            true,
+            "the plan",
+        )
+        .card;
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideUp);
         revealer.set_child(Some(&card));
@@ -1167,6 +1154,7 @@ pub(crate) mod tests {
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();
         thinking_strip_follows_the_turn();
+        subagent_shelf::tests::shelf_follows_running_subagents();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });

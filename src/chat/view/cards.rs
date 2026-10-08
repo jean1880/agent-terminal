@@ -72,6 +72,71 @@ pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     l
 }
 
+/// A card above the composer whose header opens and closes its body: the plan, the running
+/// sub-agents. Built by [`collapsible`].
+pub struct Collapsible {
+    pub card: gtk4::Box,
+    /// The header button and the body it opens: wired up already; kept for tests to drive.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub toggle: gtk4::Button,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub body: gtk4::Revealer,
+}
+
+/// A collapsible card: a header button (`icon`, `title`, a chevron) over `content`, open or
+/// closed to start with. The chevron, the tooltip ("Hide …"/"Show …" + `what`) and the
+/// accessible expanded state follow every toggle.
+pub fn collapsible(
+    icon: &str,
+    title: &gtk4::Label,
+    content: &impl IsA<gtk4::Widget>,
+    open: bool,
+    what: &'static str,
+) -> Collapsible {
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    card.add_css_class("plan-card");
+    let toggle = gtk4::Button::new();
+    toggle.add_css_class("flat");
+    toggle.add_css_class("plan-toggle");
+    let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    head.append(&gtk4::Image::from_icon_name(icon));
+    title.set_hexpand(true);
+    head.append(title);
+    let chevron = gtk4::Image::new();
+    head.append(&chevron);
+    toggle.set_child(Some(&head));
+    card.append(&toggle);
+    let body = gtk4::Revealer::builder()
+        .reveal_child(open)
+        .child(content)
+        .build();
+    card.append(&body);
+
+    let show = move |toggle: &gtk4::Button, chevron: &gtk4::Image, open: bool| {
+        chevron.set_icon_name(Some(if open {
+            "at-pan-down-symbolic"
+        } else {
+            "at-pan-up-symbolic"
+        }));
+        toggle.set_tooltip_text(Some(&format!(
+            "{} {what}",
+            if open { "Hide" } else { "Show" }
+        )));
+        toggle.update_state(&[gtk4::accessible::State::Expanded(Some(open))]);
+    };
+    show(&toggle, &chevron, open);
+    toggle.connect_clicked({
+        let body = body.downgrade();
+        move |toggle| {
+            let Some(body) = body.upgrade() else { return };
+            let open = !body.reveals_child();
+            body.set_reveal_child(open);
+            show(toggle, &chevron, open);
+        }
+    });
+    Collapsible { card, toggle, body }
+}
+
 pub(super) fn wrapping(l: &gtk4::Label) {
     l.set_wrap(true);
     l.set_wrap_mode(gtk4::pango::WrapMode::WordChar);

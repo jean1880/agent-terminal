@@ -237,8 +237,9 @@ impl InterruptionShelf {
 
                 self.allow_btn.set_visible(false);
                 self.deny_btn.set_visible(false);
+                // The label alone: a button holds a label or an icon, and setting an (empty)
+                // icon after it replaced the text with nothing, a blank pill.
                 self.jump_btn.set_label("Answer in transcript ↓");
-                self.jump_btn.set_icon_name("");
                 self.jump_btn.remove_css_class("flat");
                 self.jump_btn.add_css_class("pill");
                 self.jump_btn.add_css_class("suggested-action");
@@ -313,5 +314,27 @@ pub(crate) mod tests {
         );
         // Break the test's own cycle (shelf → sink → shelf).
         shelf.borrow_mut().take();
+
+        // A pending question: the shelf's one button says what it does (it rendered as a blank
+        // pill when an empty icon was set over its label).
+        let mut asked = Transcript::new();
+        asked.apply(
+            &Envelope::new(Event::QuestionRequested {
+                questions: vec![agent_core::event::Question {
+                    id: "q1".into(),
+                    header: "Approach".into(),
+                    question: "How should the crash be simulated?".into(),
+                    options: vec![],
+                    multi_select: false,
+                }],
+            })
+            .request("q"),
+            Driver::Claude,
+        );
+        built.update(&asked);
+        assert_eq!(
+            built.jump_btn.label().as_deref(),
+            Some("Answer in transcript ↓")
+        );
     }
 }

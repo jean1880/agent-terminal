@@ -74,6 +74,10 @@
 .subagent-status, .subagent-task { font-size: 0.85em; }
 .subagent-panel-title { font-weight: 700; font-size: 1.15em; color: #ebe9ff; }
 .subagent-text { color: #c9c6ee; }
+/* The sticky running-sub-agents card above the composer (subagent_shelf.rs). */
+.subagent-shelf-row { padding: 6px 10px; }
+.subagent-shelf .subagent-list { background-color: transparent; }
+.subagent-now { font-family: monospace; font-size: 0.85em; color: #a8a2dc; margin-left: 24px; }
 .approval-remembers { font-size: 0.85em; }
 .usage-text.usage-tag { font-size: 0.75em; color: #6d6794; min-width: 2.2em; }
 .usage-text.usage-warn { color: #ffc46b; }
