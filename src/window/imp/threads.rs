@@ -34,10 +34,10 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, driver_key, driver_label, group_rows, handoff_target, held_finish_due, is_busy,
-    needs_attention, parse_driver, react, relative_time, resume_as, row_tooltip, stop_heading,
-    stored_model, thread_title, turn_finishes_thread, Attention, Badge, ResumeAs, RowKey,
-    SidebarRow,
+    badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, group_rows,
+    held_finish_due, is_busy, needs_attention, parse_driver, react, relative_time, resume_as,
+    row_tooltip, safe_handoff_target, stop_heading, stored_model, thread_title,
+    turn_finishes_thread, Attention, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -119,6 +119,9 @@ pub(super) struct ChatTab {
     /// A handoff found stored and undelivered when the thread was built: re-armed (not seeded
     /// again) in whichever session starts first.
     stored_handoff: Option<crate::chat::session::Handoff>,
+    /// The mode the user last chose in this thread, from its stored history: what its session
+    /// starts from, before the agent's profile default.
+    chosen_mode: Option<Mode>,
     /// The reasoning effort the session starts with, overriding the profile's default (a thread
     /// continued in another agent at a chosen effort).
     pending_effort: Option<String>,
@@ -860,9 +863,17 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
 /// but the socket failed, the reason (`Err(Some(_))`, such as a binary replaced by an upgrade).
 fn bind_approval(hook: Result<(), String>, thread: &str, cwd: &str, mode: Mode) -> Approval {
     let installed = hook.is_ok();
+    // Not checked yet is not "not installed": the notice says which.
+    let unchecked = hook
+        .as_ref()
+        .is_err_and(|r| r == crate::chat::session::HOOK_NOT_CHECKED);
     ApprovalHandle::bind_checked(hook, thread, std::path::Path::new(cwd), mode).map_err(|reason| {
         info!("agy runs without its approval hook in this thread: {reason}");
-        installed.then_some(reason)
+        if unchecked {
+            Some(crate::chat::session::HOOK_NOT_CHECKED.to_owned())
+        } else {
+            installed.then_some(reason)
+        }
     })
 }
 
@@ -889,7 +900,7 @@ pub(super) async fn check_hook() -> Result<(), String> {
 fn cached_hook_verdict() -> Result<(), String> {
     HOOK_VERDICT
         .with(|v| v.borrow().clone())
-        .unwrap_or_else(|| Err("the approval hook has not been checked yet".to_owned()))
+        .unwrap_or_else(|| Err(crate::chat::session::HOOK_NOT_CHECKED.to_owned()))
 }
 
 /// Starts a [`check_hook`] without waiting for it (window start, focus, the periodic refresh).
@@ -2182,6 +2193,7 @@ impl AgentTerminalWindow {
                 pending_prompt: None,
                 pending_handoff: None,
                 stored_handoff: None,
+                chosen_mode: None,
                 pending_effort: None,
                 pending_switch: None,
                 unavailable: false,
@@ -2379,6 +2391,8 @@ impl AgentTerminalWindow {
             // completed turn since, is not re-armed (it would take that many events without one).
             chat.stored_handoff =
                 crate::chat::session::undelivered_handoff(history.iter().map(|(_, env)| env));
+            chat.chosen_mode =
+                crate::chat::session::chosen_mode(history.iter().map(|(_, env)| env));
         }
 
         // The demo window starts no agent session (see `start_session`): the script plays.
@@ -2490,10 +2504,21 @@ impl AgentTerminalWindow {
                 .or_else(|| profile.default_model.clone()),
             effort,
         );
-        // The thread's own last mode (what its picker shows), else the profile's: starting in
-        // the profile's left the picker showing one mode while the agent ran in another.
-        let mode = view
-            .replayed_mode()
+        // The mode the user chose in this thread first (the session then runs what this agent
+        // can honour of it), else the thread's own last running mode (what its picker shows),
+        // else the profile's: starting in the profile's left the picker showing one mode while
+        // the agent ran in another, and could reopen a switched thread in a laxer mode. A mode the
+        // agent moved to on its own (Claude entering plan mode) is not a choice: the user's own
+        // last choice wins on reopen.
+        let chosen = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page)
+            .and_then(|t| t.chat.as_ref())
+            .and_then(|c| c.chosen_mode);
+        let mode = chosen
+            .or_else(|| view.replayed_mode())
             .or(profile.default_mode)
             .unwrap_or_default();
         let program = resolved
@@ -2794,10 +2819,13 @@ impl AgentTerminalWindow {
             }
             After::RateLimited(banner, driver) => {
                 banner.set_title(&format!("{} hit its rate limit", driver_label(driver)));
-                // With no other usable agent there is nothing to continue in: no button.
-                match handoff_target(driver, |d| self.agent_usable(d)) {
-                    Some(other) => banner
-                        .set_button_label(Some(&format!("Continue in {}", driver_label(other)))),
+                // With no other usable agent there is nothing to continue in: no button. An agy
+                // that would edit unasked is offered only as a last resort, and says so.
+                let unasked = self.agy_cannot_ask_for(thread);
+                match safe_handoff_target(driver, |d| self.agent_usable(d), unasked) {
+                    Some((other, flagged)) => {
+                        banner.set_button_label(Some(&continue_label(other, flagged)));
+                    }
                     None => banner.set_button_label(None),
                 }
                 banner.set_revealed(true);
@@ -2981,14 +3009,71 @@ impl AgentTerminalWindow {
             .and_then(|t| t.chat.as_ref().map(|c| c.slot.clone()))
     }
 
-    /// The rate-limit banner's button: hand the thread to the other agent.
+    /// Whether handing `thread` to agy would let it edit files unasked: the thread forbids that
+    /// ([`forbids_unasked_edits`]: Ask or Plan; no session yet counts as forbidding) and agy's
+    /// approval hook is not proven, so it would run without a way to ask. Ceiling: a hook that is
+    /// installed but whose socket then fails to bind is only known once agy starts (its notice
+    /// says so then).
+    fn agy_cannot_ask_for(&self, thread: &str) -> bool {
+        let wanted = self
+            .slot_of(thread)
+            .and_then(|s| s.get())
+            .map(|s| s.wanted_mode());
+        forbids_unasked_edits(wanted) && cached_hook_verdict().is_err()
+    }
+
+    /// The banners' "Continue in" button and a bare `/handoff`: hand the thread to the next
+    /// usable agent, never silently to an agy that would edit unasked (see
+    /// [`safe_handoff_target`]): that one is confirmed first.
     fn continue_rate_limited(&self, thread: &str) {
-        if let Some(slot) = self.slot_of(thread) {
-            match handoff_target(slot.driver(), |d| self.agent_usable(d)) {
-                Some(target) => slot.switch(target, None, None),
-                None => self.show_toast("No other agent is installed and enabled"),
-            }
+        let Some(slot) = self.slot_of(thread) else {
+            return;
+        };
+        let target = safe_handoff_target(
+            slot.driver(),
+            |d| self.agent_usable(d),
+            self.agy_cannot_ask_for(thread),
+        );
+        match target {
+            Some((target, false)) => slot.switch(target, None, None),
+            Some((target, true)) => self.confirm_unasked_switch(thread, target),
+            None => self.show_toast("No other agent is installed and enabled"),
         }
+    }
+
+    /// Asks before handing `thread` to `target` (agy without its hook) while the thread forbids
+    /// unasked edits: it would apply edits on its own. One question at a time.
+    fn confirm_unasked_switch(&self, thread: &str, target: Driver) {
+        if self.unasked_prompt_open.replace(true) {
+            return;
+        }
+        let label = driver_label(target);
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Continue in {label}?")),
+            Some(&format!(
+                "This thread does not allow edits you have not approved, but {label} cannot ask: \
+                 its approval hook is not installed (or not checked yet). It refuses shell \
+                 commands, but will edit files without asking, in every mode, Plan included."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("continue", "Continue Anyway")]);
+        dialog.set_response_appearance("continue", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let obj = self.obj().downgrade();
+        let thread = thread.to_owned();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let response = dialog
+                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
+                .await;
+            window.imp().unasked_prompt_open.set(false);
+            if response == "continue" {
+                if let Some(slot) = window.imp().slot_of(&thread) {
+                    slot.switch(target, None, None);
+                }
+            }
+        });
     }
 
     fn view_action(&self, thread: &str, action: &ViewAction) {
@@ -3004,12 +3089,11 @@ impl AgentTerminalWindow {
         });
         match action {
             ViewAction::NewThread => self.new_chat_thread(Some(slot.driver()), dir, None),
-            ViewAction::Handoff { target } => {
-                match target.or_else(|| handoff_target(slot.driver(), |d| self.agent_usable(d))) {
-                    Some(target) => slot.switch(target, None, None),
-                    None => self.show_toast("No other agent is installed and enabled"),
-                }
-            }
+            // A named target is the user's own choice; a bare /handoff picks one like the banner.
+            ViewAction::Handoff {
+                target: Some(target),
+            } => slot.switch(*target, None, None),
+            ViewAction::Handoff { target: None } => self.continue_rate_limited(thread),
             ViewAction::Fork | ViewAction::CompactByHandoff => {
                 self.fork_thread(thread, slot.driver(), dir);
             }
@@ -3684,13 +3768,22 @@ impl AgentTerminalWindow {
     /// another agent; the banner goes away again when the agent is back.
     fn update_unavailable_banners(&self) {
         let availability = AgentAvailability::shared();
+        let hook_unproven = cached_hook_verdict().is_err();
         let mut tabs = self.tabs.borrow_mut();
         for chat in tabs.iter_mut().filter_map(|t| t.chat.as_mut()) {
             let driver = chat.slot.driver();
             let state = availability.get(driver);
-            let other = handoff_target(driver, |d| availability.is_ready(d));
-            match unavailable_banner(driver, &state, other) {
+            // As agy_cannot_ask_for (inline: the tabs are borrowed here).
+            let wanted = chat.slot.get().map(|s| s.wanted_mode());
+            let cannot_ask = forbids_unasked_edits(wanted) && hook_unproven;
+            let other = safe_handoff_target(driver, |d| availability.is_ready(d), cannot_ask);
+            match unavailable_banner(driver, &state, other.map(|(d, _)| d)) {
                 Some((title, button)) => {
+                    // An agy that would edit unasked says so on the button.
+                    let button = match other {
+                        Some((target, true)) => Some(continue_label(target, true)),
+                        _ => button,
+                    };
                     chat.rate_banner.set_title(&title);
                     chat.rate_banner.set_button_label(button.as_deref());
                     chat.rate_banner.set_revealed(true);
@@ -4079,16 +4172,21 @@ mod tests {
     }
 
     #[test]
-    fn an_unchecked_hook_is_treated_as_not_installed() {
+    fn an_unchecked_hook_fails_closed_and_says_it_is_not_checked_yet() {
         HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
         let before = cached_hook_verdict();
         assert!(before
             .as_ref()
             .is_err_and(|e| e.contains("not been checked")));
-        // And it stays closed through the binding: no socket, so agy runs without the skip flag.
-        // The hook is not known to be installed, so the notice explains how to install it.
+        // It stays closed through the binding: no socket, so agy runs without the skip flag.
+        // But the notice says the hook is not checked yet, not that it is missing.
         assert!(matches!(
             bind_approval(before, "t", "/tmp", Mode::Ask),
+            Err(Some(reason)) if reason == crate::chat::session::HOOK_NOT_CHECKED
+        ));
+        // Checked and missing: the install instructions.
+        assert!(matches!(
+            bind_approval(Err("no entry".into()), "t", "/tmp", Mode::Ask),
             Err(None)
         ));
         // Installed, but the socket cannot be used (a relative workspace is refused before

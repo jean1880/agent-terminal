@@ -186,6 +186,12 @@ pub enum Event {
     Notice {
         text: String,
     },
+    /// The mode the user chose for the thread, which the running mode can differ from (agy without
+    /// its hook cannot ask). Stored so a reopened thread, on whichever agent, starts from the
+    /// user's choice rather than that agent's profile default. Never shown.
+    ModeChosen {
+        mode: crate::adapter::Mode,
+    },
     /// The app handed this thread's history to a new agent session (a switch, a fork). Stored so
     /// the handoff survives a restart: it is pending until a turn completes after it. Never shown.
     HandoffSeeded {

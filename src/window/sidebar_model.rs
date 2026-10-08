@@ -1,7 +1,7 @@
 //! The thread sidebar's pure logic: which rows show, grouped and ordered how, with which badge
 //! and relative time. No GTK, so it is tested without a display.
 
-use agent_core::adapter::Driver;
+use agent_core::adapter::{Driver, Mode};
 
 /// What a sidebar row opens.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -291,6 +291,42 @@ pub fn handoff_target(from: Driver, usable: impl Fn(Driver) -> bool) -> Option<D
     (1..all.len())
         .map(|step| all[(at + step) % all.len()])
         .find(|d| usable(*d))
+}
+
+/// Whether a thread whose user chose `wanted` (unknown: `None`) forbids edits nobody approved.
+/// Only Accept edits allows them; Ask and Plan (read-only, as far as the user is concerned) both
+/// forbid them, and an unknown mode is treated as forbidding them, the safe guess.
+pub fn forbids_unasked_edits(wanted: Option<Mode>) -> bool {
+    wanted != Some(Mode::AcceptEdits)
+}
+
+/// The agent an automatic handoff from `from` lands on (a rate-limit or unavailable banner, a
+/// bare `/handoff`), and whether it would edit files unasked. While `agy_cannot_ask` (the thread
+/// forbids unasked edits, see [`forbids_unasked_edits`], and agy's approval hook is not proven),
+/// agy is skipped: it would apply edits on its own, in every mode, Plan included. It is still
+/// returned, flagged, when no other agent is usable, so the caller can say so and confirm rather
+/// than offer nothing.
+pub fn safe_handoff_target(
+    from: Driver,
+    usable: impl Fn(Driver) -> bool,
+    agy_cannot_ask: bool,
+) -> Option<(Driver, bool)> {
+    let unasked = |d: Driver| agy_cannot_ask && d == Driver::Agy;
+    handoff_target(from, |d| usable(d) && !unasked(d))
+        .map(|d| (d, false))
+        .or_else(|| handoff_target(from, &usable).map(|d| (d, unasked(d))))
+}
+
+/// The "Continue in" button for a target from [`safe_handoff_target`].
+pub fn continue_label(target: Driver, unasked: bool) -> String {
+    if unasked {
+        format!(
+            "Continue in {} (edits without asking)",
+            driver_label(target)
+        )
+    } else {
+        format!("Continue in {}", driver_label(target))
+    }
 }
 
 pub fn driver_label(driver: Driver) -> &'static str {
@@ -1129,5 +1165,37 @@ mod tests {
         // Never itself, and nothing when it is the only one.
         assert_eq!(handoff_target(Claude, |d| d == Claude), None);
         assert_eq!(handoff_target(Agy, |_| false), None);
+    }
+
+    /// A thread that forbids unasked edits is not handed to an agy that would edit unasked,
+    /// unless nothing else is usable, and then it says so.
+    #[test]
+    fn an_automatic_handoff_skips_an_agy_that_would_edit_unasked() {
+        use Driver::{Agy, Claude, Codex};
+        let all = |_| true;
+        // agy can ask (or the thread allows unasked edits): the plain cycle.
+        assert_eq!(safe_handoff_target(Claude, all, false), Some((Agy, false)));
+        // agy cannot ask: skipped for the next usable agent.
+        assert_eq!(safe_handoff_target(Claude, all, true), Some((Codex, false)));
+        // agy is the only other agent: offered, flagged.
+        assert_eq!(
+            safe_handoff_target(Claude, |d| d != Codex, true),
+            Some((Agy, true))
+        );
+        // Nothing usable at all.
+        assert_eq!(safe_handoff_target(Claude, |d| d == Claude, true), None);
+        // Leaving agy is never affected.
+        assert_eq!(safe_handoff_target(Agy, all, true), Some((Codex, false)));
+        assert_eq!(continue_label(Codex, false), "Continue in Codex");
+        // Plan (read-only to the user) forbids unasked edits as much as Ask; only Accept edits
+        // allows them, and an unknown mode is treated as forbidding them.
+        assert!(forbids_unasked_edits(Some(Mode::Ask)));
+        assert!(forbids_unasked_edits(Some(Mode::Plan)));
+        assert!(forbids_unasked_edits(None));
+        assert!(!forbids_unasked_edits(Some(Mode::AcceptEdits)));
+        assert_eq!(
+            continue_label(Agy, true),
+            format!("Continue in {} (edits without asking)", driver_label(Agy))
+        );
     }
 }

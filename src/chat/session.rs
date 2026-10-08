@@ -173,13 +173,23 @@ fn effective_mode(hookless_agy: bool, wanted: Mode) -> Mode {
     }
 }
 
+/// Why agy has no approval socket when its hooks file has not been checked yet (a switch to agy
+/// before the first check finished). Not "not installed": that is not known yet.
+pub(crate) const HOOK_NOT_CHECKED: &str = "the approval hook has not been checked yet";
+
 /// The notice for agy running without its approval socket: why (`unbound`, when the hook is
-/// installed but the socket could not be used; else the hook is missing), and what it still does.
+/// installed but the socket could not be used, or [`HOOK_NOT_CHECKED`]; else the hook is
+/// missing), and what it still does.
 fn hookless_text(unbound: Option<&str>) -> String {
     const STILL: &str = "It refuses shell commands, but applies file edits on its own in every \
                          mode (in Plan it writes a plan first, then edits). Ask before edits is \
                          not available.";
     match unbound {
+        Some(HOOK_NOT_CHECKED) => format!(
+            "Antigravity cannot ask you before acting yet: its approval hook has not been checked \
+             yet. {STILL} Once the check has run, switch to Antigravity again (or open a new \
+             thread) to have it ask first."
+        ),
         Some(reason) => format!(
             "Antigravity cannot ask you before acting in this thread: its approval hook is \
              installed, but {reason}. {STILL}"
@@ -318,6 +328,12 @@ impl ChatSession {
 
     /// Seeds a new thread with a budgeted, redacted handoff (fork, compact-by-handoff): it
     /// rides on the next real prompt, exactly like a cross-agent switch's.
+    /// The mode the user chose, which the running one can differ from (agy without its hook
+    /// cannot ask).
+    pub fn wanted_mode(&self) -> Mode {
+        self.inner.wanted_mode.get()
+    }
+
     pub fn seed_handoff(&self, handoff: Handoff, source: &str) {
         if handoff.carried == 0 {
             return;
@@ -953,6 +969,15 @@ impl Inner {
         }
     }
 
+    /// Stores the mode the user chose (`wanted_mode`), so a reopened thread starts from it on
+    /// whichever agent it is on, rather than from that agent's profile default: a thread switched
+    /// from Claude in Ask to an agent whose profile defaults to Accept edits must not reopen there.
+    fn record_chosen_mode(&self) {
+        self.emit(Envelope::new(Event::ModeChosen {
+            mode: self.wanted_mode.get(),
+        }));
+    }
+
     /// Arms `handoff` for the next prompt and stores it (under the current provider thread), so
     /// a restart before it is delivered re-arms it.
     fn arm_handoff(&self, handoff: Handoff) {
@@ -988,6 +1013,7 @@ impl Inner {
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
         self.wanted_mode.set(mode);
+        self.record_chosen_mode();
         if self.ask_unavailable() && mode == Mode::Ask {
             self.emit(Envelope::new(Event::Notice {
                 text: "Antigravity cannot ask before edits until the approval hook is installed; \
@@ -1285,6 +1311,8 @@ impl Inner {
         }
         *self.selected.borrow_mut() = installed.selected;
         self.attach_approval();
+        // The user's choice, stored with the agent it now applies to (see record_chosen_mode).
+        self.record_chosen_mode();
         (new_mode, mode_changed, hookless_agy)
     }
 
@@ -1440,6 +1468,17 @@ pub(crate) fn undelivered_handoff<'a>(
         }
     }
     pending
+}
+
+/// The mode the user last chose in a thread, from its stored history (the latest `ModeChosen`).
+pub(crate) fn chosen_mode<'a>(events: impl IntoIterator<Item = &'a Envelope>) -> Option<Mode> {
+    events
+        .into_iter()
+        .filter_map(|env| match env.event {
+            Event::ModeChosen { mode } => Some(mode),
+            _ => None,
+        })
+        .last()
 }
 
 /// A fresh handoff fence: a random UUID without its dashes (32 hex digits), so carried text cannot
@@ -2656,6 +2695,37 @@ mod tests {
                 "delivered: not re-armed on reopen"
             );
         });
+    }
+
+    /// The user's chosen mode is stored at every switch and on every choice, so a reopen starts
+    /// from it: Ask, not the Plan hookless agy ran, nor another agent's profile default.
+    #[test]
+    fn the_chosen_mode_is_stored_through_switches_and_choices() {
+        in_loop(|_| {
+            let log: Log = Rc::default();
+            let (session, _) = claude_on(Mode::Ask, &log);
+            let store = session.inner.store.clone();
+            let thread = session.inner.thread.clone();
+            let chosen = || {
+                let events = store.events(&thread, None, 10_000).expect("events");
+                chosen_mode(events.iter().map(|(_, e)| e))
+            };
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
+            assert_eq!(session.status().mode, Mode::Plan, "hookless agy runs Plan");
+            assert_eq!(chosen(), Some(Mode::Ask), "but the choice stored is Ask");
+            assert_eq!(session.wanted_mode(), Mode::Ask);
+
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(chosen(), Some(Mode::AcceptEdits));
+        });
+    }
+
+    #[test]
+    fn a_hook_not_checked_yet_is_not_called_missing() {
+        let unchecked = hookless_text(Some(HOOK_NOT_CHECKED));
+        assert!(unchecked.contains("not been checked yet"), "{unchecked}");
+        assert!(!unchecked.contains("not installed"), "{unchecked}");
+        assert!(hookless_text(None).contains("not installed"));
     }
 
     /// An agy thread with one user message and a known native session, a sink, and logs of what

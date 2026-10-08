@@ -967,7 +967,7 @@ impl Transcript {
                 )));
             }
             // The session's own bookkeeping: the notice beside it is what the user sees.
-            Event::HandoffSeeded { .. } => {}
+            Event::HandoffSeeded { .. } | Event::ModeChosen { .. } => {}
             // Background tasks are thread state, not transcript rows: the full list each time.
             Event::BackgroundTasks { tasks } => {
                 if self.background != *tasks {

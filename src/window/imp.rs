@@ -801,6 +801,8 @@ pub struct AgentTerminalWindow {
     summaries_loading: std::cell::Cell<bool>,
     /// The "stop running threads and close?" question is on screen.
     close_prompt_open: std::cell::Cell<bool>,
+    /// The "continue in an agent that edits unasked?" question is on screen.
+    unasked_prompt_open: std::cell::Cell<bool>,
     /// The user agreed to stop busy threads: the next close request goes through.
     close_confirmed: std::cell::Cell<bool>,
     /// A change arrived while a reload was running: load again when it ends.
