@@ -2,7 +2,9 @@
 name = "agent-kit"
 version = "0.1.0"
 edition = "2021"
-authors = ["jdesroches"]
+authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/jean1880/agent-terminal"
 description = "GTK-free git, checkpoint and session logic for agent-terminal"
 publish = false
 

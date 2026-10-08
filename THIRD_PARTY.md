@@ -68,7 +68,7 @@ trademarks of their owners; used only to identify the agent the user connects to
 Drawn for agent-terminal: `agent-thinking`, `agent-mcp`, `agent-subagent`, `agent-handoff`,
 `agent-compact`, `agent-usage`, `agent-worktree`, `agent-checkpoint`, `agent-external` (in
 `scalable/actions/`), the Codex monogram `agent-codex` and the symbolic app icon
-`com.jdesroches.AgentTerminal-symbolic` (in `scalable/apps/`). The Codex monogram is not
+`ca.nuvek.AgentTerminal-symbolic` (in `scalable/apps/`). The Codex monogram is not
 OpenAI's logo; a user may place their own mark at `$XDG_DATA_HOME/agent-terminal/brand/codex.svg`
 and it is used instead (never committed).
 
@@ -80,7 +80,7 @@ screenshots; the system Adwaita file and a bundled copy behave the same). Small 
 32 px) are crisp through the normal path. Large "hero" icons therefore bypass it:
 `icons::hero_paintable` rasterises the SVG with gdk-pixbuf at `logical size x scale factor`
 (re-rendered when the scale factor changes). The empty state uses the full-colour app icon
-(`assets/com.jdesroches.AgentTerminal.svg`, bundled under `/com/jdesroches/AgentTerminal/art`);
+(`assets/ca.nuvek.AgentTerminal.svg`, bundled under `/ca/nuvek/AgentTerminal/art`);
 other status pages draw the bundled symbolic glyph tinted to the chrome's label colour.
 Bundled SVGs stay clean: no `transform`, `style`, font attributes or groups
 (`tests/icons.rs`).

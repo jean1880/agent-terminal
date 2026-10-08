@@ -8,12 +8,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-const PREFIX: &str = "/com/jdesroches/AgentTerminal/icons";
+const PREFIX: &str = "/ca/nuvek/AgentTerminal/icons";
 
 fn main() {
     let root = Path::new("assets/icons");
     println!("cargo:rerun-if-changed=assets/icons");
-    println!("cargo:rerun-if-changed=assets/com.jdesroches.AgentTerminal.svg");
+    println!("cargo:rerun-if-changed=assets/ca.nuvek.AgentTerminal.svg");
     println!("cargo:rerun-if-changed=build.rs");
 
     let mut files = Vec::new();
@@ -26,10 +26,8 @@ fn main() {
     }
     xml.push_str("  </gresource>\n");
     // The full-colour app icon, for hero use (`APP_ART` in src/icons.rs).
-    xml.push_str("  <gresource prefix=\"/com/jdesroches/AgentTerminal/art\">\n");
-    xml.push_str(
-        "    <file>com.jdesroches.AgentTerminal.svg</file>\n  </gresource>\n</gresources>\n",
-    );
+    xml.push_str("  <gresource prefix=\"/ca/nuvek/AgentTerminal/art\">\n");
+    xml.push_str("    <file>ca.nuvek.AgentTerminal.svg</file>\n  </gresource>\n</gresources>\n");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let manifest = out_dir.join("icons.gresource.xml");

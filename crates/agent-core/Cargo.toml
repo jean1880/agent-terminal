@@ -2,7 +2,9 @@
 name = "agent-core"
 version = "0.1.0"
 edition = "2021"
-authors = ["jdesroches"]
+authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/jean1880/agent-terminal"
 description = "Pure agent-terminal logic: no GTK, no process or file I/O"
 publish = false
 

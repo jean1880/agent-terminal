@@ -23,14 +23,13 @@ use gtk4::{gdk, gdk_pixbuf, gio, glib};
 use tracing::{debug, warn};
 
 /// Resource prefix the icon files are bundled under (`scalable/<context>/<name>.svg`).
-pub const RESOURCE_PATH: &str = "/com/jdesroches/AgentTerminal/icons";
+pub const RESOURCE_PATH: &str = "/ca/nuvek/AgentTerminal/icons";
 
 /// The full-colour app icon, bundled as a resource for hero use (see `build.rs`).
-pub const APP_ART: &str = "/com/jdesroches/AgentTerminal/art/com.jdesroches.AgentTerminal.svg";
+pub const APP_ART: &str = "/ca/nuvek/AgentTerminal/art/ca.nuvek.AgentTerminal.svg";
 /// [`APP_ART`] without its three cursor dots, which the startup splash draws (and animates) as
 /// widgets of their own.
-pub const APP_ART_BARE: &str =
-    "/com/jdesroches/AgentTerminal/art/com.jdesroches.AgentTerminal.svg#bare";
+pub const APP_ART_BARE: &str = "/ca/nuvek/AgentTerminal/art/ca.nuvek.AgentTerminal.svg#bare";
 /// Marks a hero source as [`APP_ART`]-style art with its cursor dots removed.
 const BARE_SUFFIX: &str = "#bare";
 
@@ -45,7 +44,7 @@ pub const CODEX_ICON: &str = "agent-codex-symbolic";
 pub const THINKING_ICON: &str = "agent-thinking-symbolic";
 pub const MCP_ICON: &str = "agent-mcp-symbolic";
 pub const SUBAGENT_ICON: &str = "agent-subagent-symbolic";
-pub const APP_ICON: &str = "com.jdesroches.AgentTerminal-symbolic";
+pub const APP_ICON: &str = "ca.nuvek.AgentTerminal-symbolic";
 // Original glyphs for features whose buttons and rows are still being wired.
 pub const HANDOFF_ICON: &str = "agent-handoff-symbolic";
 pub const COMPACT_ICON: &str = "agent-compact-symbolic";
@@ -262,7 +261,7 @@ pub fn set_status_icon(page: &adw::StatusPage, source: &str) {
 mod tests {
     use super::*;
 
-    const ART: &str = include_str!("../assets/com.jdesroches.AgentTerminal.svg");
+    const ART: &str = include_str!("../assets/ca.nuvek.AgentTerminal.svg");
 
     /// The splash lays its dots over the bare art at the authored centres (see
     /// `window::loading`): if the icon's cursor changes, so must the splash.

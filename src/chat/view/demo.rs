@@ -1086,7 +1086,7 @@ fn stress_item(i: usize) -> Vec<Envelope> {
 /// `agent-terminal --chat-demo`: a window holding only a [`ChatView`] on the demo backend.
 pub fn run() -> glib::ExitCode {
     let app = adw::Application::builder()
-        .application_id("com.jdesroches.AgentTerminal.ChatDemo")
+        .application_id("ca.nuvek.AgentTerminal.ChatDemo")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(|app| {

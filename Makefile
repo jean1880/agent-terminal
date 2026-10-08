@@ -2,7 +2,7 @@
 
 APP_NAME = agent-terminal
 BINARY = target/release/$(APP_NAME)
-APP_ID = com.jdesroches.AgentTerminal
+APP_ID = ca.nuvek.AgentTerminal
 DESKTOP_FILE = assets/$(APP_ID).desktop
 ICON_FILE = assets/$(APP_ID).svg
 LOCAL_BIN = $(HOME)/.local/bin

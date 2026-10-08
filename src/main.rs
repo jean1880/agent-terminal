@@ -35,7 +35,7 @@ mod window;
 use agent_kit::{diff, git, handoff, restore, worktree};
 use window::AgentTerminalWindow;
 
-const APP_ID: &str = "com.jdesroches.AgentTerminal";
+const APP_ID: &str = "ca.nuvek.AgentTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {

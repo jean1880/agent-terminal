@@ -23,7 +23,7 @@ use vte4::prelude::*;
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 
 /// Static logo SVG for standalone binary.
-const LOGO_SVG: &str = include_str!("../../assets/com.jdesroches.AgentTerminal.svg");
+const LOGO_SVG: &str = include_str!("../../assets/ca.nuvek.AgentTerminal.svg");
 
 /// The smallest the window may be made (GNOME's minimum for adaptive apps). Every layout state
 /// the breakpoints allow fits it; `tests::small_window_fits` measures that.

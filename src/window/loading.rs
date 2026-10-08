@@ -20,7 +20,7 @@ pub(super) const CROSSFADE_MS: u32 = 220;
 
 /// The app icon's size on the splash. Its cursor dots are laid over it in its own units.
 const ICON_PX: i32 = 128;
-/// The icon's three cursor dots (`assets/com.jdesroches.AgentTerminal.svg`): centre x, and the
+/// The icon's three cursor dots (`assets/ca.nuvek.AgentTerminal.svg`): centre x, and the
 /// agent accent each one is drawn in. All sit at y = 66 with r = 5.5 on the 128 px canvas;
 /// `icons::tests` fails if the art moves them.
 const DOTS: [(i32, &str); 3] = [(64, "claude"), (80, "agy"), (96, "codex")];
@@ -347,7 +347,7 @@ pub(super) fn reveal(widget: &impl IsA<gtk4::Widget>) {
 pub(crate) fn demo() -> glib::ExitCode {
     const LOOP_MS: u64 = 7000;
     let app = adw::Application::builder()
-        .application_id("com.jdesroches.AgentTerminal.LoadingDemo")
+        .application_id("ca.nuvek.AgentTerminal.LoadingDemo")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(|app| {
