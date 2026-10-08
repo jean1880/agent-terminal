@@ -82,11 +82,15 @@ impl InterruptionShelf {
             let active = active.clone();
             let sink = sink.clone();
             allow_btn.connect_clicked(move |_| {
-                if let Some(PendingInterruption::Approval { request, .. }) =
-                    active.borrow().as_ref()
-                {
+                // Copied out before the sink runs: answering resolves the approval at once,
+                // which updates this shelf (`update` replaces `active`) while still in here.
+                let request = match active.borrow().as_ref() {
+                    Some(PendingInterruption::Approval { request, .. }) => Some(request.clone()),
+                    _ => None,
+                };
+                if let Some(request) = request {
                     sink(RowEvent::Approve {
-                        request: request.clone(),
+                        request,
                         decision: Decision::Allow,
                     });
                 }
@@ -97,19 +101,22 @@ impl InterruptionShelf {
             let active = active.clone();
             let sink = sink.clone();
             deny_btn.connect_clicked(move |_| {
-                if let Some(PendingInterruption::Approval {
-                    request, options, ..
-                }) = active.borrow().as_ref()
-                {
-                    let decision = if options.contains(&Decision::Deny) {
-                        Decision::Deny
-                    } else {
-                        Decision::Cancel
-                    };
-                    sink(RowEvent::Approve {
-                        request: request.clone(),
-                        decision,
-                    });
+                // Copied out before the sink runs (see the Allow button).
+                let answer = match active.borrow().as_ref() {
+                    Some(PendingInterruption::Approval {
+                        request, options, ..
+                    }) => {
+                        let decision = if options.contains(&Decision::Deny) {
+                            Decision::Deny
+                        } else {
+                            Decision::Cancel
+                        };
+                        Some((request.clone(), decision))
+                    }
+                    _ => None,
+                };
+                if let Some((request, decision)) = answer {
+                    sink(RowEvent::Approve { request, decision });
                 }
             });
         }
@@ -118,11 +125,15 @@ impl InterruptionShelf {
             let active = active.clone();
             let jump = Rc::new(jump);
             jump_btn.connect_clicked(move |_| {
-                if let Some(interruption) = active.borrow().as_ref() {
-                    let item_id = match interruption {
+                // Copied out before jumping: scrolling to the card can update this shelf.
+                let item_id = active
+                    .borrow()
+                    .as_ref()
+                    .map(|interruption| match interruption {
                         PendingInterruption::Approval { item_id, .. } => item_id.clone(),
                         PendingInterruption::Question { item_id, .. } => item_id.clone(),
-                    };
+                    });
+                if let Some(item_id) = item_id {
                     jump(item_id);
                 }
             });
@@ -241,5 +252,66 @@ impl InterruptionShelf {
                 self.revealer.set_reveal_child(false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use agent_core::adapter::Driver;
+    use agent_core::event::{Envelope, Event, ResponseCapability};
+    use std::cell::Cell;
+
+    /// Regression: answering from the shelf resolves the approval at once, which updates the
+    /// shelf again from inside its own button handler. That panicked (RefCell already borrowed)
+    /// in a callback that cannot unwind, and so aborted the app. Needs GTK (the window smoke test
+    /// runs it, through `chat::view::tests::ui_checks`).
+    pub(crate) fn answering_from_the_shelf_reenters_safely() {
+        let shelf: Rc<RefCell<Option<Rc<InterruptionShelf>>>> = Rc::default();
+        let answered = Rc::new(Cell::new(false));
+        let sink: RowSink = {
+            let (shelf, answered) = (shelf.clone(), answered.clone());
+            Rc::new(move |event| {
+                if matches!(event, RowEvent::Approve { .. }) {
+                    answered.set(true);
+                    // What the view does on an answer: the approval is resolved, so the
+                    // transcript has nothing pending and the shelf updates.
+                    if let Some(shelf) = shelf.borrow().as_ref() {
+                        shelf.update(&Transcript::new());
+                    }
+                }
+            })
+        };
+        let built = Rc::new(InterruptionShelf::new(sink, |_| {}));
+        *shelf.borrow_mut() = Some(built.clone());
+
+        let mut transcript = Transcript::new();
+        transcript.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Edit".into(),
+                title: Some("Edit src/config.rs".into()),
+                input: serde_json::json!({"file_path": "src/config.rs"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1"),
+            Driver::Claude,
+        );
+        built.update(&transcript);
+        assert!(
+            built.active.borrow().is_some(),
+            "the approval is on the shelf"
+        );
+
+        built.allow_btn.emit_clicked();
+        assert!(answered.get(), "Allow answered the approval");
+        assert!(
+            built.active.borrow().is_none(),
+            "the shelf followed the answer"
+        );
+        // Break the test's own cycle (shelf → sink → shelf).
+        shelf.borrow_mut().take();
     }
 }
