@@ -103,6 +103,34 @@ impl Shared {
     }
 }
 
+/// This process's id, read before forking for [`die_with_app`].
+fn app_pid() -> libc::pid_t {
+    // SAFETY: getpid(2) takes no arguments and cannot fail.
+    unsafe { libc::getpid() }
+}
+
+/// Runs in the forked child, before exec (so async-signal-safe calls only): the child is sent
+/// SIGTERM when the app dies, however it dies. [`terminate_all`] runs only on a clean shutdown;
+/// after a crash an agent left running keeps working on its own, with no window to report to
+/// (one went on editing and committing in a repo after the app aborted).
+///
+/// Linux sends the signal when the *thread* that forked exits, not the process. Every spawn here
+/// is on the main thread (`AgentProcess` is not `Send`, and side processes run on the main
+/// context), which lives as long as the app. Elsewhere this does nothing.
+fn die_with_app(parent: libc::pid_t) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl, getppid and _exit are async-signal-safe and touch no shared memory.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+        // The app died between the fork and here: no signal will come, so do not start.
+        if libc::getppid() != parent {
+            libc::_exit(1);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = parent;
+}
+
 /// A running agent. Dropping it terminates the process (SIGTERM, then SIGKILL after a grace).
 pub struct AgentProcess {
     shared: Rc<Shared>,
@@ -135,11 +163,13 @@ impl AgentProcess {
         // Own session and process group, so the agent's tool children can be signalled with it
         // (and a terminal Ctrl-C aimed at the app does not reach them). `setsid` is
         // async-signal-safe, which is all the post-fork child may call.
-        launcher.set_child_setup(|| {
+        let parent = app_pid();
+        launcher.set_child_setup(move || {
             // SAFETY: setsid(2) takes no arguments and touches no memory.
             unsafe {
                 libc::setsid();
             }
+            die_with_app(parent);
         });
         for key in &spec.unset {
             launcher.unsetenv(key);
@@ -425,6 +455,8 @@ pub async fn run_side(
     let launcher = gio::SubprocessLauncher::new(
         gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
     );
+    let parent = app_pid();
+    launcher.set_child_setup(move || die_with_app(parent));
     if let Some(cwd) = &cwd {
         launcher.set_cwd(cwd);
     }
