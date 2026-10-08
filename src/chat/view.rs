@@ -1886,6 +1886,264 @@ pub(crate) mod tests {
         let (title, shown) = state("shared").flatten().expect("shared row");
         assert_eq!(title, "Thought process");
         assert!(shown);
+
+        // Streaming must not re-lay out the whole block per frame: a collapsed card holds no
+        // text, and an open one changes only its last paragraph's label.
+        let delta = |text: &str| {
+            sink(
+                &Envelope::new(Event::ContentDelta {
+                    stream: StreamKind::Reasoning,
+                    text: text.into(),
+                })
+                .item("long"),
+            );
+        };
+        sink(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Reasoning,
+                title: "Thinking".into(),
+                input: None,
+                parent: None,
+            })
+            .item("long"),
+        );
+        delta("first thought.\n\nsecond");
+        while ctx.iteration(false) {}
+        let labels = |id: &str| {
+            view.inner()
+                .and_then(|i| {
+                    i.transcript.with_row(id, |row| match row {
+                        cards::Row::Reasoning(r) => {
+                            Some((r.reasoning_paragraphs(), r.reasoning_labels()))
+                        }
+                        _ => None,
+                    })
+                })
+                .flatten()
+                .expect("long row")
+        };
+        assert!(labels("long").0.is_empty(), "collapsed: no text laid out");
+        if let Some(inner) = view.inner() {
+            inner.row_event(RowEvent::Toggle {
+                id: "long".into(),
+                expanded: true,
+            });
+        }
+        while ctx.iteration(false) {}
+        let (texts, before) = labels("long");
+        assert_eq!(texts, ["first thought.", "second"], "opening shows it all");
+        delta(" thought, still going");
+        while ctx.iteration(false) {}
+        let (texts, after) = labels("long");
+        assert_eq!(texts, ["first thought.", "second thought, still going"]);
+        assert_eq!(
+            before, after,
+            "the paragraphs' labels are kept, not rebuilt"
+        );
+    }
+
+    /// Measures what a streamed thinking block costs the main loop, per delta: the view's own
+    /// work (reduce + row update), the size request the next frame then pays, and the real frame
+    /// times. Prints numbers; asserts nothing. Run on a private display like the tests above,
+    /// with `stream_cost_of_a_long_thinking_block --ignored --nocapture`.
+    #[test]
+    #[ignore = "presents a window; a measurement, run on a private display"]
+    fn stream_cost_of_a_long_thinking_block() {
+        use agent_core::event::{Event, ItemKind, StreamKind};
+        use std::time::{Duration, Instant};
+        gtk4::init().expect("GTK init");
+        let ctx = glib::MainContext::default();
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let window = gtk4::Window::new();
+        window.set_default_size(900, 700);
+        window.set_child(Some(&view));
+        window.present();
+        let sink = view.sink();
+        // A thread with history: the transcript box holds its full window of rows.
+        for n in 0..140 {
+            sink(&Envelope::new(Event::Notice {
+                text: format!("earlier message {n}, long enough to wrap onto a second line of the transcript column"),
+            }));
+        }
+        let pump = |ms: u64| {
+            let until = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < until {
+                while ctx.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        pump(800);
+
+        // Real frame times: before-paint to after-paint covers update, layout and paint.
+        let clock = window.frame_clock().expect("frame clock");
+        let frames: Rc<RefCell<Vec<f64>>> = Rc::default();
+        let start: Rc<Cell<Option<Instant>>> = Rc::default();
+        let s = start.clone();
+        clock.connect_before_paint(move |_| s.set(Some(Instant::now())));
+        let (s, f) = (start.clone(), frames.clone());
+        clock.connect_after_paint(move |_| {
+            if let Some(t) = s.take() {
+                f.borrow_mut().push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        });
+
+        let pct = |v: &mut Vec<f64>| -> String {
+            if v.is_empty() {
+                return "n/a".into();
+            }
+            v.sort_by(f64::total_cmp);
+            let at = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+            format!(
+                "n {} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2} ms",
+                v.len(),
+                at(0.5),
+                at(0.9),
+                at(0.99),
+                v[v.len() - 1]
+            )
+        };
+        let words =
+            "the model weighs whether the cache invalidation belongs in the reducer or the view ";
+        for (round, expanded) in [(0, false), (1, true)] {
+            let id = format!("think-{round}");
+            sink(
+                &Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::Reasoning,
+                    title: "Thinking".into(),
+                    input: None,
+                    parent: None,
+                })
+                .item(&id),
+            );
+            pump(50);
+            if expanded {
+                if let Some(inner) = view.inner() {
+                    inner.row_event(RowEvent::Toggle {
+                        id: id.clone(),
+                        expanded: true,
+                    });
+                }
+                pump(400);
+            }
+            frames.borrow_mut().clear();
+            let (mut apply, mut measure) = (Vec::new(), Vec::new());
+            // The view's own width: the size the frame's layout asks for, so cached rows hit.
+            let width = view.width();
+            let began = Instant::now();
+            for n in 0..1500 {
+                // Paragraphs of about 500 characters, as thinking comes.
+                let mut chunk = words[(n * 7) % 60..(n * 7) % 60 + 20].to_owned();
+                if n % 25 == 24 {
+                    chunk.push_str("\n\n");
+                }
+                let t = Instant::now();
+                sink(
+                    &Envelope::new(Event::ContentDelta {
+                        stream: StreamKind::Reasoning,
+                        text: chunk,
+                    })
+                    .item(&id),
+                );
+                while ctx.iteration(false) {}
+                apply.push(t.elapsed().as_secs_f64() * 1e3);
+                // The size request the next frame pays for what changed.
+                let t = Instant::now();
+                let _ = view.measure(gtk4::Orientation::Vertical, width);
+                measure.push(t.elapsed().as_secs_f64() * 1e3);
+                if n % 300 == 299 {
+                    let recent = &measure[measure.len() - 50..];
+                    eprintln!(
+                        "    at {} chars: size request mean {:.2} ms",
+                        (n + 1) * 20,
+                        recent.iter().sum::<f64>() / 50.0
+                    );
+                }
+                // About Claude's pace: deltas a few ms apart, so frames interleave.
+                if n % 4 == 0 {
+                    std::thread::sleep(Duration::from_millis(4));
+                    while ctx.iteration(false) {}
+                }
+            }
+            let wall = began.elapsed().as_secs_f64();
+            eprintln!(
+                "thinking {} ({} chars): wall {wall:.2} s",
+                if expanded { "expanded" } else { "collapsed" },
+                1500 * 20
+            );
+            eprintln!("  delta handling: {}", pct(&mut apply));
+            eprintln!("  size request:   {}", pct(&mut measure));
+            eprintln!("  frames:         {}", pct(&mut frames.borrow_mut()));
+            sink(
+                &Envelope::new(Event::ItemCompleted {
+                    status: agent_core::event::ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item(&id),
+            );
+            pump(200);
+        }
+
+        // The session's own per-delta work: one scrubbed store row per delta, on the main loop.
+        let dir = std::env::temp_dir().join(format!("at-stream-cost-{}", std::process::id()));
+        let store =
+            agent_kit::store::Store::open(&dir.join("threads.db")).expect("temp store opens");
+        let thread = store.create_thread("/tmp", None).expect("thread");
+        let mut writes = Vec::new();
+        for n in 0..1500 {
+            let frame = serde_json::json!({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": &words[(n * 7) % 60..(n * 7) % 60 + 20]}}});
+            let env = Envelope::new(Event::ContentDelta {
+                stream: StreamKind::Reasoning,
+                text: words[(n * 7) % 60..(n * 7) % 60 + 20].into(),
+            })
+            .item("msg:0")
+            .raw(frame);
+            let t = Instant::now();
+            store.append_event(&thread, None, &env).expect("append");
+            writes.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!("  store append per delta: {}", pct(&mut writes));
+        // Once per item: the completion re-scrubs the item's deltas (`heal_split_deltas`).
+        let t = Instant::now();
+        store
+            .append_event(
+                &thread,
+                None,
+                &Envelope::new(Event::ItemCompleted {
+                    status: agent_core::event::ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item("msg:0"),
+            )
+            .expect("append");
+        eprintln!(
+            "  store append of the completion (heal over 1500 deltas): {:.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        // The status the view reads per envelope, with a realistic slash-command list.
+        let mut status = status_of(Driver::Claude);
+        status.commands = (0..150)
+            .map(|n| agent_core::event::AgentCommand {
+                name: format!("command-{n}"),
+                description: Some("a slash command with a sentence of description".into()),
+                argument_hint: None,
+                kind: agent_core::event::AgentCommandKind::Command,
+            })
+            .collect();
+        let t = Instant::now();
+        for _ in 0..1500 {
+            std::hint::black_box(status.clone());
+        }
+        eprintln!(
+            "  status clone (150 commands): {:.4} ms each",
+            t.elapsed().as_secs_f64() * 1e3 / 1500.0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        window.destroy();
     }
 
     /// The sub-agent explorer: the header lists the thread's sub-agents, and an open panel

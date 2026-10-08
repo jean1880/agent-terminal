@@ -609,7 +609,9 @@ pub struct ReasoningRow {
     title: gtk4::Label,
     chevron: gtk4::Image,
     revealer: gtk4::Revealer,
-    text: gtk4::Label,
+    /// The text, one wrapping label per paragraph (see [`Self::show_text`]).
+    body: gtk4::Box,
+    paragraphs: RefCell<Vec<gtk4::Label>>,
 }
 
 impl ReasoningRow {
@@ -627,12 +629,11 @@ impl ReasoningRow {
         head.append(&title);
         toggle.set_child(Some(&head));
         root.append(&toggle);
-        let text = label("", &["reasoning-text"]);
-        wrapping(&text);
-        text.set_selectable(true);
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        body.add_css_class("reasoning-text");
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-        revealer.set_child(Some(&text));
+        revealer.set_child(Some(&body));
         root.append(&revealer);
 
         let id = id.to_owned();
@@ -652,7 +653,45 @@ impl ReasoningRow {
             title,
             chevron,
             revealer,
-            text,
+            body,
+            paragraphs: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Puts `text` in the paragraph labels, touching only those whose text changed.
+    ///
+    /// One label for the whole block re-laid out every character of it on each frame while it
+    /// streamed: its size request alone took 19 ms per frame at 6k characters and 106 ms at 30k
+    /// (release build), the stutter while thinking. A streamed delta now changes only the last
+    /// paragraph, so a frame costs what that paragraph does (under 1 ms at any length).
+    /// Measured by `tests::stream_cost_of_a_long_thinking_block` in `view.rs`.
+    ///
+    /// Ceiling: a single paragraph with no blank line in it still costs its whole length per
+    /// frame, and a selection cannot span two paragraphs. Upgrade path: an append-only
+    /// `TextView`, which lays out only the lines that changed.
+    fn show_text(&self, text: &str) {
+        let parts: Vec<&str> = if text.is_empty() {
+            Vec::new()
+        } else {
+            text.split("\n\n").map(str::trim).collect()
+        };
+        let mut labels = self.paragraphs.borrow_mut();
+        while labels.len() > parts.len() {
+            if let Some(l) = labels.pop() {
+                self.body.remove(&l);
+            }
+        }
+        while labels.len() < parts.len() {
+            let l = label("", &["reasoning-paragraph"]);
+            wrapping(&l);
+            l.set_selectable(true);
+            self.body.append(&l);
+            labels.push(l);
+        }
+        for (l, part) in labels.iter().zip(parts) {
+            if l.text() != part {
+                l.set_text(part);
+            }
         }
     }
 
@@ -668,7 +707,12 @@ impl ReasoningRow {
         } else {
             "Thought process"
         });
-        self.text.set_text(text);
+        // A collapsed card's text is not drawn, but a label in a closed revealer is still
+        // measured whenever it changes: streaming into it cost as much as into an open one. Its
+        // text is put in only while open (opening it updates the row, with all of it).
+        if expanded {
+            self.show_text(text);
+        }
         self.revealer.set_reveal_child(expanded);
         self.chevron.set_icon_name(Some(if expanded {
             "at-pan-down-symbolic"
@@ -681,6 +725,22 @@ impl ReasoningRow {
     #[cfg(test)]
     pub(super) fn reasoning_state(&self) -> (String, bool) {
         (self.title.text().to_string(), self.root.is_visible())
+    }
+
+    /// The paragraph labels' texts (tests).
+    #[cfg(test)]
+    pub(super) fn reasoning_paragraphs(&self) -> Vec<String> {
+        self.paragraphs
+            .borrow()
+            .iter()
+            .map(|l| l.text().to_string())
+            .collect()
+    }
+
+    /// The paragraph labels themselves, to tell a kept label from a replaced one (tests).
+    #[cfg(test)]
+    pub(super) fn reasoning_labels(&self) -> Vec<gtk4::Label> {
+        self.paragraphs.borrow().clone()
     }
 }
 
