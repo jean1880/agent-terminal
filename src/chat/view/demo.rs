@@ -7,6 +7,11 @@
 //! prompts, and answers every control with canned data.
 //!
 //! `AGENT_TERMINAL_DEMO_STRESS=<n>` preloads `n` mixed items first (the transcript spike).
+//!
+//! `AGENT_TERMINAL_DEMO_THREADS=1` runs the full window on a throwaway in-memory thread store
+//! filled by [`seed_demo_threads`] instead of the real one, and lists none of the agents' own
+//! sessions: a sidebar fit for screenshots, with nothing of the user's in it. No thread starts
+//! an agent session (each plays this script); detection and the usage probes still run.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -1138,9 +1143,119 @@ pub fn run() -> glib::ExitCode {
     app.run_with_args(&[argv0])
 }
 
+/// Whether the window should run on [`seed_demo_threads`]' store (`AGENT_TERMINAL_DEMO_THREADS`
+/// set and not blank). Tests always run on an in-memory store of their own.
+#[cfg(not(test))]
+pub fn demo_threads_requested() -> bool {
+    std::env::var("AGENT_TERMINAL_DEMO_THREADS").is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// The demo's threads: (agent, folder under the home folder, title, minutes ago), newest first.
+/// The first is the one the script's conversation fits (it starts on Claude).
+const DEMO_THREADS: [(Driver, &str, &str, i64); 7] = [
+    (
+        Driver::Claude,
+        "projects/agent-terminal",
+        "Atomic config writes",
+        0,
+    ),
+    (
+        Driver::Claude,
+        "projects/agent-terminal",
+        "Sidebar badges for rate limits",
+        25,
+    ),
+    (
+        Driver::Codex,
+        "projects/acme-api",
+        "Paginate the orders endpoint",
+        70,
+    ),
+    (
+        Driver::Claude,
+        "projects/acme-api",
+        "Fix the flaky checkout test",
+        190,
+    ),
+    (
+        Driver::Agy,
+        "projects/weather-cli",
+        "Add a --units flag",
+        1_500,
+    ),
+    (
+        Driver::Claude,
+        "projects/weather-cli",
+        "Cache API responses for ten minutes",
+        2_900,
+    ),
+    (
+        Driver::Claude,
+        "projects/dotfiles",
+        "Neovim LSP keymaps",
+        5_800,
+    ),
+];
+
+/// Fills an empty (in-memory) store with [`DEMO_THREADS`]. Each has its agent's provider thread
+/// but no native session (nothing to import from the real home) and no events: opening any of
+/// them plays the demo script live ([`play_demo`]). The provider thread is not made active,
+/// which would date the thread "now"; the sidebar takes the agent from it all the same. Folders
+/// are under `home`, so the sidebar shows them as `~/projects/…`.
+pub fn seed_demo_threads(
+    store: &agent_kit::store::Store,
+    home: &str,
+) -> Result<(), agent_kit::store::StoreError> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
+    for (driver, folder, title, minutes) in DEMO_THREADS {
+        let cwd = format!("{}/{folder}", home.trim_end_matches('/'));
+        let thread = store.create_thread_at(&cwd, Some(title), now_ms - minutes * 60_000)?;
+        store.add_provider_thread(&thread, driver.info().key, "default")?;
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// The demo backends playing into thread views, kept for the life of the process (a view
+    /// holds only their sink).
+    static PLAYING: RefCell<Vec<Rc<DemoBackend>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// In the demo window, the backend a thread's view runs on in place of an agent session (no
+/// thread starts an agent; the app's own probes still run); `None` in the real one.
+#[cfg(not(test))]
+pub fn demo_thread_backend() -> Option<Rc<DemoBackend>> {
+    demo_threads_requested().then(demo_backend)
+}
+
+/// Plays the demo script live into `sink`, the view `backend` drives, and keeps the backend for
+/// the life of the process.
+pub fn play_demo(backend: Rc<DemoBackend>, sink: EnvelopeSink) {
+    backend.connect(sink);
+    backend.play_script();
+    PLAYING.with(|p| p.borrow_mut().push(backend));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demo store lists every demo thread, newest first, with the scripted one on top (it
+    /// plays live, so it stores nothing); folders sit under the given home.
+    #[test]
+    fn the_demo_store_lists_the_demo_threads() {
+        let store = agent_kit::store::Store::open_in_memory().expect("store");
+        seed_demo_threads(&store, "/home/someone/").expect("seeded");
+        let threads = store.list_threads(false).expect("listed");
+        assert_eq!(threads.len(), DEMO_THREADS.len());
+        assert_eq!(threads[0].title, DEMO_THREADS[0].2);
+        assert!(threads
+            .iter()
+            .all(|t| t.cwd.starts_with("/home/someone/projects/")));
+        assert!(!store.has_messages(&threads[0].id).expect("read"));
+    }
 
     #[test]
     fn demo_models_cover_both_agents_and_a_via_route() {

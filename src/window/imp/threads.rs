@@ -275,6 +275,17 @@ pub(super) fn try_app_store() -> Result<Rc<Store>, String> {
 
 #[cfg(not(test))]
 fn open_store() -> Result<Rc<Store>, String> {
+    // Screenshots: demo threads in memory. Never the real store, and (being in memory) never the
+    // agents' own sessions either: see `list_recent_sessions`.
+    if crate::chat::view::demo::demo_threads_requested() {
+        warn!("AGENT_TERMINAL_DEMO_THREADS is set: showing demo threads, nothing is saved");
+        let store = in_memory_store()?;
+        let home = env::var("HOME").unwrap_or_default();
+        if let Err(e) = crate::chat::view::demo::seed_demo_threads(&store, &home) {
+            error!("Could not seed the demo threads: {e}");
+        }
+        return Ok(store);
+    }
     let path = agent_kit::store::default_path(
         env::var("XDG_STATE_HOME").ok().as_deref(),
         env::var("HOME").ok().as_deref(),
@@ -2316,9 +2327,18 @@ impl AgentTerminalWindow {
         };
         let history = loaded.history;
 
+        // The demo window (`AGENT_TERMINAL_DEMO_THREADS`): the view runs on the scripted backend.
+        #[cfg(not(test))]
+        let demo = crate::chat::view::demo::demo_thread_backend();
+        #[cfg(test)]
+        let demo: Option<Rc<crate::chat::view::demo::DemoBackend>> = None;
+
         // The view first, so no envelope of the session's start is lost. It is built from the
         // store whatever the agent's state: history is readable without the agent.
-        let backend: Rc<dyn ChatBackend> = slot.clone();
+        let backend: Rc<dyn ChatBackend> = match &demo {
+            Some(demo) => demo.clone(),
+            None => slot.clone(),
+        };
         let view = ChatView::new(backend);
         view.set_vexpand(true);
         view.set_model_source(ModelCatalog::shared());
@@ -2349,6 +2369,12 @@ impl AgentTerminalWindow {
         {
             chat.view = Some(view.clone());
             chat.building = false;
+        }
+
+        // The demo window starts no agent session (see `start_session`): the script plays.
+        if let Some(demo) = demo {
+            crate::chat::view::demo::play_demo(demo, view.sink());
+            return;
         }
 
         // No session unless the agent is Ready (found and switched on): a missing or disabled
@@ -2390,6 +2416,12 @@ impl AgentTerminalWindow {
 
     /// Starts the session of a thread whose view is built, and applies what was waiting for it.
     fn start_session(&self, page: &adw::TabPage, job: StartJob) {
+        // The demo window starts no agent, by any path (`build_thread`, a pending start when an
+        // agent becomes ready, a fork): its threads run the demo script.
+        #[cfg(not(test))]
+        if crate::chat::view::demo::demo_threads_requested() {
+            return;
+        }
         let StartJob {
             thread,
             driver,
