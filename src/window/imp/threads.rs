@@ -114,8 +114,8 @@ pub(super) struct ChatTab {
     title_item: Option<String>,
     /// Sent once the session exists (Continue In from a terminal page).
     pending_prompt: Option<String>,
-    /// Seeded into the session once it exists (fork, compact-by-handoff).
-    pending_handoff: Option<(String, usize, String)>,
+    /// Seeded into the session once it exists (fork, compact-by-handoff), with its source.
+    pending_handoff: Option<(crate::chat::session::Handoff, String)>,
     /// The reasoning effort the session starts with, overriding the profile's default (a thread
     /// continued in another agent at a chosen effort).
     pending_effort: Option<String>,
@@ -343,8 +343,8 @@ pub(super) struct NewThread {
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
     pub(super) title: Option<String>,
-    /// A budgeted, redacted handoff (summary, messages carried, source) seeded into the session.
-    pub(super) handoff: Option<(String, usize, String)>,
+    /// A budgeted, fenced and redacted handoff, with where it came from, seeded into the session.
+    pub(super) handoff: Option<(crate::chat::session::Handoff, String)>,
 }
 
 impl NewThread {
@@ -2553,8 +2553,8 @@ impl AgentTerminalWindow {
                 None => (None, None, None),
             }
         };
-        if let Some((summary, carried, source)) = handoff {
-            session.seed_handoff(summary, carried, &source);
+        if let Some((handoff, source)) = handoff {
+            session.seed_handoff(handoff, &source);
         }
         if let Some((driver, model, effort)) = switch {
             session.switch(driver, model, effort);
@@ -3035,7 +3035,7 @@ impl AgentTerminalWindow {
         } else {
             format!("“{title}”")
         };
-        let (summary, carried) = build_handoff(&messages, &format!("thread {thread}"));
+        let handoff = build_handoff(&messages, &format!("thread {thread}"));
         self.new_chat_thread(Some(driver), dir, None);
         // The new thread is the one just selected; it is built later, so the handoff waits.
         let page = self
@@ -3052,7 +3052,7 @@ impl AgentTerminalWindow {
                     .and_then(|t| t.chat.as_mut());
                 match chat {
                     Some(chat) if chat.view.is_none() => {
-                        chat.pending_handoff = Some((summary.clone(), carried, source.clone()));
+                        chat.pending_handoff = Some((handoff.clone(), source.clone()));
                         false
                     }
                     Some(_) => true,
@@ -3061,7 +3061,7 @@ impl AgentTerminalWindow {
             };
             if built {
                 if let Some(session) = self.current_slot().and_then(|s| s.get()) {
-                    session.seed_handoff(summary, carried, &source);
+                    session.seed_handoff(handoff, &source);
                 }
             }
         }

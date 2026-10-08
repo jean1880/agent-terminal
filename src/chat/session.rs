@@ -140,7 +140,7 @@ struct Inner {
     proc: RefCell<Option<AgentProcess>>,
     state: RefCell<State>,
     /// A rendered, redacted handoff waiting for the next user prompt.
-    pending_handoff: RefCell<Option<String>>,
+    pending_handoff: RefCell<Option<Handoff>>,
     /// The thread's model was retired by its agent: the next prompt first moves to this one.
     retired: RefCell<Option<RetiredModel>>,
     /// The model the thread was last SET to (an alias where the agent has one), as opposed to the
@@ -310,11 +310,12 @@ impl ChatSession {
 
     /// Seeds a new thread with a budgeted, redacted handoff (fork, compact-by-handoff): it
     /// rides on the next real prompt, exactly like a cross-agent switch's.
-    pub fn seed_handoff(&self, summary: String, carried: usize, source: &str) {
-        if carried == 0 {
+    pub fn seed_handoff(&self, handoff: Handoff, source: &str) {
+        if handoff.carried == 0 {
             return;
         }
-        *self.inner.pending_handoff.borrow_mut() = Some(summary);
+        let carried = handoff.carried;
+        *self.inner.pending_handoff.borrow_mut() = Some(handoff);
         self.inner.emit(Envelope::new(Event::Notice {
             text: format!("Continuing from {source} with {carried} earlier messages"),
         }));
@@ -887,7 +888,7 @@ impl Inner {
             self.pending_handoff.borrow().clone()
         };
         let sent = match &handoff {
-            Some(summary) => provider_message_with_handoff(summary, text),
+            Some(h) => provider_message_with_handoff(&h.summary, &h.fence, text),
             None => text.to_owned(),
         };
         self.ensure_alive();
@@ -1088,10 +1089,11 @@ impl Inner {
             }
         };
         let from = self.adapter.borrow().driver();
-        let (summary, carried) = build_handoff(
+        let handoff = build_handoff(
             &messages,
             &format!("{} thread {}", driver_label(from), self.thread),
         );
+        let carried = handoff.carried;
 
         let launch = match factory(driver) {
             Ok(launch) => launch,
@@ -1151,7 +1153,7 @@ impl Inner {
             state.mode = new_mode;
         }
         self.attach_approval();
-        *self.pending_handoff.borrow_mut() = (carried > 0).then_some(summary);
+        *self.pending_handoff.borrow_mut() = (carried > 0).then_some(handoff);
         self.emit(Envelope::new(Event::Notice {
             text: if carried == 0 {
                 format!("Switched to {}", driver_label(driver))
@@ -1190,18 +1192,36 @@ impl Inner {
     }
 }
 
-/// The budgeted, redacted handoff of a thread's history and how many messages it carries.
-/// Tool items count as assistant history; items with no text are skipped, and an item still
-/// open (its process died with it) is described as interrupted.
-pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> (String, usize) {
+/// A handoff ready to ride on the next prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Handoff {
+    /// The fenced, redacted history (see `agent_core::handoff_budget`).
+    pub summary: String,
+    /// The random marker its fences use; the prompt's user marker must use the same one.
+    pub fence: String,
+    /// Messages carried, of `total` in the thread.
+    pub carried: usize,
+    pub total: usize,
+}
+
+/// A fresh handoff fence: a random UUID without its dashes (32 hex digits), so carried text cannot
+/// guess it and forge a fence or the user marker.
+fn new_fence() -> String {
+    glib::uuid_string_random().replace('-', "")
+}
+
+/// The budgeted, fenced and redacted handoff of a thread's history. Tool items are carried as
+/// tool output (capped, untrusted); items with no text are skipped, and an item still open (its
+/// process died with it) is described as interrupted.
+pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> Handoff {
     let history: Vec<HistoricalMessage> = messages
         .iter()
         .filter(|m| !m.text.trim().is_empty())
         .map(|m| HistoricalMessage {
-            role: if m.role == "user" {
-                Role::User
-            } else {
-                Role::Assistant
+            role: match m.role.as_str() {
+                "user" => Role::User,
+                "tool" => Role::Tool,
+                _ => Role::Assistant,
             },
             kind: m.kind.clone(),
             text: m.text.clone(),
@@ -1228,12 +1248,14 @@ pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> (St
         history.first().map(|m| m.item_id.as_str()),
         history.last().map(|m| m.item_id.as_str()),
     );
-    let selection = select_history(&history, &coverage, budget);
-    let carried = selection.messages.len();
-    (
-        render_history(&selection.messages, &selection.context),
-        carried,
-    )
+    let fence = new_fence();
+    let selection = select_history(&history, &coverage, budget, &fence);
+    Handoff {
+        summary: render_history(&selection.messages, &selection.context, &fence),
+        carried: selection.messages.len(),
+        total: history.len(),
+        fence,
+    }
 }
 
 impl ChatBackend for ChatSession {
@@ -2309,10 +2331,12 @@ mod tests {
             assert_eq!(sent.len(), 3);
             assert_eq!(sent[0], "/model");
             let sent = &sent[1..];
-            assert!(sent[0].starts_with("Context handoff:"), "{}", sent[0]);
+            assert!(sent[0].starts_with("Context handoff (HANDOFF-"), "{}", sent[0]);
             assert!(sent[0].contains("please list the repo"));
             assert!(sent[0].contains("Found three files"));
-            assert!(sent[0].contains("User message:\nnow summarize"));
+            // The user's own words come last, after the fenced user marker.
+            assert!(sent[0].ends_with("):\nnow summarize"), "{}", sent[0]);
+            assert_eq!(sent[0].matches("\nUser message (HANDOFF-").count(), 1);
             assert!(!sent[0].contains(secret), "secret leaked into the handoff");
             assert_eq!(sent[1], "and again");
             assert!(prompts(&log_agy).is_empty());
@@ -2678,12 +2702,22 @@ mod tests {
             msg("tool", "tool", "", "open", "c2"),
             msg("assistant", "assistant_message", "done", "completed", "a1"),
         ];
-        let (summary, carried) = build_handoff(&history, "Claude thread t");
-        assert_eq!(carried, 3, "the empty item is skipped");
+        let handoff = build_handoff(&history, "Claude thread t");
+        assert_eq!(handoff.carried, 3, "the empty item is skipped");
+        assert_eq!(handoff.total, 3);
+        let summary = &handoff.summary;
         assert!(!summary.contains(secret));
         assert!(summary.contains("****0123"));
         assert!(summary.contains("status=interrupted"));
         assert!(summary.contains("Claude thread t"));
-        assert_eq!(build_handoff(&[], "x").1, 0);
+        // The tool's output is carried as a tool's, fenced with this handoff's own marker.
+        assert!(agent_core::handoff_budget::is_valid_fence(&handoff.fence));
+        assert!(summary.contains(&format!(
+            "<<<HANDOFF-{} BEGIN role=tool kind=command",
+            handoff.fence
+        )));
+        assert_eq!(build_handoff(&[], "x").carried, 0);
+        // Each handoff draws its own fence.
+        assert_ne!(build_handoff(&history, "t").fence, handoff.fence);
     }
 }

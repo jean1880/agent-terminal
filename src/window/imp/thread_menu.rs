@@ -323,8 +323,8 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let (handoff, carried) = build_handoff(&messages, &format!("thread {thread}"));
-            if carried == 0 {
+            let handoff = build_handoff(&messages, &format!("thread {thread}"));
+            if handoff.carried == 0 {
                 imp.show_toast("Nothing to hand over yet: send a message first");
                 return;
             }
@@ -333,7 +333,7 @@ impl AgentTerminalWindow {
                 model,
                 effort,
                 title: Some(continued_title(&title, driver)),
-                handoff: Some((handoff, carried, format!("“{title}”"))),
+                handoff: Some((handoff, format!("“{title}”"))),
                 ..NewThread::new(driver)
             });
         });
