@@ -347,6 +347,27 @@ togglebutton.option-button, button.option-button {
     background-color: #181425;
 }
 
+/* The agent at work (thinking.rs): the app icon's three cursor dots, bouncing in turn as on
+   the startup splash (window/loading.css), just above the composer. */
+@keyframes thinking-bounce {
+    0% { transform: none; }
+    15% { transform: translateY(-5px) scale(1.12, 0.92); }
+    30% { transform: translateY(1px) scale(0.94, 1.06); }
+    40% { transform: none; }
+    100% { transform: none; }
+}
+.thinking-strip { padding: 2px 6px 0 6px; min-height: 22px; }
+.thinking-dot {
+    min-width: 7px;
+    min-height: 7px;
+    border-radius: 9999px;
+    animation: thinking-bounce 1800ms ease-in-out infinite;
+}
+.thinking-dot.dot-claude { background-color: #e8846b; }
+.thinking-dot.dot-agy { background-color: #5b9cf6; animation-delay: 150ms; }
+.thinking-dot.dot-codex { background-color: #4cc38a; animation-delay: 300ms; }
+.thinking-text { color: #9c97c7; font-size: 0.9em; }
+
 .plan-card {
     background-color: #1d1830;
     border: 1px solid #2d2444;

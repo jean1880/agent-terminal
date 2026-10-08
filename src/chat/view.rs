@@ -25,6 +25,7 @@ pub mod model;
 mod panels;
 mod payload;
 mod subagents;
+mod thinking;
 mod transcript;
 mod typeahead;
 pub mod usage;
@@ -137,6 +138,8 @@ pub(crate) struct Inner {
     header: Header,
     plan: PlanPanel,
     interruption: interruption::InterruptionShelf,
+    /// The bouncing dots above the composer while the agent works.
+    thinking: thinking::ThinkingStrip,
     requests: Rc<Requests>,
     /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
     models: RefCell<Option<Rc<dyn ModelSource>>>,
@@ -199,6 +202,7 @@ impl ChatView {
                 header: Header::new(),
                 plan: PlanPanel::new(),
                 interruption,
+                thinking: thinking::ThinkingStrip::new(),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
                 model_conn: Cell::new(None),
@@ -228,6 +232,8 @@ impl ChatView {
         let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         column.append(&inner.plan.revealer);
         column.append(&inner.interruption.revealer);
+        // Right above where the reply is typed: the one place the eye already is.
+        column.append(&inner.thinking.revealer);
         column.append(inner.composer.widget());
         clamp.set_child(Some(&column));
         bottom.append(&clamp);
@@ -581,8 +587,10 @@ impl Inner {
         let status = self.backend.status();
         let running = status.running_turn || self.model.borrow().running;
         // The header counts background work too; the stop button follows the main turn only.
-        self.header
-            .set_activity(&self.model.borrow().activity(running));
+        let activity = self.model.borrow().activity(running);
+        self.header.set_activity(&activity);
+        self.thinking
+            .set(&activity, cards::driver_name(status.driver));
         self.composer.set_running(running);
         self.refresh_agent_chip();
         self.header
@@ -1131,9 +1139,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// The dots above the composer show while a turn runs, name the agent, and go when it ends.
+    fn thinking_strip_follows_the_turn() {
+        use agent_core::event::{Event, TurnState};
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let inner = view.inner().expect("a built view");
+        assert_eq!(inner.thinking.shown(), None, "a new thread shows nothing");
+        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+        assert_eq!(
+            inner.thinking.shown().as_deref(),
+            Some("Claude is thinking…")
+        );
+        view.apply(&Envelope::new(Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        }));
+        assert_eq!(inner.thinking.shown(), None, "gone once the turn ends");
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
         stale_replay_checks();
+        interruption::tests::answering_from_the_shelf_reenters_safely();
+        thinking_strip_follows_the_turn();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });
