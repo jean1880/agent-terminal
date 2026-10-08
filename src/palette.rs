@@ -7,14 +7,21 @@
 //! reads, and swaps it when the theme changes. So the theme restyles the whole window, not just
 //! the terminals.
 //!
-//! The app's own theme keeps its hand-tuned values exactly. Every other theme derives the same
-//! tokens from its terminal palette: background, foreground, and its red, green, yellow, blue
-//! and magenta (the accent). The agents' brand colours (Claude, agy, Codex) are not themed:
+//! The app's own theme keeps its hand-tuned values exactly. Every other bundled theme derives the
+//! same tokens from its terminal palette: background, foreground, and its red, green, yellow,
+//! blue and magenta (the accent). The agents' brand colours (Claude, agy, Codex) are not themed:
 //! they identify the agent.
+//!
+//! [`ThemeChoice::System`] has no values of its own. Each name is an alias of a colour the
+//! desktop's GTK theme defines ([`SYSTEM_COLOURS`]), libadwaita's own colours are left alone and
+//! the colour scheme is not forced, so light or dark, the accent colour and any `gtk.css` all come
+//! through. What Rust code needs as values (terminal and diff colours, Pango markup) is read
+//! back from the resolved style, again whenever the desktop's style changes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use gtk4::gdk;
+use gtk4::prelude::*;
 
 use crate::config::ThemeChoice;
 use crate::theme::Theme;
@@ -37,6 +44,15 @@ impl Rgb {
             f64::from(c.green()),
             f64::from(c.blue()),
         )
+    }
+
+    /// `c` drawn over `under`: what a translucent colour (Adwaita's text is one) looks like.
+    fn over(c: &gdk::RGBA, under: Rgb) -> Rgb {
+        under.mix(Rgb::from_rgba(c), f64::from(c.alpha()))
+    }
+
+    pub fn to_rgba(self) -> gdk::RGBA {
+        gdk::RGBA::new(self.0 as f32, self.1 as f32, self.2 as f32, 1.0)
     }
 
     /// `self` moved `t` (0..=1) of the way to `other`.
@@ -109,13 +125,134 @@ pub struct Chrome {
     pub info: Rgb,
 }
 
+/// The system theme: each name, as an expression of the desktop theme's named colours (the ones
+/// libadwaita documents, which a `gtk.css` theme redefines). Mixes and alphas only place a role
+/// between two of the desktop's colours; none brings a colour of its own. Same names, same
+/// order as [`Chrome::named`].
+pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
+    ("at_bg", "@window_bg_color"),
+    ("at_bg_deep", "@headerbar_bg_color"),
+    ("at_bg_sunken", "@view_bg_color"),
+    ("at_surface", "@card_bg_color"),
+    (
+        "at_surface_raised",
+        "mix(@window_bg_color, @window_fg_color, 0.08)",
+    ),
+    (
+        "at_surface_strong",
+        "mix(@window_bg_color, @accent_bg_color, 0.14)",
+    ),
+    (
+        "at_accent_surface",
+        "mix(@window_bg_color, @accent_bg_color, 0.28)",
+    ),
+    ("at_border", "alpha(@window_fg_color, 0.15)"),
+    ("at_border_strong", "alpha(@window_fg_color, 0.25)"),
+    ("at_border_hover", "alpha(@accent_color, 0.6)"),
+    ("at_fg_strong", "@window_fg_color"),
+    ("at_fg", "@window_fg_color"),
+    ("at_fg_soft", "alpha(@window_fg_color, 0.85)"),
+    ("at_fg_dim", "alpha(@window_fg_color, 0.65)"),
+    ("at_fg_faint", "alpha(@window_fg_color, 0.45)"),
+    ("at_accent", "@accent_color"),
+    (
+        "at_accent_hover",
+        "mix(@accent_color, @window_fg_color, 0.15)",
+    ),
+    ("at_success", "@success_color"),
+    (
+        "at_success_soft",
+        "mix(@success_color, @window_fg_color, 0.25)",
+    ),
+    ("at_warning", "@warning_color"),
+    (
+        "at_warning_soft",
+        "mix(@warning_color, @window_fg_color, 0.25)",
+    ),
+    ("at_danger", "@error_color"),
+    ("at_danger_soft", "mix(@error_color, @window_fg_color, 0.2)"),
+    ("at_danger_text", "mix(@error_color, @window_fg_color, 0.5)"),
+    (
+        "at_danger_bg",
+        "mix(@window_bg_color, @error_bg_color, 0.14)",
+    ),
+    (
+        "at_danger_border",
+        "mix(@window_bg_color, @error_color, 0.42)",
+    ),
+    ("at_info", "@accent_color"),
+];
+
+/// The class a probe label takes to be coloured `name`, so its value can be read back.
+fn probe_class(name: &str) -> String {
+    format!("at-probe-{}", name.replace('_', "-"))
+}
+
+/// The system theme's stylesheet: the [`SYSTEM_COLOURS`] aliases, and a probe rule per name
+/// ([`resolve_system`] reads them). Nothing of libadwaita's is redefined.
+fn system_css() -> String {
+    let mut css = String::new();
+    for (name, value) in SYSTEM_COLOURS {
+        css.push_str(&format!("@define-color {name} {value};\n"));
+    }
+    for (name, _) in SYSTEM_COLOURS {
+        css.push_str(&format!(
+            "label.{} {{ color: @{name}; }}\n",
+            probe_class(name)
+        ));
+    }
+    css
+}
+
+/// The system theme's colours as they now resolve: each name read from a probe label's style.
+/// Translucent ones are composited over the background, as they are drawn.
+fn resolve_system() -> Chrome {
+    let read = |name: &str| {
+        let probe = gtk4::Label::new(None);
+        probe.add_css_class(&probe_class(name));
+        probe.color()
+    };
+    let bg = Rgb::from_rgba(&read("at_bg"));
+    let c = |name: &str| Rgb::over(&read(name), bg);
+    Chrome {
+        bg,
+        bg_deep: c("at_bg_deep"),
+        bg_sunken: c("at_bg_sunken"),
+        surface: c("at_surface"),
+        surface_raised: c("at_surface_raised"),
+        surface_strong: c("at_surface_strong"),
+        accent_surface: c("at_accent_surface"),
+        border: c("at_border"),
+        border_strong: c("at_border_strong"),
+        border_hover: c("at_border_hover"),
+        fg_strong: c("at_fg_strong"),
+        fg: c("at_fg"),
+        fg_soft: c("at_fg_soft"),
+        fg_dim: c("at_fg_dim"),
+        fg_faint: c("at_fg_faint"),
+        accent: c("at_accent"),
+        accent_hover: c("at_accent_hover"),
+        success: c("at_success"),
+        success_soft: c("at_success_soft"),
+        warning: c("at_warning"),
+        warning_soft: c("at_warning_soft"),
+        danger: c("at_danger"),
+        danger_soft: c("at_danger_soft"),
+        danger_text: c("at_danger_text"),
+        danger_bg: c("at_danger_bg"),
+        danger_border: c("at_danger_border"),
+        info: c("at_info"),
+    }
+}
+
 impl Chrome {
-    /// The colours for `choice`.
-    pub fn for_choice(choice: ThemeChoice) -> Chrome {
+    /// The colours of a bundled palette; `None` for the system theme, whose colours are the
+    /// desktop's (see [`resolve_system`]).
+    pub fn for_choice(choice: ThemeChoice) -> Option<Chrome> {
         match choice {
-            ThemeChoice::AgentTerminal => Self::agent_terminal(),
-            other => {
-                let base = Theme::chrome_base(other);
+            ThemeChoice::System => None,
+            ThemeChoice::AgentTerminal => Some(Self::agent_terminal()),
+            other => Theme::chrome_base(other).map(|base| {
                 Self::derived(
                     Rgb::from_rgba(&base.background),
                     Rgb::from_rgba(&base.foreground),
@@ -127,7 +264,7 @@ impl Chrome {
                         Rgb::from_rgba(&base.blue),
                     ],
                 )
-            }
+            }),
         }
     }
 
@@ -281,6 +418,16 @@ impl Chrome {
 thread_local! {
     static PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
     static CURRENT: RefCell<Option<Chrome>> = const { RefCell::new(None) };
+    /// Whether the system theme is the one applied, so a desktop change re-resolves it.
+    static SYSTEM_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Whether the desktop's style is being watched (connected once per process).
+    static WATCHING: Cell<bool> = const { Cell::new(false) };
+    /// Whether a re-resolve is queued: one desktop switch notifies several properties at once,
+    /// and they share one refresh.
+    static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// Recolours what holds colours as values (terminals, diff panels) after the system
+    /// theme re-resolved. Set by the app.
+    static ON_SYSTEM_CHANGE: Cell<Option<fn()>> = const { Cell::new(None) };
 }
 
 /// The colours in use (the app's own until [`apply`] first runs).
@@ -290,19 +437,88 @@ pub fn current() -> Chrome {
         .unwrap_or_else(Chrome::agent_terminal)
 }
 
+/// What to run after the system theme follows a change of the desktop's style: recolour what
+/// took its colours as values.
+pub fn set_on_system_change(f: fn()) {
+    ON_SYSTEM_CHANGE.with(|slot| slot.set(Some(f)));
+}
+
+fn set_current(chrome: Chrome) {
+    crate::icons::set_hero_tint(chrome.fg.hex());
+    CURRENT.with(|c| *c.borrow_mut() = Some(chrome));
+}
+
 /// Restyles the whole app for `choice`: defines every named colour for it, replacing the last
 /// theme's. Above the app's own stylesheets, so the names resolve however they load.
 pub fn apply(choice: ThemeChoice) {
-    let chrome = Chrome::for_choice(choice);
-    let css = chrome.css();
-    crate::icons::set_hero_tint(chrome.fg.hex());
-    CURRENT.with(|c| *c.borrow_mut() = Some(chrome));
-    let Some(display) = gdk::Display::default() else {
+    let system = choice == ThemeChoice::System;
+    SYSTEM_ACTIVE.with(|s| s.set(system));
+    let Some(chrome) = Chrome::for_choice(choice) else {
+        apply_system();
         return;
     };
+    let css = chrome.css();
+    set_current(chrome);
+    if gdk::Display::default().is_none() {
+        return;
+    }
     // The palettes are dark: popovers, menus and entries follow them instead of the light
     // default (their text would otherwise be pale on white).
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+    load(&css);
+}
+
+/// The system theme: the desktop's colour scheme, the aliases, and the colours they resolve to.
+fn apply_system() {
+    if gdk::Display::default().is_none() {
+        set_current(Chrome::agent_terminal());
+        return;
+    }
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+    load(&system_css());
+    set_current(resolve_system());
+    watch_system();
+}
+
+/// Re-resolves the system theme when the desktop's style changes: dark or light, accent,
+/// contrast, or the GTK theme. On idle, once the new stylesheet is in.
+fn watch_system() {
+    if WATCHING.with(|w| w.replace(true)) {
+        return;
+    }
+    let refresh = || {
+        if REFRESH_PENDING.with(|p| p.replace(true)) {
+            return;
+        }
+        gtk4::glib::idle_add_local_once(|| {
+            REFRESH_PENDING.with(|p| p.set(false));
+            if !SYSTEM_ACTIVE.with(Cell::get) {
+                return;
+            }
+            set_current(resolve_system());
+            if let Some(f) = ON_SYSTEM_CHANGE.with(Cell::get) {
+                f();
+            }
+        });
+    };
+    let style = adw::StyleManager::default();
+    // `accent-color` exists from libadwaita 1.6; on older ones it never notifies, and the
+    // accent never changes either.
+    for property in ["dark", "accent-color", "high-contrast"] {
+        style.connect_notify_local(Some(property), move |_, _| refresh());
+    }
+    if let Some(settings) = gtk4::Settings::default() {
+        for property in ["gtk-theme-name", "gtk-application-prefer-dark-theme"] {
+            settings.connect_notify_local(Some(property), move |_, _| refresh());
+        }
+    }
+}
+
+/// Replaces the theme stylesheet with `css`.
+fn load(css: &str) {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
     PROVIDER.with(|slot| {
         let mut slot = slot.borrow_mut();
         let provider = slot.get_or_insert_with(|| {
@@ -314,7 +530,7 @@ pub fn apply(choice: ThemeChoice) {
             );
             provider
         });
-        provider.load_from_data(&css);
+        provider.load_from_data(css);
     });
 }
 
@@ -327,8 +543,16 @@ mod tests {
     #[test]
     fn every_theme_defines_every_name() {
         for choice in ThemeChoice::ALL {
-            let css = Chrome::for_choice(choice).css();
-            for (name, _) in Chrome::for_choice(choice).named() {
+            let Some(chrome) = Chrome::for_choice(choice) else {
+                assert_eq!(
+                    choice,
+                    ThemeChoice::System,
+                    "only the system theme has no palette"
+                );
+                continue;
+            };
+            let css = chrome.css();
+            for (name, _) in chrome.named() {
                 assert!(
                     css.contains(&format!("@define-color {name} #")),
                     "{choice}: {name}"
@@ -339,6 +563,27 @@ mod tests {
                 "{choice}: libadwaita variables"
             );
         }
+    }
+
+    /// The system theme defines the same names, each from the desktop's colours only, and
+    /// leaves libadwaita's own colours alone so the desktop's theme shows through.
+    #[test]
+    fn the_system_theme_only_aliases_the_desktops_colours() {
+        let names: Vec<&str> = Chrome::agent_terminal()
+            .named()
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        let system: Vec<&str> = SYSTEM_COLOURS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(system, names);
+        for (name, value) in SYSTEM_COLOURS {
+            assert!(!value.contains('#'), "{name}: a colour of its own");
+            assert!(value.contains('@'), "{name}: not from the desktop");
+        }
+        let css = system_css();
+        assert!(!css.contains("define-color window_bg_color"));
+        assert!(!css.contains("--window-bg-color"));
+        assert!(css.contains("label.at-probe-at-bg { color: @at_bg; }"));
     }
 
     /// Every `@at_*` name a stylesheet uses is one the palette defines: GTK drops a property
@@ -369,7 +614,7 @@ mod tests {
     /// The app's own theme is exactly what the stylesheets were tuned with.
     #[test]
     fn the_default_theme_keeps_its_values() {
-        let css = Chrome::for_choice(ThemeChoice::AgentTerminal).css();
+        let css = Chrome::agent_terminal().css();
         assert!(css.contains("@define-color at_bg #181425;"));
         assert!(css.contains("@define-color at_accent #b49bff;"));
         assert!(css.contains("@define-color at_fg_dim #918bbd;"));
@@ -379,7 +624,7 @@ mod tests {
     /// darker header than body.
     #[test]
     fn a_derived_theme_follows_its_terminal() {
-        let c = Chrome::for_choice(ThemeChoice::Dracula);
+        let c = Chrome::for_choice(ThemeChoice::Dracula).expect("a bundled palette");
         assert_eq!(c.bg.hex(), "#282a36");
         assert_eq!(c.fg.hex(), "#f8f8f2");
         assert!(c.bg_deep.0 < c.bg.0 && c.bg_deep.2 < c.bg.2);

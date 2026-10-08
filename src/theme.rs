@@ -3,6 +3,8 @@
 //! Each [`Theme`] is built from infallible [`RGBA::new`] values (no runtime
 //! string parsing, so applying a theme can never panic). Themes are cheap to
 //! build, so one is constructed on demand each time it is applied to a tab.
+//! [`ThemeChoice::System`] has no palette: terminals take the desktop's text and
+//! background, and VTE's default colours for the rest.
 
 use crate::config::ThemeChoice;
 use gtk4::gdk::RGBA;
@@ -67,11 +69,27 @@ pub struct Theme {
 impl Theme {
     /// Builds the requested theme and applies it to a terminal.
     pub fn apply(terminal: &Terminal, choice: ThemeChoice) {
-        Self::for_choice(choice).apply_to(terminal);
+        match Self::for_choice(choice) {
+            Some(theme) => theme.apply_to(terminal),
+            None => Self::apply_system(terminal),
+        }
     }
 
-    fn for_choice(choice: ThemeChoice) -> Self {
-        match choice {
+    /// The system theme sets no terminal colours of its own: the text and background are the
+    /// desktop's (as `crate::palette` resolved them), everything else is VTE's default.
+    fn apply_system(terminal: &Terminal) {
+        let chrome = crate::palette::current();
+        terminal.set_colors(Some(&chrome.fg.to_rgba()), Some(&chrome.bg.to_rgba()), &[]);
+        terminal.set_color_bold(None);
+        terminal.set_color_cursor(None);
+        terminal.set_color_highlight(None);
+        terminal.set_color_highlight_foreground(None);
+    }
+
+    /// The bundled palette for `choice`; `None` for the system theme, which has none.
+    fn for_choice(choice: ThemeChoice) -> Option<Self> {
+        Some(match choice {
+            ThemeChoice::System => return None,
             ThemeChoice::AgentTerminal => Self::agent_terminal(),
             ThemeChoice::Dracula => Self::scheme(
                 0x282a36,
@@ -133,7 +151,7 @@ impl Theme {
                     0x75715e, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf9f8f5,
                 ],
             ),
-        }
+        })
     }
 
     /// Builds a theme from hex colors. `bold` and the selection foreground both
@@ -185,10 +203,11 @@ impl Theme {
         }
     }
 
-    /// What the window's colours derive from (see [`ChromeBase`]).
-    pub fn chrome_base(choice: ThemeChoice) -> ChromeBase {
-        let t = Self::for_choice(choice);
-        ChromeBase {
+    /// What the window's colours derive from (see [`ChromeBase`]); `None` for the system theme,
+    /// whose window colours are the desktop's.
+    pub fn chrome_base(choice: ThemeChoice) -> Option<ChromeBase> {
+        let t = Self::for_choice(choice)?;
+        Some(ChromeBase {
             background: t.background,
             foreground: t.foreground,
             accent: t.palette[5],
@@ -196,13 +215,24 @@ impl Theme {
             green: t.palette[2],
             yellow: t.palette[3],
             blue: t.palette[4],
-        }
+        })
     }
 
     /// Colours for the diff panel, taken from the theme's own palette so it
-    /// matches the terminal beside it.
+    /// matches the terminal beside it. The system theme's come from the desktop's colours.
     pub fn diff_colours(choice: ThemeChoice) -> DiffColours {
-        let theme = Self::for_choice(choice);
+        let Some(theme) = Self::for_choice(choice) else {
+            let c = crate::palette::current();
+            return DiffColours {
+                background: c.bg.to_rgba(),
+                text: c.fg.to_rgba(),
+                added: c.success.to_rgba(),
+                removed: c.danger.to_rgba(),
+                hunk: c.info.to_rgba(),
+                meta: c.fg_dim.to_rgba(),
+                file: c.accent.to_rgba(),
+            };
+        };
         DiffColours {
             background: theme.background,
             text: theme.foreground,

@@ -141,9 +141,15 @@ without asking first, the thread is restarted without
   of the last window closed, each as a fresh session. **Reopen Last Thread**
   (also off by default) does the same for chat threads, showing the one you were
   in; off, the app starts with no thread open.
-- **Selectable colour themes**: Agent Terminal (default), Dracula, Nord, Gruvbox
-  Dark, Solarized Dark, One Dark, and Monokai — applied live to the whole app and
-  every open tab.
+- **Selectable colour themes** (Settings → General → Appearance): Agent Terminal
+  (default), Dracula, Nord, Gruvbox Dark, Solarized Dark, One Dark, and Monokai —
+  applied live to the whole app and every open tab. **Use System Theme** has no
+  colours of its own: it takes them from your desktop's GTK theme (light or dark,
+  its accent colour, any `~/.config/gtk-4.0/gtk.css`) and follows it as it changes;
+  terminals get the desktop's text and background with VTE's default palette.
+- **First-start setup**: with no settings file yet, a short walkthrough shows which
+  agents are installed, lets you switch them on or off, sign in, and pick the
+  default agent. Run it again from Settings → General → Setup.
 - **Profiles**: any CLI, with its own arguments, directory and environment,
   defined in `config.json` — no rebuild. Auto-detection picks the first one
   installed. Resolution runs off the UI thread and is cached for the life of the

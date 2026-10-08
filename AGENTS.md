@@ -206,9 +206,14 @@ orchestrator collects artifacts with a non-recursive scan of the workspace root.
 ## 🤖 AI Contribution Rules
 
 - Always prioritize the **Standalone Philosophy**.
-- Terminal colours are user-selectable (`ThemeChoice` in `config.rs`, palettes in
-  `theme.rs`); add new schemes there and update the guard test. The window chrome
-  follows the brand CSS in `main.rs` (background `#181425`, foreground `#c8c8ff`).
+- Colours are user-selectable (`ThemeChoice` in `config.rs`, palettes in
+  `theme.rs`, app-wide names in `palette.rs`); add new schemes there and update the
+  guard test. The default is the app's own palette (background `#181425`,
+  foreground `#c8c8ff`). `ThemeChoice::System` brings no colours: `palette.rs`
+  aliases every `@at_*` name to the desktop theme's named colours, leaves
+  libadwaita's own alone, does not force dark, and reads values back (for VTE,
+  diffs, and Pango markup parsed from then on) when the desktop's style changes.
+  Never give it a literal colour.
 - If you modify startup/detection logic, update and run the tests in `utils.rs`.
 - Deployment-specific behaviour belongs in config, not in the binary. Anything
   that reads a path or runs a command particular to one machine should be an

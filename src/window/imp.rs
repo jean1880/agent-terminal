@@ -3,6 +3,7 @@
 mod agents_prefs;
 mod diff_prefs;
 mod diffs;
+mod setup;
 mod thread_menu;
 mod threads;
 
@@ -709,6 +710,25 @@ fn initial_config() -> crate::config::TerminalConfig {
 #[cfg(test)]
 fn initial_config() -> crate::config::TerminalConfig {
     crate::config::TerminalConfig::default()
+}
+
+/// After the desktop's style changed under the system theme: every terminal and diff panel, in
+/// every window, takes the colours it now resolves to.
+fn recolour_for_system() {
+    let Some(app) = gtk4::gio::Application::default().and_downcast::<gtk4::Application>() else {
+        return;
+    };
+    let Some(window) = app
+        .windows()
+        .into_iter()
+        .find_map(|w| w.downcast::<super::AgentTerminalWindow>().ok())
+    else {
+        return;
+    };
+    let imp = window.imp();
+    let theme = crate::config::ThemeChoice::System;
+    imp.for_each_terminal_everywhere(|term| Theme::apply(term, theme));
+    imp.recolour_diff_panels(theme);
 }
 
 /// The window a widget currently sits in.
@@ -1687,6 +1707,7 @@ impl AgentTerminalWindow {
         obj.set_title(Some("Agent Terminal"));
         // The whole app's colours, from the configured theme, before anything draws.
         crate::palette::apply(self.config.borrow().theme);
+        crate::palette::set_on_system_change(recolour_for_system);
 
         let content = Box::builder().orientation(Orientation::Vertical).build();
 
@@ -1817,7 +1838,10 @@ impl AgentTerminalWindow {
                         glib::clone!(
                             #[weak]
                             obj,
-                            move || obj.imp().reveal_shell()
+                            move || {
+                                obj.imp().reveal_shell();
+                                obj.imp().offer_setup_on_first_run();
+                            }
                         ),
                     );
                 } else {
@@ -1838,7 +1862,10 @@ impl AgentTerminalWindow {
                         glib::clone!(
                             #[weak]
                             obj,
-                            move || obj.imp().show_boot_page("welcome")
+                            move || {
+                                obj.imp().show_boot_page("welcome");
+                                obj.imp().offer_setup_on_first_run();
+                            }
                         ),
                     );
                 }
@@ -3302,11 +3329,34 @@ impl AgentTerminalWindow {
             .position(|t| *t == config.theme)
             .unwrap_or(0) as u32;
         let theme_row = adw::ComboRow::builder()
-            .title("Terminal Theme")
-            .subtitle("Colours of terminal pages and the drawer, and of diffs")
+            .title("Theme")
+            .subtitle(
+                "Colours of the whole app: threads, terminals and diffs. Use System Theme takes \
+                 them from your desktop and follows it when it changes",
+            )
             .model(&theme_model)
             .selected(theme_index)
             .build();
+
+        let setup_row = adw::ActionRow::builder()
+            .title("Setup")
+            .subtitle("Go through the first-start setup again: which agents to use, and sign-in")
+            .build();
+        let setup_button = Button::builder()
+            .label("Run Setup Again…")
+            .valign(Align::Center)
+            .build();
+        setup_row.add_suffix(&setup_button);
+        setup_button.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+                obj.imp().show_setup();
+            }
+        ));
 
         // Font family and size were a hard-coded constant while the *scale* was a
         // setting, which is an odd place to have drawn the line.
@@ -3411,11 +3461,15 @@ impl AgentTerminalWindow {
             .title("General")
             .icon_name("at-document-properties-symbolic")
             .build();
+        let look = adw::PreferencesGroup::builder().title("Appearance").build();
+        look.add(&theme_row);
+        general.add(&look);
         let startup = adw::PreferencesGroup::builder().title("Startup").build();
         startup.add(&starting_directory_row);
         startup.add(&reopen_thread_row);
         startup.add(&restore_row);
         startup.add(&skip_animation_row);
+        startup.add(&setup_row);
         general.add(&startup);
         let notifications = adw::PreferencesGroup::builder()
             .title("Notifications")
@@ -3450,14 +3504,13 @@ impl AgentTerminalWindow {
             .title("Terminal")
             .icon_name("at-utilities-terminal-symbolic")
             .description(
-                "Terminal tabs and the terminal drawer (Ctrl+`). Chat threads follow the app's \
-                 own style.",
+                "Terminal tabs and the terminal drawer (Ctrl+`). Their colours follow the theme \
+                 (General).",
             )
             .build();
         let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
         appearance.add(&font_row);
         appearance.add(&font_scale_row);
-        appearance.add(&theme_row);
         appearance.add(&cursor_row);
         appearance.add(&blink_row);
         terminal.add(&appearance);

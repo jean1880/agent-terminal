@@ -363,10 +363,13 @@ fn default_icon_unknown() -> String {
 /// Ceiling on header indicators, so a config edit cannot fill the header bar.
 pub const MAX_INDICATORS: usize = 5;
 
-/// The terminal color scheme.
+/// The app's colours: the desktop's own, or one of the bundled palettes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeChoice {
+    /// No colours of its own: everything comes from the desktop's GTK theme (light or dark, its
+    /// accent, any `gtk.css`), and follows it when it changes. See `crate::palette`.
+    System,
     /// The app's own palette. Was named after Antigravity, the CLI the app first drove; the old
     /// name still loads.
     #[default]
@@ -383,6 +386,7 @@ pub enum ThemeChoice {
 impl std::fmt::Display for ThemeChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            ThemeChoice::System => "Use System Theme",
             ThemeChoice::AgentTerminal => "Agent Terminal",
             ThemeChoice::Dracula => "Dracula",
             ThemeChoice::Nord => "Nord",
@@ -397,7 +401,8 @@ impl std::fmt::Display for ThemeChoice {
 
 impl ThemeChoice {
     /// All choices in display order; the index matches the settings dropdown.
-    pub const ALL: [ThemeChoice; 7] = [
+    pub const ALL: [ThemeChoice; 8] = [
+        ThemeChoice::System,
         ThemeChoice::AgentTerminal,
         ThemeChoice::Dracula,
         ThemeChoice::Nord,
@@ -496,6 +501,10 @@ pub struct TerminalConfig {
     /// Reopen the chat threads open at the last close, showing the one that was in view. Off
     /// by default: the window starts with no thread open, the sidebar listing them all.
     pub reopen_last_thread: bool,
+    /// Set when this process found no settings file at all (none from a pre-rename release
+    /// either): a first start, which offers the setup walkthrough. Not persisted.
+    #[serde(skip)]
+    first_run: std::cell::Cell<bool>,
     /// The file as this process last read or wrote it, so a hand edit made in
     /// between can be told apart from its own writes. Not persisted.
     #[serde(skip)]
@@ -706,6 +715,7 @@ impl Default for TerminalConfig {
             sidebar_collapsed: false,
             skip_load_animation: false,
             reopen_last_thread: false,
+            first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
         }
@@ -852,6 +862,11 @@ impl TerminalConfig {
     /// a *different package* — come up with no settings at all. Leaving it costs
     /// one stale file and keeps the downgrade path intact.
     fn load_or_migrate(path: &Path, legacy_path: &Path) -> Self {
+        if !path.exists() && !legacy_path.exists() {
+            let config = Self::default();
+            config.first_run.set(true);
+            return config;
+        }
         if !path.exists() && legacy_path.exists() {
             // Only a legacy file that actually parses is adopted. Writing
             // defaults to the new path in its place would make fixing the old
@@ -958,6 +973,11 @@ impl TerminalConfig {
     pub fn agent_profile(&self, driver: agent_core::adapter::Driver) -> Option<&Profile> {
         self.agent_profile_index(driver)
             .and_then(|i| self.profiles.get(i))
+    }
+
+    /// Whether this is a first start: no settings file existed when these were loaded.
+    pub fn is_first_run(&self) -> bool {
+        self.first_run.get()
     }
 
     /// The profile the user explicitly chose, if any.
@@ -1204,17 +1224,18 @@ mod tests {
         // here until ALL is updated to match.
         fn expected_index(theme: ThemeChoice) -> usize {
             match theme {
-                ThemeChoice::AgentTerminal => 0,
-                ThemeChoice::Dracula => 1,
-                ThemeChoice::Nord => 2,
-                ThemeChoice::GruvboxDark => 3,
-                ThemeChoice::SolarizedDark => 4,
-                ThemeChoice::OneDark => 5,
-                ThemeChoice::Monokai => 6,
+                ThemeChoice::System => 0,
+                ThemeChoice::AgentTerminal => 1,
+                ThemeChoice::Dracula => 2,
+                ThemeChoice::Nord => 3,
+                ThemeChoice::GruvboxDark => 4,
+                ThemeChoice::SolarizedDark => 5,
+                ThemeChoice::OneDark => 6,
+                ThemeChoice::Monokai => 7,
             }
         }
 
-        assert_eq!(ThemeChoice::ALL.len(), 7);
+        assert_eq!(ThemeChoice::ALL.len(), 8);
         for theme in ThemeChoice::ALL {
             let index = expected_index(theme);
             assert_eq!(ThemeChoice::ALL[index], theme);
@@ -1819,6 +1840,35 @@ mod tests {
             loaded.scrollback_lines,
             TerminalConfig::default().scrollback_lines
         );
+        assert!(
+            loaded.is_first_run(),
+            "no settings anywhere is a first start"
+        );
+    }
+
+    /// Only a start with no settings file anywhere offers the setup walkthrough: not one with
+    /// a current file, nor one adopting a pre-rename file.
+    #[test]
+    fn a_first_start_is_one_with_no_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("old.json");
+        let current = dir.path().join("new.json");
+
+        TerminalConfig::default().save_to(&legacy);
+        assert!(!TerminalConfig::load_or_migrate(&current, &legacy).is_first_run());
+        assert!(current.exists(), "adopted");
+        assert!(!TerminalConfig::load_or_migrate(&current, &legacy).is_first_run());
+    }
+
+    /// The system theme is stored by name and offered first.
+    #[test]
+    fn the_system_theme_round_trips_and_leads_the_list() {
+        assert_eq!(
+            serde_json::to_string(&ThemeChoice::System).expect("serialises"),
+            "\"system\""
+        );
+        assert_eq!(ThemeChoice::ALL[0], ThemeChoice::System);
+        assert_eq!(ThemeChoice::System.to_string(), "Use System Theme");
     }
 
     #[test]

@@ -164,7 +164,6 @@ impl AgentTerminalWindow {
     }
 
     pub(super) fn add_agents_page(&self, dialog: &adw::PreferencesDialog) {
-        let obj = self.obj();
         let page = adw::PreferencesPage::builder()
             .title("Agents")
             .icon_name("at-system-users-symbolic")
@@ -176,6 +175,18 @@ impl AgentTerminalWindow {
                 "New threads start on this agent; switch agents and models from a thread's header.",
             )
             .build();
+        general.add(&self.default_agent_row());
+        page.add(&general);
+
+        for driver in Driver::ALL {
+            page.add(&self.agent_group(driver, dialog));
+        }
+        dialog.add(&page);
+    }
+
+    /// The "Default Agent for New Threads" dropdown. Applies on change.
+    pub(super) fn default_agent_row(&self) -> adw::ComboRow {
+        let obj = self.obj();
         let choices = default_agent_choices();
         let names: Vec<&str> = choices.iter().map(|(_, n)| *n).collect();
         let current = self.config.borrow().default_agent;
@@ -197,13 +208,7 @@ impl AgentTerminalWindow {
                 }
             }
         ));
-        general.add(&default_row);
-        page.add(&general);
-
-        for driver in Driver::ALL {
-            page.add(&self.agent_group(driver, dialog));
-        }
-        dialog.add(&page);
+        default_row
     }
 
     fn agent_group(
@@ -211,13 +216,22 @@ impl AgentTerminalWindow {
         driver: Driver,
         dialog: &adw::PreferencesDialog,
     ) -> adw::PreferencesGroup {
-        let obj = self.obj();
         let profile = self.agent_profile_now(driver);
         let group = adw::PreferencesGroup::builder()
             .title(driver.info().long_label)
             .description(format!("Profile “{}”", profile.name))
             .build();
+        group.add(&self.agent_enabled_row(driver, dialog.upcast_ref()));
+        group.add(&self.agent_account_row(driver, dialog.upcast_ref()));
+        self.add_agent_detail_rows(&group, driver, &profile, dialog);
+        group
+    }
 
+    /// `driver`'s on/off switch, saying what detection found (ready and where, missing and how to
+    /// install, or off). Follows the scan until `dialog` closes.
+    pub(super) fn agent_enabled_row(&self, driver: Driver, dialog: &adw::Dialog) -> adw::SwitchRow {
+        let obj = self.obj();
+        let profile = self.agent_profile_now(driver);
         let enabled = adw::SwitchRow::builder()
             .title("Enabled")
             .subtitle(AgentAvailability::shared().get(driver).describe(driver))
@@ -237,7 +251,6 @@ impl AgentTerminalWindow {
                 imp.refresh_agent_data();
             }
         ));
-        group.add(&enabled);
         // The row says what detection found: ready (where), missing (how to install), or off.
         let state_id = AgentAvailability::shared().connect_changed(glib::clone!(
             #[weak]
@@ -247,8 +260,14 @@ impl AgentTerminalWindow {
             }
         ));
         dialog.connect_closed(move |_| AgentAvailability::shared().disconnect(state_id));
+        enabled
+    }
 
-        // Who is signed in: an installed agent nobody signed in to cannot run a turn.
+    /// Who is signed in to `driver`, with Sign In (then Check Again) when nobody is: an installed
+    /// agent nobody signed in to cannot run a turn. Shown only while the agent is in use; follows
+    /// detection and the account checks until `dialog` closes.
+    pub(super) fn agent_account_row(&self, driver: Driver, dialog: &adw::Dialog) -> adw::ActionRow {
+        let obj = self.obj();
         let account = adw::ActionRow::builder()
             .title("Account")
             .use_markup(false)
@@ -305,8 +324,19 @@ impl AgentTerminalWindow {
             AgentAvailability::shared().disconnect(ready_id);
             crate::account_status::AccountStatus::shared().disconnect(account_id);
         });
-        group.add(&account);
+        account
+    }
 
+    /// The rest of `driver`'s Settings rows: command, arguments, env file, defaults, and agy's
+    /// hook.
+    fn add_agent_detail_rows(
+        &self,
+        group: &adw::PreferencesGroup,
+        driver: Driver,
+        profile: &Profile,
+        dialog: &adw::PreferencesDialog,
+    ) {
+        let obj = self.obj();
         // Command, with what detection makes of it.
         // Shows a path: plain text, not markup (an `&` or `<` in it would blank the row).
         let status = adw::ActionRow::builder()
@@ -591,9 +621,8 @@ impl AgentTerminalWindow {
         group.add(&effort_row);
 
         if driver == Driver::Agy {
-            self.add_hook_rows(&group);
+            self.add_hook_rows(group);
         }
-        group
     }
 
     /// agy's approval hook: whether hooks.json installs it, the entry to add, and a Copy button.
