@@ -450,8 +450,12 @@ fn load_css() {
             padding-top: 10px;
         }
         .folder-label {
-            color: #8a84b8;
+            color: #a8a2dc;
             margin-left: 6px;
+        }
+        .dim-label {
+            opacity: 1.0;
+            color: #9c97c7;
         }
         .thread-row {
             padding: 2px 2px;
@@ -513,7 +517,7 @@ fn load_css() {
         }
         headerbar .subtitle {
             font-size: 9pt;
-            color: #8a84b8;
+            color: #a8a2dc;
         }
         ",
     );

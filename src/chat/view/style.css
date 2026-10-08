@@ -358,6 +358,37 @@ togglebutton.option-button, button.option-button {
 .plan-step.step-done .step-glyph { color: #4ee8b0; }
 .plan-step.step-done .step-text { color: #6d6794; }
 
+/* sticky interruption shelf */
+.interruption-shelf {
+    padding: 8px 14px;
+    border-radius: 12px;
+    background-color: #221c37;
+    border: 1px solid alpha(#ffc46b, 0.45);
+    background-image: linear-gradient(180deg, alpha(#ffc46b, 0.10), alpha(#ffc46b, 0.02) 100%);
+    box-shadow: 0 4px 12px alpha(#000000, 0.35);
+}
+.interruption-shelf.is-question {
+    border-color: alpha(#5b9cf6, 0.45);
+    background-image: linear-gradient(180deg, alpha(#5b9cf6, 0.10), alpha(#5b9cf6, 0.02) 100%);
+}
+.interruption-icon {
+    color: #ffc46b;
+    font-size: 1.2em;
+}
+.interruption-shelf.is-question .interruption-icon {
+    color: #5b9cf6;
+}
+.interruption-title {
+    color: #ebe9ff;
+    font-weight: 700;
+    font-size: 0.95em;
+}
+.interruption-preview {
+    color: #a8a2dc;
+    font-family: monospace;
+    font-size: 0.88em;
+}
+
 .composer {
     padding: 6px 6px 6px 6px;
     border-radius: 16px;

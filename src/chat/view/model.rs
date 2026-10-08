@@ -212,6 +212,24 @@ pub enum QuestionState {
     Expired,
 }
 
+/// An unhandled approval or question requiring operator attention.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingInterruption {
+    Approval {
+        request: String,
+        item_id: ItemId,
+        tool: String,
+        title: Option<String>,
+        input: Value,
+        options: Vec<Decision>,
+    },
+    Question {
+        request: String,
+        item_id: ItemId,
+        questions: Vec<Question>,
+    },
+}
+
 /// Context-window occupancy for the header gauge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gauge {
@@ -372,6 +390,35 @@ impl Transcript {
     /// Top-level items in display order.
     pub fn order(&self) -> &[ItemId] {
         &self.order
+    }
+
+    /// Returns the most recent unhandled approval or question requiring operator action, if any.
+    pub fn pending_interruption(&self) -> Option<PendingInterruption> {
+        for id in self.order.iter().rev() {
+            if let Some(item) = self.items.get(id) {
+                match &item.body {
+                    Body::Approval(a) if a.state == ApprovalState::Pending => {
+                        return Some(PendingInterruption::Approval {
+                            request: a.request.clone(),
+                            item_id: id.clone(),
+                            tool: a.tool.clone(),
+                            title: a.title.clone(),
+                            input: a.input.clone(),
+                            options: a.options.clone(),
+                        });
+                    }
+                    Body::Question(q) if q.state == QuestionState::Pending => {
+                        return Some(PendingInterruption::Question {
+                            request: q.request.clone(),
+                            item_id: id.clone(),
+                            questions: q.questions.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 
     /// Whether `id` is a sub-agent or one of its steps (at any depth): what the explorer shows.
@@ -1293,7 +1340,12 @@ mod tests {
             t.item_for_request("r1").map(String::as_str),
             Some("approval:r1")
         );
+        assert!(matches!(
+            t.pending_interruption(),
+            Some(PendingInterruption::Approval { ref request, .. }) if request == "r1"
+        ));
         t.mark_approval_sent("r1", Decision::Allow);
+        assert_eq!(t.pending_interruption(), None);
         let state = |t: &Transcript| match &t.get("approval:r1").expect("card").body {
             Body::Approval(a) => a.state,
             _ => panic!("not an approval"),

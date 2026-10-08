@@ -19,6 +19,7 @@ mod composer;
 pub mod demo;
 mod difftext;
 mod header;
+mod interruption;
 mod markdown;
 pub mod model;
 mod panels;
@@ -135,6 +136,7 @@ pub(crate) struct Inner {
     composer: Rc<Composer>,
     header: Header,
     plan: PlanPanel,
+    interruption: interruption::InterruptionShelf,
     requests: Rc<Requests>,
     /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
     models: RefCell<Option<Rc<dyn ModelSource>>>,
@@ -183,6 +185,12 @@ impl ChatView {
                     inner.open_subagent(id);
                 }
             });
+            let w = weak.clone();
+            let interruption = interruption::InterruptionShelf::new(sink.clone(), move |id| {
+                if let Some(inner) = w.upgrade() {
+                    inner.transcript.scroll_to_card(&id);
+                }
+            });
             Inner {
                 backend,
                 model: Rc::new(RefCell::new(Transcript::new())),
@@ -190,6 +198,7 @@ impl ChatView {
                 composer: Composer::new(),
                 header: Header::new(),
                 plan: PlanPanel::new(),
+                interruption,
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
                 model_conn: Cell::new(None),
@@ -218,6 +227,7 @@ impl ChatView {
         clamp.set_tightening_threshold(640);
         let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         column.append(&inner.plan.revealer);
+        column.append(&inner.interruption.revealer);
         column.append(inner.composer.widget());
         clamp.set_child(Some(&column));
         bottom.append(&clamp);
@@ -288,6 +298,7 @@ impl ChatView {
         inner.transcript.reset(&inner.model.borrow());
         let model = inner.model.borrow();
         inner.plan.set(&model.plan);
+        inner.interruption.update(&model);
         inner.header.set_gauge(model.gauge.as_ref());
         if let Some(mode) = model.mode {
             inner.header.set_mode(mode);
@@ -488,6 +499,7 @@ impl Inner {
         }
         // Model and agent changes arrive as several event kinds; the header is cheap to redo.
         self.refresh_agent_chip();
+        self.interruption.update(&self.model.borrow());
     }
 
     fn queue_flush(self: &Rc<Self>) {
@@ -577,6 +589,7 @@ impl Inner {
         self.header
             .gauge
             .set_sensitive(status.capabilities.context_usage);
+        self.interruption.update(&self.model.borrow());
         self.composer.refresh_placeholder();
     }
 
@@ -868,7 +881,11 @@ impl ComposerHost for Inner {
     }
 
     fn placeholder(&self) -> String {
-        placeholder_text(&self.backend.status())
+        if self.model.borrow().pending_interruption().is_some() {
+            "Awaiting approval above...".to_owned()
+        } else {
+            placeholder_text(&self.backend.status())
+        }
     }
 }
 
@@ -2217,5 +2234,41 @@ pub(crate) mod tests {
             t.mark_approval_sent("r", Decision::Allow),
             vec![Change::Updated("approval:r".into())]
         );
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone: cargo test interruption_shelf -- --ignored"]
+    fn interruption_shelf_reveals_and_collapses() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let shelf = interruption::InterruptionShelf::new(
+            Rc::new(move |e| sent.borrow_mut().push(e)),
+            |_| {},
+        );
+        let mut t = Transcript::new();
+        shelf.update(&t);
+        assert!(!shelf.revealer.reveals_child());
+
+        t.apply(
+            &Envelope::new(agent_core::event::Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command": "cargo check"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1"),
+            Driver::Claude,
+        );
+        shelf.update(&t);
+        assert!(shelf.revealer.reveals_child());
+
+        t.mark_approval_sent("r1", Decision::Allow);
+        shelf.update(&t);
+        assert!(!shelf.revealer.reveals_child());
     }
 }

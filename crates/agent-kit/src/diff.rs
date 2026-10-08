@@ -217,6 +217,66 @@ pub fn truncate(diff: &str, max_bytes: usize, max_lines: usize) -> (&str, usize)
     (&diff[..end], total - kept)
 }
 
+/// Extracts all candidate file paths touched or modified by the thread's events.
+pub fn touched_paths_from_envelopes(
+    envelopes: &[agent_core::event::Envelope],
+) -> Vec<std::path::PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    for env in envelopes {
+        match &env.event {
+            agent_core::event::Event::ItemStarted {
+                input: Some(val), ..
+            } => {
+                for edit in crate::editdiff::preview_from_input(val) {
+                    paths.insert(std::path::PathBuf::from(edit.path));
+                }
+                if let Some(path_str) = val
+                    .get("file_path")
+                    .or_else(|| val.get("path"))
+                    .or_else(|| val.get("TargetFile"))
+                    .or_else(|| val.get("AbsolutePath"))
+                    .and_then(|v| v.as_str())
+                {
+                    paths.insert(std::path::PathBuf::from(path_str));
+                }
+            }
+            agent_core::event::Event::ApprovalRequested { input, .. } => {
+                for edit in crate::editdiff::preview_from_input(input) {
+                    paths.insert(std::path::PathBuf::from(edit.path));
+                }
+                if let Some(path_str) = input
+                    .get("file_path")
+                    .or_else(|| input.get("path"))
+                    .or_else(|| input.get("TargetFile"))
+                    .or_else(|| input.get("AbsolutePath"))
+                    .and_then(|v| v.as_str())
+                {
+                    paths.insert(std::path::PathBuf::from(path_str));
+                }
+            }
+            _ => {}
+        }
+    }
+    paths.into_iter().collect()
+}
+
+/// Discovers the enclosing git repository root for the touched file paths, if any.
+pub fn discover_enclosing_repo(paths: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    for path in paths {
+        let check_dir = if path.is_file() {
+            path.parent()
+        } else {
+            Some(path.as_path())
+        };
+        if let Some(dir) = check_dir {
+            if let Ok(Some(repo)) = crate::git::discover(dir) {
+                return Some(repo.toplevel);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +416,33 @@ mod tests {
         // A multi-byte line that does not fit is dropped whole, never split.
         let wide = "é\n日本語\n";
         assert_eq!(truncate(wide, 5, 100), ("é\n", 1));
+    }
+
+    #[test]
+    fn touched_paths_extracted_from_events() {
+        use agent_core::event::{Envelope, Event, ItemKind};
+        let env1 = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::FileChange,
+            title: "edit".into(),
+            input: Some(serde_json::json!({"file_path": "src/foo.rs"})),
+            parent: None,
+        });
+        let env2 = Envelope::new(Event::ApprovalRequested {
+            tool: "write_to_file".into(),
+            title: None,
+            input: serde_json::json!({"TargetFile": "/path/to/bar.rs"}),
+            reason: None,
+            options: vec![],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        });
+        let paths = touched_paths_from_envelopes(&[env1, env2]);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("/path/to/bar.rs"),
+                std::path::PathBuf::from("src/foo.rs")
+            ]
+        );
     }
 }

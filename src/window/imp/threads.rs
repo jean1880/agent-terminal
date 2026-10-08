@@ -1918,12 +1918,14 @@ impl AgentTerminalWindow {
 
         let diff_panel = DiffPanel::new(&Theme::diff_colours(config.theme));
         diff_panel.set_shown(config.diff_panel_visible);
+        drawer_paned.set_size_request(440, -1);
         let paned = gtk4::Paned::builder()
             .orientation(Orientation::Horizontal)
             .start_child(&drawer_paned)
             .end_child(&diff_panel.root)
             .resize_start_child(true)
             .resize_end_child(false)
+            .shrink_start_child(false)
             .shrink_end_child(false)
             .vexpand(true)
             .build();

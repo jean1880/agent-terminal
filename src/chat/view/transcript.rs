@@ -442,6 +442,23 @@ impl TranscriptView {
         self.move_to(adj.upper() - adj.page_size());
     }
 
+    /// Scrolls the transcript to the row for `id`, or to the end if not found.
+    pub fn scroll_to_card(&self, id: &str) {
+        if let Some(row) = self.rows.borrow().get(id) {
+            if let Some(bounds) = row.widget().compute_bounds(&self.scroller) {
+                let adj = self.scroller.vadjustment();
+                let target = adj.value() + f64::from(bounds.y()) - 40.0;
+                self.stick.set(false);
+                self.move_to(target.clamp(
+                    adj.lower(),
+                    (adj.upper() - adj.page_size()).max(adj.lower()),
+                ));
+                return;
+            }
+        }
+        self.scroll_to_end();
+    }
+
     /// Rebuilds everything from the model (initial load, or a thread swap).
     pub fn reset(&self, model: &Transcript) {
         for (_, row) in self.rows.borrow_mut().drain() {

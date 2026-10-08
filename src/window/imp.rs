@@ -2041,12 +2041,14 @@ impl AgentTerminalWindow {
             let config = self.config.borrow();
             let panel = DiffPanel::new(&Theme::diff_colours(config.theme));
             panel.set_shown(config.diff_panel_visible);
+            stack.set_size_request(440, -1);
             let paned = gtk4::Paned::builder()
                 .orientation(Orientation::Horizontal)
                 .start_child(&stack)
                 .end_child(&panel.root)
                 .resize_start_child(true)
                 .resize_end_child(false)
+                .shrink_start_child(false)
                 .shrink_end_child(false)
                 .vexpand(true)
                 .build();
@@ -4372,12 +4374,19 @@ impl AgentTerminalWindow {
 
     /// Recomputes `page`'s diff off the main thread, if its panel is showing.
     fn refresh_diff(&self, page: &adw::TabPage) {
-        let Some((dir, key, panel)) = self
+        let Some((dir, key, thread_id, panel)) = self
             .tabs
             .borrow()
             .iter()
             .find(|t| &t.page == page)
-            .map(|t| (t.dir.clone(), t.key, t.diff_panel.clone()))
+            .map(|t| {
+                (
+                    t.dir.clone(),
+                    t.key,
+                    t.chat.as_ref().map(|c| c.thread.clone()),
+                    t.diff_panel.clone(),
+                )
+            })
         else {
             return;
         };
@@ -4387,11 +4396,34 @@ impl AgentTerminalWindow {
         let base = panel.base();
         let generation = panel.begin();
         glib::MainContext::default().spawn_local(async move {
-            let result = gtk4::gio::spawn_blocking(move || {
-                crate::git::tab_diff(std::path::Path::new(&dir), key, base)
+            let initial = gtk4::gio::spawn_blocking({
+                let dir = dir.clone();
+                move || crate::git::tab_diff(std::path::Path::new(&dir), key, base)
             })
             .await
             .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+
+            let result = match (initial, thread_id) {
+                (Ok(crate::git::DiffOutcome::NotRepo), Some(tid)) => {
+                    let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
+                        .await
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    let paths = crate::diff::touched_paths_from_envelopes(
+                        &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
+                    );
+                    if let Some(repo_dir) = crate::diff::discover_enclosing_repo(&paths) {
+                        gtk4::gio::spawn_blocking(move || {
+                            crate::git::tab_diff(&repo_dir, key, base)
+                        })
+                        .await
+                        .unwrap_or_else(|_| Err("the diff thread panicked".to_string()))
+                    } else {
+                        Ok(crate::git::DiffOutcome::NotRepo)
+                    }
+                }
+                (res, _) => res,
+            };
             panel.show(generation, result);
         });
     }
@@ -4416,16 +4448,18 @@ impl AgentTerminalWindow {
             Some(rev) => crate::diff_tool::NewSide::Rev(rev),
             None => crate::diff_tool::NewSide::Working,
         };
+        let working_dir = if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(&dir)) {
+            repo.toplevel
+        } else if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(&file.path)) {
+            repo.toplevel
+        } else {
+            std::path::PathBuf::from(dir)
+        };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let result = crate::diff_tool::open_from_dir(
-                tool,
-                std::path::PathBuf::from(dir),
-                file.path,
-                file.from,
-                new_side,
-            )
-            .await;
+            let result =
+                crate::diff_tool::open_from_dir(tool, working_dir, file.path, file.from, new_side)
+                    .await;
             if let (Err(why), Some(obj)) = (result, obj.upgrade()) {
                 obj.imp().show_toast(&why);
             }
