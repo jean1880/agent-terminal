@@ -557,7 +557,7 @@ pub(super) mod tests {
             .expect("the first section holds Continue in and Switch");
         assert_eq!(
             gio_menu_labels_of(&section),
-            ["Continue in", "Switch this thread to"]
+            ["Continue in a new thread", "Switch this thread to"]
         );
         let housekeeping = model.item_link(1, "section").expect("second section");
         assert_eq!(

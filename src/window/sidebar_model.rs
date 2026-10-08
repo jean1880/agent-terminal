@@ -317,7 +317,7 @@ pub fn safe_handoff_target(
         .or_else(|| handoff_target(from, &usable).map(|d| (d, unasked(d))))
 }
 
-/// The "Continue in" button for a target from [`safe_handoff_target`].
+/// The "Continue in a new thread" button for a target from [`safe_handoff_target`].
 pub fn continue_label(target: Driver, unasked: bool) -> String {
     if unasked {
         format!(
@@ -479,7 +479,7 @@ pub struct MenuAgent {
 pub struct ThreadMenuInput {
     pub thread: String,
     pub archived: bool,
-    /// The thread has at least one message to hand over ("Continue in" needs one).
+    /// The thread has at least one message to hand over ("Continue in a new thread" needs one).
     pub has_messages: bool,
     /// Only enabled (and installed) agents appear.
     pub agents: Vec<MenuAgent>,
@@ -589,7 +589,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
     let thread = input.thread.clone();
     let t = thread.clone();
     let continue_in = by_agent(
-        "Continue in",
+        "Continue in a new thread",
         input.has_messages,
         &move |driver, model, effort| ThreadAction::ContinueIn {
             thread: t.clone(),
@@ -860,7 +860,7 @@ mod tests {
             entries: agents,
             enabled,
             ..
-        } = submenu(&menu, "Continue in")
+        } = submenu(&menu, "Continue in a new thread")
         else {
             panic!("a submenu");
         };
@@ -882,7 +882,7 @@ mod tests {
         );
         // Plain labels: no emoji (a PopoverMenu submenu entry draws no icon).
         assert!(labels.iter().all(|l| l.is_ascii()));
-        let all = items(&[submenu(&menu, "Continue in").clone()]);
+        let all = items(&[submenu(&menu, "Continue in a new thread").clone()]);
         let claude: Vec<_> = all
             .iter()
             .filter(|(_, a, _)| {
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn continue_is_disabled_without_messages_and_empty_without_agents() {
         let menu = thread_menu(&input(false, false));
-        let cont = items(&[submenu(&menu, "Continue in").clone()]);
+        let cont = items(&[submenu(&menu, "Continue in a new thread").clone()]);
         assert!(!cont.is_empty() && cont.iter().all(|(_, _, on)| !on));
         // Switching in place does not need a history.
         let switch = items(&[submenu(&menu, "Switch this thread to").clone()]);
@@ -954,7 +954,7 @@ mod tests {
         let mut none = input(true, false);
         none.agents.clear();
         let menu = thread_menu(&none);
-        for label in ["Continue in", "Switch this thread to"] {
+        for label in ["Continue in a new thread", "Switch this thread to"] {
             assert!(matches!(
                 submenu(&menu, label),
                 MenuEntry::Submenu { enabled: false, entries, .. } if entries.is_empty()

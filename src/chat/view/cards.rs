@@ -464,8 +464,9 @@ impl Row {
                 driver,
                 model,
                 agent_changed,
+                returned,
             } => {
-                let text = switch_text(*driver, model.as_deref(), *agent_changed);
+                let text = switch_text(*driver, model.as_deref(), *agent_changed, *returned);
                 Self::Static(divider(&text, "switch-divider", Some(*driver)))
             }
             Body::Approval(_) => Self::Approval(ApprovalCard::new(sink)),
@@ -529,8 +530,19 @@ pub fn compaction_text(manual: bool, before: u64, after: Option<u64>) -> String 
     }
 }
 
-pub fn switch_text(driver: Driver, model: Option<&str>, agent_changed: bool) -> String {
+/// The divider's text. Back on an agent the thread used before, it says the session is new (from
+/// a summary): the earlier session is not resumed, and "Continued in" read as if it were.
+pub fn switch_text(
+    driver: Driver,
+    model: Option<&str>,
+    agent_changed: bool,
+    returned: bool,
+) -> String {
     match (agent_changed, model) {
+        (true, _) if returned => format!(
+            "Back in {} · new session from a summary",
+            driver_name(driver)
+        ),
         (true, Some(m)) => format!("Continued in {} · {m}", driver_name(driver)),
         (true, None) => format!("Continued in {}", driver_name(driver)),
         (false, Some(m)) => format!("Model switched to {m}"),
@@ -1560,11 +1572,15 @@ mod tests {
             "Context auto-compacted (was 150k)"
         );
         assert_eq!(
-            switch_text(Driver::Agy, Some("gemini-3.1-pro"), true),
+            switch_text(Driver::Agy, Some("gemini-3.1-pro"), true, false),
             "Continued in Antigravity · gemini-3.1-pro"
         );
         assert_eq!(
-            switch_text(Driver::Claude, Some("sonnet"), false),
+            switch_text(Driver::Claude, Some("opus"), true, true),
+            "Back in Claude · new session from a summary"
+        );
+        assert_eq!(
+            switch_text(Driver::Claude, Some("sonnet"), false, false),
             "Model switched to sonnet"
         );
     }

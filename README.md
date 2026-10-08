@@ -133,13 +133,23 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Pick a model from any agent** in the header chip (or type `/model`). The list covers
   every Claude, Antigravity and Codex model, with search and effort levels. A model of the
   same agent switches in place. A model of another agent continues the thread there.
-- **The conversation comes with it.** The next message carries a summary of the thread so
-  far, built within a token budget and redacted (keys and tokens masked). A divider marks
-  where the thread changed hands, and each reply is labelled with the agent that wrote it.
-- **Switch back whenever you like.** Returning to an agent works the same way: it starts a
-  fresh session carrying the whole thread, including what the other agent did in between.
+- **The conversation comes with it.** The next message carries the thread so far, within
+  a token budget: all of it when it fits, otherwise the first request and the most recent
+  work, and the notice says which ("40 of 112 messages"). It is redacted (keys and tokens
+  masked), tool output is shortened and fenced off so it cannot pass for your words, and
+  reasoning is not carried. It survives a restart: the new agent gets it with your next
+  message, however much later that is. A divider marks where the thread changed hands, and
+  each reply is labelled with the agent that wrote it.
+- **Switch back whenever you like.** Returning to an agent works the same way: a fresh
+  session from a summary of the thread, including what the other agent did in between (the
+  divider says "Back in Claude · new session from a summary").
+- **Safe by default.** A switch while the agent is working asks first. If the new agent
+  cannot start (it fails to launch, or exits before its session begins), the thread goes
+  back to the old one. Your chosen
+  mode carries over and survives a reopen, and an automatic hand-off never lands on
+  Antigravity without its approval hook while the thread does not allow unasked edits.
 - **Out of quota? Keep going.** When an agent hits its limit, the thread offers
-  **Continue in <other agent>**, and so does the desktop notification.
+  **Continue in <other agent>**.
 - **Fork instead of switching**: `/fork` starts a new thread with this one's history, so
   two agents can take the same problem in different directions.
 
@@ -193,7 +203,8 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
     follows it as it changes. Terminals get the desktop's text and background with
     VTE's standard colours.
 - **Notifications** when a thread you aren't looking at finishes, needs your approval,
-  or runs out of quota. The quota notification has a **Continue in…** button.
+  or runs out of quota. For a terminal thread, the quota notification has a **Continue in…**
+  button; a chat thread offers it in the thread itself.
 - **Settings apply as you change them**, to every window, and are saved to
   `~/.config/agent-terminal/config.json`. Hand edits to that file are picked up while
   the app runs.

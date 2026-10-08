@@ -338,11 +338,9 @@ impl ChatSession {
         if handoff.carried == 0 {
             return;
         }
-        let carried = handoff.carried;
+        let text = handoff_notice(&format!("from {source}"), &handoff);
         self.inner.arm_handoff(handoff);
-        self.inner.emit(Envelope::new(Event::Notice {
-            text: format!("Continuing from {source} with {carried} earlier messages"),
-        }));
+        self.inner.emit(Envelope::new(Event::Notice { text }));
     }
 
     /// Re-arms a handoff found stored and undelivered in the thread's history (see
@@ -1235,22 +1233,18 @@ impl Inner {
             },
         );
         *self.rollback.borrow_mut() = Some(previous);
+        let text = if carried == 0 {
+            format!("Switched to {}", driver_label(driver))
+        } else {
+            handoff_notice(&format!("in {}", driver_label(driver)), &handoff)
+        };
         if carried > 0 {
             self.arm_handoff(handoff);
         } else {
             self.handoff_in_flight.set(false);
             *self.pending_handoff.borrow_mut() = None;
         }
-        self.emit(Envelope::new(Event::Notice {
-            text: if carried == 0 {
-                format!("Switched to {}", driver_label(driver))
-            } else {
-                format!(
-                    "Continuing in {} with {carried} earlier messages",
-                    driver_label(driver)
-                )
-            },
-        }));
+        self.emit(Envelope::new(Event::Notice { text }));
         if let Some(m) = model {
             self.emit(Envelope::new(Event::ModelChanged { model: m }));
         }
@@ -1479,6 +1473,28 @@ pub(crate) fn chosen_mode<'a>(events: impl IntoIterator<Item = &'a Envelope>) ->
             _ => None,
         })
         .last()
+}
+
+/// What a handoff carried, said plainly: all of the thread, or how much of it (the budget keeps
+/// the first request and the most recent work), and what never travels. `place` reads after
+/// "Continuing": "in Codex", "from “title”".
+fn handoff_notice(place: &str, handoff: &Handoff) -> String {
+    const NEVER: &str =
+        "Reasoning and tool state are not carried, and long tool output is shortened.";
+    if handoff.total == 1 {
+        format!("Continuing {place} with the 1 earlier message. {NEVER}")
+    } else if handoff.carried >= handoff.total {
+        format!(
+            "Continuing {place} with all {} earlier messages. {NEVER}",
+            handoff.total
+        )
+    } else {
+        format!(
+            "Continuing {place} with {} of {} earlier messages (the first request and the most \
+             recent work). {NEVER}",
+            handoff.carried, handoff.total
+        )
+    }
 }
 
 /// A fresh handoff fence: a random UUID without its dashes (32 hex digits), so carried text cannot
@@ -2604,7 +2620,7 @@ mod tests {
             assert_eq!(status.model.as_deref(), Some("opus"));
             assert!(status.alive);
             assert!(has(&seen, |e| matches!(e, Event::Notice { text }
-                if text == "Continuing in Claude with 2 earlier messages")));
+                if text.starts_with("Continuing in Claude with all 2 earlier messages."))));
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChanged { model } if model == "opus")
@@ -2718,6 +2734,33 @@ mod tests {
             session.set_mode(Mode::AcceptEdits);
             assert_eq!(chosen(), Some(Mode::AcceptEdits));
         });
+    }
+
+    /// The notice says how much of the thread a handoff carried, and what never travels.
+    #[test]
+    fn a_handoff_notice_says_how_much_was_carried() {
+        let h = |carried, total| Handoff {
+            summary: String::new(),
+            fence: String::new(),
+            carried,
+            total,
+        };
+        let all = handoff_notice("in Codex", &h(12, 12));
+        assert!(
+            all.starts_with("Continuing in Codex with all 12 earlier messages."),
+            "{all}"
+        );
+        let some = handoff_notice("in Codex", &h(40, 112));
+        assert!(
+            some.starts_with("Continuing in Codex with 40 of 112 earlier messages"),
+            "{some}"
+        );
+        assert!(some.contains("not carried"), "{some}");
+        let one = handoff_notice("in Codex", &h(1, 1));
+        assert!(
+            one.starts_with("Continuing in Codex with the 1 earlier message."),
+            "{one}"
+        );
     }
 
     #[test]

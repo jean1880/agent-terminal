@@ -58,6 +58,8 @@ pub enum Body {
         driver: Driver,
         model: Option<String>,
         agent_changed: bool,
+        /// The thread was on this agent before: a new session from a summary, not a resume.
+        returned: bool,
     },
     Approval(Approval),
     Question(QuestionCard),
@@ -367,6 +369,8 @@ pub struct Transcript {
     /// A turn has run in this thread.
     ran: bool,
     last_driver: Option<Driver>,
+    /// Every agent the thread has been on, so a switch back can say it is not a resume.
+    seen_drivers: Vec<Driver>,
     last_model: Option<String>,
     /// The assistant/reasoning item that item-less deltas belong to.
     open_text: Option<ItemId>,
@@ -651,9 +655,10 @@ impl Transcript {
                     && self.last_model.is_some()
                     && model.as_deref() != self.last_model.as_deref();
                 if agent_changed || model_changed {
-                    out.extend(self.push_switch(driver, model.clone(), agent_changed));
+                    let returned = agent_changed && self.seen_drivers.contains(&driver);
+                    out.extend(self.push_switch(driver, model.clone(), agent_changed, returned));
                 }
-                self.last_driver = Some(driver);
+                self.on_driver(driver);
                 if model.is_some() {
                     self.last_model.clone_from(model);
                 }
@@ -682,11 +687,11 @@ impl Transcript {
             Event::CommandsChanged { .. } => out.push(Change::Commands),
             Event::TurnStarted { model } => {
                 if self.last_driver.is_none() {
-                    self.last_driver = Some(driver);
+                    self.on_driver(driver);
                 }
                 if let Some(m) = model {
                     if self.last_model.as_deref().is_some_and(|last| last != m) {
-                        out.extend(self.push_switch(driver, Some(m.clone()), false));
+                        out.extend(self.push_switch(driver, Some(m.clone()), false, false));
                     }
                     self.last_model = Some(m.clone());
                 }
@@ -938,7 +943,7 @@ impl Transcript {
             Event::ModelChanged { model } => {
                 if self.last_model.as_deref() != Some(model.as_str()) {
                     if self.last_model.is_some() {
-                        out.extend(self.push_switch(driver, Some(model.clone()), false));
+                        out.extend(self.push_switch(driver, Some(model.clone()), false, false));
                     }
                     self.last_model = Some(model.clone());
                 }
@@ -981,11 +986,20 @@ impl Transcript {
         out
     }
 
+    /// The thread is on `driver` now.
+    fn on_driver(&mut self, driver: Driver) {
+        self.last_driver = Some(driver);
+        if !self.seen_drivers.contains(&driver) {
+            self.seen_drivers.push(driver);
+        }
+    }
+
     fn push_switch(
         &mut self,
         driver: Driver,
         model: Option<String>,
         agent_changed: bool,
+        returned: bool,
     ) -> Vec<Change> {
         let id = self.next_id("switch");
         let id = self.insert(
@@ -994,6 +1008,7 @@ impl Transcript {
                 driver,
                 model,
                 agent_changed,
+                returned,
             },
             None,
         );
@@ -1577,6 +1592,7 @@ mod tests {
                 driver,
                 model,
                 agent_changed,
+                ..
             } => {
                 assert_eq!(*driver, Driver::Agy);
                 assert_eq!(model.as_deref(), Some("gemini"));
