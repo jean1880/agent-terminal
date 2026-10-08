@@ -156,6 +156,10 @@ struct Inner {
     local_seq: Cell<u64>,
     /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
     generation: Cell<u64>,
+    /// Bumped when the adapter is replaced (a switch to another agent, a rollback); unlike
+    /// `generation`, a restart of the same agent keeps it. A side process (agy's usage or model
+    /// list) that finishes after a switch is answered with an error, never fed to the new agent.
+    adapter_epoch: Cell<u64>,
     /// The mode the user last chose. The running mode can differ (agy without its hook cannot
     /// ask), and a switch to an agent that can honour it goes back to it.
     wanted_mode: Cell<Mode>,
@@ -307,6 +311,7 @@ impl ChatSession {
             ctl_seq: Cell::new(0),
             local_seq: Cell::new(0),
             generation: Cell::new(0),
+            adapter_epoch: Cell::new(0),
             wanted_mode: Cell::new(wanted_mode),
         });
         inner.attach_approval();
@@ -823,15 +828,33 @@ impl Inner {
         let cwd = Some(self.open.borrow().cwd.clone()).filter(|c| !c.is_empty());
         let env = self.launch_env.borrow().clone();
         let weak = Rc::downgrade(self);
+        let epoch = self.adapter_epoch.get();
         glib::spawn_future_local(async move {
             let (stdout, ok) = run_side(argv, cwd, &env, AGY_TIMEOUT).await;
             let Some(inner) = weak.upgrade() else { return };
-            let envelopes = inner.adapter.borrow_mut().feed_side(&id, &stdout, ok);
-            for env in envelopes {
-                inner.emit(env);
-            }
-            inner.drain_outbox();
+            inner.finish_side(epoch, &id, &stdout, ok);
         });
+    }
+
+    /// A side process's result, for the adapter that started it (`epoch`). The thread switched
+    /// agent meanwhile: its request is answered with an error (so nothing waits on it forever)
+    /// and the output is dropped, rather than fed to the new agent's adapter.
+    fn finish_side(self: &Rc<Self>, epoch: u64, id: &str, stdout: &str, ok: bool) {
+        if epoch != self.adapter_epoch.get() {
+            self.emit(
+                Envelope::new(Event::ControlResult {
+                    ok: None,
+                    error: Some("the thread switched agent before this finished".to_owned()),
+                })
+                .request(id),
+            );
+            return;
+        }
+        let envelopes = self.adapter.borrow_mut().feed_side(id, stdout, ok);
+        for env in envelopes {
+            self.emit(env);
+        }
+        self.drain_outbox();
     }
 
     /// Stops the process and starts a new one with `delta` applied (the adapter set
@@ -1270,6 +1293,7 @@ impl Inner {
     ) -> (Mode, bool, bool) {
         *self.provider_thread.borrow_mut() = pt;
         *self.adapter.borrow_mut() = launch.adapter;
+        self.adapter_epoch.set(self.adapter_epoch.get() + 1);
         *self.launch_env.borrow_mut() = launch.env;
         let (approval, unbound) = match launch.approval {
             Ok(handle) => (Some(handle), None),
@@ -2733,6 +2757,39 @@ mod tests {
 
             session.set_mode(Mode::AcceptEdits);
             assert_eq!(chosen(), Some(Mode::AcceptEdits));
+        });
+    }
+
+    /// A side process (agy's usage, say) that finishes after the thread switched agent answers
+    /// its request with an error; its output never reaches the new agent's adapter.
+    #[test]
+    fn a_side_result_from_before_a_switch_is_answered_not_fed_to_the_new_agent() {
+        in_loop(|_| {
+            let (_, _, _, session, seen, _) =
+                agy_thread_switching_to(FakeAdapter::unboxed_dyn, FakeAdapter::unboxed_dyn);
+            let before = session.inner.adapter_epoch.get();
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            assert_ne!(session.inner.adapter_epoch.get(), before);
+
+            let errors = |id: &str| {
+                seen.borrow()
+                    .iter()
+                    .filter(|e| {
+                        e.request.as_deref() == Some(id)
+                            && matches!(&e.event, Event::ControlResult { error: Some(_), .. })
+                    })
+                    .count()
+            };
+            session
+                .inner
+                .finish_side(before, "ctl-old", "{\"usage\":1}", true);
+            assert_eq!(errors("ctl-old"), 1, "the stale request is answered");
+
+            // A result for the current agent goes to its adapter as before (the fake adapter
+            // answers nothing).
+            let now = session.inner.adapter_epoch.get();
+            session.inner.finish_side(now, "ctl-new", "{}", true);
+            assert_eq!(errors("ctl-new"), 0);
         });
     }
 
