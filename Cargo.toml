@@ -1,6 +1,6 @@
 [package]
 name = "agent-terminal"
-version = "3.0.1"
+version = "3.0.2"
 
 edition = "2021"
 authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
