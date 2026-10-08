@@ -1828,8 +1828,9 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Reopens the threads open when the app last closed (first window of a launch only).
-    /// Only the one in view is built now; the rest are built when first shown.
+    /// Reopens the threads open when the app last closed (first window of a launch only, and
+    /// only with `reopen_last_thread`). Only the one in view is built now; the rest are built
+    /// when first shown.
     ///
     /// The stored list is read off the main thread, so the reopening lands a moment later. The
     /// saved selection is then applied only when nothing else has been put in view meanwhile (a
@@ -1877,6 +1878,11 @@ impl AgentTerminalWindow {
         threads: Vec<agent_kit::store::ThreadSummary>,
         before: usize,
     ) {
+        // Off (the default), the window starts on no thread; the list is still recorded, so
+        // turning it on later picks up where the last run left off.
+        if !self.config.borrow().reopen_last_thread {
+            return;
+        }
         let Some(value) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         else {
             return;

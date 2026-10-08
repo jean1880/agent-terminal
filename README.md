@@ -138,9 +138,12 @@ without asking first, the thread is restarted without
 - **Scrollback search**: `Ctrl + Shift + F`, with case-sensitivity and regex
   toggles.
 - **Session restore** (off by default): reopens the tabs, and their directories,
-  of the last window closed, each as a fresh session.
-- **Selectable colour themes**: Antigravity (default), Dracula, Nord, Gruvbox
-  Dark, Solarized Dark, One Dark, and Monokai — applied live to every open tab.
+  of the last window closed, each as a fresh session. **Reopen Last Thread**
+  (also off by default) does the same for chat threads, showing the one you were
+  in; off, the app starts with no thread open.
+- **Selectable colour themes**: Agent Terminal (default), Dracula, Nord, Gruvbox
+  Dark, Solarized Dark, One Dark, and Monokai — applied live to the whole app and
+  every open tab.
 - **Profiles**: any CLI, with its own arguments, directory and environment,
   defined in `config.json` — no rebuild. Auto-detection picks the first one
   installed. Resolution runs off the UI thread and is cached for the life of the

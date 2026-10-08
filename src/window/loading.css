@@ -72,13 +72,13 @@ label.splash-name {
     font-size: 22pt;
     font-weight: 800;
     letter-spacing: 0.02em;
-    color: #ebe9ff;
+    color: @at_fg_strong;
     transform-origin: top;
     animation: splash-fold-down 700ms ease-out 900ms both;
 }
 label.splash-status {
     font-size: 10pt;
-    color: #9c97c7;
+    color: mix(@at_fg_soft, @at_fg_dim, 0.5);
     animation: splash-fade 600ms ease-out 1800ms both;
 }
 
@@ -90,7 +90,7 @@ label.splash-status {
 }
 
 .bone {
-    background-color: alpha(#c8c8ff, 0.09);
+    background-color: alpha(@at_fg, 0.09);
     border-radius: 6px;
     animation: bone-pulse 900ms ease-in-out infinite alternate both;
 }
@@ -104,28 +104,28 @@ label.splash-status {
 .bone-field { border-radius: 8px; }
 .bone-bubble {
     border-radius: 14px;
-    background-color: alpha(#b49bff, 0.16);
+    background-color: alpha(@at_accent, 0.16);
 }
 .bone-card {
     border-radius: 10px;
-    background-color: alpha(#c8c8ff, 0.06);
-    border: 1px solid alpha(#c8c8ff, 0.08);
+    background-color: alpha(@at_fg, 0.06);
+    border: 1px solid alpha(@at_fg, 0.08);
 }
 .bone-composer {
     border-radius: 16px;
-    background-color: #1f1a33;
-    border: 1px solid #3b3160;
+    background-color: mix(@at_surface, @at_surface_raised, 0.4);
+    border: 1px solid @at_border_strong;
 }
 
 /* The chat view's header strip, in its padding and colours. */
 .skeleton-thread-header {
     padding: 8px 16px;
     min-height: 32px;
-    background-color: #151122;
-    border-bottom: 1px solid #2d2444;
+    background-color: @at_bg_deep;
+    border-bottom: 1px solid @at_border;
 }
 .skeleton-chat {
-    background-color: #181425;
+    background-color: @at_bg;
 }
 
 /* Nothing loading any more (a read that failed): still, so it does not promise progress. */

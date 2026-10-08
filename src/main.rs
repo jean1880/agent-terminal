@@ -24,6 +24,7 @@ mod diff_tool;
 mod hook_config;
 mod icons;
 mod model_catalog;
+mod palette;
 mod probe;
 #[cfg(test)]
 mod testutil;
@@ -357,41 +358,24 @@ fn install_panic_hook() {
     }));
 }
 
-/// Loads global application styles.
+/// Loads global application styles. Their colours are names (`@at_bg`, `@at_accent`…) that
+/// `palette::apply` defines for the chosen theme; the window applies it before it draws.
 fn load_css() {
-    // The brand chrome is dark; popovers, menus and entries follow it instead of the light
-    // default (their text would otherwise inherit the brand's pale label colour on white).
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+    // Until a window applies the configured theme: the app's own, so a name never misses.
+    palette::apply(config::ThemeChoice::default());
     let provider = CssProvider::new();
     provider.load_from_data(
         "
-        @define-color accent_color #b49bff;
-        @define-color accent_bg_color #b49bff;
-        @define-color window_bg_color #181425;
-        @define-color headerbar_bg_color #120f1d;
-        /* libadwaita 1.6+ reads these instead of the names above: without them switches and
-           selections took the desktop's accent, and dialogs Adwaita's grey. */
-        :root {
-            --accent-color: #b49bff;
-            --accent-bg-color: #b49bff;
-            --accent-fg-color: #181425;
-            --window-bg-color: #181425;
-            --headerbar-bg-color: #120f1d;
-            --dialog-bg-color: #1d1830;
-            --popover-bg-color: #1d1830;
-            --card-bg-color: alpha(#c8c8ff, 0.05);
-        }
-
         window {
-            background-color: @window_bg_color;
+            background-color: @at_bg;
         }
         headerbar {
-            background-color: @headerbar_bg_color;
-            color: #c8c8ff;
-            border-bottom: 1px solid #2d2444;
+            background-color: @at_bg_deep;
+            color: @at_fg;
+            border-bottom: 1px solid @at_border;
         }
         label {
-            color: #c8c8ff;
+            color: @at_fg;
         }
         /* A coloured button sets its own text colour; the rule above, aimed at labels, would
            otherwise beat it (pale lavender on the lavender Allow button). */
@@ -405,59 +389,59 @@ fn load_css() {
         .title-1 {
             font-size: 24pt;
             font-weight: bold;
-            color: @accent_color;
+            color: @at_accent;
         }
         .command-text {
             font-family: monospace;
-            background-color: #120f1d;
+            background-color: @at_bg_deep;
             padding: 12px;
             border-radius: 6px;
-            color: #c8c8ff;
-            border: 1px solid #2d2444;
+            color: @at_fg;
+            border: 1px solid @at_border;
         }
         button.suggested-action {
-            background-color: @accent_bg_color;
-            color: #181425;
+            background-color: @at_accent;
+            color: @at_bg;
             font-weight: bold;
             padding: 8px 20px;
             border-radius: 6px;
         }
         button.suggested-action:hover {
-            background-color: #9d80ff;
+            background-color: @at_accent_hover;
         }
         .loading-text {
             font-size: 16pt;
             font-weight: bold;
-            color: #c8c8ff;
+            color: @at_fg;
         }
         .loading-subtext {
             font-size: 11pt;
-            color: #a0a0ff;
+            color: @at_fg_soft;
         }
         .exit-bar {
-            background-color: #3a1f2b;
-            border-bottom: 1px solid #7a3b4c;
+            background-color: @at_danger_bg;
+            border-bottom: 1px solid @at_danger_border;
             padding: 8px 12px;
         }
         .exit-bar-text {
-            color: #ffc4c4;
+            color: @at_danger_text;
             font-weight: bold;
         }
         .warning-indicator {
-            color: #ff7878;
+            color: @at_danger;
         }
         .success-indicator {
-            color: #4ee8b0;
+            color: @at_success;
         }
         /* Deliberately distinct from both: an indicator whose source could not
            be read must never be mistaken for a healthy one. */
         .unknown-indicator {
-            color: #a0a0ff;
+            color: @at_fg_soft;
         }
         /* 3.0 thread sidebar */
         .thread-sidebar {
-            background-color: #141120;
-            border-right: 1px solid #2d2444;
+            background-color: mix(@at_bg_deep, @at_bg, 0.35);
+            border-right: 1px solid @at_border;
         }
         .thread-list {
             background-color: transparent;
@@ -466,42 +450,43 @@ fn load_css() {
             padding-top: 10px;
         }
         .folder-label {
-            color: #a8a2dc;
+            color: @at_fg_soft;
             margin-left: 6px;
         }
         .dim-label {
             opacity: 1.0;
-            color: #9c97c7;
+            color: @at_fg_dim;
         }
         .thread-row {
             padding: 2px 2px;
         }
         .thread-title {
-            color: #c8c8ff;
+            color: @at_fg;
         }
         .thread-title.open {
-            color: #ebe9ff;
+            color: @at_fg_strong;
             font-weight: bold;
         }
+        /* The agents' own colours: not themed, they say which agent it is. */
         .thread-dot.dot-claude { color: #e8846b; }
         .thread-dot.dot-agy { color: #5b9cf6; }
         .thread-dot.dot-codex { color: #4cc38a; }
-        .thread-term { color: #a0a0ff; }
-        .thread-badge.badge-approval { color: #ffcc66; }
+        .thread-term { color: @at_fg_soft; }
+        .thread-badge.badge-approval { color: @at_warning; }
         /* A thread waiting for approval while you are elsewhere glows until you look at it. */
         @keyframes attention-glow {
-            from { background-color: alpha(#ffcc66, 0.06); box-shadow: inset 3px 0 0 alpha(#ffcc66, 0.5); }
-            to { background-color: alpha(#ffcc66, 0.22); box-shadow: inset 3px 0 0 #ffcc66; }
+            from { background-color: alpha(@at_warning, 0.06); box-shadow: inset 3px 0 0 alpha(@at_warning, 0.5); }
+            to { background-color: alpha(@at_warning, 0.22); box-shadow: inset 3px 0 0 @at_warning; }
         }
         row.needs-attention {
             animation: attention-glow 1.1s ease-in-out infinite alternate;
             border-radius: 6px;
         }
-        row.needs-attention .thread-title { color: #ffe2a3; }
+        row.needs-attention .thread-title { color: @at_warning_soft; }
         /* Background work (sub-agents, background commands) the main agent is waiting on. */
-        .thread-background { color: #7cc7ff; }
-        .thread-badge.badge-limited { color: #ff7878; }
-        .thread-badge.badge-unread { color: #b49bff; }
+        .thread-background { color: @at_info; }
+        .thread-badge.badge-limited { color: @at_danger; }
+        .thread-badge.badge-unread { color: @at_accent; }
         .thread-close, .thread-delete {
             min-width: 20px;
             min-height: 20px;
@@ -520,20 +505,20 @@ fn load_css() {
         }
         .thread-delete:hover {
             opacity: 1.0;
-            color: #ff7878;
+            color: @at_danger;
         }
         .sidebar-footer {
-            border-top: 1px solid #2d2444;
+            border-top: 1px solid @at_border;
         }
         .terminal-drawer {
-            border-top: 1px solid #2d2444;
+            border-top: 1px solid @at_border;
         }
         .hook-entry {
-            color: #c8c8ff;
+            color: @at_fg;
         }
         headerbar .subtitle {
             font-size: 9pt;
-            color: #a8a2dc;
+            color: @at_fg_soft;
         }
         ",
     );

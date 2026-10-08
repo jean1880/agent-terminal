@@ -40,6 +40,18 @@ pub struct DiffColours {
     pub file: RGBA,
 }
 
+/// What the app's window takes from a terminal theme (`crate::palette` derives the rest): its
+/// background and text, its accent (the ANSI magenta), and its red, green, yellow and blue.
+pub struct ChromeBase {
+    pub background: RGBA,
+    pub foreground: RGBA,
+    pub accent: RGBA,
+    pub red: RGBA,
+    pub green: RGBA,
+    pub yellow: RGBA,
+    pub blue: RGBA,
+}
+
 /// A resolved terminal color scheme: foreground/background, cursor, selection,
 /// and the 16-color ANSI palette.
 pub struct Theme {
@@ -170,6 +182,20 @@ impl Theme {
             highlight_bg: rgb(68, 58, 94),
             highlight_fg: rgb(230, 230, 255),
             palette,
+        }
+    }
+
+    /// What the window's colours derive from (see [`ChromeBase`]).
+    pub fn chrome_base(choice: ThemeChoice) -> ChromeBase {
+        let t = Self::for_choice(choice);
+        ChromeBase {
+            background: t.background,
+            foreground: t.foreground,
+            accent: t.palette[5],
+            red: t.palette[1],
+            green: t.palette[2],
+            yellow: t.palette[3],
+            blue: t.palette[4],
         }
     }
 

@@ -1685,6 +1685,8 @@ impl AgentTerminalWindow {
         // With breakpoints, the window's own size request is its minimum, not its content's.
         obj.set_size_request(MIN_WINDOW.0, MIN_WINDOW.1);
         obj.set_title(Some("Agent Terminal"));
+        // The whole app's colours, from the configured theme, before anything draws.
+        crate::palette::apply(self.config.borrow().theme);
 
         let content = Box::builder().orientation(Orientation::Vertical).build();
 
@@ -3340,6 +3342,15 @@ impl AgentTerminalWindow {
             .active(config.cursor_blink)
             .build();
 
+        let reopen_thread_row = adw::SwitchRow::builder()
+            .title("Reopen Last Thread")
+            .subtitle(
+                "Start with the threads open when you last closed the app, showing the one you \
+                 were in. Off: start with no thread open and pick one from the sidebar",
+            )
+            .active(config.reopen_last_thread)
+            .build();
+
         let skip_animation_row = adw::SwitchRow::builder()
             .title("Skip Load Animation")
             .subtitle("Show the window as soon as it is ready, without the logo intro")
@@ -3365,8 +3376,7 @@ impl AgentTerminalWindow {
         let restore_row = adw::SwitchRow::builder()
             .title("Reopen Terminal Tabs")
             .subtitle(
-                "Reopen the last session's terminal tabs, in their folders, as fresh sessions. \
-                 Chat threads always reopen as you left them",
+                "Reopen the last session's terminal tabs, in their folders, as fresh sessions",
             )
             .active(config.restore_session)
             .build();
@@ -3403,6 +3413,7 @@ impl AgentTerminalWindow {
             .build();
         let startup = adw::PreferencesGroup::builder().title("Startup").build();
         startup.add(&starting_directory_row);
+        startup.add(&reopen_thread_row);
         startup.add(&restore_row);
         startup.add(&skip_animation_row);
         general.add(&startup);
@@ -3579,6 +3590,16 @@ impl AgentTerminalWindow {
             }
         ));
 
+        reopen_thread_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().reopen_last_thread = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
+
         skip_animation_row.connect_active_notify(glib::clone!(
             #[weak]
             obj,
@@ -3627,7 +3648,8 @@ impl AgentTerminalWindow {
                     .copied()
                     .unwrap_or_default();
                 obj.imp().config.borrow_mut().theme = theme;
-                // Themes apply live to every open tab; no restart needed.
+                // Themes apply live to the whole app and every open tab; no restart needed.
+                crate::palette::apply(theme);
                 obj.imp()
                     .for_each_terminal_everywhere(|term| Theme::apply(term, theme));
                 obj.imp().recolour_diff_panels(theme);

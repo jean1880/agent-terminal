@@ -33,8 +33,18 @@ pub const APP_ART_BARE: &str = "/ca/nuvek/AgentTerminal/art/ca.nuvek.AgentTermin
 /// Marks a hero source as [`APP_ART`]-style art with its cursor dots removed.
 const BARE_SUFFIX: &str = "#bare";
 
-/// The colour symbolic heroes are drawn in (the chrome's label colour; the app is dark-only).
-const HERO_TINT: &str = "#c8c8ff";
+thread_local! {
+    /// The colour symbolic heroes are drawn in: the theme's body text, set by
+    /// [`set_hero_tint`] whenever a theme is applied. (This file is also built alone by the icon
+    /// test, so it cannot read the palette itself.)
+    static HERO_TINT: RefCell<String> = RefCell::new("#c8c8ff".to_owned());
+}
+
+/// Draws symbolic heroes built from now on in `hex`.
+pub fn set_hero_tint(hex: String) {
+    HERO_TINT.with(|tint| *tint.borrow_mut() = hex);
+}
+
 /// The fill the bundled symbolic SVGs are authored with, replaced by [`HERO_TINT`].
 const SVG_INK: &str = "#2e3436";
 
@@ -179,7 +189,8 @@ fn hero_svg(source: &str) -> Option<glib::Bytes> {
     }
     ["actions", "apps"].iter().find_map(|context| {
         let bytes = lookup(&format!("{RESOURCE_PATH}/scalable/{context}/{source}.svg"))?;
-        let svg = String::from_utf8_lossy(&bytes).replace(SVG_INK, HERO_TINT);
+        let svg =
+            HERO_TINT.with(|tint| String::from_utf8_lossy(&bytes).replace(SVG_INK, &tint.borrow()));
         Some(glib::Bytes::from_owned(svg.into_bytes()))
     })
 }

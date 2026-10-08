@@ -493,6 +493,9 @@ pub struct TerminalConfig {
     /// splash then plays in full (at least `loading::SPLASH_MIN_MS`) even when everything
     /// loaded at once. On: a skeleton of the window shows only while it really is loading.
     pub skip_load_animation: bool,
+    /// Reopen the chat threads open at the last close, showing the one that was in view. Off
+    /// by default: the window starts with no thread open, the sidebar listing them all.
+    pub reopen_last_thread: bool,
     /// The file as this process last read or wrote it, so a hand edit made in
     /// between can be told apart from its own writes. Not persisted.
     #[serde(skip)]
@@ -702,6 +705,7 @@ impl Default for TerminalConfig {
             default_agent: None,
             sidebar_collapsed: false,
             skip_load_animation: false,
+            reopen_last_thread: false,
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
         }
@@ -2008,6 +2012,10 @@ mod tests {
             !config.skip_load_animation,
             "an older file plays the splash"
         );
+        assert!(
+            !config.reopen_last_thread,
+            "an older file starts with no thread open"
+        );
         let claude = config.agent_profile(Driver::Claude).expect("claude");
         assert_eq!(claude.args, ["--verbose"]);
         assert!(!claude.disabled);
@@ -2029,6 +2037,7 @@ mod tests {
         config.default_agent = Some(Driver::Agy);
         config.sidebar_collapsed = true;
         config.skip_load_animation = true;
+        config.reopen_last_thread = true;
         config.profiles[0].default_model = Some("opus".into());
         config.profiles[0].default_mode = Some(Mode::AcceptEdits);
         config.profiles[0].default_effort = Some("high".into());
@@ -2041,6 +2050,7 @@ mod tests {
         assert_eq!(back.default_agent, Some(Driver::Agy));
         assert!(back.sidebar_collapsed);
         assert!(back.skip_load_animation);
+        assert!(back.reopen_last_thread);
         assert_eq!(back.profiles[0].default_model.as_deref(), Some("opus"));
         assert_eq!(back.profiles[0].default_mode, Some(Mode::AcceptEdits));
         assert_eq!(back.profiles[0].default_effort.as_deref(), Some("high"));

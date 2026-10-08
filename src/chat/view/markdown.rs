@@ -7,10 +7,16 @@
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-/// Inline code background/foreground in the brand palette.
-const INLINE_CODE_BG: &str = "#2a2340";
-const INLINE_CODE_FG: &str = "#e2d4ff";
-const LINK_FG: &str = "#9fc4ff";
+/// Inline code background/foreground and link colour, in the active theme. Pango markup takes
+/// no CSS names, so the colours are resolved when a message is parsed.
+fn inline_code_colours() -> (String, String) {
+    let chrome = crate::palette::current();
+    (chrome.surface_strong.hex(), chrome.fg_strong.hex())
+}
+
+fn link_colour() -> String {
+    crate::palette::current().info.hex()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
@@ -144,8 +150,9 @@ pub fn parse(markdown: &str) -> Vec<Block> {
                 if let Some(cell) = b.cell.as_mut() {
                     cell.push_str(&code);
                 } else {
+                    let (bg, fg) = inline_code_colours();
                     b.push_markup(&format!(
-                        "<span font_family=\"monospace\" bgcolor=\"{INLINE_CODE_BG}\" fgcolor=\"{INLINE_CODE_FG}\">\u{2009}{}\u{2009}</span>",
+                        "<span font_family=\"monospace\" bgcolor=\"{bg}\" fgcolor=\"{fg}\">\u{2009}{}\u{2009}</span>",
                         escape(&code)
                     ));
                 }
@@ -250,8 +257,9 @@ fn start(b: &mut Builder, tag: Tag) {
         Tag::Strikethrough => b.push_markup("<s>"),
         Tag::Link { dest_url, .. } => {
             b.push_markup(&format!(
-                "<a href=\"{}\"><span fgcolor=\"{LINK_FG}\">",
-                escape(&dest_url)
+                "<a href=\"{}\"><span fgcolor=\"{}\">",
+                escape(&dest_url),
+                link_colour()
             ));
         }
         Tag::Image { .. } => b.push_markup("<i>[image: "),
