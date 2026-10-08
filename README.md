@@ -1,78 +1,327 @@
-# Agent Terminal 🚀
+# Agent Terminal
 
 [![CI](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jean1880/agent-terminal)](https://github.com/jean1880/agent-terminal/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A standalone GTK4 application written in Rust for working with AI coding agents.
-3.0 is chat-first: Claude and Antigravity (`agy`) run as native chat threads,
-and any CLI can still run in a terminal.
+A native Linux desktop app for working with AI coding agents. Claude Code, Antigravity
+(`agy`) and Codex run as chat threads, with approvals, plans, diffs and undo built in.
+A terminal is always one keystroke away. It's written in Rust with GTK4 and libadwaita,
+and it ships as a single binary.
 
-> **3.0 is chat-first.** New sessions open as chat threads, not terminal tabs.
-> See [Upgrading from 2.x](#upgrading-from-2x-).
+![A chat thread continued in Antigravity after Claude ran out of quota, with an approval waiting](docs/screenshots/chat.png)
 
-> **Renamed in 2.0.0.** This was `antigravity-terminal` (and, before that,
-> `gemini-terminal`). The binary, package and config directory are now
-> `agent-terminal`; existing settings are adopted automatically on first run —
-> see [Upgrading](#upgrading-from-1x-).
+> Agent Terminal is an independent project, not affiliated with Anthropic, Google or OpenAI.
+> It drives their command-line tools, which you install and sign in to yourself.
 
-## Chat threads (3.0) 💬
+## Contents
 
-- **A sidebar of threads.** Threads live in a store and are listed in a sidebar,
-  grouped by folder and searchable. Each row shows the agent's colour, the title,
-  how long ago it was active, and a badge: working, needs approval, rate limited
-  or unread. `F9` or `Ctrl+B` (or the header button) shows or hides the sidebar.
-  It overlays the thread when the window is narrow, and its state is remembered.
-- **Every new session is a thread.** `Ctrl+Shift+T` and the header **+** open
-  one. The **+** menu also has New Thread With (Claude or Antigravity), New
-  Thread in Folder…, New Thread in Worktree… (`Ctrl+Shift+G`), Resume Session…
-  and Continue In. A resumed Claude or agy session becomes a thread that resumes
-  it. A thread opens only when you open it, and the threads that were open come
-  back on the next launch.
-- **Native chat.** Each thread shows a transcript with tool cards, inline
-  approvals, a plan panel and a composer with typeahead (`/` commands, `@` files,
-  `$` skills). Its header has the agent and model chip, the mode and the context
-  gauge.
-- **One model picker for both agents.** The chip (or `/model`) lists every Claude
-  model and every agy model, with search and effort levels. Models that agy
-  serves on Google's quota are marked *via Antigravity*. Picking a model of the
-  same agent switches in place. Picking one of the other agent continues the
-  same thread in that agent: a budgeted, redacted summary of the conversation
-  goes with the next message, and a divider marks the switch.
-- **Usage and account.** The usage indicator updates on every turn: in a
-  thread's header for its agent, and for all agents at the foot of the sidebar.
-- **Terminal drawer.** `` Ctrl+` `` opens your `$SHELL` in the thread's folder,
-  under the chat.
-- **2.x features on threads.** The diff panel (`Ctrl+Shift+D`), checkpoints
-  (taken when a turn completes), undo, worktrees and notifications work on
-  threads. `/rewind` undoes the last turn's changes, `/fork` starts a new thread
-  carrying this one's history, and a rate limit offers "Continue in <other
-  agent>".
-- **Terminal threads.** **+** → New Terminal Thread runs any profile in a 2.x
-  terminal page, listed in the sidebar too. A CLI with no chat adapter (Gemini,
-  a script) runs this way.
-- **Settings → Agents.** Configure each agent's command or path (and see whether
-  it is installed, and which version), extra arguments, environment file,
-  default model, mode and effort, and whether it is enabled. You can also pick
-  the default agent for new threads. Changes are saved to `config.json`, on the
-  2.x profiles that run each agent.
+- [Highlights](#highlights)
+- [Screenshots](#screenshots)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Features](#features)
+- [Command-line options](#command-line-options)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Configuration](#configuration)
+- [agy's approval hook](#agys-approval-hook)
+- [Reference](#reference)
+- [Troubleshooting](#troubleshooting)
+- [Building from source](#building-from-source)
+- [Upgrading](#upgrading)
+- [Contributing](#contributing)
 
-### agy's approval hook
+## Highlights
 
-agy runs tools without asking unless it has a hook to ask with. agent-terminal
-runs agy with `--dangerously-skip-permissions` **only** when its own approval
-hook is installed in `~/.gemini/config/hooks.json`. Each tool call then waits
-for your answer in the thread.
+- **One window for three agents.** Claude, Antigravity and Codex threads live in one
+  sidebar, grouped by folder and searchable. Claude and agy sessions you already ran
+  in those CLIs show up there too.
+- **Switch agents mid-task.** When one runs out of quota, continue the same thread in
+  another. A redacted, budgeted summary of the conversation goes with it.
+- **You stay in control.** Inline approvals for commands and edits, a plan panel, and
+  questions the agent asks you as cards with answers to pick.
+- **Git safety net.** Each turn is checkpointed into hidden refs. The diff panel shows
+  what changed, undo puts it back, and a worktree gives an agent its own checkout.
+  Your branch, index and stash are never touched.
+- **Your desktop, your colours.** The bundled Agent Terminal theme, six classics, or
+  **Use System Theme** to follow your desktop's GTK theme, light or dark.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Markdown, code and a table in a Claude reply](docs/screenshots/chat-markdown.png) | ![A model switch, a rate limit and a question card](docs/screenshots/chat-question.png) |
+| Replies render markdown, code and tables. | Model switches, rate limits, and questions with answers to pick. |
+| ![Settings: the theme list, Use System Theme first](docs/screenshots/settings-theme.png) | ![Settings under Use System Theme on a light desktop](docs/screenshots/settings-system-theme.png) |
+| Themes apply to the whole app, live. | **Use System Theme** on a light desktop. |
+| ![The first-start walkthrough](docs/screenshots/setup-welcome.png) | |
+| A first start walks you through your agents. | |
+
+## Install
+
+Agent Terminal runs on Linux with **GTK 4.10+**, **libadwaita 1.5+**, **VTE 0.72+**
+(GTK4 build) and **GtkSourceView 5**. That means Ubuntu 24.04, Debian 13, Fedora 40,
+current Arch, or newer.
+
+Packages for each release are attached to the
+[GitHub Releases](https://github.com/jean1880/agent-terminal/releases) page.
+
+### Debian / Ubuntu
+
+```bash
+sudo apt install ./agent-terminal_<version>_amd64.deb
+```
+
+`apt` pulls in the GTK, libadwaita, VTE and GtkSourceView libraries the package needs.
+
+### Fedora
+
+```bash
+sudo dnf install ./agent-terminal-<version>-1.x86_64.rpm
+```
+
+### Arch Linux
+
+```bash
+sudo pacman -U ./agent-terminal-<version>-1-x86_64.pkg.tar.zst
+```
+
+### From source
+
+See [Building from source](#building-from-source). Then run `make install` to install
+into `~/.local` (binary, icon and desktop entry), and `make uninstall` to remove it.
+
+### The agents themselves
+
+Install and sign in to at least one agent CLI. Agent Terminal finds them on your
+`PATH`, in the usual install folders, and through your login shell (so `nvm` and
+`asdf` installs work):
+
+| Agent | Command | Get it |
+|---|---|---|
+| Claude Code | `claude` | [docs.claude.com/claude-code](https://docs.claude.com/en/docs/claude-code) |
+| Antigravity | `agy` | [antigravity.google](https://antigravity.google) |
+| Codex | `codex` | [github.com/openai/codex](https://github.com/openai/codex) |
+
+## Quick start
+
+1. **Launch Agent Terminal** from your app menu, or run `agent-terminal`.
+2. **The first start opens a short setup.** It shows which agents are installed,
+   lets you switch off any you don't use, and offers **Sign In…** for any agent nobody
+   is signed in to. It also asks which agent new threads start on. Run it again any
+   time from Settings → General → Setup.
+3. **Start a thread** with `Ctrl+Shift+T` (or the **+** button). It opens in the
+   current folder; **+** → New Thread in Folder… picks another.
+4. **Type a request** and press Enter. Use `/` for commands, `@` to mention files and
+   `$` for skills. When the agent wants to run a command or edit a file, approve or
+   deny it inline. The mode picker in the thread's header switches between
+   **Ask before edits**, **Accept edits** and **Plan**.
+5. **See and undo changes.** `Ctrl+Shift+D` opens the diff panel. Its undo arrow puts
+   the last turn's changes back. `` Ctrl+` `` opens a shell in the thread's folder.
+6. **Using agy?** Install its [approval hook](#agys-approval-hook) so it asks before
+   it acts.
+
+## Features
+
+### Chat threads
+
+- **A sidebar of threads**, grouped by folder and searchable. Each row shows the
+  agent, the title, how long ago it was active, and a badge: working, needs approval,
+  rate limited or unread. `F9` or `Ctrl+B` shows or hides it. It overlays the thread
+  when the window is narrow.
+- **Your existing sessions.** Recent Claude and agy sessions appear as threads.
+  Opening one imports its history and resumes it. (Codex history is not imported yet.)
+- **A native transcript**: markdown, code blocks, tool cards, file-change cards with
+  their diffs, inline approvals, a plan panel, sub-agent progress, questions with
+  answers to pick, and a composer with typeahead.
+- **One model picker for every agent.** The header chip (or `/model`) lists each
+  agent's models, with search and effort levels. Models that agy serves on Google's
+  quota are marked *via Antigravity*. Picking a model of another agent continues the
+  thread there.
+- **Hand-offs.** When an agent runs out of quota, the thread offers **Continue in
+  <other agent>**. A budgeted, redacted summary of the conversation goes with your
+  next message, and a divider marks the switch.
+- **Usage at a glance.** Each agent's quota windows sit in the thread header and at the
+  foot of the sidebar, and update every turn.
+- `/rewind` undoes the last turn's changes. `/fork` starts a new thread carrying this
+  one's history.
+
+### Git safety net
+
+- **Turn checkpoints**: in a git repository, the working tree is snapshotted into
+  hidden refs when a turn ends. Your branch, index and stash stay as they were.
+  See [Turn checkpoints](#turn-checkpoints).
+- **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, or everything since
+  the thread opened. Open any file in your own diff tool. See [Diff panel](#diff-panel).
+- **Undo a turn**, which saves the current state first, so the undo can itself be undone.
+  See [Undoing a turn](#undoing-a-turn).
+- **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can
+  work without touching yours. See [Worktree threads](#worktree-threads).
+
+### Terminals
+
+- **Terminal drawer** (`` Ctrl+` ``): your `$SHELL` in the thread's folder, under the
+  chat.
+- **Terminal threads**: **+** → New Terminal Thread runs any configured CLI in a full
+  terminal page, for tools with no chat support (a script, the Gemini CLI). These have
+  scrollback search (`Ctrl+Shift+F`), Sixel images and clickable links.
+- **A dead session keeps its page.** A CLI that exits with an error leaves its
+  scrollback and the error in place, with **Restart** and **Close**.
+
+### Appearance and behaviour
+
+- **Themes**, in Settings → General → Appearance:
+  - **Agent Terminal** (default), Dracula, Nord, Gruvbox Dark, Solarized Dark, One Dark
+    and Monokai. Each applies live to the whole app: threads, terminals and diffs.
+  - **Use System Theme** has no colours of its own. It takes them from your desktop's
+    GTK theme (light or dark, its accent colour, any `~/.config/gtk-4.0/gtk.css`) and
+    follows it as it changes. Terminals get the desktop's text and background with
+    VTE's standard colours.
+- **Notifications** when a thread you aren't looking at finishes, needs your approval,
+  or runs out of quota. The quota notification has a **Continue in…** button.
+- **Settings apply as you change them**, to every window, and are saved to
+  `~/.config/agent-terminal/config.json`. Hand edits to that file are picked up while
+  the app runs.
+- **Status indicators**: optional header lights driven by a file or a command. See
+  [Status indicators](#status-indicators).
+
+## Command-line options
+
+```text
+agent-terminal [OPTIONS]
+```
+
+| Option | Meaning |
+|---|---|
+| `-r`, `--resume SESSION_ID` | Open a thread resuming that Claude or agy session, in the folder it was recorded in. |
+| `-d`, `--dir DIR` | With `--resume`: resume in `DIR` instead of looking the folder up. |
+| `-h`, `--help` | Show the options (`--help-all` adds GTK's own). |
+| `--approval-hook` | Internal: agy's approval hook runs this. Not for direct use. |
+| `--chat-demo` | Open a window showing a scripted chat, with no agent running. |
+
+Agent Terminal runs as a single instance. A second launch hands its request to the
+window that is already open and exits, so `agent-terminal --resume <id>` opens the
+thread in your existing window. A bad ID or folder is reported on the terminal you
+ran it from, with exit status 2.
+
+```bash
+agent-terminal --resume 215bf7f7-88e4-4070-b41b-332500303534
+agent-terminal --resume <id> --dir ~/git/some-project
+```
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `RUST_LOG` | Log level and filters (default `info`). |
+| `XDG_CONFIG_HOME` | Where `agent-terminal/config.json` lives (default `~/.config`). Point it at a scratch folder to run an isolated copy. |
+| `XDG_STATE_HOME` | Where the thread store, hand-off briefs and agy's always-allow rules live (default `~/.local/state`). |
+| `AGENT_TERMINAL_HOOK_BIN` | The binary agy's approval hook runs (default `agent-terminal` on `PATH`). |
+
+## Keyboard shortcuts
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Shift+T` | New thread |
+| `Ctrl+Shift+G` | New thread in a new worktree |
+| `Ctrl+Shift+W` | Close the thread |
+| `Ctrl+Shift+R` | Restart the session |
+| `F9`, `Ctrl+B` | Show or hide the sidebar |
+| `` Ctrl+` `` | Show or hide the terminal drawer |
+| `Ctrl+Shift+D` | Show or hide the diff panel |
+| `Ctrl+Shift+F` | Search a terminal's scrollback |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
+| `Ctrl+Tab`, `Ctrl+Page Down` | Next thread |
+| `Ctrl+Shift+Tab`, `Ctrl+Page Up` | Previous thread |
+| `Alt+1`…`Alt+8`, `Alt+9` | Go to thread N, or the last one |
+| `Ctrl+Alt+1`…`Ctrl+Alt+9` | New terminal thread with the Nth profile, in the current folder |
+| `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Terminal zoom in / out / reset (saved) |
+| `Ctrl+click` | Open a link in a terminal |
+
+These are caught before a terminal sees them, so a CLI never receives them.
+
+## Configuration
+
+Everything in Settings is saved to `~/.config/agent-terminal/config.json`. A few things
+can only be set there: profiles, status indicators and the cleared environment.
+
+| File | What |
+|---|---|
+| `~/.config/agent-terminal/config.json` | Settings, profiles, indicators. Written atomically, `0600`. |
+| `~/.local/state/agent-terminal/threads.db` | The thread store (SQLite). Every stored event is redacted. |
+| `~/.local/state/agent-terminal/handoffs/` | Hand-off briefs: `0700` folder, `0600` files, pruned after 7 days. |
+| `~/.local/state/agent-terminal/always-allow.json` | agy actions you chose to always allow, per folder. |
+
+A settings file that can't be parsed is copied aside (`config.json.invalid-…`) and
+reported before defaults replace it. An edit that doesn't parse yet suspends saving
+until it is fixed.
+
+### Settings reference
+
+| Key | Default | Meaning |
+|---|---|---|
+| `theme` | `"agent-terminal"` | `system`, `agent-terminal`, `dracula`, `nord`, `gruvbox-dark`, `solarized-dark`, `one-dark` or `monokai` |
+| `starting_directory` | `""` | Where new threads open (blank: your home folder) |
+| `default_agent` | none | `claude`, `agy` or `codex` for new threads (none: the first one installed) |
+| `profiles` | Claude, Agy, Codex | The CLIs on offer. See [Profiles](#profiles) |
+| `default_profile` | none | The profile terminal threads run (none: the first one installed) |
+| `checkpoints` | `true` | Snapshot each turn in a git repository |
+| `worktree_root` | `""` | Where worktrees go (blank: a hidden folder beside the repository) |
+| `diff_tool` | none | The external diff tool for **Open in…** |
+| `diffs_expanded` | `false` | Open a file-change card's diff as soon as the edit lands |
+| `notify_on_bell` | `false` | Notify when a background thread finishes |
+| `notify_on_quota` | `true` | Notify, with a hand-off button, when an agent runs out of quota |
+| `reopen_last_thread` | `false` | Start with the threads open at the last close |
+| `restore_session` | `false` | Reopen the last terminal threads, as fresh sessions |
+| `skip_load_animation` | `false` | Show the window as soon as it is ready |
+| `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font and zoom |
+| `cursor_shape`, `cursor_blink` | `block`, `true` | Terminal cursor |
+| `scrollback_lines` | `10000` | Terminal scrollback |
+| `indicators` | `[]` | Header status lights. See [Status indicators](#status-indicators) |
+| `turn_command` | none | A command run when a turn ends (`{id}`, `{dir}` are filled in) |
+| `clear_env` | session markers | Variables removed from a spawned agent's environment (`*` matches a prefix) |
+
+### Profiles
+
+Profiles define how each CLI is run: the chat agents (Settings → Agents edits these)
+and anything you want as a terminal thread. Adding a CLI is a config edit, not a
+rebuild:
+
+```jsonc
+{
+  "profiles": [
+    { "name": "Claude",  "command": "claude" },
+    { "name": "Codex",   "command": "codex", "args": ["--full-auto"] },
+    // Root a profile in a specific project, with its own environment.
+    { "name": "Infra",   "command": "claude",
+      "dir": "~/git/infra",
+      "env_file": "~/.config/agent-terminal/infra.env" }
+  ],
+  "default_profile": "Claude"   // omit, or null, to use the first one installed
+}
+```
+
+`env_file` is sourced in a subshell and its *exported environment* merged into the
+session. Nothing it prints reaches the terminal, because output before `exec` breaks the
+CLI's terminal handshake. Settings → Agents also sets each agent's extra arguments,
+environment file, default model, mode and effort, and whether it is enabled.
+
+## agy's approval hook
+
+agy runs tools without asking unless it has a hook to ask with. Agent Terminal runs
+agy with `--dangerously-skip-permissions` **only** when its own approval hook is
+installed in `~/.gemini/config/hooks.json`. Each tool call then waits for your answer
+in the thread.
 
 Without the hook, the mode picker drives agy's own `--mode` flag (Plan or Accept
 edits), and **Ask before edits is unavailable**: headless agy has nobody to ask.
-Be aware of what that means, because it was verified live: without the skip flag
-agy refuses shell commands in every mode, but **it applies file edits in every
-mode, Plan included** (it writes a plan, then carries it out). The thread tells
-you so. Install the hook if you want agy to ask first.
+Without the skip flag agy refuses shell commands in every mode, but **it applies
+file edits in every mode, Plan included** (it writes a plan, then carries it out). The
+thread tells you so.
 
 To install the hook, add this entry as a top-level key of
-`~/.gemini/config/hooks.json`. Settings → Agents shows the same entry, with a
-Copy button and whether it is installed. The app generates it with
-`hook_config::install_entry_json()`:
+`~/.gemini/config/hooks.json`. Settings → Agents shows the same entry, with a Copy
+button and whether it is installed:
 
 ```json
 {
@@ -93,190 +342,13 @@ Copy button and whether it is installed. The app generates it with
 }
 ```
 
-The hook does nothing outside agent-terminal, because the socket variable is
-unset there. The app also checks that the hook really fires: if agy runs a tool
-without asking first, the thread is restarted without
-`--dangerously-skip-permissions`.
+The hook does nothing outside Agent Terminal, because the socket variable is unset
+there. The app also checks that the hook really fires: if agy runs a tool without
+asking first, the thread is restarted without `--dangerously-skip-permissions`.
 
-## Features ✨
-
-- **Native GTK4 & VTE4**: high-performance terminal rendering with a Libadwaita
-  header bar.
-- **Tabbed sessions**: multiple terminals in one window.
-  - `Ctrl + Shift + T` (or the header **+**) opens a new tab rooted in the current
-    tab's directory. The tab bar auto-hides when only one tab is open.
-  - **New Tab in Folder…** opens a folder picker and roots a new tab there —
-    useful because a running CLI session cannot re-root itself.
-- **Resume a session by ID**: `agent-terminal --resume <session-id>` opens a tab
-  in the running window (or a new one), resuming that conversation from the
-  directory it was recorded in. Or browse for it: **Resume Session…** on the
-  **+** dropdown and the right-click menu lists recent sessions by title, folder
-  and age, with search; **Resume Session As** browses another CLI's sessions
-  (Claude or Agy). See [Resuming sessions](#resuming-sessions).
-- **Hand a task to another CLI**: when Claude or Agy runs out of quota, a banner
-  on the tab offers **Continue in <other CLI>**. It opens a tab in the same
-  folder whose first prompt points at a brief the terminal wrote from the
-  transcript and the git state. **Continue In** on the menus does the same at
-  any time. See [Handing off between CLIs](#handing-off-between-clis).
-- **Turn checkpoints**: in a git repository, the working tree is snapshotted
-  into hidden refs whenever a turn ends, without touching your branch, index
-  or stash. See [Turn checkpoints](#turn-checkpoints).
-- **Diff panel**: `Ctrl + Shift + D` shows what changed beside the terminal:
-  uncommitted work, the last turn, or everything since the tab opened. See
-  [Diff panel](#diff-panel). Its undo arrow reverts the last turn, keeping what
-  it replaces so the undo can itself be undone. See [Undoing a turn](#undoing-a-turn).
-- **New Tab in Worktree**: `Ctrl + Shift + G` creates a branch in its own git
-  worktree and opens a tab there, so two agents can work on one repository
-  without trampling each other. See [Worktree tabs](#worktree-tabs).
-- **Sessions survive a crash**: if the CLI exits non-zero the tab stays open with
-  its scrollback intact and a bar explaining what happened, offering **Restart**
-  and **Close Tab**. A clean exit still closes the tab as you would expect.
-- **Attention when a turn finishes**: a bell in a background tab marks that tab,
-  with an optional desktop notification — so an agent that finishes while you are
-  elsewhere actually reaches you. The notification also fires for the tab in view
-  when the window itself is in the background, and is cleared once you look.
-- **Scrollback search**: `Ctrl + Shift + F`, with case-sensitivity and regex
-  toggles.
-- **Session restore** (off by default): reopens the tabs, and their directories,
-  of the last window closed, each as a fresh session. **Reopen Last Thread**
-  (also off by default) does the same for chat threads, showing the one you were
-  in; off, the app starts with no thread open.
-- **Selectable colour themes** (Settings → General → Appearance): Agent Terminal
-  (default), Dracula, Nord, Gruvbox Dark, Solarized Dark, One Dark, and Monokai —
-  applied live to the whole app and every open tab. **Use System Theme** has no
-  colours of its own: it takes them from your desktop's GTK theme (light or dark,
-  its accent colour, any `~/.config/gtk-4.0/gtk.css`) and follows it as it changes;
-  terminals get the desktop's text and background with VTE's default palette.
-- **First-start setup**: with no settings file yet, a short walkthrough shows which
-  agents are installed, lets you switch them on or off, sign in, and pick the
-  default agent. Run it again from Settings → General → Setup.
-- **Profiles**: any CLI, with its own arguments, directory and environment,
-  defined in `config.json` — no rebuild. Auto-detection picks the first one
-  installed. Resolution runs off the UI thread and is cached for the life of the
-  process. See [Profiles](#profiles).
-- **Settings**: starting directory (validated as you type), scrollback lines,
-  font and font scale, cursor shape and blink, profile, theme, notifications and
-  session restore — each applied immediately, to every window, and persisted to
-  `~/.config/agent-terminal/config.json`. Hand edits to that file are picked up
-  while the app runs (profile and indicator lists in the header refresh in new
-  windows). A file that cannot be parsed is copied aside
-  (`config.json.invalid-…`) and reported before defaults can replace it; an
-  edit that does not parse yet suspends saving until it is fixed.
-- **Shortcuts**:
-  | Keys | Action |
-  |---|---|
-  | `Ctrl + Shift + T` | New tab |
-  | `Ctrl + Shift + W` | Close tab |
-  | `Ctrl + Shift + R` | Restart the current session |
-  | `Ctrl + Shift + F` | Search the scrollback |
-  | `Ctrl + Shift + D` | Show or hide the diff panel |
-  | `Ctrl + Shift + G` | New tab in a new worktree |
-  | `Ctrl + Shift + C` / `V` | Copy / paste |
-  | `Ctrl + Tab` / `Ctrl + Shift + Tab` | Next / previous tab |
-  | `Ctrl + Page Down` / `Page Up` | Next / previous tab |
-  | `Alt + 1`…`8`, `Alt + 9` | Jump to tab, or the last tab |
-  | `Ctrl + Alt + 1`…`9` | New tab as the Nth profile, in the current folder |
-  | `Ctrl + Plus` / `Minus` | Zoom (persisted) |
-  | `Ctrl + 0` | Reset zoom |
-  | `Ctrl + Left-Click` | Open a hovered hyperlink |
-
-  These are caught before the terminal sees them, so the CLI never receives
-  them. Two a CLI might otherwise use: `Ctrl + Minus`, which terminals send as
-  `^_` (undo in readline), and `Alt + 1`…`9`, readline's numeric arguments.
-- **Observability**: logs to the systemd journal, with a panic hook, so a
-  desktop-launched failure is diagnosable after the fact:
-  ```bash
-  journalctl --user -t agent-terminal -b
-  ```
-  When run from a terminal, logs also print to stderr. Level defaults to `info`
-  and is overridable via `RUST_LOG`.
-- **Standalone identity**: treated as a unique application by your window manager
-  (won't group with standard terminals). All assets are embedded in the binary.
-- **Sixel support**: inline image rendering.
-
-## Upgrading from 2.x ⬆️
-
-- **Chat is the default.** `Ctrl+Shift+T`, **+**, New in Folder, New in
-  Worktree, Resume and Continue In now open chat threads. No setting switches
-  back to terminal tabs: that is the deliberate 3.0 change. Use **+** → New
-  Terminal Thread for a 2.x terminal page, with any profile.
-- **Your config keeps working.** 2.x `config.json` loads as it is. Profiles still
-  define the Claude and agy commands, arguments, env files and folders. The new
-  per-agent settings (default model, mode, effort, enabled) and the default agent
-  are optional fields with defaults, and you set them under Settings → Agents.
-- **Threads are stored** in `$XDG_STATE_HOME/agent-terminal/threads.db`
-  (`~/.local/state/…`), with every stored event redacted. 2.x tab restore still
-  applies to terminal pages.
-- **agy cannot ask before acting** until you install its approval hook (see
-  above): it refuses commands, but edits files on its own.
-
-## Upgrading from 1.x ⬆️
-
-The apt package is renamed, so `apt upgrade` pulls in `agent-terminal` and
-removes `antigravity-terminal` via a transitional package.
-
-On first launch, settings at `~/.config/antigravity-terminal/config.json` are
-copied to `~/.config/agent-terminal/config.json`. **The old file is deliberately
-left in place** so that reinstalling 1.x still finds its configuration.
-
-## Prerequisites 🛠️
-
-- **Rust & Cargo** (1.92+)
-- **GTK 4.10+** (`libgtk-4-dev`)
-- **VTE 2.91 GTK4** (`libvte-2.91-gtk4-dev`)
-- **libadwaita 1.5+** (`libadwaita-1-dev`)
-- **glib-compile-resources** (`libglib2.0-dev-bin`), to bundle the icons at build time
-
-## Quick Start ⚡
-
-```bash
-make deps          # install system dependencies
-make start-local   # build (debug) and run
-```
-
-> **Running a local build while the packaged one is open?** GTK's single-instance
-> handling will hand your launch to the already-running process, so your build
-> never actually runs. Use its own bus:
-> ```bash
-> dbus-run-session -- ./target/debug/agent-terminal
-> ```
-
-## Advanced Usage 🔧
-
-### Profiles
-Profiles are the sessions offered in Settings, on the **+** button's dropdown,
-and in the right-click **New Tab As** menu. Adding a CLI is a config edit, not a
-rebuild:
-
-```jsonc
-{
-  "profiles": [
-    { "name": "Claude",  "command": "claude" },
-    { "name": "Codex",   "command": "codex", "args": ["--full-auto"] },
-    // Root a profile in a specific project, with its own environment.
-    { "name": "Infra",   "command": "claude",
-      "dir": "~/git/ansible-homelab",
-      "env_file": "~/.config/agent-terminal/infra.env" }
-  ],
-  "default_profile": "Claude"   // omit, or null, to use the first one installed
-}
-```
-
-`env_file` is sourced in a subshell and its *exported environment* merged into
-the session. Nothing it prints reaches the terminal — output before `exec` breaks
-the CLI's terminal handshake, which is why the old "startup script" setting could
-never work.
+## Reference
 
 ### Resuming sessions
-```bash
-agent-terminal --resume 215bf7f7-88e4-4070-b41b-332500303534
-agent-terminal --resume <id> --dir ~/git/some-project   # skip the lookup
-```
-
-A launch while Agent Terminal is already running hands the request to that
-instance and exits, so the tab opens in your existing window. Bad IDs and
-directories are reported on the terminal you typed the command in, with exit
-status 2.
 
 Resuming is declared per profile, so the binary knows no CLI's conventions:
 
@@ -287,68 +359,50 @@ Resuming is declared per profile, so the binary knows no CLI's conventions:
   "session_title": "/aiTitle" }                 // JSON pointer to a session's title
 ```
 
-**Resume Session…** opens a browser of the store's 200 most recently active
-sessions, newest first. Each row shows the session's title, the folder it will
-resume in, and how long ago it was last active. Type to filter by title, folder
-or ID; Enter resumes the top match. **Enter ID…** in its header falls back to
-pasting an ID. The latest title in a transcript wins, since a CLI may retitle a
-session as it goes; a session without one is listed by ID. Only the first and
-last 256 KiB of each transcript are read, so a store of multi-MiB transcripts
-still lists quickly. A store that cannot be read says so rather than showing an
-empty list.
+**Resume Session…** opens a browser of the store's 200 most recently active sessions,
+newest first. Each row shows the session's title, the folder it will resume in, and
+how long ago it was last active. Type to filter by title, folder or ID; Enter resumes
+the top match. **Enter ID…** in its header falls back to pasting an ID. Only the first
+and last 256 KiB of each transcript are read, so a store of multi-MiB transcripts
+still lists quickly. A store that cannot be read says so rather than showing an empty
+list.
 
 `session_store` exists because Claude only resumes a session from the project
-directory it was recorded in. The transcript is looked up (directly in the store
-or one directory down) and its first recorded `cwd` becomes the tab's directory.
-If it can't be found, the tab opens in the profile's default directory and a
-dialog explains how to pass `--dir`.
+directory it was recorded in. The transcript is looked up (directly in the store or
+one directory down) and its first recorded `cwd` becomes the thread's directory. If it
+can't be found, the thread opens in the profile's default directory and a dialog
+explains how to pass `--dir`.
 
-Agy keeps one history log instead of a transcript per session, so its profile
-declares `"session_format": "agy-history"`. Its sessions are titled by their
-first prompt and resumed with `--conversation <id>` in the workspace they were
-recorded in. Only the last 4 MiB of the log is read.
+agy keeps one history log instead of a transcript per session, so its profile declares
+`"session_format": "agy-history"`. Its sessions are titled by their first prompt and
+resumed with `--conversation <id>` in the workspace they were recorded in. Only the
+last 4 MiB of the log is read.
 
-Claude and Agy profiles saved by an older release are filled in with the
-settings above on load; so are the hand-off settings below. An explicit empty
-list, such as `"resume_args": []`, opts out. Other CLIs can resume once they
-declare `resume_args`. Restarting a resumed tab resumes it again, with the
-tab's own profile, rather than starting a new session.
+Claude and agy profiles saved by an older release are filled in with these settings on
+load; so are the hand-off settings below. An explicit empty list, such as
+`"resume_args": []`, opts out.
 
 ### Handing off between CLIs
-When one CLI runs out of quota mid-task, **Continue In ▸ <profile>** (on the
-**+** dropdown and the right-click menu) opens a tab running the other one in
-the same folder. It starts with a prompt that points at a *hand-off brief*. The
-out-of-quota CLI cannot summarize its own work, so the terminal writes the
-brief from what is on disk:
 
-- the original request, the latest requests, the last reply and the files the
-  session edited, from the transcript (Agy's log records requests only);
+For a terminal thread, **Continue In ▸ <profile>** opens one running another CLI in
+the same folder, starting with a prompt that points at a *hand-off brief*. The
+out-of-quota CLI cannot summarize its own work, so the brief is written from disk:
+
+- the original request, the latest requests, the last reply and the files the session
+  edited, from the transcript (agy's log records requests only);
 - `git status`, `git diff HEAD --stat` and the last five commits;
 - the end of the screen, if no transcript can be found.
 
-Briefs are written to `$XDG_STATE_HOME/agent-terminal/handoffs/` (by default
-`~/.local/state/…`). The directory is `0700`, each file is `0600`, and briefs
-older than 7 days are pruned. Credentials in common formats (`ghp_…`, `sk-…`,
-`AIza…`, `Bearer …`, `*_KEY=…`, `"password": …`, PEM blocks) are masked as
-`****` plus their last four characters. The masking works by pattern, so a
-secret in an unrecognized format can get through, and each brief says so. The
-source tab stays open, so you can resume it once its quota resets. The
-receiving CLI may ask permission before reading a file outside the project.
+Briefs are written to `$XDG_STATE_HOME/agent-terminal/handoffs/`. The directory is
+`0700`, each file is `0600`, and briefs older than 7 days are pruned. Credentials in
+common formats (`ghp_…`, `sk-…`, `AIza…`, `Bearer …`, `*_KEY=…`, `"password": …`, PEM
+blocks) are masked as `****` plus their last four characters. The masking works by
+pattern, so a secret in an unrecognized format can get through, and each brief says
+so.
 
-The terminal also watches for the quota running out. A new Claude tab is started
-under an ID the terminal picks (`--session-id`), so its transcript is known, and
-the watcher looks for a `rate_limit` error there. A CLI with no such record uses
-`limit_markers`, text matched near the bottom of the screen. Either way, the tab
-shows a banner offering **Continue in <next profile>**, which hides again once
-the session replies normally. A transcript that can't be read leaves the banner
-as it was rather than reporting that all is well.
-
-It also raises a desktop notification with the same **Continue in …** button,
-so you can hand off without opening the window. Clicking the notification
-itself brings that tab forward. The notification is withdrawn if the session
-recovers or the tab closes. Nothing switches until you click. Turn it off with
-**Notify When Out of Quota** in Settings (`notify_on_quota`). It is on by
-default, unlike bell notifications.
+Quota exhaustion is detected from Claude's transcript (a `rate_limit` error), or by
+`limit_markers`, text matched near the bottom of the screen, for a CLI with no such
+record:
 
 ```jsonc
 { "name": "Agy", "command": "agy",
@@ -359,10 +413,8 @@ default, unlike bell notifications.
   "session_id_args": ["--session-id", "{id}"] }          // start under a chosen ID
 ```
 
-Agy's quota message has not been captured yet, so its default markers are the
-Google API's error names. Adjust them once you have seen the real message.
-
 ### Status indicators
+
 Optional header-bar lights driven by a file or a command. Empty by default.
 
 ```jsonc
@@ -383,32 +435,31 @@ Optional header-bar lights driven by a file or a command. Empty by default.
 }
 ```
 
-Each indicator has **three** states, not two: OK, needs-attention, and *unknown*.
-A source that cannot be read gets its own icon and says so — it is never quietly
-reported as healthy. Commands run off the UI thread and are killed at their
-timeout. `"action": "send-to-terminal"` adds a button that types the detail into
-the running session, behind a preview.
+Each indicator has **three** states, not two: OK, needs-attention, and *unknown*. A
+source that cannot be read gets its own icon and says so; it is never quietly reported
+as healthy. Commands run off the UI thread and are killed at their timeout.
+`"action": "send-to-terminal"` adds a button that types the detail into the running
+session, behind a preview.
 
 ### Turn checkpoints
-In a tab whose folder is inside a git repository, the working tree is
-snapshotted each time a turn ends: when the CLI rings the bell, or when its
-output has been quiet for 8 seconds. **Checkpoint Now** on the right-click menu
-takes one on demand. The tab's tooltip shows the latest one. A snapshot that
-fails marks the tab with a warning icon, and the tooltip on that icon says why.
 
-Snapshots are commits recorded only as refs under `refs/agent-terminal/<tab>/`.
-They never touch your branch, index, working tree or stash. Each captures
-tracked changes plus untracked, non-ignored files. It leaves out files over
-5 MiB, more than 2,000 new files, nested repositories, and names that look
-like secrets (`.env*`, `*.pem`, `*.key`, `id_rsa*`, …). Each tab keeps 50
-checkpoints, and any checkpoint older than 7 days is deleted.
+In a thread whose folder is inside a git repository, the working tree is snapshotted
+each time a turn ends. **Checkpoint Now** takes one on demand. A snapshot that fails
+marks the thread with a warning icon, and its tooltip says why.
+
+Snapshots are commits recorded only as refs under `refs/agent-terminal/<thread>/`. They
+never touch your branch, index, working tree or stash. Each captures tracked changes
+plus untracked, non-ignored files. It leaves out files over 5 MiB, more than 2,000 new
+files, nested repositories, and names that look like secrets (`.env*`, `*.pem`,
+`*.key`, `id_rsa*`, …). Each thread keeps 50 checkpoints, and any checkpoint older than
+7 days is deleted.
 
 A normal `git push` does not send these refs. `git push --mirror`, or a local
-`git clone` of the repository, **does**. Known limits: a dirty submodule's
-contents, and files ignored by `.gitignore`, are not captured. Tracked Git LFS
-files are stored in `.git/lfs/objects` with no size cap.
+`git clone` of the repository, **does**. A dirty submodule's contents, and files
+ignored by `.gitignore`, are not captured. Tracked Git LFS files are stored in
+`.git/lfs/objects` with no size cap.
 
-Turn it off in Settings (**Checkpoint Each Turn**). To remove every checkpoint
+Turn it off in Settings → Git (**Checkpoint Each Turn**). To remove every checkpoint
 from a repository:
 
 ```bash
@@ -416,70 +467,53 @@ git for-each-ref --format='delete %(refname)' refs/agent-terminal | git update-r
 ```
 
 ### Diff panel
-`Ctrl + Shift + D`, or **Show or Hide Changes** on the right-click menu, opens a
-read-only panel beside the terminal. It shows a file list with line counts, and
-a coloured unified diff below it. Clicking a file jumps to its diff. The
-dropdown picks what to compare against:
+
+`Ctrl+Shift+D` opens a read-only panel with a file list, line counts and a coloured
+unified diff. The dropdown picks what to compare against:
 
 | Base | Shows |
 |---|---|
 | **Uncommitted** | HEAD against the working tree now, untracked files included |
-| **Last turn** | What the tab's latest checkpoint changed |
-| **This tab** | Everything since the state the tab's first checkpoint was taken on top of, up to now |
+| **Last turn** | What the thread's latest checkpoint changed |
+| **This thread** | Everything since the state the thread's first checkpoint was taken on top of |
 
-A tab's first checkpoint usually comes a few seconds after it opens, once the
-CLI's startup output goes quiet. Uncommitted work already present when the tab
-opened, and not changed before that first checkpoint, counts as the tab's in
-**This tab**.
-
-The panel refreshes when it opens, when a new checkpoint is taken, when the
-base changes, and on its refresh button. It never polls. Git's external diff
-and textconv drivers are not run. Diffs above 1 MiB or 20,000 lines are cut
-short, and one with more than 200,000 changed lines shows only its file
-list. Whether new tabs open with the panel, and its width, are remembered.
+The panel refreshes when it opens, when a checkpoint is taken, when the base changes,
+and on its refresh button. It never polls. Git's external diff and textconv drivers
+are not run. Diffs above 1 MiB or 20,000 lines are cut short. With a diff tool set
+(Settings → Git), **Open in…** launches it on any file.
 
 ### Undoing a turn
-With the diff panel on **Last turn** or **This tab**, the undo arrow puts the
-working tree back to the diff's left side: how it was before the last turn, or
-when the tab started. A confirmation lists every file that will change (`~`) or
-be deleted (`−`), and warns if the session still looks busy.
 
-- **The current state is saved first**, as
-  `refs/agent-terminal/<tab>/pre-restore-<time>`, and the **Undo** on the
-  "Changes undone" message puts it back.
-- **Nothing checkpoints never capture is touched**: ignored files, files over
-  5 MiB, names that look like secrets, nested repositories. The confirmation
-  names them.
-- **Commits and staged changes are never touched.** Only the working tree
-  changes; HEAD and the index stay as they are.
-- **If a file changes after you open the confirmation** (the agent still
-  writing), nothing is restored and you're asked to try again, so nothing
-  unsaved can be lost.
+With the diff panel on **Last turn** or **This thread**, the undo arrow puts the
+working tree back to the diff's left side. A confirmation lists every file that will
+change (`~`) or be deleted (`−`), and warns if the agent still looks busy.
+
+- **The current state is saved first**, as `refs/agent-terminal/<thread>/pre-restore-<time>`,
+  and the **Undo** on the "Changes undone" message puts it back.
+- **Nothing checkpoints never capture is touched**: ignored files, files over 5 MiB,
+  names that look like secrets, nested repositories.
+- **Commits and staged changes are never touched.** Only the working tree changes.
+- **If a file changes after you open the confirmation**, nothing is restored and you're
+  asked to try again, so nothing unsaved can be lost.
 - Deletions stay inside the repository and never follow a symlinked folder.
-- Afterwards the result is checked against the checkpoint. Anything that still
-  differs is reported, with the `git restore` command that puts the saved state
-  back by hand.
+- Afterwards the result is checked against the checkpoint. Anything that still differs
+  is reported, with the `git restore` command that puts the saved state back by hand.
 
-### Worktree tabs
-**New Tab in Worktree…** (`Ctrl + Shift + G`, or the right-click menu, where
-**New Tab in Worktree As** also picks the CLI) asks for a new branch and what to
-start it from. It defaults to the current tab's branch. Both are checked as you
-type, and **Create** stays disabled until they pass. It then runs
-`git worktree add -b <branch>` and opens a tab in the new worktree.
+### Worktree threads
+
+**New Thread in Worktree…** (`Ctrl+Shift+G`) asks for a new branch and what to start
+it from, checks both as you type, then runs `git worktree add -b <branch>` and opens a
+thread there.
 
 Worktrees go in a hidden folder beside the repository,
-`<parent>/.<repo>.worktrees/<branch>`. They're hidden so tools that scan every
-project folder don't index a second copy of the repository. Set **Worktree
-Folder** in Settings to use `<folder>/<repo>/<branch>` instead. Ignored files
-(`node_modules`, `.env`, build output) aren't copied into a new worktree.
+`<parent>/.<repo>.worktrees/<branch>`, so tools that scan every project folder don't
+index a second copy. Set **Worktree Folder** in Settings → Git to use
+`<folder>/<repo>/<branch>` instead. Ignored files (`node_modules`, `.env`, build
+output) aren't copied into a new worktree.
 
-Closing a worktree tab offers **Remove**, but only when the worktree has
-nothing uncommitted, no untracked files, no ignored files, and no other open
-tab is in it. Ignored files count because `git worktree remove` would delete
-them without asking. The in-use check runs again when you click. Removal never
-uses `--force` and never deletes the branch. Anything else is simply kept.
-Submodules and repositories with a separate git directory aren't supported.
-To clean up by hand:
+Closing a worktree thread offers **Remove**, but only when the worktree has nothing
+uncommitted, no untracked or ignored files, and nothing else open in it. Removal never
+uses `--force` and never deletes the branch. To clean up by hand:
 
 ```bash
 git worktree list
@@ -487,63 +521,107 @@ git worktree remove <path>      # refuses if it has changes
 git branch -d <branch>          # refuses if it is unmerged
 ```
 
-### Generating a Debian package (.deb)
+## Troubleshooting
+
+**Where are the logs?** In the systemd journal, and on stderr when started from a
+terminal:
+
 ```bash
-make package
+journalctl --user -t agent-terminal -b
+RUST_LOG=debug agent-terminal
 ```
-*Requires `cargo-deb`; the Makefile installs it if missing.* Runtime dependencies
-are derived from the built binary via `$auto`, so they cannot drift from what it
-actually links.
 
-### Development workflow
-- **Build**: `cargo build` · **Run**: `make start-local`
-- **Lint**: `cargo fmt` and `cargo clippy --all-targets -- -D warnings`
-- **Test**: `cargo test`
+**"No AI CLI detected."** None of the configured commands was found on `PATH`, in the
+usual install folders, or through your login shell. Install one (see
+[The agents themselves](#the-agents-themselves)), or set its full path in Settings →
+Agents, then press **Check again**.
 
-## Project Structure 📁
+**An agent says "Not signed in".** Use **Sign In…** in Settings → Agents (or on the
+thread's banner), finish signing in, then **Check Again**.
 
-- `src/main.rs` — entry point, application setup, logging, global CSS, accelerators.
-- `src/window/imp.rs` — window implementation: pages, spawning, input, settings.
-- `src/window/imp/threads.rs` — the chat-first shell: thread sidebar, thread
-  pages over the hidden tab view, terminal drawer, re-homed 2.x features.
-- `src/window/imp/agents_prefs.rs` — Settings → Agents.
-- `src/window/sidebar_model.rs` — pure sidebar logic: grouping, badges, ages,
-  titles, resume mapping.
-- `src/chat/` — the chat thread: `session.rs` (adapter, process, store,
-  switching, handoff) and `view/` (transcript, composer, panels, model picker).
-- `src/agent_proc.rs` — the agent process transport (gio).
-- `src/approval_server.rs`, `src/approval_hook.rs`, `src/hook_config.rs` — agy's
-  approval socket, the `--approval-hook` client, and the hooks.json check.
-- `src/model_catalog.rs`, `src/account_status.rs`, `src/claude_probe.rs` — both
-  agents' model lists, usage and account.
-- `crates/agent-core` — pure: events, adapters, policies, redaction.
-- `crates/agent-kit` — GTK-free I/O: the thread store, git, diffs, restore,
-  worktrees, hand-off briefs, sessions.
-- `src/window/mod.rs` — the `AgentTerminalWindow` GObject wrapper.
-- `src/config.rs` — persisted settings and the 1.x migration, with tests.
-- `src/theme.rs` — terminal colour schemes.
-- `src/utils.rs` — pure logic: profile resolution, startup command, env files,
-  status indicators, path resolution, session stores.
-- `src/handoff.rs` — pure logic for hand-offs: brief building, redaction and
-  quota detection.
-- `src/git.rs` — git plumbing for turn checkpoints and the diff panel: repo
-  discovery, snapshots through a private index, checkpoint refs, retention and
-  diffs.
-- `src/diff.rs` — pure logic for the diff panel: bases, numstat parsing, line
-  classification and truncation.
-- `src/window/diff_panel.rs` — the diff panel's widgets.
-- `src/restore.rs` — undoing a turn: saving the current state first, restoring
-  a checkpoint to the working tree, contained deletion and the check after.
-- `src/worktree.rs` — New Tab in Worktree: default locations, branch checks,
-  and creating and (clean-only) removing worktrees.
+**agy edits files in Plan mode.** It does, without its approval hook. Install the
+[hook](#agys-approval-hook).
 
-## Contributing 🤝
+**My local build doesn't start / opens the old version.** Agent Terminal is
+single-instance. If another copy is running, a new launch hands over to it and exits.
+Run a development build on its own session bus:
 
-1. Branch: `git checkout -b feature/cool-new-thing`.
-2. Keep it green: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and
-   `cargo test`.
-3. Commit using Conventional Commits.
+```bash
+dbus-run-session -- ./target/debug/agent-terminal
+```
 
-## License 📄
+**Settings reset after a hand edit.** The file didn't parse. Your version was kept as
+`config.json.invalid-…` beside it, and the app said so when it started.
 
-MIT — see [LICENSE](LICENSE).
+## Building from source
+
+Requirements: **Rust 1.92+** and the development packages below.
+
+| Distribution | Packages |
+|---|---|
+| Debian / Ubuntu | `libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libgtksourceview-5-dev libglib2.0-dev-bin pkg-config` |
+| Fedora | `gtk4-devel libadwaita-devel vte291-gtk4-devel gtksourceview5-devel glib2-devel` |
+| Arch | `gtk4 libadwaita vte4 gtksourceview5 pkgconf` |
+
+```bash
+git clone https://github.com/jean1880/agent-terminal.git
+cd agent-terminal
+make deps          # Debian/Ubuntu: install the packages above
+make start-local   # build (debug) and run
+make build         # release build: target/release/agent-terminal
+make install       # into ~/.local (binary, icon, desktop entry)
+make package       # a .deb, via cargo-deb
+```
+
+Development checks (CI runs the same):
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+### Project structure
+
+- `src/main.rs`: entry point, command-line options, logging, global CSS, shortcuts.
+- `src/window/imp.rs`: the window, settings, spawning, terminal pages.
+- `src/window/imp/threads.rs`: the thread sidebar, thread pages, terminal drawer.
+- `src/window/imp/agents_prefs.rs`, `setup.rs`: Settings → Agents, and the first-start walkthrough.
+- `src/chat/`: the chat thread: `session.rs` (adapter, process, store, switching,
+  hand-off) and `view/` (transcript, composer, panels, model picker).
+- `src/palette.rs`, `src/theme.rs`: app-wide colours (and the system theme), terminal palettes.
+- `src/config.rs`: settings, migration and validation.
+- `src/agent_proc.rs`, `src/approval_server.rs`, `src/approval_hook.rs`: the agent process
+  transport and agy's approval socket and hook.
+- `crates/agent-core`: pure logic, with no GTK or I/O: events, the Claude/agy/Codex
+  adapters, policies, redaction.
+- `crates/agent-kit`: GTK-free I/O: the thread store, git checkpoints, diffs, restore,
+  worktrees, hand-off briefs, session readers.
+
+## Upgrading
+
+### From 2.x
+
+- **Chat is the default.** `Ctrl+Shift+T`, **+**, New in Folder, New in Worktree,
+  Resume and Continue In open chat threads. **+** → New Terminal Thread gives a 2.x
+  terminal page with any profile.
+- **Your config keeps working.** The new per-agent settings and the default agent are
+  optional, and set in Settings → Agents. The theme moved to Settings → General.
+- **Threads are stored** in `~/.local/state/agent-terminal/threads.db`.
+- **agy can't ask before acting** until you install its [approval hook](#agys-approval-hook).
+
+### From 1.x (`antigravity-terminal`)
+
+On first launch, settings at `~/.config/antigravity-terminal/config.json` are copied to
+`~/.config/agent-terminal/config.json`. The old file is left in place.
+
+## Contributing
+
+1. Branch: `git checkout -b feat/cool-new-thing`.
+2. Keep it green: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`
+   and `cargo test --workspace`.
+3. Commit using [Conventional Commits](https://www.conventionalcommits.org/).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
