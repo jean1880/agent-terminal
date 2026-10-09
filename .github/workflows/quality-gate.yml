@@ -1,0 +1,51 @@
+name: Shared source and native UX gate
+
+on:
+  workflow_call:
+    outputs:
+      tested_commit:
+        description: Exact checkout commit that passed the source and native gate
+        value: ${{ jobs.check.outputs.tested_commit }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    outputs:
+      tested_commit: ${{ steps.gate.outputs.tested_commit }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libvte-2.91-gtk4-dev libadwaita-1-dev \
+            libgtksourceview-5-dev libglib2.0-dev-bin xvfb xauth dbus-x11 python3
+      - name: Install Rust checks
+        run: rustup component add rustfmt clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ux-gate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ux-gate-
+      - name: Source and native UX gate
+        id: gate
+        run: |
+          python3 tests/qa/test_gate.py
+          python3 tests/qa/test_package_smoke.py
+          python3 tests/qa/gate.py --delivery
+          echo "tested_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Preserve synthetic test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ux-gate-${{ github.sha }}
+          path: target/qa-artifacts/
+          if-no-files-found: warn
+          retention-days: 14

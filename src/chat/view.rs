@@ -31,6 +31,9 @@ mod transcript;
 mod typeahead;
 pub mod usage;
 
+#[cfg(test)]
+mod ux_tests;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::{Rc, Weak};
@@ -680,11 +683,18 @@ impl Inner {
 
     fn refresh_agent_chip(&self) {
         let status = self.backend.status();
-        let model = status
-            .model
-            .clone()
-            .or_else(|| self.model.borrow().current_model().map(str::to_owned));
-        self.header.set_agent(status.driver, model.as_deref());
+        let model = status.model.clone().or_else(|| {
+            status
+                .pending_model
+                .is_none()
+                .then(|| self.model.borrow().current_model().map(str::to_owned))
+                .flatten()
+        });
+        self.header.set_agent(
+            status.driver,
+            model.as_deref(),
+            status.pending_model.as_deref(),
+        );
         // The composer's hint names the agent too: it must follow a switch, which arrives as
         // events and never goes through `refresh_status` (that only runs on running changes).
         self.composer.refresh_placeholder();
@@ -1073,7 +1083,7 @@ impl PlanPanel {
             row.append(&text);
             self.steps.append(&row);
         }
-        self.revealer.set_reveal_child(!plan.is_empty());
+        self.revealer.set_reveal_child(model::plan_is_active(plan));
     }
 }
 
@@ -1082,10 +1092,11 @@ pub(crate) mod tests {
     use super::*;
     use agent_core::event::Decision;
 
-    fn status_of(driver: Driver) -> SessionStatus {
+    pub(super) fn status_of(driver: Driver) -> SessionStatus {
         SessionStatus {
             driver,
             model: None,
+            pending_model: None,
             effort: None,
             mode: Mode::Ask,
             running_turn: false,
@@ -1107,8 +1118,8 @@ pub(crate) mod tests {
     }
 
     /// A backend whose status the test changes, as a session does on a switch.
-    struct SwitchableBackend {
-        status: RefCell<SessionStatus>,
+    pub(super) struct SwitchableBackend {
+        pub(super) status: RefCell<SessionStatus>,
     }
 
     impl ChatBackend for SwitchableBackend {
@@ -1127,6 +1138,194 @@ pub(crate) mod tests {
         fn status(&self) -> SessionStatus {
             self.status.borrow().clone()
         }
+    }
+
+    /// Completion arrives while the turn is still running; history stays inspectable after
+    /// reopening and subsequent interrupted/failed plans never become completed.
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn completed_plans_retire_to_history_and_new_turns_start_fresh() {
+        use agent_core::event::{Event, TurnState};
+
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        let context = glib::MainContext::default();
+        let until = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !condition() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native plan condition timed out"
+                );
+                context.iteration(false);
+            }
+        };
+        let plan = |status| {
+            Envelope::new(Event::PlanUpdated {
+                steps: vec![PlanStep {
+                    text: "Inspect the synthetic plan history".into(),
+                    status,
+                }],
+            })
+        };
+        let finished = |state| {
+            Envelope::new(Event::TurnCompleted {
+                state,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            })
+        };
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Codex)),
+        });
+        let view = ChatView::new(backend.clone());
+        let window = gtk4::Window::new();
+        window.set_default_size(560, 700);
+        window.set_child(Some(&view));
+        window.present();
+        until(&|| view.width() > 0);
+        let inner = view.inner().expect("built view");
+        let history_id = |status: StepStatus| {
+            let model = inner.model.borrow();
+            model
+                .order()
+                .iter()
+                .find(|id| {
+                    matches!(&model.get(id).expect("item").body,
+                        model::Body::Plan { steps, .. } if steps[0].status == status)
+                })
+                .cloned()
+                .expect("plan history row")
+        };
+        let events = [
+            Envelope::new(Event::TurnStarted { model: None }),
+            plan(StepStatus::Pending),
+            plan(StepStatus::InProgress),
+            plan(StepStatus::Completed),
+            finished(TurnState::Completed),
+        ];
+        view.apply(&events[0]);
+        for event in &events[1..3] {
+            view.apply(event);
+            assert!(inner.plan.revealer.reveals_child());
+        }
+        view.apply(&events[3]);
+        assert!(inner.model.borrow().running, "completion precedes turn end");
+        assert!(
+            !inner.plan.revealer.reveals_child(),
+            "completed shelf retires immediately"
+        );
+        let completed = history_id(StepStatus::Completed);
+        inner.row_event(RowEvent::Toggle {
+            id: completed.clone(),
+            expanded: true,
+        });
+        until(&|| {
+            inner
+                .transcript
+                .with_row(&completed, |row| row.widget().height() > 0)
+                == Some(true)
+        });
+        assert!(
+            inner
+                .model
+                .borrow()
+                .get(&completed)
+                .expect("completed plan")
+                .expanded
+        );
+        let history = inner
+            .transcript
+            .with_row(&completed, |row| match row {
+                cards::Row::Plan { root, steps, .. } => Some((
+                    root.is_expanded(),
+                    root.label().map(|text| text.to_string()),
+                    steps
+                        .first_child()
+                        .and_downcast::<gtk4::Label>()
+                        .map(|label| label.text().to_string()),
+                )),
+                _ => None,
+            })
+            .flatten()
+            .expect("inspectable plan row");
+        assert!(history.0, "history expands to expose step details");
+        assert_eq!(history.1.as_deref(), Some("Completed plan"));
+        assert_eq!(
+            history.2.as_deref(),
+            Some("Completed: Inspect the synthetic plan history")
+        );
+        let expander = inner
+            .transcript
+            .with_row(&completed, |row| match row {
+                cards::Row::Plan { root, .. } => Some(root.clone()),
+                _ => None,
+            })
+            .flatten()
+            .expect("plan expander");
+        // Invoke the widget's own notification path as a user expansion does, outside the
+        // transcript accessor's borrow; it must persist the choice without re-entering GTK.
+        for expanded in [false, true] {
+            expander.set_expanded(expanded);
+            assert_eq!(
+                inner.model.borrow().get(&completed).expect("plan").expanded,
+                expanded
+            );
+        }
+        view.apply(&events[4]);
+        backend.status.borrow_mut().alive = false;
+        view.replay(&events);
+        assert!(
+            !inner.plan.revealer.reveals_child(),
+            "reopen keeps the shelf retired"
+        );
+        let completed = history_id(StepStatus::Completed);
+        assert!(inner.transcript.with_row(&completed, |_| ()).is_some());
+        backend.status.borrow_mut().alive = true;
+
+        for state in [TurnState::Interrupted, TurnState::Failed] {
+            view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+            assert!(
+                !inner.plan.revealer.reveals_child(),
+                "new turn has no stale shelf"
+            );
+            view.apply(&plan(StepStatus::InProgress));
+            assert!(inner.plan.revealer.reveals_child());
+            view.apply(&finished(state));
+            assert!(
+                !inner.plan.revealer.reveals_child(),
+                "finished turn retires incomplete work"
+            );
+            let history_order = inner.model.borrow().order().to_vec();
+            view.apply(&plan(StepStatus::Pending));
+            assert!(
+                !inner.plan.revealer.reveals_child(),
+                "late update cannot reopen the shelf"
+            );
+            assert_eq!(
+                inner.model.borrow().order(),
+                history_order,
+                "late update cannot add history"
+            );
+            assert!(matches!(
+                &inner.model.borrow().get(&completed).expect("completed history").body,
+                model::Body::Plan { steps, .. } if steps[0].status == StepStatus::Completed
+            ));
+            let model = inner.model.borrow();
+            let last = model
+                .order()
+                .iter()
+                .rev()
+                .find_map(|id| match &model.get(id)?.body {
+                    model::Body::Plan { steps, outcome } => Some((steps, outcome)),
+                    _ => None,
+                })
+                .expect("latest plan history");
+            assert_eq!(last.0[0].status, StepStatus::InProgress);
+            assert_eq!(*last.1, Some(state));
+        }
+        window.close();
     }
 
     /// A thread stored mid-turn, reopened: replayed before its session starts (no live agent),
@@ -1275,8 +1474,84 @@ pub(crate) mod tests {
         assert_eq!(inner.thinking.shown(), None, "gone once the turn ends");
     }
 
+    fn model_chip_follows_pending_acceptance_and_rejection() {
+        let mut status = status_of(Driver::Claude);
+        status.model = Some("sonnet".into());
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status),
+        });
+        let view = ChatView::new(backend.clone());
+        let chip = view.inner().expect("view").header.chip.clone();
+        let tooltip = || chip.tooltip_text().expect("model tooltip").to_string();
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "sonnet".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Claude · sonnet · Switch model or agent (/model)"
+        );
+
+        backend.status.borrow_mut().pending_model = Some("opus".into());
+        view.sink()(&Envelope::new(Event::ModelChangeRequested {
+            model: "opus".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Claude · sonnet → opus (pending) · Switch model or agent (/model)"
+        );
+        {
+            let mut status = backend.status.borrow_mut();
+            status.model = Some("opus".into());
+            status.pending_model = None;
+        }
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "opus".into(),
+        }));
+        assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+
+        backend.status.borrow_mut().pending_model = Some("unavailable".into());
+        view.sink()(&Envelope::new(Event::ModelChangeRequested {
+            model: "unavailable".into(),
+        }));
+        assert!(tooltip().contains("opus → unavailable (pending)"));
+        backend.status.borrow_mut().pending_model = None;
+        view.sink()(&Envelope::new(Event::ModelChangeFailed {
+            model: "unavailable".into(),
+            message: "Model is unavailable".into(),
+        }));
+        assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+
+        // The reducer still remembers Claude's model while the replacement provider starts.
+        // A pending Codex selection must not make that old model look like a Codex model.
+        {
+            let mut status = backend.status.borrow_mut();
+            *status = status_of(Driver::Codex);
+            status.pending_model = Some("gpt-5-codex".into());
+        }
+        view.sink()(&Envelope::new(Event::ModelChangeRequested {
+            model: "gpt-5-codex".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Codex · gpt-5-codex (pending) · Switch model or agent (/model)"
+        );
+        {
+            let mut status = backend.status.borrow_mut();
+            status.model = Some("gpt-5-codex".into());
+            status.pending_model = None;
+        }
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "gpt-5-codex".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Codex · gpt-5-codex · Switch model or agent (/model)"
+        );
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
+        model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();
         thinking_strip_follows_the_turn();
@@ -1454,6 +1729,9 @@ pub(crate) mod tests {
     #[ignore = "presents a window; run on a private display"]
     fn the_newest_row_stays_in_view_while_following() {
         gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
         let ctx = glib::MainContext::default();
         let backend = demo::demo_backend();
         let view = ChatView::new(backend.clone());
@@ -1491,6 +1769,10 @@ pub(crate) mod tests {
                 }
             }
             eprintln!("{what}: longest below-fold stretch {longest} frames, worst {worst:.0} px");
+            crate::testutil::capture_window(
+                &window,
+                &format!("follow-bottom-{}", what.replace(' ', "-")),
+            );
             (longest, worst)
         };
         backend.play_script();
@@ -2049,6 +2331,107 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn long_tool_titles_keep_user_messages_inside_the_viewport() {
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let ctx = glib::MainContext::default();
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Codex)),
+        }));
+        let command = format!("git show {}", "a".repeat(820));
+        let mut history = demo::DemoBackend::stress_history(180);
+        history.push(
+            Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::Command,
+                title: command.clone(),
+                input: Some(serde_json::json!({"command": command})),
+                parent: None,
+            })
+            .item("wide-command"),
+        );
+        history.push(
+            Envelope::new(Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Completed,
+                output: Some("done".into()),
+                error: None,
+            })
+            .item("wide-command"),
+        );
+        let path = format!("src/{}.rs", "x".repeat(820));
+        history.push(
+            Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::FileChange,
+                title: path.clone(),
+                input: Some(serde_json::json!([{
+                    "path": path, "kind": {"type": "add"}, "diff": "+example"
+                }])),
+                parent: None,
+            })
+            .item("wide-file"),
+        );
+        history.push(
+            Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::UserMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item("visible-user"),
+        );
+        history.push(
+            Envelope::new(Event::ContentSnapshot {
+                stream: agent_core::event::StreamKind::Assistant,
+                text: "Can you still see this message?".into(),
+            })
+            .item("visible-user"),
+        );
+        view.replay(&history);
+        let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        holder.append(&view);
+        let hidden = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        hidden.set_visible(false);
+        let pane = gtk4::Paned::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .start_child(&holder)
+            .end_child(&hidden)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        let window = gtk4::Window::new();
+        window.set_default_size(560, 460);
+        window.set_child(Some(&pane));
+        window.present();
+        let inner = view.inner().expect("view");
+        assert!(
+            crate::testutil::pump_until(&ctx, 8, || inner.transcript.frames() >= 3),
+            "layout frames"
+        );
+        let overflow = crate::testutil::overflowing_bins(view.upcast_ref());
+        let (user, width) = inner
+            .transcript
+            .row_bounds_in_viewport("visible-user")
+            .expect("user in viewport");
+        let bottom = inner.transcript.last_row_overflow().expect("last row");
+        let report = inner.transcript.scroll_debug();
+        window.destroy();
+        assert!(
+            overflow.is_empty(),
+            "content exceeds its viewport: {overflow:?}\n{report}"
+        );
+        assert!(
+            user.x() >= 0.0 && user.x() + user.width() <= width as f32,
+            "user row exceeds {width}px: {user:?}\n{report}"
+        );
+        assert!(
+            bottom.0 <= 2.0 && bottom.1,
+            "newest user message below viewport: {bottom:?}\n{report}"
+        );
+    }
+
     /// Measures what a streamed thinking block costs the main loop, per delta: the view's own
     /// work (reduce + row update), the size request the next frame then pays, and the real frame
     /// times. Prints numbers; asserts nothing. Run on a private display like the tests above,
@@ -2072,7 +2455,9 @@ pub(crate) mod tests {
         // A thread with history: the transcript box holds its full window of rows.
         for n in 0..140 {
             sink(&Envelope::new(Event::Notice {
-                text: format!("earlier message {n}, long enough to wrap onto a second line of the transcript column"),
+                text: format!(
+                    "earlier message {n}, long enough to wrap onto a second line of the transcript column"
+                ),
             }));
         }
         let pump = |ms: u64| {
@@ -2677,9 +3062,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "needs a display; run alone: cargo test interruption_shelf -- --ignored"]
     fn interruption_shelf_reveals_and_collapses() {
-        if gtk4::init().is_err() {
-            return;
-        }
+        gtk4::init().expect("GTK must be available for the native gate");
         let sent = Rc::new(RefCell::new(Vec::new()));
         let shelf = interruption::InterruptionShelf::new(
             Rc::new(move |e| sent.borrow_mut().push(e)),

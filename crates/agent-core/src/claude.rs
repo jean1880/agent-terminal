@@ -30,6 +30,7 @@ use serde_json::{json, Map, Value};
 
 use crate::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
+    Outbox,
 };
 use crate::caps::Capabilities;
 use crate::event::{
@@ -99,6 +100,11 @@ pub struct ClaudeAdapter {
     /// changed, so it becomes `ModeChanged` (without it the picker snapped back on the next
     /// status refresh).
     mode_requests: HashMap<String, Mode>,
+    /// Model controls await acknowledgement; request order prevents a delayed reply from
+    /// replacing a newer successfully selected model.
+    model_requests: HashMap<String, (u64, String)>,
+    model_ack_order: u64,
+    outbox: Outbox,
     /// The permission mode Claude last reported in `init` (it changes it itself too, as when
     /// a plan is accepted).
     mode: Option<Mode>,
@@ -142,6 +148,9 @@ impl ClaudeAdapter {
             context_requests: HashSet::new(),
             usage_requests: HashSet::new(),
             mode_requests: HashMap::new(),
+            model_requests: HashMap::new(),
+            model_ack_order: 0,
+            outbox: Outbox::default(),
             mode: None,
             current_effort: std::cell::RefCell::new(None),
         }
@@ -820,16 +829,30 @@ impl ClaudeAdapter {
         let mut out = Vec::new();
 
         let mode_set = self.mode_requests.remove(id);
+        let model_set = self.model_requests.remove(id);
         if str_of(resp, "subtype") == Some("error") {
             self.usage_requests.remove(id);
+            self.context_requests.remove(id);
             let error = str_of(resp, "error")
                 .unwrap_or("control request failed")
                 .to_owned();
-            return vec![Envelope::new(Event::ControlResult {
-                ok: None,
-                error: Some(error),
-            })
-            .request(id)];
+            out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: None,
+                    error: Some(error.clone()),
+                })
+                .request(id),
+            );
+            if let Some((_, model)) = model_set {
+                out.push(
+                    Envelope::new(Event::ModelChangeFailed {
+                        message: format!("Claude set_model to {model} failed: {error}"),
+                        model,
+                    })
+                    .request(id),
+                );
+            }
+            return out;
         }
 
         out.push(
@@ -842,6 +865,13 @@ impl ClaudeAdapter {
         if let Some(mode) = mode_set {
             self.mode = Some(mode);
             out.push(Envelope::new(Event::ModeChanged { mode }));
+        }
+        if let Some((order, model)) = model_set {
+            if str_of(resp, "subtype") == Some("success") && order > self.model_ack_order {
+                self.model_ack_order = order;
+                self.model = Some(model.clone());
+                out.push(Envelope::new(Event::ModelChanged { model }).request(id));
+            }
         }
         let body = body.unwrap_or(Value::Null);
         if self.init_id.as_deref() == Some(id) {
@@ -1039,6 +1069,13 @@ impl Adapter for ClaudeAdapter {
     }
 
     fn handshake(&mut self) -> Vec<String> {
+        // The host reuses this adapter when effort changes respawn the process. Its first
+        // init must confirm the restarted session even if only effort changed.
+        self.session_started = false;
+        self.init_seen = false;
+        self.commands_seen = false;
+        self.mode = None;
+        self.interrupt_pending = false;
         let id = self.next_id("init");
         self.init_id = Some(id.clone());
         vec![self.control_line(&id, json!({"subtype": "initialize"}))]
@@ -1092,6 +1129,14 @@ impl Adapter for ClaudeAdapter {
                     })]);
                 }
                 let id = self.next_id("model");
+                self.model_requests
+                    .insert(id.clone(), (self.counter, model.clone()));
+                self.outbox.events.push(
+                    Envelope::new(Event::ModelChangeRequested {
+                        model: model.clone(),
+                    })
+                    .request(&id),
+                );
                 self.control_line(&id, json!({"subtype": "set_model", "model": model}))
             }
             Command::SetMode { mode } => {
@@ -1129,6 +1174,10 @@ impl Adapter for ClaudeAdapter {
             first.raw = Some(frame);
         }
         out
+    }
+
+    fn drain_outbox(&mut self) -> Outbox {
+        std::mem::take(&mut self.outbox)
     }
 
     fn feed_stderr(&mut self, line: &str) -> Vec<Envelope> {
@@ -1192,9 +1241,20 @@ impl Adapter for ClaudeAdapter {
                     ok: None,
                     error: Some("agent exited".to_owned()),
                 })
-                .request(id),
+                .request(&id),
             );
+            if let Some((_, model)) = self.model_requests.remove(&id) {
+                out.push(Envelope::new(Event::ModelChangeFailed {
+                    message: format!("Claude set_model to {model} failed: agent exited before acknowledgement"),
+                    model,
+                }).request(id));
+            }
         }
+        self.model_requests.clear();
+        self.mode_requests.clear();
+        self.context_requests.clear();
+        self.usage_requests.clear();
+        self.outbox = Outbox::default();
         if std::mem::take(&mut self.turn_open) {
             out.push(Envelope::new(Event::TurnCompleted {
                 state: if expected {
@@ -2985,6 +3045,183 @@ mod tests {
                 .as_slice(),
             [Action::Respawn(_)]
         ));
+    }
+
+    #[test]
+    fn restarted_process_reports_session_started_for_changed_or_unchanged_model() {
+        for model in ["claude-opus-4-6", "m"] {
+            let mut a = ClaudeAdapter::new();
+            let mut session = OpenSession {
+                program: "claude".into(),
+                extra_args: vec![],
+                cwd: "/w".into(),
+                model: Some("m".into()),
+                effort: Some("medium".into()),
+                mode: Mode::Ask,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+            };
+            a.argv(&session);
+            a.handshake();
+            a.feed(&init_frame());
+            assert!(matches!(
+                a.encode(Command::SetModel {
+                    model: model.into(),
+                    effort: Some("high".into())
+                })
+                .expect("encode")
+                .as_slice(),
+                [Action::Respawn(_)]
+            ));
+            a.on_exit(Some(0));
+            session.model = Some(model.into());
+            session.effort = Some("high".into());
+            session.resume = Some("s".into());
+            a.argv(&session);
+            a.handshake();
+            let init =
+                json!({"type": "system", "subtype": "init", "model": model, "session_id": "s"})
+                    .to_string();
+            let out = a.feed(&init);
+            assert_eq!(out.iter().filter(|e| matches!(&e.event, Event::SessionStarted { model: Some(reported), .. } if reported == model)).count(), 1, "first init of restarted process must confirm model, including an effort-only restart");
+            assert!(out
+                .iter()
+                .all(|e| !matches!(e.event, Event::ModelChanged { .. })));
+            let later = a.feed(&init);
+            assert!(later
+                .iter()
+                .all(|e| !matches!(e.event, Event::SessionStarted { .. })));
+            assert!(later
+                .iter()
+                .any(|e| matches!(e.event, Event::TurnStarted { .. })));
+        }
+    }
+
+    #[test]
+    fn model_control_acknowledges_only_successful_requests() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let request = written(
+            &mut a,
+            Command::SetModel {
+                model: "sonnet".into(),
+                effort: None,
+            },
+        );
+        let id = request["request_id"].as_str().expect("wire request id");
+        assert_eq!(request["request"]["model"], "sonnet");
+        assert_eq!(
+            a.model.as_deref(),
+            Some("m"),
+            "encode must not adopt the model"
+        );
+        let requested = a.drain_outbox().events;
+        assert!(
+            matches!(requested.as_slice(), [e] if e.event == Event::ModelChangeRequested { model: "sonnet".into() } && e.request.as_deref() == Some(id))
+        );
+        let ack = json!({"type": "control_response", "response": {"subtype": "success", "request_id": id}});
+        let out = a.feed(&ack.to_string());
+        assert!(out
+            .iter()
+            .any(|e| matches!(&e.event, Event::ModelChanged { model } if model == "sonnet")));
+        assert_eq!(a.model.as_deref(), Some("sonnet"));
+        assert!(a
+            .feed(&ack.to_string())
+            .iter()
+            .all(|e| !matches!(e.event, Event::ModelChanged { .. })));
+
+        let request = written(
+            &mut a,
+            Command::SetModel {
+                model: "rejected".into(),
+                effort: None,
+            },
+        );
+        let ack = json!({"type": "control_response", "response": {"subtype": "error", "request_id": request["request_id"], "error": "not available"}});
+        let out = a.feed(&ack.to_string());
+        assert_eq!(a.model.as_deref(), Some("sonnet"));
+        assert!(out
+            .iter()
+            .all(|e| !matches!(e.event, Event::ModelChanged { .. })));
+        assert!(out.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, message } if model == "rejected" && message.contains("set_model") && message.contains("not available"))));
+        assert!(out.iter().any(|e| matches!(&e.event, Event::ControlResult { error: Some(error), .. } if error == "not available") && e.request.as_deref() == request["request_id"].as_str()));
+    }
+
+    #[test]
+    fn model_control_late_acknowledgements_cannot_revert_newer_success() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let first = written(
+            &mut a,
+            Command::SetModel {
+                model: "sonnet".into(),
+                effort: None,
+            },
+        );
+        let second = written(
+            &mut a,
+            Command::SetModel {
+                model: "opus".into(),
+                effort: None,
+            },
+        );
+        for (request, expected) in [(second, "opus"), (first, "opus")] {
+            a.feed(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"]}}).to_string());
+            assert_eq!(a.model.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn model_control_exit_clears_pending_acknowledgements() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let request = written(
+            &mut a,
+            Command::SetModel {
+                model: "sonnet".into(),
+                effort: None,
+            },
+        );
+        let out = a.on_exit(Some(1));
+        assert!(out.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, message } if model == "sonnet" && message.contains("exited"))));
+        assert!(a.model_requests.is_empty());
+        assert!(a.pending_controls.is_empty());
+        assert!(a.drain_outbox().is_empty());
+        let late = a.feed(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"]}}).to_string());
+        assert!(late
+            .iter()
+            .all(|e| !matches!(e.event, Event::ModelChanged { .. })));
+        assert_eq!(a.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn model_control_keeps_earlier_success_when_newer_selection_is_rejected() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let first = written(
+            &mut a,
+            Command::SetModel {
+                model: "sonnet".into(),
+                effort: None,
+            },
+        );
+        let second = written(
+            &mut a,
+            Command::SetModel {
+                model: "opus".into(),
+                effort: None,
+            },
+        );
+        let out = a.feed(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": first["request_id"]}}).to_string());
+        assert!(out
+            .iter()
+            .any(|e| matches!(&e.event, Event::ModelChanged { model } if model == "sonnet")));
+        let out = a.feed(&json!({"type": "control_response", "response": {"subtype": "error", "request_id": second["request_id"], "error": "not available"}}).to_string());
+        assert!(out.iter().any(
+            |e| matches!(&e.event, Event::ModelChangeFailed { model, .. } if model == "opus")
+        ));
+        assert_eq!(a.model.as_deref(), Some("sonnet"));
     }
 
     #[test]

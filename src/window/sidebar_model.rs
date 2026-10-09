@@ -364,6 +364,7 @@ pub enum ThreadAction {
     Unarchive(String),
     Delete(String),
     OpenFolder(String),
+    ReviewEnvironment(String),
     CopyId(String),
 }
 
@@ -404,6 +405,7 @@ impl ThreadAction {
             Self::Unarchive(t) => simple("unarchive", t),
             Self::Delete(t) => simple("delete", t),
             Self::OpenFolder(t) => simple("folder", t),
+            Self::ReviewEnvironment(t) => simple("review-environment", t),
             Self::CopyId(t) => simple("copy-id", t),
         }
     }
@@ -444,6 +446,7 @@ impl ThreadAction {
             "unarchive" => simple(Self::Unarchive(thread)),
             "delete" => simple(Self::Delete(thread)),
             "folder" => simple(Self::OpenFolder(thread)),
+            "review-environment" => simple(Self::ReviewEnvironment(thread)),
             "copy-id" => simple(Self::CopyId(thread)),
             _ => None,
         }
@@ -627,6 +630,11 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
         ]),
         MenuEntry::Section(vec![
             item("Open folder", ThreadAction::OpenFolder(thread.clone())),
+            MenuEntry::Item {
+                label: "Review Multi-Agent Environment…".to_owned(),
+                action: ThreadAction::ReviewEnvironment(thread.clone()),
+                enabled: !input.agents.is_empty(),
+            },
             item("Copy thread id", ThreadAction::CopyId(thread)),
         ]),
     ]
@@ -985,6 +993,7 @@ mod tests {
                 "Archive",
                 "Delete…",
                 "Open folder",
+                "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]
         );
@@ -995,6 +1004,7 @@ mod tests {
                 "Unarchive",
                 "Delete…",
                 "Open folder",
+                "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]
         );
@@ -1020,6 +1030,7 @@ mod tests {
             ThreadAction::Unarchive("t".into()),
             ThreadAction::Delete("t".into()),
             ThreadAction::OpenFolder("t".into()),
+            ThreadAction::ReviewEnvironment("t".into()),
             ThreadAction::CopyId("t".into()),
         ];
         for a in actions {
@@ -1037,6 +1048,20 @@ mod tests {
         ] {
             assert_eq!(ThreadAction::decode(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn review_targets_the_clicked_thread_without_needing_history() {
+        let mut target = input(false, false);
+        target.thread = "clicked-not-selected".into();
+        let menu = thread_menu(&target);
+        assert!(items(&menu).iter().any(|(_, action, enabled)| *enabled
+            && *action == ThreadAction::ReviewEnvironment("clicked-not-selected".into())));
+        target.agents.clear();
+        assert!(items(&thread_menu(&target))
+            .iter()
+            .any(|(_, action, enabled)| !*enabled
+                && matches!(action, ThreadAction::ReviewEnvironment(_))));
     }
 
     #[test]

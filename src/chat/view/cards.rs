@@ -415,6 +415,11 @@ pub enum Row {
     Static(gtk4::Widget),
     Approval(ApprovalCard),
     Question(QuestionCardWidget),
+    Plan {
+        root: gtk4::Expander,
+        steps: gtk4::Box,
+        updating: Rc<Cell<bool>>,
+    },
 }
 
 impl Row {
@@ -471,6 +476,32 @@ impl Row {
             }
             Body::Approval(_) => Self::Approval(ApprovalCard::new(sink)),
             Body::Question(q) => Self::Question(QuestionCardWidget::new(q, sink)),
+            Body::Plan { .. } => {
+                let root = gtk4::Expander::new(None);
+                let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                steps.set_margin_start(12);
+                steps.set_margin_top(6);
+                steps.set_margin_bottom(6);
+                root.set_child(Some(&steps));
+                let id = item.id.clone();
+                let sink = sink.clone();
+                let updating = Rc::new(Cell::new(false));
+                let guard = updating.clone();
+                root.connect_expanded_notify(move |root| {
+                    if guard.get() {
+                        return;
+                    }
+                    sink(RowEvent::Toggle {
+                        id: id.clone(),
+                        expanded: root.is_expanded(),
+                    });
+                });
+                Self::Plan {
+                    root,
+                    steps,
+                    updating,
+                }
+            }
         };
         row.update(item);
         row
@@ -484,6 +515,7 @@ impl Row {
             Self::Static(w) => w.clone(),
             Self::Approval(a) => a.root.clone().upcast(),
             Self::Question(q) => q.root.clone().upcast(),
+            Self::Plan { root, .. } => root.clone().upcast(),
         }
     }
 
@@ -544,6 +576,49 @@ impl Row {
             (Self::Tool(t), Body::Tool(_)) => t.update(item),
             (Self::Approval(a), Body::Approval(_)) => a.update(item),
             (Self::Question(q), Body::Question(card)) => q.update(card.state),
+            (
+                Self::Plan {
+                    root,
+                    steps: list,
+                    updating,
+                },
+                Body::Plan { steps, outcome },
+            ) => {
+                use agent_core::event::{StepStatus, TurnState};
+                let complete =
+                    !steps.is_empty() && steps.iter().all(|s| s.status == StepStatus::Completed);
+                let title = if complete {
+                    "Completed plan"
+                } else {
+                    match outcome {
+                        Some(TurnState::Interrupted) => "Plan interrupted",
+                        Some(TurnState::Failed) => "Plan failed",
+                        Some(TurnState::Completed) => "Plan ended with unfinished steps",
+                        None => "Plan",
+                    }
+                };
+                root.set_label(Some(title));
+                if root.is_expanded() != item.expanded {
+                    updating.set(true);
+                    root.set_expanded(item.expanded);
+                    updating.set(false);
+                }
+                root.update_property(&[gtk4::accessible::Property::Label(title)]);
+                while let Some(child) = list.first_child() {
+                    list.remove(&child);
+                }
+                for step in steps {
+                    let state = match step.status {
+                        StepStatus::Pending => "Pending",
+                        StepStatus::InProgress => "In progress",
+                        StepStatus::Completed => "Completed",
+                    };
+                    let row = label(&format!("{state}: {}", step.text), &[]);
+                    wrapping(&row);
+                    row.set_selectable(true);
+                    list.append(&row);
+                }
+            }
             _ => {}
         }
     }
@@ -911,7 +986,12 @@ impl ToolCard {
         let kind_icon = gtk4::Image::new();
         kind_icon.add_css_class("kind-icon");
         let title = label("", &["card-title"]);
+        // Codex command titles contain the whole command. An unconstrained title widens
+        // the viewport's content, placing right-aligned user bubbles outside the window.
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title.set_max_width_chars(32);
         let summary = label("", &["card-summary"]);
+        summary.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         summary.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         summary.set_hexpand(true);
         let badge = label("", &["status-badge"]);
@@ -1214,6 +1294,7 @@ impl ToolCard {
         self.kind_icon.set_icon_name(Some(kind_icon(tool.kind)));
         self.title
             .set_text(if is_edit { "Show changes" } else { &tool.title });
+        self.title.set_tooltip_text(Some(&tool.title));
         let summary = payload::tool_summary(tool.kind, tool.input.as_ref(), &tool.input_text);
         let paths = if is_edit {
             tool.input

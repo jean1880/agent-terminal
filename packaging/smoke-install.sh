@@ -7,6 +7,15 @@
 #   bash packaging/smoke-install.sh <package file>
 set -euo pipefail
 
+if [[ -d "$1" ]]; then
+    shopt -s nullglob
+    packages=("$1"/*.deb "$1"/*.rpm "$1"/*.pkg.tar.zst)
+    if [[ ${#packages[@]} -ne 1 ]]; then
+        echo "expected exactly one package in $1" >&2
+        exit 2
+    fi
+    set -- "${packages[0]}"
+fi
 pkg="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 
 case "$pkg" in

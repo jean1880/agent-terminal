@@ -240,6 +240,15 @@ fn known_profile_settings(command: &str) -> Option<KnownProfile> {
             prompt_args: strings(&["--prompt-interactive", "{prompt}"]),
             limit_markers: Some(strings(&["RESOURCE_EXHAUSTED", "quota exceeded"])),
         }),
+        "codex" => Some(KnownProfile {
+            resume_args: strings(&["app-server"]),
+            store: "~/.codex/sessions".to_string(),
+            title: None,
+            format: SessionFormat::Jsonl,
+            session_id_args: None,
+            prompt_args: strings(&["{prompt}"]),
+            limit_markers: None,
+        }),
         _ => None,
     }
 }
@@ -549,18 +558,33 @@ pub enum DiskChange {
 }
 
 /// Why the last load fell back to defaults, for the UI to report once.
+#[cfg(not(test))]
 static LOAD_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    // Parallel config fixtures must not open a modal in the unrelated GTK window test.
+    static LOAD_PROBLEM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Takes the reason the settings could not be loaded, if they could not.
 pub fn take_load_problem() -> Option<String> {
-    LOAD_PROBLEM.lock().ok()?.take()
+    #[cfg(not(test))]
+    {
+        LOAD_PROBLEM.lock().ok()?.take()
+    }
+    #[cfg(test)]
+    LOAD_PROBLEM.with(|slot| slot.borrow_mut().take())
 }
 
 fn report_load_problem(problem: String) {
     warn!("{problem}");
+    #[cfg(not(test))]
     if let Ok(mut slot) = LOAD_PROBLEM.lock() {
         *slot = Some(problem);
     }
+    #[cfg(test)]
+    LOAD_PROBLEM.with(|slot| *slot.borrow_mut() = Some(problem));
 }
 
 /// Copies `path` to `<name>.<tag>-<nanos>` beside it, so a file about to be
@@ -1744,6 +1768,27 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_resume_codex_profile_gains_resume_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[{"name":"Codex","command":"codex"}]}"#)
+            .unwrap();
+
+        let codex = &TerminalConfig::load_from(&path).profiles[0];
+        assert_eq!(
+            codex.resume_args.as_deref(),
+            Some(&["app-server".to_string()][..])
+        );
+        assert_eq!(codex.session_store.as_deref(), Some("~/.codex/sessions"));
+        assert_eq!(codex.session_format, SessionFormat::Jsonl);
+        assert_eq!(codex.session_title, None);
+        assert!(codex.can_take_prompt());
+        assert!(!codex.can_pin_session_id());
+    }
+
+    #[test]
     fn a_resume_era_claude_profile_gains_handoff_settings_but_keeps_opt_outs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -1928,6 +1973,30 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, ["Claude", "Claude (3)", "Claude (2)"]);
+    }
+
+    #[test]
+    fn load_problems_stay_with_the_parallel_test_that_created_them() {
+        let ready = std::sync::Barrier::new(2);
+        let checked = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                report_load_problem("synthetic invalid config".into());
+                ready.wait();
+                checked.wait();
+                assert_eq!(
+                    take_load_problem().as_deref(),
+                    Some("synthetic invalid config")
+                );
+            });
+            ready.wait();
+            let problem = take_load_problem();
+            checked.wait();
+            assert!(
+                problem.is_none(),
+                "another test's error must not open a modal here"
+            );
+        });
     }
 
     #[test]

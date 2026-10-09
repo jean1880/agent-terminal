@@ -107,7 +107,7 @@ pub(super) struct ChatTab {
     /// notification) waits for that work: released by the next turn's end or, with no turn
     /// following, once the list empties (`release_held_finish`).
     finish_held: bool,
-    approval: bool,
+    pub(super) approval: bool,
     rate_limited: bool,
     pub(super) unread: bool,
     /// A "stop and close?" question is already on screen for this thread.
@@ -228,6 +228,7 @@ impl ChatBackend for SessionSlot {
             None => SessionStatus {
                 driver: self.driver,
                 model: self.model.clone(),
+                pending_model: None,
                 effort: None,
                 mode: self.mode,
                 running_turn: false,
@@ -351,6 +352,8 @@ pub(super) struct NewThread {
     pub(super) driver: Driver,
     /// The folder (the agent's, else the starting directory, when `None`).
     pub(super) dir: Option<String>,
+    /// Refuse folder fallback for workflows whose prompt is bound to an exact target.
+    pub(super) require_exact_dir: bool,
     /// Sent once the session has started.
     pub(super) prompt: Option<String>,
     pub(super) model: Option<String>,
@@ -365,6 +368,7 @@ impl NewThread {
         Self {
             driver,
             dir: None,
+            require_exact_dir: false,
             prompt: None,
             model: None,
             effort: None,
@@ -1055,21 +1059,36 @@ impl AgentTerminalWindow {
         if let Some(header) = self.header.borrow().as_ref() {
             let toggle = gtk4::ToggleButton::builder()
                 .icon_name("at-sidebar-show-symbolic")
-                .tooltip_text("Show or Hide Threads (F9, Ctrl+B)")
+                .tooltip_text("Show or Hide Threads (F9)")
                 .active(split.shows_sidebar())
                 .build();
             split
                 .bind_property("show-sidebar", &toggle, "active")
                 .bidirectional()
                 .build();
+            split.connect_notify_local(
+                Some("show-sidebar"),
+                glib::clone!(
+                    #[weak]
+                    obj,
+                    move |_, _| obj.imp().update_sidebar_toggle_attention()
+                ),
+            );
             // Only a user's toggle is remembered, not the narrow-width overlay closing itself.
             toggle.connect_clicked(glib::clone!(
                 #[weak]
                 obj,
-                move |t| obj.imp().remember_sidebar(t.is_active())
+                move |t| {
+                    let imp = obj.imp();
+                    imp.remember_sidebar(t.is_active());
+                    imp.update_sidebar_toggle_attention();
+                }
             ));
             header.pack_start(&toggle);
-            self.shell_controls.borrow_mut().push(toggle.upcast());
+            self.shell_controls
+                .borrow_mut()
+                .push(toggle.clone().upcast());
+            *self.sidebar_toggle.borrow_mut() = Some(toggle);
         }
         *self.split_view.borrow_mut() = Some(split);
         *self.sidebar.borrow_mut() = Some(sidebar);
@@ -1102,7 +1121,7 @@ impl AgentTerminalWindow {
         self.schedule_config_save();
     }
 
-    /// F9 / Ctrl+B.
+    /// F9.
     pub(super) fn toggle_sidebar(&self) {
         let split = self.split_view.borrow().clone();
         if let Some(split) = split {
@@ -1112,6 +1131,58 @@ impl AgentTerminalWindow {
             if !split.is_collapsed() {
                 self.remember_sidebar(shown);
             }
+        }
+    }
+
+    /// When the sidebar is collapsed or hidden, updates the toggle button's attention state
+    /// (pulsing amber glow for blocking approvals/questions, or unread accent for completed turns).
+    pub(super) fn update_sidebar_toggle_attention(&self) {
+        let Some(toggle) = self.sidebar_toggle.borrow().clone() else {
+            return;
+        };
+        let sidebar_shown = self
+            .split_view
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.shows_sidebar());
+        if sidebar_shown {
+            toggle.remove_css_class("needs-attention");
+            toggle.remove_css_class("has-unread");
+            toggle.set_tooltip_text(Some("Show or Hide Threads (F9)"));
+            return;
+        }
+        let rows = self.sidebar_rows();
+        let selected = self.selected_row_key();
+        let focused = self.obj().is_active();
+        let needs_attn = rows
+            .iter()
+            .filter(|r| needs_attention(r, selected.as_ref(), focused))
+            .count();
+        let unread = rows
+            .iter()
+            .filter(|r| Some(&r.key) != selected.as_ref() && r.badge == Some(Badge::Unread))
+            .count();
+
+        if needs_attn > 0 {
+            toggle.add_css_class("needs-attention");
+            toggle.remove_css_class("has-unread");
+            let text = match needs_attn {
+                1 => "Show Threads (1 thread needs approval · F9)".to_string(),
+                n => format!("Show Threads ({n} threads need approval · F9)"),
+            };
+            toggle.set_tooltip_text(Some(&text));
+        } else if unread > 0 {
+            toggle.remove_css_class("needs-attention");
+            toggle.add_css_class("has-unread");
+            let text = match unread {
+                1 => "Show Threads (1 unread thread · F9)".to_string(),
+                n => format!("Show Threads ({n} unread threads · F9)"),
+            };
+            toggle.set_tooltip_text(Some(&text));
+        } else {
+            toggle.remove_css_class("needs-attention");
+            toggle.remove_css_class("has-unread");
+            toggle.set_tooltip_text(Some("Show or Hide Threads (F9)"));
         }
     }
 
@@ -1534,6 +1605,7 @@ impl AgentTerminalWindow {
                 sidebar.search.grab_focus();
             }
         }
+        self.update_sidebar_toggle_attention();
     }
 
     fn sidebar_row_widget(&self, row: &SidebarRow, now: i64) -> gtk4::ListBoxRow {
@@ -2922,6 +2994,7 @@ impl AgentTerminalWindow {
                 "A thread needs approval"
             };
             self.notify_thread(&page, &approval_notification_id(thread), heading);
+            self.bump_thread_attention_toast(&page, thread, question);
         }
         match after {
             After::Nothing => {}
@@ -3053,6 +3126,35 @@ impl AgentTerminalWindow {
         }
         // GApplication is called into with no tab borrowed (the borrow above is released).
         app.send_notification(Some(id), &notification);
+    }
+
+    /// Bumps an interactive in-app toast when a thread needs attention and the user is away from it.
+    fn bump_thread_attention_toast(&self, page: &adw::TabPage, thread: &str, question: bool) {
+        let Some(overlay) = self.toast_overlay.borrow().clone() else {
+            return;
+        };
+        let title = page.title();
+        let name = if title.is_empty() { "Thread" } else { &title };
+        let msg = if question {
+            format!("'{name}' has a question")
+        } else {
+            format!("'{name}' needs approval")
+        };
+        let toast = adw::Toast::builder()
+            .title(msg)
+            .use_markup(false)
+            .button_label("Switch")
+            .timeout(10)
+            .priority(adw::ToastPriority::High)
+            .build();
+        let obj = self.obj().downgrade();
+        let thread_id = thread.to_owned();
+        toast.connect_button_clicked(move |_| {
+            if let Some(window) = obj.upgrade() {
+                window.imp().open_thread(&thread_id, true);
+            }
+        });
+        overlay.add_toast(toast);
     }
 
     /// Withdraws a thread's approval and turn-done notifications.
@@ -3222,13 +3324,16 @@ impl AgentTerminalWindow {
         let dialog = adw::AlertDialog::new(
             Some("Switch agents now?"),
             Some(&format!(
-                "{} is still working. Switching stops this turn, and discards any approval or \
-                 question waiting for your answer; the unfinished work is carried as \
-                 interrupted.",
+                "{} is still working. Switching interrupts this turn and continues the \
+                 unfinished task with the selected agent. Any approval or question waiting \
+                 for your answer is cancelled; the new turn can ask again.",
                 driver_label(from)
             )),
         );
-        dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", "Stop and Switch")]);
+        dialog.add_responses(&[
+            ("cancel", "Keep Waiting"),
+            ("switch", "Switch and Continue"),
+        ]);
         dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -3485,6 +3590,7 @@ impl AgentTerminalWindow {
             effort,
             title,
             handoff,
+            require_exact_dir,
         } = new;
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let requested = dir.unwrap_or_else(|| {
@@ -3494,7 +3600,13 @@ impl AgentTerminalWindow {
                 .and_then(|p| p.dir.clone())
                 .unwrap_or_else(|| self.config.borrow().starting_directory.clone())
         });
-        let cwd = resolve_working_directory(&requested, &home);
+        let cwd = if require_exact_dir {
+            // The review validates this folder off the UI thread before calling us.
+            // Preserve it verbatim: a later deletion must fail spawning, never fall back.
+            requested
+        } else {
+            resolve_working_directory(&requested, &home)
+        };
         let store = app_store();
         let thread = match store.create_thread(&cwd, title.as_deref()) {
             Ok(id) => id,
@@ -4146,16 +4258,17 @@ pub(super) mod tests {
             imp.toggle_sidebar();
         }
         let ctx = glib::MainContext::default();
+        let accepted_focus = crate::testutil::pump_until(&ctx, 5, || {
+            close_for_key().is_some_and(|button| {
+                button.is_mapped() && button.is_sensitive() && button.grab_focus()
+            })
+        });
         assert!(
-            crate::testutil::pump_until(&ctx, 5, || {
-                close_for_key().is_some_and(|button| button.is_mapped() && button.is_sensitive())
-            }),
-            "the shown sidebar's close button must map before focusing it"
+            accepted_focus,
+            "the shown sidebar's current close button must accept focus after revealing"
         );
-        // State and time callbacks can rebuild the list during mapping. Resolve the control
-        // by thread identity after the bounded wait, never focus a widget from an old row.
-        let close = close_for_key().expect("mapped close button");
-        assert!(close.grab_focus());
+        // Mapping happens before the split-view reveal finishes accepting focus. State and
+        // time callbacks can also rebuild rows; each attempt resolves the current control.
         let focus = gtk4::prelude::GtkWindowExt::focus(window).expect("focused control");
         assert_eq!(
             sidebar_focus_target(&sidebar, &focus),

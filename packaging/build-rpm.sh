@@ -5,7 +5,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 dnf install -y --setopt=install_weak_deps=False \
-    curl gcc pkgconf-pkg-config tar rpm-build \
+    curl gcc pkgconf-pkg-config tar rpm-build python3 \
     gtk4-devel libadwaita-devel vte291-gtk4-devel gtksourceview5-devel glib2-devel
 
 ensure_rust

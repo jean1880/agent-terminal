@@ -4,6 +4,34 @@ use std::time::{Duration, Instant};
 
 use gtk4::glib;
 
+/// Capture only a synthetic test window when the QA runner requests artefacts.
+pub fn capture_window(window: &gtk4::Window, name: &str) {
+    use gtk4::prelude::*;
+    let Some(directory) = std::env::var_os("AGENT_TERMINAL_QA_ARTIFACTS") else {
+        return;
+    };
+    let capture = || -> Result<(), String> {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("invalid synthetic screenshot name".into());
+        }
+        let paintable = gtk4::WidgetPaintable::new(Some(window));
+        let snapshot = gtk4::Snapshot::new();
+        paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+        let node = snapshot.to_node().ok_or("window snapshot unavailable")?;
+        let renderer = window.renderer().ok_or("window renderer unavailable")?;
+        let texture = renderer.render_texture(&node, None);
+        let directory = std::path::PathBuf::from(&directory);
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        texture
+            .save_to_png(directory.join(format!("{name}.png")))
+            .map_err(|error| error.to_string())
+    };
+    // Artefacts aid diagnosis; capture errors must not replace the geometry assertion.
+    if let Err(error) = capture() {
+        eprintln!("Synthetic screenshot {name} unavailable: {error}");
+    }
+}
+
 /// Runs `body` with a private main context as the thread default, so every test drives its own
 /// loop and tests running in parallel threads never share a context.
 pub fn in_loop<R>(body: impl FnOnce(&glib::MainContext) -> R) -> R {

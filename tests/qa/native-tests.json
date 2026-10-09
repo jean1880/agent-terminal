@@ -1,0 +1,9 @@
+[
+  "chat::view::tests::long_tool_titles_keep_user_messages_inside_the_viewport",
+  "chat::view::tests::the_newest_row_stays_in_view_while_following",
+  "chat::view::tests::jump_to_latest_returns_to_the_bottom",
+  "chat::view::tests::interruption_shelf_reveals_and_collapses",
+  "window::imp::tests::small_window_fits",
+  "chat::view::tests::completed_plans_retire_to_history_and_new_turns_start_fresh",
+  "chat::view::ux_tests::native_ux_matrix"
+]

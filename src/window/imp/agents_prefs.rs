@@ -62,6 +62,39 @@ fn validation_row() -> adw::ActionRow {
         .build()
 }
 
+/// Older GTK expects one accessible for ErrorMessage; current GTK expects a reference list.
+/// Ask the runtime for its value type because gtk-rs always constructs the newer list form.
+fn set_error_message(widget: &gtk4::Widget, feedback: &adw::ActionRow) {
+    use glib::translate::{IntoGlib, ToGlibPtr, Uninitialized};
+
+    let relation = gtk4::AccessibleRelation::ErrorMessage;
+    // SAFETY: GTK's init_value requires an empty GValue and initialises it before any use.
+    let mut expected = unsafe { glib::Value::uninitialized() };
+    relation.init_value(&mut expected);
+    if expected.type_().is_a(glib::Object::static_type())
+        || expected.type_().is_a(gtk4::Accessible::static_type())
+    {
+        let value = feedback.to_value();
+        let mut relations = [relation.into_glib()];
+        // SAFETY: one relation and one initialised object GValue are alive for the synchronous
+        // call. Both widgets are GTK objects on the main thread; GTK copies the referenced
+        // accessible into its relation state. This preserves the ErrorMessage relation on GTK
+        // runtimes whose ABI accepts a single object rather than gtk-rs's list value.
+        unsafe {
+            gtk4::ffi::gtk_accessible_update_relation_value(
+                widget.upcast_ref::<gtk4::Accessible>().to_glib_none().0,
+                1,
+                relations.as_mut_ptr(),
+                value.to_glib_none().0,
+            );
+        }
+    } else {
+        widget.update_relation(&[gtk4::accessible::Relation::ErrorMessage(&[feedback
+            .upcast_ref::<gtk4::Widget>()
+            .upcast_ref()])]);
+    }
+}
+
 /// Invalid drafts remain in the entry so they can be corrected, while the saved value stays
 /// in use. Say that visibly and expose the reason alongside the native invalid state.
 fn show_validation(
@@ -88,9 +121,7 @@ fn show_validation(
                 widget.update_state(&[gtk4::accessible::State::Invalid(
                     gtk4::AccessibleInvalidState::True,
                 )]);
-                widget.update_relation(&[gtk4::accessible::Relation::ErrorMessage(&[feedback
-                    .upcast_ref::<gtk4::Widget>()
-                    .upcast_ref()])]);
+                set_error_message(widget, feedback);
             }
         }
         None => {

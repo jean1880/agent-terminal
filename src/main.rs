@@ -21,6 +21,7 @@ mod claude_probe;
 mod codex_probe;
 pub mod config;
 mod diff_tool;
+mod environment_review;
 mod hook_config;
 mod icons;
 mod model_catalog;
@@ -145,27 +146,51 @@ fn main() -> glib::ExitCode {
         // Anything handled by a controller on the terminal widget stops working
         // the moment focus moves — to the settings dialog, the search entry, a
         // header button — which is exactly when a user reaches for copy or zoom.
+        #[cfg(target_os = "macos")]
+        {
+            app.set_accels_for_action("win.new-tab", &["<Meta>t", "<Primary><Shift>T"]);
+            app.set_accels_for_action("win.close-tab", &["<Meta>w", "<Primary><Shift>W"]);
+            app.set_accels_for_action("win.copy", &["<Meta>c", "<Primary><Shift>C"]);
+            app.set_accels_for_action("win.paste", &["<Meta>v", "<Primary><Shift>V"]);
+            app.set_accels_for_action("win.search", &["<Meta>f", "<Primary><Shift>F"]);
+            app.set_accels_for_action(
+                "win.toggle-sidebar",
+                &["F9", "<Meta>b", "<Primary><Shift>B"],
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>T"]);
+            app.set_accels_for_action("win.close-tab", &["<Ctrl><Shift>W"]);
+            app.set_accels_for_action("win.copy", &["<Ctrl><Shift>C"]);
+            app.set_accels_for_action("win.paste", &["<Ctrl><Shift>V"]);
+            app.set_accels_for_action("win.search", &["<Ctrl><Shift>F"]);
+            app.set_accels_for_action("win.toggle-sidebar", &["F9", "<Primary><Shift>B"]);
+        }
+
         for (action, accels) in [
-            ("win.new-tab", &["<Ctrl><Shift>T"][..]),
-            ("win.restart-tab", &["<Ctrl><Shift>R"]),
-            ("win.close-tab", &["<Ctrl><Shift>W"]),
-            ("win.copy", &["<Ctrl><Shift>C"]),
-            ("win.paste", &["<Ctrl><Shift>V"]),
-            ("win.search", &["<Ctrl><Shift>F"]),
-            ("win.toggle-diff", &["<Ctrl><Shift>D"]),
-            ("win.new-tab-worktree", &["<Ctrl><Shift>G"]),
-            ("win.toggle-sidebar", &["F9", "<Ctrl>B"]),
-            ("win.toggle-drawer", &["<Ctrl>grave"]),
+            ("win.restart-tab", &["<Primary><Shift>R"][..]),
+            ("win.toggle-diff", &["<Primary><Shift>D"]),
+            ("win.new-tab-worktree", &["<Primary><Shift>G"]),
+            ("win.new-tab-folder", &["<Primary><Shift>O"]),
+            ("win.checkpoint-now", &["<Primary><Shift>S"]),
+            ("win.resume-session", &["<Primary><Shift>E"]),
+            ("win.toggle-drawer", &["<Ctrl>grave", "<Primary>J"]),
+            ("win.preferences", &["<Primary>comma"]),
+            ("win.shortcuts", &["<Primary>question"]),
             // Both the shifted and unshifted key, so Ctrl+= works on layouts
             // where + needs Shift.
             (
                 "win.zoom-in",
-                &["<Ctrl>plus", "<Ctrl>equal", "<Ctrl>KP_Add"],
+                &["<Primary>plus", "<Primary>equal", "<Primary>KP_Add"],
             ),
-            ("win.zoom-out", &["<Ctrl>minus", "<Ctrl>KP_Subtract"]),
-            ("win.zoom-reset", &["<Ctrl>0", "<Ctrl>KP_0"]),
-            ("win.next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"]),
-            ("win.previous-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"]),
+            ("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]),
+            ("win.zoom-reset", &["<Primary>0", "<Primary>KP_0"]),
+            ("win.next-tab", &["<Primary>Tab", "<Primary>Page_Down"]),
+            (
+                "win.previous-tab",
+                &["<Primary><Shift>Tab", "<Primary>Page_Up"],
+            ),
         ] {
             app.set_accels_for_action(action, accels);
         }
@@ -483,6 +508,14 @@ fn load_css() {
             border-radius: 6px;
         }
         row.needs-attention .thread-title { color: @at_warning_soft; }
+        /* When the sidebar is collapsed, its toggle button pulses if another thread needs attention. */
+        button.needs-attention {
+            animation: attention-glow 1.1s ease-in-out infinite alternate;
+            color: @at_warning;
+        }
+        button.has-unread {
+            color: @at_accent;
+        }
         /* Background work (sub-agents, background commands) the main agent is waiting on. */
         .thread-background { color: @at_info; }
         .thread-badge.badge-limited { color: @at_danger; }

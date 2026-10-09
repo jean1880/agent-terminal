@@ -11,6 +11,8 @@
 //! Logging never includes prompt or frame bodies.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -121,6 +123,26 @@ struct State {
     native_id: Option<String>,
 }
 
+/// An unacknowledged selection, kept separate from the model reported by the agent.
+struct PendingModel {
+    model: String,
+    request: Option<String>,
+    effort: Option<String>,
+    previous_model: Option<String>,
+    previous_effort: Option<String>,
+    restarting: bool,
+}
+
+fn accepted_model_choice(driver: Driver, requested: Option<&str>, reported: &str) -> String {
+    let alias = requested.filter(|choice| {
+        driver == Driver::Claude
+            && (*choice == "default"
+                || matches!(*choice, "opus" | "sonnet" | "haiku")
+                    && agent_core::catalog::family_of(reported) == *choice)
+    });
+    alias.unwrap_or(reported).to_owned()
+}
+
 struct Inner {
     adapter: RefCell<Box<dyn Adapter>>,
     open: RefCell<OpenSession>,
@@ -152,6 +174,7 @@ struct Inner {
     /// The model the thread was last SET to (an alias where the agent has one), as opposed to the
     /// resolved id its events report: what is stored and what retirement is judged on.
     selected: RefCell<Option<String>>,
+    pending_model: RefCell<Option<PendingModel>>,
     ctl_seq: Cell<u64>,
     local_seq: Cell<u64>,
     /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
@@ -163,6 +186,9 @@ struct Inner {
     /// The mode the user last chose. The running mode can differ (agy without its hook cannot
     /// ask), and a switch to an agent that can honour it goes back to it.
     wanted_mode: Cell<Mode>,
+    /// Pending Codex approval details `(tool_key, detail)` mapped by request id, so AllowAlways
+    /// choices can be persisted in `always-allow.json`.
+    codex_pending_approvals: RefCell<HashMap<String, (String, String)>>,
 }
 
 /// The mode a session can actually run in. agy without its approval hook cannot ask before
@@ -308,11 +334,13 @@ impl ChatSession {
             rollback: RefCell::new(None),
             retired: RefCell::new(None),
             selected: RefCell::new(selected),
+            pending_model: RefCell::new(None),
             ctl_seq: Cell::new(0),
             local_seq: Cell::new(0),
             generation: Cell::new(0),
             adapter_epoch: Cell::new(0),
             wanted_mode: Cell::new(wanted_mode),
+            codex_pending_approvals: RefCell::new(HashMap::new()),
         });
         inner.attach_approval();
         // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
@@ -499,6 +527,12 @@ impl Inner {
                 }
                 if let Some(m) = model {
                     self.set_model(m);
+                    if self.pending_model.borrow().as_ref().is_some_and(|p| {
+                        p.restarting
+                            && (self.adapter.borrow().driver() != Driver::Codex || p.model == *m)
+                    }) {
+                        self.confirm_model_change(m);
+                    }
                 }
             }
             Event::TurnStarted { model } => {
@@ -518,7 +552,66 @@ impl Inner {
                     *self.pending_handoff.borrow_mut() = None;
                 }
             }
-            Event::ModelChanged { model } => self.set_model(model),
+            Event::ModelChanged { model } => {
+                self.set_model(model);
+                let accepted = self.pending_model.borrow().as_ref().is_some_and(|p| {
+                    match (&p.request, &env.request) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        (None, _) => p.model == *model || (p.restarting && env.request.is_none()),
+                        _ => false,
+                    }
+                });
+                if accepted {
+                    self.confirm_model_change(model);
+                } else {
+                    // An earlier request may succeed while a later one is pending. Preserve
+                    // that later request, but rollback/reopen must follow this actual success.
+                    let requested = env
+                        .request
+                        .is_none()
+                        .then(|| self.selected.borrow().clone())
+                        .flatten();
+                    let stored = accepted_model_choice(
+                        self.adapter.borrow().driver(),
+                        requested.as_deref(),
+                        model,
+                    );
+                    self.persist_model(&stored);
+                    self.open.borrow_mut().model = Some(stored.clone());
+                    if let Some(pending) = self.pending_model.borrow_mut().as_mut() {
+                        pending.previous_model = Some(stored);
+                        pending.previous_effort = self.state.borrow().effort.clone();
+                    }
+                }
+            }
+            Event::ModelChangeRequested { model } => {
+                if !self
+                    .pending_model
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.model == *model)
+                {
+                    self.prepare_model_change(
+                        model.clone(),
+                        self.state.borrow().effort.clone(),
+                        false,
+                    );
+                }
+                if let Some(pending) = self.pending_model.borrow_mut().as_mut() {
+                    pending.request.clone_from(&env.request);
+                }
+            }
+            Event::ModelChangeFailed { model, .. } => {
+                if self.pending_model.borrow().as_ref().is_some_and(|p| {
+                    match (&p.request, &env.request) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        (None, _) => p.model == *model,
+                        _ => false,
+                    }
+                }) {
+                    self.reject_model_change();
+                }
+            }
             Event::ModeChanged { mode } => {
                 self.state.borrow_mut().mode = *mode;
                 self.open.borrow_mut().mode = *mode;
@@ -529,6 +622,11 @@ impl Inner {
             Event::CommandsChanged { commands } => {
                 self.state.borrow_mut().commands = commands.clone();
             }
+            Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
+                if let Some(req) = &env.request {
+                    self.codex_pending_approvals.borrow_mut().remove(req);
+                }
+            }
             _ => {}
         }
     }
@@ -536,6 +634,49 @@ impl Inner {
     fn set_model(&self, model: &str) {
         self.state.borrow_mut().model = Some(model.to_owned());
         self.open.borrow_mut().model = Some(model.to_owned());
+    }
+
+    fn prepare_model_change(&self, model: String, effort: Option<String>, restarting: bool) {
+        let state = self.state.borrow();
+        let previous_model = self
+            .selected
+            .borrow()
+            .clone()
+            .or_else(|| state.model.clone());
+        *self.pending_model.borrow_mut() = Some(PendingModel {
+            model,
+            request: None,
+            effort,
+            previous_model,
+            previous_effort: state.effort.clone(),
+            restarting,
+        });
+    }
+
+    fn confirm_model_change(&self, reported: &str) {
+        let Some(pending) = self.pending_model.borrow_mut().take() else {
+            return;
+        };
+        self.state.borrow_mut().effort = pending.effort.clone();
+        self.open.borrow_mut().effort = pending.effort;
+        // Known Claude aliases legitimately resolve to versioned ids. A different model
+        // reported by a resumed process or reroute must instead be what reopens.
+        let stored = accepted_model_choice(
+            self.adapter.borrow().driver(),
+            Some(&pending.model),
+            reported,
+        );
+        self.persist_model(&stored);
+        self.open.borrow_mut().model = Some(stored);
+    }
+
+    fn reject_model_change(&self) {
+        let Some(pending) = self.pending_model.borrow_mut().take() else {
+            return;
+        };
+        self.open.borrow_mut().model = pending.previous_model;
+        self.open.borrow_mut().effort = pending.previous_effort.clone();
+        self.state.borrow_mut().effort = pending.previous_effort;
     }
 
     // ---- process ----
@@ -549,12 +690,24 @@ impl Inner {
         let launch = self.launch_env.borrow();
         // The profile's environment first, so it can never override the approval socket.
         let mut env = launch.env.clone();
-        env.extend(approval.map(|a| a.env()).unwrap_or_default());
+        env.extend(approval.as_ref().map(|a| a.env()).unwrap_or_default());
+        let mut unset = launch.unset.clone();
+        if approval.is_none() {
+            if !unset.iter().any(|u| u == agent_core::approval::ENV_SOCKET) {
+                unset.push(agent_core::approval::ENV_SOCKET.to_owned());
+            }
+            if !unset
+                .iter()
+                .any(|u| u == crate::approval_server::ENV_HOOK_BIN)
+            {
+                unset.push(crate::approval_server::ENV_HOOK_BIN.to_owned());
+            }
+        }
         SpawnSpec {
             argv,
             cwd: (!open.cwd.is_empty()).then(|| open.cwd.clone()),
             env,
-            unset: launch.unset.clone(),
+            unset,
         }
     }
 
@@ -605,7 +758,19 @@ impl Inner {
                     self.roll_back(previous, &e.to_string());
                     return;
                 }
-                self.error(e);
+                let pending = self
+                    .pending_model
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.model.clone());
+                if let Some(model) = pending {
+                    self.emit(Envelope::new(Event::ModelChangeFailed {
+                        model,
+                        message: e,
+                    }));
+                } else {
+                    self.error(e);
+                }
             }
         }
     }
@@ -626,6 +791,7 @@ impl Inner {
         for env in envelopes {
             self.emit(env.clone());
             self.watch_tool_step(&env);
+            self.check_codex_auto_approval(&env);
             if generation != self.generation.get() {
                 return; // the process was replaced while handling this envelope
             }
@@ -670,6 +836,58 @@ impl Inner {
             }
             inner.trip_canary();
         });
+    }
+
+    /// If an approval request from Codex matches an already remembered "Always allow" rule
+    /// for this workspace, auto-approves it immediately without stalling the user.
+    fn check_codex_auto_approval(self: &Rc<Self>, env: &Envelope) {
+        if self.adapter.borrow().driver() != Driver::Codex {
+            return;
+        }
+        let Event::ApprovalRequested { tool, input, .. } = &env.event else {
+            return;
+        };
+        let Some(req) = &env.request else {
+            return;
+        };
+        if tool != "command_execution" {
+            return;
+        }
+        let Some(command) = input.get("command").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let open_cwd = self.open.borrow().cwd.clone();
+        let cwd = input
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(open_cwd.as_str());
+        let tool_key = "run_command".to_string();
+        let detail = format!("{cwd}\n{command}");
+        self.codex_pending_approvals
+            .borrow_mut()
+            .insert(req.clone(), (tool_key.clone(), detail.clone()));
+
+        if let Some(path) = crate::always_allow::path() {
+            let rules = crate::always_allow::AlwaysRules::load(&path);
+            let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                .to_string_lossy()
+                .into_owned();
+            let matching_keys = rules.keys_for(&workspace);
+            if matching_keys
+                .iter()
+                .any(|(t, d)| t == &tool_key && d == &detail)
+            {
+                info!(command = %command, "auto-approving remembered Codex command");
+                let weak = Rc::downgrade(self);
+                let req = req.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.respond_approval(&req, Decision::Allow);
+                    }
+                });
+            }
+        }
     }
 
     /// The hook is not gating agy: stop it now and carry on without the skip flag (plan mode, no
@@ -729,6 +947,10 @@ impl Inner {
         // A dead process completed nothing: a pending handoff goes out with the next prompt,
         // even when the exit raised no turn of its own (it died before one opened).
         self.handoff_in_flight.set(false);
+        // The final exit envelope repaints the header. Clear pending state first so a dead
+        // process cannot leave the chip claiming its model change is still in progress.
+        self.reject_model_change();
+        self.codex_pending_approvals.borrow_mut().clear();
         for env in envelopes {
             self.emit(env);
         }
@@ -740,6 +962,7 @@ impl Inner {
     /// Stops the process on purpose; its own exit callback is then ignored.
     fn stop_current(&self) {
         self.generation.set(self.generation.get() + 1);
+        self.adapter.borrow_mut().discard_queued_prompts();
         self.finish_process(None, true);
     }
 
@@ -771,6 +994,7 @@ impl Inner {
 
     /// Encodes and carries out one command. False when the adapter refused it.
     fn command(self: &Rc<Self>, command: Command) -> bool {
+        let model_change = matches!(command, Command::SetModel { .. });
         let result = self.adapter.borrow_mut().encode(command);
         match result {
             Ok(actions) => {
@@ -779,6 +1003,9 @@ impl Inner {
                 true
             }
             Err(e) => {
+                if model_change {
+                    self.reject_model_change();
+                }
                 self.report(&e);
                 false
             }
@@ -871,6 +1098,13 @@ impl Inner {
     /// `resume` to the native id so history carries over).
     fn respawn(self: &Rc<Self>, delta: &OpenSessionDelta) {
         self.stop_current();
+        if let Some(model) = &delta.model {
+            let effort = delta
+                .effort
+                .clone()
+                .or_else(|| self.state.borrow().effort.clone());
+            self.prepare_model_change(model.clone(), effort, true);
+        }
         // Without the hook agy cannot ask, so Ask is never put on its command line.
         let mode = delta
             .mode
@@ -883,7 +1117,6 @@ impl Inner {
             }
             if let Some(e) = &delta.effort {
                 open.effort = Some(e.clone());
-                self.state.borrow_mut().effort = Some(e.clone());
             }
             if let Some(mode) = mode {
                 open.mode = mode;
@@ -892,7 +1125,9 @@ impl Inner {
             open.new_session_id = None;
         }
         if let Some(m) = &delta.model {
-            self.emit(Envelope::new(Event::ModelChanged { model: m.clone() }));
+            self.emit(Envelope::new(Event::ModelChangeRequested {
+                model: m.clone(),
+            }));
         }
         if let Some(mode) = mode {
             self.emit(Envelope::new(Event::ModeChanged { mode }));
@@ -995,7 +1230,19 @@ impl Inner {
             None => text.to_owned(),
         };
         self.ensure_alive();
-        if self.command(Command::Prompt { text: sent }) && handoff.is_some() {
+        // A submitted/queued inference is already work: the user must be able to stop it
+        // while waiting for the backend's turn/started, not only after that reply arrives.
+        let starts_turn =
+            self.state.borrow().alive && self.adapter.borrow().prompt_starts_turn(text);
+        let was_running = self.state.borrow().running_turn;
+        if starts_turn {
+            self.state.borrow_mut().running_turn = true;
+        }
+        let accepted = self.command(Command::Prompt { text: sent });
+        if !accepted && starts_turn {
+            self.state.borrow_mut().running_turn = was_running;
+        }
+        if accepted && handoff.is_some() {
             self.handoff_in_flight.set(true);
         }
     }
@@ -1029,6 +1276,36 @@ impl Inner {
                 return;
             }
         }
+        if decision == Decision::AllowAlways && self.adapter.borrow().driver() == Driver::Codex {
+            if let Some((tool, detail)) = self.codex_pending_approvals.borrow_mut().remove(request)
+            {
+                if let Some(path) = crate::always_allow::path() {
+                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
+                    let open_cwd = self.open.borrow().cwd.clone();
+                    let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                        .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                        .to_string_lossy()
+                        .into_owned();
+                    let added = rules.add(crate::always_allow::Rule {
+                        workspace,
+                        tool: tool.clone(),
+                        detail,
+                    });
+                    if added {
+                        match rules.save(&path) {
+                            Ok(()) => {
+                                info!(tool = %tool, "remembered an always-allow rule for Codex")
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "could not save the always-allow rule for Codex")
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            self.codex_pending_approvals.borrow_mut().remove(request);
+        }
         // Claude and Codex never acknowledge an answer, so once the adapter has accepted it and
         // written it, the card is resolved here; otherwise it would sit at "Allow…" for good.
         let sent = self.command(Command::Approve {
@@ -1045,16 +1322,25 @@ impl Inner {
     fn set_mode(self: &Rc<Self>, mode: Mode) {
         self.wanted_mode.set(mode);
         self.record_chosen_mode();
-        if self.ask_unavailable() && mode == Mode::Ask {
-            self.emit(Envelope::new(Event::Notice {
-                text: "Antigravity cannot ask before edits until the approval hook is installed; \
-                       it stays in its current mode."
-                    .to_owned(),
-            }));
-            // The picker shows the mode actually running.
-            let current = self.state.borrow().mode;
-            self.emit(Envelope::new(Event::ModeChanged { mode: current }));
-            return;
+        if self.ask_unavailable() {
+            if mode == Mode::Ask {
+                self.emit(Envelope::new(Event::Notice {
+                    text:
+                        "Antigravity cannot ask before edits until the approval hook is installed; \
+                           it stays in its current mode."
+                            .to_owned(),
+                }));
+                // The picker shows the mode actually running.
+                let current = self.state.borrow().mode;
+                self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+                return;
+            } else if mode == Mode::Plan {
+                self.emit(Envelope::new(Event::Notice {
+                    text: "Antigravity Plan mode refuses shell commands, but may still edit files \
+                           on disk without the approval hook installed."
+                        .to_owned(),
+                }));
+            }
         }
         if self.command(Command::SetMode { mode }) {
             if let Some(a) = self.approval() {
@@ -1094,15 +1380,24 @@ impl Inner {
     // ---- switching ----
 
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
-        let (caps, current_driver, mode, status_model, current_effort) = {
+        let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();
             let state = self.state.borrow();
             (
                 adapter.capabilities().clone(),
                 adapter.driver(),
                 state.mode,
-                state.model.clone(),
-                state.effort.clone(),
+                self.pending_model
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.model.clone())
+                    .or_else(|| state.model.clone()),
+                self.pending_model
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.effort.clone())
+                    .unwrap_or_else(|| state.effort.clone()),
+                state.running_turn,
             )
         };
         // No effort asked for on the same agent means "keep it", not "clear it".
@@ -1142,27 +1437,68 @@ impl Inner {
         let plan = plan_selection(&caps, &current.selection, &target.selection);
         let transition = decide_transition(Some(&current), &target, true, Some(&plan));
         debug!(?transition, "model switch");
-        // A choice made now settles any pending question about a retired model, and a model
-        // switched to on this agent is what a reopened thread resumes on.
+        // A choice made now settles any pending question about a retired model.
+        // Persistence follows backend acceptance, never a click or a failed request.
         *self.retired.borrow_mut() = None;
-        if matches!(
-            transition,
-            Transition::SwitchModelInSession | Transition::RestartAndResume
-        ) && !target_model.is_empty()
+        if same_driver
+            && running
+            && matches!(
+                transition,
+                Transition::SwitchModelInSession | Transition::RestartAndResume
+            )
         {
-            self.persist_model(&target_model);
+            // The picker already confirmed Switch and Continue. A process replacement actually
+            // interrupts this turn and expires its questions/approvals before resuming.
+            let native = self.state.borrow().native_id.clone();
+            // Transport writes are asynchronous: even a known native session might never
+            // have received the latest task. Carry bounded context as well as native history.
+            let handoff = match self.store.transcript_messages(&self.thread) {
+                Ok(messages) => build_handoff(
+                    &messages,
+                    &format!("{} thread {}", driver_label(driver), self.thread),
+                ),
+                Err(e) => {
+                    self.error(format!(
+                        "Could not read the unfinished task to continue: {e}"
+                    ));
+                    return;
+                }
+            };
+            self.respawn(&OpenSessionDelta {
+                model: Some(target_model),
+                effort,
+                mode: None,
+                resume: native,
+            });
+            if handoff.carried > 0 {
+                self.arm_handoff(handoff);
+            }
+            self.continue_after_switch(driver);
+            return;
         }
         match transition {
             Transition::Reuse => {}
             Transition::SwitchModelInSession => {
+                self.ensure_alive();
+                if !self.state.borrow().alive {
+                    return;
+                }
+                self.prepare_model_change(target_model.clone(), effort.clone(), false);
                 // The plan only picks this when the effort is unchanged, so passing the target's
                 // is the same as keeping it.
-                self.command(Command::SetModel {
+                if !self.command(Command::SetModel {
                     model: target_model,
                     effort,
-                });
+                }) {
+                    self.reject_model_change();
+                }
             }
             Transition::RestartAndResume => {
+                self.ensure_alive();
+                if !self.state.borrow().alive {
+                    return;
+                }
+                self.prepare_model_change(target_model.clone(), effort.clone(), false);
                 let result = self.adapter.borrow_mut().encode(Command::SetModel {
                     model: target_model.clone(),
                     effort: effort.clone(),
@@ -1174,11 +1510,6 @@ impl Inner {
                     Ok(actions) => {
                         // An adapter that applies the effort in session (Codex, per turn) asks
                         // for no respawn; the status and the next launch still follow it.
-                        let respawns = actions.iter().any(|a| matches!(a, Action::Respawn(_)));
-                        if let (false, Some(e)) = (respawns, &effort) {
-                            self.open.borrow_mut().effort = Some(e.clone());
-                            self.state.borrow_mut().effort = Some(e.clone());
-                        }
                         self.execute(actions);
                         self.drain_outbox();
                     }
@@ -1188,12 +1519,35 @@ impl Inner {
                         mode: None,
                         resume: native,
                     }),
-                    Err(e) => self.report(&e),
+                    Err(e) => {
+                        self.reject_model_change();
+                        self.report(&e);
+                    }
                 }
             }
-            Transition::CreateWithHandoff => self.create_with_handoff(driver, model, effort),
+            Transition::CreateWithHandoff => {
+                self.create_with_handoff(driver, model, effort);
+                if running {
+                    self.continue_after_switch(driver);
+                }
+            }
             Transition::Reject(reason) => self.error(reason),
         }
+    }
+
+    /// A confirmed busy switch continues the task once on the replacement process. The
+    /// provider's native history (or the pending handoff) supplies the original request;
+    /// replaying that request could repeat tool actions that already completed.
+    fn continue_after_switch(self: &Rc<Self>, driver: Driver) {
+        if self.adapter.borrow().driver() != driver || !self.state.borrow().alive {
+            return;
+        }
+        self.send_prompt(
+            "Continue the unfinished task after the model switch. Review the existing context \
+             and current workspace state, then proceed from where the interrupted turn left \
+             off. Do not repeat completed actions. Any unanswered approval or question was \
+             cancelled by the switch; ask again if it is still needed.",
+        );
     }
 
     fn create_with_handoff(
@@ -1279,7 +1633,9 @@ impl Inner {
         }
         self.emit(Envelope::new(Event::Notice { text }));
         if let Some(m) = model {
-            self.emit(Envelope::new(Event::ModelChanged { model: m }));
+            self.state.borrow_mut().model = None;
+            self.prepare_model_change(m.clone(), effort.clone(), true);
+            self.emit(Envelope::new(Event::ModelChangeRequested { model: m }));
         }
         if mode_changed {
             self.emit(Envelope::new(Event::ModeChanged { mode: new_mode }));
@@ -1416,6 +1772,11 @@ impl Inner {
         SessionStatus {
             driver: adapter.driver(),
             model: state.model.clone(),
+            pending_model: self
+                .pending_model
+                .borrow()
+                .as_ref()
+                .map(|p| p.model.clone()),
             effort: state.effort.clone(),
             mode: state.mode,
             running_turn: state.running_turn,
@@ -1640,6 +2001,9 @@ fn as_deliberate_stop(env: &mut Envelope) {
 }
 
 #[cfg(test)]
+mod scripted_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{in_loop, pump_until};
@@ -1683,6 +2047,23 @@ mod tests {
             .map(|v| v["frame"].to_string())
             .collect();
         std::fs::write(dir.join("frames.ndjson"), frames.join("\n") + "\n").expect("frames");
+        // The captured init omits a model. When this fake is launched with a selection,
+        // report it like the backend does so tests verify adoption rather than a click.
+        let selected_frames: Vec<String> = frames
+            .iter()
+            .map(|line| {
+                let mut frame: serde_json::Value = serde_json::from_str(line).expect("frame");
+                if frame["event"] == "init" {
+                    frame["init"]["model"] = serde_json::json!("gemini-flash");
+                }
+                frame.to_string()
+            })
+            .collect();
+        std::fs::write(
+            dir.join("frames-flash.ndjson"),
+            selected_frames.join("\n") + "\n",
+        )
+        .expect("frames");
         let script = dir.join("agent.sh");
         std::fs::write(
             &script,
@@ -1691,8 +2072,14 @@ mod tests {
                 "echo \"$@\" >> \"$D/args.log\"\n",
                 "echo \"${AGENT_TERMINAL_APPROVAL_SOCKET-unset}\" >> \"$D/sock.log\"\n",
                 "echo \"${AGENT_TERMINAL_HOOK_BIN-unset}\" >> \"$D/hookbin.log\"\n",
+                "FRAMES=frames.ndjson\n",
+                "PREV=''\n",
+                "for ARG in \"$@\"; do\n",
+                "  if [ \"$PREV\" = --model ] && [ \"$ARG\" = gemini-flash ]; then FRAMES=frames-flash.ndjson; fi\n",
+                "  PREV=$ARG\n",
+                "done\n",
                 "read line\n",
-                "cat \"$D/frames.ndjson\"\n",
+                "cat \"$D/$FRAMES\"\n",
             ),
         )
         .expect("script");
@@ -1895,6 +2282,9 @@ mod tests {
             assert!(has(&seen, |e| matches!(e, Event::Notice { text }
                 if text == "Continued on SONNET (claude-sonnet-3-7 was retired)")));
             // What a reopened thread resumes on is the replacement (an alias), not the dead id.
+            session.inner.emit(Envelope::new(Event::ModelChanged {
+                model: "sonnet".into(),
+            }));
             let pt = store.provider_threads(&thread).expect("pts");
             assert_eq!(pt[0].model, "sonnet");
             // Asked once: the next prompt does not repeat it.
@@ -2171,11 +2561,16 @@ mod tests {
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::ModelChanged { model } if model == "gemini-flash")
+                |e| matches!(e, Event::ModelChangeRequested { model } if model == "gemini-flash")
             ));
-            assert_eq!(session.status().model.as_deref(), Some("gemini-flash"));
+            assert_eq!(
+                session.status().pending_model.as_deref(),
+                Some("gemini-flash")
+            );
             session.send_prompt("again");
             assert!(pump_until(ctx, 15, || exited_count(&seen) >= 3));
+            assert_eq!(session.status().model.as_deref(), Some("gemini-flash"));
+            assert_eq!(session.status().pending_model, None);
             let args = lines(tmp.path().join("args.log"));
             let last = args.last().expect("args");
             assert!(last.contains("--model gemini-flash"), "{args:?}");
@@ -2541,7 +2936,17 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--model", "claude-sonnet-5-5"]));
             assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
-            assert_eq!(spec.unset, ["CLAUDECODE"]);
+            assert!(spec.unset.contains(&"CLAUDECODE".to_owned()));
+            assert_eq!(session.status().model, None);
+            assert_eq!(
+                session.status().pending_model.as_deref(),
+                Some("claude-sonnet-5-5")
+            );
+            session.inner.emit(Envelope::new(Event::SessionStarted {
+                native_id: "profile-sonnet".into(),
+                model: Some("claude-sonnet-5-5".into()),
+                cwd: None,
+            }));
             assert_eq!(session.status().model.as_deref(), Some("claude-sonnet-5-5"));
 
             // A model picked from the catalogue wins over the default.
@@ -2554,7 +2959,7 @@ mod tests {
                 .any(|w| w == ["--model", "claude-opus-5-5"]));
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::ModelChanged { model } if model == "claude-opus-5-5")
+                |e| matches!(e, Event::ModelChangeRequested { model } if model == "claude-opus-5-5")
             ));
         });
     }
@@ -2691,13 +3096,14 @@ mod tests {
 
             let status = session.status();
             assert_eq!(status.driver, Driver::Claude);
-            assert_eq!(status.model.as_deref(), Some("opus"));
+            assert_eq!(status.model, None);
+            assert_eq!(status.pending_model.as_deref(), Some("opus"));
             assert!(status.alive);
             assert!(has(&seen, |e| matches!(e, Event::Notice { text }
                 if text.starts_with("Continuing in Claude with all 2 earlier messages."))));
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::ModelChanged { model } if model == "opus")
+                |e| matches!(e, Event::ModelChangeRequested { model } if model == "opus")
             ));
             let pts = store.provider_threads(&thread).expect("pts");
             assert_eq!(pts.len(), 2);
@@ -3375,10 +3781,11 @@ mod tests {
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert!(has(
                 &seen,
-                |e| matches!(e, Event::ModelChanged { model } if model == "gemini-flash")
+                |e| matches!(e, Event::ModelChangeRequested { model } if model == "gemini-flash")
             ));
             let status = session.status();
-            assert_eq!(status.model.as_deref(), Some("gemini-flash"));
+            assert_eq!(status.model.as_deref(), Some("gemini-pro"));
+            assert_eq!(status.pending_model.as_deref(), Some("gemini-flash"));
             assert!(status.alive);
         });
     }
@@ -3393,8 +3800,179 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_confirmed_model_switch_stops_the_active_turn_and_resumes_with_the_choice() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::with_open_turn(Driver::Claude, &log),
+                open_on("sonnet"),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.inner.emit(Envelope::new(Event::SessionStarted {
+                native_id: "native-before-switch".into(),
+                model: Some("sonnet".into()),
+                cwd: None,
+            }));
+            session.inner.emit(Envelope::new(Event::TurnStarted {
+                model: Some("sonnet".into()),
+            }));
+            let before = session.inner.generation.get();
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            assert!(
+                session.status().running_turn,
+                "the replacement turn continues automatically"
+            );
+            let sent = prompts(&log);
+            assert_eq!(sent.len(), 1, "continue exactly once");
+            assert!(sent[0].contains("Continue the unfinished task after the model switch."));
+            assert_eq!(session.status().pending_model.as_deref(), Some("opus"));
+            assert!(session.inner.generation.get() > before);
+            assert_eq!(session.inner.open.borrow().model.as_deref(), Some("opus"));
+            assert_eq!(
+                session.inner.open.borrow().resume.as_deref(),
+                Some("native-before-switch")
+            );
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::TurnCompleted {
+                    state: TurnState::Interrupted,
+                    ..
+                }
+            )));
+        });
+    }
+
     fn pt_of(store: &Store, thread: &str) -> ProviderThreadId {
         create_provider_thread(store, thread, Driver::Agy, Some("gemini-pro")).expect("pt")
+    }
+
+    #[test]
+    fn submitted_work_switches_before_turn_started_and_carries_the_original_task() {
+        in_loop(|_| {
+            for native in [None, Some("native-submitted")] {
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, _) = make_sink();
+                let log: Log = Rc::default();
+                let session = ChatSession::new(
+                    FakeAdapter::boxed(Driver::Claude, &log),
+                    open_on("sonnet"),
+                    store,
+                    thread,
+                    sink,
+                    None,
+                );
+                if let Some(native) = native {
+                    session.inner.emit(Envelope::new(Event::SessionStarted {
+                        native_id: native.into(),
+                        model: Some("sonnet".into()),
+                        cwd: None,
+                    }));
+                }
+                session.send_prompt("Finish the unique submitted task");
+                assert!(
+                    session.status().running_turn,
+                    "submitted inference is busy before acknowledgement"
+                );
+                let before = session.inner.generation.get();
+                session.switch(Driver::Claude, Some("opus".into()), None);
+                assert!(session.inner.generation.get() > before);
+                let sent = prompts(&log);
+                assert_eq!(sent.len(), 2, "original submission plus one continuation");
+                assert!(sent[1].contains("Finish the unique submitted task"));
+                assert!(sent[1].contains("Do not repeat completed actions."));
+                assert_eq!(session.inner.open.borrow().resume.as_deref(), native);
+                session.shutdown(false);
+            }
+        });
+    }
+
+    #[test]
+    fn reordered_model_replies_preserve_the_newest_request_and_latest_accepted_choice() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, _) = make_sink();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("sonnet"),
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            let requested = |model: &str, request: &str| {
+                session.inner.emit(
+                    Envelope::new(Event::ModelChangeRequested {
+                        model: model.into(),
+                    })
+                    .request(request),
+                )
+            };
+            let accepted = |model: &str, request: &str| {
+                session.inner.emit(
+                    Envelope::new(Event::ModelChanged {
+                        model: model.into(),
+                    })
+                    .request(request),
+                )
+            };
+            requested("opus", "older-opus");
+            requested("haiku", "newer-haiku");
+            accepted("opus", "older-opus");
+            assert_eq!(session.status().pending_model.as_deref(), Some("haiku"));
+            session.inner.emit(
+                Envelope::new(Event::ModelChangeFailed {
+                    model: "haiku".into(),
+                    message: "unavailable".into(),
+                })
+                .request("newer-haiku"),
+            );
+            assert_eq!(session.status().model.as_deref(), Some("opus"));
+            assert!(session.status().pending_model.is_none());
+            assert_eq!(session.inner.open.borrow().model.as_deref(), Some("opus"));
+            assert_eq!(
+                store.provider_threads(&thread).expect("providers")[0].model,
+                "opus"
+            );
+
+            requested("haiku", "old-haiku");
+            requested("opus", "intervening-opus");
+            requested("haiku", "latest-haiku");
+            accepted("haiku", "old-haiku");
+            assert_eq!(
+                session.status().pending_model.as_deref(),
+                Some("haiku"),
+                "same model name cannot acknowledge a later request"
+            );
+            accepted("haiku", "latest-haiku");
+            assert!(session.status().pending_model.is_none());
+            session.shutdown(false);
+        });
+    }
+
+    #[test]
+    fn claude_aliases_follow_the_reported_family_and_actual_fallbacks_are_preserved() {
+        assert_eq!(
+            accepted_model_choice(Driver::Claude, Some("sonnet"), "claude-sonnet-4-6"),
+            "sonnet"
+        );
+        assert_eq!(
+            accepted_model_choice(Driver::Claude, Some("opus"), "claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            accepted_model_choice(Driver::Codex, Some("sonnet"), "actual-model"),
+            "actual-model"
+        );
     }
 
     #[test]

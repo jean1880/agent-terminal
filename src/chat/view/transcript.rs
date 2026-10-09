@@ -82,11 +82,21 @@ pub struct TranscriptView {
     restore_to: Cell<Option<f64>>,
     /// A [`Self::settle`] is queued for after the current layout.
     settle_queued: Cell<bool>,
+    /// The mapped frame clock's post-layout handler; disconnected on unmap.
+    layout_handler: RefCell<Option<(gtk4::gdk::FrameClock, glib::SignalHandlerId)>>,
     /// Frames the tick callback has seen (tests read it).
     #[cfg(test)]
     ticks: Cell<u64>,
     sink: RowSink,
     empty: gtk4::Box,
+}
+
+impl Drop for TranscriptView {
+    fn drop(&mut self) {
+        if let Some((clock, handler)) = self.layout_handler.get_mut().take() {
+            clock.disconnect(handler);
+        }
+    }
 }
 
 impl TranscriptView {
@@ -164,6 +174,7 @@ impl TranscriptView {
             anchor: Cell::new(None),
             restore_to: Cell::new(None),
             settle_queued: Cell::new(false),
+            layout_handler: RefCell::new(None),
             #[cfg(test)]
             ticks: Cell::new(0),
             sink,
@@ -186,6 +197,18 @@ impl TranscriptView {
     #[cfg(test)]
     pub fn scroll_parts(&self) -> (gtk4::Button, gtk4::Adjustment) {
         (self.jump.clone(), self.scroller.vadjustment())
+    }
+
+    /// A materialised row's bounds in the actual viewport, and its allocated width.
+    #[cfg(test)]
+    pub fn row_bounds_in_viewport(&self, id: &str) -> Option<(gtk4::graphene::Rect, i32)> {
+        let viewport = self.scroller.child()?;
+        self.with_row(id, |row| {
+            row.widget()
+                .compute_bounds(&viewport)
+                .map(|bounds| (bounds, viewport.width()))
+        })
+        .flatten()
     }
 
     /// How far (px) the last row's bottom edge is below the visible area (negative: inside it),
@@ -281,7 +304,7 @@ impl TranscriptView {
 
     /// Moves the value where it belongs: the bottom while following, or the place to restore
     /// after older rows were prepended. The only place (with `scroll_to_end` and the jump) that
-    /// moves the view, and never during layout.
+    /// moves the view, after a viewport allocation rather than inside its size notifications.
     ///
     /// Not from the size notifications: GTK emits them while the viewport lays out its child,
     /// and a value set then is not applied to the child until something else lays it out
@@ -350,6 +373,38 @@ impl TranscriptView {
             glib::Propagation::Proceed
         });
         self.scroller.add_controller(keys);
+        // GtkViewport freezes adjustment notifications until after allocating its child.
+        // The tick runs before layout, so both tick and idle can be one allocation behind
+        // during continuous growth. Settle after GTK's layout handler; adjustment changes
+        // request another layout pass in this frame, before painting the newest row.
+        let weak = Rc::downgrade(self);
+        self.scroller.connect_map(move |scroller| {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            if view.layout_handler.borrow().is_some() {
+                return;
+            }
+            let Some(clock) = scroller.frame_clock() else {
+                return;
+            };
+            let weak = Rc::downgrade(&view);
+            let handler = clock.connect_local("layout", true, move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.settle();
+                }
+                None
+            });
+            *view.layout_handler.borrow_mut() = Some((clock, handler));
+        });
+        let weak = Rc::downgrade(self);
+        self.scroller.connect_unmap(move |_| {
+            if let Some(view) = weak.upgrade() {
+                if let Some((clock, handler)) = view.layout_handler.borrow_mut().take() {
+                    clock.disconnect(handler);
+                }
+            }
+        });
         let adj = self.scroller.vadjustment();
         // The view leaves the bottom only when the user scrolls up, and comes back when they
         // scroll down into it, jump, or send. Every move it makes itself goes through

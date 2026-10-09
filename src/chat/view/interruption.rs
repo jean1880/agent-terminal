@@ -9,7 +9,7 @@ use std::rc::Rc;
 use agent_core::event::{Decision, ItemKind};
 use gtk4::prelude::*;
 
-use super::cards::{label, RowEvent, RowSink};
+use super::cards::{decision_label, label, RowEvent, RowSink};
 use super::model::{PendingInterruption, Transcript};
 use super::payload;
 
@@ -21,8 +21,12 @@ pub struct InterruptionShelf {
     preview: gtk4::Label,
     allow_btn: gtk4::Button,
     deny_btn: gtk4::Button,
-    jump_btn: gtk4::Button,
+    pub(crate) more_btn: gtk4::MenuButton,
+    pub(crate) more_box: gtk4::Box,
+    pub(crate) more_popover: gtk4::Popover,
+    pub(crate) jump_btn: gtk4::Button,
     active: Rc<RefCell<Option<PendingInterruption>>>,
+    sink: RowSink,
 }
 
 impl InterruptionShelf {
@@ -62,12 +66,29 @@ impl InterruptionShelf {
         allow_btn.add_css_class("pill");
         allow_btn.add_css_class("suggested-action");
 
-        let jump_btn = gtk4::Button::from_icon_name("at-pan-down-symbolic");
+        let more_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        more_box.set_margin_top(6);
+        more_box.set_margin_bottom(6);
+        more_box.set_margin_start(6);
+        more_box.set_margin_end(6);
+
+        let more_popover = gtk4::Popover::new();
+        more_popover.set_child(Some(&more_box));
+
+        let more_btn = gtk4::MenuButton::new();
+        more_btn.set_icon_name("at-pan-down-symbolic");
+        more_btn.set_popover(Some(&more_popover));
+        more_btn.add_css_class("flat");
+        more_btn.set_tooltip_text(Some("More permission options"));
+        more_btn.set_visible(false);
+
+        let jump_btn = gtk4::Button::from_icon_name("at-go-bottom-symbolic");
         jump_btn.add_css_class("flat");
         jump_btn.set_tooltip_text(Some("Jump to card in transcript"));
 
         actions.append(&deny_btn);
         actions.append(&allow_btn);
+        actions.append(&more_btn);
         actions.append(&jump_btn);
         card.append(&actions);
 
@@ -147,8 +168,12 @@ impl InterruptionShelf {
             preview,
             allow_btn,
             deny_btn,
+            more_btn,
+            more_box,
+            more_popover,
             jump_btn,
             active,
+            sink,
         }
     }
 
@@ -206,8 +231,43 @@ impl InterruptionShelf {
                     } else {
                         "Cancel"
                     });
+
+                // Clear previous extra options in the dropdown popover
+                while let Some(child) = self.more_box.first_child() {
+                    self.more_box.remove(&child);
+                }
+
+                let extra_decisions: Vec<Decision> =
+                    [Decision::AllowForSession, Decision::AllowAlways]
+                        .into_iter()
+                        .filter(|d| options.contains(d))
+                        .collect();
+
+                for d in &extra_decisions {
+                    let b = gtk4::Button::with_label(decision_label(*d));
+                    b.add_css_class("pill");
+                    let sink = self.sink.clone();
+                    let active = self.active.clone();
+                    let popover = self.more_popover.clone();
+                    let decision = *d;
+                    b.connect_clicked(move |_| {
+                        popover.popdown();
+                        let request = match active.borrow().as_ref() {
+                            Some(PendingInterruption::Approval { request, .. }) => {
+                                Some(request.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(request) = request {
+                            sink(RowEvent::Approve { request, decision });
+                        }
+                    });
+                    self.more_box.append(&b);
+                }
+                self.more_btn.set_visible(!extra_decisions.is_empty());
+
                 self.jump_btn.set_label("");
-                self.jump_btn.set_icon_name("at-pan-down-symbolic");
+                self.jump_btn.set_icon_name("at-go-bottom-symbolic");
                 self.jump_btn.remove_css_class("suggested-action");
                 self.jump_btn.remove_css_class("pill");
                 self.jump_btn.add_css_class("flat");
@@ -218,6 +278,7 @@ impl InterruptionShelf {
                 self.revealer.set_reveal_child(true);
             }
             Some(PendingInterruption::Question { questions, .. }) => {
+                self.more_btn.set_visible(false);
                 self.card.add_css_class("is-question");
                 self.icon.set_icon_name(Some("at-dialog-question-symbolic"));
                 let count = questions.len();
@@ -239,6 +300,7 @@ impl InterruptionShelf {
                 self.deny_btn.set_visible(false);
                 // The label alone: a button holds a label or an icon, and setting an (empty)
                 // icon after it replaced the text with nothing, a blank pill.
+                self.jump_btn.set_icon_name("");
                 self.jump_btn.set_label("Answer in transcript ↓");
                 self.jump_btn.remove_css_class("flat");
                 self.jump_btn.add_css_class("pill");
@@ -250,6 +312,7 @@ impl InterruptionShelf {
                 self.revealer.set_reveal_child(true);
             }
             None => {
+                self.more_btn.set_visible(false);
                 self.revealer.set_reveal_child(false);
             }
         }
@@ -335,6 +398,60 @@ pub(crate) mod tests {
         assert_eq!(
             built.jump_btn.label().as_deref(),
             Some("Answer in transcript ↓")
+        );
+
+        // An approval with session and always allow: more_btn is visible, populated,
+        // and clicking an item issues the approval.
+        let session_approved = Rc::new(Cell::new(false));
+        let sink2: RowSink = {
+            let session_approved = session_approved.clone();
+            Rc::new(move |event| {
+                if let RowEvent::Approve { decision, .. } = event {
+                    if decision == Decision::AllowForSession {
+                        session_approved.set(true);
+                    }
+                }
+            })
+        };
+        let shelf2 = InterruptionShelf::new(sink2, |_| {});
+        let mut transcript2 = Transcript::new();
+        transcript2.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: Some("Run cargo test".into()),
+                input: serde_json::json!({"command": "cargo test"}),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::AllowAlways,
+                    Decision::Deny,
+                ],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r2"),
+            Driver::Claude,
+        );
+        shelf2.update(&transcript2);
+        assert!(
+            shelf2.more_btn.is_visible(),
+            "More dropdown button is visible"
+        );
+        assert_eq!(
+            shelf2.jump_btn.icon_name().as_deref(),
+            Some("at-go-bottom-symbolic")
+        );
+        let first_child = shelf2
+            .more_box
+            .first_child()
+            .expect("more_box has children");
+        let btn = first_child.downcast::<gtk4::Button>().expect("is button");
+        assert_eq!(btn.label().as_deref(), Some("Allow for session"));
+        btn.emit_clicked();
+        assert!(
+            session_approved.get(),
+            "Allow for session answered the approval"
         );
     }
 }

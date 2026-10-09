@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use crate::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
+    Outbox,
 };
 use crate::caps::Capabilities;
 use crate::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState, Usage};
@@ -75,6 +76,9 @@ pub struct AgyAdapter {
     fallback_prefix: String,
     /// Accumulated text of each open response item, flushed as a snapshot on completion.
     resp_text: HashMap<String, String>,
+    /// Cumulative token count across turns in this session.
+    cumulative_tokens: u64,
+    outbox: Outbox,
 }
 
 impl Default for AgyAdapter {
@@ -99,6 +103,8 @@ impl AgyAdapter {
             exit_expected: false,
             fallback_prefix: format!("a{}", ADAPTER_SEQ.fetch_add(1, Ordering::Relaxed)),
             resp_text: HashMap::new(),
+            cumulative_tokens: 0,
+            outbox: Outbox::default(),
         }
     }
 
@@ -351,6 +357,10 @@ impl AgyAdapter {
             })),
             _ => None,
         };
+        if let Some(usage) = &result.usage {
+            let turn_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+            self.cumulative_tokens = self.cumulative_tokens.max(turn_tokens);
+        }
         self.turn_open = false;
         out.push(env(Event::TurnCompleted {
             state,
@@ -427,6 +437,11 @@ impl Adapter for AgyAdapter {
         Vec::new()
     }
 
+    fn prompt_starts_turn(&self, text: &str) -> bool {
+        let first = text.split_whitespace().next().unwrap_or_default();
+        !SIDE_COMMANDS.contains(&first.to_ascii_lowercase().as_str())
+    }
+
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match command {
             Command::Prompt { text } => {
@@ -434,7 +449,7 @@ impl Adapter for AgyAdapter {
                 // other `/word` is forwarded as agent text (custom commands and skills).
                 let trimmed = text.trim();
                 let first = trimmed.split_whitespace().next().unwrap_or("");
-                if SIDE_COMMANDS.contains(&first.to_ascii_lowercase().as_str()) {
+                if !self.prompt_starts_turn(&text) {
                     self.side_seq += 1;
                     let id = format!("side-{}", self.side_seq);
                     let command =
@@ -481,6 +496,29 @@ impl Adapter for AgyAdapter {
                         SideKind::Json,
                         &["-p", "/config", "--output-format", "json"],
                     ),
+                    Control::ContextUsage => {
+                        let max = 1_048_576;
+                        let event = if self.cumulative_tokens > 0 {
+                            self.outbox.events.push(Envelope::new(Event::UsageUpdated {
+                                used: self.cumulative_tokens,
+                                max: Some(max),
+                                auto_compact_at: None,
+                            }));
+                            Event::ControlResult {
+                                ok: Some(json!({"used": self.cumulative_tokens, "max": max})),
+                                error: None,
+                            }
+                        } else {
+                            Event::ControlResult {
+                                ok: None,
+                                error: Some(
+                                    "Antigravity has not reported token usage yet".to_owned(),
+                                ),
+                            }
+                        };
+                        self.outbox.events.push(Envelope::new(event).request(id));
+                        return Ok(Vec::new());
+                    }
                     _ => {
                         return Err(AdapterError::Unsupported(
                             "this control is not offered by agy",
@@ -602,6 +640,10 @@ impl Adapter for AgyAdapter {
         }
         out.push(env(Event::SessionExited { code, expected }));
         out
+    }
+
+    fn drain_outbox(&mut self) -> Outbox {
+        std::mem::take(&mut self.outbox)
     }
 }
 
@@ -932,6 +974,52 @@ mod tests {
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
         assert!(last.raw.is_some());
+    }
+
+    #[test]
+    fn context_usage_control_reports_cumulative_tokens() {
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Control {
+            id: "cu1".into(),
+            control: Control::ContextUsage,
+        })
+        .expect("control");
+        let outbox = a.drain_outbox();
+        assert_eq!(outbox.events.len(), 1);
+        assert!(matches!(
+            &outbox.events[0].event,
+            Event::ControlResult { ok: None, error: Some(err) } if err.contains("not reported")
+        ));
+
+        a.feed(
+            r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":1000,"output_tokens":200}}}"#,
+        );
+
+        a.encode(Command::Control {
+            id: "cu2".into(),
+            control: Control::ContextUsage,
+        })
+        .expect("control");
+        let outbox = a.drain_outbox();
+        assert_eq!(outbox.events.len(), 2);
+        assert!(matches!(
+            &outbox.events[0].event,
+            Event::UsageUpdated {
+                used: 1200,
+                max: Some(1_048_576),
+                ..
+            }
+        ));
+        match &outbox.events[1].event {
+            Event::ControlResult {
+                ok: Some(val),
+                error: None,
+            } => {
+                assert_eq!(val["used"], 1200);
+                assert_eq!(val["max"], 1_048_576);
+            }
+            other => panic!("expected ControlResult ok, got {other:?}"),
+        }
     }
 
     #[test]

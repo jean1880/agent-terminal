@@ -3,6 +3,7 @@
 mod agents_prefs;
 mod diff_prefs;
 mod diffs;
+mod environment_review;
 mod setup;
 mod thread_menu;
 mod threads;
@@ -38,6 +39,148 @@ const NARROW_SP: f64 = 480.0;
 /// Below this width a visible diff panel would compete with the thread sidebar for horizontal
 /// space. It is temporarily hidden by a breakpoint and returns when the window grows again.
 const DIFF_HIDE_SP: f64 = 880.0;
+
+/// Embedded XML definition for GtkShortcutsWindow.
+const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <object class="GtkShortcutsWindow" id="shortcuts_window">
+    <property name="modal">True</property>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="section-name">shortcuts</property>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Chat &amp; Threads</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;T</property>
+                <property name="title">New Thread / Tab</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;O</property>
+                <property name="title">New Tab in Folder</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;G</property>
+                <property name="title">New Tab in Worktree</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;W</property>
+                <property name="title">Close Tab</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;S</property>
+                <property name="title">Checkpoint Workspace</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;E</property>
+                <property name="title">Resume Session</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Panels &amp; Views</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">F9</property>
+                <property name="title">Toggle Sidebar</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;J</property>
+                <property name="title">Toggle Terminal Drawer</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;D</property>
+                <property name="title">Toggle Diff View</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;F</property>
+                <property name="title">Search</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Navigation &amp; Tabs</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;Tab</property>
+                <property name="title">Next Tab</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Tab</property>
+                <property name="title">Previous Tab</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Alt&gt;1...9</property>
+                <property name="title">Select Tab by Number</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">General</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;comma</property>
+                <property name="title">Settings</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;question</property>
+                <property name="title">Keyboard Shortcuts</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;plus</property>
+                <property name="title">Zoom In</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;minus</property>
+                <property name="title">Zoom Out</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;0</property>
+                <property name="title">Reset Zoom</property>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>
+"#;
 
 /// Per-tab state, tracked explicitly so terminal/directory lookups never depend
 /// on walking the tab's widget hierarchy. `dir` is the directory the tab was
@@ -820,6 +963,8 @@ pub struct AgentTerminalWindow {
     /// The thread sidebar beside the pages.
     split_view: RefCell<Option<adw::OverlaySplitView>>,
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
+    /// The toggle button in the header bar controlling the sidebar.
+    pub(super) sidebar_toggle: RefCell<Option<gtk4::ToggleButton>>,
     /// The tab view, or the empty state when no page is open.
     pages_stack: RefCell<Option<gtk4::Stack>>,
     /// The last session's threads are still being reopened: an empty tab view shows a loading
@@ -1455,6 +1600,14 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&new_thread_agent);
 
+        let review = gtk4::gio::SimpleAction::new("review-environment", None);
+        review.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| obj.imp().review_current_environment()
+        ));
+        obj.add_action(&review);
+
         // New Terminal Thread as <profile>: the 2.x terminal page, for any profile.
         let new_terminal = gtk4::gio::SimpleAction::new(
             "new-terminal-profile",
@@ -1509,6 +1662,28 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&resume_action);
+
+        let preferences_action = gtk4::gio::SimpleAction::new("preferences", None);
+        preferences_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Preferences");
+                obj.imp().show_preferences();
+            }
+        ));
+        obj.add_action(&preferences_action);
+
+        let shortcuts_action = gtk4::gio::SimpleAction::new("shortcuts", None);
+        shortcuts_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| {
+                debug!("Action: Keyboard Shortcuts");
+                obj.imp().show_shortcuts();
+            }
+        ));
+        obj.add_action(&shortcuts_action);
 
         // Both targeted by profile name, like the new-tab-as actions.
         for name in ["resume-session-profile", "continue-in"] {
@@ -2218,6 +2393,10 @@ impl AgentTerminalWindow {
         self.fill_new_with_menu();
         threads.append_submenu(Some("New Thread With"), &with);
         threads.append(Some("New Thread in Folder…"), Some("win.new-tab-folder"));
+        threads.append(
+            Some("Review Multi-Agent Environment…"),
+            Some("win.review-environment"),
+        );
         threads.append(
             Some("New Thread in Worktree…"),
             Some("win.new-tab-worktree"),
@@ -3809,6 +3988,16 @@ impl AgentTerminalWindow {
         ));
 
         dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
+    }
+
+    /// Presents the GtkShortcutsWindow with keyboard shortcut documentation.
+    fn show_shortcuts(&self) {
+        let obj = self.obj();
+        let builder = gtk4::Builder::from_string(SHORTCUTS_XML);
+        if let Some(window) = builder.object::<gtk4::ShortcutsWindow>("shortcuts_window") {
+            window.set_transient_for(Some(&*obj));
+            window.present();
+        }
     }
 
     /// Re-resolves the selected profile for the tabs opened from now on.
@@ -6030,6 +6219,7 @@ mod tests {
         crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
         chat_shell_opens_threads_and_lists_them(&window);
+        environment_review::tests::confirmation_preserves_target(&window);
     }
 
     /// The narrowest window that still shows the sidebar beside the thread (at 1× text scale).
@@ -6167,6 +6357,13 @@ mod tests {
         // Long enough for timers (the restore skeleton's removal) to run.
         crate::testutil::pump_until(&ctx, 1, || false);
 
+        // GDK's toplevel size includes client-side shadows; widget allocations do not.
+        // Request the intended content size, so breakpoint neighbours are measured at their
+        // actual allocation on both X11 and Broadway rather than ten pixels below it.
+        let surface = window.surface().expect("mapped test surface");
+        let frame_width = (surface.width() - root.width()).max(0);
+        let frame_height = (surface.height() - root.height()).max(0);
+
         let split = imp.split_view.borrow().clone().expect("the split view");
         split.set_show_sidebar(true);
         // The window at each width either side of every breakpoint, the real breakpoints
@@ -6205,19 +6402,19 @@ mod tests {
                 }
                 scaled_widths.sort_unstable();
                 scaled_widths.dedup();
-                scaled_widths.retain(|width| *width <= display_width);
+                scaled_widths.retain(|width| *width + frame_width <= display_width);
                 for width in scaled_widths {
-                    window.set_default_size(width, height);
+                    window.set_default_size(width + frame_width, height + frame_height);
                     let sized = crate::testutil::pump_until(&ctx, 3, || {
-                        window.width() == width && window.height() == height
+                        root.width() == width && root.height() == height
                     });
                     // Let the breakpoint the new size selects apply.
                     crate::testutil::pump_until(&ctx, 1, || false);
                     assert!(
                         sized,
                         "the window took {width}×{height} (it is {}×{})",
-                        window.width(),
-                        window.height()
+                        root.width(),
+                        root.height()
                     );
                     let state = format!(
                         "{width}×{height}, text {scale}×, sidebar {}, diff panel {}",
@@ -6228,6 +6425,15 @@ mod tests {
                         },
                         if diff_shown { "shown" } else { "hidden" }
                     );
+                    if width == MIN_WINDOW.0 || width == 950 {
+                        crate::testutil::capture_window(
+                            window.upcast_ref(),
+                            &format!(
+                                "window-{width}-scale-{}-diff-{diff_shown}",
+                                (scale * 100.0) as u32
+                            ),
+                        );
+                    }
                     for overflow in crate::testutil::overflowing_bins(&root) {
                         eprintln!("layout overflow at {state}: {overflow}");
                         report.push_str(&format!("== {state}: {overflow}\n"));
@@ -6287,6 +6493,11 @@ mod tests {
                 .is_some_and(|a| a.is_enabled()),
             "the shell's actions are on once it is shown"
         );
+        assert!(window.lookup_action("preferences").is_some());
+        assert!(window.lookup_action("shortcuts").is_some());
+        assert!(window.lookup_action("checkpoint-now").is_some());
+        assert!(window.lookup_action("new-tab-folder").is_some());
+        assert!(window.lookup_action("resume-session").is_some());
         assert_eq!(
             imp.tabs.borrow().len(),
             0,
@@ -6305,6 +6516,39 @@ mod tests {
         let rows = imp.sidebar_rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.open && r.folder == dir_s));
+
+        // When sidebar is collapsed and a background thread is unread, toggle gets .has-unread
+        if let Some(split) = imp.split_view.borrow().as_ref() {
+            split.set_show_sidebar(false);
+        }
+        if let Some(tab) = imp.tabs.borrow_mut().get_mut(0) {
+            if let Some(chat) = tab.chat.as_mut() {
+                chat.unread = true;
+            }
+        }
+        imp.update_sidebar_toggle_attention();
+        let toggle = imp.sidebar_toggle.borrow().clone().expect("toggle");
+        assert!(toggle.has_css_class("has-unread"));
+        assert!(!toggle.has_css_class("needs-attention"));
+
+        // When a background thread needs approval, toggle gets .needs-attention
+        if let Some(tab) = imp.tabs.borrow_mut().get_mut(0) {
+            if let Some(chat) = tab.chat.as_mut() {
+                chat.approval = true;
+            }
+        }
+        imp.update_sidebar_toggle_attention();
+        assert!(toggle.has_css_class("needs-attention"));
+        assert!(!toggle.has_css_class("has-unread"));
+
+        // When sidebar is reopened, classes on toggle are cleared
+        if let Some(split) = imp.split_view.borrow().as_ref() {
+            split.set_show_sidebar(true);
+        }
+        imp.update_sidebar_toggle_attention();
+        assert!(!toggle.has_css_class("has-unread"));
+        assert!(!toggle.has_css_class("needs-attention"));
+
         threads::tests::sidebar_focus_survives_refresh(window);
 
         // Archive and delete go through the store; the sidebar follows the loaded list.

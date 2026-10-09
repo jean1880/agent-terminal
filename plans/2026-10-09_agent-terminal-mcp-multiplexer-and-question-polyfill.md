@@ -1,0 +1,295 @@
+# Architectural Plan: Synthetic MCP Multiplexer & Question Extraction Polyfill
+
+> **Status:** 📋 PROPOSED — 2026-10-09 · **Target:** `agent-terminal` v3.1 / `crates/agent-core`  
+> **Context:** Tri-agent parity architecture across Claude Code, Antigravity (`agy`), and OpenAI Codex (`codex app-server`).  
+> **Predecessor:** Hive Board Topic #26 (`agent-terminal-parity-council`, messages #290–#295).  
+> **Spelling Standard:** Canadian English in authored prose (-our, -re, -ce nouns, doubled -ll-, grey).
+
+---
+
+## 1. Executive Summary & Purpose
+
+In `agent-terminal` v3.0, Claude Code, Antigravity (`agy`), and OpenAI Codex are unified under a single GTK4 chat-first front end. Whilst basic conversational turns, file diff cards, and mode policies have achieved parity, two foundational architectural gaps remain:
+
+1. **Tool Multiplexing Asymmetry (Cut 4A):** Claude Code natively connects to Model Context Protocol (MCP) servers via stdio JSON-RPC; Antigravity connects via its internal configuration and native tool definitions; Codex `app-server` exposes dynamic tool calls (`dynamicToolCall`, `mcpToolCall`, `collabAgentToolCall`) but lacks transparent out-of-the-box bridge support for shared local MCP suites. Crucially, `agent-terminal` has no mechanism to inject its own host-side capabilities (checkpoints, live diff views, workspace branch switches) into running agent processes without bespoke per-agent configuration.
+2. **Decision-Gate Asymmetry (Cut 4B):** Claude Code and Antigravity invoke structured question tools (`ask_question`) which render rich, interactive radio/checkbox cards in the GTK4 view. Codex (and models falling back to conversational free text) generates Markdown-formatted lists (e.g., `"1. Option A\n2. Option B\nWhich should I proceed with?"`). These render as inert text blocks, forcing the operator to manually type responses rather than clicking interactive UI choice chips.
+
+This document sets out the comprehensive technical architecture, failure modes, threat models, and implementation roadmap for resolving both gaps in a dedicated follow-up development track.
+
+---
+
+## 2. Assumptions & Invariants
+
+| # | Assumption | Status | Verification Method |
+|---|---|---|---|
+| 1 | Claude Code communicates exclusively via stream-json over stdio. | VERIFIED | `crates/agent-core/src/claude.rs` adapter and live inspection. |
+| 2 | Antigravity communicates via NDJSON over stdio with an external approval hook client. | VERIFIED | `crates/agent-core/src/agy.rs` and `src/approval_hook.rs`. |
+| 3 | Codex `app-server` communicates via JSON-RPC 2.0 without a top-level `"jsonrpc"` key over stdio NDJSON. | VERIFIED | `crates/agent-core/src/codex.rs` and codex 0.160.1 schema. |
+| 4 | GTK4 UI event dispatch requires all UI updates to land on the GLib main context (`glib::idle_add_local_once`). | VERIFIED | `src/chat/view.rs` and `src/chat/session.rs`. |
+| 5 | Shell script invocations from AI harnesses stall for 570–600s if graphical approval prompts block headless workers. | VERIFIED | Homelab operational experience; direct file modifications mandated. |
+
+---
+
+## 3. Part I: Synthetic MCP Multiplexer Architecture
+
+```
+                    ┌──────────────────────────────────────────────┐
+                    │            agent-terminal Host               │
+                    │                                              │
+                    │  ┌────────────────────────────────────────┐  │
+                    │  │      Host Tool Virtualisation API      │  │
+                    │  │ (Checkpoints, Diffs, Worktrees, RAG)   │  │
+                    │  └──────────────────┬─────────────────────┘  │
+                    │                     │                        │
+                    │  ┌──────────────────▼─────────────────────┐  │
+                    │  │     Synthetic MCP Multiplexer Core     │  │
+                    │  │     (Process Supervisor & Router)      │  │
+                    │  └──────┬──────────────┬──────────────┬───┘  │
+                    └─────────┼──────────────┼──────────────┼──────┘
+                              │              │              │
+             ┌────────────────▼──┐    ┌──────▼──────┐   ┌───▼────────────────┐
+             │ Unix Domain Socket│    │ stdio Pipes │    │ JSON-RPC Adapter   │
+             └────────┬──────────┘    └──────┬──────┘   └───┬────────────────┘
+                      │                      │              │
+             ┌────────▼──────────┐    ┌──────▼──────┐   ┌───▼────────────────┐
+             │   Codex app-srv   │    │ Claude Code │   │ Antigravity (agy)  │
+             │   mcpToolCall     │    │   stdio MCP │   │  Sidecar MCP Server│
+             └───────────────────┘    └─────────────┘   └────────────────────┘
+```
+
+### 3.1. The Core Problems to Overcome
+
+1. **Protocol and Transport Divergence:**
+   - Claude expects stdio child processes spawned by Claude itself, listed in `~/.claude.json`.
+   - Antigravity consumes MCP configurations generated by `agent-sync` into `~/.gemini/config/mcp_config.json`.
+   - Codex `app-server` manages its own MCP connections defined in `~/.codex/config.toml`, routing tool calls through `item/mcpToolCall` or `item/dynamicToolCall` notifications.
+   - *Impediment:* A single local tool server cannot simultaneously serve three independent parent processes without dynamic port/socket negotiation or virtualised forwarding.
+
+2. **Process Lifecycle & Zombie Mitigation:**
+   - Spawning independent tool child processes per agent session multiplies memory overhead and risks orphaned background daemons if an agent crashes or exits abnormally.
+   - *Impediment:* Need a centralised supervisor within `agent-terminal` that holds tool server processes open across agent switches, or multiplexes requests over Unix Domain Sockets (UDS).
+
+3. **Schema Incompatibilities:**
+   - JSON Schema versions vary: Draft-07, Draft 2020-12, and OpenAPI 3.0 dialects.
+   - Antigravity strictly validates parameter schemas; Codex app-server permits loose argument objects; Claude enforces strict required-field constraints.
+   - *Impediment:* Schema sanitisation and normalisation must occur dynamically at the boundary before exposing tool definitions to the respective agent.
+
+4. **Security & Sandboxing Boundaries:**
+   - Exposing host tools to LLMs introduces prompt injection and unauthorized execution risks.
+   - *Impediment:* Must maintain strict token-scrubbing (via `nuvek-core::scrub`), command argument allowlisting, and least-privilege sandboxing.
+
+### 3.2. Detailed Technical Design
+
+#### A. Synthetic Multiplexer Daemon (`agent-mcp-hub`)
+Rather than forcing each agent to spawn independent instances of homelab MCP tools (`ansible`, `media`, `unraid`, `prometheus`, etc.), `agent-terminal` will house an embedded Tokio-based MCP Hub:
+
+- **Transport:** Spawns a dedicated Unix Domain Socket per workspace session:
+  `$XDG_RUNTIME_DIR/agent-terminal/mcp-<session-uuid>.sock`
+- **Bridge Proxies:**
+  - **For Claude Code:** A lightweight stdio shim binary (`agent-mcp-forwarder --socket <path>`) registered in `.claude.json`.
+  - **For Antigravity:** A synthetic entry in `mcp_config.json` pointing to the forwarder shim.
+  - **For Codex:** The adapter intercepts Codex tool calls and forwards them via JSON-RPC 2.0 directly across the socket.
+
+#### B. Process Supervisor State Machine
+The supervisor manages external and host-native MCP servers:
+```
+  [Uninitialised]
+         │
+         ▼ spawn()
+    [Starting] ──────(timeout 5s)──────► [Failed] ──► (Alert Operator)
+         │                                  ▲
+         ▼ handshake / initialize           │
+     [Ready] ◄────────(turn settles)────────┤
+         │                                  │
+         ▼ tool call dispatch               │
+      [Busy] ────────(crash / panic)────────┘
+         │
+         ▼ session shutdown
+    [Draining]
+         │
+         ▼ SIGTERM -> SIGKILL (2s grace)
+     [Stopped]
+```
+
+#### C. Host-Native Tool Injection
+The multiplexer exposes synthetic tools implemented natively inside `agent-terminal`:
+- `terminal_diff_view(file, old_rev, new_rev)`: Triggers the external visual diff tool (Meld/VS Code) via the host configuration.
+- `terminal_checkpoint(label)`: Creates an instantaneous Git worktree checkpoint.
+- `terminal_switch_mode(mode)`: Requests a runtime mode transition.
+
+---
+
+## 4. Part II: Structured Question Extraction Polyfill
+
+```
+   ┌──────────────────────────────────────────────────────────────┐
+   │ Assistant Turn Stream: Markdown Free Text                    │
+   │ "Which database migration strategy should we employ?        │
+   │  1. Zero-downtime blue/green deployment                      │
+   │  2. Maintenance window with offline schema migration         │
+   │  3. In-place additive column backfill"                       │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ Phase 1: pulldown-cmark AST Parsing & Pattern Matcher        │
+   │ - Detect terminal interrogative sentence                     │
+   │ - Match ordered list / bullet list options                   │
+   │ - Verify exclusivity & absence of code fence context         │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ Phase 2: Anti-Injection & Safety Filter                      │
+   │ - Reject lists containing shell injection tokens ($(), `)    │
+   │ - Ignore passive tutorials or documentation quotes           │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ Synthesis: Virtual QuestionCard Event                        │
+   │ - Generate Event::QuestionRequested                          │
+   │ - Populate Question { id, header, question, options }        │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  │
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ GTK4 Interruption Shelf & View Rendering                     │
+   │ ┌──────────────────────────────────────────────────────────┐ │
+   │ │ [?] Migration Strategy Choice                            │ │
+   │ │ (o) 1. Zero-downtime blue/green deployment               │ │
+   │ │ ( ) 2. Maintenance window with offline schema migration   │ │
+   │ │ ( ) 3. In-place additive column backfill                 │ │
+   │ │ [ Submit Choice ]                     [ Type Freeform ]  │ │
+   │ └──────────────────────────────────────────────────────────┘ │
+   └──────────────────────────────────────────────────────────────┘
+```
+
+### 4.1. The Core Problems to Overcome
+
+1. **The Conversational Text Ambiguity:**
+   - Free text assistant turns frequently include numbered lists that are *not* decision gates:
+     * Step-by-step procedural guides (e.g., "1. Run cargo build, 2. Run cargo test").
+     * Code reviews outlining multiple independent flaws.
+     * Rhetorical choices or illustrative comparisons.
+   - *Impediment:* A naive regular expression parser generates massive false-positive rates, confusing the operator with unwanted interactive buttons.
+
+2. **Indirect Prompt Injection Risks:**
+   - Malicious files read during repository inspection (or web search content) can attempt to trick the parser into displaying deceptive choice chips (e.g., "1. Approve immediate force-push to production").
+   - *Impediment:* The parser must strictly attribute content to the assistant message channel, verify option text bounds, and provide clear provenance labels.
+
+3. **Reply Encoding & Conversational Synchronisation:**
+   - When a user selects Option 2 on a native `ask_question` card, the adapter sends a structured JSON payload (`{"selected": ["2"]}`).
+   - When answering a conversational question in Codex or plain text models, sending a raw JSON object will confuse the model. The reply must be formatted naturally: `"I select option 2: Maintenance window with offline schema migration"`.
+   - *Impediment:* The polyfill must understand the current agent driver and encode the operator's decision into the precise conversational pattern expected by that model.
+
+### 4.2. Detailed Technical Design
+
+#### A. Two-Stage AST Parser (`crates/agent-core/src/question_extract.rs`)
+Rather than brittle regex heuristics, the polyfill operates over the Markdown Abstract Syntax Tree via `pulldown-cmark`:
+
+```rust
+pub struct ExtractedQuestion {
+    pub prompt: String,
+    pub options: Vec<ExtractedOption>,
+    pub multi_select: bool,
+}
+
+pub struct ExtractedOption {
+    pub index: usize,
+    pub label: String,
+    pub description: Option<String>,
+}
+```
+
+1. **AST Block Filter:**
+   - Scans the trailing blocks of an assistant message turn.
+   - Requires a terminal paragraph ending in an interrogative mark (`?`, `：`, `?`), followed or preceded by a `List(None)` (bulleted) or `List(Some(1))` (ordered) node.
+   - Discards any lists nested inside code blocks, blockquotes, or tables.
+
+2. **Semantic Decision Heuristics:**
+   - List item count must fall strictly between `2` and `6` items (fewer is not a choice; more is an inventory).
+   - Labels are constrained to `<= 80` characters. Descriptions are constrained to `<= 200` characters.
+   - Content must not match command-syntax patterns (e.g., lines beginning with `$ `, `sudo `, `cargo `).
+
+#### B. Polyfill Synthetic Envelope Injection
+When an assistant turn completes without an explicit tool interruption:
+1. `question_extract::parse(&turn_text)` evaluates the final turn text.
+2. If a valid question pattern is detected with confidence score `>= 0.85`:
+   - Emits a synthetic `Event::QuestionRequested { request: format!("polyfill:{}", turn_id), questions }`.
+   - Marks the envelope with `synthetic: true` to indicate client-side polyfill origin.
+3. The GTK4 `InterruptionShelf` renders the interactive chips above the composer.
+4. When the operator clicks "Submit Choice":
+   - Emits `Event::QuestionResolved`.
+   - Populates the composer with the natural language confirmation string.
+   - Submits the prompt to the active agent process seamlessly.
+
+---
+
+## 5. Implementation Roadmap & Phases
+
+```
+   ┌───────────────────────────────────────────────────────────────────┐
+   │ Phase 1: Question AST Parser & Safety Validation (crates/agent-core)│
+   │ - pulldown-cmark visitor                                          │
+   │ - Confidence scoring engine                                       │
+   │ - Comprehensive synthetic test fixtures & false-positive suite    │
+   └─────────────────────────────────┬─────────────────────────────────┘
+                                     │
+                                     ▼
+   ┌───────────────────────────────────────────────────────────────────┐
+   │ Phase 2: GTK4 Question Polyfill Integration (src/chat/session.rs) │
+   │ - Interruption shelf hook for polyfill envelopes                  │
+   │ - Conversational reply string formatter per Driver                │
+   │ - Operator bypass toggle ("View as raw text")                     │
+   └─────────────────────────────────┬─────────────────────────────────┘
+                                     │
+                                     ▼
+   ┌───────────────────────────────────────────────────────────────────┐
+   │ Phase 3: Synthetic MCP Core & Supervisor Daemon                   │
+   │ - UDS listener & framing protocol                                 │
+   │ - Tokio process supervisor with 2-second SIGKILL escalation       │
+   │ - Schema validator and normalisation translation                  │
+   └─────────────────────────────────┬─────────────────────────────────┘
+                                     │
+                                     ▼
+   ┌───────────────────────────────────────────────────────────────────┐
+   │ Phase 4: Tri-Agent MCP Registration & End-to-End Verification     │
+   │ - Claude Code stdio forwarder shim                                │
+   │ - Antigravity sidecar configuration generator                     │
+   │ - Codex app-server dynamic tool interceptor                       │
+   └───────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 1: Question AST Parser & Test Harness (1–2 Days)
+- Implement `crates/agent-core/src/question_extract.rs`.
+- Add test fixtures spanning real-world Codex and Claude text responses:
+  - 10 true-positive decision queries.
+  - 20 adversarial false-positive scenarios (procedural steps, code review diffs, documentation lists).
+
+### Phase 2: GTK4 Question Polyfill UI Wiring (1 Day)
+- Connect synthetic question events into `src/chat/session.rs`.
+- Ensure interaction chips clear smoothly on turn settle or manual composer typing.
+- Verify keyboard navigation (`Up`/`Down` arrow keys, `Return` to submit).
+
+### Phase 3: Synthetic MCP Socket Core (2–3 Days)
+- Author `crates/agent-mcp-hub` in the Cargo workspace.
+- Implement socket lifecycle, connection pooling, and process watchdog timers.
+- Expose `agent-terminal` host tools (diffs, checkpoints, git inspection).
+
+### Phase 4: Full Tri-Agent Protocol Bridging (2 Days)
+- Configure stdio forwarder and Codex `item/mcpToolCall` translation.
+- End-to-end integration testing across Claude Code, Antigravity, and Codex.
+- Document operator configuration and troubleshooting procedures.
+
+---
+
+## 6. Rollback & Contingency Plan
+
+1. **Question Polyfill Contingency:**
+   - Add a configuration boolean in `config.json`: `"polyfill_questions": true` (default).
+   - If false-positive detection causes operator friction, the feature can be toggled off instantly in Preferences without restarting the application.
+2. **MCP Multiplexer Contingency:**
+   - The multiplexer operates as an opt-in proxy layer. If a tool server fails or the socket becomes unresponsive, agent adapters drop back to direct process spawning without interrupting basic text streaming.
+3. **Git Reversion Path:**
+   - All code will land in discrete commits gated by `~/scripts/rust-gate.sh` and Conventional Commit standards. Any regression can be reverted cleanly with `git revert`.
