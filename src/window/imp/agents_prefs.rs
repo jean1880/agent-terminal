@@ -48,7 +48,8 @@ const COMMAND_HELP: &str =
     "The agent's command name (found on PATH) or the full path to its binary";
 const ARGS_HELP: &str =
     "Arguments added to every launch of this agent, quoted as in a shell (e.g. --verbose)";
-const ENV_FILE_HELP: &str = "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
+const ENV_FILE_HELP: &str =
+    "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
 
 fn validation_row() -> adw::ActionRow {

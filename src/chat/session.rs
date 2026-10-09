@@ -22,18 +22,18 @@ use agent_core::adapter::{
 use agent_core::catalog::Replacement;
 use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind, TurnState};
 use agent_core::handoff_budget::{
-    DEFAULT_HANDOFF_TOKEN_CAP, HistoricalMessage, Role, handoff_budget, handoff_coverage,
-    provider_message_with_handoff, render_history, select_history,
+    handoff_budget, handoff_coverage, provider_message_with_handoff, render_history,
+    select_history, HistoricalMessage, Role, DEFAULT_HANDOFF_TOKEN_CAP,
 };
 use agent_core::transition::{
-    ModelSelection, SessionState, Transition, decide_transition, plan_selection,
+    decide_transition, plan_selection, ModelSelection, SessionState, Transition,
 };
 use agent_kit::store::{ProviderThreadId, Store, ThreadId, TranscriptMessage};
 use gtk4::glib;
 use tracing::{debug, info, warn};
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
-use crate::agent_proc::{AGY_TIMEOUT, AgentEnv, AgentProcess, SpawnSpec, run_side};
+use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
 use crate::approval_server::ApprovalHandle;
 
 /// Process environment the adapter does not own: what the agent's profile adds (its env file)
@@ -189,6 +189,8 @@ struct Inner {
     /// Pending Codex approval details `(tool_key, detail)` mapped by request id, so AllowAlways
     /// choices can be persisted in `always-allow.json`.
     codex_pending_approvals: RefCell<HashMap<String, (String, String)>>,
+    /// Active rules scoped to this chat session only (for Codex or in-app auto-approvals).
+    session_rules: RefCell<crate::always_allow::AlwaysRules>,
 }
 
 /// The mode a session can actually run in. agy without its approval hook cannot ask before
@@ -341,6 +343,7 @@ impl ChatSession {
             adapter_epoch: Cell::new(0),
             wanted_mode: Cell::new(wanted_mode),
             codex_pending_approvals: RefCell::new(HashMap::new()),
+            session_rules: RefCell::new(crate::always_allow::AlwaysRules::default()),
         });
         inner.attach_approval();
         // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
@@ -867,27 +870,37 @@ impl Inner {
             .borrow_mut()
             .insert(req.clone(), (tool_key.clone(), detail.clone()));
 
-        if let Some(path) = crate::always_allow::path() {
+        let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+            .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+            .to_string_lossy()
+            .into_owned();
+
+        let session_matched = self
+            .session_rules
+            .borrow()
+            .matches_any(&workspace, &tool_key, command);
+
+        let persistent_matched = if let Some(path) = crate::always_allow::path() {
             let rules = crate::always_allow::AlwaysRules::load(&path);
-            let workspace = std::fs::canonicalize(Path::new(&open_cwd))
-                .unwrap_or_else(|_| PathBuf::from(&open_cwd))
-                .to_string_lossy()
-                .into_owned();
             let matching_keys = rules.keys_for(&workspace);
-            if rules.matches_any(&workspace, &tool_key, command)
+            rules.matches_any(&workspace, &tool_key, command)
                 || matching_keys
                     .iter()
                     .any(|(t, d)| t == &tool_key && d == &detail)
-            {
-                info!(command = %command, "auto-approving remembered Codex command");
-                let weak = Rc::downgrade(self);
-                let req = req.clone();
-                glib::idle_add_local_once(move || {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.respond_approval(&req, Decision::Allow);
-                    }
-                });
-            }
+        } else {
+            false
+        };
+
+        if session_matched || persistent_matched {
+            info!(command = %command, "auto-approving remembered Codex command");
+            let weak = Rc::downgrade(self);
+            let req = req.clone();
+            let ctx = glib::MainContext::ref_thread_default();
+            ctx.invoke_local(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.respond_approval(&req, Decision::Allow);
+                }
+            });
         }
     }
 
@@ -1286,40 +1299,46 @@ impl Inner {
                 return;
             }
         }
-        if decision == Decision::AllowAlways && self.adapter.borrow().driver() == Driver::Codex {
+        if matches!(decision, Decision::AllowAlways | Decision::AllowForSession)
+            && self.adapter.borrow().driver() == Driver::Codex
+        {
             if let Some((tool, detail)) = self.codex_pending_approvals.borrow_mut().remove(request)
             {
-                if let Some(path) = crate::always_allow::path() {
-                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                    let rule_to_save = if let Some(mut r) = custom_rule {
-                        if r.workspace.is_empty() {
-                            let open_cwd = self.open.borrow().cwd.clone();
-                            r.workspace = std::fs::canonicalize(Path::new(&open_cwd))
-                                .unwrap_or_else(|_| PathBuf::from(&open_cwd))
-                                .to_string_lossy()
-                                .into_owned();
-                        }
-                        r
-                    } else {
-                        let open_cwd = self.open.borrow().cwd.clone();
-                        let workspace = std::fs::canonicalize(Path::new(&open_cwd))
-                            .unwrap_or_else(|_| PathBuf::from(&open_cwd))
-                            .to_string_lossy()
-                            .into_owned();
-                        crate::always_allow::Rule::new(workspace, tool.clone(), detail)
-                    };
-                    let tool_name = rule_to_save.tool.clone();
-                    let added = rules.add(rule_to_save);
-                    if added {
-                        match rules.save(&path) {
-                            Ok(()) => {
-                                info!(tool = %tool_name, "remembered an always-allow rule for Codex")
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "could not save the always-allow rule for Codex")
+                let open_cwd = self.open.borrow().cwd.clone();
+                let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                    .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                    .to_string_lossy()
+                    .into_owned();
+
+                let rule = if let Some(mut r) = custom_rule {
+                    if r.workspace.is_empty() {
+                        r.workspace = workspace;
+                    }
+                    r
+                } else {
+                    let cmd = detail.rsplit_once('\n').map_or(detail.as_str(), |(_, c)| c);
+                    crate::always_allow::Rule::new(workspace, tool.clone(), cmd)
+                };
+
+                if decision == Decision::AllowAlways {
+                    if let Some(path) = crate::always_allow::path() {
+                        let mut rules = crate::always_allow::AlwaysRules::load(&path);
+                        let tool_name = rule.tool.clone();
+                        let added = rules.add(rule.clone());
+                        if added {
+                            match rules.save(&path) {
+                                Ok(()) => {
+                                    info!(tool = %tool_name, "remembered an always-allow rule for Codex")
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "could not save the always-allow rule for Codex")
+                                }
                             }
                         }
                     }
+                    self.session_rules.borrow_mut().add(rule);
+                } else if decision == Decision::AllowForSession {
+                    self.session_rules.borrow_mut().add(rule);
                 }
             }
         } else {
@@ -2191,16 +2210,12 @@ mod tests {
             assert_eq!(pts.len(), 1);
             assert_eq!(pts[0].native_id.as_deref(), Some(CONVERSATION));
             let stored = store.events(&thread, None, 1000).expect("events");
-            assert!(
-                stored
-                    .iter()
-                    .any(|(_, e)| matches!(e.event, Event::TurnCompleted { .. }))
-            );
-            assert!(
-                stored
-                    .iter()
-                    .all(|(_, e)| !matches!(e.event, Event::Unknown) || e.raw.is_some())
-            );
+            assert!(stored
+                .iter()
+                .any(|(_, e)| matches!(e.event, Event::TurnCompleted { .. })));
+            assert!(stored
+                .iter()
+                .all(|(_, e)| !matches!(e.event, Event::Unknown) || e.raw.is_some()));
             let msgs = store.transcript_messages(&thread).expect("msgs");
             assert_eq!(msgs[0].text, "add multiply");
 
@@ -2218,10 +2233,9 @@ mod tests {
                 "{args:?}"
             );
             assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
-            assert!(
-                args.iter()
-                    .all(|a| !a.contains("--dangerously-skip-permissions"))
-            );
+            assert!(args
+                .iter()
+                .all(|a| !a.contains("--dangerously-skip-permissions")));
         });
     }
 
@@ -2346,11 +2360,10 @@ mod tests {
             session.set_retired(Some(retired("old", "sonnet")));
             session.switch(Driver::Claude, Some("opus".into()), None);
             session.send_prompt("hi");
-            assert!(
-                !log.borrow()
-                    .iter()
-                    .any(|c| matches!(c, Command::SetModel { model, .. } if model == "sonnet"))
-            );
+            assert!(!log
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, Command::SetModel { model, .. } if model == "sonnet")));
             assert!(!has(&seen, |e| matches!(e, Event::Notice { text }
                 if text.contains("was retired"))));
         });
@@ -2414,11 +2427,10 @@ mod tests {
                 Some(handle.clone()),
             );
             let spec = session.launch_spec();
-            assert!(
-                spec.argv
-                    .iter()
-                    .any(|a| a == "--dangerously-skip-permissions")
-            );
+            assert!(spec
+                .argv
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"));
             let env: std::collections::HashMap<_, _> = spec.env.iter().cloned().collect();
             let socket = env
                 .get("AGENT_TERMINAL_APPROVAL_SOCKET")
@@ -2469,12 +2481,10 @@ mod tests {
             );
             let spec = session.launch_spec();
             assert!(spec.env.is_empty());
-            assert!(
-                !spec
-                    .argv
-                    .iter()
-                    .any(|a| a == "--dangerously-skip-permissions")
-            );
+            assert!(!spec
+                .argv
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"));
             assert!(spec.argv.windows(2).any(|w| w == ["--mode", "plan"]));
             session.send_prompt("go");
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
@@ -2756,11 +2766,9 @@ mod tests {
                 })
                 .collect();
             assert_eq!(completed, vec![(TurnState::Interrupted, None)]);
-            assert!(
-                stored
-                    .iter()
-                    .any(|(_, e)| matches!(e.event, Event::SessionExited { .. }))
-            );
+            assert!(stored
+                .iter()
+                .any(|(_, e)| matches!(e.event, Event::SessionExited { .. })));
             assert!(has(&seen, |e| matches!(e, Event::SessionExited { .. })));
             assert!(!session.status().alive && !session.status().running_turn);
             // A second call finds nothing to stop and writes nothing more.
@@ -2971,11 +2979,10 @@ mod tests {
             assert_eq!(spec.argv[0], "/bin/true");
             assert!(spec.argv.contains(&"--profile-arg".to_owned()));
             assert!(!spec.argv.contains(&"--agy-only".to_owned()));
-            assert!(
-                spec.argv
-                    .windows(2)
-                    .any(|w| w == ["--model", "claude-sonnet-5-5"])
-            );
+            assert!(spec
+                .argv
+                .windows(2)
+                .any(|w| w == ["--model", "claude-sonnet-5-5"]));
             assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
             assert!(spec.unset.contains(&"CLAUDECODE".to_owned()));
             assert_eq!(session.status().model, None);
@@ -2994,11 +3001,10 @@ mod tests {
             session.switch(Driver::Agy, Some("gemini-3.1-pro-high".into()), None);
             session.switch(Driver::Claude, Some("claude-opus-5-5".into()), None);
             let spec = session.launch_spec();
-            assert!(
-                spec.argv
-                    .windows(2)
-                    .any(|w| w == ["--model", "claude-opus-5-5"])
-            );
+            assert!(spec
+                .argv
+                .windows(2)
+                .any(|w| w == ["--model", "claude-opus-5-5"]));
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChangeRequested { model } if model == "claude-opus-5-5")
@@ -4050,5 +4056,108 @@ mod tests {
         assert_eq!(build_handoff(&[], "x").carried, 0);
         // Each handoff draws its own fence.
         assert_ne!(build_handoff(&history, "t").fence, handoff.fence);
+    }
+
+    #[test]
+    fn codex_session_approval_rule_auto_approves_matching_commands() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let log: Log = Rc::default();
+            let mut open = open_on("codex");
+            open.cwd = tmp.path().to_string_lossy().to_string();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Codex, &log),
+                open,
+                store,
+                thread,
+                sink,
+                None,
+            );
+
+            // First Codex approval request arrives
+            let env1 = Envelope::new(Event::ApprovalRequested {
+                tool: "command_execution".into(),
+                title: None,
+                input: serde_json::json!({
+                    "command": "cargo test --bin foo",
+                    "cwd": tmp.path().to_string_lossy(),
+                }),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::AllowAlways,
+                    Decision::Deny,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("req-1");
+            session.inner.emit(env1.clone());
+            session.inner.check_codex_auto_approval(&env1);
+
+            assert!(session
+                .inner
+                .codex_pending_approvals
+                .borrow()
+                .contains_key("req-1"));
+
+            // Operator approves for session with loosened rule: "cargo *"
+            let custom_rule = crate::always_allow::Rule::new(
+                "*".to_string(),
+                "run_command".to_string(),
+                "cargo *".to_string(),
+            );
+            session.respond_approval_with_rule(
+                "req-1",
+                Decision::AllowForSession,
+                Some(custom_rule),
+            );
+
+            // Verify session rule was added to session_rules
+            assert!(session.inner.session_rules.borrow().matches_any(
+                &tmp.path().to_string_lossy(),
+                "run_command",
+                "cargo clippy"
+            ));
+
+            // Second Codex command arrives: "cargo clippy"
+            let env2 = Envelope::new(Event::ApprovalRequested {
+                tool: "command_execution".into(),
+                title: None,
+                input: serde_json::json!({
+                    "command": "cargo clippy",
+                    "cwd": tmp.path().to_string_lossy(),
+                }),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::AllowAlways,
+                    Decision::Deny,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("req-2");
+            session.inner.emit(env2.clone());
+            session.inner.check_codex_auto_approval(&env2);
+
+            // GLib idle callback fires to auto-approve req-2
+            assert!(pump_until(ctx, 10, || {
+                seen.borrow().iter().any(|env| {
+                    env.request.as_deref() == Some("req-2")
+                        && matches!(
+                            env.event,
+                            Event::ApprovalResolved {
+                                decision: Decision::Allow
+                            }
+                        )
+                })
+            }));
+        });
     }
 }

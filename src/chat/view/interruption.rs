@@ -9,7 +9,7 @@ use std::rc::Rc;
 use agent_core::event::{Decision, ItemKind};
 use gtk4::prelude::*;
 
-use super::cards::{RowEvent, RowSink, decision_label, label};
+use super::cards::{decision_label, label, RowEvent, RowSink};
 use super::model::{PendingInterruption, Transcript};
 use super::payload;
 

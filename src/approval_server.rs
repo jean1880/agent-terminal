@@ -451,6 +451,8 @@ struct ServerInner {
     queries: RefCell<HashMap<String, u32>>,
     /// Where "Always allow" rules are kept ([`crate::always_allow`]); `None` offers no "Always".
     always: RefCell<Option<PathBuf>>,
+    /// Active rules scoped to this session only.
+    session_rules: RefCell<crate::always_allow::AlwaysRules>,
 }
 
 impl Drop for ServerInner {
@@ -630,6 +632,7 @@ impl ApprovalHandle {
             deadline,
             queries: RefCell::new(HashMap::new()),
             always: RefCell::new(None),
+            session_rules: RefCell::new(crate::always_allow::AlwaysRules::default()),
         });
         // From here `Drop` removes the file, including on the early return below.
         std::fs::set_permissions(&inner.path, std::fs::Permissions::from_mode(0o600))
@@ -713,17 +716,34 @@ impl ApprovalHandle {
         };
         if matches!(decision, Decision::AllowForSession | Decision::AllowAlways) {
             if decision == Decision::AllowAlways {
-                if let Some(mut rule) = custom_rule {
+                if let Some(mut rule) = custom_rule.clone() {
                     if rule.workspace.is_empty() {
                         rule.workspace = self.workspace_key();
                     }
-                    self.save_custom_rule(rule);
+                    self.save_custom_rule(rule.clone());
+                    self.inner.session_rules.borrow_mut().add(rule);
                 } else if let Some(key) = &pending.key {
                     if let Some(always) = always_key(key) {
                         self.remember_always(&always);
                     }
                 } else if let Some(detail) = &pending.detail {
                     self.remember_always_custom(&pending.tool, detail);
+                }
+            } else if decision == Decision::AllowForSession {
+                if let Some(mut rule) = custom_rule {
+                    if rule.workspace.is_empty() {
+                        rule.workspace = self.workspace_key();
+                    }
+                    self.inner.session_rules.borrow_mut().add(rule);
+                } else if let Some(detail) = &pending.detail {
+                    self.inner
+                        .session_rules
+                        .borrow_mut()
+                        .add(crate::always_allow::Rule::new(
+                            self.workspace_key(),
+                            pending.tool.clone(),
+                            detail.clone(),
+                        ));
                 }
             }
             if let Some(key) = pending.key {
@@ -919,20 +939,17 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         Verdict::Ask => {}
     }
     let ws = inner.workspace_key();
-    let auto_matched = if let Some(always_path) = inner.always.borrow().as_ref() {
-        let rules = crate::always_allow::AlwaysRules::load(always_path);
-        if query.tool == "run_command" {
-            if let Some(cmd) = query
+    let auto_matched = {
+        let cmd = if query.tool == "run_command" {
+            query
                 .args
                 .get("CommandLine")
                 .or_else(|| query.args.get("command"))
                 .and_then(Value::as_str)
-            {
-                rules.matches_any(&ws, "run_command", cmd)
-            } else {
-                false
-            }
-        } else if query.tool == "call_mcp_tool" {
+        } else {
+            None
+        };
+        let mcp_target = if query.tool == "call_mcp_tool" {
             let server = query
                 .args
                 .get("ServerName")
@@ -945,13 +962,40 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
                 .or_else(|| query.args.get("tool"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let target = format!("{server}/{tool}");
-            rules.matches_any(&ws, "call_mcp_tool", &target)
+            Some(format!("{server}/{tool}"))
+        } else {
+            None
+        };
+
+        if let Some(target) = cmd {
+            if inner
+                .session_rules
+                .borrow()
+                .matches_any(&ws, "run_command", target)
+            {
+                true
+            } else if let Some(always_path) = inner.always.borrow().as_ref() {
+                let rules = crate::always_allow::AlwaysRules::load(always_path);
+                rules.matches_any(&ws, "run_command", target)
+            } else {
+                false
+            }
+        } else if let Some(target) = mcp_target.as_deref() {
+            if inner
+                .session_rules
+                .borrow()
+                .matches_any(&ws, "call_mcp_tool", target)
+            {
+                true
+            } else if let Some(always_path) = inner.always.borrow().as_ref() {
+                let rules = crate::always_allow::AlwaysRules::load(always_path);
+                rules.matches_any(&ws, "call_mcp_tool", target)
+            } else {
+                false
+            }
         } else {
             false
         }
-    } else {
-        false
     };
 
     if auto_matched {
@@ -985,10 +1029,11 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     }
 
     let id = query.id.clone();
-    let (remembers, detail) = if query.tool == "run_command" && inner.always.borrow().is_some() {
+    let (remembers, detail) = if query.tool == "run_command" {
         let cmd = query
             .args
             .get("CommandLine")
+            .or_else(|| query.args.get("command"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         const SHELL_SYNTAX: &[&str] = &[";", "&", "|", "`", "$", ">", "<", "\n", "\r"];
@@ -996,7 +1041,12 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
             (None, None)
         } else {
             let cwd = query.cwd.as_deref().unwrap_or_default();
-            (Some(format!("`{cmd}` in {cwd}")), Some(cmd.to_string()))
+            let rem = if inner.always.borrow().is_some() {
+                Some(format!("`{cmd}` in {cwd}"))
+            } else {
+                None
+            };
+            (rem, Some(cmd.to_string()))
         }
     } else {
         let rem = key
@@ -1823,12 +1873,10 @@ mod tests {
                 .into_owned();
             assert_eq!(evil.socket_path().parent(), a.socket_path().parent());
             assert!(name.ends_with("-xyz.sock"), "{name}");
-            assert!(
-                bind("")
-                    .socket_path()
-                    .to_string_lossy()
-                    .ends_with("-t.sock")
-            );
+            assert!(bind("")
+                .socket_path()
+                .to_string_lossy()
+                .ends_with("-t.sock"));
         });
     }
 
@@ -1932,6 +1980,54 @@ mod tests {
             assert_eq!(r2.decision, Decision::Allow);
             // No new card was shown to user!
             assert_eq!(seen2.borrow().len(), 0);
+        });
+    }
+
+    #[test]
+    fn respond_with_rule_session_allows_runners_and_loosened_patterns_in_same_session() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("cargo test --bin foo"), "q_session"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
+
+            // Operator loosens pattern to "cargo *" for this session only.
+            let session_rule = crate::always_allow::Rule::new(
+                "*".to_string(),
+                "run_command".to_string(),
+                "cargo *".to_string(),
+            );
+            assert!(handle.respond_with_rule(
+                "q_session",
+                Decision::AllowForSession,
+                Some(session_rule)
+            ));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowForSession);
+
+            // Subsequent runner command "cargo clippy" in the SAME session auto-approves immediately!
+            let rx2 = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("cargo clippy"), "q_session2"),
+            );
+            let r2 = wait_reply(ctx, &rx2);
+            assert_eq!(r2.decision, Decision::Allow);
+            // No new card was shown!
+            assert_eq!(seen.borrow().len(), 1);
+
+            // But in a fresh session / handle, it is not remembered on disk:
+            drop(handle);
+            let (fresh_handle, fresh_seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let rx3 = client(
+                fresh_handle.socket_path().to_owned(),
+                with_id(cmd("cargo clippy"), "q_fresh"),
+            );
+            assert!(pump_until(ctx, 10, || fresh_seen.borrow().len() == 1));
+            assert!(fresh_handle.respond("q_fresh", Decision::Deny));
+            assert_eq!(wait_reply(ctx, &rx3).decision, Decision::Deny);
         });
     }
 }

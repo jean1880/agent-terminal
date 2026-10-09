@@ -14,7 +14,7 @@ use sourceview5::prelude::*;
 
 use super::difftext::{self, DiffText};
 use super::markdown::{self, Block, TextKind};
-use super::model::{ApprovalState, Body, Item, QuestionState, Tone, ToolStatus, format_tokens};
+use super::model::{format_tokens, ApprovalState, Body, Item, QuestionState, Tone, ToolStatus};
 use super::payload;
 use crate::chat::DiffReply;
 use crate::diff_tool::{self, DiffTools};
@@ -1603,7 +1603,7 @@ impl ApprovalCard {
                 let sink = self.sink.clone();
                 let request = a.request.clone();
                 let popover = popover.clone();
-                if d == Decision::AllowAlways {
+                if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
                     let initial_cmd = match tool.as_str() {
@@ -1640,13 +1640,14 @@ impl ApprovalCard {
                         let confirm = !cfg!(test)
                             && crate::config::TerminalConfig::load().confirm_rule_modification;
                         if confirm && !initial_cmd.is_empty() {
-                            confirm_always_allow(
+                            confirm_approval_rule(
                                 &b_clone,
                                 request.clone(),
                                 tool.clone(),
                                 initial_cmd.clone(),
                                 cwd_str.clone(),
                                 sink.clone(),
+                                d,
                             );
                         } else {
                             sink(RowEvent::Approve {
@@ -1875,21 +1876,32 @@ impl QuestionCardWidget {
     }
 }
 
-fn confirm_always_allow(
+fn confirm_approval_rule(
     parent: &impl IsA<gtk4::Widget>,
     request: String,
     tool: String,
     initial_pattern: String,
     cwd: Option<String>,
     sink: Rc<dyn Fn(RowEvent)>,
+    decision: Decision,
 ) {
-    let dialog = adw::AlertDialog::new(
-        Some("Confirm Auto-Approval Rule"),
-        Some(
+    let (title, subtitle, save_label) = if decision == Decision::AllowForSession {
+        (
+            "Confirm Session Approval Rule",
+            "Modify the pattern below to loosen or tighten what will be approved for the \
+             remainder of this session. Wildcards (* and ?) are supported.",
+            "Save for Session & Allow",
+        )
+    } else {
+        (
+            "Confirm Auto-Approval Rule",
             "Modify the pattern below to loosen or tighten what will be automatically approved \
              in future sessions. Wildcards (* and ?) are supported.",
-        ),
-    );
+            "Save Always & Allow",
+        )
+    };
+
+    let dialog = adw::AlertDialog::new(Some(title), Some(subtitle));
 
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     content_box.set_margin_top(8);
@@ -1953,11 +1965,20 @@ fn confirm_always_allow(
     content_box.append(&caption);
 
     dialog.set_extra_child(Some(&content_box));
-    dialog.add_responses(&[
-        ("cancel", "Cancel"),
-        ("allow_once", "Allow Once"),
-        ("save", "Save Rule & Allow"),
-    ]);
+    if decision == Decision::AllowAlways {
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("allow_once", "Allow Once"),
+            ("save_session", "Save for Session"),
+            ("save", save_label),
+        ]);
+    } else {
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("allow_once", "Allow Once"),
+            ("save", save_label),
+        ]);
+    }
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("save"));
     dialog.set_close_response("cancel");
@@ -1985,7 +2006,26 @@ fn confirm_always_allow(
                 let rule = crate::always_allow::Rule::new(workspace, t, pattern);
                 sink(RowEvent::Approve {
                     request: req,
-                    decision: Decision::AllowAlways,
+                    decision,
+                    custom_rule: Some(rule),
+                });
+            }
+            "save_session" => {
+                let user_pattern = entry.text().trim().to_string();
+                let pattern = if user_pattern.is_empty() {
+                    initial_pattern
+                } else {
+                    user_pattern
+                };
+                let workspace = if global_check.is_active() {
+                    "*".to_string()
+                } else {
+                    c.unwrap_or_default()
+                };
+                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
+                sink(RowEvent::Approve {
+                    request: req,
+                    decision: Decision::AllowForSession,
                     custom_rule: Some(rule),
                 });
             }
@@ -2100,6 +2140,15 @@ pub(crate) mod tests {
         always.emit_clicked();
         assert!(
             matches!(events.borrow().last(), Some(RowEvent::Approve { request, decision: Decision::AllowAlways, .. }) if request == "approval")
+        );
+        let session_btn = always
+            .next_sibling()
+            .expect("session allow")
+            .downcast::<gtk4::Button>()
+            .expect("grant");
+        session_btn.emit_clicked();
+        assert!(
+            matches!(events.borrow().last(), Some(RowEvent::Approve { request, decision: Decision::AllowForSession, .. }) if request == "approval")
         );
         assert!(
             approval

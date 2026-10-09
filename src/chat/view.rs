@@ -40,7 +40,7 @@ use std::rc::{Rc, Weak};
 
 use adw::subclass::prelude::*;
 use agent_core::adapter::{Control, Driver, Mode};
-use agent_core::commands::{BuiltinAction, Trigger, builtins, compact_text};
+use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
 use agent_core::event::Event;
 use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;

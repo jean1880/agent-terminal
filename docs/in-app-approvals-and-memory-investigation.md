@@ -102,6 +102,18 @@ This document captures the forensic findings and technical implementation detail
 - Added auto-approval onboarding rows to `setup_agents_page`.
 - Enabled by default for seamless workflow, with clear Canadian English copy explaining how it works and warning of broad wildcard risks.
 
+### 3.3 Session-Scoped Pattern Auto-Approvals (`Decision::AllowForSession`)
+
+- **The Problem with Runners in Session Scope**: Previously, `session_key` checked `rememberable_command(command)`. For runners (`cargo`, `make`, `npm`, `python`), `rememberable_command` returned `false`. Consequently, `session_key` returned `None`, `pending.key` was `None`, and `inner.allowed.insert(key)` did nothing. Every subsequent runner invocation in the same session re-prompted the operator.
+- **In-Memory Session Engine (`session_rules`)**: Both `ApprovalServer` (for AGY/Claude) and `ChatSession` (for Codex) maintain an in-memory `session_rules: RefCell<AlwaysRules>` instance:
+  - When an approval request arrives, `session_rules.matches_any(&ws, &query.tool, &target)` is evaluated first.
+  - When `Decision::AllowForSession` is selected, the rule (either exact command or custom loosened pattern from the dialogue) is added to `session_rules`.
+  - Runners (`cargo`, `make`, etc.) now work seamlessly under session scope without repeated prompts.
+- **Interactive Session Confirmation Dialogue**:
+  - `confirm_always_allow` was generalised to `confirm_approval_rule`.
+  - Clicking "Allow for this session" opens an `adw::AlertDialog` titled `"Confirm Session Approval Rule"` with preset loosening chips (`first *`, `first second *`) and action `"Save for Session & Allow"`.
+  - Clicking "Always allow" opens `"Confirm Auto-Approval Rule"` and also exposes a `"Save for Session"` choice.
+
 ---
 
 ## 4. Verification & Quality Gates

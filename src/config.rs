@@ -1466,11 +1466,9 @@ mod tests {
     #[test]
     fn a_missing_session_file_is_an_empty_session() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            SessionState::load_from(&dir.path().join("none.json"))
-                .tabs
-                .is_empty()
-        );
+        assert!(SessionState::load_from(&dir.path().join("none.json"))
+            .tabs
+            .is_empty());
     }
 
     #[test]
@@ -1717,11 +1715,9 @@ mod tests {
 
         // Saving a config without a tool writes no key (older builds read it unchanged).
         old.save_to(&path);
-        assert!(
-            !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("diff_tool")
-        );
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("diff_tool"));
 
         let mut config = TerminalConfig::load_from(&path);
         config.diff_tool = Some(DiffTool {
@@ -2110,11 +2106,9 @@ mod tests {
         config.save_to(&path);
         let copies = kept_copies(dir.path(), "external");
         assert_eq!(copies.len(), 1, "{copies:?}");
-        assert!(
-            std::fs::read_to_string(dir.path().join(&copies[0]))
-                .unwrap()
-                .contains("1234")
-        );
+        assert!(std::fs::read_to_string(dir.path().join(&copies[0]))
+            .unwrap()
+            .contains("1234"));
 
         // Nothing changed since that save, so the next one keeps nothing more.
         config.save_to(&path);
