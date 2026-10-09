@@ -455,7 +455,11 @@ impl Composer {
         };
         let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
         let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-        if !(shift || ctrl) {
+        let meta = state.contains(gdk::ModifierType::META_MASK)
+            || state.contains(gdk::ModifierType::SUPER_MASK)
+            || state.contains(gdk::ModifierType::ALT_MASK);
+        let modified = shift || ctrl || meta;
+        if !modified {
             let token = self.current_token();
             let outcome = self.popup.borrow_mut().key(key, &token);
             match outcome {
@@ -475,7 +479,7 @@ impl Composer {
             }
         }
         match key {
-            Key::Up | Key::Down if !(shift || ctrl) && !self.text().contains('\n') => {
+            Key::Up | Key::Down if !modified && !self.text().contains('\n') => {
                 let current = self.text();
                 let recalled = match key {
                     Key::Up => self
@@ -492,7 +496,7 @@ impl Composer {
                 }
                 glib::Propagation::Proceed
             }
-            Key::Enter if !shift => {
+            Key::Enter if !shift && !ctrl && !meta => {
                 self.submit();
                 glib::Propagation::Stop
             }
