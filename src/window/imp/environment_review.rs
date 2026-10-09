@@ -98,6 +98,7 @@ impl AgentTerminalWindow {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use std::{cell::Cell, rc::Rc};
 
     pub(in crate::window::imp) fn confirmation_preserves_target(
         window: &super::super::super::AgentTerminalWindow,
@@ -133,6 +134,11 @@ pub(super) mod tests {
             ..NewThread::new(Driver::Claude)
         });
         let before = imp.tabs.borrow().len();
+        // Libadwaita 1.5 opens its embedded sheet on the second mapped frame. Merely
+        // appearing in visible_dialog() does not prove it has opened; closing an unmapped
+        // sheet can otherwise leave it registered forever in this construction test.
+        window.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window.is_mapped()));
         let trigger = || {
             let target =
                 crate::window::sidebar_model::ThreadAction::ReviewEnvironment(thread.clone())
@@ -144,15 +150,34 @@ pub(super) mod tests {
             assert!(crate::testutil::pump_until(&ctx, 5, || window
                 .visible_dialog()
                 .is_some()));
-            window
+            let dialog = window
                 .visible_dialog()
                 .unwrap()
                 .downcast::<adw::AlertDialog>()
-                .unwrap()
+                .unwrap();
+            let frames = Rc::new(Cell::new(0));
+            dialog.add_tick_callback({
+                let frames = frames.clone();
+                move |_, _| {
+                    frames.set(frames.get() + 1);
+                    if frames.get() >= 3 {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                }
+            });
+            assert!(crate::testutil::pump_until(&ctx, 5, || {
+                dialog.is_mapped() && frames.get() >= 3
+            }));
+            dialog
         };
         let cancel = trigger();
         assert!(cancel.body().contains(&dir));
-        cancel.close();
+        assert!(
+            cancel.close(),
+            "the review confirmation allows cancellation"
+        );
         assert!(crate::testutil::pump_until(&ctx, 5, || window
             .visible_dialog()
             .is_none()));
