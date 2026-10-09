@@ -40,7 +40,7 @@ use std::rc::{Rc, Weak};
 
 use adw::subclass::prelude::*;
 use agent_core::adapter::{Control, Driver, Mode};
-use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
+use agent_core::commands::{BuiltinAction, Trigger, builtins, compact_text};
 use agent_core::event::Event;
 use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
@@ -775,13 +775,18 @@ impl Inner {
                     self.queue_flush();
                 }
             }
-            RowEvent::Approve { request, decision } => {
+            RowEvent::Approve {
+                request,
+                decision,
+                custom_rule,
+            } => {
                 let changes = self
                     .model
                     .borrow_mut()
                     .mark_approval_sent(&request, decision);
                 self.handle(changes);
-                self.backend.respond_approval(&request, decision);
+                self.backend
+                    .respond_approval_with_rule(&request, decision, custom_rule);
                 // The decision is made: typing goes back to the composer, not the spent card.
                 self.composer.grab_focus();
             }

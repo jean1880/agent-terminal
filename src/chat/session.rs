@@ -22,18 +22,18 @@ use agent_core::adapter::{
 use agent_core::catalog::Replacement;
 use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind, TurnState};
 use agent_core::handoff_budget::{
-    handoff_budget, handoff_coverage, provider_message_with_handoff, render_history,
-    select_history, HistoricalMessage, Role, DEFAULT_HANDOFF_TOKEN_CAP,
+    DEFAULT_HANDOFF_TOKEN_CAP, HistoricalMessage, Role, handoff_budget, handoff_coverage,
+    provider_message_with_handoff, render_history, select_history,
 };
 use agent_core::transition::{
-    decide_transition, plan_selection, ModelSelection, SessionState, Transition,
+    ModelSelection, SessionState, Transition, decide_transition, plan_selection,
 };
 use agent_kit::store::{ProviderThreadId, Store, ThreadId, TranscriptMessage};
 use gtk4::glib;
 use tracing::{debug, info, warn};
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
-use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
+use crate::agent_proc::{AGY_TIMEOUT, AgentEnv, AgentProcess, SpawnSpec, run_side};
 use crate::approval_server::ApprovalHandle;
 
 /// Process environment the adapter does not own: what the agent's profile adds (its env file)
@@ -874,9 +874,10 @@ impl Inner {
                 .to_string_lossy()
                 .into_owned();
             let matching_keys = rules.keys_for(&workspace);
-            if matching_keys
-                .iter()
-                .any(|(t, d)| t == &tool_key && d == &detail)
+            if rules.matches_any(&workspace, &tool_key, command)
+                || matching_keys
+                    .iter()
+                    .any(|(t, d)| t == &tool_key && d == &detail)
             {
                 info!(command = %command, "auto-approving remembered Codex command");
                 let weak = Rc::downgrade(self);
@@ -1270,8 +1271,17 @@ impl Inner {
     }
 
     fn respond_approval(self: &Rc<Self>, request: &str, decision: Decision) {
+        self.respond_approval_with_rule(request, decision, None);
+    }
+
+    fn respond_approval_with_rule(
+        self: &Rc<Self>,
+        request: &str,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+    ) {
         if let Some(handle) = self.approval() {
-            if handle.respond(request, decision) {
+            if handle.respond_with_rule(request, decision, custom_rule.clone()) {
                 self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
                 return;
             }
@@ -1281,20 +1291,29 @@ impl Inner {
             {
                 if let Some(path) = crate::always_allow::path() {
                     let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                    let open_cwd = self.open.borrow().cwd.clone();
-                    let workspace = std::fs::canonicalize(Path::new(&open_cwd))
-                        .unwrap_or_else(|_| PathBuf::from(&open_cwd))
-                        .to_string_lossy()
-                        .into_owned();
-                    let added = rules.add(crate::always_allow::Rule {
-                        workspace,
-                        tool: tool.clone(),
-                        detail,
-                    });
+                    let rule_to_save = if let Some(mut r) = custom_rule {
+                        if r.workspace.is_empty() {
+                            let open_cwd = self.open.borrow().cwd.clone();
+                            r.workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                                .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                                .to_string_lossy()
+                                .into_owned();
+                        }
+                        r
+                    } else {
+                        let open_cwd = self.open.borrow().cwd.clone();
+                        let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                            .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                            .to_string_lossy()
+                            .into_owned();
+                        crate::always_allow::Rule::new(workspace, tool.clone(), detail)
+                    };
+                    let tool_name = rule_to_save.tool.clone();
+                    let added = rules.add(rule_to_save);
                     if added {
                         match rules.save(&path) {
                             Ok(()) => {
-                                info!(tool = %tool, "remembered an always-allow rule for Codex")
+                                info!(tool = %tool_name, "remembered an always-allow rule for Codex")
                             }
                             Err(e) => {
                                 warn!(error = %e, "could not save the always-allow rule for Codex")
@@ -1959,6 +1978,16 @@ impl ChatBackend for ChatSession {
         self.inner.respond_approval(request, decision);
     }
 
+    fn respond_approval_with_rule(
+        &self,
+        request: &str,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+    ) {
+        self.inner
+            .respond_approval_with_rule(request, decision, custom_rule);
+    }
+
     fn answer_questions(&self, request: &str, answers: serde_json::Value) {
         self.inner.command(Command::Answer {
             request: request.to_owned(),
@@ -2162,12 +2191,16 @@ mod tests {
             assert_eq!(pts.len(), 1);
             assert_eq!(pts[0].native_id.as_deref(), Some(CONVERSATION));
             let stored = store.events(&thread, None, 1000).expect("events");
-            assert!(stored
-                .iter()
-                .any(|(_, e)| matches!(e.event, Event::TurnCompleted { .. })));
-            assert!(stored
-                .iter()
-                .all(|(_, e)| !matches!(e.event, Event::Unknown) || e.raw.is_some()));
+            assert!(
+                stored
+                    .iter()
+                    .any(|(_, e)| matches!(e.event, Event::TurnCompleted { .. }))
+            );
+            assert!(
+                stored
+                    .iter()
+                    .all(|(_, e)| !matches!(e.event, Event::Unknown) || e.raw.is_some())
+            );
             let msgs = store.transcript_messages(&thread).expect("msgs");
             assert_eq!(msgs[0].text, "add multiply");
 
@@ -2185,9 +2218,10 @@ mod tests {
                 "{args:?}"
             );
             assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
-            assert!(args
-                .iter()
-                .all(|a| !a.contains("--dangerously-skip-permissions")));
+            assert!(
+                args.iter()
+                    .all(|a| !a.contains("--dangerously-skip-permissions"))
+            );
         });
     }
 
@@ -2312,10 +2346,11 @@ mod tests {
             session.set_retired(Some(retired("old", "sonnet")));
             session.switch(Driver::Claude, Some("opus".into()), None);
             session.send_prompt("hi");
-            assert!(!log
-                .borrow()
-                .iter()
-                .any(|c| matches!(c, Command::SetModel { model, .. } if model == "sonnet")));
+            assert!(
+                !log.borrow()
+                    .iter()
+                    .any(|c| matches!(c, Command::SetModel { model, .. } if model == "sonnet"))
+            );
             assert!(!has(&seen, |e| matches!(e, Event::Notice { text }
                 if text.contains("was retired"))));
         });
@@ -2379,10 +2414,11 @@ mod tests {
                 Some(handle.clone()),
             );
             let spec = session.launch_spec();
-            assert!(spec
-                .argv
-                .iter()
-                .any(|a| a == "--dangerously-skip-permissions"));
+            assert!(
+                spec.argv
+                    .iter()
+                    .any(|a| a == "--dangerously-skip-permissions")
+            );
             let env: std::collections::HashMap<_, _> = spec.env.iter().cloned().collect();
             let socket = env
                 .get("AGENT_TERMINAL_APPROVAL_SOCKET")
@@ -2433,10 +2469,12 @@ mod tests {
             );
             let spec = session.launch_spec();
             assert!(spec.env.is_empty());
-            assert!(!spec
-                .argv
-                .iter()
-                .any(|a| a == "--dangerously-skip-permissions"));
+            assert!(
+                !spec
+                    .argv
+                    .iter()
+                    .any(|a| a == "--dangerously-skip-permissions")
+            );
             assert!(spec.argv.windows(2).any(|w| w == ["--mode", "plan"]));
             session.send_prompt("go");
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
@@ -2718,9 +2756,11 @@ mod tests {
                 })
                 .collect();
             assert_eq!(completed, vec![(TurnState::Interrupted, None)]);
-            assert!(stored
-                .iter()
-                .any(|(_, e)| matches!(e.event, Event::SessionExited { .. })));
+            assert!(
+                stored
+                    .iter()
+                    .any(|(_, e)| matches!(e.event, Event::SessionExited { .. }))
+            );
             assert!(has(&seen, |e| matches!(e, Event::SessionExited { .. })));
             assert!(!session.status().alive && !session.status().running_turn);
             // A second call finds nothing to stop and writes nothing more.
@@ -2931,10 +2971,11 @@ mod tests {
             assert_eq!(spec.argv[0], "/bin/true");
             assert!(spec.argv.contains(&"--profile-arg".to_owned()));
             assert!(!spec.argv.contains(&"--agy-only".to_owned()));
-            assert!(spec
-                .argv
-                .windows(2)
-                .any(|w| w == ["--model", "claude-sonnet-5-5"]));
+            assert!(
+                spec.argv
+                    .windows(2)
+                    .any(|w| w == ["--model", "claude-sonnet-5-5"])
+            );
             assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
             assert!(spec.unset.contains(&"CLAUDECODE".to_owned()));
             assert_eq!(session.status().model, None);
@@ -2953,10 +2994,11 @@ mod tests {
             session.switch(Driver::Agy, Some("gemini-3.1-pro-high".into()), None);
             session.switch(Driver::Claude, Some("claude-opus-5-5".into()), None);
             let spec = session.launch_spec();
-            assert!(spec
-                .argv
-                .windows(2)
-                .any(|w| w == ["--model", "claude-opus-5-5"]));
+            assert!(
+                spec.argv
+                    .windows(2)
+                    .any(|w| w == ["--model", "claude-opus-5-5"])
+            );
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChangeRequested { model } if model == "claude-opus-5-5")

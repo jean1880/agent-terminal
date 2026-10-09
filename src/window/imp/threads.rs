@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
-use agent_core::catalog::{model_notice, ModelNotice};
+use agent_core::catalog::{ModelNotice, model_notice};
 use agent_core::event::{BackgroundTask, Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
 
@@ -23,21 +23,21 @@ use crate::account_status::AccountStatus;
 use crate::agent_proc::AgentEnv;
 use crate::approval_server::ApprovalHandle;
 use crate::availability::{
-    classify, probe_targets, unavailable_banner, AgentAvailability, Availability,
+    AgentAvailability, Availability, classify, probe_targets, unavailable_banner,
 };
 use crate::chat::session::{
-    build_handoff, retired_notice, AgentLaunch, Approval, ChatSession, LaunchEnv, RetiredModel,
+    AgentLaunch, Approval, ChatSession, LaunchEnv, RetiredModel, build_handoff, retired_notice,
 };
 use crate::chat::view::usage::UsageIndicator;
 use crate::chat::view::{ChatView, ViewAction};
 use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
-use crate::config::{profile_driver, Profile};
-use crate::model_catalog::{retirement_banner, ModelCatalog};
+use crate::config::{Profile, profile_driver};
+use crate::model_catalog::{ModelCatalog, retirement_banner};
 use crate::window::sidebar_model::{
-    badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, group_rows,
-    held_finish_due, is_busy, needs_attention, parse_driver, react, relative_time, resume_as,
-    row_tooltip, safe_handoff_target, stop_heading, stored_model, thread_title,
-    turn_finishes_thread, Attention, Badge, ResumeAs, RowKey, SidebarRow,
+    Attention, Badge, ResumeAs, RowKey, SidebarRow, badge_for, continue_label, driver_key,
+    driver_label, forbids_unasked_edits, group_rows, held_finish_due, is_busy, needs_attention,
+    parse_driver, react, relative_time, resume_as, row_tooltip, safe_handoff_target, stop_heading,
+    stored_model, thread_title, turn_finishes_thread,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -194,6 +194,16 @@ impl ChatBackend for SessionSlot {
     fn respond_approval(&self, request: &str, decision: Decision) {
         if let Some(s) = self.get() {
             s.respond_approval(request, decision);
+        }
+    }
+    fn respond_approval_with_rule(
+        &self,
+        request: &str,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+    ) {
+        if let Some(s) = self.get() {
+            s.respond_approval_with_rule(request, decision, custom_rule);
         }
     }
     fn answer_questions(&self, request: &str, answers: serde_json::Value) {
@@ -4485,9 +4495,11 @@ pub(super) mod tests {
     fn unset_list_always_drops_an_inherited_approval_socket() {
         let names = unset_list(&[]);
         assert!(names.iter().any(|n| n == agent_core::approval::ENV_SOCKET));
-        assert!(names
-            .iter()
-            .any(|n| n == crate::approval_server::ENV_HOOK_BIN));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == crate::approval_server::ENV_HOOK_BIN)
+        );
     }
 
     #[test]
@@ -4552,9 +4564,11 @@ pub(super) mod tests {
     fn an_unchecked_hook_fails_closed_and_says_it_is_not_checked_yet() {
         HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
         let before = cached_hook_verdict();
-        assert!(before
-            .as_ref()
-            .is_err_and(|e| e.contains("not been checked")));
+        assert!(
+            before
+                .as_ref()
+                .is_err_and(|e| e.contains("not been checked"))
+        );
         // It stays closed through the binding: no socket, so agy runs without the skip flag.
         // But the notice says the hook is not checked yet, not that it is missing.
         assert!(matches!(

@@ -22,6 +22,15 @@ pub trait ChatBackend {
     fn send_prompt(&self, text: &str);
     fn interrupt(&self);
     fn respond_approval(&self, request: &str, decision: Decision);
+    fn respond_approval_with_rule(
+        &self,
+        request: &str,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+    ) {
+        let _ = custom_rule;
+        self.respond_approval(request, decision);
+    }
     fn answer_questions(&self, request: &str, answers: serde_json::Value);
     /// Switch model and/or agent. Same agent: in-session or restart per capabilities;
     /// other agent: budgeted, redacted handoff into a new provider thread.

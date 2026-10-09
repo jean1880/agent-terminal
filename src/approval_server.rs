@@ -431,6 +431,8 @@ type Sink = Rc<dyn Fn(Envelope)>;
 struct Pending {
     conn: gio::SocketConnection,
     key: Option<(String, String)>,
+    tool: String,
+    detail: Option<String>,
 }
 
 struct ServerInner {
@@ -501,7 +503,13 @@ impl ApprovalHandle {
     /// workspace's remembered rules as already allowed (an exact match, like the session's).
     /// The file is a few rules of JSON; reading it is not worth a worker.
     pub fn use_always_rules(&self, path: PathBuf) {
-        let rules = crate::always_allow::AlwaysRules::load(&path);
+        let mut rules = crate::always_allow::AlwaysRules::load(&path);
+        if rules.rules.is_empty() {
+            let imported = rules.import_agent_permissions(None);
+            if imported > 0 {
+                let _ = rules.save(&path);
+            }
+        }
         // Only kinds "Always" may keep, whatever a hand-edited file says.
         self.inner.allowed.borrow_mut().extend(
             rules
@@ -515,16 +523,7 @@ impl ApprovalHandle {
     /// The workspace as rules name it: its real path, so a symlink re-pointed later does not
     /// carry old rules to another folder.
     fn workspace_key(&self) -> String {
-        self.inner
-            .workspaces
-            .first()
-            .map(|w| {
-                std::fs::canonicalize(w)
-                    .unwrap_or_else(|_| w.clone())
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_default()
+        self.inner.workspace_key()
     }
 
     /// Binds `dir/approval-<pid>-<thread>.sock`. `workspace` bounds `AcceptEdits` auto-allows.
@@ -702,18 +701,32 @@ impl ApprovalHandle {
         self.inner.pending.borrow().contains_key(request)
     }
 
-    /// Answers a pending request. False when it is not (or no longer) pending.
-    pub fn respond(&self, request: &str, decision: Decision) -> bool {
+    /// Answers a pending request, optionally saving a custom rule for AllowAlways.
+    pub fn respond_with_rule(
+        &self,
+        request: &str,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+    ) -> bool {
         let Some(pending) = self.inner.pending.borrow_mut().remove(request) else {
             return false;
         };
         if matches!(decision, Decision::AllowForSession | Decision::AllowAlways) {
-            if let Some(key) = pending.key {
-                if decision == Decision::AllowAlways {
-                    if let Some(always) = always_key(&key) {
+            if decision == Decision::AllowAlways {
+                if let Some(mut rule) = custom_rule {
+                    if rule.workspace.is_empty() {
+                        rule.workspace = self.workspace_key();
+                    }
+                    self.save_custom_rule(rule);
+                } else if let Some(key) = &pending.key {
+                    if let Some(always) = always_key(key) {
                         self.remember_always(&always);
                     }
+                } else if let Some(detail) = &pending.detail {
+                    self.remember_always_custom(&pending.tool, detail);
                 }
+            }
+            if let Some(key) = pending.key {
                 self.inner.allowed.borrow_mut().insert(key);
             }
         }
@@ -727,27 +740,45 @@ impl ApprovalHandle {
         true
     }
 
+    /// Answers a pending request. False when it is not (or no longer) pending.
+    #[allow(dead_code)]
+    pub fn respond(&self, request: &str, decision: Decision) -> bool {
+        self.respond_with_rule(request, decision, None)
+    }
+
+    fn save_custom_rule(&self, rule: crate::always_allow::Rule) {
+        let Some(path) = self.inner.always.borrow().clone() else {
+            return;
+        };
+        let mut rules = crate::always_allow::AlwaysRules::load(&path);
+        let tool = rule.tool.clone();
+        let detail = rule.detail.clone();
+        let added = rules.add(rule);
+        if added {
+            match rules.save(&path) {
+                Ok(()) => {
+                    info!(tool = %tool, detail = %detail, "remembered custom always-allow rule")
+                }
+                Err(e) => warn!(error = %e, "could not save custom always-allow rule"),
+            }
+        }
+    }
+
+    fn remember_always_custom(&self, tool: &str, detail: &str) {
+        self.save_custom_rule(crate::always_allow::Rule::new(
+            self.workspace_key(),
+            tool.to_string(),
+            detail.to_string(),
+        ));
+    }
+
     /// Adds `key` to this workspace's "Always allow" rules on disk. A failed write is logged:
     /// the call is still allowed, and the rule still holds for this session.
     ///
     /// Load, add, save with no lock: two sessions remembering at the same instant can lose one
     /// rule, and the cost is being asked again.
     fn remember_always(&self, (tool, detail): &(String, String)) {
-        let Some(path) = self.inner.always.borrow().clone() else {
-            return;
-        };
-        let mut rules = crate::always_allow::AlwaysRules::load(&path);
-        let added = rules.add(crate::always_allow::Rule {
-            workspace: self.workspace_key(),
-            tool: tool.clone(),
-            detail: detail.clone(),
-        });
-        if added {
-            match rules.save(&path) {
-                Ok(()) => info!(tool = %tool, "remembered an always-allow rule"),
-                Err(e) => warn!(error = %e, "could not save the always-allow rule"),
-            }
-        }
+        self.remember_always_custom(tool, detail);
     }
 
     /// Denies and expires everything still pending (the agent exited or restarted).
@@ -768,6 +799,18 @@ impl ApprovalHandle {
 }
 
 impl ServerInner {
+    fn workspace_key(&self) -> String {
+        self.workspaces
+            .first()
+            .map(|w| {
+                std::fs::canonicalize(w)
+                    .unwrap_or_else(|_| w.clone())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default()
+    }
+
     fn emit(&self, env: Envelope) {
         let sink = self.sink.borrow().clone();
         if let Some(sink) = sink {
@@ -870,10 +913,56 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
                     decision: Decision::Allow,
                     reason: None,
                 },
-            )
+            );
         }
         Verdict::Deny(why) => return deny(conn, why),
         Verdict::Ask => {}
+    }
+    let ws = inner.workspace_key();
+    let auto_matched = if let Some(always_path) = inner.always.borrow().as_ref() {
+        let rules = crate::always_allow::AlwaysRules::load(always_path);
+        if query.tool == "run_command" {
+            if let Some(cmd) = query
+                .args
+                .get("CommandLine")
+                .or_else(|| query.args.get("command"))
+                .and_then(Value::as_str)
+            {
+                rules.matches_any(&ws, "run_command", cmd)
+            } else {
+                false
+            }
+        } else if query.tool == "call_mcp_tool" {
+            let server = query
+                .args
+                .get("ServerName")
+                .or_else(|| query.args.get("server"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let tool = query
+                .args
+                .get("ToolName")
+                .or_else(|| query.args.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let target = format!("{server}/{tool}");
+            rules.matches_any(&ws, "call_mcp_tool", &target)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if auto_matched {
+        info!(tool = %query.tool, "auto-approving action matching pattern rules");
+        return reply(
+            conn,
+            ApprovalReply {
+                decision: Decision::Allow,
+                reason: None,
+            },
+        );
     }
     let key = session_key(&query);
     if key
@@ -896,16 +985,31 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     }
 
     let id = query.id.clone();
-    // "Always" only where rules are kept, and only for what stays exact forever (see
-    // `always_key`): the card says precisely what would be saved.
-    let remembers = key
-        .as_ref()
-        .filter(|_| inner.always.borrow().is_some())
-        .and_then(always_key)
-        .map(|(_, detail)| match detail.split_once('\n') {
-            Some((cwd, command)) => format!("`{command}` in {cwd}"),
-            None => detail,
-        });
+    let (remembers, detail) = if query.tool == "run_command" && inner.always.borrow().is_some() {
+        let cmd = query
+            .args
+            .get("CommandLine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        const SHELL_SYNTAX: &[&str] = &[";", "&", "|", "`", "$", ">", "<", "\n", "\r"];
+        if SHELL_SYNTAX.iter().any(|c| cmd.contains(c)) {
+            (None, None)
+        } else {
+            let cwd = query.cwd.as_deref().unwrap_or_default();
+            (Some(format!("`{cmd}` in {cwd}")), Some(cmd.to_string()))
+        }
+    } else {
+        let rem = key
+            .as_ref()
+            .filter(|_| inner.always.borrow().is_some())
+            .and_then(always_key)
+            .map(|(_, detail)| match detail.split_once('\n') {
+                Some((cwd, command)) => format!("`{command}` in {cwd}"),
+                None => detail.clone(),
+            });
+        let det = key.as_ref().map(|(_, d)| d.clone());
+        (rem, det)
+    };
     let mut options = vec![Decision::Allow, Decision::AllowForSession];
     if remembers.is_some() {
         options.push(Decision::AllowAlways);
@@ -917,6 +1021,8 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         Pending {
             conn: conn.clone(),
             key,
+            tool: query.tool.clone(),
+            detail,
         },
     );
     let title = query
@@ -1505,6 +1611,45 @@ mod tests {
     }
 
     #[test]
+    fn pattern_rules_auto_approve_without_asking_user() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let rules_path = tmp.path().join("always-allow.json");
+            let mut rules = crate::always_allow::AlwaysRules::default();
+            rules.add(crate::always_allow::Rule::with_kind(
+                "*",
+                "run_command",
+                "cargo test*",
+                crate::always_allow::PatternKind::Wildcard,
+            ));
+            rules.save(&rules_path).expect("save");
+
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            handle.use_always_rules(rules_path);
+
+            // A command matching the pattern is auto-approved without emitting a card:
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("cargo test --workspace"), "p1"),
+            );
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+            assert!(
+                seen.borrow().is_empty(),
+                "no approval requested card for auto-approved pattern"
+            );
+
+            // A command not matching the pattern asks for approval:
+            let rx2 = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("cargo build"), "p2"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
+            assert!(handle.respond("p2", Decision::Deny));
+            assert_eq!(wait_reply(ctx, &rx2).decision, Decision::Deny);
+        });
+    }
+
+    #[test]
     fn round_trip_then_session_memory_then_socket_removal() {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
@@ -1678,10 +1823,12 @@ mod tests {
                 .into_owned();
             assert_eq!(evil.socket_path().parent(), a.socket_path().parent());
             assert!(name.ends_with("-xyz.sock"), "{name}");
-            assert!(bind("")
-                .socket_path()
-                .to_string_lossy()
-                .ends_with("-t.sock"));
+            assert!(
+                bind("")
+                    .socket_path()
+                    .to_string_lossy()
+                    .ends_with("-t.sock")
+            );
         });
     }
 
@@ -1747,6 +1894,44 @@ mod tests {
             });
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
             assert!(seen.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn respond_with_rule_saves_custom_wildcard_rule_and_auto_approves_later() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let rules = tmp.path().join("always.json");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            handle.use_always_rules(rules.clone());
+
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("cargo test --bin foo"), "q_custom"),
+            );
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
+
+            // User modifies pattern to "cargo test*" with global workspace ("*")
+            let custom_rule = crate::always_allow::Rule::new(
+                "*".to_string(),
+                "run_command".to_string(),
+                "cargo test*".to_string(),
+            );
+            assert!(handle.respond_with_rule("q_custom", Decision::AllowAlways, Some(custom_rule)));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
+
+            // Next request for "cargo test --bin bar" in a brand new session/handle should auto-approve without asking!
+            drop(handle);
+            let (again, seen2) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            again.use_always_rules(rules.clone());
+            let rx2 = client(
+                again.socket_path().to_owned(),
+                with_id(cmd("cargo test --bin bar"), "q_auto"),
+            );
+            let r2 = wait_reply(ctx, &rx2);
+            assert_eq!(r2.decision, Decision::Allow);
+            // No new card was shown to user!
+            assert_eq!(seen2.borrow().len(), 0);
         });
     }
 }

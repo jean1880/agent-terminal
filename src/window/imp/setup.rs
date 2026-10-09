@@ -120,6 +120,59 @@ impl AgentTerminalWindow {
         threads.add(&self.default_agent_row());
         page.add(&threads);
 
+        let approvals = adw::PreferencesGroup::builder()
+            .title("In-App Approvals & Pattern Matching")
+            .description(
+                "Agent Terminal can manage approvals directly within the app, automatically \
+                 permitting commands and tools that match saved pattern rules (e.g. 'cargo test*') \
+                 without blocking on modal prompts.",
+            )
+            .build();
+        let obj = self.obj();
+        let auto_approve_row = adw::SwitchRow::builder()
+            .title("Automatic Pattern Approvals")
+            .subtitle(
+                "Auto-approve matched commands. On by default for smooth operation, but broad \
+                 wildcards carry the risk of running commands without review.",
+            )
+            .active(self.config.borrow().pattern_auto_approval)
+            .build();
+        auto_approve_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                let active = row.is_active();
+                if imp.config.borrow().pattern_auto_approval != active {
+                    imp.config.borrow_mut().pattern_auto_approval = active;
+                    imp.schedule_config_save();
+                }
+            }
+        ));
+        approvals.add(&auto_approve_row);
+
+        let confirm_row = adw::SwitchRow::builder()
+            .title("Confirm & Customise Patterns on Save")
+            .subtitle(
+                "Show a confirmation dialogue to loosen or tighten patterns when choosing 'Always allow'.",
+            )
+            .active(self.config.borrow().confirm_rule_modification)
+            .build();
+        confirm_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                let active = row.is_active();
+                if imp.config.borrow().confirm_rule_modification != active {
+                    imp.config.borrow_mut().confirm_rule_modification = active;
+                    imp.schedule_config_save();
+                }
+            }
+        ));
+        approvals.add(&confirm_row);
+        page.add(&approvals);
+
         let done = Button::builder()
             .label("Done")
             .halign(Align::Center)

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use agent_core::event::{Decision, ItemKind};
 use gtk4::prelude::*;
 
-use super::cards::{decision_label, label, RowEvent, RowSink};
+use super::cards::{RowEvent, RowSink, decision_label, label};
 use super::model::{PendingInterruption, Transcript};
 use super::payload;
 
@@ -113,6 +113,7 @@ impl InterruptionShelf {
                     sink(RowEvent::Approve {
                         request,
                         decision: Decision::Allow,
+                        custom_rule: None,
                     });
                 }
             });
@@ -137,7 +138,11 @@ impl InterruptionShelf {
                     _ => None,
                 };
                 if let Some((request, decision)) = answer {
-                    sink(RowEvent::Approve { request, decision });
+                    sink(RowEvent::Approve {
+                        request,
+                        decision,
+                        custom_rule: None,
+                    });
                 }
             });
         }
@@ -259,7 +264,11 @@ impl InterruptionShelf {
                             _ => None,
                         };
                         if let Some(request) = request {
-                            sink(RowEvent::Approve { request, decision });
+                            sink(RowEvent::Approve {
+                                request,
+                                decision,
+                                custom_rule: None,
+                            });
                         }
                     });
                     self.more_box.append(&b);

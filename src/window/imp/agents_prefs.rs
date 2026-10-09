@@ -48,8 +48,7 @@ const COMMAND_HELP: &str =
     "The agent's command name (found on PATH) or the full path to its binary";
 const ARGS_HELP: &str =
     "Arguments added to every launch of this agent, quoted as in a shell (e.g. --verbose)";
-const ENV_FILE_HELP: &str =
-    "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
+const ENV_FILE_HELP: &str = "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
 
 fn validation_row() -> adw::ActionRow {
@@ -266,6 +265,8 @@ impl AgentTerminalWindow {
         general.add(&self.default_agent_row());
         page.add(&general);
 
+        page.add(&self.permissions_group());
+
         for driver in Driver::ALL {
             page.add(&self.agent_group(driver, dialog));
         }
@@ -297,6 +298,202 @@ impl AgentTerminalWindow {
             }
         ));
         default_row
+    }
+
+    /// The "In-App Approvals & Pattern Matching" preferences group.
+    pub(super) fn permissions_group(&self) -> adw::PreferencesGroup {
+        let group = adw::PreferencesGroup::builder()
+            .title("In-App Approvals & Pattern Matching")
+            .description(
+                "Agent Terminal manages approvals directly within the app, automatically permitting \
+                 commands and tools matching wildcard rules (e.g. 'cargo test*') without interrupting your work.",
+            )
+            .build();
+
+        let obj = self.obj();
+        let auto_approve_row = adw::SwitchRow::builder()
+            .title("In-App Pattern Auto-Approval")
+            .subtitle("Automatically approve commands and tools matching saved pattern rules")
+            .active(self.config.borrow().pattern_auto_approval)
+            .build();
+        auto_approve_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                let active = row.is_active();
+                if imp.config.borrow().pattern_auto_approval != active {
+                    imp.config.borrow_mut().pattern_auto_approval = active;
+                    imp.schedule_config_save();
+                }
+            }
+        ));
+        group.add(&auto_approve_row);
+
+        let confirm_row = adw::SwitchRow::builder()
+            .title("Confirm & Customise Patterns on Save")
+            .subtitle(
+                "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
+            )
+            .active(self.config.borrow().confirm_rule_modification)
+            .build();
+        confirm_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                let active = row.is_active();
+                if imp.config.borrow().confirm_rule_modification != active {
+                    imp.config.borrow_mut().confirm_rule_modification = active;
+                    imp.schedule_config_save();
+                }
+            }
+        ));
+        group.add(&confirm_row);
+
+        // Import permissions row
+        let import_row = adw::ActionRow::builder()
+            .title("Import Agent Permissions")
+            .subtitle("Import allowlisted commands and tools from Claude, Antigravity, and permissions.toml")
+            .build();
+        let import_btn = gtk4::Button::builder()
+            .label("Import Now")
+            .valign(gtk4::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        import_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                if let Some(path) = crate::always_allow::path() {
+                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
+                    let added_count = rules.import_agent_permissions(None);
+                    if added_count > 0 {
+                        let _ = rules.save(&path);
+                        imp.show_toast(&format!(
+                            "Imported {added_count} permission rules from agent configurations"
+                        ));
+                    } else {
+                        imp.show_toast("Permission rules are already up to date");
+                    }
+                }
+            }
+        ));
+        import_row.add_suffix(&import_btn);
+        group.add(&import_row);
+
+        // Manage rules row
+        let rule_count = crate::always_allow::path()
+            .map(|p| crate::always_allow::AlwaysRules::load(&p).rules.len())
+            .unwrap_or(0);
+        let manage_row = adw::ActionRow::builder()
+            .title("Saved Permission Rules")
+            .subtitle(format!(
+                "{rule_count} active rules stored in always-allow.json"
+            ))
+            .build();
+        let manage_btn = gtk4::Button::builder()
+            .label("Manage Rules…")
+            .valign(gtk4::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        manage_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |btn| {
+                let imp = obj.imp();
+                imp.show_rules_dialog(btn.upcast_ref());
+            }
+        ));
+        manage_row.add_suffix(&manage_btn);
+        group.add(&manage_row);
+
+        group
+    }
+
+    fn show_rules_dialog(&self, parent: &gtk4::Widget) {
+        let Some(path) = crate::always_allow::path() else {
+            return;
+        };
+        let rules = crate::always_allow::AlwaysRules::load(&path);
+
+        let dialog = adw::AlertDialog::new(
+            Some("Permission Rules"),
+            Some("Rules that automatically approve matching commands and tools."),
+        );
+
+        let scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .min_content_height(250)
+            .max_content_height(400)
+            .min_content_width(420)
+            .build();
+
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+
+        if rules.rules.is_empty() {
+            let empty_row = adw::ActionRow::builder()
+                .title("No rules saved yet")
+                .subtitle(
+                    "Choose 'Always allow' during approval or click 'Import Agent Permissions'",
+                )
+                .build();
+            list.append(&empty_row);
+        } else {
+            for (i, r) in rules.rules.iter().enumerate() {
+                let ws_label = if r.workspace == "*" {
+                    "All workspaces"
+                } else {
+                    &r.workspace
+                };
+                let row = adw::ActionRow::builder()
+                    .title(&r.detail)
+                    .subtitle(format!("{} • {} • {:?}", r.tool, ws_label, r.kind))
+                    .build();
+                let del_btn = gtk4::Button::builder()
+                    .icon_name("at-user-trash-symbolic")
+                    .valign(gtk4::Align::Center)
+                    .css_classes(["flat", "destructive-action"])
+                    .tooltip_text("Delete this rule")
+                    .build();
+                let obj = self.obj();
+                let p = path.clone();
+                let idx = i;
+                del_btn.connect_clicked(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[weak]
+                    row,
+                    move |_| {
+                        let imp = obj.imp();
+                        let mut current_rules = crate::always_allow::AlwaysRules::load(&p);
+                        if idx < current_rules.rules.len() {
+                            current_rules.rules.remove(idx);
+                            let _ = current_rules.save(&p);
+                            row.set_visible(false);
+                            imp.show_toast("Rule removed");
+                        }
+                    }
+                ));
+                row.add_suffix(&del_btn);
+                list.append(&row);
+            }
+        }
+        scroll.set_child(Some(&list));
+        dialog.set_extra_child(Some(&scroll));
+        dialog.add_responses(&[("close", "Close")]);
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+
+        let root = parent.root();
+        glib::MainContext::default().spawn_local(async move {
+            let _ = dialog.choose_future(root.as_ref()).await;
+        });
     }
 
     fn agent_group(
@@ -956,10 +1153,12 @@ pub(super) mod tests {
                 &editable,
                 gtk4::AccessibleRelation::ErrorMessage
             ));
-            assert!(feedback.iter().any(|row| row.is_visible()
-                && row
-                    .subtitle()
-                    .is_some_and(|s| s.contains("previous saved value"))));
+            assert!(feedback.iter().any(|row| {
+                row.is_visible()
+                    && row
+                        .subtitle()
+                        .is_some_and(|s| s.contains("previous saved value"))
+            }));
             assert_eq!(
                 imp.agent_profile_now(Driver::Codex),
                 saved,

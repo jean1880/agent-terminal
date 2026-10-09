@@ -5,16 +5,16 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use adw::prelude::*;
 use agent_core::adapter::Driver;
 use agent_core::event::{Decision, ItemKind};
 use gtk4::glib;
-use gtk4::prelude::*;
 use serde_json::Value;
 use sourceview5::prelude::*;
 
 use super::difftext::{self, DiffText};
 use super::markdown::{self, Block, TextKind};
-use super::model::{format_tokens, ApprovalState, Body, Item, QuestionState, Tone, ToolStatus};
+use super::model::{ApprovalState, Body, Item, QuestionState, Tone, ToolStatus, format_tokens};
 use super::payload;
 use crate::chat::DiffReply;
 use crate::diff_tool::{self, DiffTools};
@@ -28,6 +28,7 @@ pub enum RowEvent {
     Approve {
         request: String,
         decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
     },
     Answer {
         request: String,
@@ -1602,13 +1603,69 @@ impl ApprovalCard {
                 let sink = self.sink.clone();
                 let request = a.request.clone();
                 let popover = popover.clone();
-                b.connect_clicked(move |_| {
-                    popover.popdown();
-                    sink(RowEvent::Approve {
-                        request: request.clone(),
-                        decision: d,
+                if d == Decision::AllowAlways {
+                    let tool = a.tool.clone();
+                    let input_val = a.input.clone();
+                    let initial_cmd = match tool.as_str() {
+                        "run_command" => input_val
+                            .get("CommandLine")
+                            .or_else(|| input_val.get("command"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        "call_mcp_tool" => {
+                            let s = input_val
+                                .get("ServerName")
+                                .or_else(|| input_val.get("server_name"))
+                                .and_then(Value::as_str);
+                            let t = input_val
+                                .get("ToolName")
+                                .or_else(|| input_val.get("tool_name"))
+                                .and_then(Value::as_str);
+                            match (s, t) {
+                                (Some(s), Some(t)) => format!("{s}/{t}"),
+                                _ => String::new(),
+                            }
+                        }
+                        _ => a.remembers.clone().unwrap_or_default(),
+                    };
+                    let cwd_str = input_val
+                        .get("Cwd")
+                        .or_else(|| input_val.get("cwd"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let b_clone = b.clone();
+                    b.connect_clicked(move |_| {
+                        popover.popdown();
+                        let confirm = !cfg!(test)
+                            && crate::config::TerminalConfig::load().confirm_rule_modification;
+                        if confirm && !initial_cmd.is_empty() {
+                            confirm_always_allow(
+                                &b_clone,
+                                request.clone(),
+                                tool.clone(),
+                                initial_cmd.clone(),
+                                cwd_str.clone(),
+                                sink.clone(),
+                            );
+                        } else {
+                            sink(RowEvent::Approve {
+                                request: request.clone(),
+                                decision: d,
+                                custom_rule: None,
+                            });
+                        }
                     });
-                });
+                } else {
+                    b.connect_clicked(move |_| {
+                        popover.popdown();
+                        sink(RowEvent::Approve {
+                            request: request.clone(),
+                            decision: d,
+                            custom_rule: None,
+                        });
+                    });
+                }
                 if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     if !added_more {
                         self.buttons.append(&more);
@@ -1818,6 +1875,134 @@ impl QuestionCardWidget {
     }
 }
 
+fn confirm_always_allow(
+    parent: &impl IsA<gtk4::Widget>,
+    request: String,
+    tool: String,
+    initial_pattern: String,
+    cwd: Option<String>,
+    sink: Rc<dyn Fn(RowEvent)>,
+) {
+    let dialog = adw::AlertDialog::new(
+        Some("Confirm Auto-Approval Rule"),
+        Some(
+            "Modify the pattern below to loosen or tighten what will be automatically approved \
+             in future sessions. Wildcards (* and ?) are supported.",
+        ),
+    );
+
+    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    content_box.set_margin_top(8);
+    content_box.set_margin_bottom(8);
+    content_box.set_margin_start(12);
+    content_box.set_margin_end(12);
+
+    let entry = gtk4::Entry::builder()
+        .text(&initial_pattern)
+        .placeholder_text("e.g. cargo test* or git diff*")
+        .activates_default(true)
+        .hexpand(true)
+        .build();
+    content_box.append(&entry);
+
+    if tool == "run_command" {
+        let chips_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        chips_box.set_halign(gtk4::Align::Start);
+        let words: Vec<&str> = initial_pattern.split_whitespace().collect();
+        if let Some(first) = words.first() {
+            let chip1 = gtk4::Button::with_label(&format!("{first} *"));
+            chip1.add_css_class("flat");
+            chip1.add_css_class("pill");
+            chip1.set_tooltip_text(Some(&format!("Loosen to permit any '{first}' command")));
+            let e = entry.clone();
+            let label = format!("{first} *");
+            chip1.connect_clicked(move |_| {
+                e.set_text(&label);
+            });
+            chips_box.append(&chip1);
+
+            if words.len() > 1 {
+                let prefix2 = format!("{} {} *", words[0], words[1]);
+                let chip2 = gtk4::Button::with_label(&prefix2);
+                chip2.add_css_class("flat");
+                chip2.add_css_class("pill");
+                chip2.set_tooltip_text(Some(&format!("Loosen to permit any '{prefix2}' command")));
+                let e = entry.clone();
+                chip2.connect_clicked(move |_| {
+                    e.set_text(&prefix2);
+                });
+                chips_box.append(&chip2);
+            }
+        }
+        content_box.append(&chips_box);
+    }
+
+    let global_check = gtk4::CheckButton::builder()
+        .label("Apply across all workspaces")
+        .active(false)
+        .build();
+    content_box.append(&global_check);
+
+    let caption = gtk4::Label::builder()
+        .label(
+            "Caution: Overly broad patterns will permit arbitrary agent commands without review.",
+        )
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    content_box.append(&caption);
+
+    dialog.set_extra_child(Some(&content_box));
+    dialog.add_responses(&[
+        ("cancel", "Cancel"),
+        ("allow_once", "Allow Once"),
+        ("save", "Save Rule & Allow"),
+    ]);
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+
+    let root = parent.root();
+    let req = request;
+    let t = tool;
+    let c = cwd;
+
+    glib::MainContext::default().spawn_local(async move {
+        let response = dialog.choose_future(root.as_ref()).await;
+        match response.as_str() {
+            "save" => {
+                let user_pattern = entry.text().trim().to_string();
+                let pattern = if user_pattern.is_empty() {
+                    initial_pattern
+                } else {
+                    user_pattern
+                };
+                let workspace = if global_check.is_active() {
+                    "*".to_string()
+                } else {
+                    c.unwrap_or_default()
+                };
+                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
+                sink(RowEvent::Approve {
+                    request: req,
+                    decision: Decision::AllowAlways,
+                    custom_rule: Some(rule),
+                });
+            }
+            "allow_once" => {
+                sink(RowEvent::Approve {
+                    request: req,
+                    decision: Decision::Allow,
+                    custom_rule: None,
+                });
+            }
+            _ => {
+                // Cancelled: leave pending.
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1914,7 +2099,7 @@ pub(crate) mod tests {
             .expect("grant");
         always.emit_clicked();
         assert!(
-            matches!(events.borrow().last(), Some(RowEvent::Approve { request, decision: Decision::AllowAlways }) if request == "approval")
+            matches!(events.borrow().last(), Some(RowEvent::Approve { request, decision: Decision::AllowAlways, .. }) if request == "approval")
         );
         assert!(
             approval
