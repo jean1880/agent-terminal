@@ -713,9 +713,14 @@ mod tests {
         let items = completion_items(builtins(), &[], &Capabilities::agy(), &slash(""));
         let n = names(&items);
         assert!(!n.contains(&"mcp"));
-        assert!(!n.contains(&"context"));
+        assert!(n.contains(&"context"));
         assert!(n.contains(&"config"));
         assert!(n.contains(&"compact"));
+
+        let mut no_context = Capabilities::agy();
+        no_context.context_usage = false;
+        let items = completion_items(builtins(), &[], &no_context, &slash(""));
+        assert!(!names(&items).contains(&"context"));
     }
 
     #[test]

@@ -47,10 +47,11 @@
 
 use std::collections::HashSet;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::adapter::Adapter;
 use crate::claude::{is_async_launch, task_status, ClaudeAdapter};
+use crate::codex::CodexAdapter;
 use crate::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState};
 
 /// The newest this many items are kept from one imported conversation.
@@ -94,6 +95,358 @@ pub fn agy_prompts(rows: &[(String, Option<i64>)]) -> Vec<Envelope> {
         text: AGY_REPLIES_NOTICE.to_owned(),
     }));
     out
+}
+
+/// Imports an OpenAI Codex transcript held in memory.
+pub fn codex_transcript<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Envelope> {
+    let mut importer = CodexImporter::new();
+    for line in lines {
+        importer.push_line(line);
+    }
+    importer.finish()
+}
+
+/// Streaming form of [`codex_transcript`]: push lines one at a time, then [`finish`](Self::finish).
+pub struct CodexImporter {
+    adapter: CodexAdapter,
+    out: Vec<Envelope>,
+    items: usize,
+    dropped: usize,
+    known: HashSet<String>,
+    open_tools: Vec<String>,
+    pending_user_prompt: Option<(String, String)>,
+    thread_id: Option<String>,
+    turn_open: bool,
+    line_no: usize,
+}
+
+impl Default for CodexImporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexImporter {
+    pub fn new() -> Self {
+        Self {
+            adapter: CodexAdapter::new(),
+            out: Vec::new(),
+            items: 0,
+            dropped: 0,
+            known: HashSet::new(),
+            open_tools: Vec::new(),
+            pending_user_prompt: None,
+            thread_id: None,
+            turn_open: false,
+            line_no: 0,
+        }
+    }
+
+    /// Feeds one transcript line. Blank, malformed and irrelevant lines are ignored.
+    pub fn push_line(&mut self, line: &str) {
+        self.line_no += 1;
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let Ok(raw) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let record = if let Some(frame) = raw.get("frame").filter(|f| f.is_object()) {
+            frame.clone()
+        } else {
+            raw
+        };
+
+        if let Some(tid) = record
+            .get("threadId")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                record
+                    .get("thread")
+                    .and_then(|t| t.get("id"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                record
+                    .get("params")
+                    .and_then(|p| p.get("threadId"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                record
+                    .get("params")
+                    .and_then(|p| p.get("thread"))
+                    .and_then(|t| t.get("id"))
+                    .and_then(Value::as_str)
+            })
+        {
+            if self.thread_id.is_none() {
+                self.thread_id = Some(tid.to_owned());
+                self.adapter.set_thread_id(tid.to_owned());
+            }
+        }
+
+        if let Some(method) = record.get("method").and_then(Value::as_str) {
+            self.json_rpc_method(method, &record);
+        } else if let Some(ty) = record.get("type").and_then(Value::as_str) {
+            self.direct_item(ty, &record);
+        } else if let Some(turns) = record.get("turns").and_then(Value::as_array) {
+            for turn in turns {
+                self.direct_turn(turn);
+            }
+        } else if record.get("items").and_then(Value::as_array).is_some() {
+            self.direct_turn(&record);
+        }
+
+        if self.items > 2 * MAX_IMPORTED_ITEMS {
+            self.dropped += cap(&mut self.out, MAX_IMPORTED_ITEMS);
+            self.items = count_items(&self.out);
+        }
+    }
+
+    /// Settles open turns and tools, and returns the capped envelopes.
+    pub fn finish(mut self) -> Vec<Envelope> {
+        self.flush_pending_prompt();
+        if self.turn_open {
+            self.close_turn();
+        }
+        self.settle_open_tools();
+        let dropped = self.dropped + cap(&mut self.out, MAX_IMPORTED_ITEMS);
+        finish_cap(&mut self.out, dropped);
+        self.out
+    }
+
+    fn json_rpc_method(&mut self, method: &str, record: &Value) {
+        let params = record.get("params").unwrap_or(&Value::Null);
+        match method {
+            "turn/start" => {
+                let text = user_text(params.get("input").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    self.pending_user_prompt = Some((format!("user:l{}", self.line_no), text));
+                }
+            }
+            "turn/started" => {
+                if self.turn_open {
+                    self.close_turn();
+                }
+                self.turn_open = true;
+                let envs = self.adapter.feed(&record.to_string());
+                self.absorb(envs);
+            }
+            "turn/completed" => {
+                let envs = self.adapter.feed(&record.to_string());
+                self.absorb(envs);
+                self.settle_open_tools();
+                self.turn_open = false;
+            }
+            "item/started" => {
+                let item = params.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+                    self.user_message_item(item);
+                } else {
+                    self.flush_pending_prompt();
+                    self.ensure_turn();
+                    let envs = self.adapter.feed(&record.to_string());
+                    self.absorb(envs);
+                }
+            }
+            "item/completed" => {
+                let item = params.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+                    // Handled at item/started or direct user_message_item
+                } else {
+                    self.flush_pending_prompt();
+                    self.ensure_turn();
+                    let envs = self.adapter.feed(&record.to_string());
+                    self.absorb(envs);
+                }
+            }
+            _ => {
+                self.flush_pending_prompt();
+                let envs = self.adapter.feed(&record.to_string());
+                self.absorb(envs);
+            }
+        }
+    }
+
+    fn direct_item(&mut self, ty: &str, record: &Value) {
+        if ty == "userMessage" {
+            self.user_message_item(record);
+        } else {
+            self.flush_pending_prompt();
+            self.ensure_turn();
+            if self.thread_id.is_none() {
+                self.thread_id = Some("imported-thread".to_owned());
+                self.adapter.set_thread_id("imported-thread".to_owned());
+            }
+            let syn = json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": self.thread_id.as_deref().unwrap_or("imported-thread"),
+                    "item": record
+                }
+            });
+            let envs = self.adapter.feed(&syn.to_string());
+            self.absorb(envs);
+        }
+    }
+
+    fn direct_turn(&mut self, turn: &Value) {
+        if self.turn_open {
+            self.close_turn();
+        }
+        self.open_turn();
+        if let Some(items) = turn.get("items").and_then(Value::as_array) {
+            for item in items {
+                if let Some(ty) = item.get("type").and_then(Value::as_str) {
+                    self.direct_item(ty, item);
+                }
+            }
+        }
+        self.close_turn();
+    }
+
+    fn flush_pending_prompt(&mut self) {
+        if let Some((id, text)) = self.pending_user_prompt.take() {
+            let text = clean_user_text(&text);
+            if !text.is_empty() && self.known.insert(id.clone()) {
+                self.ensure_turn();
+                push_user_message(&mut self.out, id, &text);
+                self.items += 1;
+            }
+        }
+    }
+
+    fn user_message_item(&mut self, item: &Value) {
+        self.pending_user_prompt = None;
+        let id = s(item, "id").map_or_else(|| format!("user:l{}", self.line_no), str::to_owned);
+        let text = user_text(item.get("content").unwrap_or(&Value::Null));
+        let text = if text.is_empty() {
+            item.get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            text
+        };
+        let text = clean_user_text(&text);
+        if !text.is_empty() && self.known.insert(id.clone()) {
+            self.ensure_turn();
+            push_user_message(&mut self.out, id, &text);
+            self.items += 1;
+        }
+    }
+
+    fn ensure_turn(&mut self) {
+        if !self.turn_open {
+            self.open_turn();
+        }
+    }
+
+    fn open_turn(&mut self) {
+        self.turn_open = true;
+        if !self
+            .out
+            .last()
+            .is_some_and(|e| matches!(e.event, Event::TurnStarted { .. }))
+        {
+            self.out
+                .push(Envelope::new(Event::TurnStarted { model: None }));
+        }
+    }
+
+    fn close_turn(&mut self) {
+        self.settle_open_tools();
+        if !self
+            .out
+            .last()
+            .is_some_and(|e| matches!(e.event, Event::TurnCompleted { .. }))
+        {
+            self.out.push(turn_completed(TurnState::Completed));
+        }
+        self.turn_open = false;
+    }
+
+    fn settle_open_tools(&mut self) {
+        for id in std::mem::take(&mut self.open_tools) {
+            self.out.push(
+                Envelope::new(Event::ItemCompleted {
+                    status: ItemStatus::Interrupted,
+                    output: None,
+                    error: None,
+                })
+                .item(id),
+            );
+        }
+    }
+
+    fn absorb(&mut self, envs: Vec<Envelope>) {
+        for mut env in envs {
+            env.raw = None;
+            match &mut env.event {
+                Event::TurnStarted { .. } => {
+                    if self
+                        .out
+                        .last()
+                        .is_some_and(|e| matches!(e.event, Event::TurnStarted { .. }))
+                    {
+                        continue;
+                    }
+                    self.turn_open = true;
+                }
+                Event::TurnCompleted { .. } => {
+                    if self
+                        .out
+                        .last()
+                        .is_some_and(|e| matches!(e.event, Event::TurnCompleted { .. }))
+                    {
+                        continue;
+                    }
+                    self.settle_open_tools();
+                    self.turn_open = false;
+                }
+                Event::ItemStarted { kind, .. } => {
+                    let Some(id) = env.item.clone() else {
+                        continue;
+                    };
+                    if !self.known.insert(id.clone()) {
+                        continue;
+                    }
+                    if !matches!(
+                        kind,
+                        ItemKind::AssistantMessage | ItemKind::Reasoning | ItemKind::UserMessage
+                    ) {
+                        self.open_tools.push(id);
+                    }
+                    self.items += 1;
+                }
+                Event::ContentSnapshot { .. } | Event::ContentDelta { .. } => {
+                    if !env.item.as_ref().is_some_and(|i| self.known.contains(i)) {
+                        continue;
+                    }
+                }
+                Event::ItemCompleted { output, error, .. } => {
+                    let Some(id) = env.item.clone() else {
+                        continue;
+                    };
+                    if !self.known.contains(&id) {
+                        continue;
+                    }
+                    self.open_tools.retain(|t| *t != id);
+                    for field in [output, error].into_iter().flatten() {
+                        truncate_chars(field, MAX_TOOL_OUTPUT_CHARS);
+                    }
+                }
+                Event::Notice { .. }
+                | Event::Compacted { .. }
+                | Event::PlanUpdated { .. }
+                | Event::WorkersUpdated { .. } => {}
+                _ => continue,
+            }
+            self.out.push(env);
+        }
+    }
 }
 
 /// Streaming form of [`claude_transcript`]: push lines one at a time, then [`finish`](Self::finish).
@@ -571,6 +924,10 @@ fn slash_command(text: &str) -> Option<String> {
     })
 }
 
+fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,5 +1310,54 @@ mod tests {
             Some(Event::Notice { text }) if text == AGY_REPLIES_NOTICE
         ));
         assert!(agy_prompts(&[]).is_empty());
+    }
+
+    const CODEX_SYNTHETIC: &str = include_str!("../tests/fixtures/codex-synthetic-turn.ndjson");
+
+    #[test]
+    fn codex_transcript_imports_user_messages_and_tools() {
+        let envs = codex_transcript(CODEX_SYNTHETIC.lines());
+        assert!(!envs.is_empty());
+        let users = user_texts(&envs);
+        assert_eq!(users, ["list the files"]);
+        let has_command = envs.iter().any(|e| {
+            matches!(
+                &e.event,
+                Event::ItemStarted {
+                    kind: ItemKind::Command,
+                    ..
+                }
+            )
+        });
+        assert!(has_command, "should import command execution item");
+        let has_turn_start = envs
+            .iter()
+            .any(|e| matches!(&e.event, Event::TurnStarted { .. }));
+        let has_turn_end = envs
+            .iter()
+            .any(|e| matches!(&e.event, Event::TurnCompleted { .. }));
+        assert!(has_turn_start);
+        assert!(has_turn_end);
+    }
+
+    #[test]
+    fn codex_transcript_imports_direct_items() {
+        let lines = [
+            r#"{"type":"userMessage","id":"um_1","content":[{"type":"text","text":"hello world"}]}"#,
+            r#"{"type":"agentMessage","id":"msg_1","text":"hello back"}"#,
+        ];
+        let envs = codex_transcript(lines);
+        let users = user_texts(&envs);
+        assert_eq!(users, ["hello world"]);
+        let assistant = envs.iter().any(|e| {
+            matches!(
+                &e.event,
+                Event::ItemStarted {
+                    kind: ItemKind::AssistantMessage,
+                    ..
+                }
+            )
+        });
+        assert!(assistant);
     }
 }

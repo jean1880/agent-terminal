@@ -240,6 +240,15 @@ fn known_profile_settings(command: &str) -> Option<KnownProfile> {
             prompt_args: strings(&["--prompt-interactive", "{prompt}"]),
             limit_markers: Some(strings(&["RESOURCE_EXHAUSTED", "quota exceeded"])),
         }),
+        "codex" => Some(KnownProfile {
+            resume_args: strings(&["app-server"]),
+            store: "~/.codex/sessions".to_string(),
+            title: None,
+            format: SessionFormat::Jsonl,
+            session_id_args: None,
+            prompt_args: strings(&["{prompt}"]),
+            limit_markers: None,
+        }),
         _ => None,
     }
 }
@@ -1756,6 +1765,27 @@ mod tests {
         assert!(agy.can_take_prompt());
         // Not known to accept a fresh ID, so never asked to.
         assert!(!agy.can_pin_session_id());
+    }
+
+    #[test]
+    fn a_pre_resume_codex_profile_gains_resume_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"profiles":[{"name":"Codex","command":"codex"}]}"#)
+            .unwrap();
+
+        let codex = &TerminalConfig::load_from(&path).profiles[0];
+        assert_eq!(
+            codex.resume_args.as_deref(),
+            Some(&["app-server".to_string()][..])
+        );
+        assert_eq!(codex.session_store.as_deref(), Some("~/.codex/sessions"));
+        assert_eq!(codex.session_format, SessionFormat::Jsonl);
+        assert_eq!(codex.session_title, None);
+        assert!(codex.can_take_prompt());
+        assert!(!codex.can_pin_session_id());
     }
 
     #[test]

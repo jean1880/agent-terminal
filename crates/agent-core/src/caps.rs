@@ -70,7 +70,7 @@ impl Capabilities {
             mcp_panel: false,
             settings_panel: true,
             model_list: true,
-            context_usage: false,
+            context_usage: true,
             usage: true,
             compact_command: None,
             streams_text: true,

@@ -293,6 +293,12 @@ impl CodexAdapter {
         }
     }
 
+    /// Sets the thread id directly (used by transcript importers).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_thread_id(&mut self, thread_id: String) {
+        self.thread_id = Some(thread_id);
+    }
+
     /// The version reported in `initialize`'s `clientInfo` (default: this crate's version; the
     /// app passes its own).
     pub fn client_version(mut self, version: impl Into<String>) -> Self {
@@ -1365,7 +1371,18 @@ impl CodexAdapter {
             return;
         }
         let item = s(params, "itemId").unwrap_or_default().to_owned();
-        let options = match params.get("availableDecisions").and_then(Value::as_array) {
+        let remembers = if method == "item/commandExecution/requestApproval" {
+            let command = s(params, "command");
+            let cwd = s(params, "cwd");
+            match (command, cwd) {
+                (Some(cmd), Some(cwd)) => Some(format!("`{cmd}` in {cwd}")),
+                (Some(cmd), None) => Some(format!("`{cmd}`")),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut options = match params.get("availableDecisions").and_then(Value::as_array) {
             Some(list) if all_decisions => {
                 let mut options: Vec<Decision> = Vec::new();
                 for d in list
@@ -1385,6 +1402,13 @@ impl CodexAdapter {
             }
             _ => ALL_DECISIONS.to_vec(),
         };
+        if remembers.is_some() && !options.contains(&Decision::AllowAlways) {
+            if let Some(pos) = options.iter().position(|d| *d == Decision::Allow) {
+                options.insert(pos + 1, Decision::AllowAlways);
+            } else {
+                options.push(Decision::AllowAlways);
+            }
+        }
         self.approvals.insert(
             key.clone(),
             PendingApproval {
@@ -1402,8 +1426,7 @@ impl CodexAdapter {
                 reason: s(params, "reason").map(str::to_owned),
                 options,
                 response: ResponseCapability::Live,
-                // Codex has no persistent allow.
-                remembers: None,
+                remembers,
             })
             .item(item)
             .request(key),
@@ -1942,8 +1965,9 @@ impl Adapter for CodexAdapter {
     }
 }
 
-const ALL_DECISIONS: [Decision; 4] = [
+const ALL_DECISIONS: [Decision; 5] = [
     Decision::Allow,
+    Decision::AllowAlways,
     Decision::AllowForSession,
     Decision::Deny,
     Decision::Cancel,
@@ -1985,11 +2009,9 @@ fn codex_mode_label(mode: Mode) -> &'static str {
 /// The wire name of a decision (`CommandExecutionApprovalDecision` / `FileChangeApprovalDecision`).
 fn decision_wire(decision: Decision) -> &'static str {
     match decision {
-        Decision::Allow => "accept",
+        // AllowAlways is emulated locally by agent-terminal; on the wire to Codex it is an accept.
+        Decision::Allow | Decision::AllowAlways => "accept",
         Decision::AllowForSession => "acceptForSession",
-        // Codex has no persistent allow and never offers it, so `encode` refuses it before any
-        // line is written; the name only appears in that refusal.
-        Decision::AllowAlways => "acceptAlways",
         Decision::Deny => "decline",
         Decision::Cancel => "cancel",
     }
@@ -2886,9 +2908,9 @@ mod tests {
         }));
         assert!(matches!(&approval.event, Event::ApprovalRequested {
             tool, title: Some(t), reason: Some(r), options, response: ResponseCapability::Live, input,
-            remembers: None
+            remembers: Some(ref rem)
         } if tool == "command_execution" && t == "ls -la" && r.contains("outside")
-            && options == &ALL_DECISIONS.to_vec() && input["command"] == "ls -la"));
+            && options == &ALL_DECISIONS.to_vec() && input["command"] == "ls -la" && rem.contains("ls -la")));
         assert!(
             matches!(&ev[15].event, Event::ItemCompleted { output: Some(o), error: None, .. }
             if o.starts_with("total 8"))
@@ -3874,6 +3896,34 @@ mod tests {
             matches!(&ev[0].event, Event::ApprovalRequested { options, .. }
             if options == &vec![Decision::Allow, Decision::Cancel])
         );
+    }
+
+    #[test]
+    fn command_execution_approval_offers_allow_always_when_command_present() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":6,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","command":"git status","cwd":"/repo","availableDecisions":["accept","acceptForSession","decline","cancel"]}}"#,
+        );
+        let req = ev[0].request.clone().expect("request");
+        match &ev[0].event {
+            Event::ApprovalRequested {
+                options, remembers, ..
+            } => {
+                assert_eq!(remembers.as_deref(), Some("`git status` in /repo"));
+                assert!(options.contains(&Decision::AllowAlways));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let w = one_write(
+            a.encode(Command::Approve {
+                request: req,
+                decision: Decision::AllowAlways,
+                updated_input: None,
+                message: None,
+            })
+            .expect("allow always"),
+        );
+        assert_eq!(w, json!({"id": 6, "result": {"decision": "accept"}}));
     }
 
     #[test]

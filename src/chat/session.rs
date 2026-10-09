@@ -11,6 +11,8 @@
 //! Logging never includes prompt or frame bodies.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -184,6 +186,9 @@ struct Inner {
     /// The mode the user last chose. The running mode can differ (agy without its hook cannot
     /// ask), and a switch to an agent that can honour it goes back to it.
     wanted_mode: Cell<Mode>,
+    /// Pending Codex approval details `(tool_key, detail)` mapped by request id, so AllowAlways
+    /// choices can be persisted in `always-allow.json`.
+    codex_pending_approvals: RefCell<HashMap<String, (String, String)>>,
 }
 
 /// The mode a session can actually run in. agy without its approval hook cannot ask before
@@ -335,6 +340,7 @@ impl ChatSession {
             generation: Cell::new(0),
             adapter_epoch: Cell::new(0),
             wanted_mode: Cell::new(wanted_mode),
+            codex_pending_approvals: RefCell::new(HashMap::new()),
         });
         inner.attach_approval();
         // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
@@ -616,6 +622,11 @@ impl Inner {
             Event::CommandsChanged { commands } => {
                 self.state.borrow_mut().commands = commands.clone();
             }
+            Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
+                if let Some(req) = &env.request {
+                    self.codex_pending_approvals.borrow_mut().remove(req);
+                }
+            }
             _ => {}
         }
     }
@@ -679,12 +690,24 @@ impl Inner {
         let launch = self.launch_env.borrow();
         // The profile's environment first, so it can never override the approval socket.
         let mut env = launch.env.clone();
-        env.extend(approval.map(|a| a.env()).unwrap_or_default());
+        env.extend(approval.as_ref().map(|a| a.env()).unwrap_or_default());
+        let mut unset = launch.unset.clone();
+        if approval.is_none() {
+            if !unset.iter().any(|u| u == agent_core::approval::ENV_SOCKET) {
+                unset.push(agent_core::approval::ENV_SOCKET.to_owned());
+            }
+            if !unset
+                .iter()
+                .any(|u| u == crate::approval_server::ENV_HOOK_BIN)
+            {
+                unset.push(crate::approval_server::ENV_HOOK_BIN.to_owned());
+            }
+        }
         SpawnSpec {
             argv,
             cwd: (!open.cwd.is_empty()).then(|| open.cwd.clone()),
             env,
-            unset: launch.unset.clone(),
+            unset,
         }
     }
 
@@ -768,6 +791,7 @@ impl Inner {
         for env in envelopes {
             self.emit(env.clone());
             self.watch_tool_step(&env);
+            self.check_codex_auto_approval(&env);
             if generation != self.generation.get() {
                 return; // the process was replaced while handling this envelope
             }
@@ -812,6 +836,58 @@ impl Inner {
             }
             inner.trip_canary();
         });
+    }
+
+    /// If an approval request from Codex matches an already remembered "Always allow" rule
+    /// for this workspace, auto-approves it immediately without stalling the user.
+    fn check_codex_auto_approval(self: &Rc<Self>, env: &Envelope) {
+        if self.adapter.borrow().driver() != Driver::Codex {
+            return;
+        }
+        let Event::ApprovalRequested { tool, input, .. } = &env.event else {
+            return;
+        };
+        let Some(req) = &env.request else {
+            return;
+        };
+        if tool != "command_execution" {
+            return;
+        }
+        let Some(command) = input.get("command").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let open_cwd = self.open.borrow().cwd.clone();
+        let cwd = input
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(open_cwd.as_str());
+        let tool_key = "run_command".to_string();
+        let detail = format!("{cwd}\n{command}");
+        self.codex_pending_approvals
+            .borrow_mut()
+            .insert(req.clone(), (tool_key.clone(), detail.clone()));
+
+        if let Some(path) = crate::always_allow::path() {
+            let rules = crate::always_allow::AlwaysRules::load(&path);
+            let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                .to_string_lossy()
+                .into_owned();
+            let matching_keys = rules.keys_for(&workspace);
+            if matching_keys
+                .iter()
+                .any(|(t, d)| t == &tool_key && d == &detail)
+            {
+                info!(command = %command, "auto-approving remembered Codex command");
+                let weak = Rc::downgrade(self);
+                let req = req.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.respond_approval(&req, Decision::Allow);
+                    }
+                });
+            }
+        }
     }
 
     /// The hook is not gating agy: stop it now and carry on without the skip flag (plan mode, no
@@ -874,6 +950,7 @@ impl Inner {
         // The final exit envelope repaints the header. Clear pending state first so a dead
         // process cannot leave the chip claiming its model change is still in progress.
         self.reject_model_change();
+        self.codex_pending_approvals.borrow_mut().clear();
         for env in envelopes {
             self.emit(env);
         }
@@ -1199,6 +1276,36 @@ impl Inner {
                 return;
             }
         }
+        if decision == Decision::AllowAlways && self.adapter.borrow().driver() == Driver::Codex {
+            if let Some((tool, detail)) = self.codex_pending_approvals.borrow_mut().remove(request)
+            {
+                if let Some(path) = crate::always_allow::path() {
+                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
+                    let open_cwd = self.open.borrow().cwd.clone();
+                    let workspace = std::fs::canonicalize(Path::new(&open_cwd))
+                        .unwrap_or_else(|_| PathBuf::from(&open_cwd))
+                        .to_string_lossy()
+                        .into_owned();
+                    let added = rules.add(crate::always_allow::Rule {
+                        workspace,
+                        tool: tool.clone(),
+                        detail,
+                    });
+                    if added {
+                        match rules.save(&path) {
+                            Ok(()) => {
+                                info!(tool = %tool, "remembered an always-allow rule for Codex")
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "could not save the always-allow rule for Codex")
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            self.codex_pending_approvals.borrow_mut().remove(request);
+        }
         // Claude and Codex never acknowledge an answer, so once the adapter has accepted it and
         // written it, the card is resolved here; otherwise it would sit at "Allow…" for good.
         let sent = self.command(Command::Approve {
@@ -1215,16 +1322,25 @@ impl Inner {
     fn set_mode(self: &Rc<Self>, mode: Mode) {
         self.wanted_mode.set(mode);
         self.record_chosen_mode();
-        if self.ask_unavailable() && mode == Mode::Ask {
-            self.emit(Envelope::new(Event::Notice {
-                text: "Antigravity cannot ask before edits until the approval hook is installed; \
-                       it stays in its current mode."
-                    .to_owned(),
-            }));
-            // The picker shows the mode actually running.
-            let current = self.state.borrow().mode;
-            self.emit(Envelope::new(Event::ModeChanged { mode: current }));
-            return;
+        if self.ask_unavailable() {
+            if mode == Mode::Ask {
+                self.emit(Envelope::new(Event::Notice {
+                    text:
+                        "Antigravity cannot ask before edits until the approval hook is installed; \
+                           it stays in its current mode."
+                            .to_owned(),
+                }));
+                // The picker shows the mode actually running.
+                let current = self.state.borrow().mode;
+                self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+                return;
+            } else if mode == Mode::Plan {
+                self.emit(Envelope::new(Event::Notice {
+                    text: "Antigravity Plan mode refuses shell commands, but may still edit files \
+                           on disk without the approval hook installed."
+                        .to_owned(),
+                }));
+            }
         }
         if self.command(Command::SetMode { mode }) {
             if let Some(a) = self.approval() {
@@ -2820,7 +2936,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--model", "claude-sonnet-5-5"]));
             assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
-            assert_eq!(spec.unset, ["CLAUDECODE"]);
+            assert!(spec.unset.contains(&"CLAUDECODE".to_owned()));
             assert_eq!(session.status().model, None);
             assert_eq!(
                 session.status().pending_model.as_deref(),
