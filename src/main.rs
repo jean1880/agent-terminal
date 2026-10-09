@@ -27,6 +27,8 @@ mod icons;
 mod model_catalog;
 mod palette;
 mod probe;
+#[cfg(not(feature = "terminal"))]
+pub mod terminal_stub;
 #[cfg(test)]
 mod testutil;
 mod theme;
@@ -342,23 +344,34 @@ fn handle_command_line(
 fn init_logging() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Send everything to the journal for desktop-launched sessions. Option<Layer>
-    // is itself a no-op Layer, so a missing journal just drops this layer.
-    let journald_layer = tracing_journald::layer()
-        .map(|layer| layer.with_syslog_identifier("agent-terminal".to_string()))
-        .map_err(|err| eprintln!("journald unavailable ({err}); relying on stderr"))
-        .ok();
-
     // Also log to the terminal when one is attached (e.g. `make start-local`).
     let stderr_layer = std::io::stderr()
         .is_terminal()
         .then(|| fmt::layer().with_writer(std::io::stderr));
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(journald_layer)
-        .with(stderr_layer)
-        .init();
+    #[cfg(feature = "journald")]
+    {
+        // Send everything to the journal for desktop-launched sessions. Option<Layer>
+        // is itself a no-op Layer, so a missing journal just drops this layer.
+        let journald_layer = tracing_journald::layer()
+            .map(|layer| layer.with_syslog_identifier("agent-terminal".to_string()))
+            .map_err(|err| eprintln!("journald unavailable ({err}); relying on stderr"))
+            .ok();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(journald_layer)
+            .with(stderr_layer)
+            .init();
+    }
+
+    #[cfg(not(feature = "journald"))]
+    {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(stderr_layer)
+            .init();
+    }
 
     install_panic_hook();
 }

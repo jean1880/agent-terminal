@@ -8,8 +8,13 @@
 
 use crate::config::ThemeChoice;
 use gtk4::gdk::RGBA;
+#[cfg(feature = "terminal")]
 use vte4::prelude::*;
+#[cfg(feature = "terminal")]
 use vte4::Terminal;
+
+#[cfg(not(feature = "terminal"))]
+use crate::terminal_stub::Terminal;
 
 /// Converts 8-bit sRGB components to a fully opaque [`RGBA`].
 fn rgb(r: u8, g: u8, b: u8) -> RGBA {

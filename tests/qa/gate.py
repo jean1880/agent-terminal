@@ -144,6 +144,7 @@ def main():
             steps.extend([
                 ("format", ["cargo", "fmt", "--all", "--", "--check"], 120, None),
                 ("clippy", ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"], 1200, None),
+                ("macos-mvp-check", ["cargo", "check", "--locked", "--no-default-features"], 300, None),
                 ("workspace", ["xvfb-run", "-a", "dbus-run-session", "--", "cargo", "test", "--locked", "--workspace", "--all-targets"], 1200, None),
             ])
         for index, test in enumerate(native):

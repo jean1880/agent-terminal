@@ -21,8 +21,15 @@ use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack}
 use std::cell::RefCell;
 use std::env;
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "terminal")]
 use vte4::prelude::*;
+#[cfg(feature = "terminal")]
 use vte4::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
+
+#[cfg(not(feature = "terminal"))]
+use crate::terminal_stub as vte4;
+#[cfg(not(feature = "terminal"))]
+use crate::terminal_stub::{CursorBlinkMode, CursorShape, Format, PtyFlags, Terminal};
 
 /// Static logo SVG for standalone binary.
 const LOGO_SVG: &str = include_str!("../../assets/ca.nuvek.AgentTerminal.svg");

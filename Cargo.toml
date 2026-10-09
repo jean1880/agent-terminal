@@ -35,7 +35,7 @@ tracing = "0.1"
 #           the bottom rows instead of copying the whole scrollback)
 # All are satisfied by Ubuntu 24.04 (VTE 0.76) and newer.
 gtk4 = { version = "0.11", features = ["v4_10"] }
-vte4 = { version = "0.10", features = ["v0_72"] }
+vte4 = { version = "0.10", features = ["v0_72"], optional = true }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 # The chat composer (and code blocks). v5_12 pairs with GTK 4.10; GtkSourceView 5.12+ is on
 # Ubuntu 24.04 and newer.
@@ -48,9 +48,14 @@ tracing = { workspace = true }
 # For setsid(2) and kill(2) on the agent's process group (agent_proc); not a GTK crate.
 libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-journald = "0.3"
+tracing-journald = { version = "0.3", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = ["terminal", "journald"]
+terminal = ["dep:vte4"]
+journald = ["dep:tracing-journald"]
 
 [build-dependencies]
 # Compiles assets/icons into a GResource (needs glib-compile-resources on PATH). 0.22 pairs

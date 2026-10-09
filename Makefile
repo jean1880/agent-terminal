@@ -32,6 +32,14 @@ build:
 	@echo "Building $(APP_NAME) in release mode..."
 	cargo build --release
 
+build-macos:
+	@echo "Building $(APP_NAME) for macOS (no default features)..."
+	cargo build --no-default-features --release
+
+check-macos:
+	@echo "Checking $(APP_NAME) for macOS (no default features)..."
+	cargo check --no-default-features
+
 start-local:
 	@echo "Building and running $(APP_NAME) locally..."
 	cargo run
