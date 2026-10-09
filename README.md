@@ -46,13 +46,17 @@ and it ships as a single binary.
 - **Switch agents in the middle of a conversation.** A thread isn't tied to one agent.
   Move it from Claude to Antigravity to Codex (and back) whenever you like, from the
   model picker or `/model`. The new agent is handed the conversation so far, and the
-  thread keeps one history across all of them. Use the best model for each step, or
-  keep working when one agent hits its quota.
+  thread keeps one history across all of them. Confirm **Switch and Continue** during
+  active work to interrupt the turn and continue with your choice; an idle switch
+  sets the model for your next message.
 - **One window for three agents.** Claude, Antigravity and Codex threads live in one
   sidebar, grouped by folder and searchable. Claude and agy sessions you already ran
   in those CLIs show up there too.
 - **You stay in control.** Inline approvals for commands and edits, a plan panel, and
   questions the agent asks you as cards with answers to pick.
+- **Review your multi-agent setup.** One confirmed action opens a review in the exact
+  work folder, with a scorecard, skill and MCP recommendations, and an ordered
+  improvement guide.
 - **Git safety net.** Each turn is checkpointed into hidden refs. The diff panel shows
   what changed, undo puts it back, and a worktree gives an agent its own checkout.
   Your branch, index and stash are never touched.
@@ -162,15 +166,26 @@ terms yourself and do not use this integration if they do not permit your intend
 A thread belongs to the work, not to an agent. At any point you can hand it to another one:
 
 - **Pick a model from any agent** in the header chip (or type `/model`). The list covers
-  every Claude, Antigravity and Codex model, with search and effort levels. A model of the
-  same agent switches in place. A model of another agent continues the thread there.
-- **The conversation comes with it.** The next message carries the thread so far, within
-  a token budget: all of it when it fits, otherwise the first request and the most recent
+  available models from Claude, Antigravity and Codex, with search and effort levels. The same
+  agent keeps its native conversation, updating in place or restarting and resuming
+  as needed. Choosing another agent carries the conversation into a new session.
+- **Switch during active work.** Confirm **Switch and Continue** to interrupt the
+  running turn and automatically continue the unfinished task with the selected model.
+  Pending approvals and questions are cancelled; the new turn can ask again if needed.
+- **Switch while idle.** The session stays idle and uses the selected model for your
+  next message. No continuation prompt is sent.
+- **See whether the change was accepted.** The header shows the requested model as
+  **pending** until the backend acknowledges it. Codex applies model choices on the
+  next turn, so an idle selection can remain pending until you send a message.
+  Rejected changes show an error and preserve the last accepted choice.
+- **The conversation comes with it.** When changing agents, the continuation or your
+  next message carries the thread so far, within a token budget: all of it when it
+  fits, otherwise the first request and the most recent
   work, and the notice says which ("40 of 112 messages"). It is redacted (keys and tokens
   masked), tool output is shortened and fenced off so it cannot pass for your words, and
-  reasoning is not carried. It survives a restart: the new agent gets it with your next
-  message, however much later that is. A divider marks where the thread changed hands, and
-  each reply is labelled with the agent that wrote it.
+  reasoning is not carried. An undelivered handoff survives a restart until the next
+  message. A divider marks where the thread changed hands, and each reply is labelled
+  with the agent that wrote it.
 - **Switch back whenever you like.** Returning to an agent works the same way: a fresh
   session from a summary of the thread, including what the other agent did in between (the
   divider says "Back in Claude · new session from a summary").
@@ -184,17 +199,40 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Fork instead of switching**: `/fork` starts a new thread with this one's history, so
   two agents can take the same problem in different directions.
 
+### Multi-agent environment review
+
+- **Start from the folder you are working in.** Choose **Review Multi-Agent
+  Environment…** from the window menu, or a thread's context menu to review that
+  thread's folder. Confirm **Start Review** to open a new agent session in that exact
+  folder, including nested project folders.
+- **A [bundled review skill](assets/skills/multi-agent-environment-review/SKILL.md).**
+  The session receives the skill and review instructions
+  automatically. It inspects relevant project instructions, agent configuration,
+  skills, MCP registrations, permissions, delegation and recovery practices.
+  The instructions request a read-only review, with no installations, configuration
+  changes or MCP server probes. The selected agent's usual permissions and quota apply.
+- **A consistent report in chat.** Seven sections cover scope and evidence, summary,
+  scorecard, agent/MCP matrix, skill suggestions, ordered improvements and limits.
+  Eight aspects receive evidence-based ratings from **0–5** or **unknown**, with an
+  overall score and evidence coverage. Recommendations explain what to change, how
+  to verify it, how to undo it and what approval is needed. Configured tools are
+  distinguished from tools with demonstrated runtime results.
+
 ### Chat threads
 
 - **A sidebar of threads**, grouped by folder and searchable. Each row shows the
   agent, the title, how long ago it was active, and a badge: working, needs approval,
-  rate limited or unread. `F9` or `Ctrl+B` shows or hides it. It overlays the thread
-  when the window is narrow.
+  rate limited or unread. `F9` or `Ctrl+Shift+B` shows or hides it. It overlays the
+  thread when the window is narrow. When hidden, its toggle still signals unread
+  activity or a thread needing your attention.
 - **Your existing sessions.** Recent Claude and agy sessions appear as threads.
   Opening one imports its history and resumes it. (Codex history is not imported yet.)
 - **A native transcript**: markdown, code blocks, tool cards, file-change cards with
   their diffs, inline approvals, a plan panel, sub-agent progress, questions with
   answers to pick, and a composer with typeahead.
+- **Pending approvals stay within reach.** A panel above the composer keeps approval
+  controls available while you scroll, with extra choices in a popover when the
+  agent supports them. Pending questions offer a jump back to their answer card.
 - **One model picker for every agent.** See
   [Switching agents](#switching-agents-mid-conversation). Models that agy serves on
   Google's quota are marked *via Antigravity*.
@@ -288,16 +326,21 @@ agent-terminal --resume <id> --dir ~/git/some-project
 | `Ctrl+Shift+G` | New thread in a new worktree |
 | `Ctrl+Shift+W` | Close the thread |
 | `Ctrl+Shift+R` | Restart the session |
-| `F9`, `Ctrl+B` | Show or hide the sidebar |
-| `` Ctrl+` `` | Show or hide the terminal drawer |
+| `Ctrl+Shift+O` | New thread in a chosen folder |
+| `Ctrl+Shift+E` | Resume an existing session |
+| `Ctrl+Shift+S` | Take a checkpoint now |
+| `F9`, `Ctrl+Shift+B` | Show or hide the sidebar |
+| `` Ctrl+` ``, `Ctrl+J` | Show or hide the terminal drawer |
 | `Ctrl+Shift+D` | Show or hide the diff panel |
 | `Ctrl+Shift+F` | Search a terminal's scrollback |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
+| `Ctrl+,` | Open Settings |
+| `Ctrl+?` | Show keyboard shortcuts |
 | `Ctrl+Tab`, `Ctrl+Page Down` | Next thread |
 | `Ctrl+Shift+Tab`, `Ctrl+Page Up` | Previous thread |
 | `Alt+1`…`Alt+8`, `Alt+9` | Go to thread N, or the last one |
 | `Ctrl+Alt+1`…`Ctrl+Alt+9` | New terminal thread with the Nth profile, in the current folder |
-| `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Terminal zoom in / out / reset (saved) |
+| `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Chat and terminal text zoom in / out / reset (saved); `Ctrl+=` also zooms in |
 | `Ctrl+click` | Open a link in a terminal |
 
 These are caught before a terminal sees them, so a CLI never receives them.
