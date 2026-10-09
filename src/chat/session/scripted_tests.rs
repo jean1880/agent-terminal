@@ -426,6 +426,81 @@ fn scripted_reload_rejects_previous_process_frames_and_adopts_deferred_mode_next
 }
 
 #[test]
+fn scripted_busy_model_switch_resumes_with_the_selected_model_and_continues_once() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        let old_request = fixture.wait_pending(ctx);
+        let old_generation = session.inner.generation.get();
+        // A resume response may describe the previous thread's default. The next turn must
+        // still explicitly use the new choice rather than restoring that old default.
+        std::fs::write(fixture.dir.path().join("startup-model"), "synthetic-model")
+            .expect("reported startup model");
+        session.switch(
+            Driver::Codex,
+            Some("synthetic-new-model".into()),
+            Some("high".into()),
+        );
+        fixture.wait(ctx, "continued replacement turn", || {
+            fixture.model.borrow().activity(false) == Activity::Finished
+                && session.status().model.as_deref() == Some("synthetic-new-model")
+        });
+        assert!(session.inner.generation.get() > old_generation);
+        assert!(session.status().pending_model.is_none());
+        assert_eq!(session.status().effort.as_deref(), Some("high"));
+        assert!(fixture.pending().is_none(), "old approval expired");
+        let before = fixture.seen.borrow().len();
+        session.inner.on_line(
+            old_generation,
+            r#"{"method":"turn/started","params":{"turn":{"model":"synthetic-model"}}}"#,
+            false,
+        );
+        assert_eq!(
+            fixture.seen.borrow().len(),
+            before,
+            "old process cannot replace the selected model"
+        );
+        session.respond_approval(&old_request, Decision::Allow);
+        let incoming = fixture.incoming();
+        let resumes: Vec<_> = incoming
+            .iter()
+            .filter(|f| f["method"] == "thread/resume")
+            .collect();
+        assert_eq!(resumes.len(), 1);
+        assert_eq!(resumes[0]["params"]["threadId"], "fixture-thread");
+        assert_eq!(resumes[0]["params"]["model"], "synthetic-new-model");
+        let turns: Vec<_> = incoming
+            .iter()
+            .filter(|f| f["method"] == "turn/start")
+            .collect();
+        assert_eq!(
+            turns.len(),
+            2,
+            "original turn plus exactly one continuation"
+        );
+        assert_eq!(turns[1]["params"]["model"], "synthetic-new-model");
+        assert_eq!(turns[1]["params"]["effort"], "high");
+        let continued = turns[1]["params"]["input"][0]["text"]
+            .as_str()
+            .expect("continuation");
+        assert!(continued.contains("Continue the unfinished task"));
+        assert!(
+            continued.contains("pending"),
+            "unfinished original request is carried"
+        );
+        assert!(fixture.seen.borrow().iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                ..
+            }
+        )));
+        session.shutdown(false);
+    });
+}
+
+#[test]
 fn scripted_spawn_failure_reports_an_error_and_retry_keeps_the_user_history() {
     in_loop(|ctx| {
         let fixture = Fixture::new();

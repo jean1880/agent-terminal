@@ -1395,6 +1395,14 @@ impl Transcript {
                     self.last_model = Some(model.clone());
                 }
             }
+            // Pending selection is process-local backend state, never restored from history.
+            Event::ModelChangeRequested { .. } => {}
+            Event::ModelChangeFailed { model, message } => {
+                out.extend(self.push_notice(
+                    format!("Could not switch to {model}: {message}. The previous model is kept."),
+                    Tone::Warning,
+                ));
+            }
             Event::Notice { text } => {
                 out.extend(self.push_notice(text.clone(), Tone::Info));
             }

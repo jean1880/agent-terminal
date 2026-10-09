@@ -683,11 +683,18 @@ impl Inner {
 
     fn refresh_agent_chip(&self) {
         let status = self.backend.status();
-        let model = status
-            .model
-            .clone()
-            .or_else(|| self.model.borrow().current_model().map(str::to_owned));
-        self.header.set_agent(status.driver, model.as_deref());
+        let model = status.model.clone().or_else(|| {
+            status
+                .pending_model
+                .is_none()
+                .then(|| self.model.borrow().current_model().map(str::to_owned))
+                .flatten()
+        });
+        self.header.set_agent(
+            status.driver,
+            model.as_deref(),
+            status.pending_model.as_deref(),
+        );
         // The composer's hint names the agent too: it must follow a switch, which arrives as
         // events and never goes through `refresh_status` (that only runs on running changes).
         self.composer.refresh_placeholder();
@@ -1089,6 +1096,7 @@ pub(crate) mod tests {
         SessionStatus {
             driver,
             model: None,
+            pending_model: None,
             effort: None,
             mode: Mode::Ask,
             running_turn: false,
@@ -1466,8 +1474,84 @@ pub(crate) mod tests {
         assert_eq!(inner.thinking.shown(), None, "gone once the turn ends");
     }
 
+    fn model_chip_follows_pending_acceptance_and_rejection() {
+        let mut status = status_of(Driver::Claude);
+        status.model = Some("sonnet".into());
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status),
+        });
+        let view = ChatView::new(backend.clone());
+        let chip = view.inner().expect("view").header.chip.clone();
+        let tooltip = || chip.tooltip_text().expect("model tooltip").to_string();
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "sonnet".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Claude · sonnet · Switch model or agent (/model)"
+        );
+
+        backend.status.borrow_mut().pending_model = Some("opus".into());
+        view.sink()(&Envelope::new(Event::ModelChangeRequested {
+            model: "opus".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Claude · sonnet → opus (pending) · Switch model or agent (/model)"
+        );
+        {
+            let mut status = backend.status.borrow_mut();
+            status.model = Some("opus".into());
+            status.pending_model = None;
+        }
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "opus".into(),
+        }));
+        assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+
+        backend.status.borrow_mut().pending_model = Some("unavailable".into());
+        view.sink()(&Envelope::new(Event::ModelChangeRequested {
+            model: "unavailable".into(),
+        }));
+        assert!(tooltip().contains("opus → unavailable (pending)"));
+        backend.status.borrow_mut().pending_model = None;
+        view.sink()(&Envelope::new(Event::ModelChangeFailed {
+            model: "unavailable".into(),
+            message: "Model is unavailable".into(),
+        }));
+        assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+
+        // The reducer still remembers Claude's model while the replacement provider starts.
+        // A pending Codex selection must not make that old model look like a Codex model.
+        {
+            let mut status = backend.status.borrow_mut();
+            *status = status_of(Driver::Codex);
+            status.pending_model = Some("gpt-5-codex".into());
+        }
+        view.sink()(&Envelope::new(Event::ModelChangeRequested {
+            model: "gpt-5-codex".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Codex · gpt-5-codex (pending) · Switch model or agent (/model)"
+        );
+        {
+            let mut status = backend.status.borrow_mut();
+            status.model = Some("gpt-5-codex".into());
+            status.pending_model = None;
+        }
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "gpt-5-codex".into(),
+        }));
+        assert_eq!(
+            tooltip(),
+            "Codex · gpt-5-codex · Switch model or agent (/model)"
+        );
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
+        model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();
         thinking_strip_follows_the_turn();

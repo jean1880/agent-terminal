@@ -320,17 +320,21 @@ fn model_list(
 }
 
 /// Asks before a switch that would stop `from`'s running turn (and any approval or question
-/// waiting in it); `then` runs only on "Stop and Switch". Cancel is the default.
+/// waiting in it); `then` runs only on "Switch and Continue". Cancel is the default.
 fn confirm_busy_switch(parent: &adw::Dialog, from: Driver, to: Driver, then: impl Fn() + 'static) {
     let (from, to) = (from.info().label, to.info().label);
     let dialog = adw::AlertDialog::new(
         Some(&format!("Switch to {to} now?")),
         Some(&format!(
-            "{from} is still working. Switching stops this turn, and discards any approval or \
-             question waiting for your answer; the unfinished work is carried as interrupted."
+            "{from} is still working. Switching interrupts this turn and continues the \
+             unfinished task with the selected model. Any approval or question waiting for \
+             your answer is cancelled; the new turn can ask again."
         )),
     );
-    dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", "Stop and Switch")]);
+    dialog.add_responses(&[
+        ("cancel", "Keep Waiting"),
+        ("switch", "Switch and Continue"),
+    ]);
     dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -787,6 +791,7 @@ pub(crate) mod tests {
         SessionStatus {
             driver,
             model: model.map(str::to_owned),
+            pending_model: None,
             effort: None,
             mode: agent_core::adapter::Mode::Ask,
             running_turn: false,

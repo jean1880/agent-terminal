@@ -324,7 +324,7 @@ impl Header {
         self.fit_height();
     }
 
-    pub fn set_agent(&self, driver: Driver, model: Option<&str>) {
+    pub fn set_agent(&self, driver: Driver, model: Option<&str>, pending: Option<&str>) {
         if let Some(prev) = self.last_driver.get() {
             self.chip.remove_css_class(accent_class(prev));
         }
@@ -333,12 +333,15 @@ impl Header {
         self.brand
             .set_from_gicon(&crate::icons::driver_icon(driver));
         self.agent.set_text(driver_name(driver));
-        self.model.set_text(model.unwrap_or("default model"));
-        let name = format!(
-            "{} · {}",
-            driver_name(driver),
-            model.unwrap_or("default model")
-        );
+        let model_text = match pending {
+            Some(target) => match model {
+                Some(previous) => format!("{previous} → {target} (pending)"),
+                None => format!("{target} (pending)"),
+            },
+            None => model.unwrap_or("default model").to_owned(),
+        };
+        self.model.set_text(&model_text);
+        let name = format!("{} · {}", driver_name(driver), model_text);
         self.chip
             .update_property(&[gtk4::accessible::Property::Label(&name)]);
         self.chip

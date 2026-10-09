@@ -129,11 +129,25 @@ enum Pending {
     Initialize,
     /// `thread/start` or `thread/resume`.
     ThreadStart,
-    TurnStart,
+    TurnStart(SubmittedModel),
     Compact,
     Interrupt,
     /// `model/list`, answering the control with this id.
     Models(String),
+}
+
+/// The selection actually written to one `turn/start`, independent of later picker changes.
+#[derive(Debug, Clone)]
+struct SubmittedModel {
+    model: Option<String>,
+    effort: Option<String>,
+    revision: u64,
+}
+
+impl SubmittedModel {
+    fn selection_key(&self) -> Option<String> {
+        (self.revision != 0).then(|| format!("codex-model-{}", self.revision))
+    }
 }
 
 /// An unanswered approval server request.
@@ -172,12 +186,22 @@ pub struct CodexAdapter {
     session: Mutex<Option<OpenSession>>,
     next_id: u64,
     pending: HashMap<u64, Pending>,
+    startup_failed: bool,
     thread_id: Option<String>,
     turn_id: Option<String>,
     turn_open: bool,
     /// An interrupt was sent for the open turn, so an exit before it ends is expected.
     interrupt_sent: bool,
     model: Option<String>,
+    /// An explicit launch model or later choice must survive the initial thread response.
+    /// That response reports startup state separately from the selected turn default.
+    model_selected_during_start: bool,
+    selection_revision: u64,
+    confirmed_revision: u64,
+    accepted_revision: Option<u64>,
+    confirmed_model: Option<String>,
+    confirmed_effort: Option<String>,
+    effective_selection: Option<SubmittedModel>,
     /// Reasoning effort sent on every `turn/start` (`low`/`medium`/`high`/...; a model-advertised
     /// string). Seeded from `OpenSession::effort`, changed by `Command::SetModel { effort }`
     /// (per turn: no respawn).
@@ -232,11 +256,19 @@ impl CodexAdapter {
             session: Mutex::new(None),
             next_id: 0,
             pending: HashMap::new(),
+            startup_failed: false,
             thread_id: None,
             turn_id: None,
             turn_open: false,
             interrupt_sent: false,
             model: None,
+            model_selected_during_start: false,
+            selection_revision: 0,
+            confirmed_revision: 0,
+            accepted_revision: None,
+            confirmed_model: None,
+            confirmed_effort: None,
+            effective_selection: None,
             effort: None,
             mode: Mode::default(),
             effective_mode: None,
@@ -308,6 +340,7 @@ impl CodexAdapter {
     }
 
     fn finish_effective_mode(&mut self, out: &mut Vec<Envelope>) {
+        self.effective_selection = None;
         if self
             .effective_mode
             .take()
@@ -315,6 +348,75 @@ impl CodexAdapter {
         {
             out.push(Envelope::new(Event::ModeChanged { mode: self.mode }));
         }
+    }
+
+    fn confirm_submitted_model(&mut self, submitted: &SubmittedModel, out: &mut Vec<Envelope>) {
+        if submitted.revision < self.confirmed_revision
+            || self.accepted_revision == Some(submitted.revision)
+        {
+            return;
+        }
+        self.accepted_revision = Some(submitted.revision);
+        if submitted.revision == self.confirmed_revision
+            && submitted.model == self.confirmed_model
+            && submitted.effort == self.confirmed_effort
+        {
+            return;
+        }
+        self.confirmed_revision = submitted.revision;
+        self.confirmed_model = submitted.model.clone();
+        self.confirmed_effort = submitted.effort.clone();
+        if let Some(model) = &submitted.model {
+            let mut event = Envelope::new(Event::ModelChanged {
+                model: model.clone(),
+            });
+            event.request = submitted.selection_key();
+            out.push(event);
+        }
+    }
+
+    fn selection_is_unconfirmed(&self, submitted: &SubmittedModel) -> bool {
+        submitted.revision >= self.confirmed_revision
+            && self.accepted_revision != Some(submitted.revision)
+            && (submitted.revision > self.confirmed_revision
+                || submitted.model != self.confirmed_model
+                || submitted.effort != self.confirmed_effort)
+    }
+
+    fn fail_startup(&mut self, message: String, out: &mut Vec<Envelope>) {
+        if self.startup_failed {
+            return;
+        }
+        self.startup_failed = true;
+        let submitted =
+            !self.queued.is_empty() || self.effective_selection.is_some() || self.turn_open;
+        self.queued.clear();
+        self.outbox.actions.clear();
+        self.thread_id = None;
+        self.turn_id = None;
+        self.turn_open = false;
+        if let Some(model) = &self.model {
+            let mut event = Envelope::new(Event::ModelChangeFailed {
+                model: model.clone(),
+                message: message.clone(),
+            });
+            if self.selection_revision != 0 {
+                event.request = Some(format!("codex-model-{}", self.selection_revision));
+            }
+            out.push(event);
+        }
+        out.push(Envelope::new(Event::Error {
+            message: message.clone(),
+        }));
+        if submitted {
+            out.push(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Failed,
+                usage: None,
+                cost_usd: None,
+                error: Some(message),
+            }));
+        }
+        self.finish_effective_mode(out);
     }
 
     /// Verified against the installed app-server schema: operation statuses and agent statuses
@@ -532,7 +634,19 @@ impl CodexAdapter {
         params.insert("sandboxPolicy".into(), sandbox);
         // The model catalogue can default summaries to "none"; ask for them every turn.
         params.insert("summary".into(), json!("detailed"));
-        self.request(Pending::TurnStart, "turn/start", Value::Object(params))
+        let submitted = SubmittedModel {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            revision: self.selection_revision,
+        };
+        if self.effective_selection.is_none() {
+            self.effective_selection = Some(submitted.clone());
+        }
+        self.request(
+            Pending::TurnStart(submitted),
+            "turn/start",
+            Value::Object(params),
+        )
     }
 
     // ---- items ----
@@ -722,6 +836,9 @@ impl CodexAdapter {
     // ---- notifications ----
 
     fn on_notification(&mut self, method: &str, params: &Value, out: &mut Vec<Envelope>) {
+        if self.startup_failed {
+            return;
+        }
         if self.worker_notification(method, params, out) {
             return;
         }
@@ -740,8 +857,12 @@ impl CodexAdapter {
                 if let Some(turn) = s(params.get("turn").unwrap_or(&Value::Null), "id") {
                     self.turn_id = Some(turn.to_owned());
                 }
+                let submitted = self.effective_selection.clone();
+                if let Some(selection) = &submitted {
+                    self.confirm_submitted_model(selection, out);
+                }
                 out.push(Envelope::new(Event::TurnStarted {
-                    model: self.model.clone(),
+                    model: submitted.map_or_else(|| self.confirmed_model.clone(), |s| s.model),
                 }));
             }
             "turn/completed" => self.on_turn_completed(params, out),
@@ -879,10 +1000,27 @@ impl CodexAdapter {
             }
             "model/rerouted" => match s(params, "toModel") {
                 Some(model) => {
-                    self.model = Some(model.to_owned());
-                    out.push(Envelope::new(Event::ModelChanged {
+                    let selection_key = self
+                        .effective_selection
+                        .as_ref()
+                        .and_then(SubmittedModel::selection_key);
+                    self.confirmed_model = Some(model.to_owned());
+                    if let Some(selection) = &mut self.effective_selection {
+                        self.confirmed_revision = self.confirmed_revision.max(selection.revision);
+                        self.accepted_revision = Some(selection.revision);
+                        self.confirmed_effort = selection.effort.clone();
+                        if selection.revision == self.selection_revision {
+                            self.model = Some(model.to_owned());
+                        }
+                        selection.model = Some(model.to_owned());
+                    } else {
+                        self.model = Some(model.to_owned());
+                    }
+                    let mut event = Envelope::new(Event::ModelChanged {
                         model: model.to_owned(),
-                    }));
+                    });
+                    event.request = selection_key;
+                    out.push(event);
                 }
                 None => out.push(Envelope::new(Event::Unknown)),
             },
@@ -1279,6 +1417,14 @@ impl CodexAdapter {
             out.push(Envelope::new(Event::Unknown));
             return;
         };
+        if self.startup_failed
+            && matches!(
+                pending,
+                Pending::Initialize | Pending::ThreadStart | Pending::TurnStart(_)
+            )
+        {
+            return;
+        }
         let result = frame.get("result");
         let error = frame
             .get("error")
@@ -1286,7 +1432,8 @@ impl CodexAdapter {
         match (pending, result, error) {
             (Pending::Initialize, Some(_), _) => {}
             (Pending::ThreadStart, Some(result), _) => self.on_thread_ready(result, out),
-            (Pending::TurnStart, Some(result), _) => {
+            (Pending::TurnStart(submitted), Some(result), _) => {
+                self.confirm_submitted_model(&submitted, out);
                 if self.turn_id.is_none() {
                     self.turn_id = result
                         .get("turn")
@@ -1308,8 +1455,22 @@ impl CodexAdapter {
                 })
                 .request(control),
             ),
-            (Pending::TurnStart, None, error) => {
+            (Pending::TurnStart(submitted), None, error) => {
                 let message = error.unwrap_or_else(|| "turn/start failed".to_owned());
+                if self.selection_is_unconfirmed(&submitted) {
+                    if let Some(model) = &submitted.model {
+                        let mut event = Envelope::new(Event::ModelChangeFailed {
+                            model: model.clone(),
+                            message: message.clone(),
+                        });
+                        event.request = submitted.selection_key();
+                        out.push(event);
+                    }
+                    if submitted.revision == self.selection_revision {
+                        self.model = self.confirmed_model.clone();
+                        self.effort = self.confirmed_effort.clone();
+                    }
+                }
                 out.push(Envelope::new(Event::Error {
                     message: message.clone(),
                 }));
@@ -1324,7 +1485,13 @@ impl CodexAdapter {
                     self.finish_effective_mode(out);
                 }
             }
-            (Pending::Initialize | Pending::ThreadStart | Pending::Compact, None, error) => {
+            (Pending::Initialize | Pending::ThreadStart, None, error) => {
+                self.fail_startup(
+                    error.unwrap_or_else(|| "Codex thread startup failed".to_owned()),
+                    out,
+                );
+            }
+            (Pending::Compact, None, error) => {
                 out.push(Envelope::new(Event::Error {
                     message: error.unwrap_or_else(|| "request failed".to_owned()),
                 }));
@@ -1335,23 +1502,32 @@ impl CodexAdapter {
     }
 
     fn on_thread_ready(&mut self, result: &Value, out: &mut Vec<Envelope>) {
+        if self.startup_failed {
+            return;
+        }
         let Some(thread) = result
             .get("thread")
             .and_then(|t| s(t, "id"))
+            .filter(|id| !id.is_empty())
             .map(str::to_owned)
         else {
-            out.push(Envelope::new(Event::Error {
-                message: "thread/start returned no thread id".to_owned(),
-            }));
+            self.fail_startup("thread/start returned no thread id".to_owned(), out);
             return;
         };
         self.thread_id = Some(thread.clone());
-        if let Some(model) = s(result, "model") {
-            self.model = Some(model.to_owned());
+        let startup_model = s(result, "model").map(str::to_owned);
+        self.confirmed_model = startup_model.clone();
+        let startup_effort = self.session().as_ref().and_then(|s| s.effort.clone());
+        self.confirmed_effort = startup_effort;
+        if !self.model_selected_during_start {
+            if let Some(model) = &startup_model {
+                self.model = Some(model.clone());
+            }
         }
+        self.model_selected_during_start = false;
         out.push(Envelope::new(Event::SessionStarted {
             native_id: thread.clone(),
-            model: self.model.clone(),
+            model: startup_model,
             cwd: s(result, "cwd").map(str::to_owned),
         }));
         while let Some(text) = self.queued.pop_front() {
@@ -1385,7 +1561,15 @@ impl Adapter for CodexAdapter {
         // A new process: forget the last one's connection state. Queued prompts survive.
         self.next_id = 0;
         self.pending.clear();
+        self.startup_failed = false;
         self.thread_id = None;
+        self.model_selected_during_start = false;
+        self.selection_revision = 0;
+        self.confirmed_revision = 0;
+        self.accepted_revision = None;
+        self.confirmed_model = None;
+        self.confirmed_effort = None;
+        self.effective_selection = None;
         self.turn_id = None;
         self.turn_open = false;
         self.effective_mode = None;
@@ -1418,6 +1602,7 @@ impl Adapter for CodexAdapter {
         self.outbox = Outbox::default();
         if let Some(s) = &session {
             self.model = s.model.clone();
+            self.model_selected_during_start = s.model.is_some();
             self.effort = s.effort.clone();
             self.mode = s.mode;
             self.cwd = Some(s.cwd.clone()).filter(|c| !c.is_empty());
@@ -1457,10 +1642,25 @@ impl Adapter for CodexAdapter {
         vec![init, initialized, thread]
     }
 
+    fn prompt_starts_turn(&self, text: &str) -> bool {
+        !text.trim().eq_ignore_ascii_case("/compact")
+    }
+
+    fn discard_queued_prompts(&mut self) {
+        self.queued.clear();
+    }
+
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
+        if self.startup_failed
+            && matches!(&command, Command::Prompt { .. } | Command::SetModel { .. })
+        {
+            return Err(AdapterError::Invalid(
+                "Codex thread startup failed; restart the session before sending another prompt or model choice".to_owned(),
+            ));
+        }
         match command {
             Command::Prompt { text } => {
-                if text.trim().eq_ignore_ascii_case("/compact") {
+                if !self.prompt_starts_turn(&text) {
                     let Some(thread) = self.thread_id.clone() else {
                         return Err(AdapterError::Invalid(
                             "the Codex thread is not started yet".to_owned(),
@@ -1563,11 +1763,16 @@ impl Adapter for CodexAdapter {
             }
             Command::SetModel { model, effort } => {
                 // Applied by the next `turn/start`; no restart. `None` keeps the effort.
+                self.model_selected_during_start = self.thread_id.is_none();
+                self.selection_revision = self.selection_revision.saturating_add(1);
                 if effort.is_some() {
                     self.effort = effort;
                 }
                 self.model = Some(model.clone());
-                self.emit(Event::ModelChanged { model });
+                self.outbox.events.push(
+                    Envelope::new(Event::ModelChangeRequested { model })
+                        .request(format!("codex-model-{}", self.selection_revision)),
+                );
                 Ok(Vec::new())
             }
             Command::SetMode { mode } => {
@@ -2676,9 +2881,9 @@ mod tests {
             matches!(&ev[5].event, Event::ContentSnapshot { text, .. } if text == "**Planning** the listing")
         );
         let approval = &ev[13];
-        assert!(approval.request.as_deref().is_some_and(
-            |request| request.starts_with("codex:item/commandExecution/requestApproval:")
-        ));
+        assert!(approval.request.as_deref().is_some_and(|request| {
+            request.starts_with("codex:item/commandExecution/requestApproval:")
+        }));
         assert!(matches!(&approval.event, Event::ApprovalRequested {
             tool, title: Some(t), reason: Some(r), options, response: ResponseCapability::Live, input,
             remembers: None
@@ -2780,6 +2985,278 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_queued_prompt_is_replaced_by_one_continuation_on_the_resumed_model() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        assert!(a
+            .encode(Command::Prompt {
+                text: "original work".into()
+            })
+            .expect("queue original")
+            .is_empty());
+        a.discard_queued_prompts();
+        a.on_exit(None);
+        let mut resumed = session(Mode::Ask, Some("th-1"));
+        resumed.model = Some("selected".into());
+        resumed.effort = Some("high".into());
+        a.argv(&resumed);
+        let handshake = a.handshake();
+        let resume: Value = serde_json::from_str(&handshake[2]).expect("resume request");
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "th-1");
+        assert_eq!(resume["params"]["model"], "selected");
+        assert!(a
+            .encode(Command::Prompt {
+                text: "continue the interrupted work".into()
+            })
+            .expect("queue continuation")
+            .is_empty());
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"selected"}}"#);
+        let flushed = writes(&a.drain_outbox().actions);
+        assert_eq!(
+            flushed.len(),
+            1,
+            "stopped work must not be replayed alongside continuation"
+        );
+        assert_eq!(flushed[0]["params"]["model"], "selected");
+        assert_eq!(flushed[0]["params"]["effort"], "high");
+        assert_eq!(
+            flushed[0]["params"]["input"][0]["text"],
+            "continue the interrupted work"
+        );
+        assert!(!a.prompt_starts_turn(" /COMPACT "));
+        assert!(a.prompt_starts_turn("/review"));
+    }
+
+    #[test]
+    fn an_initial_turn_confirms_or_rejects_its_model_when_startup_omits_it() {
+        for success in [false, true] {
+            let mut a = CodexAdapter::new();
+            a.argv(&session(Mode::Ask, Some("th-1")));
+            a.handshake();
+            a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+            let sent = one_write(
+                a.encode(Command::Prompt {
+                    text: "continue".into(),
+                })
+                .expect("send"),
+            );
+            let response = if success {
+                json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}})
+            } else {
+                json!({"id":sent["id"],"error":{"message":"model unavailable"}})
+            };
+            let events = a.feed(&response.to_string());
+            if success {
+                assert!(events.iter().any(
+                    |e| matches!(&e.event, Event::ModelChanged { model } if model == "gpt-5-codex")
+                        && e.request.is_none()
+                ));
+                let started = a.feed(
+                    r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#,
+                );
+                assert!(!started
+                    .iter()
+                    .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+            } else {
+                assert!(events.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, .. } if model == "gpt-5-codex") && e.request.is_none()));
+                assert!(events.iter().any(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Failed,
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn startup_failure_discards_queued_work_and_late_responses_cannot_restart_it() {
+        for resume in [None, Some("th-1")] {
+            for failure in [
+                r#"{"id":1,"error":{"message":"initialize denied"}}"#,
+                r#"{"id":2,"error":{"message":"thread denied"}}"#,
+                r#"{"id":2,"result":{"thread":{}}}"#,
+            ] {
+                let mut a = CodexAdapter::new();
+                a.argv(&session(Mode::Ask, resume));
+                a.handshake();
+                a.encode(Command::Prompt {
+                    text: "continue".into(),
+                })
+                .expect("queue");
+                let events = a.feed(failure);
+                assert!(events
+                    .iter()
+                    .any(|e| matches!(e.event, Event::Error { .. })));
+                assert!(events.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, .. } if model == "gpt-5-codex")));
+                assert!(events.iter().any(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Failed,
+                        ..
+                    }
+                )));
+                let late =
+                    a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex"}}"#);
+                assert!(!late
+                    .iter()
+                    .any(|e| matches!(e.event, Event::SessionStarted { .. })));
+                assert!(a.drain_outbox().actions.is_empty());
+                assert!(a
+                    .encode(Command::Prompt {
+                        text: "stale retry".into()
+                    })
+                    .is_err());
+                a.argv(&session(Mode::Ask, resume));
+                a.handshake();
+                a.encode(Command::Prompt {
+                    text: "fresh retry".into(),
+                })
+                .expect("queue fresh retry");
+                a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex"}}"#);
+                let sent = writes(&a.drain_outbox().actions);
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0]["params"]["input"][0]["text"], "fresh retry");
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_initialize_failure_invalidates_a_submitted_turn() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let sent = one_write(
+            a.encode(Command::Prompt {
+                text: "continue".into(),
+            })
+            .expect("send"),
+        );
+        let failed = a.feed(r#"{"id":1,"error":{"message":"initialize denied"}}"#);
+        assert!(failed.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        )));
+        let late = a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        assert!(late.is_empty());
+        let started =
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        assert!(started.is_empty());
+    }
+
+    #[test]
+    fn an_initial_turn_reroute_is_not_overwritten_by_its_original_acceptance() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let sent = one_write(
+            a.encode(Command::Prompt {
+                text: "continue".into(),
+            })
+            .expect("send"),
+        );
+        let reroute = a.feed(r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","toModel":"fallback"}}"#);
+        assert!(matches!(&reroute[0].event, Event::ModelChanged { model } if model == "fallback"));
+        assert!(reroute[0].request.is_none());
+        let ack = a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        assert!(!ack
+            .iter()
+            .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+        assert_eq!(a.confirmed_model.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn an_explicit_launch_model_is_used_for_continuation_when_startup_reports_the_old_model() {
+        for resume in [None, Some("th-1")] {
+            let mut a = CodexAdapter::new();
+            let mut open = session(Mode::Ask, resume);
+            open.model = Some("selected".into());
+            open.effort = Some("high".into());
+            a.argv(&open);
+            a.handshake();
+            a.encode(Command::Prompt {
+                text: "continue".into(),
+            })
+            .expect("queue continuation");
+            let events = a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"old"}}"#);
+            assert!(
+                matches!(&events[0].event, Event::SessionStarted { model: Some(model), .. } if model == "old")
+            );
+            let flushed = writes(&a.drain_outbox().actions);
+            assert_eq!(flushed.len(), 1);
+            assert_eq!(flushed[0]["params"]["model"], "selected");
+            assert_eq!(flushed[0]["params"]["effort"], "high");
+            let accepted =
+                a.feed(&json!({"id":flushed[0]["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+            assert!(accepted.iter().any(
+                |e| matches!(&e.event, Event::ModelChanged { model } if model == "selected")
+                    && e.request.is_none()
+            ));
+            let started = a.feed(
+                r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#,
+            );
+            assert!(!started
+                .iter()
+                .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+        }
+        let mut a = CodexAdapter::new();
+        let mut open = session(Mode::Ask, None);
+        open.model = None;
+        a.argv(&open);
+        a.handshake();
+        a.encode(Command::Prompt {
+            text: "use default".into(),
+        })
+        .expect("queue default");
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"reported-default"}}"#);
+        let flushed = writes(&a.drain_outbox().actions);
+        assert_eq!(flushed[0]["params"]["model"], "reported-default");
+    }
+
+    #[test]
+    fn a_model_selected_during_thread_start_survives_the_original_model_response() {
+        for resume in [None, Some("th-1")] {
+            let mut a = CodexAdapter::new();
+            a.argv(&session(Mode::Ask, resume));
+            a.handshake();
+            a.encode(Command::SetModel {
+                model: "gpt-5.5".into(),
+                effort: Some("high".into()),
+            })
+            .expect("select");
+            a.drain_outbox();
+            assert!(a
+                .encode(Command::Prompt {
+                    text: "queued".into()
+                })
+                .expect("queue")
+                .is_empty());
+            let events =
+                a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex"}}"#);
+            assert!(matches!(&events[0].event,
+                Event::SessionStarted { model: Some(model), .. } if model == "gpt-5-codex"));
+            let flushed = writes(&a.drain_outbox().actions);
+            assert_eq!(flushed[0]["params"]["model"], "gpt-5.5");
+            assert_eq!(flushed[0]["params"]["effort"], "high");
+            let next = one_write(
+                a.encode(Command::Prompt {
+                    text: "next".into(),
+                })
+                .expect("send"),
+            );
+            assert_eq!(next["params"]["model"], "gpt-5.5");
+        }
+    }
+
+    #[test]
     fn a_prompt_before_the_thread_exists_is_queued_then_flushed_in_order() {
         let mut a = CodexAdapter::new();
         a.argv(&session(Mode::Ask, None));
@@ -2853,9 +3330,10 @@ mod tests {
         assert_eq!(
             outbox.events,
             vec![
-                Envelope::new(Event::ModelChanged {
+                Envelope::new(Event::ModelChangeRequested {
                     model: "gpt-5.5".into()
-                }),
+                })
+                .request("codex-model-1"),
                 Envelope::new(Event::ModeChanged {
                     mode: Mode::AcceptEdits
                 }),
@@ -2868,6 +3346,274 @@ mod tests {
             w["params"]["sandboxPolicy"],
             json!({"type": "workspaceWrite"})
         );
+    }
+
+    #[test]
+    fn model_confirmation_uses_the_submitted_choice_and_requires_backend_acceptance() {
+        for notification_first in [false, true] {
+            let mut a = started(Mode::Ask);
+            a.encode(Command::SetModel {
+                model: "selected".into(),
+                effort: Some("high".into()),
+            })
+            .expect("select");
+            let requested = a.drain_outbox();
+            let selection_key = requested.events[0].request.clone();
+            assert_eq!(selection_key.as_deref(), Some("codex-model-1"));
+            assert!(
+                matches!(&requested.events[0].event, Event::ModelChangeRequested { model } if model == "selected")
+            );
+            assert!(!requested
+                .events
+                .iter()
+                .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+            let sent = one_write(
+                a.encode(Command::Prompt {
+                    text: "first".into(),
+                })
+                .expect("send"),
+            );
+            a.encode(Command::SetModel {
+                model: "newer".into(),
+                effort: Some("low".into()),
+            })
+            .expect("select newer");
+            a.drain_outbox();
+            let response = json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string();
+            let notification =
+                r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#;
+            let frames = if notification_first {
+                [notification, response.as_str()]
+            } else {
+                [response.as_str(), notification]
+            };
+            let events: Vec<_> = frames.into_iter().flat_map(|frame| a.feed(frame)).collect();
+            assert!(events
+                .iter()
+                .filter(|e| matches!(e.event, Event::ModelChanged { .. }))
+                .all(|e| e.request == selection_key));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| matches!(&e.event, Event::ModelChanged { model } if model == "selected")
+                    )
+                    .count(),
+                1
+            );
+            assert!(events.iter().any(|e| matches!(&e.event, Event::TurnStarted { model: Some(model) } if model == "selected")));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(&e.event, Event::ModelChanged { model } if model == "newer")));
+            let next = one_write(
+                a.encode(Command::Prompt {
+                    text: "next".into(),
+                })
+                .expect("next"),
+            );
+            assert_eq!(next["params"]["model"], "newer");
+            assert_eq!(next["params"]["effort"], "low");
+        }
+    }
+
+    #[test]
+    fn a_rejected_model_restores_confirmed_settings_without_overwriting_a_newer_choice() {
+        for newer in [false, true] {
+            let mut a = started(Mode::Ask);
+            a.encode(Command::SetModel {
+                model: "invalid".into(),
+                effort: Some("high".into()),
+            })
+            .expect("select");
+            a.drain_outbox();
+            let sent = one_write(
+                a.encode(Command::Prompt {
+                    text: "first".into(),
+                })
+                .expect("send"),
+            );
+            if newer {
+                a.encode(Command::SetModel {
+                    model: "newer".into(),
+                    effort: Some("low".into()),
+                })
+                .expect("select newer");
+                a.drain_outbox();
+            }
+            let events = a.feed(
+                &json!({"id":sent["id"],"error":{"code":-32600,"message":"no such model"}})
+                    .to_string(),
+            );
+            assert!(events.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, message } if model == "invalid" && message == "no such model")));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+            assert!(events.iter().any(|e| matches!(
+                e.event,
+                Event::TurnCompleted {
+                    state: TurnState::Failed,
+                    ..
+                }
+            )));
+            let next = one_write(
+                a.encode(Command::Prompt {
+                    text: "next".into(),
+                })
+                .expect("next"),
+            );
+            assert_eq!(
+                next["params"]["model"],
+                if newer { "newer" } else { "gpt-5-codex" }
+            );
+            if newer {
+                assert_eq!(next["params"]["effort"], "low");
+            } else {
+                assert!(next["params"].get("effort").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rejection_restores_the_last_accepted_model_and_effort() {
+        let mut a = started(Mode::Ask);
+        a.encode(Command::SetModel {
+            model: "accepted".into(),
+            effort: Some("high".into()),
+        })
+        .expect("select");
+        a.drain_outbox();
+        let sent = one_write(
+            a.encode(Command::Prompt {
+                text: "first".into(),
+            })
+            .expect("send"),
+        );
+        a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed"}}}"#);
+        a.encode(Command::SetModel {
+            model: "invalid".into(),
+            effort: Some("low".into()),
+        })
+        .expect("select invalid");
+        a.drain_outbox();
+        let sent = one_write(
+            a.encode(Command::Prompt {
+                text: "second".into(),
+            })
+            .expect("send"),
+        );
+        a.feed(&json!({"id":sent["id"],"error":{"message":"no such model"}}).to_string());
+        let next = one_write(
+            a.encode(Command::Prompt {
+                text: "retry".into(),
+            })
+            .expect("send"),
+        );
+        assert_eq!(next["params"]["model"], "accepted");
+        assert_eq!(next["params"]["effort"], "high");
+    }
+
+    #[test]
+    fn a_reroute_confirms_the_active_turn_without_overwriting_a_later_choice() {
+        let mut a = started(Mode::Ask);
+        a.encode(Command::SetModel {
+            model: "selected".into(),
+            effort: Some("high".into()),
+        })
+        .expect("select");
+        a.drain_outbox();
+        let sent = one_write(
+            a.encode(Command::Prompt {
+                text: "first".into(),
+            })
+            .expect("send"),
+        );
+        a.encode(Command::SetModel {
+            model: "newer".into(),
+            effort: Some("low".into()),
+        })
+        .expect("select newer");
+        a.drain_outbox();
+        let events = a.feed(r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","fromModel":"selected","toModel":"fallback","reason":"x"}}"#);
+        assert_eq!(events[0].request.as_deref(), Some("codex-model-1"));
+        assert!(matches!(&events[0].event, Event::ModelChanged { model } if model == "fallback"));
+        let ack = a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        assert!(!ack
+            .iter()
+            .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+        let started =
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        assert!(
+            matches!(&started[0].event, Event::TurnStarted { model: Some(model) } if model == "fallback")
+        );
+        let next = one_write(
+            a.encode(Command::Prompt {
+                text: "next".into(),
+            })
+            .expect("next"),
+        );
+        assert_eq!(next["params"]["model"], "newer");
+        assert_eq!(next["params"]["effort"], "low");
+    }
+
+    #[test]
+    fn repeated_model_choices_have_distinct_acceptance_and_rejection_keys() {
+        for success in [false, true] {
+            let mut a = started(Mode::Ask);
+            a.encode(Command::SetModel {
+                model: "same".into(),
+                effort: Some("high".into()),
+            })
+            .expect("first choice");
+            let first_key = a.drain_outbox().events[0].request.clone();
+            let sent = one_write(
+                a.encode(Command::Prompt {
+                    text: "first".into(),
+                })
+                .expect("send"),
+            );
+            for (model, effort) in [("other", "high"), ("same", "low")] {
+                a.encode(Command::SetModel {
+                    model: model.into(),
+                    effort: Some(effort.into()),
+                })
+                .expect("later choice");
+            }
+            let latest_key = a
+                .drain_outbox()
+                .events
+                .last()
+                .expect("latest request")
+                .request
+                .clone();
+            assert_eq!(first_key.as_deref(), Some("codex-model-1"));
+            assert_eq!(latest_key.as_deref(), Some("codex-model-3"));
+            let response = if success {
+                json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}})
+            } else {
+                json!({"id":sent["id"],"error":{"message":"refused"}})
+            };
+            let events = a.feed(&response.to_string());
+            let ack = events
+                .iter()
+                .find(|e| {
+                    matches!(
+                        e.event,
+                        Event::ModelChanged { .. } | Event::ModelChangeFailed { .. }
+                    )
+                })
+                .expect("selection acknowledgement");
+            assert_eq!(ack.request, first_key);
+            assert_ne!(ack.request, latest_key);
+            let next = one_write(
+                a.encode(Command::Prompt {
+                    text: "next".into(),
+                })
+                .expect("next"),
+            );
+            assert_eq!(next["params"]["model"], "same");
+            assert_eq!(next["params"]["effort"], "low");
+        }
     }
 
     #[test]

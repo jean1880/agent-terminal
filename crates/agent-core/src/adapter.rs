@@ -276,6 +276,15 @@ pub trait Adapter {
     fn argv(&self, session: &OpenSession) -> Vec<String>;
     /// Lines to write as soon as the process starts (Claude `initialize`); may be empty.
     fn handshake(&mut self) -> Vec<String>;
+    /// Whether a prompt starts/queues work in the main session, including custom commands.
+    /// Local controls and side processes override this so the host can mark submitted turns
+    /// busy before the backend acknowledges them.
+    fn prompt_starts_turn(&self, _text: &str) -> bool {
+        true
+    }
+    /// Discard prompts waiting for backend startup when the host deliberately stops work.
+    /// A retry after a failed spawn can instead keep them by leaving this uncalled.
+    fn discard_queued_prompts(&mut self) {}
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError>;
     /// One stdout line → zero or more canonical events. Never panics on bad input: an
     /// unparseable line becomes `Event::Unknown` with the text in `raw`.

@@ -90,7 +90,11 @@ for line in sys.stdin:
     elif method in ("thread/start", "thread/resume"):
         if method == "thread/resume":
             assert frame["params"]["threadId"] == thread
-        emit({"id": frame["id"], "result": {"thread": {"id": thread}}})
+        result = {"thread": {"id": thread}}
+        startup_model = root / "startup-model"
+        if startup_model.exists():
+            result["model"] = startup_model.read_text()
+        emit({"id": frame["id"], "result": result})
     elif method == "turn/start":
         turn_number += 1
         turn = f"connection-{connection}-turn-{turn_number}"
@@ -106,7 +110,7 @@ for line in sys.stdin:
             notify("item/started", item={"id": f"{turn}-command", "type": "commandExecution",
                                          "command": "printf synthetic", "status": "inProgress"})
             sys.exit(24)
-        elif scenario == "success":
+        elif scenario == "success" or "Continue the unfinished task after the model switch." in scenario:
             complete()
         else:
             request()

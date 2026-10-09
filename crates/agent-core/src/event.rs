@@ -181,6 +181,15 @@ pub enum Event {
     ModelChanged {
         model: String,
     },
+    /// A selection is waiting for backend acceptance; it is not yet the running model.
+    ModelChangeRequested {
+        model: String,
+    },
+    /// The backend refused a requested selection. Keep the last accepted model.
+    ModelChangeFailed {
+        model: String,
+        message: String,
+    },
     /// Full replacement of the agent's running background tasks (sub-agents, shell commands);
     /// empty once the last one ends. A thread with any is still working after its turn ended.
     /// Claude only (`background_tasks_changed`).

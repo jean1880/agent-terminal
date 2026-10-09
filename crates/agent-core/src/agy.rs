@@ -427,6 +427,11 @@ impl Adapter for AgyAdapter {
         Vec::new()
     }
 
+    fn prompt_starts_turn(&self, text: &str) -> bool {
+        let first = text.split_whitespace().next().unwrap_or_default();
+        !SIDE_COMMANDS.contains(&first.to_ascii_lowercase().as_str())
+    }
+
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match command {
             Command::Prompt { text } => {
@@ -434,7 +439,7 @@ impl Adapter for AgyAdapter {
                 // other `/word` is forwarded as agent text (custom commands and skills).
                 let trimmed = text.trim();
                 let first = trimmed.split_whitespace().next().unwrap_or("");
-                if SIDE_COMMANDS.contains(&first.to_ascii_lowercase().as_str()) {
+                if !self.prompt_starts_turn(&text) {
                     self.side_seq += 1;
                     let id = format!("side-{}", self.side_seq);
                     let command =

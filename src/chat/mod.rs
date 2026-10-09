@@ -77,6 +77,8 @@ pub trait DiffSource {
 pub struct SessionStatus {
     pub driver: Driver,
     pub model: Option<String>,
+    /// Requested selection waiting for backend acceptance. `model` remains the last report.
+    pub pending_model: Option<String>,
     /// Reasoning effort of the session, when one was asked for.
     pub effort: Option<String>,
     pub mode: Mode,

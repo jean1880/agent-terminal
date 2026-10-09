@@ -228,6 +228,7 @@ impl ChatBackend for SessionSlot {
             None => SessionStatus {
                 driver: self.driver,
                 model: self.model.clone(),
+                pending_model: None,
                 effort: None,
                 mode: self.mode,
                 running_turn: false,
@@ -3323,13 +3324,16 @@ impl AgentTerminalWindow {
         let dialog = adw::AlertDialog::new(
             Some("Switch agents now?"),
             Some(&format!(
-                "{} is still working. Switching stops this turn, and discards any approval or \
-                 question waiting for your answer; the unfinished work is carried as \
-                 interrupted.",
+                "{} is still working. Switching interrupts this turn and continues the \
+                 unfinished task with the selected agent. Any approval or question waiting \
+                 for your answer is cancelled; the new turn can ask again.",
                 driver_label(from)
             )),
         );
-        dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", "Stop and Switch")]);
+        dialog.add_responses(&[
+            ("cancel", "Keep Waiting"),
+            ("switch", "Switch and Continue"),
+        ]);
         dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");

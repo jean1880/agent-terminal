@@ -66,6 +66,7 @@ pub fn demo_backend() -> Rc<DemoBackend> {
         status: RefCell::new(SessionStatus {
             driver: Driver::Claude,
             model: Some("claude-opus-5-5".into()),
+            pending_model: None,
             effort: Some("medium".into()),
             mode: Mode::Ask,
             running_turn: false,
