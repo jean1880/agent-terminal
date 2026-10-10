@@ -352,6 +352,20 @@ impl AgentTerminalWindow {
         ));
         group.add(&confirm_row);
 
+        // Warning row: shown prominently when rules differ between Agent Terminal and agent configs
+        let warning_row = adw::ActionRow::builder()
+            .title("Permissions Out of Sync")
+            .use_markup(false)
+            .subtitle("Saved rules differ from agent configurations. Use Import or Export below to synchronise.")
+            .css_classes(["warning"])
+            .visible(false)
+            .build();
+        let warning_icon = gtk4::Image::from_icon_name("at-dialog-warning-symbolic");
+        warning_icon.set_valign(gtk4::Align::Center);
+        warning_icon.add_css_class("warning-indicator");
+        warning_row.add_prefix(&warning_icon);
+        group.add(&warning_row);
+
         // Import permissions row
         let import_row = adw::ActionRow::builder()
             .title("Import Agent Permissions")
@@ -362,27 +376,6 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .css_classes(["pill"])
             .build();
-        import_btn.connect_clicked(glib::clone!(
-            #[weak]
-            obj,
-            move |_| {
-                let imp = obj.imp();
-                if let Some(path) = crate::always_allow::path() {
-                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                    let added_count = rules.import_agent_permissions(None);
-                    if added_count > 0 {
-                        let _ = rules.save(&path);
-                        imp.show_toast(&format!(
-                            "Imported {added_count} permission rules from agent configurations"
-                        ));
-                    } else {
-                        imp.show_toast("Permission rules are already up to date");
-                    }
-                }
-            }
-        ));
-        import_row.add_suffix(&import_btn);
-        group.add(&import_row);
 
         // Export permissions row
         let export_row = adw::ActionRow::builder()
@@ -394,26 +387,6 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .css_classes(["pill"])
             .build();
-        export_btn.connect_clicked(glib::clone!(
-            #[weak]
-            obj,
-            move |_| {
-                let imp = obj.imp();
-                if let Some(path) = crate::always_allow::path() {
-                    let rules = crate::always_allow::AlwaysRules::load(&path);
-                    let exported_count = rules.export_agent_permissions(None);
-                    if exported_count > 0 {
-                        imp.show_toast(&format!(
-                            "Exported {exported_count} permission rules to agent configurations"
-                        ));
-                    } else {
-                        imp.show_toast("Agent configurations are already up to date");
-                    }
-                }
-            }
-        ));
-        export_row.add_suffix(&export_btn);
-        group.add(&export_row);
 
         // Manage rules row
         let rule_count = crate::always_allow::path()
@@ -430,12 +403,87 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .css_classes(["pill"])
             .build();
+
+        let sync_cb = Rc::new(glib::clone!(
+            #[weak]
+            warning_row,
+            #[weak]
+            import_row,
+            #[weak]
+            export_row,
+            #[weak]
+            manage_row,
+            move || {
+                if let Some(path) = crate::always_allow::path() {
+                    let rules = crate::always_allow::AlwaysRules::load(&path);
+                    Self::update_sync_indicator(
+                        &rules,
+                        &warning_row,
+                        &import_row,
+                        &export_row,
+                        &manage_row,
+                    );
+                }
+            }
+        ));
+
+        // Initial sync state check
+        sync_cb();
+
+        let on_sync = sync_cb.clone();
+        import_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                if let Some(path) = crate::always_allow::path() {
+                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
+                    let added_count = rules.import_agent_permissions(None);
+                    if added_count > 0 {
+                        let _ = rules.save(&path);
+                        imp.show_toast(&format!(
+                            "Imported {added_count} permission rules from agent configurations"
+                        ));
+                    } else {
+                        imp.show_toast("Permission rules are already up to date");
+                    }
+                    on_sync();
+                }
+            }
+        ));
+        import_row.add_suffix(&import_btn);
+        group.add(&import_row);
+
+        let on_sync = sync_cb.clone();
+        export_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                if let Some(path) = crate::always_allow::path() {
+                    let rules = crate::always_allow::AlwaysRules::load(&path);
+                    let exported_count = rules.export_agent_permissions(None);
+                    if exported_count > 0 {
+                        imp.show_toast(&format!(
+                            "Exported {exported_count} permission rules to agent configurations"
+                        ));
+                    } else {
+                        imp.show_toast("Agent configurations are already up to date");
+                    }
+                    on_sync();
+                }
+            }
+        ));
+        export_row.add_suffix(&export_btn);
+        group.add(&export_row);
+
+        let on_sync = sync_cb.clone();
         manage_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
             move |btn| {
                 let imp = obj.imp();
-                imp.show_rules_dialog(btn.upcast_ref());
+                imp.show_rules_dialog(btn.upcast_ref(), Some(on_sync.clone()));
             }
         ));
         manage_row.add_suffix(&manage_btn);
@@ -444,16 +492,88 @@ impl AgentTerminalWindow {
         group
     }
 
-    fn show_rules_dialog(&self, parent: &gtk4::Widget) {
+    fn update_sync_indicator(
+        rules: &crate::always_allow::AlwaysRules,
+        warning_row: &adw::ActionRow,
+        import_row: &adw::ActionRow,
+        export_row: &adw::ActionRow,
+        manage_row: &adw::ActionRow,
+    ) {
+        manage_row.set_subtitle(&format!(
+            "{} active rules stored in always-allow.json",
+            rules.rules.len()
+        ));
+
+        let status = rules.check_sync_status(None);
+        if status.is_out_of_sync() {
+            warning_row.set_subtitle(&status.summary());
+            warning_row.set_visible(true);
+
+            if status.unimported_count > 0 {
+                import_row.add_css_class("warning");
+                import_row.set_subtitle(&format!(
+                    "One-way import: pull {} unimported rule{} from agent configurations",
+                    status.unimported_count,
+                    if status.unimported_count == 1 {
+                        " is"
+                    } else {
+                        "s are"
+                    }
+                ));
+            } else {
+                import_row.remove_css_class("warning");
+                import_row.set_subtitle(
+                    "One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml",
+                );
+            }
+
+            if status.unexported_count > 0 {
+                export_row.add_css_class("warning");
+                export_row.set_subtitle(&format!(
+                    "One-way export: push {} unsynced rule{} to agent configurations",
+                    status.unexported_count,
+                    if status.unexported_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+            } else {
+                export_row.remove_css_class("warning");
+                export_row.set_subtitle(
+                    "One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations",
+                );
+            }
+        } else {
+            warning_row.set_visible(false);
+            import_row.remove_css_class("warning");
+            import_row.set_subtitle(
+                "One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml",
+            );
+            export_row.remove_css_class("warning");
+            export_row.set_subtitle(
+                "One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations",
+            );
+        }
+    }
+
+    fn show_rules_dialog(&self, parent: &gtk4::Widget, on_changed: Option<Rc<dyn Fn()>>) {
         let Some(path) = crate::always_allow::path() else {
             return;
         };
         let rules = crate::always_allow::AlwaysRules::load(&path);
+        let status = rules.check_sync_status(None);
 
-        let dialog = adw::AlertDialog::new(
-            Some("Permission Rules"),
-            Some("Rules that automatically approve matching commands and tools."),
-        );
+        let subtitle = if status.is_out_of_sync() {
+            format!(
+                "Warning: {}. Rules that automatically approve matching commands and tools.",
+                status.summary()
+            )
+        } else {
+            "Rules that automatically approve matching commands and tools.".to_string()
+        };
+
+        let dialog = adw::AlertDialog::new(Some("Permission Rules"), Some(&subtitle));
 
         let scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -496,6 +616,7 @@ impl AgentTerminalWindow {
                 let obj = self.obj();
                 let p = path.clone();
                 let idx = i;
+                let cb = on_changed.clone();
                 del_btn.connect_clicked(glib::clone!(
                     #[weak]
                     obj,
@@ -509,6 +630,9 @@ impl AgentTerminalWindow {
                             let _ = current_rules.save(&p);
                             row.set_visible(false);
                             imp.show_toast("Rule removed");
+                            if let Some(ref f) = cb {
+                                f();
+                            }
                         }
                     }
                 ));
@@ -547,6 +671,9 @@ impl AgentTerminalWindow {
                         } else {
                             imp.show_toast("Permission rules are already up to date");
                         }
+                        if let Some(ref f) = on_changed {
+                            f();
+                        }
                     }
                     "export" => {
                         let rules = crate::always_allow::AlwaysRules::load(&p);
@@ -557,6 +684,9 @@ impl AgentTerminalWindow {
                             ));
                         } else {
                             imp.show_toast("Agent configurations are already up to date");
+                        }
+                        if let Some(ref f) = on_changed {
+                            f();
                         }
                     }
                     _ => {}

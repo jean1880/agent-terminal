@@ -146,6 +146,40 @@ pub fn matches_wildcard(pattern: &str, text: &str) -> bool {
     p_idx == p_bytes.len()
 }
 
+/// Status representing whether Agent Terminal permission rules and external
+/// agent configurations (permissions.toml, Claude, Antigravity) are in sync.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionSyncStatus {
+    /// Rules present in external agent configs that are not yet imported into Agent Terminal.
+    pub unimported_count: usize,
+    /// Rules in Agent Terminal that are not yet exported to external agent configs.
+    pub unexported_count: usize,
+}
+
+impl PermissionSyncStatus {
+    pub fn is_out_of_sync(&self) -> bool {
+        self.unimported_count > 0 || self.unexported_count > 0
+    }
+
+    pub fn summary(&self) -> String {
+        match (self.unimported_count, self.unexported_count) {
+            (0, 0) => "Permission rules are in sync with agent configurations".to_string(),
+            (i, 0) => format!(
+                "{i} external rule{} not imported into Agent Terminal",
+                if i == 1 { " is" } else { "s are" }
+            ),
+            (0, e) => format!(
+                "{e} rule{} in Agent Terminal not exported to agent configurations",
+                if e == 1 { "" } else { "s" }
+            ),
+            (i, e) => format!(
+                "{i} unimported and {e} unexported rule{} between Agent Terminal and agent configurations",
+                if i + e == 1 { "" } else { "s" }
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlwaysRules {
     #[serde(default)]
@@ -271,8 +305,7 @@ impl AlwaysRules {
         added
     }
 
-    /// Exports rules to `permissions.toml`.
-    pub fn export_to_permissions_toml(&self, path: &Path) -> Result<usize, std::io::Error> {
+    fn sync_permissions_toml(&self, path: &Path, write: bool) -> Result<usize, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
         let mut new_content = content.clone();
         let mut added = 0;
@@ -321,7 +354,7 @@ impl AlwaysRules {
             }
         }
 
-        if added > 0 {
+        if write && added > 0 {
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, new_content)?;
             std::fs::rename(&tmp, path)?;
@@ -329,8 +362,17 @@ impl AlwaysRules {
         Ok(added)
     }
 
-    /// Exports rules to Claude `settings.json`.
-    pub fn export_to_claude_settings(&self, path: &Path) -> Result<usize, std::io::Error> {
+    /// Exports rules to `permissions.toml`.
+    pub fn export_to_permissions_toml(&self, path: &Path) -> Result<usize, std::io::Error> {
+        self.sync_permissions_toml(path, true)
+    }
+
+    /// Counts how many rules from `AlwaysRules` are missing from `permissions.toml`.
+    pub fn count_unexported_to_permissions_toml(&self, path: &Path) -> usize {
+        self.sync_permissions_toml(path, false).unwrap_or(0)
+    }
+
+    fn sync_claude_settings(&self, path: &Path, write: bool) -> Result<usize, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
         let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
             return Ok(0);
@@ -386,7 +428,7 @@ impl AlwaysRules {
             }
         }
 
-        if added > 0 {
+        if write && added > 0 {
             let formatted = serde_json::to_string_pretty(&val).map_err(std::io::Error::other)?;
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, formatted)?;
@@ -395,8 +437,17 @@ impl AlwaysRules {
         Ok(added)
     }
 
-    /// Exports rules to Antigravity `settings.json`.
-    pub fn export_to_agy_settings(&self, path: &Path) -> Result<usize, std::io::Error> {
+    /// Exports rules to Claude `settings.json`.
+    pub fn export_to_claude_settings(&self, path: &Path) -> Result<usize, std::io::Error> {
+        self.sync_claude_settings(path, true)
+    }
+
+    /// Counts how many rules from `AlwaysRules` are missing from Claude `settings.json`.
+    pub fn count_unexported_to_claude_settings(&self, path: &Path) -> usize {
+        self.sync_claude_settings(path, false).unwrap_or(0)
+    }
+
+    fn sync_agy_settings(&self, path: &Path, write: bool) -> Result<usize, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
         let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
             return Ok(0);
@@ -444,13 +495,66 @@ impl AlwaysRules {
             }
         }
 
-        if added > 0 {
+        if write && added > 0 {
             let formatted = serde_json::to_string_pretty(&val).map_err(std::io::Error::other)?;
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, formatted)?;
             std::fs::rename(&tmp, path)?;
         }
         Ok(added)
+    }
+
+    /// Exports rules to Antigravity `settings.json`.
+    pub fn export_to_agy_settings(&self, path: &Path) -> Result<usize, std::io::Error> {
+        self.sync_agy_settings(path, true)
+    }
+
+    /// Counts how many rules from `AlwaysRules` are missing from Antigravity `settings.json`.
+    pub fn count_unexported_to_agy_settings(&self, path: &Path) -> usize {
+        self.sync_agy_settings(path, false).unwrap_or(0)
+    }
+
+    /// Counts how many rules in Agent Terminal are not yet exported to available agent configurations.
+    pub fn count_unexported(&self, home: Option<&Path>) -> usize {
+        let mut count = 0;
+        let home_buf = if cfg!(test) {
+            home.map(PathBuf::from)
+        } else {
+            home.map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        };
+        let Some(home) = home_buf else {
+            return 0;
+        };
+
+        let perm_toml = home.join("git/agent-config/sync/permissions.toml");
+        if perm_toml.exists() {
+            count += self.count_unexported_to_permissions_toml(&perm_toml);
+        }
+
+        let claude_settings = home.join(".claude/settings.json");
+        if claude_settings.exists() {
+            count += self.count_unexported_to_claude_settings(&claude_settings);
+        }
+
+        let agy_settings = home.join(".gemini/antigravity-cli/settings.json");
+        if agy_settings.exists() {
+            count += self.count_unexported_to_agy_settings(&agy_settings);
+        }
+
+        count
+    }
+
+    /// Checks the synchronization state between Agent Terminal's `AlwaysRules`
+    /// and the external agent configuration files.
+    pub fn check_sync_status(&self, home: Option<&Path>) -> PermissionSyncStatus {
+        let mut scratch = self.clone();
+        let unimported_count = scratch.import_agent_permissions(home);
+        let unexported_count = self.count_unexported(home);
+        PermissionSyncStatus {
+            unimported_count,
+            unexported_count,
+        }
     }
 
     /// Parses allow rules from `permissions.toml`.
@@ -839,5 +943,62 @@ mcp = [
 
         // Rules themselves are untouched (strict one-way)
         assert_eq!(rules.rules.len(), 6);
+    }
+
+    #[test]
+    fn sync_status_detection() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+
+        let toml_dir = home.join("git/agent-config/sync");
+        std::fs::create_dir_all(&toml_dir).unwrap();
+        let toml_path = toml_dir.join("permissions.toml");
+        std::fs::write(&toml_path, "[allow]\nshell = [\n    \"fdfind\",\n]\n").unwrap();
+
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let claude_path = claude_dir.join("settings.json");
+        std::fs::write(
+            &claude_path,
+            r#"{"permissions":{"allow":["Bash(date:*)"]}}"#,
+        )
+        .unwrap();
+
+        let agy_dir = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&agy_dir).unwrap();
+        let agy_path = agy_dir.join("settings.json");
+        std::fs::write(
+            &agy_path,
+            r#"{"permissions":{"allow":["command(uptime)"]}}"#,
+        )
+        .unwrap();
+
+        // 1. Initial state: rules is empty, external configs have 3 rules.
+        let mut rules = AlwaysRules::default();
+        let status = rules.check_sync_status(Some(home));
+        assert!(status.is_out_of_sync());
+        assert_eq!(status.unimported_count, 3);
+        assert_eq!(status.unexported_count, 0);
+        assert!(status
+            .summary()
+            .contains("3 external rules are not imported"));
+
+        // 2. Import external rules: imported count is 0, but external configs don't yet share each other's rules (6 unexported)
+        assert_eq!(rules.import_agent_permissions(Some(home)), 3);
+        let status2 = rules.check_sync_status(Some(home));
+        assert!(status2.is_out_of_sync());
+        assert_eq!(status2.unimported_count, 0);
+        assert_eq!(status2.unexported_count, 6);
+
+        // 3. Export to external configs: now everything is in sync across all configs!
+        assert_eq!(rules.export_agent_permissions(Some(home)), 6);
+        let status3 = rules.check_sync_status(Some(home));
+        assert!(!status3.is_out_of_sync());
+        assert_eq!(status3.unimported_count, 0);
+        assert_eq!(status3.unexported_count, 0);
+        assert_eq!(
+            status3.summary(),
+            "Permission rules are in sync with agent configurations"
+        );
     }
 }
