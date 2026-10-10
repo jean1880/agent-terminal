@@ -199,6 +199,8 @@ struct Inner {
     queued_prompts: RefCell<std::collections::VecDeque<QueuedPrompt>>,
     weak_self: RefCell<Option<std::rc::Weak<Inner>>>,
     prompt_in_flight: Cell<bool>,
+    /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
+    last_enriched_step: Cell<Option<u64>>,
 }
 
 struct QueuedPrompt {
@@ -247,6 +249,59 @@ fn hookless_text(unbound: Option<&str>) -> String {
             crate::hook_config::install_entry_json()
         ),
     }
+}
+
+/// Reads the thinking block for `target_index` from the native Antigravity transcript on disk.
+/// Antigravity CLI omits raw thinking strings from stdout in `--output-format stream-json`,
+/// but writes them synchronously to `~/.gemini/antigravity-cli/brain/<conv_id>/.system_generated/logs/transcript.jsonl`.
+fn find_agy_thinking(conv_id: &str, target_index: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let home = std::env::var("HOME").ok()?;
+    let home_path = Path::new(&home);
+    let paths = [
+        home_path
+            .join(".gemini/antigravity-cli/brain")
+            .join(conv_id)
+            .join(".system_generated/logs/transcript.jsonl"),
+        home_path
+            .join(".gemini/brain")
+            .join(conv_id)
+            .join(".system_generated/logs/transcript.jsonl"),
+    ];
+    let path = paths.iter().find(|p| p.exists())?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+
+    // Read the tail of the transcript (up to 64 KiB), where recent steps live.
+    let to_read = len.min(65_536) as usize;
+    let seek_pos = len.saturating_sub(65_536);
+    file.seek(SeekFrom::Start(seek_pos)).ok()?;
+    let mut buf = vec![0u8; to_read];
+    file.read_exact(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+
+    for line in text.lines().rev() {
+        if !line.contains("\"thinking\"") {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(idx) = val.get("step_index").and_then(serde_json::Value::as_u64) {
+                if idx == target_index || (idx == target_index.saturating_sub(1) && target_index > 0) {
+                    if let Some(th) = val.get("thinking").and_then(serde_json::Value::as_str) {
+                        let trimmed = th.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// One thread's chat backend. See the module docs.
@@ -362,6 +417,7 @@ impl ChatSession {
             queued_prompts: RefCell::new(std::collections::VecDeque::new()),
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
+            last_enriched_step: Cell::new(None),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -565,10 +621,12 @@ impl Inner {
                     self.set_model(m);
                 }
                 self.state.borrow_mut().running_turn = true;
+                self.last_enriched_step.set(None);
             }
             Event::TurnCompleted { state, .. } => {
                 self.prompt_in_flight.set(false);
                 self.state.borrow_mut().running_turn = false;
+                self.last_enriched_step.set(None);
                 // A completed turn is the proof the new agent read the handoff it carried; any
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
@@ -825,6 +883,68 @@ impl Inner {
         self.approval.borrow().clone()
     }
 
+    /// Enriches an Antigravity `step_update` line with its thinking string from the native transcript.
+    /// `agy` streams token usage over stdout but omits the raw thinking block, persisting it to disk.
+    fn enrich_agy_step<'a>(&self, line: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.adapter.borrow().driver() != Driver::Agy || !line.contains("\"step_update\"") {
+            return std::borrow::Cow::Borrowed(line);
+        }
+
+        let mut val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return std::borrow::Cow::Borrowed(line),
+        };
+
+        if val.get("event").and_then(serde_json::Value::as_str) != Some("step_update") {
+            return std::borrow::Cow::Borrowed(line);
+        }
+
+        let step_obj = match val.get_mut("step_update").and_then(serde_json::Value::as_object_mut) {
+            Some(obj) => obj,
+            None => return std::borrow::Cow::Borrowed(line),
+        };
+
+        let has_thinking = step_obj
+            .get("thinking")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| !t.trim().is_empty());
+        if has_thinking {
+            return std::borrow::Cow::Borrowed(line);
+        }
+
+        let step_index = match step_obj.get("step_index").and_then(serde_json::Value::as_u64) {
+            Some(i) => i,
+            None => return std::borrow::Cow::Borrowed(line),
+        };
+
+        if self.last_enriched_step.get() == Some(step_index) {
+            return std::borrow::Cow::Borrowed(line);
+        }
+
+        let conv_id = step_obj
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| self.state.borrow().native_id.clone());
+
+        let Some(conv_id) = conv_id else {
+            return std::borrow::Cow::Borrowed(line);
+        };
+
+        if let Some(thinking) = find_agy_thinking(&conv_id, step_index) {
+            self.last_enriched_step.set(Some(step_index));
+            step_obj.insert("thinking".to_string(), serde_json::Value::String(thinking.clone()));
+            if let Some(tool_info) = step_obj.get_mut("tool_info").and_then(serde_json::Value::as_object_mut) {
+                tool_info.insert("thinking".to_string(), serde_json::Value::String(thinking));
+            }
+            if let Ok(serialized) = serde_json::to_string(&val) {
+                return std::borrow::Cow::Owned(serialized);
+            }
+        }
+
+        std::borrow::Cow::Borrowed(line)
+    }
+
     fn on_line(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
         if generation != self.generation.get() {
             return;
@@ -832,7 +952,8 @@ impl Inner {
         let envelopes = if stderr {
             self.adapter.borrow_mut().feed_stderr(line)
         } else {
-            self.adapter.borrow_mut().feed(line)
+            let enriched = self.enrich_agy_step(line);
+            self.adapter.borrow_mut().feed(&enriched)
         };
         for env in envelopes {
             self.emit(env.clone());
@@ -4292,5 +4413,131 @@ mod tests {
                 })
             }));
         });
+    }
+
+    #[test]
+    fn enrich_agy_step_reads_thinking_from_native_transcript() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let conv_id = "test-conv-12345678";
+        let logs_dir = tmp
+            .path()
+            .join(".gemini/antigravity-cli/brain")
+            .join(conv_id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).expect("mkdir");
+
+        // Write a transcript entry containing a thinking block for step 2
+        let transcript_line = serde_json::json!({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "thinking": "Observing the file contents to see existing functions.",
+            "tool_calls": [{"name": "view_file"}]
+        });
+        std::fs::write(
+            logs_dir.join("transcript.jsonl"),
+            format!("{transcript_line}\n"),
+        )
+        .expect("write transcript");
+
+        // Set HOME temporarily so find_agy_thinking locates the test transcript
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::agy::AgyAdapter::new("agy")),
+                OpenSession {
+                    program: "unused".into(),
+                    extra_args: Vec::new(),
+                    cwd: "/".into(),
+                    model: None,
+                    effort: None,
+                    mode: Mode::Plan,
+                    resume: None,
+                    new_session_id: None,
+                    approval_hook: false,
+                },
+                store,
+                thread,
+                sink,
+                None,
+            );
+
+            // AGY stdout frame without thinking
+            let stdout_frame = serde_json::json!({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": conv_id,
+                    "state": "ACTIVE",
+                    "step_index": 2,
+                    "step_type": "tool",
+                    "tool_name": "view_file",
+                    "tool_info": {
+                        "name": "view_file",
+                        "parameters": {"AbsolutePath": "/work/file.rs"}
+                    }
+                }
+            })
+            .to_string();
+
+            session.inner.on_line(session.inner.generation.get(), &stdout_frame, false);
+
+            // The session should have emitted a Reasoning ItemStarted + ContentDelta with the thinking text!
+            let has_reasoning = seen.borrow().iter().any(|env| {
+                matches!(
+                    &env.event,
+                    Event::ItemStarted { kind: ItemKind::Reasoning, .. }
+                )
+            });
+            assert!(has_reasoning, "expected ItemKind::Reasoning to be emitted");
+
+            let reasoning_delta = seen.borrow().iter().find_map(|env| {
+                if let Event::ContentDelta { stream: StreamKind::Reasoning, text } = &env.event {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(
+                reasoning_delta.as_deref(),
+                Some("Observing the file contents to see existing functions.")
+            );
+
+            // Redundant DONE step update should not emit a second Reasoning ItemStarted
+            let done_frame = serde_json::json!({
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": conv_id,
+                    "state": "DONE",
+                    "step_index": 2,
+                    "step_type": "tool",
+                    "tool_name": "view_file",
+                    "tool_info": {
+                        "name": "view_file",
+                        "output": "file content",
+                        "parameters": {"AbsolutePath": "/work/file.rs"}
+                    }
+                }
+            })
+            .to_string();
+
+            session.inner.on_line(session.inner.generation.get(), &done_frame, false);
+
+            let reasoning_count = seen
+                .borrow()
+                .iter()
+                .filter(|env| matches!(&env.event, Event::ItemStarted { kind: ItemKind::Reasoning, .. }))
+                .count();
+            assert_eq!(reasoning_count, 1, "thinking item should not be duplicated");
+        });
+
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        }
     }
 }

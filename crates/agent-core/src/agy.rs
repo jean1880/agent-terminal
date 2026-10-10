@@ -7,7 +7,7 @@
 //! (`agent-terminal --approval-hook`, see [`crate::approval`]) is the gate, so `Approve` and
 //! `Answer` are unsupported on purpose.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
@@ -68,6 +68,8 @@ pub struct AgyAdapter {
     prompt_pending: bool,
     /// Ids of items started and not yet completed, in start order.
     open_items: Vec<String>,
+    /// Thinking item IDs that have already completed, preventing re-opening on redundant step updates.
+    completed_thinks: HashSet<String>,
     side_seq: u64,
     side_kinds: HashMap<String, SideKind>,
     /// An interrupt or respawn was requested, so the coming exit is expected.
@@ -98,6 +100,7 @@ impl AgyAdapter {
             turn_open: false,
             prompt_pending: false,
             open_items: Vec::new(),
+            completed_thinks: HashSet::new(),
             side_seq: 0,
             side_kinds: HashMap::new(),
             exit_expected: false,
@@ -275,18 +278,21 @@ impl AgyAdapter {
             .filter(|t| !t.trim().is_empty());
         if let Some(think_text) = think {
             let think_id = self.item_id("think", index);
-            if !self.open_items.contains(&think_id) {
-                self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
-            }
-            out.push(
-                Envelope::new(Event::ContentDelta {
-                    stream: StreamKind::Reasoning,
-                    text: think_text.to_owned(),
-                })
-                .item(&think_id),
-            );
-            if step.state == "DONE" {
-                self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
+            if !self.completed_thinks.contains(&think_id) {
+                if !self.open_items.contains(&think_id) {
+                    self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
+                }
+                out.push(
+                    Envelope::new(Event::ContentDelta {
+                        stream: StreamKind::Reasoning,
+                        text: think_text.to_owned(),
+                    })
+                    .item(&think_id),
+                );
+                if step.state == "DONE" {
+                    self.completed_thinks.insert(think_id.clone());
+                    self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
+                }
             }
         }
 
@@ -327,16 +333,19 @@ impl AgyAdapter {
             .filter(|t| !t.trim().is_empty());
         if let Some(think_text) = think {
             let think_id = self.item_id("think", index);
-            if !self.open_items.contains(&think_id) {
-                self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
-                out.push(
-                    Envelope::new(Event::ContentDelta {
-                        stream: StreamKind::Reasoning,
-                        text: think_text.to_owned(),
-                    })
-                    .item(&think_id),
-                );
-                self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
+            if !self.completed_thinks.contains(&think_id) {
+                self.completed_thinks.insert(think_id.clone());
+                if !self.open_items.contains(&think_id) {
+                    self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
+                    out.push(
+                        Envelope::new(Event::ContentDelta {
+                            stream: StreamKind::Reasoning,
+                            text: think_text.to_owned(),
+                        })
+                        .item(&think_id),
+                    );
+                    self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
+                }
             }
         }
 

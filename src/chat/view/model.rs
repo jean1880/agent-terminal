@@ -886,7 +886,22 @@ impl Transcript {
                     parent_item.children.push(id.clone());
                 }
             }
-            None => self.order.push(id.clone()),
+            None => {
+                let is_queued = matches!(&body, Body::User { queued: true, .. });
+                if !is_queued {
+                    if let Some(first_queued) = self.order.iter().position(|oid| {
+                        self.items
+                            .get(oid)
+                            .is_some_and(|item| matches!(&item.body, Body::User { queued: true, .. }))
+                    }) {
+                        self.order.insert(first_queued, id.clone());
+                    } else {
+                        self.order.push(id.clone());
+                    }
+                } else {
+                    self.order.push(id.clone());
+                }
+            }
         }
         self.items.insert(
             id.clone(),
@@ -3026,6 +3041,64 @@ mod tests {
     }
 
     #[test]
+    fn queued_user_prompts_stay_pinned_at_the_bottom_of_transcript_order() {
+        let mut t = Transcript::new();
+        // Turn 1 starts with a user message
+        t.apply(&started("u1", ItemKind::UserMessage, None), Driver::Agy);
+        // Turn 1 runs a tool
+        t.apply(&started("t1", ItemKind::FileRead, None), Driver::Agy);
+
+        // While turn 1 is running, the operator queues a follow-up prompt
+        let q_envelope = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::UserMessage,
+            title: "queued".to_string(),
+            input: Some(serde_json::json!({"queued": true})),
+            parent: None,
+        })
+        .item("q1");
+        t.apply(&q_envelope, Driver::Agy);
+
+        assert_eq!(t.order(), ["u1", "t1", "q1"]);
+
+        // Turn 1 continues emitting events: another tool, reasoning, assistant message
+        t.apply(&started("t2", ItemKind::Command, None), Driver::Agy);
+        t.apply(&started("r1", ItemKind::Reasoning, None), Driver::Agy);
+        t.apply(&started("a1", ItemKind::AssistantMessage, None), Driver::Agy);
+
+        // Queued prompt q1 must remain at the very end
+        assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1"]);
+
+        // Operator queues a second prompt
+        let q2_envelope = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::UserMessage,
+            title: "queued".to_string(),
+            input: Some(serde_json::json!({"queued": true})),
+            parent: None,
+        })
+        .item("q2");
+        t.apply(&q2_envelope, Driver::Agy);
+
+        assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1", "q2"]);
+
+        // Turn 1 completes and q1 is unqueued
+        let unqueue_q1 = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::UserMessage,
+            title: String::new(),
+            input: None,
+            parent: None,
+        })
+        .item("q1");
+        t.apply(&unqueue_q1, Driver::Agy);
+
+        // q1 is now active, q2 is still queued at the end
+        assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1", "q2"]);
+
+        // q1's turn emits a tool
+        t.apply(&started("t3", ItemKind::FileRead, None), Driver::Agy);
+        assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1", "t3", "q2"]);
+    }
+
+    #[test]
     fn token_formatting() {
         assert_eq!(format_tokens(950), "950");
         assert_eq!(format_tokens(2_082), "2.1k");
@@ -3036,3 +3109,4 @@ mod tests {
         assert_eq!(format_tokens(1_000_000), "1M");
     }
 }
+

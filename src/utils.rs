@@ -368,7 +368,7 @@ pub fn strip_env(env: &mut Vec<String>, patterns: &[String]) -> Vec<String> {
 /// mistaken for health.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndicatorState {
-    Ok,
+    Ok { detail: String },
     Warn { detail: String },
     Unknown { reason: String },
 }
@@ -377,7 +377,7 @@ impl IndicatorState {
     /// The detail text to show when the indicator is clicked.
     pub fn detail(&self) -> &str {
         match self {
-            IndicatorState::Ok => "",
+            IndicatorState::Ok { detail } => detail,
             IndicatorState::Warn { detail } => detail,
             IndicatorState::Unknown { reason } => reason,
         }
@@ -405,7 +405,9 @@ fn read_indicator_with(source: &crate::config::IndicatorSource, search: &str) ->
                     if content.lines().any(|line| !line.trim().is_empty()) {
                         IndicatorState::Warn { detail: content }
                     } else {
-                        IndicatorState::Ok
+                        IndicatorState::Ok {
+                            detail: String::new(),
+                        }
                     }
                 }
                 Err(err) => IndicatorState::Unknown {
@@ -447,7 +449,10 @@ fn run_with_timeout(
     let mut cmd = std::process::Command::new(command);
     cmd.args(args).env("PATH", search);
     match run_command(cmd, command, timeout_secs) {
-        Ok(output) if output.status.success() => IndicatorState::Ok,
+        Ok(output) if output.status.success() => {
+            let detail = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            IndicatorState::Ok { detail }
+        }
         Ok(output) => {
             let mut detail = String::from_utf8_lossy(&output.stdout).to_string();
             if detail.trim().is_empty() {
@@ -1086,7 +1091,9 @@ mod tests {
             read_indicator(&crate::config::IndicatorSource::File {
                 path: empty.to_string_lossy().to_string(),
             }),
-            IndicatorState::Ok
+            IndicatorState::Ok {
+                detail: String::new()
+            }
         );
 
         let populated = dir.path().join("drift.txt");
@@ -1149,7 +1156,24 @@ mod tests {
                 argv: vec!["true".to_string()],
                 timeout_secs: 5,
             }),
-            IndicatorState::Ok
+            IndicatorState::Ok {
+                detail: String::new()
+            }
+        );
+
+        let state = read_indicator(&crate::config::IndicatorSource::Command {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'LiteLLM: 100 tok'; exit 0".to_string(),
+            ],
+            timeout_secs: 5,
+        });
+        assert_eq!(
+            state,
+            IndicatorState::Ok {
+                detail: "LiteLLM: 100 tok".to_string()
+            }
         );
 
         let state = read_indicator(&crate::config::IndicatorSource::Command {

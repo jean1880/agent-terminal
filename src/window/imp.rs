@@ -68,13 +68,13 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;O</property>
-                <property name="title">New Tab in Folder</property>
+                <property name="title">New Thread in Existing Folder</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;G</property>
-                <property name="title">New Tab in Worktree</property>
+                <property name="title">New Thread in Isolated Git Worktree</property>
               </object>
             </child>
             <child>
@@ -1461,13 +1461,16 @@ impl AgentTerminalWindow {
             obj.add_action(&action);
         }
 
-        // New Tab in Worktree, as the active profile or a named one.
+        // New Thread in Isolated Git Worktree, as the active profile or a named one.
+        // Disabled (greyed out in menus) if git is not installed on the system.
         let new_tab_worktree = gtk4::gio::SimpleAction::new("new-tab-worktree", None);
+        let git_available = agent_kit::git::git_installed();
+        new_tab_worktree.set_enabled(git_available);
         new_tab_worktree.connect_activate(glib::clone!(
             #[weak]
             obj,
             move |_, _| {
-                debug!("Action: New Tab in Worktree");
+                debug!("Action: New Thread in Isolated Git Worktree");
                 obj.imp().new_tab_in_worktree(None);
             }
         ));
@@ -1476,6 +1479,7 @@ impl AgentTerminalWindow {
             "new-tab-worktree-profile",
             Some(&String::static_variant_type()),
         );
+        new_tab_worktree_as.set_enabled(git_available);
         new_tab_worktree_as.connect_activate(glib::clone!(
             #[weak]
             obj,
@@ -1796,11 +1800,26 @@ impl AgentTerminalWindow {
                 in_flight.set(false);
 
                 let (icon, css, tooltip) = match &state {
-                    crate::utils::IndicatorState::Ok => (
-                        &indicator.icon_ok,
-                        "success-indicator",
-                        format!("{}: OK", indicator.label),
-                    ),
+                    crate::utils::IndicatorState::Ok { detail } => {
+                        let first_line = detail.lines().find(|l| !l.trim().is_empty()).map(str::trim);
+                        let tooltip = match first_line {
+                            Some(line) => {
+                                if line.starts_with(&format!("{}:", indicator.label))
+                                    || line.starts_with(&indicator.label)
+                                {
+                                    line.to_string()
+                                } else {
+                                    format!("{}: {line}", indicator.label)
+                                }
+                            }
+                            None => format!("{}: OK", indicator.label),
+                        };
+                        (
+                            &indicator.icon_ok,
+                            "success-indicator",
+                            tooltip,
+                        )
+                    }
                     crate::utils::IndicatorState::Warn { .. } => (
                         &indicator.icon_warn,
                         "warning-indicator",
@@ -1849,7 +1868,7 @@ impl AgentTerminalWindow {
     fn present_indicator_detail(&self, indicator: &crate::config::Indicator, detail: &str) {
         let obj = self.obj();
         let body = if detail.trim().is_empty() {
-            "Nothing to report.".to_string()
+            "All systems healthy. No warnings or issues detected.".to_string()
         } else {
             detail.to_string()
         };
@@ -2405,13 +2424,16 @@ impl AgentTerminalWindow {
         *self.new_with_menu.borrow_mut() = Some(with.clone());
         self.fill_new_with_menu();
         threads.append_submenu(Some("New Thread With"), &with);
-        threads.append(Some("New Thread in Folder…"), Some("win.new-tab-folder"));
+        threads.append(
+            Some("New Thread in Existing Folder…"),
+            Some("win.new-tab-folder"),
+        );
         threads.append(
             Some("Review Multi-Agent Environment…"),
             Some("win.review-environment"),
         );
         threads.append(
-            Some("New Thread in Worktree…"),
+            Some("New Thread in Isolated Git Worktree…"),
             Some("win.new-tab-worktree"),
         );
         menu.append_section(None, &threads);
@@ -2429,7 +2451,7 @@ impl AgentTerminalWindow {
     fn new_tab_in_folder(&self, profile: Option<Profile>) {
         let obj = self.obj();
         let dialog = gtk4::FileDialog::builder()
-            .title("Select Folder for New Tab")
+            .title("Select Folder for New Thread")
             .accept_label("Open")
             .modal(true)
             .build();
@@ -3083,14 +3105,20 @@ impl AgentTerminalWindow {
             Some("New Tab As"),
             &self.build_profile_menu("win.new-tab-profile", |_| true),
         );
-        menu.append(Some("New Tab in Folder…"), Some("win.new-tab-folder"));
+        menu.append(
+            Some("New Tab in Existing Folder…"),
+            Some("win.new-tab-folder"),
+        );
         menu.append_submenu(
-            Some("New Tab in Folder As"),
+            Some("New Tab in Existing Folder As"),
             &self.build_profile_menu("win.new-tab-folder-profile", |_| true),
         );
-        menu.append(Some("New Tab in Worktree…"), Some("win.new-tab-worktree"));
+        menu.append(
+            Some("New Tab in Isolated Git Worktree…"),
+            Some("win.new-tab-worktree"),
+        );
         menu.append_submenu(
-            Some("New Tab in Worktree As"),
+            Some("New Tab in Isolated Git Worktree As"),
             &self.build_profile_menu("win.new-tab-worktree-profile", |_| true),
         );
         menu.append(Some("New Window"), Some("app.new-window"));
@@ -3712,9 +3740,9 @@ impl AgentTerminalWindow {
             .title("Checkpoints and Worktrees")
             .description(
                 "A worktree is a second checkout of a repository, on its own branch, in its own \
-                 folder. New Thread in Worktree (Ctrl+Shift+G) makes one, so an agent can work \
-                 without touching the checkout you are using. The starting directory (General) \
-                 is only where new threads open by default.",
+                 folder. New Thread in Isolated Git Worktree (Ctrl+Shift+G) makes one, so an \
+                 agent can work without touching the checkout you are using. The starting \
+                 directory (General) is only where new threads open by default.",
             )
             .build();
         history.add(&checkpoints_row);
@@ -5200,10 +5228,15 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// New Tab in Worktree: checks, off the main thread, that the current
+    /// New Thread in Isolated Git Worktree: checks, off the main thread, that the current
     /// tab is in a repository, then asks for the branch to create.
     fn new_tab_in_worktree(&self, profile: Option<Profile>) {
+        if !agent_kit::git::git_installed() {
+            self.show_toast("Git is not installed on this system");
+            return;
+        }
         let Some(dir) = self.current_dir() else {
+            self.show_toast("Select or open a folder first");
             return;
         };
         let obj = self.obj();
@@ -5220,13 +5253,8 @@ impl AgentTerminalWindow {
                 .unwrap_or_else(|_| Err("the repository check panicked".to_string()));
                 match found {
                     Ok((main, branch)) => obj.imp().show_worktree_dialog(main, branch, profile),
-                    Err(err) => present_message(
-                        &obj,
-                        "Not in a Git Repository",
-                        &format!(
-                            "New Tab in Worktree starts from the current tab's repository, \
-                             and its folder is not in one.\n\n{err}"
-                        ),
+                    Err(_) => obj.imp().show_toast(
+                        "Isolated worktrees require a Git repository: this folder is not in one",
                     ),
                 }
             }
@@ -5266,8 +5294,8 @@ impl AgentTerminalWindow {
             .build();
         let note = Label::builder()
             .label(
-                "Ignored files (node_modules, .env, build output) are not copied into a \
-                 new worktree.",
+                "Ignored files (node_modules, .env, build output) are not copied into an \
+                 isolated worktree.",
             )
             .wrap(true)
             .xalign(0.0)
@@ -5286,8 +5314,11 @@ impl AgentTerminalWindow {
         form.append(&note);
 
         let dialog = adw::AlertDialog::new(
-            Some("New Tab in Worktree"),
-            Some("Creates a branch in a worktree of its own and opens a tab there."),
+            Some("New Thread in Isolated Git Worktree"),
+            Some(
+                "Creates a new Git branch and an isolated checkout folder so the agent \
+                 can experiment without modifying your current branch or uncommitted work.",
+            ),
         );
         dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
         dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);

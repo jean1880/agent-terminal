@@ -149,7 +149,7 @@ terms yourself and do not use this integration if they do not permit your intend
    is signed in to. It also asks which agent new threads start on. Run it again any
    time from Settings → General → Setup.
 3. **Start a thread** with `Ctrl+Shift+T` (or the **+** button). It opens in the
-   current folder; **+** → New Thread in Folder… picks another.
+   current folder; **+** → New Thread in Existing Folder… picks another.
 4. **Type a request** and press Enter. Use `/` for commands, `@` to mention files and
    `$` for skills. When the agent wants to run a command or edit a file, approve or
    deny it inline. The mode picker in the thread's header switches between
@@ -614,7 +614,7 @@ change (`~`) or be deleted (`−`), and warns if the agent still looks busy.
 
 ### Worktree threads
 
-**New Thread in Worktree…** (`Ctrl+Shift+G`) asks for a new branch and what to start
+**New Thread in Isolated Git Worktree…** (`Ctrl+Shift+G`) asks for a new branch and what to start
 it from, checks both as you type, then runs `git worktree add -b <branch>` and opens a
 thread there.
 

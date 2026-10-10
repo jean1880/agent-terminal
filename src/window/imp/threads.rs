@@ -1211,7 +1211,7 @@ impl AgentTerminalWindow {
             .title("No thread open")
             .description(
                 "Start a new thread, or pick one from the sidebar.\n\
-                 Ctrl+Shift+T new thread · Ctrl+Shift+G new thread in a worktree · F9 threads",
+                 Ctrl+Shift+T new thread · Ctrl+Shift+G new thread in an isolated worktree · F9 threads",
             )
             .vexpand(true)
             .build();
