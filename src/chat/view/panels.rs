@@ -835,7 +835,7 @@ pub(crate) mod tests {
         ));
         assert!(!is_current(&m, &status(Driver::Agy, None)));
         assert_eq!(group_title(Driver::Claude), "Claude");
-        assert_eq!(group_title(Driver::Agy), "Antigravity (agy)");
+        assert_eq!(group_title(Driver::Agy), "Antigravity");
         assert_eq!(group_title(Driver::Codex), "Codex");
     }
 

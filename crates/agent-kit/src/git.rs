@@ -871,6 +871,58 @@ pub enum DiffOutcome {
     Ready(TabDiff),
 }
 
+/// Finds the target primary branch commit (e.g. origin/HEAD, main, master) for a repository.
+pub fn find_target_branch(repo: &RepoInfo) -> Option<String> {
+    use std::ffi::OsStr;
+    if let Ok(out) = git_raw(
+        &repo.toplevel,
+        [
+            OsStr::new("symbolic-ref"),
+            OsStr::new("--short"),
+            OsStr::new("refs/remotes/origin/HEAD"),
+        ],
+        &[],
+        SNAPSHOT_TIMEOUT_SECS,
+    ) {
+        let name = String::from_utf8_lossy(&out).trim().to_string();
+        if !name.is_empty() {
+            if let Ok(rev) = git_raw(
+                &repo.toplevel,
+                [
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--verify"),
+                    OsStr::new(&name),
+                ],
+                &[],
+                SNAPSHOT_TIMEOUT_SECS,
+            ) {
+                let r = String::from_utf8_lossy(&rev).trim().to_string();
+                if crate::filediff::is_object_id(&r) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+    for candidate in ["origin/main", "origin/master", "main", "master"] {
+        if let Ok(rev) = git_raw(
+            &repo.toplevel,
+            [
+                OsStr::new("rev-parse"),
+                OsStr::new("--verify"),
+                OsStr::new(candidate),
+            ],
+            &[],
+            SNAPSHOT_TIMEOUT_SECS,
+        ) {
+            let r = String::from_utf8_lossy(&rev).trim().to_string();
+            if crate::filediff::is_object_id(&r) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
 /// Builds the diff for tab `key`, rooted in `dir`, against `base`. Blocking.
 pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<DiffOutcome, String> {
     use crate::diff::{CheckpointCommit, DiffBase, Unavailable};
@@ -907,16 +959,32 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
             }
         }
     };
+    let target_branch = if base == DiffBase::TargetBranch {
+        find_target_branch(&repo)
+    } else {
+        None
+    };
     let empty = empty_tree(&repo)?;
-    let (from, to) =
-        match crate::diff::diff_range(base, repo.head.as_deref(), &checkpoints, &current, &empty) {
-            Ok(range) => range,
-            Err(Unavailable::NoCheckpoints) => {
-                return Ok(DiffOutcome::Unavailable(
-                    "No checkpoints in this tab yet".to_string(),
-                ))
-            }
-        };
+    let (from, to) = match crate::diff::diff_range(
+        base,
+        repo.head.as_deref(),
+        &checkpoints,
+        &current,
+        &empty,
+        target_branch.as_deref(),
+    ) {
+        Ok(range) => range,
+        Err(Unavailable::NoCheckpoints) => {
+            return Ok(DiffOutcome::Unavailable(
+                "No checkpoints in this tab yet".to_string(),
+            ))
+        }
+        Err(Unavailable::NoTargetBranch) => {
+            return Ok(DiffOutcome::Unavailable(
+                "No main or master branch found in this repository".to_string(),
+            ))
+        }
+    };
 
     let numstat = git_raw(
         &repo.toplevel,
@@ -925,9 +993,10 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
         SNAPSHOT_TIMEOUT_SECS,
     )?;
     let stats = crate::diff::parse_numstat(&numstat);
-    // Undo goes back to the diff's left side. Not offered for Uncommitted,
-    // where that would be "throw away everything since HEAD".
-    let undo_to = (base != DiffBase::Uncommitted).then(|| from.clone());
+    // Undo goes back to the diff's left side. Not offered for Uncommitted or TargetBranch,
+    // where that would throw away unstaged or branch work.
+    let undo_to =
+        (base != DiffBase::Uncommitted && base != DiffBase::TargetBranch).then(|| from.clone());
     let to_checkpoint = (base == DiffBase::LastTurn).then(|| to.clone());
     let (_, added, deleted) = crate::diff::totals(&stats);
     if added + deleted > MAX_FETCHED_DIFF_LINES {

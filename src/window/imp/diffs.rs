@@ -156,10 +156,11 @@ impl ThreadDiffs {
 impl DiffSource for ThreadDiffs {
     fn load(&self, ask: DiffAsk, done: Box<dyn FnOnce(DiffReply)>) {
         let Some(me) = self.me.upgrade() else { return };
+        let dir = self.dir.clone();
         glib::MainContext::default().spawn_local(async move {
             let base = me.base_of(&ask.item).await;
             let reply = gtk4::gio::spawn_blocking(move || {
-                filediff::shown_for_item(base.as_ref(), &ask.input)
+                filediff::shown_for_item_in(base.as_ref(), &ask.input, Some(Path::new(&dir)))
             })
             .await
             .unwrap_or_else(|_| Err("computing the diff panicked".to_owned()));

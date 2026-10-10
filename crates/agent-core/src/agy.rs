@@ -298,14 +298,18 @@ impl AgyAdapter {
             .clone()
             .or(info.name.clone())
             .unwrap_or_else(|| "tool".to_owned());
-        let params = info.parameters.clone();
-        self.start_item_with(
-            out,
-            &id,
-            tool_kind(&name),
-            tool_title(&name, params.as_ref()),
-            params,
-        );
+        let kind = tool_kind(&name);
+        let mut params = info.parameters.clone();
+        if let Some(p) = params.as_mut().and_then(Value::as_object_mut) {
+            if !p.contains_key("tool_name") {
+                p.insert("tool_name".to_string(), Value::String(name.clone()));
+            }
+        }
+        let title = match kind {
+            ItemKind::FileChange => name.clone(),
+            _ => tool_title(&name, params.as_ref()),
+        };
+        self.start_item_with(out, &id, kind, title, params);
         match step.state.as_str() {
             "DONE" => {
                 let output = info.output.as_ref().map(value_text);
@@ -317,6 +321,12 @@ impl AgyAdapter {
                     .as_ref()
                     .and_then(error_message)
                     .unwrap_or_else(|| "tool error".to_owned());
+                if crate::quota::is_rate_limit_or_quota(&message) {
+                    out.push(env(Event::RateLimited {
+                        resets_at: None,
+                        detail: Some(Value::String(message.clone())),
+                    }));
+                }
                 let status = if message.contains(HOOK_DENIAL) {
                     ItemStatus::Declined
                 } else {
@@ -357,6 +367,21 @@ impl AgyAdapter {
             })),
             _ => None,
         };
+        if let Some(err) = &error {
+            if crate::quota::is_rate_limit_or_quota(err)
+                || crate::quota::is_rate_limit_or_quota(&result.status)
+            {
+                out.push(env(Event::RateLimited {
+                    resets_at: None,
+                    detail: Some(Value::String(err.clone())),
+                }));
+            }
+        } else if crate::quota::is_rate_limit_or_quota(&result.status) {
+            out.push(env(Event::RateLimited {
+                resets_at: None,
+                detail: Some(Value::String(result.status.clone())),
+            }));
+        }
         if let Some(usage) = &result.usage {
             let turn_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
             self.cumulative_tokens = self.cumulative_tokens.max(turn_tokens);
@@ -564,9 +589,17 @@ impl Adapter for AgyAdapter {
     fn feed_stderr(&mut self, line: &str) -> Vec<Envelope> {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("error:") {
-            vec![env(Event::Error {
+            let mut res = Vec::new();
+            if crate::quota::is_rate_limit_or_quota(rest) {
+                res.push(env(Event::RateLimited {
+                    resets_at: None,
+                    detail: Some(Value::String(rest.trim().to_owned())),
+                }));
+            }
+            res.push(env(Event::Error {
                 message: rest.trim().to_owned(),
-            })]
+            }));
+            res
         } else if let Some(rest) = line.strip_prefix("warning:") {
             vec![env(Event::Notice {
                 text: rest.trim().to_owned(),
@@ -579,8 +612,15 @@ impl Adapter for AgyAdapter {
     fn feed_side(&mut self, id: &str, stdout: &str, success: bool) -> Vec<Envelope> {
         let kind = self.side_kinds.remove(id).unwrap_or(SideKind::Json);
         let mut quota = None;
+        let mut rate_limit = None;
         let event = if !success {
             let detail = stdout.trim().lines().next().unwrap_or("").trim();
+            if crate::quota::is_rate_limit_or_quota(detail) {
+                rate_limit = Some(Event::RateLimited {
+                    resets_at: None,
+                    detail: Some(Value::String(detail.to_owned())),
+                });
+            }
             Event::ControlResult {
                 ok: None,
                 error: Some(if detail.is_empty() {
@@ -603,6 +643,12 @@ impl Adapter for AgyAdapter {
                     let doc = parse_side_json(stdout);
                     let windows = crate::quota::agy_usage(&doc);
                     if !windows.is_empty() {
+                        if let Some(w) = windows.iter().find(|w| w.used >= 1.0) {
+                            rate_limit = Some(Event::RateLimited {
+                                resets_at: w.resets_at.clone(),
+                                detail: Some(Value::String("Quota exhausted".to_owned())),
+                            });
+                        }
                         quota = Some(Event::QuotaUpdated {
                             account: None,
                             windows,
@@ -616,6 +662,7 @@ impl Adapter for AgyAdapter {
             }
         };
         let mut out = vec![Envelope::new(event).request(id)];
+        out.extend(rate_limit.map(Envelope::new));
         out.extend(quota.map(Envelope::new));
         out
     }

@@ -10,6 +10,8 @@ pub enum DiffBase {
     /// HEAD against the working tree as it is now (untracked files included).
     #[default]
     Uncommitted,
+    /// Target branch (main/master) against the working tree as it is now.
+    TargetBranch,
     /// The tab's latest checkpoint against the one before it.
     LastTurn,
     /// Where the tab's first checkpoint started against the working tree now.
@@ -18,11 +20,17 @@ pub enum DiffBase {
 
 impl DiffBase {
     /// Dropdown order. Guarded by `all_lists_every_base_in_dropdown_order`.
-    pub const ALL: [DiffBase; 3] = [DiffBase::Uncommitted, DiffBase::LastTurn, DiffBase::ThisTab];
+    pub const ALL: [DiffBase; 4] = [
+        DiffBase::Uncommitted,
+        DiffBase::TargetBranch,
+        DiffBase::LastTurn,
+        DiffBase::ThisTab,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             DiffBase::Uncommitted => "Uncommitted",
+            DiffBase::TargetBranch => "Target branch",
             DiffBase::LastTurn => "Last turn",
             DiffBase::ThisTab => "This tab",
         }
@@ -41,6 +49,7 @@ pub struct CheckpointCommit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unavailable {
     NoCheckpoints,
+    NoTargetBranch,
 }
 
 /// The two tree-ishes to diff for `base`.
@@ -55,10 +64,15 @@ pub fn diff_range(
     checkpoints: &[CheckpointCommit],
     current: &str,
     empty_tree: &str,
+    target_branch: Option<&str>,
 ) -> Result<(String, String), Unavailable> {
     let or_empty = |rev: Option<&str>| rev.unwrap_or(empty_tree).to_string();
     match base {
         DiffBase::Uncommitted => Ok((or_empty(head), current.to_string())),
+        DiffBase::TargetBranch => {
+            let target = target_branch.ok_or(Unavailable::NoTargetBranch)?;
+            Ok((target.to_string(), current.to_string()))
+        }
         DiffBase::LastTurn => {
             let last = checkpoints.last().ok_or(Unavailable::NoCheckpoints)?;
             Ok((or_empty(last.parent.as_deref()), last.commit.clone()))
@@ -287,8 +301,9 @@ mod tests {
         for (i, base) in DiffBase::ALL.iter().enumerate() {
             let expected = match base {
                 DiffBase::Uncommitted => 0,
-                DiffBase::LastTurn => 1,
-                DiffBase::ThisTab => 2,
+                DiffBase::TargetBranch => 1,
+                DiffBase::LastTurn => 2,
+                DiffBase::ThisTab => 3,
             };
             assert_eq!(i, expected);
         }
@@ -304,10 +319,16 @@ mod tests {
     #[test]
     fn ranges_follow_the_base() {
         let cps = [cp("c1", Some("head")), cp("c2", Some("c1"))];
-        let range = |base, head, cps: &[CheckpointCommit]| diff_range(base, head, cps, "now", "E");
+        let range = |base, head, cps: &[CheckpointCommit]| {
+            diff_range(base, head, cps, "now", "E", Some("target"))
+        };
         assert_eq!(
             range(DiffBase::Uncommitted, Some("head"), &cps),
             Ok(("head".into(), "now".into()))
+        );
+        assert_eq!(
+            range(DiffBase::TargetBranch, Some("head"), &cps),
+            Ok(("target".into(), "now".into()))
         );
         assert_eq!(
             range(DiffBase::LastTurn, Some("head"), &cps),
@@ -322,10 +343,14 @@ mod tests {
     #[test]
     fn a_missing_parent_or_head_diffs_against_the_empty_tree() {
         let cps = [cp("c1", None)];
-        let range = |base, head| diff_range(base, head, &cps, "now", "E");
+        let range = |base, head| diff_range(base, head, &cps, "now", "E", Some("target"));
         assert_eq!(
             range(DiffBase::Uncommitted, None),
             Ok(("E".into(), "now".into()))
+        );
+        assert_eq!(
+            range(DiffBase::TargetBranch, None),
+            Ok(("target".into(), "now".into()))
         );
         assert_eq!(
             range(DiffBase::LastTurn, None),
@@ -341,10 +366,14 @@ mod tests {
     fn checkpoint_bases_need_a_checkpoint() {
         for base in [DiffBase::LastTurn, DiffBase::ThisTab] {
             assert_eq!(
-                diff_range(base, Some("h"), &[], "now", "E"),
+                diff_range(base, Some("h"), &[], "now", "E", None),
                 Err(Unavailable::NoCheckpoints)
             );
         }
+        assert_eq!(
+            diff_range(DiffBase::TargetBranch, Some("h"), &[], "now", "E", None),
+            Err(Unavailable::NoTargetBranch)
+        );
     }
 
     #[test]

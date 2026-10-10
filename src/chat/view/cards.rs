@@ -1301,11 +1301,7 @@ impl ToolCard {
             tool.input.as_ref(),
             &tool.input_text,
         );
-        self.title.set_text(if is_edit {
-            "Show changes"
-        } else {
-            &action_title
-        });
+        self.title.set_text(&action_title);
         self.title
             .set_tooltip_text(Some(&format!("{action_title}: {target_summary}")));
         let mut paths = tool
@@ -1339,7 +1335,7 @@ impl ToolCard {
         });
         self.header
             .update_property(&[gtk4::accessible::Property::Label(&if is_edit {
-                format!("Show changes for {files}")
+                format!("{action_title} {files}")
             } else {
                 format!("{action_title} {target_summary}")
             })]);

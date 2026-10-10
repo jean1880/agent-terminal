@@ -22,7 +22,7 @@ impl std::fmt::Display for CliClient {
         match self {
             CliClient::Auto => write!(f, "Auto-detect"),
             CliClient::Gemini => write!(f, "Gemini"),
-            CliClient::Agy => write!(f, "Agy"),
+            CliClient::Agy => write!(f, "Antigravity"),
             CliClient::Claude => write!(f, "Claude"),
         }
     }
@@ -416,12 +416,17 @@ fn apply_known_settings(profile: &mut Profile) {
 /// The profiles a fresh install starts with: the chat agents, in preference order. The
 /// standalone Gemini CLI is not one (Gemini is reached through agy).
 fn default_profiles() -> Vec<Profile> {
-    ["Claude", "Agy", "Codex"]
+    ["Claude", "Antigravity", "Codex"]
         .iter()
         .map(|name| {
+            let cmd = if *name == "Antigravity" {
+                "agy".to_string()
+            } else {
+                name.to_lowercase()
+            };
             let mut profile = Profile {
                 name: (*name).to_string(),
-                command: name.to_lowercase(),
+                command: cmd,
                 ..Profile::default()
             };
             apply_known_settings(&mut profile);
@@ -1073,6 +1078,18 @@ impl TerminalConfig {
     fn normalize(mut self) -> Self {
         if self.profiles.is_empty() {
             self.profiles = default_profiles();
+        }
+
+        // Migrate "Agy" profile name to "Antigravity" if "Antigravity" is not already defined.
+        if !self.profiles.iter().any(|p| p.name == "Antigravity") {
+            for profile in &mut self.profiles {
+                if profile.name == "Agy" {
+                    profile.name = "Antigravity".to_string();
+                }
+            }
+            if self.default_profile.as_deref() == Some("Agy") {
+                self.default_profile = Some("Antigravity".to_string());
+            }
         }
 
         // Names are the key every menu and action looks a profile up by, so a
@@ -2113,6 +2130,20 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, ["Claude", "Claude (3)", "Claude (2)"]);
+    }
+
+    #[test]
+    fn agy_profile_is_migrated_to_antigravity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"default_profile":"Agy","profiles":[{"name":"Agy","command":"agy"}]}"#,
+        )
+        .unwrap();
+        let cfg = TerminalConfig::load_from(&path);
+        assert_eq!(cfg.profiles[0].name, "Antigravity");
+        assert_eq!(cfg.default_profile.as_deref(), Some("Antigravity"));
     }
 
     #[test]

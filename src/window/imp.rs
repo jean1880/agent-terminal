@@ -1,6 +1,7 @@
 //! Private implementation details of the AgentTerminalWindow.
 
 mod agents_prefs;
+mod animated_menu;
 mod diff_prefs;
 mod diffs;
 mod environment_review;
@@ -2142,14 +2143,16 @@ impl AgentTerminalWindow {
         *self.tab_view.borrow_mut() = Some(tab_view.clone());
 
         // Chat-first: the sidebar navigates; the tab view is the hidden page stack, with no
-        // tab bar. "New" in the header is a split button: click opens a thread on the default
-        // agent in the current folder; the menu has every other way to start one.
+        // tab bar. The header has a quick "+" button for new threads on the default agent,
+        // and an animated hamburger menu for thread creation options, handoffs, and resumes.
         let mut panel_buttons = Vec::new();
         if let Some(header) = self.header.borrow().as_ref() {
-            let new_btn = adw::SplitButton::builder()
+            let menu_btn = animated_menu::build_animated_menu_button(&self.build_new_menu());
+            header.pack_start(&menu_btn);
+
+            let new_btn = Button::builder()
                 .icon_name("at-list-add-symbolic")
                 .tooltip_text("New Thread (Ctrl+Shift+T)")
-                .menu_model(&self.build_new_menu())
                 .build();
             new_btn.connect_clicked(glib::clone!(
                 #[weak]
@@ -2173,6 +2176,7 @@ impl AgentTerminalWindow {
             header.pack_end(&diff_btn);
             header.pack_end(&drawer_btn);
             self.shell_controls.borrow_mut().extend([
+                menu_btn.upcast::<gtk4::Widget>(),
                 new_btn.upcast::<gtk4::Widget>(),
                 diff_btn.clone().upcast(),
                 drawer_btn.clone().upcast(),
@@ -2390,7 +2394,7 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// The header's New menu: threads first, then resume and hand-off, then terminal pages.
+    /// The header's menu: threads first, then resume and hand-off.
     fn build_new_menu(&self) -> gtk4::gio::Menu {
         let menu = gtk4::gio::Menu::new();
         let threads = gtk4::gio::Menu::new();
@@ -2410,12 +2414,6 @@ impl AgentTerminalWindow {
         );
         menu.append_section(None, &threads);
         menu.append_section(None, &self.build_session_section());
-        let terminal = gtk4::gio::Menu::new();
-        terminal.append_submenu(
-            Some("New Terminal Thread"),
-            &self.build_profile_menu("win.new-terminal-profile", |_| true),
-        );
-        menu.append_section(None, &terminal);
         menu
     }
 
@@ -6225,6 +6223,12 @@ mod tests {
         crate::chat::view::tests::reasoning_ui_checks();
         crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
+        animated_menu::tests::gtk_checks();
+        assert_eq!(
+            window.imp().build_new_menu().n_items(),
+            2,
+            "menu has only threads and sessions sections, no terminal section"
+        );
         chat_shell_opens_threads_and_lists_them(&window);
         environment_review::tests::confirmation_preserves_target(&window);
     }

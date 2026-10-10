@@ -302,6 +302,19 @@ pub struct Shown {
 /// diff is the agent's own edit instead. `Err` when the input names no file edit at all.
 /// Blocking when a base is given.
 pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Result<Shown, String> {
+    shown_for_item_in(base, input, None)
+}
+
+/// The diff of a file-change item whose tool input is `input`. With a `base`, each named file is
+/// compared against it; when there is none, or git cannot answer for one of the files, the whole
+/// diff is the agent's own edit instead, falling back to on-disk inspection for newly created or
+/// untracked files. `Err` when the input names no file edit at all.
+/// Blocking when a base is given.
+pub fn shown_for_item_in(
+    base: Option<&TurnBase>,
+    input: &serde_json::Value,
+    cwd: Option<&Path>,
+) -> Result<Shown, String> {
     let mut files = editdiff::paths_from_input(input);
     let preview = editdiff::preview_from_input(input);
     for p in preview.iter().map(|e| e.path.clone()) {
@@ -312,10 +325,22 @@ pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Res
     if files.is_empty() && preview.is_empty() {
         return Err("This edit carries no file diff to show.".to_owned());
     }
+    let resolve_file_path = |p: &str| -> PathBuf {
+        let p_path = Path::new(p);
+        if p_path.is_absolute() {
+            p_path.to_path_buf()
+        } else if let Some(cwd) = cwd {
+            cwd.join(p_path)
+        } else {
+            p_path.to_path_buf()
+        }
+    };
     let from_checkpoint = base.and_then(|base| {
         let mut text = String::new();
         for path in &files {
-            let file = resolve(&base.toplevel, path).ok()?;
+            let full = resolve_file_path(path);
+            let full_str = full.to_string_lossy();
+            let file = resolve(&base.toplevel, &full_str).ok()?;
             match turn_file_diff(base, &file).ok()? {
                 FileDiff::Text(d) => text.push_str(&d.diff),
                 FileDiff::Binary => {
@@ -329,7 +354,11 @@ pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Res
                 }
             }
         }
-        Some(text)
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     });
     let (text, origin) = match from_checkpoint {
         Some(text) => (text, Origin::Checkpoint),
@@ -340,8 +369,11 @@ pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Res
             } else if !files.is_empty() {
                 let mut fallback = String::new();
                 for path in &files {
-                    if let Some(repo) = crate::git::discover(Path::new(path)).ok().flatten() {
-                        if let Ok(file) = resolve(&repo.toplevel, path) {
+                    let full = resolve_file_path(path);
+                    let mut file_handled = false;
+                    if let Some(repo) = crate::git::discover(&full).ok().flatten() {
+                        let full_str = full.to_string_lossy();
+                        if let Ok(file) = resolve(&repo.toplevel, &full_str) {
                             if let Some(head) = repo.head {
                                 let head_base = TurnBase {
                                     toplevel: repo.toplevel.clone(),
@@ -349,7 +381,20 @@ pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Res
                                 };
                                 if let Ok(FileDiff::Text(d)) = turn_file_diff(&head_base, &file) {
                                     fallback.push_str(&d.diff);
+                                    file_handled = true;
                                 }
+                            }
+                        }
+                    }
+                    if !file_handled && full.is_file() {
+                        if let Ok(bytes) = std::fs::read(&full) {
+                            if !bytes.is_empty()
+                                && !is_binary(&bytes)
+                                && bytes.len() <= editdiff::MAX_SIDE_BYTES
+                            {
+                                let content = String::from_utf8_lossy(&bytes);
+                                let d = editdiff::file_diff(path, None, &content);
+                                fallback.push_str(&d.diff);
                             }
                         }
                     }

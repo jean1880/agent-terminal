@@ -11,7 +11,7 @@
 //! Logging never includes prompt or frame bodies.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -20,7 +20,9 @@ use agent_core::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
 };
 use agent_core::catalog::Replacement;
-use agent_core::event::{AgentCommand, Decision, Envelope, Event, ItemKind, StreamKind, TurnState};
+use agent_core::event::{
+    AgentCommand, Decision, Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState,
+};
 use agent_core::handoff_budget::{
     handoff_budget, handoff_coverage, provider_message_with_handoff, render_history,
     select_history, HistoricalMessage, Role, DEFAULT_HANDOFF_TOKEN_CAP,
@@ -84,7 +86,7 @@ pub struct RetiredModel {
 pub type AdapterFactory = Rc<dyn Fn(Driver) -> Result<AgentLaunch, String>>;
 
 /// How long a state-changing tool step may run before its hook query must have arrived.
-const CANARY_GRACE: Duration = Duration::from_secs(3);
+const CANARY_GRACE: Duration = Duration::from_secs(8);
 
 /// The hooked tool names a started item of this kind can be. `None`: not watched (see
 /// [`Inner::watch_tool_step`]).
@@ -157,6 +159,8 @@ struct Inner {
     unbound: RefCell<Option<String>>,
     /// How long a tool step may wait for its hook query to show up.
     canary_grace: Cell<Duration>,
+    /// Tool item ids that were cancelled, declined or failed before completion (not tripped by canary).
+    canary_cancelled: RefCell<HashSet<String>>,
     factory: RefCell<Option<AdapterFactory>>,
     launch_env: RefCell<LaunchEnv>,
     proc: RefCell<Option<AgentProcess>>,
@@ -327,6 +331,7 @@ impl ChatSession {
             approval: RefCell::new(approval),
             unbound: RefCell::new(unbound),
             canary_grace: Cell::new(CANARY_GRACE),
+            canary_cancelled: RefCell::new(HashSet::new()),
             factory: RefCell::new(None),
             launch_env: RefCell::new(env),
             proc: RefCell::new(None),
@@ -718,6 +723,7 @@ impl Inner {
         let spec = self.launch_spec();
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        self.canary_cancelled.borrow_mut().clear();
         let (w_out, w_err, w_exit) = (
             Rc::downgrade(self),
             Rc::downgrade(self),
@@ -813,32 +819,56 @@ impl Inner {
     /// watched: agy's internal steps (finish, wait, task bookkeeping) are not known to be hooked,
     /// and killing a healthy session over one would be worse than missing it.
     fn watch_tool_step(self: &Rc<Self>, env: &Envelope) {
-        let Event::ItemStarted { kind, .. } = &env.event else {
-            return;
-        };
-        let Some(tools) = canary_tools(*kind) else {
-            return;
-        };
-        let Some(approval) = self.approval() else {
-            return;
-        };
-        if self.adapter.borrow().driver() != Driver::Agy || approval.consume_query(tools) {
-            return;
+        match &env.event {
+            Event::ItemStarted { kind, .. } => {
+                let Some(tools) = canary_tools(*kind) else {
+                    return;
+                };
+                let Some(approval) = self.approval() else {
+                    return;
+                };
+                if self.adapter.borrow().driver() != Driver::Agy || approval.consume_query(tools) {
+                    return;
+                }
+                let item_id = env.item.clone();
+                if let Some(id) = &item_id {
+                    if self.canary_cancelled.borrow().contains(id) {
+                        return;
+                    }
+                }
+                let weak = Rc::downgrade(self);
+                let generation = self.generation.get();
+                let grace = self.canary_grace.get();
+                glib::spawn_future_local(async move {
+                    glib::timeout_future(grace).await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    if inner.generation.get() != generation {
+                        return; // that process is already gone
+                    }
+                    if inner.approval().is_some_and(|a| a.consume_query(tools)) {
+                        return;
+                    }
+                    if let Some(id) = &item_id {
+                        if inner.canary_cancelled.borrow().contains(id) {
+                            return;
+                        }
+                    }
+                    inner.trip_canary();
+                });
+            }
+            Event::ItemCompleted { status, error, .. } => {
+                if let Some(id) = &env.item {
+                    if *status != ItemStatus::Completed
+                        || error.as_deref().is_some_and(|e| {
+                            e.contains("denied") || e.contains("hook") || e.contains("refused")
+                        })
+                    {
+                        self.canary_cancelled.borrow_mut().insert(id.clone());
+                    }
+                }
+            }
+            _ => {}
         }
-        let weak = Rc::downgrade(self);
-        let generation = self.generation.get();
-        let grace = self.canary_grace.get();
-        glib::spawn_future_local(async move {
-            glib::timeout_future(grace).await;
-            let Some(inner) = weak.upgrade() else { return };
-            if inner.generation.get() != generation {
-                return; // that process is already gone
-            }
-            if inner.approval().is_some_and(|a| a.consume_query(tools)) {
-                return;
-            }
-            inner.trip_canary();
-        });
     }
 
     /// If an approval request from Codex matches an already remembered "Always allow" rule

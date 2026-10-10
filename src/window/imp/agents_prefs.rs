@@ -1172,7 +1172,7 @@ impl AgentTerminalWindow {
             .title("Hook Entry")
             .subtitle(
                 "Add it as a top-level key of ~/.gemini/config/hooks.json. Until it is \
-                 installed, agy cannot ask before acting: it refuses shell commands but \
+                 installed, Antigravity cannot ask before acting: it refuses shell commands but \
                  applies file edits on its own, in Plan mode too.",
             )
             .build();
@@ -1184,15 +1184,15 @@ impl AgentTerminalWindow {
             #[weak]
             hook,
             async move {
-                // Off the main thread, and it refreshes the verdict new agy sessions use.
+                // Off the main thread, and it refreshes the verdict new Antigravity sessions use.
                 match super::threads::check_hook().await {
                     Ok(()) => {
-                        hook.set_subtitle("Installed: agy asks agent-terminal before it acts");
+                        hook.set_subtitle("Installed: Antigravity asks agent-terminal before it acts");
                         hook.remove_css_class("error");
                     }
                     Err(_) => {
                         hook.set_subtitle(
-                            "Not installed: agy cannot ask before acting until the entry below is added",
+                            "Not installed: Antigravity cannot ask before acting until the entry below is added",
                         );
                         hook.add_css_class("error");
                     }
@@ -1202,8 +1202,8 @@ impl AgentTerminalWindow {
     }
 }
 
-/// agy's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
-/// and applies to agy sessions started after it (a running one keeps what it already allowed).
+/// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
+/// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
 fn always_allowed_rows() -> adw::ExpanderRow {
     use crate::always_allow::{self, AlwaysRules};
     let rules = always_allow::path()
@@ -1215,7 +1215,7 @@ fn always_allowed_rows() -> adw::ExpanderRow {
             0 => {
                 "None yet. “Always allow” on an approval adds one, for that folder only".to_owned()
             }
-            n => format!("{n} remembered. Removing one applies to new agy sessions"),
+            n => format!("{n} remembered. Removing one applies to new Antigravity sessions"),
         })
         .build();
     for rule in rules.rules {

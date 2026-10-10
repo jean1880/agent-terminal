@@ -267,6 +267,26 @@ pub fn codex_rate_limits(result: &Value) -> Vec<QuotaWindow> {
         .unwrap_or_default()
 }
 
+/// Whether an error message or status indicates that the model ran out of tokens,
+/// hit a quota limit, or was rate limited.
+pub fn is_rate_limit_or_quota(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("resource_exhausted")
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("token limit")
+        || lower.contains("tokens exhausted")
+        || lower.contains("out of tokens")
+        || lower.contains("maximum tokens")
+        || lower.contains("insufficient tokens")
+        || lower.contains("capacity exceeded")
+        || lower.contains("out of credits")
+}
+
 // ---------------------------------------------------------------------------------------------
 // Time helpers (no chrono: the UI needs only epoch seconds and an "in 3 h 47 min" phrase)
 // ---------------------------------------------------------------------------------------------

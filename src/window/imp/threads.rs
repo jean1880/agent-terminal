@@ -2880,34 +2880,45 @@ impl AgentTerminalWindow {
                     }
                     After::Nothing
                 }
-                Event::TurnCompleted { state, .. } => {
+                Event::TurnCompleted { state, error, .. } => {
                     chat.diffs.turn_ended();
                     chat.running = false;
                     chat.approval = false;
                     withdraw_ask = true;
-                    // With sub-agents or background commands still going the thread is not
-                    // finished: no mark and no "finished" yet. Claude runs another turn to read
-                    // their results, and that one finishes the thread.
-                    let finished = turn_finishes_thread(!chat.background.is_empty());
-                    let r = react(
-                        Attention::TurnDone,
-                        in_view,
-                        focused,
-                        self.config.borrow().notify_on_bell,
-                    );
-                    // A shown thread in an unfocused window keeps its mark until focus returns.
-                    if finished {
-                        chat.unread |= r.unread;
+                    if *state == agent_core::event::TurnState::Failed
+                        && error
+                            .as_deref()
+                            .is_some_and(agent_core::quota::is_rate_limit_or_quota)
+                    {
+                        chat.rate_limited = true;
                     }
-                    // An interrupted turn was stopped on purpose (a close, a quit, the stop
-                    // button): there is nothing to announce, now or when the background ends.
-                    let stopped = *state == agent_core::event::TurnState::Interrupted;
-                    chat.finish_held = !finished && !stopped;
-                    // The turn's end is "output went quiet" for the checkpoint bookkeeping.
-                    last_output.set(std::time::Instant::now());
-                    After::TurnDone {
-                        page,
-                        notify: finished && r.notify && !stopped,
+                    if chat.rate_limited {
+                        After::RateLimited(chat.rate_banner.clone(), driver)
+                    } else {
+                        // With sub-agents or background commands still going the thread is not
+                        // finished: no mark and no "finished" yet. Claude runs another turn to read
+                        // their results, and that one finishes the thread.
+                        let finished = turn_finishes_thread(!chat.background.is_empty());
+                        let r = react(
+                            Attention::TurnDone,
+                            in_view,
+                            focused,
+                            self.config.borrow().notify_on_bell,
+                        );
+                        // A shown thread in an unfocused window keeps its mark until focus returns.
+                        if finished {
+                            chat.unread |= r.unread;
+                        }
+                        // An interrupted turn was stopped on purpose (a close, a quit, the stop
+                        // button): there is nothing to announce, now or when the background ends.
+                        let stopped = *state == agent_core::event::TurnState::Interrupted;
+                        chat.finish_held = !finished && !stopped;
+                        // The turn's end is "output went quiet" for the checkpoint bookkeeping.
+                        last_output.set(std::time::Instant::now());
+                        After::TurnDone {
+                            page,
+                            notify: finished && r.notify && !stopped,
+                        }
                     }
                 }
                 Event::BackgroundTasks { tasks } => {
@@ -2962,6 +2973,22 @@ impl AgentTerminalWindow {
                 Event::RateLimited { .. } => {
                     chat.rate_limited = true;
                     After::RateLimited(chat.rate_banner.clone(), driver)
+                }
+                Event::Error { message } => {
+                    if agent_core::quota::is_rate_limit_or_quota(message) {
+                        chat.rate_limited = true;
+                        After::RateLimited(chat.rate_banner.clone(), driver)
+                    } else {
+                        After::Sidebar
+                    }
+                }
+                Event::QuotaUpdated { windows, .. } => {
+                    if windows.iter().any(|w| w.used >= 1.0) {
+                        chat.rate_limited = true;
+                        After::RateLimited(chat.rate_banner.clone(), driver)
+                    } else {
+                        After::Sidebar
+                    }
                 }
                 Event::ItemStarted {
                     kind: ItemKind::UserMessage,
@@ -3576,9 +3603,8 @@ impl AgentTerminalWindow {
             present_message(
                 &self.obj(),
                 "No Chat Agent Available",
-                "None of Claude, Antigravity (agy) or Codex is installed and enabled. Install one, \
-                 or enable it in Settings → Agents. Terminal threads still work from the New \
-                 Thread menu.",
+                "None of Claude, Antigravity or Codex is installed and enabled. Install one, \
+                 or enable it in Settings → Agents.",
             );
             return;
         };

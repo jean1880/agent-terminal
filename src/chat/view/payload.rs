@@ -321,6 +321,10 @@ pub fn card_title_and_summary(
         ItemKind::FileChange => {
             let lower_title = raw_title.to_ascii_lowercase();
             let is_write = lower_title.contains("write")
+                || val
+                    .and_then(|v| v.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.contains("write"))
                 || (val.is_some_and(|v| {
                     (v.get("content").is_some() || v.get("CodeContent").is_some())
                         && v.get("old_string").is_none()
