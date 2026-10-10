@@ -505,13 +505,7 @@ impl ApprovalHandle {
     /// workspace's remembered rules as already allowed (an exact match, like the session's).
     /// The file is a few rules of JSON; reading it is not worth a worker.
     pub fn use_always_rules(&self, path: PathBuf) {
-        let mut rules = crate::always_allow::AlwaysRules::load(&path);
-        if rules.rules.is_empty() {
-            let imported = rules.import_agent_permissions(None);
-            if imported > 0 {
-                let _ = rules.save(&path);
-            }
-        }
+        let rules = crate::always_allow::AlwaysRules::load(&path);
         // Only kinds "Always" may keep, whatever a hand-edited file says.
         self.inner.allowed.borrow_mut().extend(
             rules

@@ -228,6 +228,231 @@ impl AlwaysRules {
         added
     }
 
+    /// Exports permission rules from `AlwaysRules` to available agent configuration files:
+    /// 1. `~/git/agent-config/sync/permissions.toml`
+    /// 2. `~/.claude/settings.json`
+    /// 3. `~/.gemini/antigravity-cli/settings.json`
+    ///
+    /// This is strictly a ONE-WAY export: it never alters `always-allow.json`.
+    /// Returns the number of newly added rules across all targets.
+    pub fn export_agent_permissions(&self, home: Option<&Path>) -> usize {
+        let mut added = 0;
+        let home_buf = if cfg!(test) {
+            home.map(PathBuf::from)
+        } else {
+            home.map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        };
+        let Some(home) = home_buf else {
+            return 0;
+        };
+
+        let perm_toml = home.join("git/agent-config/sync/permissions.toml");
+        if perm_toml.exists() {
+            if let Ok(c) = self.export_to_permissions_toml(&perm_toml) {
+                added += c;
+            }
+        }
+
+        let claude_settings = home.join(".claude/settings.json");
+        if claude_settings.exists() {
+            if let Ok(c) = self.export_to_claude_settings(&claude_settings) {
+                added += c;
+            }
+        }
+
+        let agy_settings = home.join(".gemini/antigravity-cli/settings.json");
+        if agy_settings.exists() {
+            if let Ok(c) = self.export_to_agy_settings(&agy_settings) {
+                added += c;
+            }
+        }
+
+        added
+    }
+
+    /// Exports rules to `permissions.toml`.
+    pub fn export_to_permissions_toml(&self, path: &Path) -> Result<usize, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let mut new_content = content.clone();
+        let mut added = 0;
+
+        for r in &self.rules {
+            let (target_array, entry) = match r.tool.as_str() {
+                "run_command" | "Bash" | "bash" => {
+                    let d = r.detail.trim();
+                    match r.kind {
+                        PatternKind::Exact => ("shell_exact", d.to_string()),
+                        PatternKind::Prefix => ("shell", d.trim_end_matches('*').to_string()),
+                        PatternKind::Wildcard => {
+                            if d.ends_with('*') && !d[..d.len() - 1].contains('*') {
+                                ("shell", d.trim_end_matches('*').to_string())
+                            } else {
+                                ("shell_glob", d.to_string())
+                            }
+                        }
+                    }
+                }
+                "call_mcp_tool" => ("mcp", r.detail.trim().to_string()),
+                _ => continue,
+            };
+
+            if entry.is_empty() || new_content.contains(&format!("\"{entry}\"")) {
+                continue;
+            }
+
+            let needle = format!("{target_array} = [");
+            if let Some(pos) = new_content.find(&needle) {
+                let after_needle = pos + needle.len();
+                let insert_pos = if let Some(newline_pos) = new_content[after_needle..].find('\n') {
+                    after_needle + newline_pos + 1
+                } else {
+                    after_needle
+                };
+                new_content.insert_str(insert_pos, &format!("    \"{entry}\",\n"));
+                added += 1;
+            } else if let Some(allow_pos) = new_content.find("[allow]") {
+                let insert_pos = allow_pos + "[allow]\n".len();
+                new_content.insert_str(
+                    insert_pos,
+                    &format!("{target_array} = [\n    \"{entry}\",\n]\n"),
+                );
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, new_content)?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(added)
+    }
+
+    /// Exports rules to Claude `settings.json`.
+    pub fn export_to_claude_settings(&self, path: &Path) -> Result<usize, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return Ok(0);
+        };
+        let mut added = 0;
+
+        let permissions_obj = val.as_object_mut().and_then(|root| {
+            if !root.contains_key("permissions") {
+                root.insert("permissions".to_owned(), serde_json::json!({}));
+            }
+            root.get_mut("permissions").and_then(|p| p.as_object_mut())
+        });
+
+        let Some(perms) = permissions_obj else {
+            return Ok(0);
+        };
+
+        if !perms.contains_key("allow") {
+            perms.insert("allow".to_owned(), serde_json::json!([]));
+        }
+        let Some(allow_list) = perms.get_mut("allow").and_then(|a| a.as_array_mut()) else {
+            return Ok(0);
+        };
+
+        for r in &self.rules {
+            let entry = match r.tool.as_str() {
+                "run_command" | "Bash" | "bash" => {
+                    let d = r.detail.trim();
+                    match r.kind {
+                        PatternKind::Exact => format!("Bash({d})"),
+                        PatternKind::Prefix => {
+                            format!("Bash({}:*)", d.trim_end_matches('*'))
+                        }
+                        PatternKind::Wildcard => {
+                            if d.ends_with('*') && !d[..d.len() - 1].contains('*') {
+                                format!("Bash({}:*)", d.trim_end_matches('*'))
+                            } else {
+                                format!("Bash({d})")
+                            }
+                        }
+                    }
+                }
+                "call_mcp_tool" => {
+                    format!("mcp__{}", r.detail.trim().replace('/', "__"))
+                }
+                _ => continue,
+            };
+
+            let json_str = serde_json::Value::String(entry);
+            if !allow_list.contains(&json_str) {
+                allow_list.push(json_str);
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            let formatted = serde_json::to_string_pretty(&val).map_err(std::io::Error::other)?;
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, formatted)?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(added)
+    }
+
+    /// Exports rules to Antigravity `settings.json`.
+    pub fn export_to_agy_settings(&self, path: &Path) -> Result<usize, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return Ok(0);
+        };
+        let mut added = 0;
+
+        let permissions_obj = val.as_object_mut().and_then(|root| {
+            if !root.contains_key("permissions") {
+                root.insert("permissions".to_owned(), serde_json::json!({}));
+            }
+            root.get_mut("permissions").and_then(|p| p.as_object_mut())
+        });
+
+        let Some(perms) = permissions_obj else {
+            return Ok(0);
+        };
+
+        if !perms.contains_key("allow") {
+            perms.insert("allow".to_owned(), serde_json::json!([]));
+        }
+        let Some(allow_list) = perms.get_mut("allow").and_then(|a| a.as_array_mut()) else {
+            return Ok(0);
+        };
+
+        for r in &self.rules {
+            let entry = match r.tool.as_str() {
+                "run_command" | "Bash" | "bash" => {
+                    let d = r.detail.trim();
+                    if d.ends_with('*') && !d[..d.len() - 1].contains('*') {
+                        format!("command({})", d.trim_end_matches('*'))
+                    } else {
+                        format!("command({d})")
+                    }
+                }
+                "call_mcp_tool" => {
+                    format!("mcp({})", r.detail.trim())
+                }
+                _ => continue,
+            };
+
+            let json_str = serde_json::Value::String(entry);
+            if !allow_list.contains(&json_str) {
+                allow_list.push(json_str);
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            let formatted = serde_json::to_string_pretty(&val).map_err(std::io::Error::other)?;
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, formatted)?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(added)
+    }
+
     /// Parses allow rules from `permissions.toml`.
     pub fn import_permissions_toml(&mut self, content: &str) -> usize {
         let mut count = 0;
@@ -538,5 +763,81 @@ mcp = [
                 "/h/.local/state/agent-terminal/always-allow.json"
             ))
         );
+    }
+
+    #[test]
+    fn one_way_import_and_export() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let toml_path = dir.path().join("permissions.toml");
+        std::fs::write(
+            &toml_path,
+            "[allow]\nshell = [\n    \"fdfind\",\n]\nshell_exact = [\n    \"env\",\n]\n",
+        )
+        .expect("write toml");
+
+        let claude_path = dir.path().join("claude_settings.json");
+        std::fs::write(
+            &claude_path,
+            r#"{"permissions":{"allow":["Bash(cargo check:*)"]}}"#,
+        )
+        .expect("write claude");
+
+        let agy_path = dir.path().join("agy_settings.json");
+        std::fs::write(&agy_path, r#"{"permissions":{"allow":["command(date)"]}}"#)
+            .expect("write agy");
+
+        // 1. One-way Import: loads external rules into AlwaysRules, external files are untouched.
+        let mut rules = AlwaysRules::default();
+        let toml_content = std::fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(rules.import_permissions_toml(&toml_content), 2);
+        let claude_content = std::fs::read_to_string(&claude_path).unwrap();
+        assert_eq!(rules.import_claude_settings(&claude_content), 1);
+        let agy_content = std::fs::read_to_string(&agy_path).unwrap();
+        assert_eq!(rules.import_agy_settings(&agy_content), 1);
+
+        assert_eq!(rules.rules.len(), 4);
+        assert!(rules.matches_any("/ws", "run_command", "fdfind foo"));
+        assert!(rules.matches_any("/ws", "run_command", "cargo check --quiet"));
+        assert!(rules.matches_any("/ws", "run_command", "date"));
+
+        // 2. Add an Agent Terminal-originated rule
+        rules.add(Rule::with_kind(
+            "*",
+            "run_command",
+            "make test*",
+            PatternKind::Wildcard,
+        ));
+        rules.add(Rule::with_kind(
+            "*",
+            "call_mcp_tool",
+            "test-mcp/tool",
+            PatternKind::Prefix,
+        ));
+
+        // 3. One-way Export: pushes rules to external files without altering AlwaysRules.
+        let exp_toml = rules
+            .export_to_permissions_toml(&toml_path)
+            .expect("export toml");
+        assert!(exp_toml > 0);
+        let updated_toml = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(updated_toml.contains("\"make test\""));
+        assert!(updated_toml.contains("\"test-mcp/tool\""));
+
+        let exp_claude = rules
+            .export_to_claude_settings(&claude_path)
+            .expect("export claude");
+        assert!(exp_claude > 0);
+        let updated_claude = std::fs::read_to_string(&claude_path).unwrap();
+        assert!(updated_claude.contains("Bash(make test:*)"));
+        assert!(updated_claude.contains("mcp__test-mcp__tool"));
+
+        let exp_agy = rules.export_to_agy_settings(&agy_path).expect("export agy");
+        assert!(exp_agy > 0);
+        let updated_agy = std::fs::read_to_string(&agy_path).unwrap();
+        assert!(updated_agy.contains("command(make test)"));
+        assert!(updated_agy.contains("mcp(test-mcp/tool)"));
+
+        // Rules themselves are untouched (strict one-way)
+        assert_eq!(rules.rules.len(), 6);
     }
 }

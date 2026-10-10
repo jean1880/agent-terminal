@@ -355,7 +355,7 @@ impl AgentTerminalWindow {
         // Import permissions row
         let import_row = adw::ActionRow::builder()
             .title("Import Agent Permissions")
-            .subtitle("Import allowlisted commands and tools from Claude, Antigravity, and permissions.toml")
+            .subtitle("One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml")
             .build();
         let import_btn = gtk4::Button::builder()
             .label("Import Now")
@@ -383,6 +383,37 @@ impl AgentTerminalWindow {
         ));
         import_row.add_suffix(&import_btn);
         group.add(&import_row);
+
+        // Export permissions row
+        let export_row = adw::ActionRow::builder()
+            .title("Export Agent Permissions")
+            .subtitle("One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations")
+            .build();
+        let export_btn = gtk4::Button::builder()
+            .label("Export Now")
+            .valign(gtk4::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        export_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                if let Some(path) = crate::always_allow::path() {
+                    let rules = crate::always_allow::AlwaysRules::load(&path);
+                    let exported_count = rules.export_agent_permissions(None);
+                    if exported_count > 0 {
+                        imp.show_toast(&format!(
+                            "Exported {exported_count} permission rules to agent configurations"
+                        ));
+                    } else {
+                        imp.show_toast("Agent configurations are already up to date");
+                    }
+                }
+            }
+        ));
+        export_row.add_suffix(&export_btn);
+        group.add(&export_row);
 
         // Manage rules row
         let rule_count = crate::always_allow::path()
@@ -487,14 +518,51 @@ impl AgentTerminalWindow {
         }
         scroll.set_child(Some(&list));
         dialog.set_extra_child(Some(&scroll));
-        dialog.add_responses(&[("close", "Close")]);
+        dialog.add_responses(&[
+            ("import", "Import Rules"),
+            ("export", "Export Rules"),
+            ("close", "Close"),
+        ]);
         dialog.set_default_response(Some("close"));
         dialog.set_close_response("close");
 
         let root = parent.root();
-        glib::MainContext::default().spawn_local(async move {
-            let _ = dialog.choose_future(root.as_ref()).await;
-        });
+        let obj = self.obj();
+        let p = path.clone();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            async move {
+                let response = dialog.choose_future(root.as_ref()).await;
+                let imp = obj.imp();
+                match response.as_str() {
+                    "import" => {
+                        let mut rules = crate::always_allow::AlwaysRules::load(&p);
+                        let count = rules.import_agent_permissions(None);
+                        if count > 0 {
+                            let _ = rules.save(&p);
+                            imp.show_toast(&format!(
+                                "Imported {count} permission rules from agent configurations"
+                            ));
+                        } else {
+                            imp.show_toast("Permission rules are already up to date");
+                        }
+                    }
+                    "export" => {
+                        let rules = crate::always_allow::AlwaysRules::load(&p);
+                        let count = rules.export_agent_permissions(None);
+                        if count > 0 {
+                            imp.show_toast(&format!(
+                                "Exported {count} permission rules to agent configurations"
+                            ));
+                        } else {
+                            imp.show_toast("Agent configurations are already up to date");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        ));
     }
 
     fn agent_group(
