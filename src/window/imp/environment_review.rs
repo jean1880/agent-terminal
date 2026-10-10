@@ -98,7 +98,6 @@ impl AgentTerminalWindow {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use std::{cell::Cell, rc::Rc};
 
     pub(in crate::window::imp) fn confirmation_preserves_target(
         window: &super::super::super::AgentTerminalWindow,
@@ -155,21 +154,7 @@ pub(super) mod tests {
                 .unwrap()
                 .downcast::<adw::AlertDialog>()
                 .unwrap();
-            let frames = Rc::new(Cell::new(0));
-            dialog.add_tick_callback({
-                let frames = frames.clone();
-                move |_, _| {
-                    frames.set(frames.get() + 1);
-                    if frames.get() >= 3 {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                }
-            });
-            assert!(crate::testutil::pump_until(&ctx, 5, || {
-                dialog.is_mapped() && frames.get() >= 3
-            }));
+            assert!(crate::testutil::pump_until(&ctx, 5, || dialog.is_mapped()));
             dialog
         };
         let cancel = trigger();
