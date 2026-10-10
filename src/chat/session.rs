@@ -290,7 +290,9 @@ fn find_agy_thinking(conv_id: &str, target_index: u64) -> Option<String> {
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(idx) = val.get("step_index").and_then(serde_json::Value::as_u64) {
-                if idx == target_index || (idx == target_index.saturating_sub(1) && target_index > 0) {
+                if idx == target_index
+                    || (idx == target_index.saturating_sub(1) && target_index > 0)
+                {
                     if let Some(th) = val.get("thinking").and_then(serde_json::Value::as_str) {
                         let trimmed = th.trim();
                         if !trimmed.is_empty() {
@@ -899,7 +901,10 @@ impl Inner {
             return std::borrow::Cow::Borrowed(line);
         }
 
-        let step_obj = match val.get_mut("step_update").and_then(serde_json::Value::as_object_mut) {
+        let step_obj = match val
+            .get_mut("step_update")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             Some(obj) => obj,
             None => return std::borrow::Cow::Borrowed(line),
         };
@@ -912,7 +917,10 @@ impl Inner {
             return std::borrow::Cow::Borrowed(line);
         }
 
-        let step_index = match step_obj.get("step_index").and_then(serde_json::Value::as_u64) {
+        let step_index = match step_obj
+            .get("step_index")
+            .and_then(serde_json::Value::as_u64)
+        {
             Some(i) => i,
             None => return std::borrow::Cow::Borrowed(line),
         };
@@ -933,8 +941,14 @@ impl Inner {
 
         if let Some(thinking) = find_agy_thinking(&conv_id, step_index) {
             self.last_enriched_step.set(Some(step_index));
-            step_obj.insert("thinking".to_string(), serde_json::Value::String(thinking.clone()));
-            if let Some(tool_info) = step_obj.get_mut("tool_info").and_then(serde_json::Value::as_object_mut) {
+            step_obj.insert(
+                "thinking".to_string(),
+                serde_json::Value::String(thinking.clone()),
+            );
+            if let Some(tool_info) = step_obj
+                .get_mut("tool_info")
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 tool_info.insert("thinking".to_string(), serde_json::Value::String(thinking));
             }
             if let Ok(serialized) = serde_json::to_string(&val) {
@@ -4485,19 +4499,28 @@ mod tests {
             })
             .to_string();
 
-            session.inner.on_line(session.inner.generation.get(), &stdout_frame, false);
+            session
+                .inner
+                .on_line(session.inner.generation.get(), &stdout_frame, false);
 
             // The session should have emitted a Reasoning ItemStarted + ContentDelta with the thinking text!
             let has_reasoning = seen.borrow().iter().any(|env| {
                 matches!(
                     &env.event,
-                    Event::ItemStarted { kind: ItemKind::Reasoning, .. }
+                    Event::ItemStarted {
+                        kind: ItemKind::Reasoning,
+                        ..
+                    }
                 )
             });
             assert!(has_reasoning, "expected ItemKind::Reasoning to be emitted");
 
             let reasoning_delta = seen.borrow().iter().find_map(|env| {
-                if let Event::ContentDelta { stream: StreamKind::Reasoning, text } = &env.event {
+                if let Event::ContentDelta {
+                    stream: StreamKind::Reasoning,
+                    text,
+                } = &env.event
+                {
                     Some(text.clone())
                 } else {
                     None
@@ -4526,12 +4549,22 @@ mod tests {
             })
             .to_string();
 
-            session.inner.on_line(session.inner.generation.get(), &done_frame, false);
+            session
+                .inner
+                .on_line(session.inner.generation.get(), &done_frame, false);
 
             let reasoning_count = seen
                 .borrow()
                 .iter()
-                .filter(|env| matches!(&env.event, Event::ItemStarted { kind: ItemKind::Reasoning, .. }))
+                .filter(|env| {
+                    matches!(
+                        &env.event,
+                        Event::ItemStarted {
+                            kind: ItemKind::Reasoning,
+                            ..
+                        }
+                    )
+                })
                 .count();
             assert_eq!(reasoning_count, 1, "thinking item should not be duplicated");
         });

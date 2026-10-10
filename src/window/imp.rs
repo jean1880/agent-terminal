@@ -1801,7 +1801,8 @@ impl AgentTerminalWindow {
 
                 let (icon, css, tooltip) = match &state {
                     crate::utils::IndicatorState::Ok { detail } => {
-                        let first_line = detail.lines().find(|l| !l.trim().is_empty()).map(str::trim);
+                        let first_line =
+                            detail.lines().find(|l| !l.trim().is_empty()).map(str::trim);
                         let tooltip = match first_line {
                             Some(line) => {
                                 if line.starts_with(&format!("{}:", indicator.label))
@@ -1814,11 +1815,7 @@ impl AgentTerminalWindow {
                             }
                             None => format!("{}: OK", indicator.label),
                         };
-                        (
-                            &indicator.icon_ok,
-                            "success-indicator",
-                            tooltip,
-                        )
+                        (&indicator.icon_ok, "success-indicator", tooltip)
                     }
                     crate::utils::IndicatorState::Warn { .. } => (
                         &indicator.icon_warn,

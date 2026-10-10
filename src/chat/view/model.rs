@@ -890,9 +890,9 @@ impl Transcript {
                 let is_queued = matches!(&body, Body::User { queued: true, .. });
                 if !is_queued {
                     if let Some(first_queued) = self.order.iter().position(|oid| {
-                        self.items
-                            .get(oid)
-                            .is_some_and(|item| matches!(&item.body, Body::User { queued: true, .. }))
+                        self.items.get(oid).is_some_and(|item| {
+                            matches!(&item.body, Body::User { queued: true, .. })
+                        })
                     }) {
                         self.order.insert(first_queued, id.clone());
                     } else {
@@ -3063,7 +3063,10 @@ mod tests {
         // Turn 1 continues emitting events: another tool, reasoning, assistant message
         t.apply(&started("t2", ItemKind::Command, None), Driver::Agy);
         t.apply(&started("r1", ItemKind::Reasoning, None), Driver::Agy);
-        t.apply(&started("a1", ItemKind::AssistantMessage, None), Driver::Agy);
+        t.apply(
+            &started("a1", ItemKind::AssistantMessage, None),
+            Driver::Agy,
+        );
 
         // Queued prompt q1 must remain at the very end
         assert_eq!(t.order(), ["u1", "t1", "t2", "r1", "a1", "q1"]);
@@ -3109,4 +3112,3 @@ mod tests {
         assert_eq!(format_tokens(1_000_000), "1M");
     }
 }
-
