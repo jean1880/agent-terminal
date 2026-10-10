@@ -847,7 +847,7 @@ fn agent_launch_with(
         adapter,
         program,
         extra_args: profile.args.clone(),
-        default_model: profile.default_model.clone(),
+        default_model: profile.effective_default_model(None),
         default_effort: profile.default_effort.clone(),
         env: LaunchEnv {
             env: resolved.env,
@@ -2705,7 +2705,7 @@ impl AgentTerminalWindow {
             provider
                 .as_ref()
                 .and_then(|p| stored_model(Some(&p.model)))
-                .or_else(|| profile.default_model.clone()),
+                .or_else(|| profile.effective_default_model(None)),
             effort,
         );
         // The mode the user chose in this thread first (the session then runs what this agent
@@ -3631,7 +3631,7 @@ impl AgentTerminalWindow {
             self.config
                 .borrow()
                 .agent_profile(driver)
-                .and_then(|p| p.default_model.clone())
+                .and_then(|p| p.effective_default_model(None))
         });
         // A profile default the agent has retired is never started: the suggestion is used.
         let (model, effort, _) = live_model(driver, model, effort);

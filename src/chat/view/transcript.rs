@@ -135,10 +135,12 @@ impl TranscriptView {
         empty.set_halign(gtk4::Align::Center);
         let title = gtk4::Label::new(Some("Start a conversation"));
         title.add_css_class("empty-title");
+        title.set_selectable(true);
         let hint = gtk4::Label::new(Some(
             "Type a message below. / for commands, @ for files, $ for skills.",
         ));
         hint.add_css_class("empty-hint");
+        hint.set_selectable(true);
         empty.append(&title);
         empty.append(&hint);
         empty.set_can_target(false);

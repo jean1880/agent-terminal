@@ -67,6 +67,7 @@ pub fn brand_image(driver: Driver) -> gtk4::Image {
 pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     let l = gtk4::Label::new(Some(text));
     l.set_xalign(0.0);
+    l.set_selectable(true);
     for c in classes {
         l.add_css_class(c);
     }
@@ -450,6 +451,7 @@ impl Row {
                 let md = MarkdownView::new();
                 root.append(md.widget());
                 let caret = label("▍", &["stream-caret"]);
+                caret.set_selectable(false);
                 root.append(&caret);
                 Self::Assistant { root, md, caret }
             }
@@ -1293,31 +1295,42 @@ impl ToolCard {
         });
         self.badge.set_visible(!self.badge.text().is_empty());
         self.kind_icon.set_icon_name(Some(kind_icon(tool.kind)));
-        self.title
-            .set_text(if is_edit { "Show changes" } else { &tool.title });
-        self.title.set_tooltip_text(Some(&tool.title));
-        let summary = payload::tool_summary(tool.kind, tool.input.as_ref(), &tool.input_text);
-        let paths = if is_edit {
-            tool.input
-                .as_ref()
-                .map(agent_kit::editdiff::preview_from_input)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|edit| edit.path)
-                .collect::<Vec<_>>()
+        let (action_title, target_summary) = payload::card_title_and_summary(
+            tool.kind,
+            &tool.title,
+            tool.input.as_ref(),
+            &tool.input_text,
+        );
+        self.title.set_text(if is_edit {
+            "Show changes"
         } else {
-            Vec::new()
-        };
+            &action_title
+        });
+        self.title
+            .set_tooltip_text(Some(&format!("{action_title}: {target_summary}")));
+        let mut paths = tool
+            .input
+            .as_ref()
+            .map(agent_kit::editdiff::paths_from_input)
+            .unwrap_or_default();
+        if paths.is_empty() && !tool.input_text.is_empty() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tool.input_text) {
+                paths = agent_kit::editdiff::paths_from_input(&val);
+            }
+        }
         let files = if paths.is_empty() {
-            tool.title.clone()
+            if !target_summary.is_empty() {
+                target_summary.clone()
+            } else {
+                tool.title.clone()
+            }
         } else {
             paths.join(", ")
         };
-        self.summary.set_text(if is_edit {
-            &files
-        } else {
-            summary.as_deref().unwrap_or("")
-        });
+        self.summary
+            .set_text(if is_edit { &files } else { &target_summary });
+        self.summary
+            .set_tooltip_text(Some(if is_edit { &files } else { &target_summary }));
         self.summary.set_wrap(is_edit);
         self.summary.set_ellipsize(if is_edit {
             gtk4::pango::EllipsizeMode::None
@@ -1328,7 +1341,7 @@ impl ToolCard {
             .update_property(&[gtk4::accessible::Property::Label(&if is_edit {
                 format!("Show changes for {files}")
             } else {
-                format!("{} {}", tool.title, summary.as_deref().unwrap_or(""))
+                format!("{action_title} {target_summary}")
             })]);
         let input = payload::tool_input_text(tool.kind, tool.input.as_ref(), &tool.input_text);
         self.input_box.set_visible(!input.trim().is_empty());
@@ -1607,9 +1620,10 @@ impl ApprovalCard {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
                     let initial_cmd = match tool.as_str() {
-                        "run_command" => input_val
+                        "run_command" | "Bash" | "bash" => input_val
                             .get("CommandLine")
                             .or_else(|| input_val.get("command"))
+                            .or_else(|| input_val.get("cmd"))
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
@@ -1876,6 +1890,86 @@ impl QuestionCardWidget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalSuggestion {
+    pub(crate) pattern: String,
+    pub(crate) label: String,
+    pub(crate) description: Option<String>,
+}
+
+pub(crate) fn build_approval_suggestions(
+    tool: &str,
+    initial_pattern: &str,
+) -> Vec<ApprovalSuggestion> {
+    let initial = initial_pattern.trim();
+    if initial.is_empty() {
+        return Vec::new();
+    }
+
+    let mut suggestions: Vec<ApprovalSuggestion> = Vec::new();
+    let is_shell_cmd = matches!(tool, "run_command" | "Bash" | "bash");
+
+    let exact_desc = if is_shell_cmd {
+        "Exact command"
+    } else if tool == "call_mcp_tool" {
+        "Exact tool"
+    } else {
+        "Exact pattern"
+    };
+    suggestions.push(ApprovalSuggestion {
+        pattern: initial.to_string(),
+        label: initial.to_string(),
+        description: Some(exact_desc.to_string()),
+    });
+
+    if is_shell_cmd {
+        let clean_words: Vec<&str> = initial
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '*' || c == '?'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if clean_words.len() > 1 {
+            let p2 = format!("{} {} *", clean_words[0], clean_words[1]);
+            if !suggestions.iter().any(|s| s.pattern == p2) {
+                suggestions.push(ApprovalSuggestion {
+                    pattern: p2.clone(),
+                    label: p2,
+                    description: Some(format!(
+                        "Permit any '{} {}' command",
+                        clean_words[0], clean_words[1]
+                    )),
+                });
+            }
+        }
+        if let Some(first) = clean_words.first() {
+            let p1 = format!("{first} *");
+            if !suggestions.iter().any(|s| s.pattern == p1) {
+                suggestions.push(ApprovalSuggestion {
+                    pattern: p1.clone(),
+                    label: p1,
+                    description: Some(format!("Permit any '{first}' command")),
+                });
+            }
+        }
+    } else if tool == "call_mcp_tool" || initial.contains('/') {
+        if let Some((server, _tool_name)) = initial.split_once('/') {
+            let clean_server = server.trim_matches(|c| c == '*' || c == '?');
+            if !clean_server.is_empty() {
+                let p_server = format!("{clean_server}/*");
+                if !suggestions.iter().any(|s| s.pattern == p_server) {
+                    suggestions.push(ApprovalSuggestion {
+                        pattern: p_server.clone(),
+                        label: p_server,
+                        description: Some(format!("Permit all tools on '{clean_server}'")),
+                    });
+                }
+            }
+        }
+    }
+
+    suggestions
+}
+
 fn confirm_approval_rule(
     parent: &impl IsA<gtk4::Widget>,
     request: String,
@@ -1917,36 +2011,90 @@ fn confirm_approval_rule(
         .build();
     content_box.append(&entry);
 
-    if tool == "run_command" {
-        let chips_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        chips_box.set_halign(gtk4::Align::Start);
-        let words: Vec<&str> = initial_pattern.split_whitespace().collect();
-        if let Some(first) = words.first() {
-            let chip1 = gtk4::Button::with_label(&format!("{first} *"));
-            chip1.add_css_class("flat");
-            chip1.add_css_class("pill");
-            chip1.set_tooltip_text(Some(&format!("Loosen to permit any '{first}' command")));
-            let e = entry.clone();
-            let label = format!("{first} *");
-            chip1.connect_clicked(move |_| {
-                e.set_text(&label);
-            });
-            chips_box.append(&chip1);
+    let suggestions = build_approval_suggestions(&tool, &initial_pattern);
+    if suggestions.len() > 1 {
+        let flow = gtk4::FlowBox::new();
+        flow.set_selection_mode(gtk4::SelectionMode::None);
+        flow.set_max_children_per_line(3);
+        flow.set_column_spacing(8);
+        flow.set_row_spacing(8);
+        flow.set_homogeneous(false);
 
-            if words.len() > 1 {
-                let prefix2 = format!("{} {} *", words[0], words[1]);
-                let chip2 = gtk4::Button::with_label(&prefix2);
-                chip2.add_css_class("flat");
-                chip2.add_css_class("pill");
-                chip2.set_tooltip_text(Some(&format!("Loosen to permit any '{prefix2}' command")));
-                let e = entry.clone();
-                chip2.connect_clicked(move |_| {
-                    e.set_text(&prefix2);
-                });
-                chips_box.append(&chip2);
+        let in_sync = Rc::new(Cell::new(false));
+        let mut toggle_buttons: Vec<(gtk4::ToggleButton, String)> = Vec::new();
+
+        for opt in &suggestions {
+            let b = gtk4::ToggleButton::new();
+            b.add_css_class("option-button");
+
+            let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            let ol = label(&opt.label, &["option-label"]);
+            wrapping(&ol);
+            ol.set_max_width_chars(32);
+            ol.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+            inner.append(&ol);
+
+            if let Some(desc) = &opt.description {
+                let dl = label(desc, &["option-desc"]);
+                wrapping(&dl);
+                dl.set_max_width_chars(36);
+                inner.append(&dl);
             }
+
+            b.set_child(Some(&inner));
+            b.set_tooltip_text(Some(&opt.pattern));
+
+            if opt.pattern == initial_pattern {
+                b.set_active(true);
+            }
+
+            toggle_buttons.push((b.clone(), opt.pattern.clone()));
+            flow.insert(&b, -1);
         }
-        content_box.append(&chips_box);
+
+        let buttons_rc = Rc::new(toggle_buttons);
+        for (b, pat) in buttons_rc.iter() {
+            let entry_clone = entry.clone();
+            let buttons_clone = buttons_rc.clone();
+            let in_sync_clone = in_sync.clone();
+            let pattern = pat.clone();
+
+            b.connect_toggled(move |btn| {
+                if in_sync_clone.get() {
+                    return;
+                }
+                in_sync_clone.set(true);
+                if btn.is_active() {
+                    entry_clone.set_text(&pattern);
+                    for (other_btn, other_pat) in buttons_clone.iter() {
+                        if other_pat != &pattern {
+                            other_btn.set_active(false);
+                        }
+                    }
+                } else if entry_clone.text().trim() == pattern {
+                    btn.set_active(true);
+                }
+                in_sync_clone.set(false);
+            });
+        }
+
+        {
+            let buttons_clone = buttons_rc.clone();
+            let in_sync_clone = in_sync.clone();
+            entry.connect_changed(move |ent| {
+                if in_sync_clone.get() {
+                    return;
+                }
+                in_sync_clone.set(true);
+                let current = ent.text().trim().to_string();
+                for (btn, pat) in buttons_clone.iter() {
+                    btn.set_active(pat == &current);
+                }
+                in_sync_clone.set(false);
+            });
+        }
+
+        content_box.append(&flow);
     }
 
     let global_check = gtk4::CheckButton::builder()
@@ -2157,6 +2305,7 @@ pub(crate) mod tests {
                 .contains("cargo test in this folder"),
             "scope explanation is retained"
         );
+        chat_labels_are_selectable();
     }
 
     #[test]
@@ -2188,5 +2337,107 @@ pub(crate) mod tests {
         assert_eq!(normalise_lang("RS"), "rust");
         assert_eq!(normalise_lang("bash"), "sh");
         assert_eq!(normalise_lang("toml"), "toml");
+    }
+
+    #[test]
+    fn approval_suggestions_for_shell_and_mcp() {
+        // Multi-word shell command
+        let s = build_approval_suggestions("run_command", "cargo test --workspace");
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].pattern, "cargo test --workspace");
+        assert_eq!(s[0].description.as_deref(), Some("Exact command"));
+        assert_eq!(s[1].pattern, "cargo test *");
+        assert_eq!(
+            s[1].description.as_deref(),
+            Some("Permit any 'cargo test' command")
+        );
+        assert_eq!(s[2].pattern, "cargo *");
+        assert_eq!(
+            s[2].description.as_deref(),
+            Some("Permit any 'cargo' command")
+        );
+
+        // Two-word command with Bash tool
+        let s = build_approval_suggestions("Bash", "git status");
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].pattern, "git status");
+        assert_eq!(s[1].pattern, "git status *");
+        assert_eq!(s[2].pattern, "git *");
+
+        // Single-word command
+        let s = build_approval_suggestions("bash", "htop");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].pattern, "htop");
+        assert_eq!(s[1].pattern, "htop *");
+
+        // MCP tool
+        let s = build_approval_suggestions("call_mcp_tool", "ansible/deploy_apply");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].pattern, "ansible/deploy_apply");
+        assert_eq!(s[0].description.as_deref(), Some("Exact tool"));
+        assert_eq!(s[1].pattern, "ansible/*");
+        assert_eq!(
+            s[1].description.as_deref(),
+            Some("Permit all tools on 'ansible'")
+        );
+
+        // Deduplication when pattern already has wildcard
+        let s = build_approval_suggestions("run_command", "cargo *");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].pattern, "cargo *");
+
+        // Empty pattern
+        let s = build_approval_suggestions("run_command", "");
+        assert!(s.is_empty());
+    }
+
+    fn chat_labels_are_selectable() {
+        let l = label("sample text", &["custom-class"]);
+        assert!(l.is_selectable());
+
+        let err = error_row("something went wrong");
+        let col = err.last_child().unwrap().downcast::<gtk4::Box>().unwrap();
+        let title_lbl = col
+            .first_child()
+            .unwrap()
+            .downcast::<gtk4::Label>()
+            .unwrap();
+        let text_lbl = col.last_child().unwrap().downcast::<gtk4::Label>().unwrap();
+        assert!(title_lbl.is_selectable());
+        assert!(text_lbl.is_selectable());
+
+        let not = notice("Heads up", Tone::Info);
+        let not_lbl = not.last_child().unwrap().downcast::<gtk4::Label>().unwrap();
+        assert!(not_lbl.is_selectable());
+
+        let div = divider("Context compacted", "compaction-divider", None);
+        let pill = div
+            .downcast::<gtk4::Box>()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk4::Box>()
+            .unwrap();
+        let div_lbl = pill
+            .first_child()
+            .unwrap()
+            .downcast::<gtk4::Label>()
+            .unwrap();
+        assert!(div_lbl.is_selectable());
+
+        let sink: RowSink = Rc::new(|_| {});
+        let app = ApprovalCard::new(&sink);
+        assert!(app.title.is_selectable());
+        assert!(app.reason.is_selectable());
+        assert!(app.remembers.is_selectable());
+        assert!(app.outcome.is_selectable());
+
+        let tc = ToolCard::new("t1", &sink);
+        assert!(tc.title.is_selectable());
+        assert!(tc.summary.is_selectable());
+        assert!(tc.badge.is_selectable());
+        assert!(tc.error.is_selectable());
     }
 }

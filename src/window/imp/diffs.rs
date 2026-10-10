@@ -130,7 +130,12 @@ impl ThreadDiffs {
 
     /// The item's baseline, once it is known (waits for one still being taken).
     async fn base_of(&self, item: &str) -> Option<TurnBase> {
-        let slot = self.bases.borrow().get(item).cloned()?;
+        let slot = self
+            .bases
+            .borrow()
+            .get(item)
+            .cloned()
+            .or_else(|| self.current.borrow().clone())?;
         wait_until(BASE_WAIT, Duration::from_millis(100), || !slot.pending()).await;
         slot.ready()
     }
@@ -169,11 +174,16 @@ impl DiffSource for ThreadDiffs {
             return;
         };
         // A multi-file edit (Codex) opens its first file; the diff panel lists the rest.
-        let Some(path) = agent_kit::editdiff::preview_from_input(&ask.input)
+        let path = agent_kit::editdiff::paths_from_input(&ask.input)
             .into_iter()
             .next()
-            .map(|e| e.path)
-        else {
+            .or_else(|| {
+                agent_kit::editdiff::preview_from_input(&ask.input)
+                    .into_iter()
+                    .next()
+                    .map(|e| e.path)
+            });
+        let Some(path) = path else {
             (self.toast)("This edit names no file to open");
             return;
         };

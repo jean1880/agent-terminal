@@ -793,8 +793,13 @@ impl AgentTerminalWindow {
             filling,
             move || {
                 let saved = obj.imp().agent_profile_now(driver).default_model;
+                let from_settings = crate::config::agent_settings_model(driver, None);
+                let default_label = match &from_settings {
+                    Some(m) => format!("The CLI's default ({m})"),
+                    None => "The CLI's default".to_owned(),
+                };
                 let mut ids: Vec<Option<String>> = vec![None];
-                let mut labels: Vec<String> = vec!["The CLI's default".to_owned()];
+                let mut labels: Vec<String> = vec![default_label];
                 for m in ModelCatalog::shared()
                     .models()
                     .into_iter()

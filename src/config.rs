@@ -166,6 +166,126 @@ pub fn choose_default_agent(
         .find(|d| usable(*d))
 }
 
+/// The model configured in `driver`'s own settings file (`settings.json`, `config.toml`).
+pub fn agent_settings_model(
+    driver: agent_core::adapter::Driver,
+    home: Option<&Path>,
+) -> Option<String> {
+    let home_buf = if cfg!(test) {
+        home.map(PathBuf::from)
+    } else {
+        home.map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    };
+    let home = home_buf.as_deref()?;
+    match driver {
+        agent_core::adapter::Driver::Claude => claude_settings_model(home),
+        agent_core::adapter::Driver::Agy => agy_settings_model(home),
+        agent_core::adapter::Driver::Codex => codex_settings_model(home),
+    }
+}
+
+/// The model configured in the settings file of the agent running `command`.
+pub fn agent_settings_model_for_command(command: &str, home: Option<&Path>) -> Option<String> {
+    use agent_core::adapter::Driver;
+    let name = Path::new(command.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())?;
+    let driver = Driver::ALL
+        .into_iter()
+        .find(|d| d.info().default_command == name)?;
+    agent_settings_model(driver, home)
+}
+
+fn claude_settings_model(home: &Path) -> Option<String> {
+    let settings_path = home.join(".claude/settings.json");
+    let content = std::fs::read_to_string(settings_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    val.get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn agy_settings_model(home: &Path) -> Option<String> {
+    let cli_path = home.join(".gemini/antigravity-cli/settings.json");
+    let gemini_path = home.join(".gemini/settings.json");
+    let content = std::fs::read_to_string(&cli_path)
+        .or_else(|_| std::fs::read_to_string(&gemini_path))
+        .ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let raw = val.get("model")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(normalize_agy_model_setting(raw))
+}
+
+fn normalize_agy_model_setting(model: &str) -> String {
+    let trimmed = model.trim();
+    if let Some(open) = trimmed.rfind('(') {
+        if let Some(close) = trimmed[open..].find(')') {
+            let effort = trimmed[open + 1..open + close].trim().to_lowercase();
+            let base_display = trimmed[..open].trim();
+            let base_slug = base_display.to_lowercase().replace(' ', "-");
+            return format!("{base_slug}-{effort}");
+        }
+    }
+    if trimmed.contains(' ') {
+        trimmed.to_lowercase().replace(' ', "-")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn codex_settings_model(home: &Path) -> Option<String> {
+    let config_path = home.join(".codex/config.toml");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Some(model) = parse_toml_top_level_model(&content) {
+            return Some(model);
+        }
+    }
+    let cache_path = home.join(".codex/models_cache.json");
+    if let Ok(content) = std::fs::read_to_string(&cache_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(models) = val.get("models").and_then(serde_json::Value::as_array) {
+                if let Some(first) = models.first() {
+                    if let Some(slug) = first.get("slug").and_then(serde_json::Value::as_str) {
+                        let trimmed = slug.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_toml_top_level_model(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if k.trim() == "model" {
+                let v = v.trim();
+                let stripped = v.trim_matches(|c| c == '"' || c == '\'');
+                if !stripped.is_empty() {
+                    return Some(stripped.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Profile {
     /// The full argv to exec, command first.
     pub fn argv(&self) -> Vec<String> {
@@ -189,6 +309,14 @@ impl Profile {
     /// hand-off.
     pub fn can_take_prompt(&self) -> bool {
         self.prompt_args.as_ref().is_some_and(|a| !a.is_empty())
+    }
+
+    /// The default model configured for this profile: either explicitly chosen on the profile,
+    /// or pulled from the agent's settings file when left on the CLI's default.
+    pub fn effective_default_model(&self, home: Option<&Path>) -> Option<String> {
+        self.default_model
+            .clone()
+            .or_else(|| agent_settings_model_for_command(&self.command, home))
     }
 }
 
@@ -2226,5 +2354,83 @@ mod tests {
             ..Profile::default()
         };
         assert_eq!(profile_driver(&wrapped), Some(Driver::Codex));
+    }
+
+    #[test]
+    fn default_model_is_pulled_from_agent_settings() {
+        use agent_core::adapter::Driver;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // 1. Claude: ~/.claude/settings.json
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            br#"{"model": "claude-sonnet-4-6"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            agent_settings_model(Driver::Claude, Some(home)),
+            Some("claude-sonnet-4-6".to_string())
+        );
+
+        // 2. Agy: ~/.gemini/antigravity-cli/settings.json with display label containing effort
+        let agy_dir = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&agy_dir).unwrap();
+        std::fs::write(
+            agy_dir.join("settings.json"),
+            br#"{"model": "Gemini 3.8 Flash (High)"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            agent_settings_model(Driver::Agy, Some(home)),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+
+        // 3. Codex: ~/.codex/config.toml
+        let codex_dir = home.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            b"model = \"gpt-5-codex\"\n\n[other]\nfoo = \"bar\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            agent_settings_model(Driver::Codex, Some(home)),
+            Some("gpt-5-codex".to_string())
+        );
+
+        // 4. Codex fallback to models_cache.json when config.toml has no top-level model
+        let dir2 = tempfile::tempdir().unwrap();
+        let home2 = dir2.path();
+        let codex_dir2 = home2.join(".codex");
+        std::fs::create_dir_all(&codex_dir2).unwrap();
+        std::fs::write(
+            codex_dir2.join("models_cache.json"),
+            br#"{"models": [{"slug": "gpt-6.1-sol"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            agent_settings_model(Driver::Codex, Some(home2)),
+            Some("gpt-6.1-sol".to_string())
+        );
+
+        // 5. Profile::effective_default_model
+        let mut claude_profile = Profile {
+            command: "claude".into(),
+            ..Profile::default()
+        };
+        // Pulls from settings when profile has none
+        assert_eq!(
+            claude_profile.effective_default_model(Some(home)),
+            Some("claude-sonnet-4-6".to_string())
+        );
+        // Explicit profile setting overrides agent settings
+        claude_profile.default_model = Some("opus".into());
+        assert_eq!(
+            claude_profile.effective_default_model(Some(home)),
+            Some("opus".to_string())
+        );
     }
 }

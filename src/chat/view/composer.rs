@@ -28,8 +28,13 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 use sourceview5::prelude::*;
 
-use super::cards::label;
 use super::typeahead::{apply_completion, Key, KeyOutcome, LatestRequest, Popup};
+
+fn label(text: &str, classes: &[&str]) -> gtk4::Label {
+    let l = super::cards::label(text, classes);
+    l.set_selectable(false);
+    l
+}
 
 /// Debounce for `@file` suggestions (a round trip to the agent CLI).
 const FILE_DEBOUNCE: Duration = Duration::from_millis(120);

@@ -200,6 +200,30 @@ pub fn tool_summary(kind: ItemKind, input: Option<&Value>, input_text: &str) -> 
             &parsed
         }
     };
+    if kind == ItemKind::FileRead {
+        if let Some(pat) = str_field(input, &["pattern", "query"]) {
+            let path = str_field(
+                input,
+                &[
+                    "SearchPath",
+                    "path",
+                    "file_path",
+                    "DirectoryPath",
+                    "directory",
+                ],
+            );
+            let s = match path {
+                Some(p) if !p.is_empty() && p != "." => format!("{pat} in {p}"),
+                _ => pat.to_owned(),
+            };
+            let line = s.lines().next().unwrap_or(&s).trim();
+            let mut out: String = line.chars().take(140).collect();
+            if line.chars().count() > 140 || s.lines().count() > 1 {
+                out.push('…');
+            }
+            return Some(out);
+        }
+    }
     let keys: &[&str] = match kind {
         ItemKind::Command => &["command", "CommandLine", "cmd"],
         ItemKind::FileChange | ItemKind::FileRead => &[
@@ -208,9 +232,14 @@ pub fn tool_summary(kind: ItemKind, input: Option<&Value>, input_text: &str) -> 
             "TargetFile",
             "AbsolutePath",
             "notebook_path",
+            "DirectoryPath",
+            "SearchPath",
+            "filePath",
+            "filepath",
         ],
         ItemKind::WebSearch => &["query", "url"],
         ItemKind::Subagent => &["description", "subagent_type", "prompt"],
+        ItemKind::McpTool => &["ToolName", "tool", "query", "command"],
         _ => &[
             "command",
             "file_path",
@@ -230,13 +259,294 @@ pub fn tool_summary(kind: ItemKind, input: Option<&Value>, input_text: &str) -> 
     Some(out)
 }
 
-/// Pretty input for a card body: the command line for commands, otherwise indented JSON.
+/// Derives the clean action label (e.g. "Read", "Edit", "Run", "Search") and the target summary
+/// (e.g. file path, command, query) so card headers clearly explain what is happening without
+/// ever showing just a bare file name.
+pub fn card_title_and_summary(
+    kind: ItemKind,
+    raw_title: &str,
+    input: Option<&Value>,
+    input_text: &str,
+) -> (String, String) {
+    let parsed;
+    let val = match input {
+        Some(v) if !v.is_null() => Some(v),
+        _ => {
+            parsed = serde_json::from_str::<Value>(input_text).ok();
+            parsed.as_ref()
+        }
+    };
+
+    let summary = tool_summary(kind, val, input_text).unwrap_or_default();
+
+    match kind {
+        ItemKind::Command => {
+            let cmd = if !summary.is_empty() {
+                summary
+            } else if !raw_title.is_empty() && raw_title != "command" && raw_title != "Bash" {
+                raw_title.to_owned()
+            } else {
+                String::new()
+            };
+            ("Run".to_owned(), cmd)
+        }
+        ItemKind::FileRead => {
+            let lower_title = raw_title.to_ascii_lowercase();
+            let action = if lower_title.contains("grep")
+                || lower_title.contains("search")
+                || val
+                    .and_then(|v| v.get("pattern").or_else(|| v.get("SearchPath")))
+                    .is_some()
+            {
+                "Search".to_owned()
+            } else if lower_title.contains("list")
+                || lower_title.contains("glob")
+                || val.and_then(|v| v.get("DirectoryPath")).is_some()
+            {
+                "List".to_owned()
+            } else if lower_title.contains("find") {
+                "Find".to_owned()
+            } else {
+                "Read".to_owned()
+            };
+            let target = if !summary.is_empty() {
+                summary
+            } else if looks_like_path(raw_title) {
+                raw_title.to_owned()
+            } else {
+                String::new()
+            };
+            (action, target)
+        }
+        ItemKind::FileChange => {
+            let lower_title = raw_title.to_ascii_lowercase();
+            let is_write = lower_title.contains("write")
+                || (val.is_some_and(|v| {
+                    (v.get("content").is_some() || v.get("CodeContent").is_some())
+                        && v.get("old_string").is_none()
+                        && v.get("TargetContent").is_none()
+                }));
+            let action = if is_write {
+                "Write".to_owned()
+            } else {
+                "Edit".to_owned()
+            };
+            let paths = val
+                .map(agent_kit::editdiff::paths_from_input)
+                .unwrap_or_default();
+            let target = if !paths.is_empty() {
+                paths.join(", ")
+            } else if !summary.is_empty() {
+                summary
+            } else if looks_like_path(raw_title) {
+                raw_title.to_owned()
+            } else {
+                String::new()
+            };
+            (action, target)
+        }
+        ItemKind::WebSearch => {
+            let lower_title = raw_title.to_ascii_lowercase();
+            let is_fetch = lower_title.contains("fetch")
+                || lower_title.contains("read_url")
+                || (val.is_some_and(|v| v.get("url").is_some() && v.get("query").is_none()));
+            let action = if is_fetch {
+                "Fetch".to_owned()
+            } else {
+                "Search".to_owned()
+            };
+            (action, summary)
+        }
+        ItemKind::McpTool => {
+            let tool_name = if raw_title.starts_with("mcp__") {
+                raw_title.strip_prefix("mcp__").unwrap().replace("__", ".")
+            } else if raw_title == "call_mcp_tool" {
+                if let Some(v) = val {
+                    let server = str_field(v, &["ServerName", "server"]).unwrap_or("mcp");
+                    let tool = str_field(v, &["ToolName", "tool"]).unwrap_or("tool");
+                    format!("{server}.{tool}")
+                } else {
+                    "call_mcp_tool".to_owned()
+                }
+            } else if !raw_title.is_empty() && raw_title != "tool" {
+                raw_title.to_owned()
+            } else {
+                "MCP Tool".to_owned()
+            };
+            (tool_name, summary)
+        }
+        ItemKind::Subagent => ("Subagent".to_owned(), summary),
+        ItemKind::Reasoning => ("Thinking".to_owned(), summary),
+        _ => {
+            let title = if looks_like_path(raw_title) {
+                if let Some(v) = val {
+                    if v.get("TargetContent").is_some() || v.get("old_string").is_some() {
+                        "Edit".to_owned()
+                    } else if v.get("AbsolutePath").is_some() || v.get("file_path").is_some() {
+                        "Read".to_owned()
+                    } else {
+                        "Tool".to_owned()
+                    }
+                } else {
+                    "Tool".to_owned()
+                }
+            } else if !raw_title.is_empty() {
+                raw_title.to_owned()
+            } else {
+                "Tool".to_owned()
+            };
+            let target = if !summary.is_empty() {
+                summary
+            } else if looks_like_path(raw_title) {
+                raw_title.to_owned()
+            } else {
+                String::new()
+            };
+            (title, target)
+        }
+    }
+}
+
+fn looks_like_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    s.contains('/')
+        || s.contains('\\')
+        || s.ends_with(".rs")
+        || s.ends_with(".py")
+        || s.ends_with(".ts")
+        || s.ends_with(".js")
+        || s.ends_with(".toml")
+        || s.ends_with(".json")
+        || s.ends_with(".md")
+        || s.ends_with(".txt")
+}
+
+/// Pretty, human-readable input for a card body: command lines, clear action/target summaries,
+/// or indented JSON.
 pub fn tool_input_text(kind: ItemKind, input: Option<&Value>, input_text: &str) -> String {
     match input {
         Some(v) if !v.is_null() => {
             if kind == ItemKind::Command {
                 if let Some(cmd) = str_field(v, &["command", "CommandLine", "cmd"]) {
-                    return format!("$ {cmd}");
+                    let mut s = format!("$ {cmd}");
+                    if let Some(cwd) = str_field(v, &["cwd", "Cwd"]) {
+                        s.push_str(&format!("\nWorking directory: {cwd}"));
+                    }
+                    if let Some(desc) = str_field(v, &["description", "Description", "toolAction"])
+                    {
+                        s.push_str(&format!("\nAction: {desc}"));
+                    }
+                    return s;
+                }
+            }
+            if matches!(kind, ItemKind::FileRead | ItemKind::FileChange) {
+                let mut lines = Vec::new();
+                if let Some(action) = str_field(
+                    v,
+                    &[
+                        "toolAction",
+                        "toolSummary",
+                        "Description",
+                        "Instruction",
+                        "description",
+                        "instruction",
+                    ],
+                ) {
+                    lines.push(format!("Action: {action}"));
+                }
+                if let Some(pat) = str_field(v, &["pattern", "query"]) {
+                    lines.push(format!("Pattern: {pat}"));
+                }
+                if let Some(path) = str_field(
+                    v,
+                    &[
+                        "file_path",
+                        "TargetFile",
+                        "path",
+                        "AbsolutePath",
+                        "notebook_path",
+                        "DirectoryPath",
+                        "SearchPath",
+                    ],
+                ) {
+                    let label = if v.get("DirectoryPath").is_some() || v.get("SearchPath").is_some()
+                    {
+                        "Directory"
+                    } else {
+                        "File"
+                    };
+                    lines.push(format!("{label}: {path}"));
+                }
+                if let (Some(start), Some(end)) = (v.get("StartLine"), v.get("EndLine")) {
+                    lines.push(format!("Lines: {start} – {end}"));
+                }
+                if !lines.is_empty()
+                    && (v.get("old_string").is_none() && v.get("TargetContent").is_none())
+                {
+                    return lines.join("\n");
+                }
+            }
+            if kind == ItemKind::WebSearch {
+                let mut lines = Vec::new();
+                if let Some(action) = str_field(v, &["toolAction", "toolSummary"]) {
+                    lines.push(format!("Action: {action}"));
+                }
+                if let Some(q) = str_field(v, &["query", "q", "search_query"]) {
+                    lines.push(format!("Query: {q}"));
+                }
+                if let Some(u) = str_field(v, &["url", "Url"]) {
+                    lines.push(format!("URL: {u}"));
+                }
+                if !lines.is_empty() {
+                    return lines.join("\n");
+                }
+            }
+            if kind == ItemKind::McpTool {
+                let mut lines = Vec::new();
+                if let (Some(server), Some(tool)) = (
+                    str_field(v, &["ServerName", "server"]),
+                    str_field(v, &["ToolName", "tool"]),
+                ) {
+                    lines.push(format!("Tool: {server}.{tool}"));
+                }
+                if let Some(action) = str_field(
+                    v,
+                    &["toolAction", "toolSummary", "Description", "description"],
+                ) {
+                    lines.push(format!("Action: {action}"));
+                }
+                if let Some(args) = v
+                    .get("Arguments")
+                    .or_else(|| v.get("arguments"))
+                    .or_else(|| v.get("args"))
+                {
+                    if let Ok(pretty) = serde_json::to_string_pretty(args) {
+                        lines.push(format!("Arguments:\n{pretty}"));
+                    }
+                }
+                if !lines.is_empty() {
+                    return lines.join("\n");
+                }
+            }
+            if kind == ItemKind::Subagent {
+                let mut lines = Vec::new();
+                if let Some(role) = str_field(v, &["role", "Role", "subagent_type", "TypeName"]) {
+                    lines.push(format!("Subagent: {role}"));
+                }
+                if let Some(desc) = str_field(
+                    v,
+                    &["description", "Description", "toolAction", "toolSummary"],
+                ) {
+                    lines.push(format!("Action: {desc}"));
+                }
+                if let Some(prompt) = str_field(v, &["prompt", "Prompt"]) {
+                    lines.push(format!("Task: {prompt}"));
+                }
+                if !lines.is_empty() {
+                    return lines.join("\n");
                 }
             }
             serde_json::to_string_pretty(v).unwrap_or_default()
@@ -398,6 +708,111 @@ mod tests {
             tool_input_text(ItemKind::Tool, None, "partial {"),
             "partial {"
         );
+    }
+
+    #[test]
+    fn card_titles_and_summaries_are_distinct_actions_never_bare_file_names() {
+        let (action, target) = card_title_and_summary(
+            ItemKind::FileRead,
+            "/work/repo/calc.py",
+            Some(&json!({"AbsolutePath": "/work/repo/calc.py"})),
+            "",
+        );
+        assert_eq!(action, "Read");
+        assert_eq!(target, "/work/repo/calc.py");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::FileRead,
+            "list_dir",
+            Some(&json!({"DirectoryPath": "src/chat/view"})),
+            "",
+        );
+        assert_eq!(action, "List");
+        assert_eq!(target, "src/chat/view");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::FileRead,
+            "grep_search",
+            Some(&json!({"SearchPath": "src", "pattern": "diff"})),
+            "",
+        );
+        assert_eq!(action, "Search");
+        assert_eq!(target, "diff in src");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::FileChange,
+            "/work/repo/calc.py",
+            Some(&json!({"TargetFile": "/work/repo/calc.py"})),
+            "",
+        );
+        assert_eq!(action, "Edit");
+        assert_eq!(target, "/work/repo/calc.py");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::FileChange,
+            "write_to_file",
+            Some(&json!({"TargetFile": "src/new.rs", "CodeContent": "fn main() {}"})),
+            "",
+        );
+        assert_eq!(action, "Write");
+        assert_eq!(target, "src/new.rs");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::Command,
+            "false",
+            Some(&json!({"CommandLine": "cargo test"})),
+            "",
+        );
+        assert_eq!(action, "Run");
+        assert_eq!(target, "cargo test");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::WebSearch,
+            "read_url_content",
+            Some(&json!({"url": "https://nuvek.ca"})),
+            "",
+        );
+        assert_eq!(action, "Fetch");
+        assert_eq!(target, "https://nuvek.ca");
+
+        let (action, target) = card_title_and_summary(
+            ItemKind::McpTool,
+            "call_mcp_tool",
+            Some(&json!({"ServerName": "unraid", "ToolName": "unraid_containers"})),
+            "",
+        );
+        assert_eq!(action, "unraid.unraid_containers");
+        assert_eq!(target, "unraid_containers");
+    }
+
+    #[test]
+    fn formatted_tool_input_renders_readable_details() {
+        let formatted = tool_input_text(
+            ItemKind::FileRead,
+            Some(&json!({
+                "AbsolutePath": "src/cards.rs",
+                "toolAction": "Viewing ToolCard",
+                "StartLine": 10,
+                "EndLine": 50
+            })),
+            "",
+        );
+        assert!(formatted.contains("Action: Viewing ToolCard"));
+        assert!(formatted.contains("File: src/cards.rs"));
+        assert!(formatted.contains("Lines: 10 – 50"));
+
+        let cmd = tool_input_text(
+            ItemKind::Command,
+            Some(&json!({
+                "CommandLine": "git status",
+                "Cwd": "/home/user",
+                "toolAction": "Checking status"
+            })),
+            "",
+        );
+        assert!(cmd.contains("$ git status"));
+        assert!(cmd.contains("Working directory: /home/user"));
+        assert!(cmd.contains("Action: Checking status"));
     }
 
     #[test]

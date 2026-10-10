@@ -108,11 +108,25 @@ pub fn resolve(toplevel: &Path, path: &str) -> Result<RepoFile, String> {
     let given = Path::new(path);
     let rel: PathBuf = if given.is_absolute() {
         // The agent may name the path through the root as the user typed it or as it resolves.
-        given
-            .strip_prefix(toplevel)
-            .or_else(|_| given.strip_prefix(&root))
-            .map_err(|_| "The file is outside the repository".to_owned())?
-            .to_path_buf()
+        if let Ok(r) = given.strip_prefix(toplevel) {
+            r.to_path_buf()
+        } else if let Ok(r) = given.strip_prefix(&root) {
+            r.to_path_buf()
+        } else if let Ok(c) = given.canonicalize() {
+            c.strip_prefix(&root)
+                .map(Path::to_path_buf)
+                .map_err(|_| "The file is outside the repository".to_owned())?
+        } else if let (Some(parent), Some(file_name)) = (given.parent(), given.file_name()) {
+            let c_parent = parent
+                .canonicalize()
+                .map_err(|_| "The file is outside the repository".to_owned())?;
+            c_parent
+                .strip_prefix(&root)
+                .map(|r| r.join(file_name))
+                .map_err(|_| "The file is outside the repository".to_owned())?
+        } else {
+            return Err("The file is outside the repository".to_owned());
+        }
     } else {
         given.to_path_buf()
     };
@@ -288,26 +302,30 @@ pub struct Shown {
 /// diff is the agent's own edit instead. `Err` when the input names no file edit at all.
 /// Blocking when a base is given.
 pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Result<Shown, String> {
+    let mut files = editdiff::paths_from_input(input);
     let preview = editdiff::preview_from_input(input);
-    if preview.is_empty() {
+    for p in preview.iter().map(|e| e.path.clone()) {
+        if !files.contains(&p) {
+            files.push(p);
+        }
+    }
+    if files.is_empty() && preview.is_empty() {
         return Err("This edit carries no file diff to show.".to_owned());
     }
-    let files: Vec<String> = preview.iter().map(|e| e.path.clone()).collect();
     let from_checkpoint = base.and_then(|base| {
         let mut text = String::new();
-        for edit in &preview {
-            let file = resolve(&base.toplevel, &edit.path).ok()?;
+        for path in &files {
+            let file = resolve(&base.toplevel, path).ok()?;
             match turn_file_diff(base, &file).ok()? {
                 FileDiff::Text(d) => text.push_str(&d.diff),
                 FileDiff::Binary => {
-                    text.push_str(&format!("# {}: binary file, not shown\n", edit.path));
+                    text.push_str(&format!("# {path}: binary file, not shown\n"));
                 }
-                FileDiff::Unchanged => text.push_str(&format!(
-                    "# {}: no changes since the turn started\n",
-                    edit.path
-                )),
+                FileDiff::Unchanged => {
+                    text.push_str(&format!("# {path}: no changes since the turn started\n"))
+                }
                 FileDiff::TooLarge => {
-                    text.push_str(&format!("# {}: too large to show\n", edit.path));
+                    text.push_str(&format!("# {path}: too large to show\n"));
                 }
             }
         }
@@ -315,10 +333,36 @@ pub fn shown_for_item(base: Option<&TurnBase>, input: &serde_json::Value) -> Res
     });
     let (text, origin) = match from_checkpoint {
         Some(text) => (text, Origin::Checkpoint),
-        None => (
-            preview.iter().map(|e| e.diff.as_str()).collect::<String>(),
-            Origin::AgentEdit,
-        ),
+        None => {
+            let agent_text = preview.iter().map(|e| e.diff.as_str()).collect::<String>();
+            if !agent_text.is_empty() {
+                (agent_text, Origin::AgentEdit)
+            } else if !files.is_empty() {
+                let mut fallback = String::new();
+                for path in &files {
+                    if let Some(repo) = crate::git::discover(Path::new(path)).ok().flatten() {
+                        if let Ok(file) = resolve(&repo.toplevel, path) {
+                            if let Some(head) = repo.head {
+                                let head_base = TurnBase {
+                                    toplevel: repo.toplevel.clone(),
+                                    rev: head,
+                                };
+                                if let Ok(FileDiff::Text(d)) = turn_file_diff(&head_base, &file) {
+                                    fallback.push_str(&d.diff);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !fallback.is_empty() {
+                    (fallback, Origin::Checkpoint)
+                } else {
+                    return Err(format!("No diff is available for {}", files.join(", ")));
+                }
+            } else {
+                return Err("This edit carries no file diff to show.".to_owned());
+            }
+        }
     };
     let (kept, omitted_lines) = crate::diff::truncate(
         &text,
@@ -651,6 +695,33 @@ mod tests {
 
         // Not an edit at all.
         assert!(shown_for_item(None, &json!({"command": "ls"})).is_err());
+    }
+
+    #[test]
+    fn an_edit_with_only_target_file_diffs_against_a_checkpoint() {
+        use serde_json::json;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let p = tmp.path();
+        sh(p, &["init", "-b", "main"]);
+        sh(p, &["config", "user.email", "tests@test.invalid"]);
+        sh(p, &["config", "user.name", "Tests"]);
+        std::fs::write(p.join("calc.py"), "def add(a, b):\n    return a + b\n").expect("write");
+        sh(p, &["add", "calc.py"]);
+        sh(p, &["commit", "-m", "init"]);
+
+        let base = take_turn_base(p, 1, "test", true)
+            .expect("base")
+            .expect("base");
+        std::fs::write(
+            p.join("calc.py"),
+            "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n",
+        )
+        .expect("write");
+
+        let input = json!({"TargetFile": p.join("calc.py").to_str().unwrap()});
+        let shown = shown_for_item(Some(&base), &input).expect("shown");
+        assert_eq!(shown.origin, Origin::Checkpoint);
+        assert!(shown.text.contains("+def multiply(a, b):"));
     }
 
     #[test]

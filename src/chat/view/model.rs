@@ -1187,7 +1187,21 @@ impl Transcript {
             Event::ContentSnapshot { stream, text } => {
                 let id = self.text_target(env, *stream, driver, &mut out);
                 if let Some(id) = id {
-                    if self.write_stream(&id, *stream, text, true) {
+                    let mut updated = self.write_stream(&id, *stream, text, true);
+                    if *stream == StreamKind::ToolInput {
+                        if let Some(item) = self.items.get_mut(&id) {
+                            if let Body::Tool(t) = &mut item.body {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text)
+                                {
+                                    if !parsed.is_null() && t.input.as_ref() != Some(&parsed) {
+                                        t.input = Some(parsed);
+                                        updated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if updated {
                         out.push(Change::Updated(id));
                     }
                 }

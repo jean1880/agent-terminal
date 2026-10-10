@@ -7,8 +7,14 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 
-use super::cards::{accent_class, driver_name, label};
+use super::cards::{accent_class, driver_name};
 use super::model::{format_tokens, Activity, Gauge};
+
+fn label(text: &str, classes: &[&str]) -> gtk4::Label {
+    let l = super::cards::label(text, classes);
+    l.set_selectable(false);
+    l
+}
 
 /// Dropdown order of the modes. Driven by index both ways; the guard test keeps it complete.
 pub const MODES: [Mode; 3] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan];
@@ -338,7 +344,11 @@ impl Header {
                 Some(previous) => format!("{previous} → {target} (pending)"),
                 None => format!("{target} (pending)"),
             },
-            None => model.unwrap_or("default model").to_owned(),
+            None => match model {
+                Some(m) => m.to_owned(),
+                None => crate::config::agent_settings_model(driver, None)
+                    .unwrap_or_else(|| "default model".to_owned()),
+            },
         };
         self.model.set_text(&model_text);
         let name = format!("{} · {}", driver_name(driver), model_text);

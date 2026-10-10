@@ -70,8 +70,19 @@ fn ask(stdin: &str, socket: &str, timeout: Duration) -> Option<approval::Approva
     approval::parse_reply(first).ok()
 }
 
+unsafe extern "C" fn handle_signal(_: libc::c_int) {
+    let msg = b"{\"decision\":\"deny\",\"reason\":\"hook process terminated\"}\n";
+    let _ = libc::write(libc::STDOUT_FILENO, msg.as_ptr().cast(), msg.len());
+    libc::_exit(0);
+}
+
 /// Entry point for `--approval-hook`: reads stdin, prints the decision, exits 0.
 pub fn main() -> std::process::ExitCode {
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_signal as *const () as usize);
+        libc::signal(libc::SIGINT, handle_signal as *const () as usize);
+        libc::signal(libc::SIGHUP, handle_signal as *const () as usize);
+    }
     let mut stdin = String::new();
     if std::io::stdin().read_to_string(&mut stdin).is_err() {
         stdin.clear(); // unreadable payload: a gated call then denies

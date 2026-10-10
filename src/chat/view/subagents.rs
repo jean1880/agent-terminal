@@ -277,6 +277,7 @@ impl SubagentButton {
                         .label(group)
                         .accessible_role(gtk4::AccessibleRole::Heading)
                         .xalign(0.0)
+                        .selectable(true)
                         .css_classes(["heading"])
                         .margin_top(10)
                         .margin_bottom(6)

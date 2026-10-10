@@ -315,7 +315,7 @@ fn str_of<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|k| v.get(*k).and_then(Value::as_str))
 }
 
-fn path_of(v: &Value) -> Option<&str> {
+pub fn path_of(v: &Value) -> Option<&str> {
     str_of(
         v,
         &[
@@ -324,15 +324,71 @@ fn path_of(v: &Value) -> Option<&str> {
             "path",
             "AbsolutePath",
             "notebook_path",
+            "filePath",
+            "filepath",
+            "target_file",
+            "targetFile",
         ],
     )
     .filter(|p| !p.trim().is_empty())
 }
 
+/// All file paths named by the input, in the order they appear.
+pub fn paths_from_input(input: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |p: &str| {
+        let p = p.trim();
+        if !p.is_empty() && !out.iter().any(|existing: &String| existing == p) {
+            out.push(p.to_owned());
+        }
+    };
+    if let Some(list) = input
+        .as_array()
+        .or_else(|| input.get("changes").and_then(Value::as_array))
+    {
+        for item in list {
+            if let Some(p) = path_of(item) {
+                push(p);
+            }
+        }
+    }
+    if let Some(files) = input.get("files").and_then(Value::as_array) {
+        for item in files {
+            if let Some(s) = item.as_str() {
+                push(s);
+            }
+        }
+    }
+    if let Some(p) = path_of(input) {
+        push(p);
+    }
+    out
+}
+
 /// Replacement pairs: Claude `old_string`/`new_string`, agy `TargetContent`/`ReplacementContent`.
 fn pair_of(v: &Value) -> Option<(&str, &str)> {
-    let old = str_of(v, &["old_string", "TargetContent"])?;
-    let new = str_of(v, &["new_string", "ReplacementContent"])?;
+    let old = str_of(
+        v,
+        &[
+            "old_string",
+            "TargetContent",
+            "oldString",
+            "old_str",
+            "target_content",
+            "targetContent",
+        ],
+    )?;
+    let new = str_of(
+        v,
+        &[
+            "new_string",
+            "ReplacementContent",
+            "newString",
+            "new_str",
+            "replacement_content",
+            "replacementContent",
+        ],
+    )?;
     Some((old, new))
 }
 
@@ -375,7 +431,17 @@ pub fn preview_from_input(input: &Value) -> Vec<FileEdit> {
     }
     // A whole-file write: what is written is shown as added (what it replaces is not known from
     // the request alone; the per-file view compares against the checkpoint).
-    if let Some(text) = str_of(input, &["content", "CodeContent", "new_source"]) {
+    if let Some(text) = str_of(
+        input,
+        &[
+            "content",
+            "CodeContent",
+            "new_source",
+            "code_content",
+            "codeContent",
+            "text",
+        ],
+    ) {
         return vec![unified(path, None, text, Numbering::Real)];
     }
     Vec::new()
