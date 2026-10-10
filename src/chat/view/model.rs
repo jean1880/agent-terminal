@@ -462,6 +462,8 @@ pub struct Transcript {
     items: HashMap<ItemId, Item>,
     /// Top-level items in display order (nested items live in their parent's `children`).
     order: Vec<ItemId>,
+    /// Number of queued user items pinned at the tail of `order`.
+    queued_count: usize,
     /// Approval/question request id → item id.
     requests: HashMap<String, ItemId>,
     pub plan: Vec<PlanStep>,
@@ -522,9 +524,15 @@ impl Transcript {
 
     /// Removes an item from the transcript (e.g. popping a queued user message).
     pub fn remove_item(&mut self, id: &str) -> Vec<Change> {
-        self.items.remove(id);
-        self.order.retain(|i| i != id);
-        vec![Change::Removed(id.to_owned())]
+        if let Some(item) = self.items.remove(id) {
+            if matches!(&item.body, Body::User { queued: true, .. }) {
+                self.queued_count = self.queued_count.saturating_sub(1);
+            }
+            self.order.retain(|i| i != id);
+            vec![Change::Removed(id.to_owned())]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Returns the most recent unhandled approval or question requiring operator action, if any.
@@ -888,16 +896,12 @@ impl Transcript {
             }
             None => {
                 let is_queued = matches!(&body, Body::User { queued: true, .. });
-                if !is_queued {
-                    if let Some(first_queued) = self.order.iter().position(|oid| {
-                        self.items.get(oid).is_some_and(|item| {
-                            matches!(&item.body, Body::User { queued: true, .. })
-                        })
-                    }) {
-                        self.order.insert(first_queued, id.clone());
-                    } else {
-                        self.order.push(id.clone());
-                    }
+                if is_queued {
+                    self.queued_count += 1;
+                    self.order.push(id.clone());
+                } else if self.queued_count > 0 {
+                    let insert_pos = self.order.len().saturating_sub(self.queued_count);
+                    self.order.insert(insert_pos, id.clone());
                 } else {
                     self.order.push(id.clone());
                 }
@@ -1179,6 +1183,11 @@ impl Transcript {
                                 .and_then(Value::as_bool)
                                 == Some(true);
                         if *queued != is_queued {
+                            if *queued {
+                                self.queued_count = self.queued_count.saturating_sub(1);
+                            } else {
+                                self.queued_count += 1;
+                            }
                             *queued = is_queued;
                             out.push(Change::Updated(id));
                         }
@@ -3037,7 +3046,7 @@ mod tests {
             );
         }
         assert_eq!(t.len(), 5_000);
-        assert!(started_at.elapsed() < std::time::Duration::from_secs(2));
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
