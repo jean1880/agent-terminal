@@ -258,7 +258,7 @@ impl AgyAdapter {
                     self.ensure_turn(out);
                 }
             }
-            "agent_response" => self.on_response(step, index, out),
+            "agent_response" | "thinking" | "thought" => self.on_response(step, index, out),
             "tool" => self.on_tool(step, index, out),
             _ if step.tool_name.is_some() => self.on_tool(step, index, out),
             _ => out.push(env(Event::Unknown)),
@@ -266,6 +266,30 @@ impl AgyAdapter {
     }
 
     fn on_response(&mut self, step: &Step, index: u64, out: &mut Vec<Envelope>) {
+        let think = step
+            .thinking
+            .as_deref()
+            .or(step.thought.as_deref())
+            .or(step.thoughts.as_deref())
+            .or(step.thinking_delta.as_deref())
+            .filter(|t| !t.trim().is_empty());
+        if let Some(think_text) = think {
+            let think_id = self.item_id("think", index);
+            if !self.open_items.contains(&think_id) {
+                self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
+            }
+            out.push(
+                Envelope::new(Event::ContentDelta {
+                    stream: StreamKind::Reasoning,
+                    text: think_text.to_owned(),
+                })
+                .item(&think_id),
+            );
+            if step.state == "DONE" {
+                self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
+            }
+        }
+
         let id = self.item_id("resp", index);
         let text = step.text_delta.as_deref().filter(|t| !t.is_empty());
         if let Some(text) = text {
@@ -291,8 +315,32 @@ impl AgyAdapter {
     }
 
     fn on_tool(&mut self, step: &Step, index: u64, out: &mut Vec<Envelope>) {
-        let id = self.item_id("step", index);
         let info = step.tool_info.clone().unwrap_or_default();
+        let think = step
+            .thinking
+            .as_deref()
+            .or(step.thought.as_deref())
+            .or(step.thoughts.as_deref())
+            .or(step.thinking_delta.as_deref())
+            .or(info.thinking.as_deref())
+            .or(info.thought.as_deref())
+            .filter(|t| !t.trim().is_empty());
+        if let Some(think_text) = think {
+            let think_id = self.item_id("think", index);
+            if !self.open_items.contains(&think_id) {
+                self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
+                out.push(
+                    Envelope::new(Event::ContentDelta {
+                        stream: StreamKind::Reasoning,
+                        text: think_text.to_owned(),
+                    })
+                    .item(&think_id),
+                );
+                self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
+            }
+        }
+
+        let id = self.item_id("step", index);
         let name = step
             .tool_name
             .clone()
@@ -837,6 +885,14 @@ struct Step {
     #[serde(default)]
     text_delta: Option<String>,
     #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    thought: Option<String>,
+    #[serde(default)]
+    thinking_delta: Option<String>,
+    #[serde(default)]
+    thoughts: Option<String>,
+    #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
     tool_info: Option<ToolInfo>,
@@ -852,6 +908,10 @@ struct ToolInfo {
     parameters: Option<Value>,
     #[serde(default)]
     error: Option<Value>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    thought: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1594,5 +1654,42 @@ mod tests {
         // No open turn: no TurnCompleted.
         let mut a = AgyAdapter::default();
         assert_eq!(a.on_exit(Some(0)).len(), 1);
+    }
+
+    #[test]
+    fn thinking_attached_to_actions_and_responses_emits_reasoning_items() {
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+
+        // Tool step with thinking
+        let events = a.feed(r#"{"event":"step_update","conversation_id":"c1","step_update":{"step_type":"tool","step_index":1,"state":"DONE","thinking":"Let me inspect the file","tool_name":"view_file","tool_info":{"parameters":{"path":"src/lib.rs"},"output":"ok"}}}"#);
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            Event::ItemStarted {
+                kind: ItemKind::Reasoning,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "Let me inspect the file")));
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            Event::ItemStarted {
+                kind: ItemKind::FileRead,
+                ..
+            }
+        )));
+
+        // Response step with thought
+        let events = a.feed(r#"{"event":"step_update","conversation_id":"c1","step_update":{"step_type":"agent_response","step_index":2,"state":"DONE","thought":"Now explain what was found","text_delta":"The file looks good."}}"#);
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            Event::ItemStarted {
+                kind: ItemKind::Reasoning,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "Now explain what was found")));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Assistant, text } if text == "The file looks good.")));
     }
 }

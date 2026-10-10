@@ -138,6 +138,10 @@ pub trait ComposerHost {
     /// Asks for `@` suggestions; `None` when the agent cannot answer them.
     fn request_files(&self, query: &str) -> Option<String>;
     fn placeholder(&self) -> String;
+    /// Pulls the most recently queued prompt out of the queue to allow editing, if any.
+    fn pop_queued_prompt(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct Composer {
@@ -487,11 +491,20 @@ impl Composer {
             Key::Up | Key::Down if !modified && !self.text().contains('\n') => {
                 let current = self.text();
                 let recalled = match key {
-                    Key::Up => self
-                        .history
-                        .borrow_mut()
-                        .move_up(&current)
-                        .map(str::to_owned),
+                    Key::Up => {
+                        if current.trim().is_empty() {
+                            if let Some(host) = self.host() {
+                                if let Some(queued) = host.pop_queued_prompt() {
+                                    self.set_text(&queued);
+                                    return glib::Propagation::Stop;
+                                }
+                            }
+                        }
+                        self.history
+                            .borrow_mut()
+                            .move_up(&current)
+                            .map(str::to_owned)
+                    }
                     Key::Down => self.history.borrow_mut().move_down().map(str::to_owned),
                     _ => None,
                 };

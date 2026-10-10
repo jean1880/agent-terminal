@@ -20,6 +20,9 @@ pub mod view;
 /// to the backend at construction (including `ControlResult` for `control`).
 pub trait ChatBackend {
     fn send_prompt(&self, text: &str);
+    fn queue_prompt(&self, text: &str) {
+        self.send_prompt(text);
+    }
     fn interrupt(&self);
     fn respond_approval(&self, request: &str, decision: Decision);
     fn respond_approval_with_rule(
@@ -46,6 +49,10 @@ pub trait ChatBackend {
     fn control(&self, control: Control) -> String;
     /// Current agent, model, mode and capabilities for the header and typeahead.
     fn status(&self) -> SessionStatus;
+    /// Pops the most recent queued user prompt if sitting in queue, returning (item_id, prompt_text).
+    fn pop_queued_prompt(&self) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// Where the model picker gets its rows: both agents' full model lists in one snapshot.

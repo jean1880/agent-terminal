@@ -186,6 +186,12 @@ impl ChatBackend for SessionSlot {
             }
         }
     }
+    fn queue_prompt(&self, text: &str) {
+        match self.get() {
+            Some(s) => s.queue_prompt(text),
+            None => self.send_prompt(text),
+        }
+    }
     fn interrupt(&self) {
         if let Some(s) = self.get() {
             s.interrupt();
@@ -247,6 +253,9 @@ impl ChatBackend for SessionSlot {
                 commands: Vec::new(),
             },
         }
+    }
+    fn pop_queued_prompt(&self) -> Option<(String, String)> {
+        self.get().and_then(|s| s.pop_queued_prompt())
     }
 }
 
@@ -2400,6 +2409,7 @@ impl AgentTerminalWindow {
                 starting: false,
                 diffs,
             }),
+            discovered_repo: None,
         });
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);

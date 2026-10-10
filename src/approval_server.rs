@@ -60,7 +60,7 @@ pub enum Verdict {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolClass {
+pub enum ToolClass {
     ReadOnly,
     Edit,
     /// Commands, network, MCP, subagents: always ask (or deny in plan mode).
@@ -69,7 +69,7 @@ enum ToolClass {
     Unknown,
 }
 
-fn classify(tool: &str) -> ToolClass {
+pub fn classify(tool: &str) -> ToolClass {
     match tool {
         "view_file" | "list_dir" | "grep_search" | "find_by_name" | "codebase_search"
         | "view_code_item" | "read_resource" | "list_resources" => ToolClass::ReadOnly,
@@ -96,11 +96,21 @@ fn mutates(tool: &str) -> bool {
     ) || classify(tool) == ToolClass::Edit
 }
 
-const TARGET_KEYS: [&str; 4] = ["TargetFile", "AbsolutePath", "FilePath", "Path"];
+pub const TARGET_KEYS: [&str; 9] = [
+    "TargetFile",
+    "target_file",
+    "AbsolutePath",
+    "absolute_path",
+    "FilePath",
+    "file_path",
+    "Path",
+    "path",
+    "file",
+];
 
 /// Every file an edit tool names, from the argument names agy uses. A payload with several
 /// of them is judged on all of them.
-fn edit_targets(args: &Value) -> Vec<&str> {
+pub fn edit_targets(args: &Value) -> Vec<&str> {
     TARGET_KEYS
         .iter()
         .filter_map(|k| args.get(*k).and_then(Value::as_str))
@@ -378,10 +388,17 @@ pub fn session_key(query: &ApprovalQuery) -> Option<(String, String)> {
                 return None;
             };
             let path = Path::new(target);
-            if !path.is_absolute() || has_parent_dir(path) {
+            let full_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else if let Some(cwd) = &query.cwd {
+                Path::new(cwd).join(path)
+            } else {
+                return None;
+            };
+            if has_parent_dir(&full_path) {
                 return None;
             }
-            resolve(path).to_string_lossy().into_owned()
+            resolve(&full_path).to_string_lossy().into_owned()
         }
         _ => return None,
     };
@@ -960,6 +977,23 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         } else {
             None
         };
+        let edit_target = if classify(&query.tool) == ToolClass::Edit {
+            let targets = edit_targets(&query.args);
+            if let [target] = targets.as_slice() {
+                let path = Path::new(target);
+                if path.is_absolute() {
+                    Some(target.to_string())
+                } else if let Some(cwd) = &query.cwd {
+                    Some(Path::new(cwd).join(path).to_string_lossy().into_owned())
+                } else {
+                    Some(target.to_string())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if let Some(target) = cmd {
             if inner
@@ -984,6 +1018,19 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
             } else if let Some(always_path) = inner.always.borrow().as_ref() {
                 let rules = crate::always_allow::AlwaysRules::load(always_path);
                 rules.matches_any(&ws, "call_mcp_tool", target)
+            } else {
+                false
+            }
+        } else if let Some(target) = edit_target.as_deref() {
+            if inner
+                .session_rules
+                .borrow()
+                .matches_any(&ws, &query.tool, target)
+            {
+                true
+            } else if let Some(always_path) = inner.always.borrow().as_ref() {
+                let rules = crate::always_allow::AlwaysRules::load(always_path);
+                rules.matches_any(&ws, &query.tool, target)
             } else {
                 false
             }

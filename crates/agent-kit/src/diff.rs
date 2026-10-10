@@ -231,6 +231,58 @@ pub fn truncate(diff: &str, max_bytes: usize, max_lines: usize) -> (&str, usize)
     (&diff[..end], total - kept)
 }
 
+fn extract_candidate_paths(
+    val: &serde_json::Value,
+    paths: &mut std::collections::BTreeSet<std::path::PathBuf>,
+) {
+    for edit in crate::editdiff::preview_from_input(val) {
+        paths.insert(std::path::PathBuf::from(edit.path));
+    }
+    const KEYS: &[&str] = &[
+        "file_path",
+        "FilePath",
+        "path",
+        "Path",
+        "file",
+        "TargetFile",
+        "target_file",
+        "AbsolutePath",
+        "absolute_path",
+        "Cwd",
+        "cwd",
+        "directory",
+        "dir",
+    ];
+    for k in KEYS {
+        if let Some(s) = val.get(*k).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                paths.insert(std::path::PathBuf::from(s));
+            }
+        }
+    }
+    if let Some(args) = val
+        .get("Arguments")
+        .or_else(|| val.get("arguments"))
+        .or_else(|| val.get("args"))
+    {
+        extract_candidate_paths(args, paths);
+    }
+    if let Some(cmd) = val
+        .get("CommandLine")
+        .or_else(|| val.get("command"))
+        .or_else(|| val.get("cmd"))
+        .and_then(|v| v.as_str())
+    {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        for i in 0..parts.len() {
+            if parts[i] == "-C" && i + 1 < parts.len() {
+                let clean = parts[i + 1].trim_matches(|c| c == '"' || c == '\'');
+                paths.insert(std::path::PathBuf::from(clean));
+            }
+        }
+    }
+}
+
 /// Extracts all candidate file paths touched or modified by the thread's events.
 pub fn touched_paths_from_envelopes(
     envelopes: &[agent_core::event::Envelope],
@@ -238,35 +290,16 @@ pub fn touched_paths_from_envelopes(
     let mut paths = std::collections::BTreeSet::new();
     for env in envelopes {
         match &env.event {
+            agent_core::event::Event::SessionStarted { cwd: Some(c), .. } => {
+                paths.insert(std::path::PathBuf::from(c));
+            }
             agent_core::event::Event::ItemStarted {
                 input: Some(val), ..
             } => {
-                for edit in crate::editdiff::preview_from_input(val) {
-                    paths.insert(std::path::PathBuf::from(edit.path));
-                }
-                if let Some(path_str) = val
-                    .get("file_path")
-                    .or_else(|| val.get("path"))
-                    .or_else(|| val.get("TargetFile"))
-                    .or_else(|| val.get("AbsolutePath"))
-                    .and_then(|v| v.as_str())
-                {
-                    paths.insert(std::path::PathBuf::from(path_str));
-                }
+                extract_candidate_paths(val, &mut paths);
             }
             agent_core::event::Event::ApprovalRequested { input, .. } => {
-                for edit in crate::editdiff::preview_from_input(input) {
-                    paths.insert(std::path::PathBuf::from(edit.path));
-                }
-                if let Some(path_str) = input
-                    .get("file_path")
-                    .or_else(|| input.get("path"))
-                    .or_else(|| input.get("TargetFile"))
-                    .or_else(|| input.get("AbsolutePath"))
-                    .and_then(|v| v.as_str())
-                {
-                    paths.insert(std::path::PathBuf::from(path_str));
-                }
+                extract_candidate_paths(input, &mut paths);
             }
             _ => {}
         }
@@ -285,6 +318,21 @@ pub fn discover_enclosing_repo(paths: &[std::path::PathBuf]) -> Option<std::path
         if let Some(dir) = check_dir {
             if let Ok(Some(repo)) = crate::git::discover(dir) {
                 return Some(repo.toplevel);
+            }
+        }
+        if path.is_relative() {
+            if let Ok(curr) = std::env::current_dir() {
+                let joined = curr.join(path);
+                let check_dir = if joined.is_file() {
+                    joined.parent()
+                } else {
+                    Some(joined.as_path())
+                };
+                if let Some(dir) = check_dir {
+                    if let Ok(Some(repo)) = crate::git::discover(dir) {
+                        return Some(repo.toplevel);
+                    }
+                }
             }
         }
     }

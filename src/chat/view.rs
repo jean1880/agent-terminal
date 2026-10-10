@@ -553,6 +553,10 @@ impl Inner {
                     drop(dirty);
                     self.queue_flush();
                 }
+                Change::Removed(id) => {
+                    self.dirty.borrow_mut().retain(|d| d != &id);
+                    self.transcript.removed(&id);
+                }
                 Change::Plan => self.plan.set(&self.model.borrow().plan),
                 Change::Gauge => self.header.set_gauge(self.model.borrow().gauge.as_ref()),
                 Change::Mode => {
@@ -958,7 +962,11 @@ impl ComposerHost for Inner {
         }
         // What you just sent, and the reply to it, are where the view goes.
         self.transcript.scroll_to_end();
-        self.backend.send_prompt(text);
+        if status.running_turn {
+            self.backend.queue_prompt(text);
+        } else {
+            self.backend.send_prompt(text);
+        }
     }
 
     fn interrupt(&self) {
@@ -976,6 +984,15 @@ impl ComposerHost for Inner {
         if let Some(me) = self.view().and_then(|v| v.inner()) {
             me.run_action(b.action, "");
         }
+    }
+
+    fn pop_queued_prompt(&self) -> Option<String> {
+        let (id, text) = self.backend.pop_queued_prompt()?;
+        let changes = self.model.borrow_mut().remove_item(&id);
+        if let Some(me) = self.view().and_then(|v| v.inner()) {
+            me.handle(changes);
+        }
+        Some(text)
     }
 
     fn command_items(&self, trigger: &Trigger) -> Vec<agent_core::commands::CompletionItem> {

@@ -256,6 +256,8 @@ struct TabState {
     /// A chat thread page (3.0). `None`: a 2.x terminal page. For a thread, `terminal`
     /// is its drawer's shell.
     chat: Option<threads::ChatTab>,
+    /// Discovered enclosing git repository when `dir` is not a git repo (e.g. root home directory).
+    discovered_repo: Option<String>,
 }
 
 /// How long a tab's output must be still before its turn counts as over and
@@ -2662,6 +2664,7 @@ impl AgentTerminalWindow {
             diff_panel: diff_panel.clone(),
             worktree: None,
             chat: None,
+            discovered_repo: None,
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
@@ -5096,7 +5099,7 @@ impl AgentTerminalWindow {
             .find(|t| &t.page == page)
             .map(|t| {
                 (
-                    t.dir.clone(),
+                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
                     t.key,
                     t.chat.as_ref().map(|c| c.thread.clone()),
                     t.diff_panel.clone(),
@@ -5155,7 +5158,7 @@ impl AgentTerminalWindow {
             .borrow()
             .iter()
             .find(|t| t.diff_panel.root == *panel_root)
-            .map(|t| t.dir.clone())
+            .map(|t| t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()))
         else {
             return;
         };

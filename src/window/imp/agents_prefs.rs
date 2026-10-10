@@ -364,6 +364,12 @@ impl AgentTerminalWindow {
         warning_icon.set_valign(gtk4::Align::Center);
         warning_icon.add_css_class("warning-indicator");
         warning_row.add_prefix(&warning_icon);
+        let view_diff_btn = gtk4::Button::builder()
+            .label("View Differences…")
+            .valign(gtk4::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        warning_row.add_suffix(&view_diff_btn);
         group.add(&warning_row);
 
         // Import permissions row
@@ -410,7 +416,11 @@ impl AgentTerminalWindow {
             #[weak]
             import_row,
             #[weak]
+            import_btn,
+            #[weak]
             export_row,
+            #[weak]
+            export_btn,
             #[weak]
             manage_row,
             move || {
@@ -420,7 +430,9 @@ impl AgentTerminalWindow {
                         &rules,
                         &warning_row,
                         &import_row,
+                        &import_btn,
                         &export_row,
+                        &export_btn,
                         &manage_row,
                     );
                 }
@@ -430,48 +442,118 @@ impl AgentTerminalWindow {
         // Initial sync state check
         sync_cb();
 
+        let on_sync_for_diff = sync_cb.clone();
+        view_diff_btn.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |btn| {
+                let imp = obj.imp();
+                imp.show_sync_differences_dialog(btn.upcast_ref(), on_sync_for_diff.clone());
+            }
+        ));
+
         let on_sync = sync_cb.clone();
+        let import_btn_weak = import_btn.downgrade();
         import_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
             move |_| {
-                let imp = obj.imp();
-                if let Some(path) = crate::always_allow::path() {
-                    let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                    let added_count = rules.import_agent_permissions(None);
-                    if added_count > 0 {
-                        let _ = rules.save(&path);
-                        imp.show_toast(&format!(
-                            "Imported {added_count} permission rules from agent configurations"
-                        ));
-                    } else {
-                        imp.show_toast("Permission rules are already up to date");
+                let Some(btn) = import_btn_weak.upgrade() else {
+                    return;
+                };
+                btn.set_sensitive(false);
+                btn.set_label("Syncing…");
+                let obj_weak = obj.downgrade();
+                let on_sync = on_sync.clone();
+                let btn_weak = btn.downgrade();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                    let Some(obj) = obj_weak.upgrade() else {
+                        return;
+                    };
+                    let imp = obj.imp();
+                    if let Some(path) = crate::always_allow::path() {
+                        let mut rules = crate::always_allow::AlwaysRules::load(&path);
+                        let added_count = rules.import_agent_permissions(None);
+                        if added_count > 0 {
+                            let _ = rules.save(&path);
+                            imp.show_toast(&format!(
+                                "Imported {added_count} permission rules from agent configurations"
+                            ));
+                        } else {
+                            imp.show_toast("Permission rules are already up to date");
+                        }
                     }
-                    on_sync();
-                }
+                    if let Some(btn) = btn_weak.upgrade() {
+                        btn.set_label("✓ Synced");
+                        btn.add_css_class("suggested-action");
+                        let btn_fade = btn.downgrade();
+                        let on_sync_fade = on_sync.clone();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(1000),
+                            move || {
+                                if let Some(btn) = btn_fade.upgrade() {
+                                    btn.remove_css_class("suggested-action");
+                                    btn.set_label("Synced");
+                                    btn.set_sensitive(false);
+                                }
+                                on_sync_fade();
+                            },
+                        );
+                    }
+                });
             }
         ));
         import_row.add_suffix(&import_btn);
         group.add(&import_row);
 
         let on_sync = sync_cb.clone();
+        let export_btn_weak = export_btn.downgrade();
         export_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
             move |_| {
-                let imp = obj.imp();
-                if let Some(path) = crate::always_allow::path() {
-                    let rules = crate::always_allow::AlwaysRules::load(&path);
-                    let exported_count = rules.export_agent_permissions(None);
-                    if exported_count > 0 {
-                        imp.show_toast(&format!(
-                            "Exported {exported_count} permission rules to agent configurations"
-                        ));
-                    } else {
-                        imp.show_toast("Agent configurations are already up to date");
+                let Some(btn) = export_btn_weak.upgrade() else {
+                    return;
+                };
+                btn.set_sensitive(false);
+                btn.set_label("Syncing…");
+                let obj_weak = obj.downgrade();
+                let on_sync = on_sync.clone();
+                let btn_weak = btn.downgrade();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                    let Some(obj) = obj_weak.upgrade() else {
+                        return;
+                    };
+                    let imp = obj.imp();
+                    if let Some(path) = crate::always_allow::path() {
+                        let rules = crate::always_allow::AlwaysRules::load(&path);
+                        let exported_count = rules.export_agent_permissions(None);
+                        if exported_count > 0 {
+                            imp.show_toast(&format!(
+                                "Exported {exported_count} permission rules to agent configurations"
+                            ));
+                        } else {
+                            imp.show_toast("Agent configurations are already up to date");
+                        }
                     }
-                    on_sync();
-                }
+                    if let Some(btn) = btn_weak.upgrade() {
+                        btn.set_label("✓ Synced");
+                        btn.add_css_class("suggested-action");
+                        let btn_fade = btn.downgrade();
+                        let on_sync_fade = on_sync.clone();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(1000),
+                            move || {
+                                if let Some(btn) = btn_fade.upgrade() {
+                                    btn.remove_css_class("suggested-action");
+                                    btn.set_label("Synced");
+                                    btn.set_sensitive(false);
+                                }
+                                on_sync_fade();
+                            },
+                        );
+                    }
+                });
             }
         ));
         export_row.add_suffix(&export_btn);
@@ -496,7 +578,9 @@ impl AgentTerminalWindow {
         rules: &crate::always_allow::AlwaysRules,
         warning_row: &adw::ActionRow,
         import_row: &adw::ActionRow,
+        import_btn: &gtk4::Button,
         export_row: &adw::ActionRow,
+        export_btn: &gtk4::Button,
         manage_row: &adw::ActionRow,
     ) {
         manage_row.set_subtitle(&format!(
@@ -520,11 +604,15 @@ impl AgentTerminalWindow {
                         "s are"
                     }
                 ));
+                import_btn.set_sensitive(true);
+                import_btn.set_label("Import Now");
             } else {
                 import_row.remove_css_class("warning");
                 import_row.set_subtitle(
                     "One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml",
                 );
+                import_btn.set_sensitive(false);
+                import_btn.set_label("Synced");
             }
 
             if status.unexported_count > 0 {
@@ -538,11 +626,15 @@ impl AgentTerminalWindow {
                         "s"
                     }
                 ));
+                export_btn.set_sensitive(true);
+                export_btn.set_label("Export Now");
             } else {
                 export_row.remove_css_class("warning");
                 export_row.set_subtitle(
                     "One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations",
                 );
+                export_btn.set_sensitive(false);
+                export_btn.set_label("Synced");
             }
         } else {
             warning_row.set_visible(false);
@@ -550,11 +642,110 @@ impl AgentTerminalWindow {
             import_row.set_subtitle(
                 "One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml",
             );
+            import_btn.set_sensitive(false);
+            import_btn.set_label("Synced");
+
             export_row.remove_css_class("warning");
             export_row.set_subtitle(
                 "One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations",
             );
+            export_btn.set_sensitive(false);
+            export_btn.set_label("Synced");
         }
+    }
+
+    fn show_sync_differences_dialog(&self, parent: &gtk4::Widget, _on_sync: Rc<dyn Fn()>) {
+        let Some(path) = crate::always_allow::path() else {
+            return;
+        };
+        let rules = crate::always_allow::AlwaysRules::load(&path);
+        let status = rules.check_sync_status(None);
+
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        if !status.unimported_rules.is_empty() {
+            let label = gtk4::Label::new(Some(&format!(
+                "Unimported Rules from Agent Configs ({})",
+                status.unimported_rules.len()
+            )));
+            label.add_css_class("heading");
+            label.set_halign(gtk4::Align::Start);
+            content.append(&label);
+
+            let desc = gtk4::Label::new(Some(
+                "These rules exist in Claude, Antigravity, or permissions.toml but are missing in Agent Terminal:"
+            ));
+            desc.set_wrap(true);
+            desc.set_halign(gtk4::Align::Start);
+            desc.add_css_class("dim-label");
+            content.append(&desc);
+
+            let list = gtk4::ListBox::new();
+            list.add_css_class("boxed-list");
+            for r in &status.unimported_rules {
+                let row = adw::ActionRow::builder().title(r).build();
+                let icon = gtk4::Image::from_icon_name("at-go-down-symbolic");
+                row.add_prefix(&icon);
+                list.append(&row);
+            }
+            content.append(&list);
+        }
+
+        if !status.unexported_rules.is_empty() {
+            let label = gtk4::Label::new(Some(&format!(
+                "Unexported Rules from Agent Terminal ({})",
+                status.unexported_rules.len()
+            )));
+            label.add_css_class("heading");
+            label.set_halign(gtk4::Align::Start);
+            content.append(&label);
+
+            let desc = gtk4::Label::new(Some(
+                "These rules exist in Agent Terminal but have not been exported to external agent configs:"
+            ));
+            desc.set_wrap(true);
+            desc.set_halign(gtk4::Align::Start);
+            desc.add_css_class("dim-label");
+            content.append(&desc);
+
+            let list = gtk4::ListBox::new();
+            list.add_css_class("boxed-list");
+            for r in &status.unexported_rules {
+                let row = adw::ActionRow::builder().title(r).build();
+                let icon = gtk4::Image::from_icon_name("at-go-up-symbolic");
+                row.add_prefix(&icon);
+                list.append(&row);
+            }
+            content.append(&list);
+        }
+
+        if status.unimported_rules.is_empty() && status.unexported_rules.is_empty() {
+            let label = gtk4::Label::new(Some("All permission rules are currently synchronized!"));
+            label.add_css_class("heading");
+            label.set_halign(gtk4::Align::Center);
+            content.append(&label);
+        }
+
+        let scroller = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .min_content_height(240)
+            .max_content_height(420)
+            .min_content_width(460)
+            .child(&content)
+            .build();
+
+        let dialog = adw::AlertDialog::new(
+            Some("Permission Synchronization Differences"),
+            Some(&status.summary()),
+        );
+        dialog.set_extra_child(Some(&scroller));
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.present(Some(parent));
     }
 
     fn show_rules_dialog(&self, parent: &gtk4::Widget, on_changed: Option<Rc<dyn Fn()>>) {

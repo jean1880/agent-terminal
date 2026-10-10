@@ -168,14 +168,42 @@ pub fn build_animated_menu_button(menu_model: &impl IsA<gio::MenuModel>) -> gtk4
         start_anim_for_btn();
     });
 
+    fn configure_popover(btn: &gtk4::MenuButton, popover: &gtk4::Popover) {
+        popover.set_halign(gtk4::Align::Start);
+        popover.set_has_arrow(false);
+        popover.set_position(gtk4::PositionType::Bottom);
+
+        let popover_weak = popover.downgrade();
+        let btn_weak = btn.downgrade();
+        popover.connect_notify_local(Some("visible"), move |popover, _| {
+            if popover.is_visible() {
+                if let (Some(pop), Some(btn)) = (popover_weak.upgrade(), btn_weak.upgrade()) {
+                    let (_, nat_w, _, _) = pop.measure(gtk4::Orientation::Horizontal, -1);
+                    let btn_w = btn.width();
+                    if nat_w > btn_w {
+                        let offset_x = (nat_w - btn_w) / 2;
+                        pop.set_offset(offset_x, 0);
+                    }
+                }
+            }
+        });
+    }
+
     if let Some(popover) = menu_btn.popover() {
-        let target_for_pop = target;
-        let start_anim_for_pop = start_animation;
+        configure_popover(&menu_btn, &popover);
+        let target_for_pop = target.clone();
+        let start_anim_for_pop = start_animation.clone();
         popover.connect_closed(move |_| {
             target_for_pop.set(0.0);
             start_anim_for_pop();
         });
     }
+
+    menu_btn.connect_notify_local(Some("popover"), move |btn, _| {
+        if let Some(popover) = btn.popover() {
+            configure_popover(btn, &popover);
+        }
+    });
 
     menu_btn
 }

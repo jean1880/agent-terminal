@@ -154,6 +154,10 @@ pub struct PermissionSyncStatus {
     pub unimported_count: usize,
     /// Rules in Agent Terminal that are not yet exported to external agent configs.
     pub unexported_count: usize,
+    /// Details of rules present in external agent configs not yet imported into Agent Terminal.
+    pub unimported_rules: Vec<String>,
+    /// Details of rules in Agent Terminal not yet exported to external agent configs.
+    pub unexported_rules: Vec<String>,
 }
 
 impl PermissionSyncStatus {
@@ -545,15 +549,73 @@ impl AlwaysRules {
         count
     }
 
+    /// Collects the list of rules in Agent Terminal that are not yet exported to available agent configs.
+    pub fn collect_unexported_rules(&self, home: Option<&Path>) -> Vec<String> {
+        let home_buf = if cfg!(test) {
+            home.map(PathBuf::from)
+        } else {
+            home.map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        };
+        let Some(home) = home_buf else {
+            return Vec::new();
+        };
+
+        let mut unexported = Vec::new();
+        let perm_toml = home.join("git/agent-config/sync/permissions.toml");
+        let claude_settings = home.join(".claude/settings.json");
+        let agy_settings = home.join(".gemini/antigravity-cli/settings.json");
+
+        let perm_content = std::fs::read_to_string(&perm_toml).unwrap_or_default();
+        let claude_content = std::fs::read_to_string(&claude_settings).unwrap_or_default();
+        let agy_content = std::fs::read_to_string(&agy_settings).unwrap_or_default();
+
+        for r in &self.rules {
+            let desc = format!("{}: {}", r.tool, r.detail);
+            let d = r.detail.trim();
+            let clean_d = d.trim_end_matches('*');
+
+            let missing_from_perm = perm_toml.exists() && {
+                let entry = if r.tool == "run_command" || r.tool == "call_mcp_tool" {
+                    clean_d
+                } else {
+                    ""
+                };
+                !entry.is_empty() && !perm_content.contains(&format!("\"{entry}\""))
+            };
+
+            let missing_from_claude =
+                claude_settings.exists() && { !claude_content.contains(clean_d) };
+
+            let missing_from_agy = agy_settings.exists() && { !agy_content.contains(clean_d) };
+
+            if (missing_from_perm || missing_from_claude || missing_from_agy)
+                && !unexported.contains(&desc)
+            {
+                unexported.push(desc);
+            }
+        }
+        unexported
+    }
+
     /// Checks the synchronization state between Agent Terminal's `AlwaysRules`
     /// and the external agent configuration files.
     pub fn check_sync_status(&self, home: Option<&Path>) -> PermissionSyncStatus {
         let mut scratch = self.clone();
         let unimported_count = scratch.import_agent_permissions(home);
-        let unexported_count = self.count_unexported(home);
+        let unimported_rules: Vec<String> = scratch
+            .rules
+            .iter()
+            .filter(|r| !self.rules.contains(r))
+            .map(|r| format!("{}: {}", r.tool, r.detail))
+            .collect();
+        let unexported_rules = self.collect_unexported_rules(home);
+        let unexported_count = unexported_rules.len().max(self.count_unexported(home));
         PermissionSyncStatus {
             unimported_count,
             unexported_count,
+            unimported_rules,
+            unexported_rules,
         }
     }
 

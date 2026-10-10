@@ -720,6 +720,13 @@ impl TranscriptView {
         }
     }
 
+    /// An item was removed from the transcript (e.g. popping a queued user message).
+    pub fn removed(&self, id: &str) {
+        if let Some(row) = self.rows.borrow_mut().remove(id) {
+            row.widget().unparent();
+        }
+    }
+
     /// Materialises up to [`PAGE`] older top-level rows above the current window, keeping the
     /// viewport where it was.
     pub fn load_older(&self, model: &Transcript) {

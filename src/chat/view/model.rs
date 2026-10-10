@@ -30,6 +30,7 @@ pub struct Item {
 pub enum Body {
     User {
         text: String,
+        queued: bool,
     },
     Assistant {
         text: String,
@@ -447,6 +448,8 @@ pub enum Change {
     Running,
     Workers,
     Commands,
+    /// An existing item was removed.
+    Removed(ItemId),
     /// A control reply, routed by request id to whoever asked.
     Control {
         request: String,
@@ -511,10 +514,17 @@ impl Transcript {
             .iter()
             .filter_map(|id| self.items.get(id))
             .filter_map(|item| match &item.body {
-                Body::User { text } if !text.is_empty() => Some(text.clone()),
+                Body::User { text, .. } if !text.is_empty() => Some(text.clone()),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Removes an item from the transcript (e.g. popping a queued user message).
+    pub fn remove_item(&mut self, id: &str) -> Vec<Change> {
+        self.items.remove(id);
+        self.order.retain(|i| i != id);
+        vec![Change::Removed(id.to_owned())]
     }
 
     /// Returns the most recent unhandled approval or question requiring operator action, if any.
@@ -1143,15 +1153,36 @@ impl Transcript {
                         if tool.kind == *kind && (tool.title != *title || tool.input != *input) {
                             tool.title.clone_from(title);
                             tool.input.clone_from(input);
+                            out.push(Change::Updated(id.clone()));
+                        }
+                    }
+                    if let Body::User { queued, .. } = &mut item.body {
+                        let is_queued = title == "queued"
+                            || input
+                                .as_ref()
+                                .and_then(|v| v.get("queued"))
+                                .and_then(Value::as_bool)
+                                == Some(true);
+                        if *queued != is_queued {
+                            *queued = is_queued;
                             out.push(Change::Updated(id));
                         }
                     }
                     return out;
                 }
                 let body = match kind {
-                    ItemKind::UserMessage => Body::User {
-                        text: String::new(),
-                    },
+                    ItemKind::UserMessage => {
+                        let queued = title == "queued"
+                            || input
+                                .as_ref()
+                                .and_then(|v| v.get("queued"))
+                                .and_then(Value::as_bool)
+                                == Some(true);
+                        Body::User {
+                            text: String::new(),
+                            queued,
+                        }
+                    }
                     ItemKind::AssistantMessage => Body::Assistant {
                         text: String::new(),
                         driver,
@@ -1556,7 +1587,7 @@ impl Transcript {
             return false;
         };
         let target: &mut String = match (&mut item.body, stream) {
-            (Body::User { text }, _) => text,
+            (Body::User { text, .. }, _) => text,
             (Body::Assistant { text, .. }, StreamKind::Assistant | StreamKind::Reasoning) => text,
             (Body::Reasoning { text, .. }, StreamKind::Reasoning | StreamKind::Assistant) => text,
             (Body::Tool(t), StreamKind::ToolInput) => &mut t.input_text,

@@ -427,10 +427,13 @@ pub enum Row {
 impl Row {
     pub fn build(item: &Item, sink: &RowSink) -> Self {
         let row = match &item.body {
-            Body::User { .. } => {
+            Body::User { queued, .. } => {
                 let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
                 root.add_css_class("user-row");
                 root.set_halign(gtk4::Align::End);
+                if *queued {
+                    root.add_css_class("queued");
+                }
                 let text = label("", &["user-bubble"]);
                 wrapping(&text);
                 text.set_hexpand(false);
@@ -563,7 +566,14 @@ impl Row {
 
     pub fn update(&self, item: &Item) {
         match (self, &item.body) {
-            (Self::User { text: l, .. }, Body::User { text }) => l.set_text(text),
+            (Self::User { root, text: l }, Body::User { text, queued }) => {
+                l.set_text(text);
+                if *queued {
+                    root.add_css_class("queued");
+                } else {
+                    root.remove_css_class("queued");
+                }
+            }
             (
                 Self::Assistant { md, caret, .. },
                 Body::Assistant {
@@ -1637,6 +1647,16 @@ impl ApprovalCard {
                                 _ => String::new(),
                             }
                         }
+                        tool_name
+                            if crate::approval_server::classify(tool_name)
+                                == crate::approval_server::ToolClass::Edit =>
+                        {
+                            crate::approval_server::edit_targets(&input_val)
+                                .first()
+                                .copied()
+                                .unwrap_or("")
+                                .to_string()
+                        }
                         _ => a.remembers.clone().unwrap_or_default(),
                     };
                     let cwd_str = input_val
@@ -1946,6 +1966,39 @@ pub(crate) fn build_approval_suggestions(
                     description: Some(format!("Permit any '{first}' command")),
                 });
             }
+        }
+    } else if crate::approval_server::classify(tool) == crate::approval_server::ToolClass::Edit {
+        let p = std::path::Path::new(initial);
+        if let Some(parent) = p.parent() {
+            let p_str = parent.to_string_lossy();
+            if !p_str.is_empty() {
+                let p_dir = format!("{p_str}/*");
+                if !suggestions.iter().any(|s| s.pattern == p_dir) {
+                    suggestions.push(ApprovalSuggestion {
+                        pattern: p_dir.clone(),
+                        label: p_dir,
+                        description: Some("Permit all edits in this directory".to_string()),
+                    });
+                }
+            }
+        }
+        if let Some(ext) = p.extension() {
+            let p_ext = format!("*.{}", ext.to_string_lossy());
+            if !suggestions.iter().any(|s| s.pattern == p_ext) {
+                suggestions.push(ApprovalSuggestion {
+                    pattern: p_ext.clone(),
+                    label: p_ext,
+                    description: Some(format!("Permit all .{} file edits", ext.to_string_lossy())),
+                });
+            }
+        }
+        let p_all = "*".to_string();
+        if !suggestions.iter().any(|s| s.pattern == p_all) {
+            suggestions.push(ApprovalSuggestion {
+                pattern: p_all.clone(),
+                label: p_all,
+                description: Some("Permit all file edits for this tool".to_string()),
+            });
         }
     } else if tool == "call_mcp_tool" || initial.contains('/') {
         if let Some((server, _tool_name)) = initial.split_once('/') {

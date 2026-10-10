@@ -117,6 +117,12 @@ levelbar.context-level block.empty { background-color: transparent; }
     border-radius: 18px 18px 6px 18px;
     border: 1px solid alpha(@at_accent, 0.25);
 }
+.user-row.queued .user-bubble {
+    background-image: linear-gradient(135deg, alpha(@at_surface_strong, 0.6), alpha(@at_surface, 0.8));
+    color: @at_fg_dim;
+    border: 1px dashed alpha(@at_accent, 0.45);
+    opacity: 0.85;
+}
 
 /* assistant message */
 .assistant-row {

@@ -195,6 +195,16 @@ struct Inner {
     codex_pending_approvals: RefCell<HashMap<String, (String, String)>>,
     /// Active rules scoped to this chat session only (for Codex or in-app auto-approvals).
     session_rules: RefCell<crate::always_allow::AlwaysRules>,
+    /// Queued user prompts submitted while a turn is already running.
+    queued_prompts: RefCell<std::collections::VecDeque<QueuedPrompt>>,
+    weak_self: RefCell<Option<std::rc::Weak<Inner>>>,
+    prompt_in_flight: Cell<bool>,
+}
+
+struct QueuedPrompt {
+    item_id: String,
+    text: String,
+    handoff: Option<Handoff>,
 }
 
 /// The mode a session can actually run in. agy without its approval hook cannot ask before
@@ -349,7 +359,11 @@ impl ChatSession {
             wanted_mode: Cell::new(wanted_mode),
             codex_pending_approvals: RefCell::new(HashMap::new()),
             session_rules: RefCell::new(crate::always_allow::AlwaysRules::default()),
+            queued_prompts: RefCell::new(std::collections::VecDeque::new()),
+            weak_self: RefCell::new(None),
+            prompt_in_flight: Cell::new(false),
         });
+        *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
         // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
         // edits does not repeat it on every reopen. An installed hook that could not be used is
@@ -553,11 +567,34 @@ impl Inner {
                 self.state.borrow_mut().running_turn = true;
             }
             Event::TurnCompleted { state, .. } => {
+                self.prompt_in_flight.set(false);
                 self.state.borrow_mut().running_turn = false;
                 // A completed turn is the proof the new agent read the handoff it carried; any
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
                     *self.pending_handoff.borrow_mut() = None;
+                }
+                if let Some(queued) = self.queued_prompts.borrow_mut().pop_front() {
+                    self.deliver(
+                        &Envelope::new(Event::ItemStarted {
+                            kind: ItemKind::UserMessage,
+                            title: String::new(),
+                            input: None,
+                            parent: None,
+                        })
+                        .item(queued.item_id),
+                    );
+                    let sent = match &queued.handoff {
+                        Some(h) => {
+                            provider_message_with_handoff(&h.summary, &h.fence, &queued.text)
+                        }
+                        None => queued.text,
+                    };
+                    self.prompt_in_flight.set(true);
+                    if let Some(strong) = self.weak_self.borrow().as_ref().and_then(|w| w.upgrade())
+                    {
+                        strong.dispatch_sent_prompt(&sent, queued.handoff);
+                    }
                 }
             }
             Event::ModelChanged { model } => {
@@ -988,6 +1025,7 @@ impl Inner {
             state.alive = false;
             state.running_turn = false;
         }
+        self.prompt_in_flight.set(false);
         // A dead process completed nothing: a pending handoff goes out with the next prompt,
         // even when the exit raised no turn of its own (it died before one opened).
         self.handoff_in_flight.set(false);
@@ -1231,6 +1269,47 @@ impl Inner {
         }
     }
 
+    fn queue_prompt(self: &Rc<Self>, text: &str) {
+        self.apply_retired();
+        let pt = self.provider_thread.borrow().clone();
+        let provider = (!pt.is_empty()).then_some(pt.as_str());
+        let item = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => item,
+            Err(e) => {
+                warn!(error = %e, "could not persist the user message");
+                self.next_local_id("user")
+            }
+        };
+
+        let handoff = if Self::is_slash_command(text) || self.handoff_in_flight.get() {
+            None
+        } else {
+            self.pending_handoff.borrow().clone()
+        };
+
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: "queued".to_string(),
+                input: Some(serde_json::json!({"queued": true})),
+                parent: None,
+            })
+            .item(item.clone()),
+        );
+        self.deliver(
+            &Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: text.to_owned(),
+            })
+            .item(item.clone()),
+        );
+        self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
+            item_id: item,
+            text: text.to_owned(),
+            handoff,
+        });
+    }
+
     fn send_prompt(self: &Rc<Self>, text: &str) {
         self.apply_retired();
         let pt = self.provider_thread.borrow().clone();
@@ -1242,7 +1321,17 @@ impl Inner {
                 self.next_local_id("user")
             }
         };
-        // The store already holds these two; the view still needs to see them.
+
+        // The handoff rides on the next real prompt: never on a slash command (it would stop
+        // being one), nor twice while the turn that carries it runs. It is spent only when that
+        // turn completes (`apply`): a prompt that never reached the agent, or a turn the agent
+        // died in, leaves it pending for the next one.
+        let handoff = if Self::is_slash_command(text) || self.handoff_in_flight.get() {
+            None
+        } else {
+            self.pending_handoff.borrow().clone()
+        };
+
         self.deliver(
             &Envelope::new(Event::ItemStarted {
                 kind: ItemKind::UserMessage,
@@ -1260,35 +1349,38 @@ impl Inner {
             .item(item),
         );
 
-        // The handoff rides on the next real prompt: never on a slash command (it would stop
-        // being one), nor twice while the turn that carries it runs. It is spent only when that
-        // turn completes (`apply`): a prompt that never reached the agent, or a turn the agent
-        // died in, leaves it pending for the next one.
-        let handoff = if Self::is_slash_command(text) || self.handoff_in_flight.get() {
-            None
-        } else {
-            self.pending_handoff.borrow().clone()
-        };
         let sent = match &handoff {
             Some(h) => provider_message_with_handoff(&h.summary, &h.fence, text),
             None => text.to_owned(),
         };
+        self.prompt_in_flight.set(true);
+        self.dispatch_sent_prompt(&sent, handoff);
+    }
+
+    fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) {
         self.ensure_alive();
         // A submitted/queued inference is already work: the user must be able to stop it
         // while waiting for the backend's turn/started, not only after that reply arrives.
         let starts_turn =
-            self.state.borrow().alive && self.adapter.borrow().prompt_starts_turn(text);
+            self.state.borrow().alive && self.adapter.borrow().prompt_starts_turn(sent);
         let was_running = self.state.borrow().running_turn;
         if starts_turn {
             self.state.borrow_mut().running_turn = true;
         }
-        let accepted = self.command(Command::Prompt { text: sent });
+        let accepted = self.command(Command::Prompt {
+            text: sent.to_owned(),
+        });
         if !accepted && starts_turn {
             self.state.borrow_mut().running_turn = was_running;
         }
         if accepted && handoff.is_some() {
             self.handoff_in_flight.set(true);
         }
+    }
+
+    fn pop_queued_prompt(&self) -> Option<(String, String)> {
+        let queued = self.queued_prompts.borrow_mut().pop_back()?;
+        Some((queued.item_id, queued.text))
     }
 
     /// Stores the mode the user chose (`wanted_mode`), so a reopened thread starts from it on
@@ -2019,6 +2111,10 @@ impl ChatBackend for ChatSession {
         self.inner.send_prompt(text);
     }
 
+    fn queue_prompt(&self, text: &str) {
+        self.inner.queue_prompt(text);
+    }
+
     fn interrupt(&self) {
         self.inner.command(Command::Interrupt);
     }
@@ -2062,6 +2158,10 @@ impl ChatBackend for ChatSession {
 
     fn status(&self) -> SessionStatus {
         self.inner.status()
+    }
+
+    fn pop_queued_prompt(&self) -> Option<(String, String)> {
+        self.inner.pop_queued_prompt()
     }
 }
 
@@ -2725,6 +2825,9 @@ mod tests {
         }
         fn capabilities(&self) -> &Capabilities {
             &self.caps
+        }
+        fn prompt_starts_turn(&self, text: &str) -> bool {
+            !text.trim().starts_with('/')
         }
         fn argv(&self, _: &OpenSession) -> Vec<String> {
             if self.unspawnable {
