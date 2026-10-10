@@ -173,20 +173,123 @@ pub fn build_animated_menu_button(menu_model: &impl IsA<gio::MenuModel>) -> gtk4
         popover.set_has_arrow(false);
         popover.set_position(gtk4::PositionType::Bottom);
 
-        let popover_weak = popover.downgrade();
+        // The menu sits flush with the window's left edge and flush to the bottom of the title bar.
+        // `halign(Start)` lines the popup *surface* up with the button, so shift it left by the
+        // button's distance from the window edge, and vertically to meet the bottom of the title
+        // bar. `inset_x` and `inset_y` track how far the menu's visible edge sits inside its surface
+        // (the theme's shadow margin / padding). The insets are measured from where the popup
+        // actually landed, then remembered so later opens start in place without jumping.
+        let inset_x = Rc::new(Cell::new(0i32));
+        let inset_y = Rc::new(Cell::new(0i32));
+        let phase = Rc::new(Cell::new(Align::Measure));
         let btn_weak = btn.downgrade();
-        popover.connect_notify_local(Some("visible"), move |popover, _| {
-            if popover.is_visible() {
-                if let (Some(pop), Some(btn)) = (popover_weak.upgrade(), btn_weak.upgrade()) {
-                    let (_, nat_w, _, _) = pop.measure(gtk4::Orientation::Horizontal, -1);
-                    let btn_w = btn.width();
-                    if nat_w > btn_w {
-                        let offset_x = (nat_w - btn_w) / 2;
-                        pop.set_offset(offset_x, 0);
-                    }
-                }
+        let (inset_x_show, inset_y_show, phase_for_show) =
+            (inset_x.clone(), inset_y.clone(), phase.clone());
+        let btn_show = btn_weak.clone();
+        popover.connect_notify_local(Some("visible"), move |pop, _| {
+            if !pop.is_visible() {
+                return;
+            }
+            phase_for_show.set(Align::Measure);
+            let Some(btn) = btn_show.upgrade() else {
+                return;
+            };
+            let Some(root) = btn.root() else {
+                return;
+            };
+            let origin = gtk4::graphene::Point::new(0.0, 0.0);
+            if let Some(at) = btn.compute_point(&root, &origin) {
+                let init_y = if let Some(target_y) = target_top_in_window(&btn) {
+                    let btn_bottom = at.y().round() as i32 + btn.height();
+                    target_y - btn_bottom - inset_y_show.get()
+                } else {
+                    -inset_y_show.get()
+                };
+                pop.set_offset(-(at.x().round() as i32) - inset_x_show.get(), init_y);
             }
         });
+        popover.connect_realize(move |pop| {
+            let Some(surface) = pop.surface() else {
+                return;
+            };
+            let pop_weak = pop.downgrade();
+            let (inset_x, inset_y, phase) = (inset_x.clone(), inset_y.clone(), phase.clone());
+            let btn_layout = btn_weak.clone();
+            surface.connect_layout(move |_, _, _| {
+                let Some(pop) = pop_weak.upgrade() else {
+                    return;
+                };
+                if phase.get() == Align::Done {
+                    return;
+                }
+                let Some((vis_x, vis_y)) = visible_pos_in_window(&pop) else {
+                    return;
+                };
+                let target_y = btn_layout
+                    .upgrade()
+                    .and_then(|b| target_top_in_window(&b))
+                    .unwrap_or(vis_y);
+                let gap_x = vis_x;
+                let gap_y = vis_y - target_y;
+                match phase.get() {
+                    Align::Measure if gap_x != 0 || gap_y != 0 => {
+                        inset_x.set(inset_x.get() + gap_x);
+                        inset_y.set(inset_y.get() + gap_y);
+                        let (x, y) = pop.offset();
+                        pop.set_offset(x - gap_x, y - gap_y);
+                        phase.set(Align::Verify);
+                    }
+                    // A gap left after the correction is a constraint (the monitor edge of a
+                    // maximized window), not the theme: forget it so the next open is not
+                    // shifted by it, and stop rather than chase the edge.
+                    Align::Verify => {
+                        inset_x.set(inset_x.get() - gap_x);
+                        inset_y.set(inset_y.get() - gap_y);
+                        phase.set(Align::Done);
+                    }
+                    _ => phase.set(Align::Done),
+                }
+            });
+        });
+    }
+
+    /// Progress of one opening's alignment, driven by the popup surface's `layout` signal.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Align {
+        Measure,
+        Verify,
+        Done,
+    }
+
+    /// Where the bottom of the title bar sits in the window's coordinates,
+    /// falling back to the bottom of the button itself if no header is found.
+    fn target_top_in_window(btn: &gtk4::MenuButton) -> Option<i32> {
+        let root = btn.root()?;
+        if let Some(header) = btn
+            .ancestor(adw::HeaderBar::static_type())
+            .or_else(|| btn.ancestor(gtk4::HeaderBar::static_type()))
+        {
+            let bottom_pt = gtk4::graphene::Point::new(0.0, header.height() as f32);
+            if let Some(p) = header.compute_point(&root, &bottom_pt) {
+                return Some(p.y().round() as i32);
+            }
+        }
+        let bottom_pt = gtk4::graphene::Point::new(0.0, btn.height() as f32);
+        btn.compute_point(&root, &bottom_pt)
+            .map(|p| p.y().round() as i32)
+    }
+
+    /// Where the popover's visible menu box starts, in its window's coordinates.
+    fn visible_pos_in_window(pop: &gtk4::Popover) -> Option<(i32, i32)> {
+        let popup = pop.surface()?.downcast::<gtk4::gdk::Popup>().ok()?;
+        let (pop_tx, pop_ty) = pop.surface_transform();
+        let (win_tx, win_ty) = pop.parent()?.native()?.surface_transform();
+        let child = pop
+            .child()?
+            .compute_point(pop, &gtk4::graphene::Point::new(0.0, 0.0))?;
+        let x = f64::from(popup.position_x()) + pop_tx + f64::from(child.x()) - win_tx;
+        let y = f64::from(popup.position_y()) + pop_ty + f64::from(child.y()) - win_ty;
+        Some((x.round() as i32, y.round() as i32))
     }
 
     if let Some(popover) = menu_btn.popover() {
