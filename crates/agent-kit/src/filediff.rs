@@ -698,30 +698,24 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_with_only_target_file_diffs_against_a_checkpoint() {
+    fn an_agy_edit_with_target_file_is_shown_as_agent_edit() {
         use serde_json::json;
-        let tmp = tempfile::tempdir().expect("tmp");
-        let p = tmp.path();
-        sh(p, &["init", "-b", "main"]);
-        sh(p, &["config", "user.email", "tests@test.invalid"]);
-        sh(p, &["config", "user.name", "Tests"]);
-        std::fs::write(p.join("calc.py"), "def add(a, b):\n    return a + b\n").expect("write");
-        sh(p, &["add", "calc.py"]);
-        sh(p, &["commit", "-m", "init"]);
-
-        let base = take_turn_base(p, 1, "test", true)
-            .expect("base")
-            .expect("base");
-        std::fs::write(
-            p.join("calc.py"),
-            "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n",
-        )
-        .expect("write");
-
-        let input = json!({"TargetFile": p.join("calc.py").to_str().unwrap()});
-        let shown = shown_for_item(Some(&base), &input).expect("shown");
-        assert_eq!(shown.origin, Origin::Checkpoint);
+        let input = json!({
+            "TargetFile": "calc.py",
+            "TargetContent": "def add(a, b):\n    return a + b\n",
+            "ReplacementContent": "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n",
+        });
+        let shown = shown_for_item(None, &input).expect("shown");
+        assert_eq!(shown.origin, Origin::AgentEdit);
         assert!(shown.text.contains("+def multiply(a, b):"));
+
+        let write_input = json!({
+            "TargetFile": "calc.py",
+            "CodeContent": "def multiply(a, b):\n    return a * b\n",
+        });
+        let write_shown = shown_for_item(None, &write_input).expect("shown");
+        assert_eq!(write_shown.origin, Origin::AgentEdit);
+        assert!(write_shown.text.contains("+def multiply(a, b):"));
     }
 
     #[test]

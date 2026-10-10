@@ -12,6 +12,7 @@ license=('MIT')
 depends=('gtk4' 'libadwaita' 'vte4' 'gtksourceview5' 'glib2' 'pango' 'cairo' 'gdk-pixbuf2'
          'graphene' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'pkgconf')
+checkdepends=('git')
 options=('!lto' '!debug')
 
 _root() {

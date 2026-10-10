@@ -5,7 +5,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 pacman -Syu --noconfirm --needed \
-    base-devel rust pkgconf python \
+    base-devel rust pkgconf python git \
     gtk4 libadwaita vte4 gtksourceview5 glib2 pango cairo gdk-pixbuf2 graphene
 
 stage_source
