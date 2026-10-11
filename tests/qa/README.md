@@ -68,6 +68,33 @@ python3 tests/qa/record_frames.py claude --cwd /tmp/sandbox --out /tmp/touch.jso
 Never point it at a real project, and re-grep the output for your canary before
 committing a fixture.
 
+## Live contract smoke (opt-in, spends quota)
+
+`tests/qa/live_smoke.py` (stdlib only) drives the real CLI and asserts contract
+facts only. It reuses the recorder's spawning, framing and scrub, runs in a
+throwaway sandbox under the temp dir (the cwd is passed explicitly and asserted;
+`$HOME` is refused), and exits non-zero with one `PASS`/`FAIL` line per check.
+
+```
+python3 tests/qa/live_smoke.py --agent claude --dry-run   # prints commands and turn plan, runs nothing
+python3 tests/qa/live_smoke.py --agent codex
+python3 tests/qa/live_smoke.py --agent agy
+```
+
+**Quota warning: each run spends real turns (claude 2, codex 2, agy 1). Get the
+user's approval per run.** Never run it in CI. Always `--dry-run` first.
+
+- claude: `--thinking-display summarized` starts and yields thinking; a `can_use_tool`
+  for `touch x.tmp` arrives and a deny lets the turn continue.
+- codex: a shell `requestApproval` carries a wrapped command and `commandActions`; an
+  unoffered `decline` is accepted (item `declined`, turn continues); on `untrusted` +
+  `workspaceWrite` an edit asks and `accept` applies it.
+- agy: tool `step_update` events carry `tool_name` and `tool_info.parameters`; the
+  reported cwd is the sandbox.
+
+`--keep` retains the sandbox and the scrubbed frames. The check functions are proven
+against the W0 fixtures without quota: `python3 -m unittest tests/qa/test_live_smoke.py`.
+
 Rollback: revert the CI/QA source changes and beta configuration together through
 their repositories' normal review/deployment process. Do not deploy or install
 anything on a daily-driver host to test these scripts. Retain a release blocker

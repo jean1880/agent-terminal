@@ -206,7 +206,7 @@ class Decisions:
         return item
 
 
-def run_claude(args, decisions):
+def claude_argv(args):
     argv = [args.program, *args.extra_arg,
             "--output-format", "stream-json", "--verbose",
             "--input-format", "stream-json",
@@ -216,7 +216,15 @@ def run_claude(args, decisions):
     if args.thinking_display:
         argv += ["--thinking-display", args.thinking_display]
     argv += ["--permission-mode", args.permission_mode]
-    s = Session(argv, args.cwd, args.out, args.timeout)
+    return argv
+
+
+def codex_argv(args):
+    return [args.program, *args.extra_arg, "app-server"]
+
+
+def run_claude(args, decisions):
+    s = Session(claude_argv(args), args.cwd, args.out, args.timeout)
     s.send({"type": "control_request", "request_id": "init-1",
             "request": {"subtype": "initialize"}})
     for prompt in args.prompt:
@@ -247,7 +255,7 @@ SANDBOXES = ("readOnly", "workspaceWrite", "dangerFullAccess")
 
 
 def run_codex(args, decisions):
-    s = Session([args.program, *args.extra_arg, "app-server"], args.cwd, args.out, args.timeout)
+    s = Session(codex_argv(args), args.cwd, args.out, args.timeout)
 
     def await_result(request_id, deadline):
         while True:
