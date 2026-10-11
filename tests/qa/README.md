@@ -47,6 +47,27 @@ or model inference occurs. A failed or unavailable runner is a failed probe;
 ordinary CI does not require Codex. The comparison represents an approved direct
 command, without changing application or global security settings.
 
+## Recording real protocol frames
+
+`tests/qa/record_frames.py` (stdlib only) spawns `claude` (stream-json with the
+stdio permission prompt, the argv agent-terminal uses) or `codex app-server`
+(JSON-RPC) in a **throwaway sandbox repo**, sends each `--prompt` as one real
+turn, answers approval requests from the ordered `--decision` list, and writes
+every raw line in both directions to a JSONL file (`dir` is `in` to the agent,
+`out` from it). Secret-looking text (`sk-…`, `ghp_…`, `AIza…`, `Bearer …`) is
+masked before it is written. Each prompt spends real quota, so keep runs small;
+save results under `tests/fixtures/real/<agent>/<scenario>.jsonl`.
+
+```
+python3 tests/qa/record_frames.py codex --cwd /tmp/sandbox --out /tmp/ask-ls.jsonl \
+    --approval-policy untrusted --sandbox readOnly --prompt "Run ls -la" --decision decline
+python3 tests/qa/record_frames.py claude --cwd /tmp/sandbox --out /tmp/touch.jsonl \
+    --thinking-display summarized --prompt "Run: touch x.tmp" --decision deny
+```
+
+Never point it at a real project, and re-grep the output for your canary before
+committing a fixture.
+
 Rollback: revert the CI/QA source changes and beta configuration together through
 their repositories' normal review/deployment process. Do not deploy or install
 anything on a daily-driver host to test these scripts. Retain a release blocker
