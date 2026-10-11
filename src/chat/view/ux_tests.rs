@@ -196,7 +196,7 @@ fn native_ux_matrix() {
             );
         }
         // 4.1: the header's status ("Waiting for approval") must not push its last item out of
-        // a narrow window; the spinner stays, the words go.
+        // a narrow window; the spinner stays, the words go, and they go before the usage meter.
         inner
             .header
             .set_activity(&model::Activity::WaitingForWorkers {
@@ -211,8 +211,8 @@ fn native_ux_matrix() {
             );
         } else if width == 950 && scale == 1.0 {
             assert!(
-                inner.header.activity_words_shown(),
-                "a wide header keeps the words"
+                !inner.header.activity_words_shown(),
+                "below the usage meter's width the words go first, the meter stays"
             );
         }
         assert!(

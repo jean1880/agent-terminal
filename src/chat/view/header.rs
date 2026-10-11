@@ -51,17 +51,22 @@ pub fn gauge_text(g: &Gauge) -> String {
 }
 
 /// The header's own width breakpoints (sp), widest first. Each drops more of the strip, so it
-/// fits the thread at any window size: the usage meter (also in the sidebar), then the context
+/// fits the thread at any window size: the activity's words, then the usage meter and the context
 /// gauge, then the sub-agents button and the model's name, with tighter spacing.
 // With explicit active/history counts the complete strip measures 956 px.
-// Drop the duplicated compact meter before that width; its comparison stays in the sidebar.
-const HIDE_USAGE_BELOW: f64 = 976.0;
+// Drop the activity's words before that width; the usage meter stays until the gauge goes.
+const HIDE_ACTIVITY_WORDS_BELOW: f64 = 976.0;
 // The complete strip measures 741 px with a thread sidebar open. Hide the gauge before the
 // content pane reaches that size so its parent never has to expand beyond the window.
 const HIDE_GAUGE_BELOW: f64 = 760.0;
 const COMPACT_BELOW: f64 = 500.0;
 /// The narrowest the strip supports: the whole window at its minimum.
 const MIN_WIDTH: i32 = 340;
+/// The idle session button's name, and what it does said plainly: an icon alone does not.
+const RESTART_LABEL: &str = "Restart agent";
+const RESTART_TOOLTIP: &str = "Restart agent: stops this thread's agent process and starts it \
+     again on the same conversation. Use it after changing the agent's settings, environment \
+     file, MCP servers or hooks, or when it stops responding. Queued prompts are dropped.";
 
 pub struct Header {
     /// What the view packs: the strip in its breakpoint bin.
@@ -175,8 +180,11 @@ impl Header {
         reload.add_css_class("flat");
         reload.add_css_class("session-reload");
         reload.set_valign(gtk4::Align::Center);
-        reload.set_tooltip_text(Some("Reload session"));
-        reload.update_property(&[gtk4::accessible::Property::Label("Reload session")]);
+        reload.set_tooltip_text(Some(RESTART_TOOLTIP));
+        reload.update_property(&[
+            gtk4::accessible::Property::Label(RESTART_LABEL),
+            gtk4::accessible::Property::Description(RESTART_TOOLTIP),
+        ]);
         root.append(&reload);
 
         // What the user allowed Codex beyond its usual limits for this session. A menu button,
@@ -280,12 +288,15 @@ impl Header {
         let hidden = false.to_value();
         // Added widest first: where several match, the last added (the narrowest) applies, so
         // each repeats the ones before it.
-        let usage = breakpoint(HIDE_USAGE_BELOW);
-        usage.add_setter(&usage_slot, "visible", Some(&hidden));
+        // The activity's words go before the usage meter: the spinner and its tooltip still say
+        // what the thread is doing, and the meter is the one thing here with no stand-in.
+        let words_off = breakpoint(HIDE_ACTIVITY_WORDS_BELOW);
+        words_off.add_setter(&activity_text, "visible", Some(&hidden));
         let gauge_off = breakpoint(HIDE_GAUGE_BELOW);
         for slot in [
             usage_slot.upcast_ref::<gtk4::Widget>(),
             gauge_slot.upcast_ref(),
+            activity_text.upcast_ref(),
         ] {
             gauge_off.add_setter(slot, "visible", Some(&hidden));
         }
@@ -344,7 +355,7 @@ impl Header {
             mode,
             pending_mode,
             mode_guard,
-            breakpoints: [usage, gauge_off, compact],
+            breakpoints: [words_off, gauge_off, compact],
             reload,
             access,
             access_list,
@@ -415,11 +426,11 @@ impl Header {
     }
 
     pub fn set_text_scale(&self, scale: f64) {
-        for (breakpoint, width) in
-            self.breakpoints
-                .iter()
-                .zip([HIDE_USAGE_BELOW, HIDE_GAUGE_BELOW, COMPACT_BELOW])
-        {
+        for (breakpoint, width) in self.breakpoints.iter().zip([
+            HIDE_ACTIVITY_WORDS_BELOW,
+            HIDE_GAUGE_BELOW,
+            COMPACT_BELOW,
+        ]) {
             breakpoint.set_condition(Some(&adw::BreakpointCondition::new_length(
                 adw::BreakpointConditionLengthType::MaxWidth,
                 width * scale,
@@ -447,15 +458,14 @@ impl Header {
         self.fit_height();
     }
 
-    /// The session control stops an active turn, or reloads an idle session so its next agent
-    /// process picks up current launch configuration.
-    /// The stop/reload button. `stop_note` is what stopping does to this agent when it is more
-    /// than ending the turn (agy exits, and restarts on the next message).
+    /// The session control stops an active turn, or restarts an idle session's agent process so
+    /// it picks up current launch configuration. `stop_note` is what stopping does to this agent
+    /// when it is more than ending the turn (agy exits, and restarts on the next message).
     pub fn set_reload_running(&self, running: bool, stop_note: Option<&str>) {
         let (icon, tooltip) = if running {
             ("at-media-playback-stop-symbolic", "Stop current turn")
         } else {
-            ("at-view-refresh-symbolic", "Reload session")
+            ("at-view-refresh-symbolic", RESTART_TOOLTIP)
         };
         let full = match stop_note.filter(|_| running) {
             Some(note) => format!("{tooltip}. {note}"),
@@ -463,8 +473,15 @@ impl Header {
         };
         self.reload.set_icon_name(icon);
         self.reload.set_tooltip_text(Some(&full));
-        self.reload
-            .update_property(&[gtk4::accessible::Property::Label(&full)]);
+        let name = if running {
+            full.as_str()
+        } else {
+            RESTART_LABEL
+        };
+        self.reload.update_property(&[
+            gtk4::accessible::Property::Label(name),
+            gtk4::accessible::Property::Description(&full),
+        ]);
     }
 
     /// Shows the "Extra access" chip while `grants` (one line each) is not empty, and lists
