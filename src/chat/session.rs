@@ -239,6 +239,8 @@ struct Inner {
     codex_shown: RefCell<HashMap<String, String>>,
     /// Where session grants let Codex write (resolved), for later rename checks.
     codex_grant_paths: RefCell<Vec<PathBuf>>,
+    /// Where this turn's grants let Codex write (resolved); cleared when the turn ends.
+    codex_turn_grant_paths: RefCell<Vec<PathBuf>>,
     /// What the current turn said, for the quick replies offered when it completes.
     reply_turn: RefCell<reply_questions::ReplyTurn>,
 }
@@ -467,6 +469,7 @@ impl ChatSession {
             held_permissions: RefCell::new(HashSet::new()),
             codex_shown: RefCell::new(HashMap::new()),
             codex_grant_paths: RefCell::new(Vec::new()),
+            codex_turn_grant_paths: RefCell::new(Vec::new()),
             reply_turn: RefCell::default(),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
@@ -691,6 +694,8 @@ impl Inner {
                 self.prompt_in_flight.set(false);
                 self.state.borrow_mut().running_turn = false;
                 self.last_enriched_step.set(None);
+                // Codex's turn-scoped permission grants ended with the turn.
+                self.codex_turn_grant_paths.borrow_mut().clear();
                 // A completed turn is the proof the new agent read the handoff it carried; any
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
@@ -1714,6 +1719,7 @@ impl Inner {
         self.held_permissions.borrow_mut().clear();
         self.codex_grants.borrow_mut().clear();
         self.codex_grant_paths.borrow_mut().clear();
+        self.codex_turn_grant_paths.borrow_mut().clear();
         for env in envelopes {
             self.emit(env);
         }
@@ -2681,27 +2687,43 @@ pub(crate) struct Handoff {
 /// How long the on-disk check of a permission card may take (a hung network mount must not hide
 /// the card for ever).
 const PERMISSION_CHECK_DEADLINE: Duration = Duration::from_secs(3);
-/// Said on a card whose places could not be checked in time.
-const CHECK_FAILED: &str = "Could not check these places on disk in time.";
+/// Said on a card whose places could not be checked in time (when shown or when answered).
+const CHECK_FAILED: &str =
+    "Could not check these places on disk in time, so it can only be denied.";
 /// Said on a card shown again because what it asks for changed while it waited for an answer.
 const CHECK_CHANGED: &str = "This request changed while it was waiting; check it again.";
 
-/// Runs [`codex_policy::judge_check`] off the main thread with a deadline. `None`: it did not
-/// finish in time (or panicked): nothing can be vouched for.
-async fn run_permission_check(check: codex_policy::Check) -> Option<codex_policy::Verdict> {
-    let job = gtk4::gio::spawn_blocking(move || codex_policy::judge_check(&check));
-    match glib::future_with_timeout(PERMISSION_CHECK_DEADLINE, job).await {
+/// Runs `job` (a disk check) off the main thread, giving up after `deadline`. `None`: it did not
+/// finish in time, or panicked: nothing can be vouched for.
+async fn run_permission_check<F>(job: F, deadline: Duration) -> Option<codex_policy::Verdict>
+where
+    F: FnOnce() -> codex_policy::Verdict + Send + 'static,
+{
+    match glib::future_with_timeout(deadline, gtk4::gio::spawn_blocking(job)).await {
         Ok(Ok(verdict)) => Some(verdict),
         _ => None,
     }
 }
 
+/// [`run_permission_check`] of [`codex_policy::judge_check`] with the standard deadline.
+async fn check_permissions(check: codex_policy::Check) -> Option<codex_policy::Verdict> {
+    run_permission_check(
+        move || codex_policy::judge_check(&check),
+        PERMISSION_CHECK_DEADLINE,
+    )
+    .await
+}
+
 impl Inner {
     /// What a card is judged against now: its input, the thread's folder, the Codex child's
-    /// homes, whether the agent may write the project unasked (Accept edits, chosen or still
-    /// effective), and where earlier session grants let it write.
+    /// homes, whether Codex may write the project unasked, and where grants already let it
+    /// write. Writability is the sandbox the running (or next) turn was sent, as the adapter
+    /// reports it (unknown counts as writable), or Accept edits chosen for later turns, where a
+    /// session grant still holds. Grants are this session's and this turn's write grants.
     fn permission_check(&self, input: &serde_json::Value) -> codex_policy::Check {
-        let mode = self.state.borrow().mode;
+        let live = self.adapter.borrow().workspace_writable().unwrap_or(true);
+        let mut granted = self.codex_grant_paths.borrow().clone();
+        granted.extend(self.codex_turn_grant_paths.borrow().iter().cloned());
         codex_policy::Check {
             input: input.clone(),
             workspace: PathBuf::from(self.open.borrow().cwd.clone()),
@@ -2709,9 +2731,8 @@ impl Inner {
                 &self.launch_env.borrow(),
                 crate::codex_home::process_env(),
             ),
-            project_writable: mode == Mode::AcceptEdits
-                || self.wanted_mode.get() == Mode::AcceptEdits,
-            granted: self.codex_grant_paths.borrow().clone(),
+            project_writable: live || self.wanted_mode.get() == Mode::AcceptEdits,
+            granted,
         }
     }
 
@@ -2742,7 +2763,7 @@ impl Inner {
         let check = self.permission_check(input);
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let verdict = run_permission_check(check).await;
+            let verdict = check_permissions(check).await;
             let Some(inner) = weak.upgrade() else { return };
             // Answered by the agent, expired or replaced while it was checked: nothing to show.
             if inner.generation.get() != generation
@@ -2937,7 +2958,7 @@ impl Inner {
         let shown = shown.to_owned();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let verdict = run_permission_check(check).await;
+            let verdict = check_permissions(check).await;
             let Some(inner) = weak.upgrade() else { return };
             let card = inner.codex_permissions.borrow().get(&shown).cloned();
             let Some(card) = card.filter(|_| inner.generation.get() == generation) else {
@@ -2956,8 +2977,12 @@ impl Inner {
                 .codex_shown
                 .borrow_mut()
                 .insert(card.wire.clone(), again.clone());
-            let env =
-                inner.show_codex_permissions(&card.original, &again, verdict, Some(CHECK_CHANGED));
+            let env = inner.show_codex_permissions(
+                &card.original,
+                &again,
+                verdict.clone(),
+                verdict.is_some().then_some(CHECK_CHANGED),
+            );
             if let Some(next) = inner.codex_permissions.borrow_mut().get_mut(&again) {
                 next.round = round;
             }
@@ -2998,6 +3023,12 @@ impl Inner {
         }
         self.codex_permissions.borrow_mut().remove(shown);
         self.codex_shown.borrow_mut().remove(&card.wire);
+        if decision == Decision::Allow {
+            // A later session grant beneath this turn's grant could be renamed through it.
+            self.codex_turn_grant_paths
+                .borrow_mut()
+                .extend(card.verdict.writes.iter().cloned());
+        }
         if decision == Decision::AllowForSession {
             self.codex_grants.borrow_mut().push(card.summary.clone());
             self.codex_grant_paths

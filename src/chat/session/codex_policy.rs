@@ -22,7 +22,7 @@
 //! and these checks would not describe what it opens.
 
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -39,13 +39,9 @@ pub(super) struct ChildHomes {
     pub codex: Option<PathBuf>,
 }
 
-/// An absolute path with no `.` or `..` component: one that names one place as written.
+/// `path` when it names one place as written ([`agent_core::codex::is_plain_absolute`]).
 fn plain_absolute(path: PathBuf) -> Option<PathBuf> {
-    (path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_))))
-    .then_some(path)
+    agent_core::codex::is_plain_absolute(&path).then_some(path)
 }
 
 /// `HOME` and `CODEX_HOME` as the Codex child sees them, through the one resolver the rules
@@ -339,7 +335,10 @@ pub(super) fn judge_check(check: &Check) -> Verdict {
         let meta = std::fs::metadata(&actual).ok();
         if let (Some(mark), Some(meta)) = (v.marks.last_mut(), &meta) {
             use std::os::unix::fs::MetadataExt;
-            *mark = Some((meta.dev(), meta.ino(), meta.nlink()));
+            // A folder's link count moves with its sub-folders; only a file's says it has
+            // other names.
+            let links = if meta.is_file() { meta.nlink() } else { 0 };
+            *mark = Some((meta.dev(), meta.ino(), links));
         }
         if write {
             v.writes.push(actual.clone());
@@ -803,5 +802,20 @@ mod tests {
             )]
         );
         assert_eq!(v.writes, [real_x]);
+    }
+
+    /// A folder's link count changes with its sub-folders: it is not part of the verdict, so a
+    /// sub-folder made in a granted folder does not count as the place changing.
+    #[test]
+    fn a_new_sub_folder_does_not_change_a_folders_verdict() {
+        let (_dir, home, project) = tree();
+        let build = project.join("build");
+        std::fs::create_dir_all(&build).expect("build");
+        let card = one("write", path(&build));
+        let before = judge(&card, &project, &homes(&home));
+        assert!(before.session_allowed, "{before:?}");
+        std::fs::create_dir_all(build.join("sub")).expect("sub");
+        assert_eq!(judge(&card, &project, &homes(&home)), before);
+        assert!(matches!(before.marks[0], Some((_, _, 0))));
     }
 }

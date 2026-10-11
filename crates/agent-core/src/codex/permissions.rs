@@ -213,6 +213,14 @@ pub(super) fn visible(text: &str) -> String {
     crate::text::without_hidden(text)
 }
 
+/// Whether `path` is absolute with no `.` or `..` component: it names one place as written.
+pub fn is_plain_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
 /// `text` cut to `max` characters, ending in an ellipsis when cut.
 pub fn clip(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
@@ -520,17 +528,14 @@ fn grant(typed: &Typed) -> Value {
 /// holds (in `read`/`write` or a `path` entry) to an absolute path with no `.` or `..`. Only
 /// names change: a key the grant does not hold, or a target that is not a plain absolute path,
 /// is an error and nothing is rewritten. Globs and special places are never touched.
+///
+/// Only the session builds `paths`, from a verdict it re-verified on disk just before the
+/// answer; the view never supplies it.
 pub(super) fn rewrite_paths(grant: &Value, paths: &Value) -> Result<Value, String> {
     let paths = paths.as_object().ok_or("the path renames are not a map")?;
     for (from, to) in paths {
         let to = to.as_str().ok_or("a renamed path is not text")?;
-        let p = Path::new(to);
-        if !displayable(to)
-            || !p.is_absolute()
-            || !p
-                .components()
-                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
-        {
+        if !displayable(to) || !is_plain_absolute(Path::new(to)) {
             return Err(format!("{to:?} is not a plain absolute path"));
         }
         if from.is_empty() {

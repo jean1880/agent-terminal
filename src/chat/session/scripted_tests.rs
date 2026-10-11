@@ -1232,3 +1232,46 @@ fn scripted_a_request_that_changed_while_waiting_is_shown_again_not_sent() {
         session.shutdown(false);
     });
 }
+
+/// Rust review #403: a check that outlives its deadline vouches for nothing; one in time does.
+#[test]
+fn a_disk_check_past_its_deadline_vouches_for_nothing() {
+    in_loop(|ctx| {
+        let slow = super::run_permission_check(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                super::codex_policy::Verdict::default()
+            },
+            std::time::Duration::from_millis(30),
+        );
+        assert_eq!(ctx.block_on(slow), None);
+        let fast = super::run_permission_check(
+            super::codex_policy::Verdict::default,
+            std::time::Duration::from_secs(3),
+        );
+        assert!(ctx.block_on(fast).is_some());
+    });
+}
+
+/// Rust review #403: making a sub-folder inside a granted folder between showing the card and
+/// answering it is not a change: the Allow is sent.
+#[test]
+fn scripted_a_new_sub_folder_does_not_hold_back_an_allow() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.dir.path().join("build")).expect("build");
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        let (request, options, _) = fixture.wait_card(ctx);
+        assert!(options.contains(&Decision::AllowForSession));
+        std::fs::create_dir_all(fixture.dir.path().join("build/sub")).expect("sub");
+        session.respond_approval(&request, Decision::AllowForSession);
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results().len(), 1);
+        assert_eq!(fixture.results()[0]["scope"], "session");
+        session.shutdown(false);
+    });
+}

@@ -117,7 +117,7 @@
 mod elicitation;
 mod permissions;
 
-pub use permissions::{clip, sentence};
+pub use permissions::{clip, is_plain_absolute, sentence};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
@@ -2442,6 +2442,13 @@ impl Adapter for CodexAdapter {
 
     fn drain_outbox(&mut self) -> Outbox {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// The `sandboxPolicy` sent on the active or pending `turn/start` (else the one the next
+    /// turn gets): `workspaceWrite` lets Codex write, and so rename, inside the workspace.
+    fn workspace_writable(&self) -> Option<bool> {
+        let mode = self.effective_mode.unwrap_or(self.mode);
+        Some(mode_policy(mode).1["type"] == "workspaceWrite")
     }
 }
 
@@ -6168,6 +6175,38 @@ mod tests {
             w,
             json!({"id": 12, "result": {"scope": "session",
                 "permissions": {"fileSystem": {"write": ["/data/real-out"]}}}})
+        );
+    }
+
+    /// The session judges renames against the sandbox the running turn was sent, not the mode
+    /// picked since: a switch mid-turn applies from the next turn.
+    #[test]
+    fn workspace_writability_follows_the_live_turns_sandbox() {
+        let mut a = started(Mode::Ask);
+        assert_eq!(a.workspace_writable(), Some(false));
+        a.encode(Command::Prompt { text: "go".into() })
+            .expect("prompt");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        assert_eq!(
+            a.workspace_writable(),
+            Some(false),
+            "this turn keeps readOnly"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert_eq!(a.workspace_writable(), Some(true), "the next turn writes");
+        let mut b = started(Mode::AcceptEdits);
+        b.encode(Command::Prompt { text: "go".into() })
+            .expect("prompt");
+        b.encode(Command::SetMode { mode: Mode::Ask })
+            .expect("mode");
+        assert_eq!(
+            b.workspace_writable(),
+            Some(true),
+            "the pending turn was sent workspaceWrite"
         );
     }
 }
