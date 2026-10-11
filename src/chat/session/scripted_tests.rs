@@ -926,7 +926,7 @@ fn scripted_a_session_grant_is_announced_and_outlives_a_mode_change_until_restar
         assert_eq!(
             notices(
                 &fixture.seen,
-                &format!("Codex has extra access for this session: write {build}, use the network")
+                &format!("Codex has extra access for this session: write to {build} and use the network. It lasts until this thread's Codex session restarts.")
             ),
             1
         );
@@ -1051,95 +1051,38 @@ fn scripted_forms_answer_through_the_adapter_and_a_link_with_a_secret_is_decline
     });
 }
 
+/// Red-team #382: a link in the project that leads outside it is judged where it leads. The card
+/// shows the resolved target and offers no session grant; the grant itself is still exactly
+/// the path the card listed.
 #[test]
-fn permission_reaches_names_home_root_codex_and_sensitive_places() {
-    let home = Path::new("/home/u");
-    let codex = [home.join(".codex"), PathBuf::from("/opt/codex-home")];
-    let reach = |access: &str, target: Value| {
-        super::permission_reaches(
-            &json!({"cwd": "/home/u", "entries": [{"access": access, "target": target}]}),
-            Some(home),
-            &codex,
-        )
-    };
-    let path = |p: &str| json!({"kind": "path", "path": p});
-    let glob = |p: &str| json!({"kind": "glob", "pattern": p});
-    assert!(reach("write", path("/home/u/proj/src")).is_empty());
-    assert!(reach("read", glob("/home/u/proj/**")).is_empty());
-    assert!(reach(
-        "read",
-        json!({"kind": "special", "name": "temp", "path": null})
-    )
-    .is_empty());
-    assert!(reach("deny", path("/")).is_empty(), "deny restricts");
-    assert_eq!(
-        reach("write", path("/")),
-        [
-            "the whole filesystem",
-            "your home folder",
-            "Codex's own settings folder"
-        ]
-    );
-    assert_eq!(
-        reach("read", path("/home/u")),
-        ["your home folder", "Codex's own settings folder"]
-    );
-    assert_eq!(
-        reach("read", path("/home")),
-        ["your home folder", "Codex's own settings folder"]
-    );
-    assert_eq!(
-        reach("read", glob("/home/u/**/*.txt")),
-        [
-            "everything under your home folder",
-            "Codex's own settings folder"
-        ]
-    );
-    assert_eq!(
-        reach("read", glob("**/*.rs"))[0],
-        "everything under your home folder",
-        "relative to cwd"
-    );
-    assert_eq!(
-        reach("write", path("/opt/codex-home/rules")),
-        ["Codex's own settings folder"]
-    );
-    assert_eq!(
-        reach("write", path("/opt")),
-        ["Codex's own settings folder"]
-    );
-    for sensitive in [
-        "/home/u/proj/.git/hooks",
-        "/home/u/.bashrc",
-        "/srv/app/AGENTS.md",
-        "/srv/.github/workflows/ci.yml",
-    ] {
-        assert!(
-            reach("write", path(sensitive))
-                .iter()
-                .any(|r| r.starts_with("files that can run code")),
-            "{sensitive}"
+fn scripted_a_symlinked_target_is_shown_resolved_and_never_session_granted() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), fixture.dir.path().join("out"))
+            .expect("symlink");
+        let session = fixture.session();
+        fixture.prompt(&session, r#"permissions:{"fileSystem":{"write":["out"]}}"#);
+        let (request, options, input) = fixture.wait_card(ctx);
+        assert_eq!(options, [Decision::Allow, Decision::Deny, Decision::Cancel]);
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        assert_eq!(
+            input["entries"][0]["target"]["resolved"],
+            real.to_string_lossy().as_ref()
         );
-    }
-    assert_eq!(
-        reach(
-            "write",
-            json!({"kind": "special", "name": "project", "path": "/home/u"})
-        ),
-        ["your home folder", "Codex's own settings folder"]
-    );
-}
-
-#[test]
-fn a_permission_summary_says_what_is_granted() {
-    let input = json!({"entries": [
-        {"access": "write", "target": {"kind": "path", "path": "/w/out"}},
-        {"access": "read", "target": {"kind": "glob", "pattern": "/data/*.csv"}},
-        {"access": "read", "target": {"kind": "special", "name": "project", "path": "/w"}},
-        {"access": "deny", "target": {"kind": "path", "path": "/w/.env"}},
-    ], "network": true});
-    assert_eq!(
-        super::permission_summary(&input),
-        "write /w/out, read files matching /data/*.csv, read the project, use the network"
-    );
+        assert_eq!(input["session_allowed"], false);
+        assert!(input["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("outside the project")));
+        session.respond_approval(&request, Decision::AllowForSession);
+        assert!(fixture.results().is_empty());
+        session.respond_approval(&request, Decision::Allow);
+        fixture.wait_finished(ctx);
+        let lexical = format!("{}/out", fixture.dir.path().display());
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {"fileSystem": {"write": [lexical]}}})]
+        );
+        session.shutdown(false);
+    });
 }
