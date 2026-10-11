@@ -114,16 +114,14 @@ impl Shared {
         }
     }
 
-    /// SIGKILL to the group now, unless it is already gone (its pid could be reused).
+    /// SIGKILL to the group now, once: not when it is already gone (its pid could be reused),
+    /// nor again when it was already sent (SIGKILL cannot be ignored; the exit is on its way).
     fn kill(&self) {
-        if self.exited.get() {
+        if self.exited.get() || self.killed.replace(true) {
             return;
         }
-        let first = !self.killed.replace(true);
         self.signal(SIGKILL);
-        if first {
-            self.notify();
-        }
+        self.notify();
     }
 
     /// Signals the agent's whole process group; falls back to the agent alone.
@@ -416,6 +414,12 @@ pub fn terminate_all() {
             }
         }
     }
+}
+
+/// How many agents [`terminate_all`] would still have to stop (tests).
+#[cfg(test)]
+pub(crate) fn live_agents() -> usize {
+    LIVE.with(|l| l.borrow().len())
 }
 
 /// The state letter (`R`, `S`, `Z`, …) of `pid` from `/proc`; `None` once it has been reaped.
@@ -801,10 +805,11 @@ mod tests {
                 *seen.borrow(),
                 [StopPhase::Stopping, StopPhase::Killing, StopPhase::Exited]
             );
-            // Nothing is left alive, so quitting returns at once.
+            // Nothing is left alive, so quitting has nothing to wait for.
+            assert_eq!(live_agents(), 0);
             let quit = std::time::Instant::now();
             terminate_all();
-            assert!(quit.elapsed() < Duration::from_millis(100));
+            assert!(quit.elapsed() < Duration::from_millis(500));
         });
     }
 
@@ -831,9 +836,11 @@ mod tests {
         in_loop(|ctx| {
             let (proc, _, _, exit) = start(&sh("exit 0"));
             assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            assert_eq!(live_agents(), 0, "an exited agent is not waited on");
             let started = std::time::Instant::now();
             terminate_all();
-            assert!(started.elapsed() < Duration::from_millis(100));
+            // Far below the grace it would otherwise poll for (a loaded CI runner is slow).
+            assert!(started.elapsed() < Duration::from_millis(500));
             drop(proc);
         });
     }

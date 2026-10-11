@@ -77,15 +77,45 @@ fn short_title(title: &str) -> String {
     cut
 }
 
+/// The closing screen's timers, each `Some` while pending (a fired one is spent and must not be
+/// removed again).
+#[derive(Default)]
+struct Timers {
+    /// Puts the closing screen up ([`SHOW_AFTER`]).
+    show: Option<glib::SourceId>,
+    /// Offers Quit Now ([`QUIT_NOW_AFTER`]).
+    quit_now: Option<glib::SourceId>,
+    /// Gives up waiting ([`CLOSE_CAP`]).
+    cap: Option<glib::SourceId>,
+}
+
+impl Timers {
+    /// The slot of the timer `pick` names.
+    fn slot(&mut self, pick: TimerKind) -> &mut Option<glib::SourceId> {
+        match pick {
+            TimerKind::Show => &mut self.show,
+            TimerKind::QuitNow => &mut self.quit_now,
+            TimerKind::Cap => &mut self.cap,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TimerKind {
+    Show,
+    QuitNow,
+    Cap,
+}
+
 /// The closing screen and what it waits on. Held by the window until it goes.
 pub(super) struct Closing {
     targets: Vec<StopTarget>,
     started: Instant,
     /// The whole window while closing: the animation, the step line and "Quit Now".
     page: gtk4::WindowHandle,
-    /// The live region the step line is announced through.
-    status: gtk4::Box,
     animation: super::pack_animation::PackAnimation,
+    /// The step line. It is the live region itself (role Status): screen readers hear its text
+    /// change, with no separate property to keep in step.
     step: gtk4::Label,
     quit_now: gtk4::Revealer,
     /// The window's own content, kept alive (not destroyed) while the closing screen is shown.
@@ -93,8 +123,7 @@ pub(super) struct Closing {
     /// Swallows keys while the old content is still on screen; removed with it, so the closing
     /// screen's own button can be reached from the keyboard.
     key_block: RefCell<Option<gtk4::EventControllerKey>>,
-    /// The show, Quit Now and cap timers, while pending.
-    timers: RefCell<[Option<glib::SourceId>; 3]>,
+    timers: RefCell<Timers>,
     finished: Cell<bool>,
     window: glib::WeakRef<super::super::AgentTerminalWindow>,
 }
@@ -107,6 +136,7 @@ impl Closing {
             .justify(gtk4::Justification::Center)
             .max_width_chars(48)
             .css_classes(["closing-step"])
+            .accessible_role(gtk4::AccessibleRole::Status)
             .build();
         let quit_button = gtk4::Button::builder()
             .label("Quit Now")
@@ -127,7 +157,6 @@ impl Closing {
             .spacing(14)
             .halign(gtk4::Align::Center)
             .valign(gtk4::Align::Center)
-            .accessible_role(gtk4::AccessibleRole::Status)
             .build();
         status.append(animation.widget());
         status.append(&step);
@@ -142,13 +171,12 @@ impl Closing {
             targets,
             started: Instant::now(),
             page,
-            status,
             animation,
             step,
             quit_now,
             content: RefCell::new(None),
             key_block: RefCell::new(None),
-            timers: RefCell::new([None, None, None]),
+            timers: RefCell::new(Timers::default()),
             finished: Cell::new(false),
             window: window.downgrade(),
         });
@@ -173,8 +201,6 @@ impl Closing {
         let line = step_line(&phases);
         if self.step.text().as_str() != line {
             self.step.set_text(&line);
-            self.status
-                .update_property(&[gtk4::accessible::Property::Description(&line)]);
         }
         if phases.iter().all(|(_, _, p)| *p == StopPhase::Exited) {
             self.finish();
@@ -220,7 +246,12 @@ impl Closing {
         if self.finished.replace(true) {
             return;
         }
-        for timer in self.timers.take().into_iter().flatten() {
+        let Timers {
+            show,
+            quit_now,
+            cap,
+        } = self.timers.take();
+        for timer in [show, quit_now, cap].into_iter().flatten() {
             timer.remove();
         }
         info!(
@@ -277,20 +308,20 @@ impl AgentTerminalWindow {
                 }
             });
         }
-        let timer = |slot: usize, after: Duration, f: fn(&Closing)| {
+        let timer = |kind: TimerKind, after: Duration, f: fn(&Closing)| {
             let weak = Rc::downgrade(&closing);
             let id = glib::timeout_add_local_once(after, move || {
                 if let Some(closing) = weak.upgrade() {
                     // Fired: its id is spent, and must not be removed again.
-                    closing.timers.borrow_mut()[slot] = None;
+                    closing.timers.borrow_mut().slot(kind).take();
                     f(&closing);
                 }
             });
-            closing.timers.borrow_mut()[slot] = Some(id);
+            *closing.timers.borrow_mut().slot(kind) = Some(id);
         };
-        timer(0, SHOW_AFTER, Closing::show);
-        timer(1, QUIT_NOW_AFTER, Closing::offer_quit_now);
-        timer(2, CLOSE_CAP, |closing| {
+        timer(TimerKind::Show, SHOW_AFTER, Closing::show);
+        timer(TimerKind::QuitNow, QUIT_NOW_AFTER, Closing::offer_quit_now);
+        timer(TimerKind::Cap, CLOSE_CAP, |closing| {
             warn!("close: agents still running at the cap; killing them");
             closing.kill_all();
             closing.finish();
@@ -482,6 +513,13 @@ mod tests {
             step_text(&window),
             "Stopping Codex in Atomic config writes…"
         );
+        // The changing line is itself the live region a screen reader follows.
+        assert!(window
+            .imp()
+            .closing
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.step.accessible_role() == gtk4::AccessibleRole::Status));
         assert!(
             window
                 .lookup_action("new-tab")
@@ -574,9 +612,10 @@ mod tests {
             "Quit Now waited out the grace"
         );
         // Nothing is left for the app's own quit to wait on.
+        assert_eq!(crate::agent_proc::live_agents(), 0);
         let quit = Instant::now();
         crate::agent_proc::terminate_all();
-        assert!(quit.elapsed() < Duration::from_millis(100));
+        assert!(quit.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
