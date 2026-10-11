@@ -415,7 +415,7 @@ fn scripted_reload_rejects_previous_process_frames_and_adopts_deferred_mode_next
             .collect();
         assert_eq!(starts[0]["params"]["approvalPolicy"], "untrusted");
         assert_eq!(starts[0]["params"]["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(starts[1]["params"]["approvalPolicy"], "on-request");
+        assert_eq!(starts[1]["params"]["approvalPolicy"], "untrusted");
         assert_eq!(
             starts[1]["params"]["sandboxPolicy"]["type"],
             "workspaceWrite"

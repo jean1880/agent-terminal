@@ -1143,13 +1143,20 @@ impl Inner {
             .as_ref()
             .filter(|_| options.contains(&Decision::AllowAlways))
             .map(|a| crate::approval_server::remembers_text(a, &ctx));
+        // Codex Accept edits runs on `untrusted` (D5): the app accepts edits whose every path is
+        // in the workspace and not sensitive; anything else, and every shell command, asks.
+        let accept_edit = driver == Driver::Codex
+            && tool == "file_change"
+            && self.state.borrow().mode == Mode::AcceptEdits
+            && codex_edits_contained(input, &workspace, home.as_deref());
         let auto = options.contains(&Decision::Allow)
-            && action.as_ref().is_some_and(|a| {
-                self.session_rules.borrow().matches_session(a, &ctx)
-                    || self
-                        .saved_rules()
-                        .is_some_and(|rules| rules.matches_any(a, &ctx))
-            });
+            && (accept_edit
+                || action.as_ref().is_some_and(|a| {
+                    self.session_rules.borrow().matches_session(a, &ctx)
+                        || self
+                            .saved_rules()
+                            .is_some_and(|rules| rules.matches_any(a, &ctx))
+                }));
         if let Some(action) = action {
             self.pending_rules
                 .borrow_mut()
@@ -2272,6 +2279,32 @@ pub(crate) fn chosen_mode<'a>(events: impl IntoIterator<Item = &'a Envelope>) ->
 /// the first request and the most recent work), and what never travels. `place` reads after
 /// "Continuing": "in Codex", "from “title”".
 /// What the switch notice adds when session approvals end (D3).
+/// Whether a Codex patch approval only touches files Accept edits may write unasked: it names at
+/// least one change, and every path (and rename target) is inside `workspace`, with no `..` or
+/// symlink on the way, and not sensitive (agy's containment check).
+fn codex_edits_contained(input: &serde_json::Value, workspace: &Path, home: Option<&Path>) -> bool {
+    let Some(changes) = input
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .filter(|c| !c.is_empty())
+    else {
+        return false;
+    };
+    changes.iter().all(|change| {
+        let move_to = change
+            .get("kind")
+            .and_then(|k| k.get("move_path"))
+            .filter(|m| !m.is_null());
+        let targets = [change.get("path"), move_to];
+        change.get("path").is_some()
+            && targets.into_iter().flatten().all(|t| {
+                t.as_str().is_some_and(|p| {
+                    crate::approval_server::path_auto_matchable(Path::new(p), workspace, home)
+                })
+            })
+    })
+}
+
 fn session_rules_ended(n: usize) -> String {
     format!("Session approvals ({n}) ended.")
 }
@@ -4605,6 +4638,83 @@ mod tests {
             assert_eq!(resolution(&seen, &same), Some(Decision::Allow));
             assert_eq!(resolution(&seen, &compound), None, "ls -la; id asks");
         });
+    }
+
+    const W0_CODEX_ACCEPT_EDITS: &str =
+        include_str!("../../tests/fixtures/real/codex/untrusted-workspacewrite.jsonl");
+
+    /// The W0 frames of `fixture` whose method is one of `methods`, the recording's sandbox
+    /// replaced by `dir`.
+    fn w0_frames(fixture: &str, dir: &Path, methods: &[&str]) -> Vec<String> {
+        let dir = dir.to_string_lossy();
+        fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["dir"] == "out")
+            .map(|r| r["frame"].clone())
+            .filter(|f| f["method"].as_str().is_some_and(|m| methods.contains(&m)))
+            .map(|f| f.to_string().replace("/tmp/w0-sandbox", &dir))
+            .collect()
+    }
+
+    fn request_for(seen: &Seen, method_tool: &str) -> Option<String> {
+        seen.borrow().iter().find_map(|e| match &e.event {
+            Event::ApprovalRequested { tool, .. } if tool == method_tool => e.request.clone(),
+            _ => None,
+        })
+    }
+
+    /// Plan 2.4 (D5), replaying `codex/untrusted-workspacewrite.jsonl`: in Accept edits the
+    /// in-workspace edit is answered `accept` by the app and the shell `ls -la` shows a card. In
+    /// Ask, or for an edit outside the workspace, the edit asks too.
+    #[test]
+    fn codex_accept_edits_auto_accepts_workspace_edits_and_shell_still_asks() {
+        let methods = [
+            "turn/started",
+            "item/started",
+            "item/fileChange/requestApproval",
+            "item/commandExecution/requestApproval",
+        ];
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.inner.state.borrow().mode, Mode::AcceptEdits);
+            for f in w0_frames(W0_CODEX_ACCEPT_EDITS, tmp.path(), &methods) {
+                feed(&session, &f);
+            }
+            let edit = request_for(&seen, "file_change").expect("edit card");
+            let shell = request_for(&seen, "command_execution").expect("shell card");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &edit).is_some()));
+            assert_eq!(resolution(&seen, &edit), Some(Decision::Allow));
+            assert!(pump_until(ctx, 10, || {
+                stdin_log(tmp.path()).contains(r#"{"id":0,"result":{"decision":"accept"}}"#)
+            }));
+            assert_eq!(resolution(&seen, &shell), None, "shell asks");
+            assert!(!stdin_log(tmp.path()).contains(r#""id":1,"result""#));
+        });
+        for (mode, sandbox) in [(Mode::Ask, None), (Mode::AcceptEdits, Some("/etc"))] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (session, seen) = recording(
+                    ctx,
+                    tmp.path(),
+                    Box::new(agent_core::codex::CodexAdapter::new()),
+                );
+                session.set_mode(mode);
+                let target = sandbox.map_or_else(|| tmp.path().to_owned(), PathBuf::from);
+                for f in w0_frames(W0_CODEX_ACCEPT_EDITS, &target, &methods[..3]) {
+                    feed(&session, &f);
+                }
+                let edit = request_for(&seen, "file_change").expect("edit card");
+                pump_until(ctx, 1, || false);
+                assert_eq!(resolution(&seen, &edit), None, "{mode:?} {sandbox:?} asks");
+            });
+        }
     }
 
     /// Plan 2.3, from the W0 Codex frame: "Always allow" saved with the dialog's prefill (the

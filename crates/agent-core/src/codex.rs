@@ -62,10 +62,14 @@
 //! | [`Mode`]      | approvalPolicy | sandboxPolicy       | Effect                                  |
 //! |---------------|----------------|---------------------|-----------------------------------------|
 //! | `Ask`         | `untrusted`    | `readOnly`          | only known-safe reads run unasked; every edit and other command asks |
-//! | `AcceptEdits` | `on-request`   | `workspaceWrite`    | edits inside the workspace are automatic; the model asks to escalate |
+//! | `AcceptEdits` | `untrusted`    | `workspaceWrite`    | every edit and other command asks; the app answers in-workspace edits itself, so shell still asks |
 //! | `Plan`        | `never`        | `readOnly`          | cannot write and never asks (T3 Code has no read-only row; this is the strictest the enums allow without the experimental `collaborationMode`) |
 //!
-//! `Ask` is T3's `approval-required` row, `AcceptEdits` its `auto-accept-edits` row.
+//! `Ask` is T3's `approval-required` row. `AcceptEdits` is not T3's `auto-accept-edits`
+//! (`on-request`, under which Codex runs shell commands unasked): W0
+//! (`untrusted-workspacewrite.jsonl`) showed that on `untrusted` + `workspaceWrite` both edits and
+//! shell ask, and an `accept` applies the edit (plan D5). The app's session accepts edits whose
+//! every path is inside the workspace and not sensitive.
 //!
 //! # Known limits (each with its upgrade path)
 //!
@@ -2053,7 +2057,7 @@ fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
 fn mode_policy(mode: Mode) -> (&'static str, Value) {
     match mode {
         Mode::Ask => ("untrusted", json!({"type": "readOnly"})),
-        Mode::AcceptEdits => ("on-request", json!({"type": "workspaceWrite"})),
+        Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
         Mode::Plan => ("never", json!({"type": "readOnly"})),
     }
 }
@@ -2721,7 +2725,7 @@ mod tests {
             .expect("prompt"),
         );
         assert_eq!(next["params"]["sandboxPolicy"]["type"], "workspaceWrite");
-        assert_eq!(next["params"]["approvalPolicy"], "on-request");
+        assert_eq!(next["params"]["approvalPolicy"], "untrusted");
     }
 
     #[test]
@@ -3367,7 +3371,7 @@ mod tests {
             (Mode::Ask, "untrusted", json!({"type": "readOnly"})),
             (
                 Mode::AcceptEdits,
-                "on-request",
+                "untrusted",
                 json!({"type": "workspaceWrite"}),
             ),
             (Mode::Plan, "never", json!({"type": "readOnly"})),
@@ -3423,7 +3427,7 @@ mod tests {
         );
         let w = one_write(a.encode(Command::Prompt { text: "x".into() }).expect("ok"));
         assert_eq!(w["params"]["model"], "gpt-5.5");
-        assert_eq!(w["params"]["approvalPolicy"], "on-request");
+        assert_eq!(w["params"]["approvalPolicy"], "untrusted");
         assert_eq!(
             w["params"]["sandboxPolicy"],
             json!({"type": "workspaceWrite"})
