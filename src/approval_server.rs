@@ -776,16 +776,11 @@ impl ServerInner {
         action: &crate::always_allow::Action,
         ctx: &crate::always_allow::Context,
     ) -> bool {
-        let mut cache = self.always.borrow_mut();
-        let Some(cache) = cache.as_mut() else {
-            return false;
-        };
-        let path = cache.path().to_owned();
-        match cache.rules() {
-            Ok(rules) => rules.matches_any(action, ctx),
-            Err(e) => {
-                let notice = crate::always_allow::blocked_notice(&path, e);
-                warn!(error = %e, "approval rules file unusable; saved rules are off");
+        // The cache borrow ends inside the helper, before any notice goes out.
+        match crate::always_allow::saved_allow(&self.always, action, ctx) {
+            Ok(allowed) => allowed,
+            Err(notice) => {
+                warn!("approval rules file unusable; saved rules are off");
                 if !self.blocked_noticed.replace(true) {
                     self.emit(Envelope::new(Event::Notice { text: notice }));
                 }
@@ -1882,6 +1877,10 @@ mod tests {
             let rules_path = tmp.path().join("always-allow.json");
             let mut rules = crate::always_allow::AlwaysRules::default();
             assert!(rules.add(
+                crate::always_allow::Rule::new("*", "run_command", "git status*").expect("rule")
+            ));
+            // A runner's pattern (as an old or hand-edited file could hold) never widens (C1).
+            assert!(rules.add(
                 crate::always_allow::Rule::new("*", "run_command", "cargo test*").expect("rule")
             ));
             rules.save(&rules_path).expect("save");
@@ -1892,7 +1891,7 @@ mod tests {
             // A command matching the pattern is auto-approved without emitting a card:
             let rx = client(
                 handle.socket_path().to_owned(),
-                with_id(cmd("cargo test --workspace"), "p1"),
+                with_id(cmd("git status --short"), "p1"),
             );
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
             assert!(
@@ -1900,10 +1899,10 @@ mod tests {
                 "no approval requested card for auto-approved pattern"
             );
 
-            // A command not matching the pattern asks for approval:
+            // The runner's pattern does not cover a longer command: it asks.
             let rx2 = client(
                 handle.socket_path().to_owned(),
-                with_id(cmd("cargo build"), "p2"),
+                with_id(cmd("cargo test --workspace"), "p2"),
             );
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
             assert!(handle.respond("p2", Decision::Deny));

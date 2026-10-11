@@ -192,10 +192,7 @@ impl AgentTerminalWindow {
     /// and left untouched, never treated as empty.
     fn import_rules(&self, path: &std::path::Path) {
         match crate::always_allow::AlwaysRules::import_into(path, &self.permission_sources()) {
-            Ok(0) => self.show_toast("Permission rules are already up to date"),
-            Ok(n) => self.show_toast(&format!(
-                "Imported {n} permission rules from agent configurations"
-            )),
+            Ok(imported) => self.show_toast(&imported.summary()),
             Err(e) => self.show_toast(&crate::always_allow::blocked_notice(path, &e)),
         }
     }
@@ -524,21 +521,29 @@ impl AgentTerminalWindow {
                     manage_row,
                     async move {
                         let computed = gtk4::gio::spawn_blocking(move || {
-                            let rules = crate::always_allow::AlwaysRules::load(&path);
+                            // An unusable file is named, never shown as "0 rules".
+                            let opened = crate::always_allow::AlwaysRules::open(&path);
+                            let blocked = opened
+                                .as_ref()
+                                .err()
+                                .map(|e| crate::always_allow::blocked_notice(&path, e));
+                            let rules = opened.unwrap_or_default();
                             let status = rules.check_sync_status(None, &sources);
-                            (rules.rules.len(), status)
+                            (rules.rules.len(), blocked, status)
                         })
                         .await;
-                        let Ok((count, status)) = computed else {
+                        let Ok((count, blocked, status)) = computed else {
                             return;
                         };
                         if sync_generation.get() != current {
                             return;
                         }
-                        manage_row.set_subtitle(&format!(
-                            "{count} active rules stored in {}",
-                            crate::always_allow::FILE_NAME
-                        ));
+                        manage_row.set_subtitle(&blocked.unwrap_or_else(|| {
+                            format!(
+                                "{count} active rules stored in {}",
+                                crate::always_allow::FILE_NAME
+                            )
+                        }));
                         Self::update_sync_indicator(
                             &status,
                             &warning_row,
@@ -1674,7 +1679,18 @@ fn always_allowed_rows() -> adw::ExpanderRow {
                 };
                 match AlwaysRules::forget(&path, &rule) {
                     Ok(_) => expander.remove(&row),
-                    Err(e) => warn!(error = %e, "could not save the always-allow rules"),
+                    Err(e) => {
+                        warn!(error = %e, "could not save the always-allow rules");
+                        // The rule stays, and its row says why it could not be removed.
+                        let notice = always_allow::blocked_notice(&path, &e);
+                        row.set_subtitle(&notice);
+                        if let Some(window) = row
+                            .root()
+                            .and_downcast::<crate::window::AgentTerminalWindow>()
+                        {
+                            window.imp().show_toast(&notice);
+                        }
+                    }
                 }
             }
         ));

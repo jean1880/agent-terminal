@@ -2245,6 +2245,10 @@ pub(crate) fn build_approval_suggestions(
         }
     }
 
+    // Never offer what the rule checks would refuse (a glob path, a runner's pattern, `*`).
+    suggestions.retain(|s| {
+        pattern_error(tool, &s.pattern, "", crate::always_allow::Scope::Session).is_none()
+    });
     suggestions
 }
 
@@ -2509,13 +2513,22 @@ fn rule_dialog(
             let (Some(dialog), Some(error)) = (dialog.upgrade(), error.upgrade()) else {
                 return;
             };
-            let why = pattern_error(&tool, &entry.text(), &initial);
-            for response in ["save", "save_session"] {
-                if dialog.has_response(response) {
-                    dialog.set_response_enabled(response, why.is_none());
-                }
+            use crate::always_allow::Scope;
+            let save_scope = if decision == Decision::AllowAlways {
+                Scope::Always
+            } else {
+                Scope::Session
+            };
+            let text = entry.text();
+            let save_why = pattern_error(&tool, &text, &initial, save_scope);
+            let session_why = pattern_error(&tool, &text, &initial, Scope::Session);
+            if dialog.has_response("save") {
+                dialog.set_response_enabled("save", save_why.is_none());
             }
-            match why {
+            if dialog.has_response("save_session") {
+                dialog.set_response_enabled("save_session", session_why.is_none());
+            }
+            match save_why.or(session_why) {
                 Some(why) => {
                     error.set_text(&why);
                     error.set_visible(true);
@@ -2533,15 +2546,24 @@ fn rule_dialog(
     (dialog, entry, global_check)
 }
 
-/// Why the dialog's pattern cannot be a rule for `tool` (an empty entry means the prefilled
-/// pattern), or `None` when it can.
-pub(super) fn pattern_error(tool: &str, text: &str, initial: &str) -> Option<String> {
+/// Why the dialog's pattern cannot be a rule for `tool` kept for `scope` (an empty entry means
+/// the prefilled pattern), or `None` when it can: [`crate::always_allow::Rule::new`] then
+/// [`crate::always_allow::Rule::check`], the checks the session applies when it is saved.
+pub(super) fn pattern_error(
+    tool: &str,
+    text: &str,
+    initial: &str,
+    scope: crate::always_allow::Scope,
+) -> Option<String> {
     let pattern = if text.trim().is_empty() {
         initial
     } else {
         text
     };
-    crate::always_allow::Rule::new("", tool, pattern).err()
+    // Judged as a global rule: the working directory is the request's, filled in when saved.
+    crate::always_allow::Rule::new("*", tool, pattern)
+        .and_then(|rule| rule.check(scope))
+        .err()
 }
 
 #[cfg(test)]
@@ -2840,11 +2862,36 @@ pub(crate) mod tests {
         assert!(!entry.has_css_class("error"));
         entry.set_text("");
         assert_eq!(enabled(&dialog), (true, true), "empty means the prefill");
+        // A4: validated for the dialog's own scope. A runner's exact command can be saved for
+        // the session but not always; its pattern not at all.
+        entry.set_text("cargo test");
+        assert_eq!(enabled(&dialog), (false, true));
+        assert!(entry.has_css_class("error"));
+        entry.set_text("cargo test *");
+        assert_eq!(enabled(&dialog), (false, false));
 
-        assert!(pattern_error("command_execution", "git status *", "").is_none());
-        assert!(pattern_error("write_to_file", "*.rs", "").is_some());
-        assert!(pattern_error("call_mcp_tool", "fs/read", "").is_none());
-        assert!(pattern_error("WebFetch", "x", "").is_some());
+        use crate::always_allow::Scope::{Always, Session};
+        assert!(pattern_error("command_execution", "git status *", "", Always).is_none());
+        assert!(pattern_error("command_execution", "cargo test", "", Session).is_none());
+        assert!(pattern_error("command_execution", "cargo test", "", Always).is_some());
+        assert!(pattern_error("write_to_file", "*.rs", "", Session).is_some());
+        assert!(pattern_error("call_mcp_tool", "fs/read", "", Always).is_none());
+        assert!(pattern_error("WebFetch", "x", "", Session).is_some());
+        // A4: no suggestion the checks would refuse.
+        for (tool, initial) in [
+            ("write_to_file", "/w/src/a.rs"),
+            ("command_execution", "cargo test --lib"),
+            ("command_execution", "ls -la"),
+            ("call_mcp_tool", "fs/read"),
+        ] {
+            for s in build_approval_suggestions(tool, initial) {
+                assert!(
+                    pattern_error(tool, &s.pattern, "", Session).is_none(),
+                    "{tool}: {}",
+                    s.pattern
+                );
+            }
+        }
     }
 
     /// Plan 2.6 (ui-audit #5, F15): a Codex command card shows the bare command and its folder,
@@ -2997,34 +3044,31 @@ pub(crate) mod tests {
 
     #[test]
     fn approval_suggestions_for_shell_and_mcp() {
-        // Multi-word shell command
+        // A runner: only its exact command (C1: a pattern never widens it).
         let s = build_approval_suggestions("run_command", "cargo test --workspace");
-        assert_eq!(s.len(), 3);
+        assert_eq!(s.len(), 1);
         assert_eq!(s[0].pattern, "cargo test --workspace");
         assert_eq!(s[0].description.as_deref(), Some("Exact command"));
-        assert_eq!(s[1].pattern, "cargo test *");
-        assert_eq!(
-            s[1].description.as_deref(),
-            Some("Permit any 'cargo test' command")
-        );
-        assert_eq!(s[2].pattern, "cargo *");
-        assert_eq!(
-            s[2].description.as_deref(),
-            Some("Permit any 'cargo' command")
-        );
 
-        // Two-word command with Bash tool
+        // A read-only git command widens.
         let s = build_approval_suggestions("Bash", "git status");
         assert_eq!(s.len(), 3);
         assert_eq!(s[0].pattern, "git status");
         assert_eq!(s[1].pattern, "git status *");
+        assert_eq!(
+            s[1].description.as_deref(),
+            Some("Permit any 'git status' command")
+        );
         assert_eq!(s[2].pattern, "git *");
 
-        // Single-word command
-        let s = build_approval_suggestions("bash", "htop");
+        // Single-word commands: an allowlisted one widens, any other is exact only.
+        let s = build_approval_suggestions("bash", "ls");
         assert_eq!(s.len(), 2);
+        assert_eq!(s[0].pattern, "ls");
+        assert_eq!(s[1].pattern, "ls *");
+        let s = build_approval_suggestions("bash", "htop");
+        assert_eq!(s.len(), 1);
         assert_eq!(s[0].pattern, "htop");
-        assert_eq!(s[1].pattern, "htop *");
 
         // MCP tool
         let s = build_approval_suggestions("call_mcp_tool", "ansible/deploy_apply");
@@ -3037,10 +3081,11 @@ pub(crate) mod tests {
             Some("Permit all tools on 'ansible'")
         );
 
-        // Deduplication when pattern already has wildcard
-        let s = build_approval_suggestions("run_command", "cargo *");
+        // Deduplication when the pattern already has its wildcard; a runner's has none to offer.
+        let s = build_approval_suggestions("run_command", "rg *");
         assert_eq!(s.len(), 1);
-        assert_eq!(s[0].pattern, "cargo *");
+        assert_eq!(s[0].pattern, "rg *");
+        assert!(build_approval_suggestions("run_command", "cargo *").is_empty());
 
         // Empty pattern
         let s = build_approval_suggestions("run_command", "");
@@ -3154,7 +3199,8 @@ pub(crate) mod tests {
 
         // The always-allow dialog's suggestions are toggle buttons around option labels.
         let entry = gtk4::Entry::new();
-        let flow = suggestion_flow(&entry, "Bash", "cargo test --workspace").expect("suggestions");
+        // A read-only command: a runner gets no patterns to choose between (C1).
+        let flow = suggestion_flow(&entry, "Bash", "git log --oneline").expect("suggestions");
         let toggles = crate::testutil::descendants(flow.upcast_ref())
             .iter()
             .filter(|w| w.is::<gtk4::ToggleButton>())
