@@ -401,7 +401,8 @@ impl AgentTerminalWindow {
         let manage_row = adw::ActionRow::builder()
             .title("Saved Permission Rules")
             .subtitle(format!(
-                "{rule_count} active rules stored in always-allow.json"
+                "{rule_count} active rules stored in {}",
+                crate::always_allow::FILE_NAME
             ))
             .build();
         let manage_btn = gtk4::Button::builder()
@@ -584,8 +585,9 @@ impl AgentTerminalWindow {
         manage_row: &adw::ActionRow,
     ) {
         manage_row.set_subtitle(&format!(
-            "{} active rules stored in always-allow.json",
-            rules.rules.len()
+            "{} active rules stored in {}",
+            rules.rules.len(),
+            crate::always_allow::FILE_NAME
         ));
 
         let status = rules.check_sync_status(None);
@@ -795,8 +797,14 @@ impl AgentTerminalWindow {
                     &r.workspace
                 };
                 let row = adw::ActionRow::builder()
-                    .title(&r.detail)
-                    .subtitle(format!("{} • {} • {:?}", r.tool, ws_label, r.kind))
+                    .use_markup(false)
+                    .title(r.detail())
+                    .subtitle(format!(
+                        "{} • {} • from {}",
+                        r.kind.label(),
+                        ws_label,
+                        r.origin
+                    ))
                     .build();
                 let del_btn = gtk4::Button::builder()
                     .icon_name("at-user-trash-symbolic")
@@ -1441,7 +1449,7 @@ fn always_allowed_rows() -> adw::ExpanderRow {
         let row = adw::ActionRow::builder()
             .use_markup(false)
             .title(rule.summary())
-            .subtitle(&rule.workspace)
+            .subtitle(format!("{} • from {}", rule.workspace, rule.origin))
             .title_lines(2)
             .build();
         let remove = Button::builder()
