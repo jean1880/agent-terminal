@@ -192,14 +192,16 @@ struct Inner {
     /// The mode the user last chose. The running mode can differ (agy without its hook cannot
     /// ask), and a switch to an agent that can honour it goes back to it.
     wanted_mode: Cell<Mode>,
-    /// Open Claude and Codex approvals a rule can describe: the call and its working directory,
-    /// by request id, so "Allow for session" / "Always allow" can record it (D1: app-owned).
-    pending_rules: RefCell<HashMap<String, (crate::always_allow::Action, String)>>,
+    /// Open Claude and Codex approvals a rule can describe: the call and the working directory
+    /// its rule is judged in (`None`: relative paths never resolve), by request id, so "Allow for
+    /// session" / "Always allow" can record it (D1: app-owned).
+    pending_rules: RefCell<HashMap<String, (crate::always_allow::Action, Option<String>)>>,
     /// This thread's session rules, each tagged with its agent; shared with agy's approval
     /// server, kept through a same-agent restart, cleared by a cross-agent switch (D3).
     session_rules: crate::approval_server::SessionRules,
-    /// Where Always rules are kept ([`crate::always_allow::path`]); `None` offers no "Always".
-    rules_path: RefCell<Option<PathBuf>>,
+    /// The Always rules ([`crate::always_allow::path`]), cached and re-read when the file
+    /// changes; `None` offers no "Always".
+    saved_rules: RefCell<Option<crate::always_allow::StoreCache>>,
     /// The unusable-rules-file notice was already shown in this thread.
     rules_blocked_noticed: Cell<bool>,
     /// Queued user prompts submitted while a turn is already running.
@@ -402,7 +404,9 @@ impl ChatSession {
             wanted_mode: Cell::new(wanted_mode),
             pending_rules: RefCell::new(HashMap::new()),
             session_rules: crate::approval_server::SessionRules::default(),
-            rules_path: RefCell::new(crate::always_allow::path()),
+            saved_rules: RefCell::new(
+                crate::always_allow::path().map(crate::always_allow::StoreCache::new),
+            ),
             rules_blocked_noticed: Cell::new(false),
             queued_prompts: RefCell::new(std::collections::VecDeque::new()),
             weak_self: RefCell::new(None),
@@ -1214,34 +1218,105 @@ impl Inner {
             .filter(|h| h.is_absolute())
     }
 
-    /// The thread's directory, and the call's working directory (`cwd` in its input, else the
-    /// thread's), as the rules judge them.
-    fn rule_dirs(&self, input: &serde_json::Value) -> (PathBuf, String) {
+    /// The thread's directory, and the working directory the call's rule is judged in: `cwd` in
+    /// its input, else the thread's; none for a Claude file call (Claude's own directory moves
+    /// with `cd`, so a relative path is never offered or matched).
+    fn rule_dirs(
+        &self,
+        input: &serde_json::Value,
+        action: Option<&crate::always_allow::Action>,
+    ) -> (PathBuf, Option<String>) {
         let open_cwd = self.open.borrow().cwd.clone();
-        let cwd = input
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .filter(|c| !c.is_empty())
-            .map_or_else(|| open_cwd.clone(), str::to_owned);
+        let file_call = action.is_some_and(|a| {
+            matches!(
+                a.kind(),
+                crate::always_allow::ActionKind::Edit | crate::always_allow::ActionKind::Read
+            )
+        });
+        let cwd = if file_call && self.adapter.borrow().driver() == Driver::Claude {
+            None
+        } else {
+            Some(
+                input
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map_or_else(|| open_cwd.clone(), str::to_owned),
+            )
+        };
         (PathBuf::from(open_cwd), cwd)
     }
 
-    /// The Always rules, or `None` (no file configured, or one that cannot be used: saved rules
-    /// are then off, and the notice names the file once per thread; the file is never touched).
-    fn saved_rules(&self) -> Option<crate::always_allow::AlwaysRules> {
-        let path = self.rules_path.borrow().clone()?;
-        match crate::always_allow::AlwaysRules::open(&path) {
-            Ok(rules) => Some(rules),
+    /// Whether an Always rule allows `action`, from the cached store. An unusable file allows
+    /// nothing: saved rules are off, the notice names the file once per thread, and the file is
+    /// never touched.
+    fn saved_allow(
+        &self,
+        action: &crate::always_allow::Action,
+        ctx: &crate::always_allow::Context,
+    ) -> bool {
+        let mut cache = self.saved_rules.borrow_mut();
+        let Some(cache) = cache.as_mut() else {
+            return false;
+        };
+        let path = cache.path().to_owned();
+        let notice = match cache.rules() {
+            Ok(rules) => return rules.matches_any(action, ctx),
             Err(e) => {
                 warn!(error = %e, "approval rules file unusable; saved rules are off");
-                if !self.rules_blocked_noticed.replace(true) {
-                    self.emit(Envelope::new(Event::Notice {
-                        text: crate::always_allow::blocked_notice(&path, &e),
-                    }));
-                }
-                None
+                crate::always_allow::blocked_notice(&path, e)
             }
+        };
+        if !self.rules_blocked_noticed.replace(true) {
+            self.emit(Envelope::new(Event::Notice { text: notice }));
         }
+        false
+    }
+
+    /// Codex fields an approval request is known to carry (W0 fixtures). Any other field with a
+    /// value (an escalation, extra permissions, a grant root) means the request is not the plain
+    /// call a rule was made for, so it is never auto-accepted.
+    fn codex_plain_request(tool: &str, input: &serde_json::Value) -> bool {
+        const COMMAND: &[&str] = &[
+            "kind",
+            "threadId",
+            "turnId",
+            "itemId",
+            "startedAtMs",
+            "environmentId",
+            "command",
+            "cwd",
+            "commandActions",
+            "proposedExecpolicyAmendment",
+            "availableDecisions",
+            "reason",
+        ];
+        // `changes` is the adapter's own: the diff it takes from the item that started the patch.
+        const FILE: &[&str] = &[
+            "kind",
+            "threadId",
+            "turnId",
+            "itemId",
+            "startedAtMs",
+            "reason",
+            "changes",
+        ];
+        let (known, kind) = match tool {
+            "command_execution" => (COMMAND, "command"),
+            "file_change" => (FILE, "fileChange"),
+            _ => return false,
+        };
+        let Some(fields) = input.as_object() else {
+            return false;
+        };
+        let kind_ok = match fields.get("kind") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(k) => k.as_str() == Some(kind),
+        };
+        kind_ok
+            && fields
+                .iter()
+                .all(|(k, v)| known.contains(&k.as_str()) || v.is_null())
     }
 
     /// The app's own approval gate for Claude and Codex (agy's is its socket, D1). For an
@@ -1269,19 +1344,19 @@ impl Inner {
             return (env, false);
         };
         let action = crate::always_allow::Action::of(tool, input);
-        let (workspace, cwd) = self.rule_dirs(input);
+        let (workspace, cwd) = self.rule_dirs(input, action.as_ref());
         let home = Self::home();
         let ctx = crate::always_allow::Context {
             driver: driver_name(driver),
             workspace: &workspace,
-            cwd: Some(&cwd),
+            cwd: cwd.as_deref(),
             home: home.as_deref(),
         };
         let offer = action
             .as_ref()
             .is_some_and(|a| crate::always_allow::offerable(a, &ctx));
         let always = offer
-            && self.rules_path.borrow().is_some()
+            && self.saved_rules.borrow().is_some()
             && action
                 .as_ref()
                 .is_some_and(crate::always_allow::always_offerable);
@@ -1294,19 +1369,21 @@ impl Inner {
             .as_ref()
             .filter(|_| options.contains(&Decision::AllowAlways))
             .map(|a| crate::approval_server::remembers_text(a, &ctx));
+        // R5: a Codex request with a field a plain call does not carry (an escalation) is never
+        // answered by the app, by a rule or by Accept edits.
+        let plain = driver != Driver::Codex || Self::codex_plain_request(tool, input);
         // Codex Accept edits runs on `untrusted` (D5): the app accepts edits whose every path is
         // in the workspace and not sensitive; anything else, and every shell command, asks.
         let accept_edit = driver == Driver::Codex
             && tool == "file_change"
             && self.state.borrow().mode == Mode::AcceptEdits
             && codex_edits_contained(input, &workspace, home.as_deref());
-        let auto = options.contains(&Decision::Allow)
+        let auto = plain
+            && options.contains(&Decision::Allow)
             && (accept_edit
                 || action.as_ref().is_some_and(|a| {
-                    self.session_rules.borrow().matches_session(a, &ctx)
-                        || self
-                            .saved_rules()
-                            .is_some_and(|rules| rules.matches_any(a, &ctx))
+                    let in_session = self.session_rules.borrow().matches_session(a, &ctx);
+                    in_session || self.saved_allow(a, &ctx)
                 }));
         if let Some(action) = action {
             self.pending_rules
@@ -1384,56 +1461,66 @@ impl Inner {
         });
     }
 
-    /// Records what "Allow for session" / "Always allow" keeps for a Claude or Codex call: the
-    /// user's pattern (`custom`) or the exact call. False when no rule could be made (said in a
-    /// notice): the call is then allowed once. An Always rule also holds for the session.
-    fn remember_rule(
+    /// The rule "Allow for session" / "Always allow" would keep for a Claude or Codex call,
+    /// judged afresh by [`crate::always_allow::decide`] (the card's buttons are not trusted). Pure:
+    /// nothing is kept until the agent has taken the answer ([`Self::keep_rule`]).
+    fn plan_rule(
         &self,
-        pending: Option<(crate::always_allow::Action, String)>,
+        pending: Option<&(crate::always_allow::Action, Option<String>)>,
         decision: Decision,
         custom: Option<crate::always_allow::Rule>,
-    ) -> bool {
+    ) -> Result<crate::always_allow::Rule, String> {
         let driver = self.adapter.borrow().driver();
         let workspace = PathBuf::from(self.open.borrow().cwd.clone());
         let home = Self::home();
-        let cwd = pending.as_ref().map(|(_, c)| c.clone());
         let ctx = crate::always_allow::Context {
             driver: driver_name(driver),
             workspace: &workspace,
-            cwd: cwd.as_deref(),
+            cwd: pending.and_then(|(_, cwd)| cwd.as_deref()),
             home: home.as_deref(),
         };
-        let rule = match (custom, pending.as_ref()) {
-            (Some(rule), _) => rule.complete(&ctx),
-            (None, Some((action, _))) => crate::always_allow::Rule::from_action(action, &ctx),
-            (None, None) => Err("nothing in this request can be remembered".to_owned()),
+        let scope = if decision == Decision::AllowAlways {
+            crate::always_allow::Scope::Always
+        } else {
+            crate::always_allow::Scope::Session
         };
-        let rule = match rule {
-            Ok(rule) => rule,
-            Err(why) => {
-                self.emit(Envelope::new(Event::Notice {
-                    text: format!("Allowed once; no rule was kept: {why}."),
-                }));
-                return false;
-            }
-        };
-        if decision == Decision::AllowAlways {
-            let path = self.rules_path.borrow().clone();
-            if let Some(path) = path {
-                match crate::always_allow::AlwaysRules::remember(&path, rule.clone()) {
-                    Ok(_) => info!(rule = %rule.summary(), "remembered an always-allow rule"),
-                    Err(e) => {
+        crate::always_allow::decide(pending.map(|(a, _)| a), custom, scope, &ctx)
+    }
+
+    /// Keeps `rule`: for the session at once, and for an Always answer also in the rules file,
+    /// written off the main thread (a failure is said in a notice; the session rule stands).
+    fn keep_rule(&self, rule: crate::always_allow::Rule, decision: Decision) {
+        let path = self
+            .saved_rules
+            .borrow()
+            .as_ref()
+            .map(|cache| cache.path().to_owned());
+        if let (Decision::AllowAlways, Some(path)) = (decision, path) {
+            let weak = self.weak_self.borrow().clone();
+            let saved = rule.clone();
+            glib::spawn_future_local(async move {
+                let target = path.clone();
+                let result = gtk4::gio::spawn_blocking(move || {
+                    crate::always_allow::AlwaysRules::remember(&target, saved)
+                })
+                .await;
+                let Some(inner) = weak.and_then(|w| w.upgrade()) else {
+                    return;
+                };
+                match result {
+                    Ok(Ok(_)) => info!("remembered an always-allow rule"),
+                    Ok(Err(e)) => {
                         warn!(error = %e, "always-allow rule not saved");
-                        self.rules_blocked_noticed.set(true);
-                        self.emit(Envelope::new(Event::Notice {
+                        inner.rules_blocked_noticed.set(true);
+                        inner.emit(Envelope::new(Event::Notice {
                             text: crate::always_allow::blocked_notice(&path, &e),
                         }));
                     }
+                    Err(_) => warn!("the always-allow save worker panicked"),
                 }
-            }
+            });
         }
         self.session_rules.borrow_mut().add(rule);
-        true
     }
 
     /// Ends this thread's session approvals (a cross-agent switch, D3); returns how many.
@@ -1944,23 +2031,33 @@ impl Inner {
         // allow (Claude without `updatedPermissions`, Codex `accept`). No rule, no claim of one:
         // the card then says "Allowed".
         let pending = self.pending_rules.borrow_mut().remove(request);
-        let mut decision = decision;
-        if matches!(decision, Decision::AllowAlways | Decision::AllowForSession)
-            && !self.remember_rule(pending, decision, custom_rule)
-        {
-            decision = Decision::Allow;
-        }
+        let plan = matches!(decision, Decision::AllowAlways | Decision::AllowForSession)
+            .then(|| self.plan_rule(pending.as_ref(), decision, custom_rule));
+        let decision = match &plan {
+            Some(Err(_)) => Decision::Allow,
+            _ => decision,
+        };
         // Claude and Codex never acknowledge an answer, so once the adapter has accepted it and
         // written it, the card is resolved here; otherwise it would sit at "Allow…" for good.
+        // A rule is kept only then: an answer the adapter refuses (the request was denied at its
+        // deadline, cancelled or expired) keeps nothing.
         let sent = self.command(Command::Approve {
             request: request.to_owned(),
             decision,
             updated_input: None,
             message: None,
         });
-        if sent {
-            self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+        if !sent {
+            return;
         }
+        match plan {
+            Some(Ok(rule)) => self.keep_rule(rule, decision),
+            Some(Err(why)) => self.emit(Envelope::new(Event::Notice {
+                text: format!("Allowed once; no rule was kept: {why}."),
+            })),
+            None => {}
+        }
+        self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
@@ -2525,40 +2622,26 @@ pub(crate) fn chosen_mode<'a>(events: impl IntoIterator<Item = &'a Envelope>) ->
         .last()
 }
 
-/// What a handoff carried, said plainly: all of the thread, or how much of it (the budget keeps
-/// the first request and the most recent work), and what never travels. `place` reads after
-/// "Continuing": "in Codex", "from “title”".
-/// What the switch notice adds when session approvals end (D3).
 /// Whether a Codex patch approval only touches files Accept edits may write unasked: it names at
-/// least one change, and every path (and rename target) is inside `workspace`, with no `..` or
-/// symlink on the way, and not sensitive (agy's containment check).
+/// least one change, and every target ([`crate::always_allow::codex_change_targets`]: each path
+/// and rename target) is inside `workspace`, with no `..` or symlink on the way, and not
+/// sensitive (agy's containment check). A missing or non-text target fails closed.
 fn codex_edits_contained(input: &serde_json::Value, workspace: &Path, home: Option<&Path>) -> bool {
-    let Some(changes) = input
-        .get("changes")
-        .and_then(serde_json::Value::as_array)
-        .filter(|c| !c.is_empty())
-    else {
-        return false;
-    };
-    changes.iter().all(|change| {
-        let move_to = change
-            .get("kind")
-            .and_then(|k| k.get("move_path"))
-            .filter(|m| !m.is_null());
-        let targets = [change.get("path"), move_to];
-        change.get("path").is_some()
-            && targets.into_iter().flatten().all(|t| {
-                t.as_str().is_some_and(|p| {
-                    crate::approval_server::path_auto_matchable(Path::new(p), workspace, home)
-                })
-            })
+    crate::always_allow::codex_change_targets(input).is_some_and(|targets| {
+        targets
+            .iter()
+            .all(|p| crate::approval_server::path_auto_matchable(Path::new(p), workspace, home))
     })
 }
 
+/// What the switch notice adds when session approvals end (D3).
 fn session_rules_ended(n: usize) -> String {
     format!("Session approvals ({n}) ended.")
 }
 
+/// What a handoff carried, said plainly: all of the thread, or how much of it (the budget keeps
+/// the first request and the most recent work), and what never travels. `place` reads after
+/// "Continuing": "in Codex", "from “title”".
 fn handoff_notice(place: &str, handoff: &Handoff) -> String {
     const NEVER: &str =
         "Reasoning and tool state are not carried, and long tool output is shortened.";
@@ -4883,7 +4966,9 @@ mod tests {
         let (sink, seen) = make_sink();
         let open = scripted(dir, "cat > \"$D/stdin.log\"");
         let session = ChatSession::new(adapter, open, store, thread, sink, None);
-        *session.inner.rules_path.borrow_mut() = Some(dir.join(crate::always_allow::FILE_NAME));
+        *session.inner.saved_rules.borrow_mut() = Some(crate::always_allow::StoreCache::new(
+            dir.join(crate::always_allow::FILE_NAME),
+        ));
         assert!(pump_until(ctx, 10, || session.inner.state.borrow().alive));
         (session, seen)
     }
@@ -4925,6 +5010,22 @@ mod tests {
             .expect("approval card")
     }
 
+    /// The Always rules in `dir` once the off-thread save has written `count` of them.
+    fn saved_rules_once(
+        ctx: &glib::MainContext,
+        dir: &Path,
+        count: usize,
+    ) -> crate::always_allow::AlwaysRules {
+        let file = dir.join(crate::always_allow::FILE_NAME);
+        assert!(
+            pump_until(ctx, 10, || {
+                crate::always_allow::AlwaysRules::open(&file).is_ok_and(|r| r.rules.len() == count)
+            }),
+            "{count} saved rules"
+        );
+        crate::always_allow::AlwaysRules::open(&file).expect("saved")
+    }
+
     fn stdin_log(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("stdin.log")).unwrap_or_default()
     }
@@ -4943,7 +5044,7 @@ mod tests {
             );
             feed(&session, &can_use_tool("r1", "touch b.tmp"));
             assert!(offered(&seen, "r1").contains(&Decision::AllowForSession));
-            let pattern = crate::always_allow::Rule::new("", "Bash", "touch b.tmp");
+            let pattern = crate::always_allow::Rule::new("", "Bash", "touch b.tmp").expect("rule");
             session.respond_approval_with_rule("r1", Decision::AllowForSession, Some(pattern));
             assert_eq!(resolution(&seen, "r1"), Some(Decision::AllowForSession));
             assert!(pump_until(ctx, 10, || stdin_log(tmp.path()).contains("\"r1\"")));
@@ -5228,11 +5329,7 @@ mod tests {
             assert!(options.contains(&Decision::AllowAlways), "{options:?}");
             session.respond_approval(&edit, Decision::AllowAlways);
             assert_eq!(resolution(&seen, &edit), Some(Decision::AllowAlways));
-            let saved = crate::always_allow::AlwaysRules::open(
-                &tmp.path().join(crate::always_allow::FILE_NAME),
-            )
-            .expect("saved");
-            assert_eq!(saved.rules.len(), 1);
+            let saved = saved_rules_once(ctx, tmp.path(), 1);
             assert_eq!(saved.rules[0].kind, crate::always_allow::ActionKind::Edit);
             assert_eq!(saved.rules[0].origin, "codex");
             drop(session);
@@ -5260,6 +5357,7 @@ mod tests {
             );
             assert!(offered(&seen, "m1").contains(&Decision::AllowAlways));
             session.respond_approval("m1", Decision::AllowAlways);
+            saved_rules_once(ctx, tmp.path(), 2);
             drop(session);
             let (session, seen) = recording(ctx, tmp.path(), claude());
             feed(
@@ -5387,6 +5485,63 @@ mod tests {
         }
     }
 
+    /// R5 on Accept edits: the same in-workspace W0 patch, carrying an escalation (a grant root),
+    /// is not accepted by the app.
+    #[test]
+    fn codex_accept_edits_never_accepts_a_request_with_an_escalation() {
+        let methods = [
+            "turn/started",
+            "item/started",
+            "item/fileChange/requestApproval",
+        ];
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            session.set_mode(Mode::AcceptEdits);
+            for f in w0_frames(W0_CODEX_ACCEPT_EDITS, tmp.path(), &methods) {
+                let mut v: serde_json::Value = serde_json::from_str(&f).expect("frame");
+                if v["method"] == "item/fileChange/requestApproval" {
+                    v["params"]["grantRoot"] = serde_json::json!("/");
+                }
+                feed(&session, &v.to_string());
+            }
+            let edit = request_for(&seen, "file_change").expect("edit card");
+            pump_until(ctx, 1, || false);
+            assert_eq!(resolution(&seen, &edit), None, "an escalation asks");
+        });
+    }
+
+    /// B5 on Accept edits: every target of a multi-change patch (paths and rename targets) must
+    /// pass the containment check; one outside, or one that is not text, makes it ask.
+    #[test]
+    fn codex_accept_edits_checks_every_target_of_a_patch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        let p = |name: &str| ws.join(name).to_string_lossy().into_owned();
+        let change = |path: serde_json::Value, moved: serde_json::Value| serde_json::json!({"path": path, "kind": {"type": "update", "move_path": moved}});
+        let null = serde_json::Value::Null;
+        let inside = serde_json::json!({"changes": [
+            change(p("a.txt").into(), null.clone()),
+            change(p("b.txt").into(), p("c.txt").into()),
+        ]});
+        assert!(codex_edits_contained(&inside, &ws, None));
+        for bad in [
+            serde_json::json!({"changes": [change(p("a.txt").into(), null.clone()),
+                change("/etc/hosts".into(), null.clone())]}),
+            serde_json::json!({"changes": [change(p("a.txt").into(), "/etc/hosts".into())]}),
+            serde_json::json!({"changes": [change(serde_json::json!(7), null.clone())]}),
+            serde_json::json!({"changes": [change(p("AGENTS.md").into(), null.clone())]}),
+            serde_json::json!({"changes": []}),
+            serde_json::json!({}),
+        ] {
+            assert!(!codex_edits_contained(&bad, &ws, None), "{bad}");
+        }
+    }
+
     /// Plan 2.3, from the W0 Codex frame: "Always allow" saved with the dialog's prefill (the
     /// bare `ls -la`) is a rule a new session matches the same wrapped request with.
     #[test]
@@ -5433,14 +5588,10 @@ mod tests {
             assert!(offered(&seen, &request).contains(&Decision::AllowAlways));
             let prefill = crate::always_allow::dialog_prefill(&tool, &input, None);
             assert_eq!(prefill, "ls -la");
-            let rule = crate::always_allow::Rule::new("", tool, prefill);
+            let rule = crate::always_allow::Rule::new("", tool, prefill).expect("rule");
             session.respond_approval_with_rule(&request, Decision::AllowAlways, Some(rule));
             assert_eq!(resolution(&seen, &request), Some(Decision::AllowAlways));
-            let saved = crate::always_allow::AlwaysRules::open(
-                &tmp.path().join(crate::always_allow::FILE_NAME),
-            )
-            .expect("saved");
-            assert_eq!(saved.rules.len(), 1);
+            let saved = saved_rules_once(ctx, tmp.path(), 1);
             assert_eq!(saved.rules[0].detail(), "ls -la");
             drop(session);
 
@@ -5533,10 +5684,11 @@ mod tests {
                 .session_rules
                 .borrow()
                 .matches_session(&touch, &agy));
-            let saved = crate::always_allow::AlwaysRules::open(
-                &workspace.join(crate::always_allow::FILE_NAME),
-            )
-            .expect("saved");
+            let file = workspace.join(crate::always_allow::FILE_NAME);
+            assert!(pump_until(ctx, 10, || {
+                crate::always_allow::AlwaysRules::open(&file).is_ok_and(|r| r.rules.len() == 1)
+            }));
+            let saved = crate::always_allow::AlwaysRules::open(&file).expect("saved");
             assert_eq!(saved.rules.len(), 1);
             assert_eq!(saved.rules[0].origin, "claude");
             let ls = crate::always_allow::Action::Shell {
@@ -5547,6 +5699,125 @@ mod tests {
                 "an Always rule matches agy by kind"
             );
             assert!(!saved.matches_any(&touch, &agy));
+        });
+    }
+
+    /// S6: an answer that arrives after the deadline denied the request keeps no rule, whatever
+    /// the user's pattern.
+    #[test]
+    fn a_late_answer_after_the_deadline_keeps_no_rule() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            session
+                .inner
+                .approval_deadline
+                .set(Duration::from_millis(50));
+            feed(&session, &can_use_tool("r1", "ls -la"));
+            assert!(pump_until(ctx, 10, || resolution(&seen, "r1").is_some()));
+            assert_eq!(resolution(&seen, "r1"), Some(Decision::Deny));
+            let pattern = crate::always_allow::Rule::new("", "Bash", "ls *").expect("rule");
+            session.respond_approval_with_rule("r1", Decision::AllowAlways, Some(pattern));
+            assert!(session.inner.session_rules.borrow().rules.is_empty());
+            // Give a stray save every chance to land.
+            for _ in 0..50 {
+                ctx.iteration(false);
+            }
+            assert!(!tmp.path().join(crate::always_allow::FILE_NAME).exists());
+        });
+    }
+
+    /// R4: Claude's working directory moves with `cd`, so a relative path is never offered a
+    /// rule; an absolute one inside the workspace is.
+    #[test]
+    fn claude_relative_paths_are_never_offered_a_rule() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            let edit = |id: &str, path: &str| {
+                serde_json::json!({"type": "control_request", "request_id": id, "request": {
+                    "subtype": "can_use_tool", "tool_name": "Edit", "tool_use_id": format!("tu-{id}"),
+                    "input": {"file_path": path, "old_string": "a", "new_string": "b"}}})
+                .to_string()
+            };
+            feed(&session, &edit("e1", "a.rs"));
+            assert!(!offered(&seen, "e1").contains(&Decision::AllowForSession));
+            let abs = tmp.path().join("a.rs").to_string_lossy().into_owned();
+            feed(&session, &edit("e2", &abs));
+            assert!(offered(&seen, "e2").contains(&Decision::AllowForSession));
+            assert!(
+                offered(&seen, "e2").contains(&Decision::AllowAlways),
+                "U2: a contained edit can be kept always"
+            );
+            assert!(!offered(&seen, "e1").contains(&Decision::AllowAlways));
+        });
+    }
+
+    /// R5: a Codex request carrying a field a plain call does not have (an escalation) is never
+    /// auto-accepted by a matching rule.
+    #[test]
+    fn codex_requests_with_extra_fields_are_never_auto_accepted() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let frame = |id: u64, item: &str, extra: Option<(&str, serde_json::Value)>| {
+                let mut params = serde_json::json!({
+                    "kind": "command", "threadId": "th", "turnId": "tu", "itemId": item,
+                    "command": "/usr/bin/zsh -lc 'ls -la'", "cwd": cwd,
+                    "availableDecisions": ["accept", "cancel"],
+                });
+                if let Some((k, v)) = extra {
+                    params[k] = v;
+                }
+                serde_json::json!({"id": id, "method": "item/commandExecution/requestApproval",
+                    "params": params})
+                .to_string()
+            };
+            let request_of = |item: &str| {
+                seen.borrow()
+                    .iter()
+                    .find(|e| {
+                        e.item.as_deref() == Some(item)
+                            && matches!(e.event, Event::ApprovalRequested { .. })
+                    })
+                    .and_then(|e| e.request.clone())
+                    .expect("card")
+            };
+            feed(&session, &frame(0, "i0", None));
+            session.respond_approval(&request_of("i0"), Decision::AllowForSession);
+            feed(
+                &session,
+                &frame(
+                    1,
+                    "i1",
+                    Some((
+                        "additionalPermissions",
+                        serde_json::json!({"network": true}),
+                    )),
+                ),
+            );
+            feed(
+                &session,
+                &frame(2, "i2", Some(("kind", serde_json::json!("escalated")))),
+            );
+            feed(&session, &frame(3, "i3", None));
+            let (extra, kind, plain) = (request_of("i1"), request_of("i2"), request_of("i3"));
+            assert!(pump_until(ctx, 10, || resolution(&seen, &plain).is_some()));
+            assert_eq!(resolution(&seen, &extra), None, "an extra field asks");
+            assert_eq!(resolution(&seen, &kind), None, "another kind asks");
         });
     }
 

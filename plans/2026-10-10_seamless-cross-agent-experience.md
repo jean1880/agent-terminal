@@ -183,6 +183,13 @@ Each wave is a release. `git revert` the wave's commits and ship the previous ve
 - **U3. W0 runs now** (about 6 real turns). W1 work that does not depend on Codex starts in parallel.
 
 ## Log
+- 2026-10-10 (checkpoint, session paused on usage limit). ON MASTER, reviewed and approved: live_smoke (agy run live, 5/5 PASS); 1.4 + 1.12; W1a first cut; UI lane 1.8, 1.9, W4 4.1–4.9 (4.6: notices dedup, dropdown truncation; diff-panel-after-undo not reproduced); session lane 1.5 (all events masked), 1.6, 1.10, 1.11 + fork mode; W2 2.1–2.7 + U2 Always for Edit/Mcp (kept per U2); W3-app 3.3, 3.5, 3.6, 3.7 (`@` files + gauge), agy interrupt/usage. Gate green at b2701e56 (14 native cases).
+  OPEN, on branches, not merged:
+  - `w1a-rules` holds the W1 security-gate fixes. Codex, agy, the native red-team and rust-review all returned CHANGES-REQUIRED; Hive #342 lists the decisions. Fixes are in 982b3f92 plus a merge. Still running: integration with W2 (R1 through `always_offerable`, R5 on Codex accept-edits, the shared `codex_change_targets`, and Rule::new returning Result). Next: merge it, then re-review the delta with the same four checkers.
+  - `lane-w3-core`: 3.1 Reasoning, 3.2 the thinking flag, 3.4 ToolKind titles, plus the Codex mapping. Builder running. Next: merge, then rust-review.
+  - `lane-w3-app`: hardening follow-ups (state clearing, a conv_id check, the `@` cache). Builder running.
+  - After all of that: live_smoke for claude and codex (approved), the parity re-run plus a regenerated parity report, one combined release (user: single large update; waves merge to master and the beta suite builds it), release notes listing the re-approve-rules and `.claude/settings.local.json` cleanup notes, and on this machine `"permission_sources": ["~/git/agent-config/sync/permissions.toml"]`.
+  - Deferred: Codex question polyfill (separate PROPOSED plan 2026-10-09).
 - 2026-10-10: Execution. User: live_smoke runs approved for every wave; no per-wave releases: waves merge to `master` (the beta suite builds it) and ship as ONE combined release at the end. Round 1 lanes in worktrees: W1a (`w1a-rules`), 1.4/1.12 (`lane-agy-policy`), 1.8/1.9 + W4 (`lane-view-parity`), live_smoke (`lane-live-smoke`).
 - 2026-10-10: W0 done (Codex 4 turns, one over the ~3 approved; Claude 2; agy 1, whose cwd slipped to $HOME on a read-only prompt). Results:
   - D5 GO; thinking flag GO.
