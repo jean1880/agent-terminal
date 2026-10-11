@@ -78,7 +78,8 @@
 //!   answered with a JSON-RPC error and a [`Event::Notice`]; map them once the UI has a place for
 //!   them. `item/tool/requestUserInput` is mapped to the native question card.
 //! - Approval decisions that carry a payload (`acceptWithExecpolicyAmendment`,
-//!   `applyNetworkPolicyAmendment`) are not offered; the four plain decisions are.
+//!   `applyNetworkPolicyAmendment`) and `acceptForSession` are never sent: session and always
+//!   scope are agent-terminal's own rules (plan D1), answered with a plain `accept`.
 //! - stderr (Codex's tracing output) is ignored.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1402,11 +1403,19 @@ impl CodexAdapter {
             }
             _ => ALL_DECISIONS.to_vec(),
         };
-        if remembers.is_some() && !options.contains(&Decision::AllowAlways) {
-            if let Some(pos) = options.iter().position(|d| *d == Decision::Allow) {
-                options.insert(pos + 1, Decision::AllowAlways);
-            } else {
-                options.push(Decision::AllowAlways);
+        // "Allow for session" and "Always allow" are the app's (plan D1): each is a plain
+        // `accept` on the wire plus a rule the app records, so they are offered wherever the
+        // server offers `accept`. `acceptForSession` and `acceptWithExecpolicyAmendment` (which
+        // would write Codex's own rules) are never sent. The app narrows these to what a rule
+        // can describe. A `fileChange` request has no `availableDecisions` (W0).
+        if let Some(pos) = options.iter().position(|d| *d == Decision::Allow) {
+            for (offset, d) in [Decision::AllowAlways, Decision::AllowForSession]
+                .into_iter()
+                .enumerate()
+            {
+                if !options.contains(&d) {
+                    options.insert(pos + 1 + offset, d);
+                }
             }
         }
         self.approvals.insert(
@@ -2009,18 +2018,18 @@ fn codex_mode_label(mode: Mode) -> &'static str {
 /// The wire name of a decision (`CommandExecutionApprovalDecision` / `FileChangeApprovalDecision`).
 fn decision_wire(decision: Decision) -> &'static str {
     match decision {
-        // AllowAlways is emulated locally by agent-terminal; on the wire to Codex it is an accept.
-        Decision::Allow | Decision::AllowAlways => "accept",
-        Decision::AllowForSession => "acceptForSession",
+        // Session and Always scope are agent-terminal's (D1): on the wire they are an accept.
+        Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => "accept",
         Decision::Deny => "decline",
         Decision::Cancel => "cancel",
     }
 }
 
+/// The plain decisions the app maps from `availableDecisions`. `acceptForSession` is not one:
+/// session scope is the app's, and it is never sent.
 fn decision_of(wire: &str) -> Option<Decision> {
     match wire {
         "accept" => Some(Decision::Allow),
-        "acceptForSession" => Some(Decision::AllowForSession),
         "decline" => Some(Decision::Deny),
         "cancel" => Some(Decision::Cancel),
         _ => None,
@@ -3734,7 +3743,8 @@ mod tests {
     fn approve_answers_the_server_request_with_the_mapped_decision() {
         for (decision, wire) in [
             (Decision::Allow, "accept"),
-            (Decision::AllowForSession, "acceptForSession"),
+            (Decision::AllowForSession, "accept"),
+            (Decision::AllowAlways, "accept"),
             (Decision::Deny, "decline"),
             (Decision::Cancel, "cancel"),
         ] {
@@ -3894,8 +3904,66 @@ mod tests {
         );
         assert!(
             matches!(&ev[0].event, Event::ApprovalRequested { options, .. }
-            if options == &vec![Decision::Allow, Decision::Cancel])
+            if options == &vec![Decision::Allow, Decision::AllowAlways, Decision::AllowForSession, Decision::Cancel])
         );
+    }
+
+    const W0_SHELL: &str =
+        include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl");
+    const W0_EDIT: &str = include_str!("../../../tests/fixtures/real/codex/ask-edit-decline.jsonl");
+
+    fn w0_request(fixture: &str, method: &str) -> String {
+        fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|rec| rec["frame"]["method"] == method)
+            .expect("W0 approval frame")["frame"]
+            .to_string()
+    }
+
+    /// W0 (`codex/ask-shell-decline.jsonl`): the server offers `accept`, an execpolicy amendment
+    /// and `cancel`, never `acceptForSession`. "Allow for session" and "Always allow" are offered
+    /// by the app and both go out as a plain `accept`; the amendment is never sent.
+    #[test]
+    fn w0_session_and_always_answer_a_plain_accept() {
+        let frame = w0_request(W0_SHELL, "item/commandExecution/requestApproval");
+        for decision in [Decision::AllowForSession, Decision::AllowAlways] {
+            let mut a = started(Mode::Ask);
+            let ev = a.feed(&frame);
+            let request = ev[0].request.clone().expect("request");
+            match &ev[0].event {
+                Event::ApprovalRequested { options, input, .. } => {
+                    assert_eq!(
+                        options,
+                        &[
+                            Decision::Allow,
+                            Decision::AllowAlways,
+                            Decision::AllowForSession,
+                            Decision::Cancel
+                        ]
+                    );
+                    assert_eq!(input["command"], "/usr/bin/zsh -lc 'ls -la'");
+                }
+                other => panic!("{other:?}"),
+            }
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("answer"));
+            assert_eq!(w, json!({"id": 0, "result": {"decision": "accept"}}));
+        }
+        // A file change names no decisions: the plain ones, Session and Always included.
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(&w0_request(W0_EDIT, "item/fileChange/requestApproval"));
+        assert!(
+            matches!(&ev[0].event, Event::ApprovalRequested { options, .. } if options == &ALL_DECISIONS.to_vec())
+        );
+    }
+
+    fn approve_cmd(request: &str, decision: Decision) -> Command {
+        Command::Approve {
+            request: request.to_owned(),
+            decision,
+            updated_input: None,
+            message: None,
+        }
     }
 
     #[test]
@@ -3940,8 +4008,8 @@ mod tests {
             message: None,
         };
         assert!(matches!(
-            a.encode(approve(Decision::AllowForSession)),
-            Err(AdapterError::Invalid(m)) if m.contains("acceptForSession")
+            a.encode(approve(Decision::Deny)),
+            Err(AdapterError::Invalid(m)) if m.contains("decline")
         ));
         // Still pending: an offered decision goes through.
         let w = one_write(a.encode(approve(Decision::Allow)).expect("offered"));
