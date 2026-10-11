@@ -1824,15 +1824,15 @@ mod tests {
             assert!(!options(2).contains(&Decision::AllowAlways));
             assert!(handle.respond("q2", Decision::Deny));
             wait_reply(ctx, &rx);
-            // Never for a file edit (a standing write grant on a path) or an MCP tool (any
-            // arguments), even though both can be allowed for the session.
+            // U2: also for an edit of one contained path and for one MCP tool, as for every
+            // agent (an edit outside the workspace or of a sensitive file gets neither).
             let target = tmp.path().join("a.rs").to_string_lossy().into_owned();
             let rx = client(
                 handle.socket_path().to_owned(),
                 with_id(edit("write_to_file", &target), "q2e"),
             );
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
-            assert!(!options(3).contains(&Decision::AllowAlways));
+            assert!(options(3).contains(&Decision::AllowAlways));
             assert!(options(3).contains(&Decision::AllowForSession));
             assert!(handle.respond("q2e", Decision::Deny));
             wait_reply(ctx, &rx);
@@ -1842,7 +1842,7 @@ mod tests {
             );
             let rx = client(handle.socket_path().to_owned(), with_id(mcp, "q2m"));
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 5));
-            assert!(!options(4).contains(&Decision::AllowAlways));
+            assert!(options(4).contains(&Decision::AllowAlways));
             assert!(handle.respond("q2m", Decision::Deny));
             wait_reply(ctx, &rx);
             drop(handle);

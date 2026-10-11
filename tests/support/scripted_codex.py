@@ -87,6 +87,10 @@ for line in sys.stdin:
         emit({"id": frame["id"], "result": {"userAgent": "synthetic-fixture"}})
     elif method == "initialized":
         pass
+    elif method == "thread/resume" and frame["params"]["threadId"] == "stale-thread":
+        # A thread that never completed a turn: Codex has no rollout to resume.
+        emit({"id": frame["id"], "error": {
+            "code": -32600, "message": "no rollout found for thread id stale-thread"}})
     elif method in ("thread/start", "thread/resume"):
         if method == "thread/resume":
             assert frame["params"]["threadId"] == thread
@@ -110,7 +114,8 @@ for line in sys.stdin:
             notify("item/started", item={"id": f"{turn}-command", "type": "commandExecution",
                                          "command": "printf synthetic", "status": "inProgress"})
             sys.exit(24)
-        elif scenario == "success" or "Continue the unfinished task after the model switch." in scenario:
+        elif (scenario == "success" or scenario.endswith("\nsuccess")  # after a handoff
+              or "Continue the unfinished task after the model switch." in scenario):
             complete()
         else:
             request()
