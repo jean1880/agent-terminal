@@ -189,49 +189,72 @@ impl AgentTerminalWindow {
     }
 
     /// Imports the agent configurations into the rules file, off the main thread (it takes the
-    /// store lock and reads files); an unusable rules file is named and left untouched.
-    fn import_rules(&self, path: &std::path::Path) {
+    /// store lock and reads files); an unusable rules file is named and left untouched. `done`
+    /// runs on the main thread once the job has finished (and its toast is shown), whatever
+    /// the outcome.
+    fn import_rules(&self, path: &std::path::Path, done: impl FnOnce() + 'static) {
         let path = path.to_owned();
         let sources = self.permission_sources();
         let obj = self.obj().downgrade();
-        glib::spawn_future_local(async move {
-            let target = path.clone();
-            let result = gtk4::gio::spawn_blocking(move || {
-                crate::always_allow::AlwaysRules::import_into(&target, &sources)
-            })
-            .await;
-            let Some(obj) = obj.upgrade() else { return };
-            let imp = obj.imp();
-            match result {
-                Ok(Ok(imported)) => imp.show_toast(&imported.summary()),
-                Ok(Err(e)) => imp.show_toast(&crate::always_allow::blocked_notice(&path, &e)),
-                Err(_) => imp.show_toast("The import did not finish"),
-            }
-        });
+        let target = path.clone();
+        Self::store_job(
+            move || crate::always_allow::AlwaysRules::import_into(&target, &sources),
+            move |result| {
+                if let Some(obj) = obj.upgrade() {
+                    let imp = obj.imp();
+                    match result {
+                        Some(Ok(imported)) => imp.show_toast(&imported.summary()),
+                        Some(Err(e)) => {
+                            imp.show_toast(&crate::always_allow::blocked_notice(&path, &e))
+                        }
+                        None => imp.show_toast("The import did not finish"),
+                    }
+                }
+                done();
+            },
+        );
     }
 
     /// Exports the global rules off the main thread (the caller has shown
-    /// [`crate::always_allow::EXPORT_WARNING`]).
-    fn export_rules(&self, path: &std::path::Path) {
+    /// [`crate::always_allow::EXPORT_WARNING`]). `done` runs on the main thread once the job has
+    /// finished.
+    fn export_rules(&self, path: &std::path::Path, done: impl FnOnce() + 'static) {
         let path = path.to_owned();
         let sources = self.permission_sources();
         let obj = self.obj().downgrade();
+        let target = path.clone();
+        Self::store_job(
+            move || crate::always_allow::AlwaysRules::export_from(&target, &sources),
+            move |result| {
+                if let Some(obj) = obj.upgrade() {
+                    let imp = obj.imp();
+                    match result {
+                        Some(Ok(0)) => {
+                            imp.show_toast("Agent configurations are already up to date")
+                        }
+                        Some(Ok(n)) => imp.show_toast(&format!(
+                            "Exported {n} global rules to agent configurations"
+                        )),
+                        Some(Err(e)) => {
+                            imp.show_toast(&crate::always_allow::blocked_notice(&path, &e))
+                        }
+                        None => imp.show_toast("The export did not finish"),
+                    }
+                }
+                done();
+            },
+        );
+    }
+
+    /// Runs a rules-store `job` on a worker thread (it may wait for the store lock) and
+    /// `finish` on the main thread with its result (`None`: the worker failed). Nothing that
+    /// depends on the job's outcome (a toast, the sync indicator) runs before `finish`.
+    fn store_job<T: Send + 'static>(
+        job: impl FnOnce() -> T + Send + 'static,
+        finish: impl FnOnce(Option<T>) + 'static,
+    ) {
         glib::spawn_future_local(async move {
-            let target = path.clone();
-            let result = gtk4::gio::spawn_blocking(move || {
-                crate::always_allow::AlwaysRules::export_from(&target, &sources)
-            })
-            .await;
-            let Some(obj) = obj.upgrade() else { return };
-            let imp = obj.imp();
-            match result {
-                Ok(Ok(0)) => imp.show_toast("Agent configurations are already up to date"),
-                Ok(Ok(n)) => imp.show_toast(&format!(
-                    "Exported {n} global rules to agent configurations"
-                )),
-                Ok(Err(e)) => imp.show_toast(&crate::always_allow::blocked_notice(&path, &e)),
-                Err(_) => imp.show_toast("The export did not finish"),
-            }
+            finish(gtk4::gio::spawn_blocking(job).await.ok());
         });
     }
 
@@ -711,25 +734,12 @@ impl AgentTerminalWindow {
                         return;
                     };
                     let imp = obj.imp();
-                    if let Some(path) = crate::always_allow::path() {
-                        imp.import_rules(&path);
-                    }
-                    if let Some(btn) = btn_weak.upgrade() {
-                        btn.set_label("✓ Synced");
-                        btn.add_css_class("suggested-action");
-                        let btn_fade = btn.downgrade();
-                        let on_sync_fade = on_sync.clone();
-                        glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(1000),
-                            move || {
-                                if let Some(btn) = btn_fade.upgrade() {
-                                    btn.remove_css_class("suggested-action");
-                                    btn.set_label("Synced");
-                                    btn.set_sensitive(false);
-                                }
-                                on_sync_fade();
-                            },
-                        );
+                    // E4: the button and the sync indicator follow the finished job.
+                    let on_sync = on_sync.clone();
+                    let done = move || mark_synced(&btn_weak, move || on_sync());
+                    match crate::always_allow::path() {
+                        Some(path) => imp.import_rules(&path, done),
+                        None => done(),
                     }
                 });
             }
@@ -759,25 +769,12 @@ impl AgentTerminalWindow {
                         return;
                     };
                     let imp = obj.imp();
-                    if let Some(path) = crate::always_allow::path() {
-                        imp.export_rules(&path);
-                    }
-                    if let Some(btn) = btn_weak.upgrade() {
-                        btn.set_label("✓ Synced");
-                        btn.add_css_class("suggested-action");
-                        let btn_fade = btn.downgrade();
-                        let on_sync_fade = on_sync.clone();
-                        glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(1000),
-                            move || {
-                                if let Some(btn) = btn_fade.upgrade() {
-                                    btn.remove_css_class("suggested-action");
-                                    btn.set_label("Synced");
-                                    btn.set_sensitive(false);
-                                }
-                                on_sync_fade();
-                            },
-                        );
+                    // E4: the button and the sync indicator follow the finished job.
+                    let on_sync = on_sync.clone();
+                    let done = move || mark_synced(&btn_weak, move || on_sync());
+                    match crate::always_allow::path() {
+                        Some(path) => imp.export_rules(&path, done),
+                        None => done(),
                     }
                 });
             }
@@ -1099,10 +1096,12 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 match response.as_str() {
                     "import" => {
-                        imp.import_rules(&p);
-                        if let Some(ref f) = on_changed {
-                            f();
-                        }
+                        // E4: refreshed once the import has finished.
+                        imp.import_rules(&p, move || {
+                            if let Some(f) = on_changed {
+                                f();
+                            }
+                        });
                     }
                     "export" => {
                         let confirm = adw::AlertDialog::new(
@@ -1117,10 +1116,12 @@ impl AgentTerminalWindow {
                         confirm.set_default_response(Some("cancel"));
                         confirm.set_close_response("cancel");
                         if confirm.choose_future(root.as_ref()).await == "export" {
-                            imp.export_rules(&p);
-                        }
-                        if let Some(ref f) = on_changed {
-                            f();
+                            // E4: refreshed once the export has finished.
+                            imp.export_rules(&p, move || {
+                                if let Some(f) = on_changed {
+                                    f();
+                                }
+                            });
                         }
                     }
                     _ => {}
@@ -1666,6 +1667,26 @@ impl AgentTerminalWindow {
 
 /// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
 /// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
+/// Shows a sync button as done ("✓ Synced", then "Synced" a second later) and then runs
+/// `refresh` (the sync indicator). Called from the background job's completion (E4).
+fn mark_synced(button: &glib::WeakRef<Button>, refresh: impl Fn() + 'static) {
+    let Some(btn) = button.upgrade() else {
+        refresh();
+        return;
+    };
+    btn.set_label("✓ Synced");
+    btn.add_css_class("suggested-action");
+    let fade = btn.downgrade();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+        if let Some(btn) = fade.upgrade() {
+            btn.remove_css_class("suggested-action");
+            btn.set_label("Synced");
+            btn.set_sensitive(false);
+        }
+        refresh();
+    });
+}
+
 /// The widget name a confirmed export click carries (see [`confirm_export_first`]).
 const EXPORT_CONFIRMED: &str = "export-confirmed";
 
@@ -2035,6 +2056,43 @@ pub(super) mod tests {
                 .is_some()));
             assert_eq!(done.get(), Some(true));
             assert!(AlwaysRules::open(&path).expect("open").rules.is_empty());
+        });
+    }
+
+    /// E4: a Settings import's completion (the toast, the sync indicator, `on_changed`) runs
+    /// only once the background job has finished: not while it waits for the store lock.
+    #[test]
+    fn import_completion_waits_for_the_background_job() {
+        use crate::always_allow::{AlwaysRules, FILE_NAME};
+        crate::testutil::in_loop(|ctx| {
+            let dir = tempfile::tempdir().expect("tmp");
+            let path = dir.path().join(FILE_NAME);
+            let source = dir.path().join("permissions.toml");
+            std::fs::write(&source, "[allow]\nshell = [\n    \"ls\",\n]\n").expect("source");
+            AlwaysRules::default().save(&path).expect("store");
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join(format!("{FILE_NAME}.lock")))
+                .expect("lock file");
+            lock.lock().expect("hold the lock");
+
+            let finished: Rc<std::cell::Cell<Option<usize>>> = Rc::default();
+            let seen = finished.clone();
+            let target = path.clone();
+            AgentTerminalWindow::store_job(
+                move || AlwaysRules::import_into(&target, &[source]),
+                move |result| seen.set(Some(result.and_then(Result::ok).map_or(0, |i| i.added))),
+            );
+            for _ in 0..20 {
+                ctx.iteration(false);
+            }
+            assert_eq!(finished.get(), None, "nothing runs before the job finishes");
+            lock.unlock().expect("release");
+            assert!(crate::testutil::pump_until(ctx, 10, || finished
+                .get()
+                .is_some()));
+            assert_eq!(finished.get(), Some(1));
+            assert_eq!(AlwaysRules::open(&path).expect("open").rules.len(), 1);
         });
     }
 

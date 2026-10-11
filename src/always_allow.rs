@@ -377,7 +377,30 @@ const EXEC_LONG: &[(&str, &str)] = &[
     // jq runs a program file and loads modules from a search path; --rawfile/--slurpfile only
     // read data, so they stay allowed.
     ("jq", "--from-file*"),
+    ("jq", "--module-path*"),
+    // rg runs a program to find the host name for hyperlinks.
+    ("rg", "--hostname-bin*"),
+    // git verifies signatures through gpg.program.
+    ("git", "--show-signature"),
 ];
+
+/// Whether a git `--format`/`--pretty` value asks for signature data (`%G…`), which runs
+/// gpg.program, in any form (`--format=%G?`, `--pretty=format:%GS`, `tformat:`, or the value as
+/// the next word).
+fn git_signature_format(argv: &[String]) -> Option<&str> {
+    let words = &argv[1..];
+    words.iter().enumerate().find_map(|(i, w)| {
+        let value = ["--format=", "--pretty="]
+            .iter()
+            .find_map(|o| w.strip_prefix(o))
+            .or_else(|| {
+                matches!(w.as_str(), "--format" | "--pretty")
+                    .then(|| words.get(i + 1).map(String::as_str))
+                    .flatten()
+            })?;
+        value.contains("%G").then_some(w.as_str())
+    })
+}
 
 /// Short option letters that do the same, refused in any single-dash cluster and with any
 /// attached value (`-ccore.pager=x`, `-C/tmp`, `-tI/usr/bin/id`, `-xzfI…`). git's letters are
@@ -398,11 +421,25 @@ const EXEC_SHORT: &[(&str, &str)] = &[
 const FIND_ACTIONS: &[&str] = &["-exec", "-ok", "-delete", "-fprint", "-fls"];
 
 /// The first option in `argv` that lets its program run other code: [`EXEC_LONG`],
-/// [`EXEC_SHORT`] letters in any cluster (and tar's dashless first argument), or
-/// [`FIND_ACTIONS`]. A denylist, so its ceiling is the programs and options it names; it guards
-/// the programs a pattern may widen ([`PREFIX_PROGRAMS`]) and every exact rule.
+/// [`EXEC_SHORT`] letters in any cluster (and tar's dashless first argument), [`FIND_ACTIONS`],
+/// or a git format asking for signatures ([`git_signature_format`]). A denylist, so its ceiling
+/// is the programs and options it names; it guards the programs a pattern may widen
+/// ([`PREFIX_PROGRAMS`]) and every exact rule.
+///
+/// git can also run programs its configuration names (`gpg.program` with
+/// `log.showSignature`, `diff.external`, textconv and diff drivers, pagers). Those are not
+/// options this can see: the widening of `git log`/`diff`/`show` relies on the configuration
+/// being out of the agent's reach. Every such program is defined in `.git/config` or the home
+/// dotfiles (`~/.gitconfig`, `~/.config/git`; a `.gitattributes` file only selects a driver
+/// defined there), and those are sensitive edit targets that never auto-match
+/// ([`crate::approval_server::path_auto_matchable`]).
 pub fn exec_option(argv: &[String]) -> Option<&str> {
     let program = basename(argv.first()?);
+    if program == "git" {
+        if let Some(word) = git_signature_format(argv) {
+            return Some(word);
+        }
+    }
     let letters = EXEC_SHORT
         .iter()
         .find(|(p, _)| *p == program)
@@ -1288,15 +1325,16 @@ impl AlwaysRules {
         home: Option<&Path>,
         sources: &[PathBuf],
     ) -> Imported {
-        let Some(home) = home_dir(home) else {
-            return Imported::default();
-        };
+        // The configured sources need no home directory; the agents' own files do.
         let mut imported = Imported::default();
         for source in sources {
             if let Ok(content) = std::fs::read_to_string(source) {
                 imported += self.import_permissions_toml(&content);
             }
         }
+        let Some(home) = home_dir(home) else {
+            return imported;
+        };
         if let Ok(content) = std::fs::read_to_string(claude_settings(&home)) {
             imported += self.import_claude_settings(&content);
         }
@@ -2206,6 +2244,37 @@ mod tests {
         }
         assert!(credential_option(&argv(&["docker", "run", "-u", "1000:1000", "img"])).is_none());
         assert!(credential_option(&argv(&["curl", "-u", "alice", "https://x"])).is_none());
+    }
+
+    /// E1-E3: jq's long module path, rg's hostname program and git's signature output are
+    /// denied; plain git log/show formats still widen.
+    #[test]
+    fn final_batch_option_denials() {
+        let c = ctx("claude", Path::new("/w"), Some("/w"));
+        let jq = Rule::new("*", "Bash", "jq *").complete(&c).expect("jq");
+        assert!(!jq.matches(&shell("jq --module-path ./mods .a d.json"), &c));
+        assert!(!jq.matches(&shell("jq --module-path=./mods .a d.json"), &c));
+        let rg = Rule::new("*", "Bash", "rg *").complete(&c).expect("rg");
+        assert!(!rg.matches(&shell("rg --hostname-bin ./evil x"), &c));
+        assert!(!rg.matches(&shell("rg --hostname-bin=./evil x"), &c));
+        let git = Rule::new("*", "Bash", "git *").complete(&c).expect("git");
+        for refused in [
+            "git log --show-signature",
+            "git show --show-signature HEAD",
+            "git log --format=%G?",
+            "git log --pretty=format:%GS",
+            "git log --pretty=tformat:%h%GK",
+            "git log --format %G?",
+        ] {
+            assert!(!git.matches(&shell(refused), &c), "{refused}");
+        }
+        for ok in [
+            "git log --format=%h",
+            "git log --pretty=oneline",
+            "git show --pretty=format:%an HEAD",
+        ] {
+            assert!(git.matches(&shell(ok), &c), "{ok}");
+        }
     }
 
     /// C2 (and A3): these never get "Always allow"; their exact command can still be allowed
