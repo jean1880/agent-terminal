@@ -870,6 +870,13 @@ fn agent_launch_with(
     })
 }
 
+/// The mode a thread's session starts in: the user's own choice in the thread first (a carried
+/// mode is recorded as one, see `create_chat_thread`), else the mode its history last ran in,
+/// else the profile's default, else Ask.
+fn start_mode(chosen: Option<Mode>, replayed: Option<Mode>, profile_default: Option<Mode>) -> Mode {
+    chosen.or(replayed).or(profile_default).unwrap_or_default()
+}
+
 /// Why `driver` cannot be started in `state`, as the thread says it.
 fn not_ready_reason(driver: Driver, state: &Availability) -> String {
     let why = match state {
@@ -2745,10 +2752,7 @@ impl AgentTerminalWindow {
             .find(|t| &t.page == page)
             .and_then(|t| t.chat.as_ref())
             .and_then(|c| c.chosen_mode);
-        let mode = chosen
-            .or_else(|| view.replayed_mode())
-            .or(profile.default_mode)
-            .unwrap_or_default();
+        let mode = start_mode(chosen, view.replayed_mode(), profile.default_mode);
         let program = resolved
             .program
             .clone()
@@ -3530,7 +3534,14 @@ impl AgentTerminalWindow {
             format!("“{title}”")
         };
         let handoff = build_handoff(&messages, &format!("thread {thread}"));
-        self.new_chat_thread(Some(driver), dir, None);
+        // The fork keeps the source's mode and model rather than the profile's defaults.
+        let session = self.slot_of(thread).and_then(|s| s.get());
+        self.create_chat_thread(NewThread {
+            dir,
+            model: session.as_ref().and_then(|s| s.selected_model()),
+            mode: session.as_ref().map(|s| s.wanted_mode()),
+            ..NewThread::new(driver)
+        });
         // The new thread is the one just selected; it is built later, so the handoff waits.
         let page = self
             .tab_view
@@ -4605,6 +4616,20 @@ pub(super) mod tests {
         };
         assert_eq!(codex.status().driver, Driver::Codex);
         assert!(codex.status().capabilities.live_approvals);
+    }
+
+    #[test]
+    fn a_thread_starts_in_the_chosen_mode_before_any_default() {
+        use Mode::{AcceptEdits, Ask, Plan};
+        assert_eq!(start_mode(Some(Ask), Some(Plan), Some(AcceptEdits)), Ask);
+        assert_eq!(start_mode(None, Some(Plan), Some(AcceptEdits)), Plan);
+        assert_eq!(start_mode(None, None, Some(AcceptEdits)), AcceptEdits);
+        assert_eq!(start_mode(None, None, None), Ask);
+        // A mode carried to a new thread (fork, continue) is stored as the user's choice, so it
+        // beats the profile's default on the new thread's first start.
+        let carried = [Envelope::new(Event::ModeChosen { mode: Ask })];
+        let chosen = crate::chat::session::chosen_mode(carried.iter());
+        assert_eq!(start_mode(chosen, None, Some(Plan)), Ask);
     }
 
     #[test]
