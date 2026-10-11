@@ -837,7 +837,13 @@ impl ServerInner {
             Scope::Session
         };
         let rule = match crate::always_allow::decide(pending.action.as_ref(), custom, scope, &ctx) {
-            Ok(rule) => rule,
+            Ok(rule) => {
+                let warnings = rule.warnings(scope, Some(&ctx));
+                if let Some(text) = crate::always_allow::kept_with_warnings(&rule, &warnings) {
+                    self.emit(Envelope::new(Event::Notice { text }));
+                }
+                rule
+            }
             Err(why) => {
                 self.emit(Envelope::new(Event::Notice {
                     text: format!("Allowed once; no rule was kept: {why}."),
@@ -1098,6 +1104,21 @@ pub(crate) fn path_auto_matchable(target: &Path, workspace: &Path, home: Option<
     contained(target, workspace) && !sensitive_target(target, workspace, home)
 }
 
+/// Whether a session read pattern may read `target` unasked: inside `workspace` ([`contained`]:
+/// no `..`, no symlink), not named like a secret ([`agent_kit::git::is_secret_path`]), not in a
+/// `.git` directory (its config can carry credentials in remote URLs), and not a top-level
+/// dotfile or dot-directory of `home`. Unlike an edit, reading an agent instruction file or a
+/// tool config runs nothing, so [`sensitive_target`]'s list does not apply.
+pub(crate) fn read_auto_matchable(target: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+    contained(target, workspace)
+        && !agent_kit::git::is_secret_path(target)
+        && !names(target).iter().any(|n| n == ".git")
+        && !home
+            .and_then(|home| relative_to(target, home))
+            .and_then(|rel| names(&rel).into_iter().next())
+            .is_some_and(|first| first.starts_with('.'))
+}
+
 /// `path` with symlinks resolved in its longest existing ancestor: how path rules are compared.
 pub(crate) fn canonical_target(path: &Path) -> PathBuf {
     resolve(path)
@@ -1118,15 +1139,42 @@ fn rule_options(
     if let (Some(action), Some(ctx)) = (action, ctx) {
         if crate::always_allow::offerable(action, ctx) {
             options.push(Decision::AllowForSession);
-            if always && crate::always_allow::always_offerable(action) {
+            let always = always && crate::always_allow::always_offerable(action);
+            if always {
                 options.push(Decision::AllowAlways);
-                remembers = Some(remembers_text(action, ctx));
             }
+            remembers = card_note(action, ctx, true, always);
         }
     }
     options.push(Decision::Deny);
     options.push(Decision::Cancel);
     (options, remembers)
+}
+
+/// What an approval card says under its buttons (its `remembers`, shown as is): what "Allow for
+/// session" keeps when that is wider than this call (a read's session pattern, only when this
+/// call itself is one it covers, as [`crate::always_allow::decide`] judges), and what "Always
+/// allow" saves. `None` when there is nothing to say.
+pub(crate) fn card_note(
+    action: &crate::always_allow::Action,
+    ctx: &crate::always_allow::Context,
+    session: bool,
+    always: bool,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(head) = crate::always_allow::session_widening(action, ctx).filter(|_| session) {
+        lines.push(format!(
+            "“Allow for session” allows `{} …` in this workspace",
+            head.join(" ")
+        ));
+    }
+    if always {
+        lines.push(format!(
+            "“Always allow” saves: {}",
+            remembers_text(action, ctx)
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// What an approval card says "Always allow" keeps for `action`.
@@ -1820,7 +1868,7 @@ mod tests {
             // The card says exactly what would be kept.
             assert!(
                 matches!(&seen.borrow()[1].event, Event::ApprovalRequested { remembers: Some(r), .. }
-                if r.starts_with("`ls -la` in "))
+                if r.contains("“Always allow” saves: `ls -la` in "))
             );
             assert!(handle.respond("q1", Decision::AllowAlways));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
@@ -1897,7 +1945,7 @@ mod tests {
             assert!(rules.add(
                 crate::always_allow::Rule::new("*", "run_command", "git status*").expect("rule")
             ));
-            // A runner's pattern (as an old or hand-edited file could hold) never widens (C1).
+            // A runner's pattern the user kept holds as written.
             assert!(rules.add(
                 crate::always_allow::Rule::new("*", "run_command", "cargo test*").expect("rule")
             ));
@@ -1917,14 +1965,20 @@ mod tests {
                 "no approval requested card for auto-approved pattern"
             );
 
-            // The runner's pattern does not cover a longer command: it asks.
+            // The runner's pattern covers a longer command, as written.
             let rx2 = client(
                 handle.socket_path().to_owned(),
                 with_id(cmd("cargo test --workspace"), "p2"),
             );
+            assert_eq!(wait_reply(ctx, &rx2).decision, Decision::Allow);
+            // A command no rule names still asks.
+            let rx3 = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("make install"), "p3"),
+            );
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
-            assert!(handle.respond("p2", Decision::Deny));
-            assert_eq!(wait_reply(ctx, &rx2).decision, Decision::Deny);
+            assert!(handle.respond("p3", Decision::Deny));
+            assert_eq!(wait_reply(ctx, &rx3).decision, Decision::Deny);
         });
     }
 
@@ -1986,14 +2040,14 @@ mod tests {
             let rx = client(path.clone(), with_id(cmd("git status --short"), "q2"));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
             assert_eq!(seen.borrow().len(), 1, "no second card");
-            // A longer variant of it is not: exact match only.
+            // A read keeps its program for the session (`git status …`), so a variant is allowed
+            // too.
             let rx = client(path.clone(), with_id(cmd("git status --short -b"), "q2b"));
-            assert!(pump_until(ctx, 10, || seen.borrow().len() == 2));
-            assert!(handle.respond("q2b", Decision::Deny));
-            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+            assert_eq!(seen.borrow().len(), 1, "no card for the variant");
             // A different command still asks.
             let rx = client(path.clone(), with_id(cmd("git push"), "q3"));
-            assert!(pump_until(ctx, 10, || seen.borrow().len() == 3));
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == 2));
             // Stop turn reaches agy as a deny (the session then interrupts the turn).
             assert!(handle.respond("q3", Decision::Cancel));
             let stopped = wait_reply(ctx, &rx);
@@ -2226,11 +2280,10 @@ mod tests {
         });
     }
 
-    /// R1 and S2: a runner is never kept by "Always allow", even through the dialog's pattern or
-    /// a direct answer the card never offered; for the session it is kept as the exact command
-    /// only, never as a pattern.
+    /// R1 and S2 as the user decides them: a runner can be kept by "Always allow" and by a typed
+    /// session pattern, exactly as written, with a notice saying it runs code.
     #[test]
-    fn runners_are_never_kept_always_and_only_exactly_for_the_session() {
+    fn runners_are_kept_as_the_user_types_them_with_a_warning() {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
             let rules = tmp.path().join("always.json");
@@ -2256,37 +2309,38 @@ mod tests {
                     .expect("card")
             };
 
+            let auto = |id: &str, line: &str| {
+                let rx = client(handle.socket_path().to_owned(), with_id(cmd(line), id));
+                wait_reply(ctx, &rx).decision
+            };
+
+            // "Always allow" is offered for a runner, and the user's `cargo test *` is kept as
+            // typed, saved, and said with a warning.
             let rx = ask("a1", "cargo test --bin foo");
-            assert!(!card_options("a1").contains(&Decision::AllowAlways));
+            assert!(card_options("a1").contains(&Decision::AllowAlways));
             let typed =
                 crate::always_allow::Rule::new("*", "run_command", "cargo test*").expect("rule");
             assert!(handle.respond_with_rule("a1", Decision::AllowAlways, Some(typed)));
-            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow, "downgraded");
-            assert!(!rules.exists(), "nothing saved");
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
+            assert!(pump_until(ctx, 10, || rules.exists()), "saved");
+            assert!(seen.borrow().iter().any(|e| matches!(&e.event,
+                Event::Notice { text } if text.contains("Kept as you chose") && text.contains("runs code"))));
+            assert_eq!(
+                auto("a2", "cargo test --lib"),
+                Decision::Allow,
+                "as written"
+            );
 
-            let rx = ask("a2", "cargo test --bin foo");
+            // The user's session pattern `cargo *` is kept as typed too.
+            let rx = ask("a3", "cargo clippy");
             let loose =
                 crate::always_allow::Rule::new("*", "run_command", "cargo *").expect("rule");
-            assert!(handle.respond_with_rule("a2", Decision::AllowForSession, Some(loose)));
-            assert_eq!(
-                wait_reply(ctx, &rx).decision,
-                Decision::Allow,
-                "no pattern kept"
-            );
-
-            let rx = ask("a3", "cargo test --bin foo");
-            assert!(handle.respond("a3", Decision::AllowForSession));
+            assert!(handle.respond_with_rule("a3", Decision::AllowForSession, Some(loose)));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowForSession);
-            let rx = client(
-                handle.socket_path().to_owned(),
-                with_id(cmd("cargo test --bin foo"), "a4"),
-            );
-            assert_eq!(
-                wait_reply(ctx, &rx).decision,
-                Decision::Allow,
-                "exact repeat"
-            );
-            let rx = ask("a5", "cargo clippy");
+            assert_eq!(auto("a4", "cargo build"), Decision::Allow, "as written");
+
+            // Something no rule covers still asks.
+            let rx = ask("a5", "make install");
             assert!(handle.respond("a5", Decision::Deny));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
         });

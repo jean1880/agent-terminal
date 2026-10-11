@@ -131,9 +131,10 @@ pub enum Event {
         reason: Option<String>,
         options: Vec<Decision>,
         response: ResponseCapability,
-        /// When "Always allow" is offered: exactly what it would save, in the agent's own terms
-        /// (Claude: `Bash(git status:*)`; agy: the command line and its folder), so the user can
-        /// judge how broad it is before choosing it.
+        /// The card's note on its remembering buttons, shown as written: what "Allow for
+        /// session" keeps when it is wider than this call, and what "Always allow" would save
+        /// (the command line and its folder, a path, an MCP tool), so the user can judge how
+        /// broad each is before choosing it. Set by the app's gate; `None` from the adapters.
         #[serde(default)]
         remembers: Option<String>,
     },

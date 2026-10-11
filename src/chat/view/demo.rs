@@ -1129,7 +1129,7 @@ fn script() -> Vec<Step> {
                 Decision::Cancel,
             ],
             response: ResponseCapability::Live,
-            remembers: Some("`cargo clean` in ~/git/agent-terminal".into()),
+            remembers: Some("“Always allow” saves: `cargo clean` in ~/git/agent-terminal".into()),
         })
         .request("ap2"),
     ));

@@ -334,7 +334,7 @@ pub struct Approval {
     pub reason: Option<String>,
     pub options: Vec<Decision>,
     pub state: ApprovalState,
-    /// What "Always allow" would save, shown on the card.
+    /// What "Allow for session" and "Always allow" keep, shown on the card as written.
     pub remembers: Option<String>,
 }
 

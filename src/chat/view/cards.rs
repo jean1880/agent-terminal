@@ -2204,13 +2204,17 @@ impl ApprovalCard {
         self.outcome.set_visible(!outcome.is_empty());
         self.buttons.set_sensitive(sensitive);
         self.buttons.set_visible(show_buttons);
-        // While the choice is open, say exactly what "Always allow" would keep.
-        match a.remembers.as_deref().filter(|_| {
-            a.state == ApprovalState::Pending && a.options.contains(&Decision::AllowAlways)
-        }) {
+        // While the choice is open, say what the remembering buttons keep: the gate wrote it
+        // (`approval_server::card_note`), judged where the call runs.
+        let remembering = a.options.contains(&Decision::AllowForSession)
+            || a.options.contains(&Decision::AllowAlways);
+        match a
+            .remembers
+            .as_deref()
+            .filter(|_| a.state == ApprovalState::Pending && remembering)
+        {
             Some(text) => {
-                self.remembers
-                    .set_text(&format!("“Always allow” saves: {text}"));
+                self.remembers.set_text(text);
                 self.remembers.set_visible(true);
             }
             None => self.remembers.set_visible(false),
@@ -3201,18 +3205,18 @@ pub(crate) mod tests {
         assert!(!entry.has_css_class("error"));
         entry.set_text("");
         assert_eq!(enabled(&dialog), (true, true), "empty means the prefill");
-        // A4: validated for the dialog's own scope. A runner's exact command can be saved for
-        // the session but not always; its pattern not at all.
+        // A4: only what no rule can hold is refused inline. A runner's command and its pattern
+        // are the user's to keep, for the session or for good.
         entry.set_text("cargo test");
-        assert_eq!(enabled(&dialog), (false, true));
-        assert!(entry.has_css_class("error"));
+        assert_eq!(enabled(&dialog), (true, true));
+        assert!(!entry.has_css_class("error"));
         entry.set_text("cargo test *");
-        assert_eq!(enabled(&dialog), (false, false));
+        assert_eq!(enabled(&dialog), (true, true));
 
         use crate::always_allow::Scope::{Always, Session};
         assert!(pattern_error("command_execution", "git status *", "", Always).is_none());
         assert!(pattern_error("command_execution", "cargo test", "", Session).is_none());
-        assert!(pattern_error("command_execution", "cargo test", "", Always).is_some());
+        assert!(pattern_error("command_execution", "cargo test", "", Always).is_none());
         assert!(pattern_error("write_to_file", "*.rs", "", Session).is_some());
         assert!(pattern_error("call_mcp_tool", "fs/read", "", Always).is_none());
         assert!(pattern_error("WebFetch", "x", "", Session).is_some());
@@ -3383,10 +3387,14 @@ pub(crate) mod tests {
 
     #[test]
     fn approval_suggestions_for_shell_and_mcp() {
-        // A runner: only its exact command (C1: a pattern never widens it).
+        // A runner gets the same choices as any command: the user decides (a warning says what
+        // a pattern for it allows when it is kept).
         let s = build_approval_suggestions("run_command", "cargo test --workspace");
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].pattern, "cargo test --workspace");
+        let patterns: Vec<&str> = s.iter().map(|s| s.pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            ["cargo test --workspace", "cargo test *", "cargo *"]
+        );
         assert_eq!(s[0].description.as_deref(), Some("Exact command"));
 
         // A read-only git command widens.
@@ -3400,14 +3408,15 @@ pub(crate) mod tests {
         );
         assert_eq!(s[2].pattern, "git *");
 
-        // Single-word commands: an allowlisted one widens, any other is exact only.
+        // Single-word commands: exact, then the program with any arguments, whatever it is.
         let s = build_approval_suggestions("bash", "ls");
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].pattern, "ls");
         assert_eq!(s[1].pattern, "ls *");
         let s = build_approval_suggestions("bash", "htop");
-        assert_eq!(s.len(), 1);
+        assert_eq!(s.len(), 2);
         assert_eq!(s[0].pattern, "htop");
+        assert_eq!(s[1].pattern, "htop *");
 
         // MCP tool
         let s = build_approval_suggestions("call_mcp_tool", "ansible/deploy_apply");
@@ -3420,11 +3429,13 @@ pub(crate) mod tests {
             Some("Permit all tools on 'ansible'")
         );
 
-        // Deduplication when the pattern already has its wildcard; a runner's has none to offer.
+        // Deduplication when the pattern already has its wildcard, a runner's included.
         let s = build_approval_suggestions("run_command", "rg *");
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].pattern, "rg *");
-        assert!(build_approval_suggestions("run_command", "cargo *").is_empty());
+        let s = build_approval_suggestions("run_command", "cargo *");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].pattern, "cargo *");
 
         // Empty pattern
         let s = build_approval_suggestions("run_command", "");

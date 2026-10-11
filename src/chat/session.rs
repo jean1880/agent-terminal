@@ -1453,10 +1453,14 @@ impl Inner {
             Decision::AllowAlways => always,
             _ => true,
         });
-        *remembers = action
-            .as_ref()
-            .filter(|_| options.contains(&Decision::AllowAlways))
-            .map(|a| crate::approval_server::remembers_text(a, &ctx));
+        *remembers = action.as_ref().and_then(|a| {
+            crate::approval_server::card_note(
+                a,
+                &ctx,
+                options.contains(&Decision::AllowForSession),
+                options.contains(&Decision::AllowAlways),
+            )
+        });
         // R5: a Codex request with a field a plain call does not carry (an escalation) is never
         // answered by the app, by a rule or by Accept edits.
         let plain = driver != Driver::Codex || Self::codex_plain_request(tool, input);
@@ -1550,14 +1554,15 @@ impl Inner {
     }
 
     /// The rule "Allow for session" / "Always allow" would keep for a Claude or Codex call,
-    /// judged afresh by [`crate::always_allow::decide`] (the card's buttons are not trusted). Pure:
+    /// judged afresh by [`crate::always_allow::decide`] (the card's buttons are not trusted), with
+    /// what the user should know about it ([`crate::always_allow::Rule::warnings`]). Pure:
     /// nothing is kept until the agent has taken the answer ([`Self::keep_rule`]).
     fn plan_rule(
         &self,
         pending: Option<&(crate::always_allow::Action, Option<String>)>,
         decision: Decision,
         custom: Option<crate::always_allow::Rule>,
-    ) -> Result<crate::always_allow::Rule, String> {
+    ) -> Result<(crate::always_allow::Rule, Vec<String>), String> {
         let driver = self.adapter.borrow().driver();
         let workspace = PathBuf::from(self.open.borrow().cwd.clone());
         let home = Self::home();
@@ -1572,7 +1577,10 @@ impl Inner {
         } else {
             crate::always_allow::Scope::Session
         };
-        crate::always_allow::decide(pending.map(|(a, _)| a), custom, scope, &ctx)
+        crate::always_allow::decide(pending.map(|(a, _)| a), custom, scope, &ctx).map(|rule| {
+            let warnings = rule.warnings(scope, Some(&ctx));
+            (rule, warnings)
+        })
     }
 
     /// Keeps `rule`: for the session at once, and for an Always answer also in the rules file,
@@ -2167,7 +2175,12 @@ impl Inner {
             return;
         }
         match plan {
-            Some(Ok(rule)) => self.keep_rule(rule, decision),
+            Some(Ok((rule, warnings))) => {
+                if let Some(text) = crate::always_allow::kept_with_warnings(&rule, &warnings) {
+                    self.emit(Envelope::new(Event::Notice { text }));
+                }
+                self.keep_rule(rule, decision);
+            }
             Some(Err(why)) => self.emit(Envelope::new(Event::Notice {
                 text: format!("Allowed once; no rule was kept: {why}."),
             })),
@@ -5988,6 +6001,73 @@ mod tests {
         });
     }
 
+    /// The 2026-10-11 Codex thread: "Allow for session" on `cat <repo>/AGENTS.md` asked again for
+    /// `cat AGENTS.md`. A read now keeps `cat …` for the workspace: the next `cat` of another
+    /// file, from a sub-folder, is answered; one outside the workspace still asks.
+    #[test]
+    fn codex_allow_for_session_on_a_read_covers_the_next_read_of_that_program() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+            std::fs::create_dir_all(ws.join("src")).expect("src");
+            let root = ws.to_string_lossy().into_owned();
+            let (session, seen) =
+                recording(ctx, &ws, Box::new(agent_core::codex::CodexAdapter::new()));
+            let ask = |id: u64, item: &str, command: String, cwd: &str| {
+                serde_json::json!({"id": id, "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "th", "turnId": "tu", "itemId": item,
+                    "command": command, "cwd": cwd,
+                    "availableDecisions": ["accept", "decline", "cancel"]}})
+                .to_string()
+            };
+            let request_of = |item: &str| {
+                seen.borrow()
+                    .iter()
+                    .find(|e| {
+                        e.item.as_deref() == Some(item)
+                            && matches!(e.event, Event::ApprovalRequested { .. })
+                    })
+                    .and_then(|e| e.request.clone())
+                    .expect("card")
+            };
+            feed(
+                &session,
+                &ask(
+                    0,
+                    "a",
+                    format!("/usr/bin/zsh -lc 'cat {root}/AGENTS.md'"),
+                    &root,
+                ),
+            );
+            let first = request_of("a");
+            session.respond_approval(&first, Decision::AllowForSession);
+            assert_eq!(resolution(&seen, &first), Some(Decision::AllowForSession));
+
+            let src = format!("{root}/src");
+            feed(
+                &session,
+                &ask(1, "b", "/usr/bin/zsh -lc 'cat lib.rs'".into(), &src),
+            );
+            feed(
+                &session,
+                &ask(2, "c", "/usr/bin/zsh -lc 'cat /etc/hosts'".into(), &root),
+            );
+            feed(
+                &session,
+                &ask(3, "d", "/usr/bin/zsh -lc 'head lib.rs'".into(), &src),
+            );
+            let (next, outside, other) = (request_of("b"), request_of("c"), request_of("d"));
+            assert!(pump_until(ctx, 10, || resolution(&seen, &next).is_some()));
+            assert_eq!(resolution(&seen, &next), Some(Decision::Allow));
+            assert_eq!(
+                resolution(&seen, &outside),
+                None,
+                "outside the workspace asks"
+            );
+            assert_eq!(resolution(&seen, &other), None, "another program asks");
+        });
+    }
+
     const W0_CODEX_ACCEPT_EDITS: &str =
         include_str!("../../tests/fixtures/real/codex/untrusted-workspacewrite.jsonl");
 
@@ -6086,12 +6166,13 @@ mod tests {
                 &session,
                 &claude_tool("m3", "mcp__fs__delete", serde_json::json!({})),
             );
-            // Outside the workspace: neither Session nor Always.
+            // Outside the workspace: offered all the same, the user's to choose (kept with a
+            // warning), and not answered by any rule yet.
             let outside = serde_json::json!({"file_path": "/etc/hosts", "old_string": "a", "new_string": "b"});
             feed(&session, &claude_tool("e2", "Edit", outside));
             let e2 = offered(&seen, "e2");
             assert!(
-                !e2.contains(&Decision::AllowAlways) && !e2.contains(&Decision::AllowForSession),
+                e2.contains(&Decision::AllowAlways) && e2.contains(&Decision::AllowForSession),
                 "{e2:?}"
             );
             pump_until(ctx, 1, || false);

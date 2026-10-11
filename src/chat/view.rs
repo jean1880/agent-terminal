@@ -3434,7 +3434,7 @@ pub(crate) mod tests {
                 reason: None,
                 options: vec![Decision::Allow, Decision::AllowAlways, Decision::Deny],
                 response: ResponseCapability::Live,
-                remembers: Some("Bash(rm -rf build) in this project".into()),
+                remembers: Some("“Always allow” saves: Bash(rm -rf build) in this project".into()),
             })
             .request("r2"),
         );

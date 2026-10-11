@@ -343,6 +343,66 @@ fn prefix_extends(argv: &[String]) -> bool {
     }
 }
 
+/// Options that make a search read past what its words name and past its own default skips:
+/// grep's recursion (it skips nothing: `.env`, `.git`, and with `-R` links out), and rg's
+/// hidden, ignored and symlinked files. A call with one is never covered by a session read
+/// pattern ([`Context::args_contained`]).
+fn unrestricted_traversal(argv: &[String]) -> bool {
+    let program = argv.first().map(|w| basename(w));
+    let words = argv.iter().skip(1).map(String::as_str);
+    let cluster_has = |w: &str, letters: &[char]| {
+        w.strip_prefix('-')
+            .filter(|s| !s.starts_with('-'))
+            .is_some_and(|s| s.chars().any(|c| letters.contains(&c)))
+    };
+    match program {
+        // `-d`/`--directories` in any form: its value may be the next word (`-d recurse`).
+        Some("grep") => words.into_iter().any(|w| {
+            matches!(w, "--recursive" | "--dereference-recursive")
+                || w.starts_with("--directories")
+                || cluster_has(w, &['r', 'R', 'd'])
+        }),
+        Some("rg") => words.into_iter().any(|w| {
+            w.starts_with("--hidden")
+                || w.starts_with("--no-ignore")
+                || w == "--follow"
+                || w == "--unrestricted"
+                || cluster_has(w, &['u', 'L', '.'])
+        }),
+        _ => false,
+    }
+}
+
+/// The pattern a plain "Allow for session" keeps for a read-only command [`prefix_extends`]
+/// allows: its program (`cat`), or `git` and its subcommand (`git diff`), as a prefix. Such a
+/// rule holds anywhere in the workspace, but only for a call whose working directory and every
+/// argument pass the containment check ([`Context::args_contained`]). `None` for any other
+/// command, which is kept exactly.
+pub fn session_pattern(argv: &[String]) -> Option<Vec<String>> {
+    if !prefix_extends(argv) || exec_option(argv).is_some() || argv_has_secret(argv) {
+        return None;
+    }
+    let head = if basename(&argv[0]) == "git" { 2 } else { 1 };
+    Some(argv[..head].to_vec())
+}
+
+/// The session read pattern a plain "Allow for session" keeps for `action` in `ctx`
+/// ([`session_pattern`]), or `None` when it keeps the exact call: only a read-only command with
+/// no secret whose own folder and paths stay in the workspace ([`Context::args_contained`]), so
+/// the call that made it is one it covers. What [`decide`] widens and the card says, from one
+/// place.
+pub fn session_widening(action: &Action, ctx: &Context) -> Option<Vec<String>> {
+    let Action::Shell { command } = action else {
+        return None;
+    };
+    if has_secret(command) {
+        return None;
+    }
+    let argv = command_tokens(command)?;
+    let head = session_pattern(&argv)?;
+    ctx.args_contained(&argv).then_some(head)
+}
+
 /// Whether a `*` pattern made of `argv` can widen at all: an allowlisted program, `git` alone, or
 /// git with an allowlisted subcommand.
 fn prefix_pattern_allowed(argv: &[String]) -> bool {
@@ -451,8 +511,9 @@ fn has_option_checks(program: &str) -> bool {
 /// options this can see: the widening of `git log`/`diff`/`show` relies on the configuration
 /// being out of the agent's reach. Every such program is defined in `.git/config` or the home
 /// dotfiles (`~/.gitconfig`, `~/.config/git`; a `.gitattributes` file only selects a driver
-/// defined there), and those are sensitive edit targets that never auto-match
-/// ([`crate::approval_server::path_auto_matchable`]).
+/// defined there), and those are sensitive edit targets
+/// ([`crate::approval_server::path_auto_matchable`]): only a rule the user chose, warned that
+/// the file is sensitive, lets an edit of one through unasked.
 pub fn exec_option(argv: &[String]) -> Option<&str> {
     let program = basename(argv.first()?);
     if program == "git" {
@@ -727,13 +788,17 @@ pub struct Context<'a> {
 }
 
 /// One request, prepared once for matching against many rules: canonical keys, the argv a
-/// command matches by (`None` when it can never match), the canonical path of a file call that
-/// passes the containment check (`None` otherwise).
+/// command matches by (`None` when it is not a simple command), the canonical path of a file
+/// call (`None` when it cannot be made absolute).
 struct Probe {
     workspace_key: String,
     cwd_key: Option<String>,
     argv: Option<Vec<String>>,
     path: Option<PathBuf>,
+    /// The command carries no secret and no exec-capable option, and its working directory and
+    /// every argument pass the containment check ([`Context::args_contained`]); what a session
+    /// read pattern needs to match.
+    args_contained: bool,
 }
 
 impl Context<'_> {
@@ -756,16 +821,77 @@ impl Context<'_> {
         crate::approval_server::path_auto_matchable(path, self.workspace, self.home)
     }
 
-    fn probe(&self, action: &Action) -> Probe {
-        let argv = match action {
-            Action::Shell { command } if !has_secret(command) => command_tokens(command)
-                .filter(|argv| !argv_has_secret(argv) && exec_option(argv).is_none()),
-            _ => None,
+    /// Whether a read command stays in the workspace, as far as its words say: its working
+    /// directory and every path it names pass [`crate::approval_server::read_auto_matchable`]
+    /// (inside, no `..`, no symlink, not a secret, not under `.git`, not a home dotfile). A path
+    /// is a plain argument, the value of `--opt=value`, the rest of a short option cluster
+    /// (`-f.env`), and the path part of a git `<rev>:<path>` (no hidden part at all there).
+    /// Fails closed on what the shell would expand (`~…`) and on [`unrestricted_traversal`].
+    ///
+    /// Ceiling: what a program selects by itself is not a word here. `rg` on a folder reads the
+    /// files it finds (it skips hidden and git-ignored ones by default), and `git diff`/`show`/
+    /// `log -p` print the files git tracks.
+    fn args_contained(&self, argv: &[String]) -> bool {
+        let Some(cwd) = self.cwd else {
+            return false;
         };
+        let readable = |word: &str| {
+            !word.starts_with('~')
+                && self.absolute(word).is_some_and(|p| {
+                    crate::approval_server::read_auto_matchable(&p, self.workspace, self.home)
+                })
+        };
+        // git names a file in a revision as `<rev>:<path>` (`git show HEAD:.env`).
+        let revision_path_ok = |word: &str| {
+            word.split_once(':').is_none_or(|(_, inner)| {
+                let inner = Path::new(inner);
+                !agent_kit::git::is_secret_path(inner)
+                    && !inner.components().any(|c| {
+                        c == std::path::Component::ParentDir
+                            || c.as_os_str().to_string_lossy().starts_with('.')
+                    })
+            })
+        };
+        let path_ok = |word: &str| word.is_empty() || (revision_path_ok(word) && readable(word));
+        readable(cwd)
+            && !unrestricted_traversal(argv)
+            && argv.iter().skip(1).all(|arg| {
+                if let Some(long) = arg.strip_prefix("--") {
+                    !arg.contains('~') && long.split_once('=').is_none_or(|(_, v)| path_ok(v))
+                } else if let Some(short) = arg.strip_prefix('-') {
+                    // Any letter may take the rest as its value (`-f.env`, `-if.env`,
+                    // `-fcredentials`): every tail is judged as a path, which letters (`-la`) and
+                    // numbers pass.
+                    !arg.contains('/')
+                        && !arg.contains('~')
+                        && short
+                            .char_indices()
+                            .skip(1)
+                            .all(|(i, _)| path_ok(&short[i..]))
+                } else {
+                    path_ok(arg)
+                }
+            })
+    }
+
+    fn probe(&self, action: &Action) -> Probe {
+        let (argv, plain) = match action {
+            Action::Shell { command } => {
+                let argv = command_tokens(command);
+                let plain = !has_secret(command)
+                    && argv
+                        .as_ref()
+                        .is_some_and(|a| !argv_has_secret(a) && exec_option(a).is_none());
+                (argv, plain)
+            }
+            _ => (None, false),
+        };
+        // The app's own session read pattern is the only rule that judges the call: a plain
+        // read that stays in the workspace. A user's rule matches as written.
+        let args_contained = plain && argv.as_ref().is_some_and(|argv| self.args_contained(argv));
         let path = match action {
             Action::Edit { path } | Action::Read { path } => self
                 .absolute(path)
-                .filter(|full| self.path_ok(full))
                 .map(|full| crate::approval_server::canonical_target(&full)),
             _ => None,
         };
@@ -774,6 +900,7 @@ impl Context<'_> {
             cwd_key: self.cwd.map(canonical_or_raw),
             argv,
             path,
+            args_contained,
         }
     }
 }
@@ -888,8 +1015,8 @@ impl Rule {
         })
     }
 
-    /// The rule a plain "Allow for session" or "Always allow" makes for `action`: exactly this
-    /// call (argv, path or MCP tool) here. Refused when the action carries a secret, a command is
+    /// The rule a plain "Always allow" makes for `action`, and "Allow for session" before
+    /// [`Self::widen_read`]: exactly this call (argv, path or MCP tool) here. Refused when the action carries a secret, a command is
     /// not a simple one, or a path is outside the workspace or sensitive. What may be kept for a
     /// scope is [`Self::check`]'s.
     pub fn from_action(action: &Action, ctx: &Context) -> Result<Self, String> {
@@ -908,10 +1035,18 @@ impl Rule {
                 )
             }
             Action::Edit { path } | Action::Read { path } => {
+                // Kept wherever it is: a path outside the workspace or sensitive is a warning
+                // ([`Self::warnings`]), the user's to accept.
                 let full = ctx
                     .absolute(path)
-                    .filter(|p| ctx.path_ok(p))
-                    .ok_or("the file is outside the workspace or sensitive")?;
+                    .ok_or("the file's folder is not known, so the path cannot be resolved")?;
+                // As a typed path rule: `..` names no one file a rule could hold.
+                if full
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err("the path has `..` in it".to_owned());
+                }
                 (
                     Target::Path {
                         path: crate::approval_server::canonical_target(&full)
@@ -938,10 +1073,31 @@ impl Rule {
         })
     }
 
+    /// An exact workspace command rule for a read-only command, made the session read pattern
+    /// ([`session_pattern`]): `cat *` in any folder of the workspace. Anything else is unchanged.
+    fn widen_read(mut self) -> Self {
+        if let Target::Argv {
+            argv,
+            prefix: false,
+        } = &self.target
+        {
+            // With no working directory known, nothing could match it: the exact rule's `check`
+            // refuses it as before.
+            let tied = self.workspace != "*" && self.cwd.is_some();
+            if let Some(head) = session_pattern(argv).filter(|_| tied) {
+                self.target = Target::Argv {
+                    argv: head,
+                    prefix: true,
+                };
+                self.cwd = None;
+            }
+        }
+        self
+    }
+
     /// A user's rule ([`Self::new`]) made concrete for the request it answers: the thread's
     /// canonical workspace (unless global), the request's canonical working directory for a shell
-    /// rule, a canonical path (which must pass the containment check), and the agent it is
-    /// created on.
+    /// rule, a canonical path (wherever it is), and the agent it is created on.
     pub fn complete(mut self, ctx: &Context) -> Result<Self, String> {
         self.origin = ctx.driver.to_owned();
         if self.workspace != "*" {
@@ -951,10 +1107,8 @@ impl Rule {
             }
         }
         if let Target::Path { path } = &mut self.target {
+            // Outside the workspace or sensitive is the user's call ([`Self::warnings`]).
             let canonical = crate::approval_server::canonical_target(Path::new(path));
-            if !ctx.path_ok(&canonical) {
-                return Err("the file is outside the workspace or sensitive".to_owned());
-            }
             *path = canonical.to_string_lossy().into_owned();
         }
         Ok(self)
@@ -972,37 +1126,61 @@ impl Rule {
         if argv.is_empty() {
             return Err("the pattern is empty".to_owned());
         }
+        // Not a judgement on the command: a rule is kept in memory and in the rules file, and a
+        // secret is never written there.
         if argv_has_secret(argv) {
-            return Err("it contains a secret".to_owned());
+            return Err("it contains a secret, which a rule would store".to_owned());
         }
-        if let Some(option) = exec_option(argv) {
-            return Err(format!("`{option}` can make {} run other code", argv[0]));
-        }
-        if self.workspace != "*" && self.cwd.is_none() {
+        // A session read pattern ([`session_pattern`]) is the one workspace rule with no working
+        // directory: it matches only calls that stay in the workspace.
+        let roams = *prefix && scope == Scope::Session && prefix_pattern_allowed(argv);
+        if self.workspace != "*" && self.cwd.is_none() && !roams {
             return Err("the command's working directory is not known".to_owned());
         }
-        if *prefix && !prefix_pattern_allowed(argv) {
-            return Err(format!(
-                "a final * only widens read-only commands (ls, cat, grep, rg, find, git \
-                 status/log/diff …), not {}; remove the * to keep the exact command",
-                argv[0]
-            ));
-        }
-        let keepable = rememberable_argv(argv);
-        match scope {
-            Scope::Always if !keepable => Err(format!(
-                "\"Always allow\" never keeps {} (a build runner, interpreter, wrapper or a git \
-                 command that runs configured programs); allow it for this session instead",
-                argv[0]
-            )),
-            // A session pattern widens only what the read-only allowlist names (checked above).
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
-    /// Whether this rule allows `action` in `ctx`. Fails closed: a command that is not a simple
-    /// one, a secret, an exec-capable option, a working-directory mismatch, or a path outside the
-    /// workspace is no match.
+    /// What the user should know about keeping this rule for `scope`, said when it is kept; never
+    /// a reason to refuse it (the user decides what they approve). A command: an option that can
+    /// make it run other code, a `*` on a program that is not a read-only one, "Always allow" on
+    /// a program that runs code. A path: one outside the workspace or sensitive (`ctx`, when
+    /// known).
+    pub fn warnings(&self, scope: Scope, ctx: Option<&Context>) -> Vec<String> {
+        let mut out = Vec::new();
+        match &self.target {
+            Target::Argv { argv, prefix } if !argv.is_empty() => {
+                let program = &argv[0];
+                if let Some(option) = exec_option(argv) {
+                    out.push(format!("`{option}` can make {program} run other code"));
+                }
+                if *prefix && !prefix_pattern_allowed(argv) {
+                    out.push(format!(
+                        "`{} *` allows {program} with any arguments, not only reads",
+                        argv_text(argv)
+                    ));
+                }
+                if scope == Scope::Always && !rememberable_argv(argv) {
+                    out.push(format!(
+                        "{program} runs code (a build runner, interpreter, wrapper or a git \
+                         command that runs configured programs), now without asking in every \
+                         session"
+                    ));
+                }
+            }
+            Target::Path { path } if ctx.is_some_and(|ctx| !ctx.path_ok(Path::new(path))) => {
+                out.push(format!(
+                    "{path} is outside the workspace or a sensitive file (config, hooks or \
+                     instructions that change what runs next)"
+                ));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Whether this rule allows `action` in `ctx`, as the rule says: a command that is not a
+    /// simple one or a working-directory mismatch is no match; a session read pattern also needs
+    /// the call to stay in the workspace with no secret or exec-capable option.
     pub fn matches(&self, action: &Action, ctx: &Context) -> bool {
         self.matches_probe(action, &ctx.probe(action))
     }
@@ -1026,12 +1204,14 @@ impl Rule {
                     if probe.cwd_key.as_ref() != Some(want) {
                         return false;
                     }
+                } else if self.workspace != "*" && !probe.args_contained {
+                    // A session read pattern holds in any folder of the workspace, never outside.
+                    return false;
                 }
                 if *prefix {
-                    // C1: only an allowlisted read-only command widens; any other program's
-                    // pattern (an imported one, say) matches its exact argv only.
+                    // As written: `git *` is every git command (the user's choice; warned when
+                    // kept, never narrowed here).
                     tokens.starts_with(argv)
-                        && (tokens.len() == argv.len() || prefix_extends(tokens))
                 } else {
                     tokens == argv
                 }
@@ -1095,51 +1275,50 @@ pub fn dialog_prefill(tool: &str, input: &Value, remembers: Option<&str>) -> Str
     }
 }
 
+/// The notice for a rule kept with `warnings` ([`Rule::warnings`]); `None` when there are none.
+pub fn kept_with_warnings(rule: &Rule, warnings: &[String]) -> Option<String> {
+    (!warnings.is_empty()).then(|| {
+        format!(
+            "Kept as you chose: {}. Note: {}.",
+            rule.summary(),
+            warnings.join("; ")
+        )
+    })
+}
+
 /// Whether "Allow for session" (and, with [`always_offerable`], "Always allow") may be offered
-/// for `action`: no secret, and a rule could match it at all (a simple command with no
-/// exec-capable option; a contained, non-sensitive path; a named MCP tool).
+/// for `action`: whenever a rule can describe it (a simple command, a path that can be made
+/// absolute, a named MCP tool) and would not have to store a secret. What it is does not
+/// decide: the user does, warned by [`Rule::warnings`].
 pub fn offerable(action: &Action, ctx: &Context) -> bool {
     if has_secret(&action.text()) {
         return false;
     }
     match action {
-        Action::Shell { command } => command_tokens(command)
-            .is_some_and(|argv| !argv_has_secret(&argv) && exec_option(&argv).is_none()),
-        Action::Edit { path } | Action::Read { path } => {
-            ctx.absolute(path).is_some_and(|p| ctx.path_ok(&p))
-        }
+        Action::Shell { command } => command_tokens(command).is_some_and(|a| !argv_has_secret(&a)),
+        Action::Edit { path } | Action::Read { path } => ctx.absolute(path).is_some(),
         Action::Mcp { .. } => true,
     }
 }
 
-/// Whether "Always allow" applies to `action`, once [`offerable`] holds (U2, D4):
-/// - a shell command [`rememberable_argv`] keeps, with no secret (R1: never a runner, wrapper,
-///   interpreter, path-named program, unsafe git command or exec-capable option). This is the
-///   predicate [`Rule::check`] applies when the rule is made, so the card never offers what is
-///   then refused;
-/// - an edit of one contained, non-sensitive path ([`offerable`] checked it; `..`, a symlink on
-///   the way, `.git`, workflows, agent instruction files and home dotfiles never qualify, and the
-///   path is checked again at every match);
-/// - one named MCP tool (whatever its arguments).
-///
-/// A read stays "for this session".
+/// Whether "Always allow" may be offered for `action`, once [`offerable`] holds: the same, since
+/// what is kept for good is the user's choice too ([`Rule::warnings`] says what it allows).
 pub fn always_offerable(action: &Action) -> bool {
     match action {
         Action::Shell { command } => {
-            !has_secret(command)
-                && command_tokens(command)
-                    .is_some_and(|argv| !argv_has_secret(&argv) && rememberable_argv(&argv))
+            !has_secret(command) && command_tokens(command).is_some_and(|a| !argv_has_secret(&a))
         }
-        Action::Edit { path } => !has_secret(path),
+        Action::Edit { path } | Action::Read { path } => !has_secret(path),
         Action::Mcp { .. } => true,
-        Action::Read { .. } => false,
     }
 }
 
 /// The rule "Allow for session" or "Always allow" keeps for one answered request, judged afresh
 /// whatever the card offered: the call must be one a rule can describe, the user's pattern
-/// (`custom`) or the exact call becomes the rule, and [`Rule::check`] decides what `scope` may
-/// keep. `Err` says why nothing is kept (the call is then allowed once).
+/// (`custom`) or the exact call becomes the rule (for a session, a read-only command that stays
+/// in the workspace becomes its [`session_pattern`]), and [`Rule::check`] decides what `scope`
+/// may keep. `Err` says why
+/// nothing is kept (the call is then allowed once).
 pub fn decide(
     action: Option<&Action>,
     custom: Option<Rule>,
@@ -1155,6 +1334,11 @@ pub fn decide(
     }
     let rule = match custom {
         Some(rule) => rule.complete(ctx)?,
+        // A read widens only when this call itself stays in the workspace; one run from outside
+        // it keeps its exact command, tied to its folder.
+        None if scope == Scope::Session && session_widening(action, ctx).is_some() => {
+            Rule::from_action(action, ctx)?.widen_read()
+        }
         None => Rule::from_action(action, ctx)?,
     };
     rule.check(scope)?;
@@ -1339,8 +1523,8 @@ impl AlwaysRules {
     /// 3. `~/.claude/settings.json`
     /// 4. `~/.gemini/antigravity-cli/settings.json`
     ///
-    /// Every imported rule must be one "Always allow" could keep ([`Rule::check`] with
-    /// [`Scope::Always`], C6): the rest are skipped and counted.
+    /// Every entry a rule can hold is imported as written ([`Rule::check`] with
+    /// [`Scope::Always`]: no secret, a simple command); the rest are skipped and counted.
     pub fn import_agent_permissions(
         &mut self,
         home: Option<&Path>,
@@ -1625,8 +1809,8 @@ impl AlwaysRules {
         })
     }
 
-    /// One imported entry: added when it parses and "Always allow" could keep it (C6), else
-    /// skipped (a runner, a credential, a pattern that cannot widen, or no rule at all).
+    /// One imported entry: added as the user's own configuration says when a rule can hold it,
+    /// else skipped (a credential in it, or shell syntax no rule can express).
     fn import_one(&mut self, origin: &str, tool: &str, pattern: &str) -> Imported {
         let rule = Rule::parse("*", tool, pattern).and_then(|mut rule| {
             rule.origin = origin.to_owned();
@@ -1718,7 +1902,7 @@ impl AlwaysRules {
     }
 }
 
-/// What an import did: rules added, entries skipped because no rule may hold them (C6), Codex
+/// What an import did: rules added, entries skipped because no rule can hold them, Codex
 /// allows kept out because a Codex rule asks about or forbids what they cover, and why Codex's
 /// rules were not imported at all, if they were not.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1739,7 +1923,7 @@ impl Imported {
         };
         if self.skipped > 0 {
             out.push_str(&format!(
-                ". {} rule{} skipped as too broad or unsafe",
+                ". {} rule{} skipped: a rule cannot hold them (a secret, or shell syntax)",
                 self.skipped,
                 plural(self.skipped)
             ));
@@ -3089,10 +3273,11 @@ mod tests {
         assert!(!offerable(&leaky, &c));
         assert!(!always_offerable(&leaky));
         assert!(decide(Some(&leaky), None, Scope::Session, &c).is_err());
+        // The user's own `printf *` holds as written: the secret is in the call, not the rule.
         let printf = Rule::new("*", "run_command", "printf *")
             .complete(&c)
             .expect("p");
-        assert!(!printf.matches(&leaky, &c));
+        assert!(printf.matches(&leaky, &c));
         let custom = Rule::new(
             "*",
             "run_command",
@@ -3147,24 +3332,34 @@ mod tests {
             "rg -z needle",
             "rg --search-zip needle",
         ] {
-            assert!(!rules.matches_any(&shell(payload), &c), "{payload:?}");
-            let custom = Rule::new("*", "run_command", payload).complete(&c);
-            assert!(
-                custom.map_or(true, |r| r.check(Scope::Session).is_err()
-                    || r.check(Scope::Always).is_err()),
+            // The user's rules hold as written: `git *` is every git command. Keeping one that
+            // names an exec-capable option says so; the app's own read pattern never covers it.
+            let tokens = command_tokens(payload);
+            assert_eq!(
+                rules.matches_any(&shell(payload), &c),
+                tokens.is_some(),
                 "{payload:?}"
             );
+            assert!(
+                tokens.as_deref().and_then(session_pattern).is_none(),
+                "{payload:?}"
+            );
+            if let Ok(custom) = Rule::new("*", "run_command", payload).complete(&c) {
+                assert!(custom.check(Scope::Always).is_ok(), "{payload:?}");
+                // Kept with a warning: an exec option, or a program that runs code.
+                assert!(
+                    !custom.warnings(Scope::Always, Some(&c)).is_empty(),
+                    "{payload:?}"
+                );
+            }
         }
         assert!(rules.matches_any(&shell("git status"), &c));
         assert!(rules.matches_any(&shell("git log --oneline"), &c));
         assert!(
-            !rules.matches_any(&shell("git push origin"), &c),
-            "not read-only"
+            rules.matches_any(&shell("git push origin"), &c),
+            "as written"
         );
-        assert!(
-            !rules.matches_any(&shell("cargo test --workspace"), &c),
-            "C1"
-        );
+        assert!(rules.matches_any(&shell("cargo test --workspace"), &c));
         assert!(rules.matches_any(&shell("find . -name x"), &c));
         assert!(exec_option(&argv(&["git", "status"])).is_none());
         // Clustered and attached short options, and tar's dashless cluster.
@@ -3185,13 +3380,17 @@ mod tests {
         assert!(exec_option(&argv(&["tar", "xzf", "a.tar"])).is_none());
     }
 
-    /// C1: a `*` pattern widens only allowlisted read-only programs (and git's read-only
-    /// subcommands); every other program's pattern is refused when made and, if held anyway,
-    /// matches its exact argv only.
+    /// The user's `*` pattern is kept and matches as written, whatever the program; one that is
+    /// not a read-only program is kept with a warning, never refused or narrowed.
     #[test]
-    fn only_read_only_programs_widen() {
+    fn a_users_star_pattern_holds_as_written_and_warns_beyond_reads() {
         let c = ctx("claude", Path::new("/w"), Some("/w"));
-        for ok in [
+        let star_warning = |r: &Rule| {
+            r.warnings(Scope::Session, Some(&c))
+                .iter()
+                .any(|w| w.contains("with any arguments"))
+        };
+        for read in [
             "ls *",
             "cat *",
             "rg *",
@@ -3200,10 +3399,11 @@ mod tests {
             "git log *",
             "git diff *",
         ] {
-            let r = Rule::new("*", "Bash", ok).complete(&c).expect(ok);
-            assert!(r.check(Scope::Session).is_ok(), "{ok}");
+            let r = Rule::new("*", "Bash", read).complete(&c).expect(read);
+            assert!(r.check(Scope::Session).is_ok(), "{read}");
+            assert!(!star_warning(&r), "{read}");
         }
-        for refused in [
+        for wide in [
             "touch *",
             "rm *",
             "cp *",
@@ -3214,34 +3414,49 @@ mod tests {
             "curl *",
             "kubectl *",
         ] {
-            let r = Rule::new("*", "Bash", refused).complete(&c).expect(refused);
-            assert!(r.check(Scope::Session).is_err(), "{refused}");
+            let r = Rule::new("*", "Bash", wide).complete(&c).expect(wide);
+            assert!(r.check(Scope::Session).is_ok(), "{wide}");
+            assert!(r.check(Scope::Always).is_ok(), "{wide}");
+            assert!(star_warning(&r), "{wide}");
         }
         let git = Rule::new("*", "Bash", "git *").complete(&c).expect("git");
-        assert!(git.matches(&shell("git blame src/a.rs"), &c));
-        assert!(!git.matches(&shell("git push"), &c));
-        assert!(!git.matches(&shell("git -C /tmp log"), &c));
+        for call in ["git blame src/a.rs", "git push", "git -C /tmp log"] {
+            assert!(git.matches(&shell(call), &c), "{call}");
+        }
+        let make = Rule::new("*", "Bash", "make *").complete(&c).expect("make");
+        assert!(make.matches(&shell("make test"), &c));
     }
 
-    /// D1: programs whose options write or execute no longer widen; D2: git's short global
-    /// letters count only before the subcommand; jq's program file and module path are denied.
+    /// What the app's own read pattern ([`session_pattern`]) widens into: D1, programs whose
+    /// options write or execute are not reads; D2, git's short global letters count only before
+    /// the subcommand; jq's program file and module path run code. A user's rule covers all of
+    /// these as written.
     #[test]
     fn round_four_allowlist_git_letters_and_jq() {
         let c = ctx("claude", Path::new("/w"), Some("/w"));
+        let app_reads = |call: &str| {
+            command_tokens(call)
+                .as_deref()
+                .and_then(session_pattern)
+                .is_some()
+        };
         for gone in [
-            "fd *",
-            "tree *",
-            "file *",
-            "date *",
-            "git branch *",
-            "git remote *",
+            "fd x",
+            "tree x",
+            "file x",
+            "date x",
+            "git branch x",
+            "git remote x",
         ] {
-            let r = Rule::new("*", "Bash", gone).complete(&c).expect(gone);
-            assert!(r.check(Scope::Session).is_err(), "{gone}");
+            assert!(!app_reads(gone), "{gone}");
+            let r = Rule::new("*", "Bash", format!("{gone} *"))
+                .complete(&c)
+                .expect(gone);
+            assert!(r.check(Scope::Session).is_ok(), "{gone}");
         }
         let git = Rule::new("*", "Bash", "git *").complete(&c).expect("git");
-        assert!(!git.matches(&shell("git branch -D main"), &c));
-        assert!(!git.matches(&shell("git remote set-url origin x"), &c));
+        assert!(git.matches(&shell("git branch -D main"), &c));
+        assert!(git.matches(&shell("git remote set-url origin x"), &c));
         // D2: after the subcommand these letters are read-only options again.
         for ok in [
             "git log -p",
@@ -3250,30 +3465,38 @@ mod tests {
             "git show -c HEAD",
         ] {
             assert!(git.matches(&shell(ok), &c), "{ok}");
+            assert!(app_reads(ok), "{ok}");
         }
-        for refused in [
+        for runs in [
             "git -p log",
             "git -c x=y log",
             "git -C /tmp log",
             "git log --output=x",
         ] {
-            assert!(!git.matches(&shell(refused), &c), "{refused}");
+            assert!(git.matches(&shell(runs), &c), "{runs}");
+            assert!(!app_reads(runs), "{runs}");
         }
         assert!(exec_option(&argv(&["git", "-c", "x=y", "log", "-p"])).is_some());
         assert!(exec_option(&argv(&["git", "log", "-p"])).is_none());
-        // jq: data files are fine, a program file or a module path is not.
+        // jq: data files are reads, a program file or a module path is not.
         let jq = Rule::new("*", "Bash", "jq *").complete(&c).expect("jq");
-        assert!(jq.matches(&shell("jq .a data.json"), &c));
-        assert!(jq.matches(&shell("jq --rawfile t a.txt .a data.json"), &c));
-        assert!(jq.matches(&shell("jq --slurpfile s a.json .a data.json"), &c));
-        for refused in [
+        for read in [
+            "jq .a data.json",
+            "jq --rawfile t a.txt .a data.json",
+            "jq --slurpfile s a.json .a data.json",
+        ] {
+            assert!(jq.matches(&shell(read), &c), "{read}");
+            assert!(app_reads(read), "{read}");
+        }
+        for runs in [
             "jq -f prog.jq data.json",
             "jq --from-file prog.jq data.json",
             "jq -L ./mods .a data.json",
             "jq -Lmods .a data.json",
             "jq -rf prog.jq data.json",
         ] {
-            assert!(!jq.matches(&shell(refused), &c), "{refused}");
+            assert!(jq.matches(&shell(runs), &c), "{runs}");
+            assert!(!app_reads(runs), "{runs}");
         }
         // D4/D5 on the rule side: curl clusters are credentials; docker's -u is not.
         for cred in [
@@ -3290,19 +3513,27 @@ mod tests {
         assert!(credential_option(&argv(&["curl", "-u", "alice", "https://x"])).is_none());
     }
 
-    /// E1-E3: jq's long module path, rg's hostname program and git's signature output are
-    /// denied; plain git log/show formats still widen.
+    /// E1-E3: jq's long module path, rg's hostname program and git's signature output run code,
+    /// so the app's own read pattern never covers them; plain git log/show formats are reads. A
+    /// user's `jq *`, `rg *` or `git *` covers all of them as written.
     #[test]
     fn final_batch_option_denials() {
         let c = ctx("claude", Path::new("/w"), Some("/w"));
-        let jq = Rule::new("*", "Bash", "jq *").complete(&c).expect("jq");
-        assert!(!jq.matches(&shell("jq --module-path ./mods .a d.json"), &c));
-        assert!(!jq.matches(&shell("jq --module-path=./mods .a d.json"), &c));
-        let rg = Rule::new("*", "Bash", "rg *").complete(&c).expect("rg");
-        assert!(!rg.matches(&shell("rg --hostname-bin ./evil x"), &c));
-        assert!(!rg.matches(&shell("rg --hostname-bin=./evil x"), &c));
-        let git = Rule::new("*", "Bash", "git *").complete(&c).expect("git");
-        for refused in [
+        let app_reads = |call: &str| {
+            command_tokens(call)
+                .as_deref()
+                .and_then(session_pattern)
+                .is_some()
+        };
+        let rules: Vec<Rule> = ["jq *", "rg *", "git *"]
+            .into_iter()
+            .map(|p| Rule::new("*", "Bash", p).complete(&c).expect(p))
+            .collect();
+        for runs in [
+            "jq --module-path ./mods .a d.json",
+            "jq --module-path=./mods .a d.json",
+            "rg --hostname-bin ./evil x",
+            "rg --hostname-bin=./evil x",
             "git log --show-signature",
             "git show --show-signature HEAD",
             "git log --format=%G?",
@@ -3310,21 +3541,27 @@ mod tests {
             "git log --pretty=tformat:%h%GK",
             "git log --format %G?",
         ] {
-            assert!(!git.matches(&shell(refused), &c), "{refused}");
+            assert!(!app_reads(runs), "{runs}");
+            // As written, wherever a rule can express the command (`%G?` is a glob: none can).
+            assert_eq!(
+                rules.iter().any(|r| r.matches(&shell(runs), &c)),
+                command_tokens(runs).is_some(),
+                "{runs}"
+            );
         }
-        for ok in [
+        for read in [
             "git log --format=%h",
             "git log --pretty=oneline",
             "git show --pretty=format:%an HEAD",
         ] {
-            assert!(git.matches(&shell(ok), &c), "{ok}");
+            assert!(app_reads(read), "{read}");
         }
     }
 
-    /// C2 (and A3): these never get "Always allow"; their exact command can still be allowed
-    /// for the session.
+    /// C2 (and A3): these run code. "Always allow" is the user's choice for them too, kept with
+    /// a warning that says so; the session keeps their exact command.
     #[test]
-    fn more_wrappers_and_runners_are_never_kept_always() {
+    fn runners_and_wrappers_are_kept_always_with_a_warning() {
         let c = ctx("codex", Path::new("/w"), Some("/w"));
         for command in [
             "builtin echo x",
@@ -3348,13 +3585,17 @@ mod tests {
             "ssh host",
         ] {
             let action = shell(command);
-            assert!(!always_offerable(&action), "{command}");
+            assert!(always_offerable(&action), "{command}");
+            let rule = decide(Some(&action), None, Scope::Always, &c).expect(command);
             assert!(
-                decide(Some(&action), None, Scope::Always, &c).is_err(),
+                rule.warnings(Scope::Always, Some(&c))
+                    .iter()
+                    .any(|w| w.contains("runs code")),
                 "{command}"
             );
+            let session = decide(Some(&action), None, Scope::Session, &c).expect(command);
             assert!(
-                decide(Some(&action), None, Scope::Session, &c).is_ok(),
+                matches!(&session.target, Target::Argv { prefix: false, .. }),
                 "session exact: {command}"
             );
         }
@@ -3438,11 +3679,17 @@ mod tests {
         assert_eq!(AlwaysRules::open(&path).expect("open").rules.len(), 8);
     }
 
-    /// R1: "Always allow" never keeps a runner, wrapper, interpreter, path-named program or an
-    /// unsafe git command, by any path; "Allow for session" keeps them as the exact command only.
+    /// R1, as warnings: a runner, wrapper, interpreter, path-named program or unsafe git command
+    /// is kept by "Always allow", by the button or by the user's own pattern, and the user is
+    /// told it runs code; "Allow for session" keeps the exact command unless the user typed more.
     #[test]
-    fn always_refuses_runners_and_session_keeps_only_their_exact_command() {
+    fn runners_are_the_users_to_keep_and_are_warned_about() {
         let c = ctx("claude", Path::new("/w"), Some("/w"));
+        let runs_code = |r: &Rule| {
+            r.warnings(Scope::Always, Some(&c))
+                .iter()
+                .any(|w| w.contains("runs code"))
+        };
         for command in [
             "cargo test",
             "zsh -lc 'cargo test'",
@@ -3454,26 +3701,21 @@ mod tests {
             "ansible-playbook site.yml",
         ] {
             let action = shell(command);
-            assert!(!always_offerable(&action), "{command}");
-            assert!(
-                decide(Some(&action), None, Scope::Always, &c).is_err(),
-                "{command}"
-            );
+            assert!(always_offerable(&action), "{command}");
+            let rule = decide(Some(&action), None, Scope::Always, &c).expect(command);
+            assert!(runs_code(&rule), "{command}");
             let typed = Rule::new("", "Bash", command).expect("a plain pattern");
             assert!(
-                decide(Some(&action), Some(typed), Scope::Always, &c).is_err(),
+                decide(Some(&action), Some(typed), Scope::Always, &c).is_ok(),
                 "dialog path: {command}"
             );
             let star = Rule::new("", "Bash", format!("{command} *")).expect("a plain pattern");
-            assert!(
-                decide(Some(&action), Some(star), Scope::Session, &c).is_err(),
-                "a session pattern: {command}"
-            );
+            let star = decide(Some(&action), Some(star), Scope::Session, &c).expect(command);
+            assert!(star.matches(&action, &c), "a session pattern: {command}");
         }
-        // git diff: never Always (it runs configured textconv and diff drivers), but a read-only
-        // command a session pattern may widen (C1).
+        // git diff runs configured textconv and diff drivers: kept for good with a warning.
         let diff = shell("git diff");
-        assert!(!always_offerable(&diff));
+        assert!(always_offerable(&diff));
         let star = Rule::new("", "Bash", "git diff *").expect("pattern");
         assert!(decide(Some(&diff), Some(star), Scope::Session, &c).is_ok());
         // The exact command for the session is still fine.
@@ -3488,6 +3730,177 @@ mod tests {
         // No cwd, no workspace-tied shell rule.
         let nocwd = ctx("claude", Path::new("/w"), None);
         assert!(decide(Some(&ls), None, Scope::Session, &nocwd).is_err());
+    }
+
+    /// A plain "Allow for session" on a read-only command keeps the program (`git` with its
+    /// subcommand) for any folder of the workspace, and matches only calls whose folder and
+    /// every argument stay inside it and away from sensitive places. Other commands, and
+    /// "Always allow", stay exact.
+    #[test]
+    fn allow_for_session_on_a_read_widens_to_the_program_inside_the_workspace() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(ws.join("sub")).expect("sub");
+        let root = ws.to_string_lossy().into_owned();
+        let sub = ws.join("sub").to_string_lossy().into_owned();
+        let at_root = ctx("codex", &ws, Some(&root));
+        let in_sub = ctx("codex", &ws, Some(&sub));
+
+        let first = shell(&format!("zsh -lc 'cat {root}/AGENTS.md'"));
+        let rule = decide(Some(&first), None, Scope::Session, &at_root).expect("session");
+        assert_eq!(
+            rule.target,
+            Target::Argv {
+                argv: vec!["cat".into()],
+                prefix: true
+            }
+        );
+        assert_eq!(rule.cwd, None);
+        for allowed in ["cat AGENTS.md", "zsh -lc 'cat -n AGENTS.md'", "cat a b/c"] {
+            assert!(rule.matches(&shell(allowed), &at_root), "{allowed}");
+        }
+        assert!(rule.matches(&shell("cat x"), &in_sub), "any folder inside");
+        assert!(
+            !rule.matches(&shell("cat ../AGENTS.md"), &in_sub),
+            "no `..`"
+        );
+        for refused in [
+            "cat /etc/passwd",
+            "cat ~/.ssh/id_ed25519",
+            "cat .git/config",
+            "head AGENTS.md",
+            "grep --file=/etc/shadow x",
+            "cat -f/etc/x",
+        ] {
+            assert!(!rule.matches(&shell(refused), &at_root), "{refused}");
+        }
+        let outside = ctx("codex", &ws, Some("/tmp"));
+        assert!(!rule.matches(&shell("cat x"), &outside), "a folder outside");
+        // Answered from outside the workspace, it keeps the exact command there, as before.
+        let exact = decide(Some(&shell("cat x")), None, Scope::Session, &outside).expect("exact");
+        assert_eq!(exact.cwd.as_deref(), Some("/tmp"));
+        assert!(matches!(&exact.target, Target::Argv { prefix: false, .. }));
+        // A workspace that is the home folder: its dotfiles and secret-looking names stay asked.
+        let home = Context {
+            home: Some(&ws),
+            ..at_root
+        };
+        assert!(rule.matches(&shell("cat notes.md"), &home));
+        for refused in [
+            "cat .gemini_env",
+            "cat .config/x",
+            "cat sub/.env",
+            "cat sub/key.pem",
+        ] {
+            assert!(!rule.matches(&shell(refused), &home), "{refused}");
+        }
+
+        // git keeps its subcommand.
+        let diff = shell("zsh -lc 'git diff v3.2.2..df46c878 --stat'");
+        let rule = decide(Some(&diff), None, Scope::Session, &at_root).expect("git");
+        assert!(rule.matches(&shell("git diff v3.2.2..HEAD -- src/a.rs"), &at_root));
+        assert!(!rule.matches(&shell("git show HEAD"), &at_root));
+        assert!(!rule.matches(&shell("git diff --ext-diff"), &at_root));
+        // A file in a revision is judged by its path part too.
+        let show = decide(
+            Some(&shell("git show HEAD:src/a.rs")),
+            None,
+            Scope::Session,
+            &at_root,
+        )
+        .expect("show");
+        assert!(show.matches(&shell("git show v1:README.md"), &at_root));
+        for refused in [
+            "git show HEAD:.env",
+            "git show HEAD:config/secrets.yml",
+            "git show HEAD:id_ed25519",
+            "git show HEAD:../x",
+        ] {
+            assert!(!show.matches(&shell(refused), &at_root), "{refused}");
+        }
+
+        // Anything else stays exact, and so does "Always allow".
+        for exact in ["sed -n 1,5p a.rs", "cargo test", "git branch -a"] {
+            let rule = decide(Some(&shell(exact)), None, Scope::Session, &at_root).expect(exact);
+            assert!(
+                matches!(&rule.target, Target::Argv { prefix: false, .. }),
+                "{exact}"
+            );
+            assert_eq!(rule.cwd.as_deref(), Some(root.as_str()), "{exact}");
+        }
+        let ls = decide(Some(&shell("ls -la")), None, Scope::Always, &at_root).expect("ls");
+        assert!(matches!(&ls.target, Target::Argv { prefix: false, .. }));
+
+        // The card says the session pattern only when this call is one it covers (review #5).
+        let note = |command: &str| {
+            crate::approval_server::card_note(&shell(command), &at_root, true, false)
+        };
+        assert_eq!(
+            note("zsh -lc 'git log -5'").as_deref(),
+            Some("“Allow for session” allows `git log …` in this workspace")
+        );
+        for exact in ["cargo test", "cat /etc/hosts", "cat .env", "grep -r x ."] {
+            assert_eq!(note(exact), None, "{exact}");
+        }
+    }
+
+    /// The Codex review of the session read pattern: what a call names through an attached
+    /// option value, a recursive search or a git revision is judged like any other path.
+    #[test]
+    fn a_session_read_pattern_judges_every_path_a_call_names() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = std::fs::canonicalize(tmp.path()).expect("canon");
+        let root = ws.to_string_lossy().into_owned();
+        let c = ctx("codex", &ws, Some(&root));
+        let pattern = |head: &[&str]| Rule {
+            workspace: c.workspace_key(),
+            cwd: None,
+            origin: "codex".into(),
+            kind: ActionKind::Shell,
+            target: Target::Argv {
+                argv: argv(head),
+                prefix: true,
+            },
+        };
+        let (grep, rg, git) = (
+            pattern(&["grep"]),
+            pattern(&["rg"]),
+            pattern(&["git", "show"]),
+        );
+        for (rule, ok) in [
+            (&grep, "grep -n needle README.md"),
+            (&grep, "grep --max-count=5 needle README.md"),
+            (&rg, "rg -n needle src"),
+            (&rg, "rg --glob=src needle"),
+            (&git, "git show HEAD:src/a.rs"),
+        ] {
+            assert!(rule.matches(&shell(ok), &c), "{ok}");
+        }
+        for (rule, refused) in [
+            // Attached values (#1).
+            (&grep, "grep --file=.env README.md"),
+            (&grep, "grep -f.env README.md"),
+            (&grep, "grep -fcredentials README.md"),
+            (&grep, "grep -if.env README.md"),
+            (&grep, "grep --directories recurse needle ."),
+            (&grep, "grep -d recurse needle ."),
+            (&rg, "rg --ignore-file=.env needle README.md"),
+            // Recursion past the default skips (#2).
+            (&grep, "grep -R needle ."),
+            (&grep, "grep -rn needle src"),
+            (&grep, "grep --recursive needle src"),
+            (&rg, "rg --hidden needle"),
+            (&rg, "rg -uu needle"),
+            (&rg, "rg --no-ignore needle"),
+            (&rg, "rg --follow needle"),
+            (&rg, "rg -L needle"),
+            // A hidden file in a revision (#3).
+            (&git, "git show HEAD:.bashrc"),
+            (&git, "git show HEAD:.github/workflows/ci.yml"),
+            (&git, "git show HEAD:config/.env.local"),
+        ] {
+            assert!(!rule.matches(&shell(refused), &c), "{refused}");
+        }
     }
 
     /// The one unwrap (W2's `unwrap_shell_wrapper`, which `dialog_prefill` and `command_tokens`
@@ -3518,8 +3931,8 @@ mod tests {
         assert_eq!(dialog_prefill("command_execution", &plain, None), "ls -la");
     }
 
-    /// U2 kept, through the shared re-check: Always for an edit only when the path is contained
-    /// and not sensitive, for one MCP tool, never for a read; whatever the card showed.
+    /// U2 as warnings, through the shared re-check: Always keeps an edit wherever it is (outside
+    /// the workspace or sensitive: kept with a warning), one MCP tool, and a read.
     #[test]
     fn always_for_edits_and_mcp_goes_through_decide() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -3530,18 +3943,22 @@ mod tests {
         let inside = edit(ws.join("a.rs").to_string_lossy().into_owned());
         let rule = decide(Some(&inside), None, Scope::Always, &c).expect("contained edit");
         assert!(rule.matches(&inside, &c));
-        for refused in [
+        assert!(rule.warnings(Scope::Always, Some(&c)).is_empty());
+        for sensitive in [
             edit("/etc/hosts".to_owned()),
             edit(ws.join(".git/config").to_string_lossy().into_owned()),
             edit(ws.join("CLAUDE.md").to_string_lossy().into_owned()),
         ] {
+            let rule = decide(Some(&sensitive), None, Scope::Always, &c).expect("kept");
+            assert!(rule.matches(&sensitive, &c), "{sensitive:?}");
             assert!(
-                decide(Some(&refused), None, Scope::Always, &c).is_err(),
-                "{refused:?}"
+                !rule.warnings(Scope::Always, Some(&c)).is_empty(),
+                "{sensitive:?}"
             );
         }
         let typed_outside = Rule::new("", "Edit", "/etc/hosts").expect("an absolute path");
-        assert!(decide(Some(&inside), Some(typed_outside), Scope::Always, &c).is_err());
+        let rule = decide(Some(&inside), Some(typed_outside), Scope::Always, &c).expect("typed");
+        assert!(rule.matches(&edit("/etc/hosts".to_owned()), &c));
         let mcp = Action::Mcp {
             server: "fs".into(),
             tool: "write".into(),
@@ -3550,7 +3967,7 @@ mod tests {
         let read = Action::Read {
             path: ws.join("a.rs").to_string_lossy().into_owned(),
         };
-        assert!(decide(Some(&read), None, Scope::Always, &c).is_err());
+        assert!(decide(Some(&read), None, Scope::Always, &c).is_ok());
         assert!(decide(Some(&read), None, Scope::Session, &c).is_ok());
     }
 
@@ -3596,7 +4013,8 @@ mod tests {
         );
     }
 
-    /// The exact #310 payloads: every one asks against rules that would have matched before.
+    /// The exact #310 payloads: a compound or expanding command is not the command a rule names,
+    /// so every one asks. Paths are kept as the user chooses, with warnings.
     #[test]
     fn issue_310_payloads_never_auto_match() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -3638,31 +4056,35 @@ mod tests {
         assert!(rule.matches(&edit(&file.to_string_lossy()), &c));
         let dotdot = format!("{repo_s}/../../.bashrc");
         assert!(!rule.matches(&edit(&dotdot), &c));
-        assert!(Rule::from_action(&edit(&dotdot), &c).is_err());
+        assert!(
+            Rule::from_action(&edit(&dotdot), &c).is_err(),
+            "`..` names no one file"
+        );
+        // A path through a link is kept as the file it really is, outside the workspace: the
+        // user's call, with a warning; it never stands in for the workspace file.
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, repo.join("link")).expect("link");
         let escape = format!("{repo_s}/link/a.rs");
-        assert!(Rule::from_action(&edit(&escape), &c).is_err());
+        let linked = Rule::from_action(&edit(&escape), &c).expect("kept");
+        assert!(!linked.warnings(Scope::Always, Some(&c)).is_empty());
         let typed = Rule::new("", "write_to_file", file.to_string_lossy())
             .complete(&c)
             .expect("path rule");
         assert!(!typed.matches(&edit(&escape), &c));
-        assert!(Rule::new("", "write_to_file", escape.as_str())
-            .complete(&c)
-            .is_err());
+        // Sensitive files can be kept too, and say why they are sensitive.
         let hook = format!("{repo_s}/.git/hooks/pre-commit");
-        assert!(Rule::from_action(&edit(&hook), &c).is_err());
-        assert!(!offerable(&edit(&hook), &c));
-        for name in [
-            "AGENTS.md",
-            "CLAUDE.md",
-            ".hg/hgrc",
-            "mise.toml",
-            ".codex/config.toml",
+        for p in [
+            hook,
+            format!("{repo_s}/AGENTS.md"),
+            format!("{repo_s}/CLAUDE.md"),
+            format!("{repo_s}/.hg/hgrc"),
+            format!("{repo_s}/mise.toml"),
+            format!("{repo_s}/.codex/config.toml"),
         ] {
-            let p = format!("{repo_s}/{name}");
-            assert!(!offerable(&edit(&p), &c), "{name} is sensitive");
+            assert!(offerable(&edit(&p), &c), "{p}");
+            let rule = Rule::from_action(&edit(&p), &c).expect(&p);
+            assert!(!rule.warnings(Scope::Always, Some(&c)).is_empty(), "{p}");
         }
     }
 
@@ -3693,8 +4115,10 @@ mod tests {
         );
     }
 
+    /// A rule never stores a secret; a user's rule still matches a call that carries one (the
+    /// secret is in the call, not the rule). The app's own read pattern never covers it.
     #[test]
-    fn secrets_are_never_remembered_or_matched() {
+    fn secrets_are_never_remembered() {
         let ws = Path::new("/w");
         let c = ctx("claude", ws, Some("/w"));
         let leaky = shell("curl -H 'x: sk-abcdefghijklmnopqrstuvwx' https://x");
@@ -3705,7 +4129,13 @@ mod tests {
             .is_err());
         let rg = Rule::new("*", "Bash", "rg *").complete(&c).expect("rg");
         assert!(rg.matches(&shell("rg TODO src"), &c));
-        assert!(!rg.matches(&shell("rg 'sk-abcdefghijklmnopqrstuvwx' src"), &c));
+        let secret_search = shell("rg 'sk-abcdefghijklmnopqrstuvwx' src");
+        assert!(rg.matches(&secret_search, &c));
+        assert!(
+            !Context { home: None, ..c }
+                .probe(&secret_search)
+                .args_contained
+        );
     }
 
     #[test]
@@ -3779,11 +4209,12 @@ mod tests {
             );
         }
         assert_eq!(Action::of("WebFetch", &serde_json::json!({})), None);
-        // Always applies to shell, edits and MCP tools (U2), never to reads, and never to a
-        // runner (R1) even through the W2 path.
+        // Always is offered for anything a rule can hold: shell, edits, reads and MCP tools,
+        // runners included (the user decides; a warning says what it runs).
         assert!(always_offerable(&shell("ls")));
-        assert!(!always_offerable(&shell("cargo test")));
-        assert!(!always_offerable(&shell("/usr/bin/zsh -lc 'make'")));
+        assert!(always_offerable(&shell("cargo test")));
+        assert!(always_offerable(&shell("/usr/bin/zsh -lc 'make'")));
+        assert!(!always_offerable(&shell("ls; id")), "no rule can hold it");
         assert!(always_offerable(&Action::Edit {
             path: "/w/a".into()
         }));
@@ -3791,7 +4222,7 @@ mod tests {
             server: "fs".into(),
             tool: "write".into()
         }));
-        assert!(!always_offerable(&Action::Read {
+        assert!(always_offerable(&Action::Read {
             path: "/w/a".into()
         }));
     }
@@ -3923,14 +4354,14 @@ mod tests {
         assert!(r.matches(&shell("git log --oneline"), &c));
         assert!(!r.matches(&shell("git logx"), &c));
         assert!(!r.matches(&shell("git push"), &c));
-        // C1: a pattern for any other program can never be kept; one held anyway (a hand-edited
-        // file) matches its exact argv only.
+        // A pattern for any program is the user's: kept and matched as written, with a warning.
         let runner = Rule::new("*", "run_command", "cargo test*")
             .complete(&c)
             .expect("parses");
-        assert!(runner.check(Scope::Session).is_err());
+        assert!(runner.check(Scope::Session).is_ok());
+        assert!(!runner.warnings(Scope::Session, Some(&c)).is_empty());
         assert!(runner.matches(&shell("cargo test"), &c));
-        assert!(!runner.matches(&shell("cargo test --workspace"), &c));
+        assert!(runner.matches(&shell("cargo test --workspace"), &c));
         for bad in ["*", "cargo * test", "a; b", "", "FOO=1 x"] {
             assert!(
                 Rule::new("*", "run_command", bad).complete(&c).is_err(),
@@ -3955,8 +4386,8 @@ mod tests {
     }
 
     #[test]
-    /// C6: every imported entry must be one "Always allow" could keep; the rest are skipped and
-    /// counted (runners, wrappers, unsafe git, credentials, patterns that cannot widen).
+    /// Every imported entry a rule can hold is kept as written; only a credential or a pattern
+    /// no rule can express is skipped and counted.
     fn import_permissions_from_toml_and_json() {
         let toml_sample = r#"
 [allow]
@@ -3982,26 +4413,31 @@ mcp = [
         let c = ctx("agy", Path::new("/any"), Some("/any"));
         let mut rules = AlwaysRules::default();
         let imported = rules.import_permissions_toml(toml_sample);
+        // The user's own configuration is imported as written; only what no rule can hold (a
+        // glob inside a word) is skipped.
         assert_eq!(
             imported,
             Imported {
-                added: 5,
-                skipped: 5,
+                added: 9,
+                skipped: 1,
                 ..Imported::default()
             }
         );
         assert!(
-            imported.summary().contains("5 rules skipped"),
+            imported.summary().contains("1 rule skipped"),
             "{}",
             imported.summary()
         );
         assert!(rules.matches_any(&shell("head -n 5 a.txt"), &c));
         assert!(rules.matches_any(&shell("ls -la"), &c));
         assert!(rules.matches_any(&shell("git status --short"), &c));
-        assert!(!rules.matches_any(&shell("git -c core.pager=x status"), &c));
-        assert!(!rules.matches_any(&shell("cargo test --lib"), &c));
-        assert!(!rules.matches_any(&shell("docker run x"), &c));
-        assert!(!rules.matches_any(&shell("env"), &c));
+        assert!(
+            !rules.matches_any(&shell("git -c core.pager=x status"), &c),
+            "not `git status …`"
+        );
+        assert!(rules.matches_any(&shell("cargo test --lib"), &c));
+        assert!(rules.matches_any(&shell("docker run x"), &c));
+        assert!(rules.matches_any(&shell("env"), &c));
         assert!(rules.matches_any(&shell("pwd"), &c));
         assert!(rules.rules.iter().all(|r| r.origin == "import"));
 
@@ -4011,13 +4447,14 @@ mcp = [
         assert_eq!(
             rules.import_claude_settings(claude_sample),
             Imported {
-                added: 2,
-                skipped: 2,
+                added: 3,
+                skipped: 1,
                 ..Imported::default()
-            }
+            },
+            "only the credential is left out"
         );
         assert!(rules.matches_any(&shell("rg TODO src"), &c));
-        assert!(!rules.matches_any(&shell("cargo clippy --workspace"), &c));
+        assert!(rules.matches_any(&shell("cargo clippy --workspace"), &c));
         let mcp = Action::Mcp {
             server: "hive-board".into(),
             tool: "board_list".into(),
@@ -4132,11 +4569,10 @@ mcp = [
         assert!(agy.contains("command(make test)"), "{agy}");
         assert!(agy.contains("mcp(test-mcp/tool)"), "{agy}");
         assert_eq!(rules.rules.len(), 6, "export never changes the rules");
-        // A5: what agy's file gets back is read back (the MCP entry included); the runner is
-        // skipped on the way in (C6).
+        // A5: what agy's file gets back is read back whole, the runner and the MCP entry included.
         let mut back = AlwaysRules::default();
         let imported = back.import_agy_settings(&agy);
-        assert_eq!(imported.skipped, 1, "make test * is skipped");
+        assert_eq!(imported.skipped, 0, "make test * comes back as written");
         assert!(back.rules.iter().any(|r| r.kind == ActionKind::Mcp));
     }
 
@@ -4253,9 +4689,9 @@ mcp = [
         Ok(vec![format!("/usr/bin/{program}")])
     }
 
-    /// Every imported Codex rule becomes `<words> *` and goes through `check(Always)`; an allow
-    /// that overlaps a prompt or forbidden rule is kept out and counted on its own; nothing
-    /// outside the `.rules` files and agent-terminal's own file is read.
+    /// Every imported Codex rule becomes `<words> *`, kept as written; an allow that overlaps the
+    /// user's own prompt or forbidden rule is kept out and counted on its own; nothing outside
+    /// the `.rules` files and agent-terminal's own file is read.
     #[test]
     fn codex_rules_import_through_the_always_checks() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -4284,34 +4720,32 @@ host_executable(name="ls", paths=["/bin/ls"])
 
         let mut rules = AlwaysRules::default();
         let imported = rules.import_codex_rules(&target);
-        // ls and git status import; git push and git log are too broad for Always; head
-        // overlaps a prompt rule.
+        // The user's allows import as written (git push and git log included); head overlaps
+        // the user's own prompt rule, which Codex would ask about, so it is kept out.
         assert_eq!(
             imported,
             Imported {
-                added: 2,
-                skipped: 2,
+                added: 4,
+                skipped: 0,
                 guarded: 1,
                 codex_refused: None
             }
         );
-        let details: Vec<String> = rules.rules.iter().map(Rule::detail).collect();
-        assert_eq!(details, ["ls *", "git status *"]);
+        let mut details: Vec<String> = rules.rules.iter().map(Rule::detail).collect();
+        details.sort();
+        assert_eq!(details, ["git log *", "git push *", "git status *", "ls *"]);
         assert!(rules.rules.iter().all(|r| r.origin == "codex"));
         let c = ctx("codex", Path::new("/w"), Some("/w"));
         assert!(rules.matches_any(&shell("ls -la"), &c));
         assert!(rules.matches_any(&shell("git status --short"), &c));
-        assert!(!rules.matches_any(&shell("git push origin"), &c));
+        assert!(rules.matches_any(&shell("git push origin"), &c));
         assert!(
             !rules.matches_any(&shell("uname -a"), &c),
             "own file not read"
         );
         let summary = imported.summary();
-        assert!(summary.contains("Imported 2 permission rules"), "{summary}");
-        assert!(
-            summary.contains("2 rules skipped as too broad or unsafe"),
-            "{summary}"
-        );
+        assert!(summary.contains("Imported 4 permission rules"), "{summary}");
+        assert!(!summary.contains("skipped"), "{summary}");
         assert!(
             summary.contains("1 Codex rule kept out because Codex asks about or forbids it"),
             "{summary}"
@@ -4321,7 +4755,7 @@ host_executable(name="ls", paths=["/bin/ls"])
         let mut via = AlwaysRules::default();
         assert_eq!(
             via.import_agent_permissions(None, &[], Some(&target)).added,
-            2
+            4
         );
         let gone = CodexTarget {
             home: dir.path().join("no-such-home"),
