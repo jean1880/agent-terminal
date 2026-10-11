@@ -1927,18 +1927,33 @@ fn system_executable(path: &Path, program: &str, home: Option<&Path>) -> Result<
         return Err(format!("{shown} is inside the home folder"));
     }
     let safe = |m: &std::fs::Metadata| m.uid() == 0 && m.mode() & 0o022 == 0;
-    let dir = path
-        .parent()
-        .and_then(|d| std::fs::metadata(d).ok())
-        .ok_or_else(|| format!("the folder of {shown} cannot be read"))?;
     let file = std::fs::metadata(path).map_err(|e| format!("{shown} cannot be read ({e})"))?;
-    if !(safe(&dir) && dir.is_dir()) {
-        return Err(format!(
-            "{shown} is in a folder other users or programs can change"
-        ));
-    }
     if !(safe(&file) && file.is_file() && file.mode() & 0o111 != 0) {
         return Err(format!("{shown} is not a system program"));
+    }
+    ancestors_safe(path, &|dir| {
+        std::fs::metadata(dir)
+            .ok()
+            .filter(std::fs::Metadata::is_dir)
+            .map(|m| (m.uid(), m.mode()))
+    })
+}
+
+/// Whether every folder above `path`, up to `/`, is root-owned and neither group- nor
+/// world-writable (a sticky `/tmp`-like folder included): otherwise someone else could swap
+/// the program, or a folder on the way to it. `stat` gives a folder's owner and mode (`None`:
+/// cannot be read, or not a folder).
+fn ancestors_safe(path: &Path, stat: &dyn Fn(&Path) -> Option<(u32, u32)>) -> Result<(), String> {
+    for dir in path.ancestors().skip(1) {
+        let (uid, mode) =
+            stat(dir).ok_or_else(|| format!("the folder {} cannot be read", dir.display()))?;
+        if uid != 0 || mode & 0o022 != 0 {
+            return Err(format!(
+                "{} is in {}, a folder other users or programs can change",
+                path.display(),
+                dir.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -1952,7 +1967,8 @@ const CODEX_FILES_CAP: usize = 256;
 /// The most patterns (alternatives expanded) across the folder.
 const CODEX_PATTERNS_CAP: usize = 2_000;
 
-/// Codex's own rules (every `.rules` file but [`codex_rules::EXPORT_FILE`]), read in full.
+/// The rules Codex loads (every `.rules` file; the allows of [`codex_rules::EXPORT_FILE`]
+/// left out), read in full.
 #[derive(Debug, Default)]
 struct CodexRead {
     /// `allow` patterns, alternatives expanded.
@@ -2153,7 +2169,8 @@ fn read_bounded(file: &Path, cap: u64, owner_checked: bool) -> Result<String, St
 
 /// Reads Codex's own rules in `target`'s folder, all or nothing (Codex 0.161 drops its whole
 /// rules policy when any file fails to load, so one file the reader cannot vouch for may be
-/// restricting the others): every `.rules` file but agent-terminal's own, sorted, within
+/// restricting the others): every `.rules` file Codex loads, agent-terminal's own included
+/// (its prompt and forbidden rules restrict; its allows are never imported), sorted, within
 /// [`CODEX_FILES_CAP`], [`CODEX_FILE_CAP`], [`CODEX_TOTAL_CAP`] and [`CODEX_PATTERNS_CAP`],
 /// with nothing but comments and `prefix_rule`/`host_executable` calls the reader understands
 /// in full. When a codex binary is known, Codex's own parser must load the same set. `Err`
@@ -2174,11 +2191,9 @@ fn read_codex_rules(target: &CodexTarget, codex_check_set: bool) -> Result<Codex
         let path = entry
             .map_err(|e| format!("{} cannot be listed ({e})", tilde(&dir)))?
             .path();
-        if path.extension().is_some_and(|e| e == "rules")
-            && path
-                .file_name()
-                .is_some_and(|n| n != codex_rules::EXPORT_FILE)
-        {
+        // Every file Codex loads, agent-terminal's own included: it is validated and its
+        // prompt and forbidden rules restrict like any other; only its allows are not imported.
+        if path.extension().is_some_and(|e| e == "rules") {
             files.push(path);
             if files.len() > CODEX_FILES_CAP {
                 return Err(format!(
@@ -2194,6 +2209,7 @@ fn read_codex_rules(target: &CodexTarget, codex_check_set: bool) -> Result<Codex
     let mut patterns = 0usize;
     for file in &files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
+        let ours = name == codex_rules::EXPORT_FILE;
         let real = follow_rules_link(file, false)?;
         let text = read_bounded(&real, CODEX_FILE_CAP, true)?;
         total += text.len() as u64;
@@ -2219,6 +2235,8 @@ fn read_codex_rules(target: &CodexTarget, codex_check_set: bool) -> Result<Codex
                 ));
             }
             match rule.decision {
+                // Our own allows came from here: never imported back.
+                codex_rules::Decision::Allow if ours => {}
                 codex_rules::Decision::Allow => read.allow.extend(rule.patterns),
                 _ => {
                     for pattern in rule.patterns {
@@ -2464,8 +2482,8 @@ impl AlwaysRules {
         self.import_codex_rules_with(target, true)
     }
 
-    /// Imports Codex's `allow` rules from `target`'s folder (every `.rules` file but
-    /// agent-terminal's own, whose entries came from here), all or nothing
+    /// Imports Codex's `allow` rules from `target`'s folder (every `.rules` file; the allows of
+    /// agent-terminal's own came from here and are not imported), all or nothing
     /// ([`read_codex_rules`]; `codex_check`: run Codex's own parser on the set first, as an
     /// import does and a status refresh does not). Each distinct pattern becomes the prefix
     /// rule `<words> *` through [`Self::import_one`]; one overlapping a `prompt` or `forbidden`
@@ -4391,6 +4409,117 @@ host_executable(name="ls", paths=["/bin/ls"])
         );
     }
 
+    /// Codex loads agent-terminal's own file like any other: it is validated with the set (a
+    /// broken one stops the import, and Codex's parser sees it), and its prompt and forbidden
+    /// rules restrict; only its allows are not imported.
+    #[test]
+    fn our_own_file_is_validated_and_restricts_like_the_others() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = dir.path().join("codex-args");
+        let fake = dir.path().join("fake-codex");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\nexit 0\n", log.display()),
+        )
+        .expect("fake");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let target = CodexTarget {
+            program: Some(fake),
+            ..codex_home(dir.path())
+        };
+        std::fs::create_dir_all(target.rules_dir()).expect("dir");
+        std::fs::set_permissions(target.rules_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let write = |path: &Path, text: &str| {
+            std::fs::write(path, text).expect("write");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        };
+        write(
+            &target.rules_dir().join("default.rules"),
+            "prefix_rule([\"cat\"])\nprefix_rule([\"wc\"])\n",
+        );
+        write(
+            &target.export_file(),
+            &format!(
+                "{}\nprefix_rule([\"uname\"])\nprefix_rule([\"cat\"], decision=\"forbidden\")\n",
+                codex_rules::HEADER
+            ),
+        );
+        let mut rules = AlwaysRules::default();
+        let imported = rules.import_codex_rules(&target);
+        assert_eq!((imported.added, imported.guarded), (1, 1), "{imported:?}");
+        let details: Vec<String> = rules.rules.iter().map(Rule::detail).collect();
+        assert_eq!(details, ["wc *"], "uname is ours; cat is forbidden in ours");
+        let args = std::fs::read_to_string(&log).expect("codex ran");
+        assert!(
+            args.contains(&*target.export_file().to_string_lossy())
+                && args.contains("default.rules"),
+            "Codex's parser sees every file it loads: {args}"
+        );
+        // A broken own file stops the whole import.
+        write(&target.export_file(), "prefix_rule(oops\n");
+        let imported = AlwaysRules::default().import_codex_rules(&target);
+        assert_eq!(imported.added, 0);
+        assert!(
+            imported
+                .codex_refused
+                .as_deref()
+                .is_some_and(|r| r.contains(codex_rules::EXPORT_FILE)),
+            "{imported:?}"
+        );
+    }
+
+    /// Every folder above a pinned program, up to `/`, must be root-owned and not group- or
+    /// world-writable (a sticky /tmp included), for the found and the canonical path alike.
+    #[test]
+    fn a_pinned_program_needs_a_root_owned_chain() {
+        let stat = |chain: &'static [(&'static str, u32, u32)]| {
+            move |dir: &Path| {
+                chain
+                    .iter()
+                    .find(|(p, _, _)| Path::new(p) == dir)
+                    .map(|(_, uid, mode)| (*uid, *mode))
+            }
+        };
+        let system: &[(&str, u32, u32)] =
+            &[("/usr/bin", 0, 0o755), ("/usr", 0, 0o755), ("/", 0, 0o755)];
+        assert!(ancestors_safe(Path::new("/usr/bin/cat"), &stat(system)).is_ok());
+        let user_ancestor: &[(&str, u32, u32)] = &[
+            ("/opt/tools/bin", 0, 0o755),
+            ("/opt/tools", 1000, 0o755),
+            ("/opt", 0, 0o755),
+            ("/", 0, 0o755),
+        ];
+        let error = ancestors_safe(Path::new("/opt/tools/bin/cat"), &stat(user_ancestor))
+            .expect_err("a user-owned ancestor");
+        assert!(error.contains("/opt/tools,"), "{error}");
+        let sticky: &[(&str, u32, u32)] =
+            &[("/tmp/bin", 0, 0o755), ("/tmp", 0, 0o1777), ("/", 0, 0o755)];
+        assert!(ancestors_safe(Path::new("/tmp/bin/cat"), &stat(sticky)).is_err());
+        let group: &[(&str, u32, u32)] =
+            &[("/srv/bin", 0, 0o775), ("/srv", 0, 0o755), ("/", 0, 0o755)];
+        assert!(ancestors_safe(Path::new("/srv/bin/cat"), &stat(group)).is_err());
+        let unreadable: &[(&str, u32, u32)] = &[("/x/bin", 0, 0o755), ("/", 0, 0o755)];
+        assert!(ancestors_safe(Path::new("/x/bin/cat"), &stat(unreadable)).is_err());
+
+        // On disk: a temp folder is never a root-owned chain (unless the tests run as root).
+        use std::os::unix::fs::MetadataExt;
+        let real_stat = |dir: &Path| {
+            std::fs::metadata(dir)
+                .ok()
+                .filter(std::fs::Metadata::is_dir)
+                .map(|m| (m.uid(), m.mode()))
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(ancestors_safe(&dir.path().join("cat"), &real_stat).is_err());
+        }
+        if Path::new("/usr/bin/cat").exists() {
+            assert!(ancestors_safe(Path::new("/usr/bin/cat"), &real_stat).is_ok());
+        }
+    }
+
     /// A plain rules file or folder gets the same ownership check as a followed link.
     #[test]
     fn plain_rules_files_and_folders_are_checked_like_links() {
@@ -5054,13 +5183,21 @@ host_executable(name="ls", paths=["/bin/ls"])
         let status = fewer.check_sync_status(None, &[], Some(&target));
         assert_eq!(status.unexported_count, 1);
         assert!(status.unexported_rules[0].contains("cannot be read"));
-
-        // The user's own Codex rules show as unimported, with where they came from.
+        // Codex loads our file too, so a broken one stops the import, and says so.
         std::fs::write(
             target.rules_dir().join("mine.rules"),
             "prefix_rule([\"wc\"])\n",
         )
         .expect("mine");
+        let status = fewer.check_sync_status(None, &[], Some(&target));
+        assert!(status.unimported_rules.is_empty());
+        assert!(status
+            .codex_refused
+            .as_deref()
+            .is_some_and(|r| r.contains(codex_rules::EXPORT_FILE)));
+
+        // The user's own Codex rules show as unimported, with where they came from.
+        std::fs::write(target.export_file(), format!("{}\n", codex_rules::HEADER)).expect("repair");
         let status = fewer.check_sync_status(None, &[], Some(&target));
         assert_eq!(
             status.unimported_rules,
