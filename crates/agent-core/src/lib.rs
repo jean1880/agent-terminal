@@ -13,6 +13,7 @@ pub mod caps;
 pub mod catalog;
 pub mod claude;
 pub mod codex;
+pub mod codex_rules;
 pub mod commands;
 pub mod event;
 pub mod form;

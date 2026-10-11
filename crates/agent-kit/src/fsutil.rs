@@ -10,6 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// a half-written one, and the contents are never readable by anyone else, even briefly. The
 /// directory is created when missing. A failure removes the temp file.
 pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_atomic_checked(path, bytes, |_| Ok(()))
+}
+
+/// [`write_private_atomic`] with a check between the write and the rename: `validate` gets the
+/// complete temp file (named `<file>.tmp<pid>-<n>`, so a loader that picks files by extension
+/// never sees it) and an `Err` from it leaves `path` exactly as it was. The temp file is
+/// created exclusively (`O_EXCL`), so a link planted at its name is never followed.
+pub fn write_private_atomic_checked(
+    path: &Path,
+    bytes: &[u8],
+    validate: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
@@ -27,12 +39,13 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let result = (|| {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        drop(f);
+        validate(&tmp)?;
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -93,6 +106,29 @@ mod tests {
         assert!(text.chars().all(|c| c == first));
         let names: Vec<_> = std::fs::read_dir(dir.path()).expect("dir").collect();
         assert_eq!(names.len(), 1, "no temp file left behind");
+    }
+
+    #[test]
+    fn a_failed_check_keeps_the_old_file_and_no_temp() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("x.rules");
+        write_private_atomic(&path, b"old").expect("first");
+        let mut seen = None;
+        let result = write_private_atomic_checked(&path, b"new", |tmp| {
+            seen = Some((
+                tmp.to_path_buf(),
+                std::fs::read(tmp).expect("candidate is complete"),
+            ));
+            Err(std::io::Error::other("rejected"))
+        });
+        assert_eq!(result.expect_err("rejected").to_string(), "rejected");
+        assert_eq!(std::fs::read(&path).expect("read"), b"old");
+        let (tmp, candidate) = seen.expect("validated");
+        assert_eq!(candidate, b"new");
+        assert!(!tmp.to_string_lossy().ends_with(".rules"));
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 1);
+        write_private_atomic_checked(&path, b"new", |_| Ok(())).expect("accepted");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
     }
 
     #[test]
