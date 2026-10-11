@@ -98,8 +98,8 @@ use crate::adapter::{
 use crate::caps::Capabilities;
 use crate::event::{
     Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, QuestionOption,
-    ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind, TurnState, Usage,
-    WorkerSnapshot, WorkerState,
+    QuestionSource, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind,
+    TurnState, Usage, WorkerSnapshot, WorkerState,
 };
 
 /// A Codex reasoning item's state: Codex shares a summary of its reasoning (label "summary").
@@ -1396,9 +1396,12 @@ impl CodexAdapter {
                 },
             );
             out.push(
-                Envelope::new(Event::QuestionRequested { questions })
-                    .item(item)
-                    .request(key),
+                Envelope::new(Event::QuestionRequested {
+                    questions,
+                    source: QuestionSource::Agent,
+                })
+                .item(item)
+                .request(key),
             );
             return;
         }
@@ -1941,6 +1944,11 @@ impl Adapter for CodexAdapter {
                 }
                 Ok(Vec::new())
             }
+            // Lane L1 (plans/2026-10-11_codex-requests-rules-and-reply-questions.md) answers
+            // `mcpServer/elicitation/request` here.
+            Command::SubmitForm { .. } => Err(AdapterError::Unsupported(
+                "Codex forms are not answered yet",
+            )),
             Command::Control { id, control } => match control {
                 Control::ListModels => {
                     let line = self.request(
@@ -4800,7 +4808,7 @@ mod tests {
         );
         assert!(matches!(
             &ev[0].event,
-            Event::QuestionRequested { questions }
+            Event::QuestionRequested { questions, .. }
                 if questions[0].id == "confirm" && questions[0].options[0].label == "Allow"
         ));
         let request = ev[0].request.clone().expect("canonical request");

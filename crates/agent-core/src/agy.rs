@@ -583,6 +583,9 @@ impl Adapter for AgyAdapter {
             Command::Approve { .. } | Command::Answer { .. } => Err(AdapterError::Unsupported(
                 "agy approvals go through the approval hook, not the adapter",
             )),
+            Command::SubmitForm { .. } => {
+                Err(AdapterError::Unsupported("agy never asks for a form"))
+            }
             Command::Control { id, control } => {
                 let action = match control {
                     Control::ListModels => self.side(id, SideKind::Models, &["models"]),

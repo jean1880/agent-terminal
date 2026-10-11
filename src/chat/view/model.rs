@@ -1505,7 +1505,7 @@ impl Transcript {
                     }
                 }));
             }
-            Event::QuestionRequested { questions } => {
+            Event::QuestionRequested { questions, .. } => {
                 let request = env.request.clone().unwrap_or_else(|| self.next_id("req"));
                 if self.requests.contains_key(&request) {
                     return out;
@@ -1638,6 +1638,8 @@ impl Transcript {
             }
             // The session's own bookkeeping: the notice beside it is what the user sees.
             Event::HandoffSeeded { .. } | Event::ModeChosen { .. } => {}
+            // Lane L1 (plans/2026-10-11_codex-requests-rules-and-reply-questions.md) renders forms.
+            Event::FormRequested { .. } | Event::FormResolved { .. } => {}
             // Background tasks are thread state, not transcript rows: the full list each time.
             Event::BackgroundTasks { tasks } => {
                 if self.background != *tasks {
@@ -2834,7 +2836,11 @@ mod tests {
     fn questions_resolve() {
         let mut t = Transcript::new();
         t.apply(
-            &ev(Event::QuestionRequested { questions: vec![] }).request("q"),
+            &ev(Event::QuestionRequested {
+                questions: vec![],
+                source: Default::default(),
+            })
+            .request("q"),
             Driver::Claude,
         );
         t.mark_questions_sent("q");
@@ -3181,7 +3187,11 @@ mod tests {
                 remembers: None,
             })
             .request("r1"),
-            ev(Event::QuestionRequested { questions: vec![] }).request("q1"),
+            ev(Event::QuestionRequested {
+                questions: vec![],
+                source: Default::default(),
+            })
+            .request("q1"),
             tasks(&[("t1", BackgroundTaskKind::Agent, Some("Map the crate"))]),
         ]
     }

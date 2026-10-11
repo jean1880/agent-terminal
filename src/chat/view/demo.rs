@@ -1008,6 +1008,7 @@ fn script() -> Vec<Step> {
     )));
     s.push(Step::Emit(
         Envelope::new(Event::QuestionRequested {
+            source: Default::default(),
             questions: vec![
                 Question {
                     id: "q1".into(),

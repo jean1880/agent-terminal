@@ -78,6 +78,7 @@ fn native_ux_matrix() {
                 ],
             }),
             Envelope::new(Event::QuestionRequested {
+                source: Default::default(),
                 questions: vec![Question {
                     id: "q1".into(),
                     header: "h".repeat(300),
@@ -406,6 +407,7 @@ fn native_click_matrix() {
         serde_json::json!({"description": "Find the writers", "subagent_type": "Explore"}),
     ));
     let asking = vec![Envelope::new(Event::QuestionRequested {
+        source: Default::default(),
         questions: vec![Question {
             id: "q1".into(),
             header: "Approach".into(),
@@ -704,6 +706,7 @@ fn native_toasts_clear_the_composer() {
     ));
     history.push(
         Envelope::new(Event::QuestionRequested {
+            source: Default::default(),
             questions: vec![Question {
                 id: "q1".into(),
                 header: "Approach".into(),

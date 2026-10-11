@@ -157,6 +157,11 @@ pub fn classify(item: ItemKind, name: &str, input: Option<&Value>) -> ToolTitle 
         .unwrap_or_else(|| kind_of_item(item, input));
     let empty = Value::Object(Map::new());
     let args = input.unwrap_or(&empty);
+    let kind = if kind == ToolKind::Edit && only_adds(args) {
+        ToolKind::Create
+    } else {
+        kind
+    };
     let target = match kind {
         ToolKind::Run => str_field(args, COMMAND_KEYS)
             .or_else(|| argv_field(args, COMMAND_KEYS))
@@ -266,6 +271,21 @@ fn edit_paths(args: &Value) -> Vec<String> {
         }
     }
     str_field(args, PATH_KEYS).into_iter().collect()
+}
+
+/// Whether a Codex patch (`changes`, or the changes as the input itself) only creates files:
+/// every change is `kind.type == "add"`. A patch that also updates, deletes or moves stays an
+/// edit.
+fn only_adds(args: &Value) -> bool {
+    let changes = args
+        .as_array()
+        .or_else(|| args.get("changes").and_then(Value::as_array));
+    changes.is_some_and(|changes| {
+        !changes.is_empty()
+            && changes
+                .iter()
+                .all(|c| c.pointer("/kind/type").and_then(Value::as_str) == Some("add"))
+    })
 }
 
 /// The command a Codex `commandActions` list describes, in the grammar: a single `read` is
@@ -770,9 +790,43 @@ mod tests {
             })
             .expect("W0 fileChange item");
         let path = changes[0]["path"].as_str().expect("path").to_owned();
+        assert_eq!(changes[0]["kind"]["type"], "update");
         assert_eq!(
-            title(ItemKind::FileChange, &path, changes),
+            title(ItemKind::FileChange, &path, changes.clone()),
             format!("Edit {path}")
+        );
+        // The same patch as a new file is a Create; mixed with an update it stays an Edit.
+        let mut created = changes.clone();
+        created[0]["kind"] = json!({"type": "add"});
+        assert_eq!(
+            title(ItemKind::FileChange, &path, created.clone()),
+            format!("Create {path}")
+        );
+        assert_eq!(
+            title(
+                ItemKind::FileChange,
+                &path,
+                json!({"changes": created.clone()})
+            ),
+            format!("Create {path}"),
+            "the changes under `changes` too"
+        );
+        let mut mixed = created.as_array().expect("changes").clone();
+        mixed.extend(changes.as_array().expect("changes").iter().cloned());
+        assert_eq!(
+            title(ItemKind::FileChange, &path, Value::Array(mixed)),
+            format!("Edit {path}, {path}")
+        );
+        let mut deleted = changes.clone();
+        deleted[0]["kind"] = json!({"type": "delete"});
+        assert_eq!(
+            title(ItemKind::FileChange, &path, deleted),
+            format!("Edit {path}")
+        );
+        assert_eq!(
+            title(ItemKind::FileChange, "file change", json!([])),
+            "Edit",
+            "no changes is not a Create"
         );
         assert_eq!(
             title(ItemKind::McpTool, "unraid.unraid_containers", json!({})),

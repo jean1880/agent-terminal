@@ -35,7 +35,7 @@ use crate::adapter::{
 use crate::caps::Capabilities;
 use crate::event::{
     AgentCommand, AgentCommandKind, BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event,
-    ItemKind, ItemStatus, Question, QuestionOption, ReasoningLabel, ReasoningState,
+    ItemKind, ItemStatus, Question, QuestionOption, QuestionSource, ReasoningLabel, ReasoningState,
     ResponseCapability, StreamKind, TurnState, Usage,
 };
 
@@ -825,6 +825,7 @@ impl ClaudeAdapter {
         let event = if tool == "AskUserQuestion" {
             Event::QuestionRequested {
                 questions: questions_of(&input),
+                source: QuestionSource::Agent,
             }
         } else {
             Event::ApprovalRequested {
@@ -1198,6 +1199,11 @@ impl Adapter for ClaudeAdapter {
                     &id,
                     json!({"subtype": "set_permission_mode", "mode": mode_name(mode)}),
                 )
+            }
+            Command::SubmitForm { .. } => {
+                return Err(AdapterError::Unsupported(
+                    "Claude's MCP forms are not raised through this adapter",
+                ))
             }
             Command::Control { id, control } => {
                 if matches!(control, Control::ContextUsage) {
@@ -2311,7 +2317,7 @@ mod tests {
         })
         .to_string();
         let out = a.feed(&frame);
-        let Event::QuestionRequested { questions } = &out[0].event else {
+        let Event::QuestionRequested { questions, .. } = &out[0].event else {
             panic!("expected a question, got {:?}", out[0].event);
         };
         assert_eq!(questions.len(), 1);

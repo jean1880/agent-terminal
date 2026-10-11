@@ -183,6 +183,15 @@ pub enum Command {
         request: String,
         answers: Value,
     },
+    /// Answer a form ([`crate::event::Event::FormRequested`]). `content` is the filled-in
+    /// fields for an accepted field form, and `None` otherwise. The adapter sends only what
+    /// [`crate::form::answer`] returns for it, and refuses content that fails.
+    SubmitForm {
+        request: String,
+        action: crate::form::FormAction,
+        #[serde(default)]
+        content: Option<Value>,
+    },
     /// `effort: None` leaves the effort as it is. Claude has no in-session effort control, so
     /// an effort different from the session's is a respawn; agy's effort is part of `model`.
     SetModel {

@@ -431,6 +431,7 @@ pub(crate) mod tests {
         let mut asked = Transcript::new();
         asked.apply(
             &Envelope::new(Event::QuestionRequested {
+                source: Default::default(),
                 questions: vec![agent_core::event::Question {
                     id: "q1".into(),
                     header: "Approach".into(),

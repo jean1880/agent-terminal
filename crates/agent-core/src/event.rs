@@ -155,9 +155,26 @@ pub enum Event {
         requested: crate::adapter::Mode,
         effective: crate::adapter::Mode,
     },
-    /// Structured questions (Claude AskUserQuestion).
+    /// Structured questions (Claude AskUserQuestion, Codex `requestUserInput`), or questions the
+    /// app found in a finished reply ([`QuestionSource::Reply`]).
     QuestionRequested {
         questions: Vec<Question>,
+        /// Who asked. A reply question is answered with a new prompt, not over the protocol.
+        #[serde(default)]
+        source: QuestionSource,
+    },
+    /// A tool server asks the user to fill in a form or open a link (Codex
+    /// `mcpServer/elicitation/request`). `Envelope::request` is the id to answer with
+    /// [`crate::adapter::Command::SubmitForm`].
+    FormRequested {
+        /// The MCP server asking, as the agent names it.
+        server: String,
+        message: String,
+        form: crate::form::Form,
+    },
+    /// The form was answered or withdrawn; the UI closes the card.
+    FormResolved {
+        action: crate::form::FormAction,
     },
     /// Context-window occupancy for the gauge.
     UsageUpdated {
@@ -359,6 +376,20 @@ pub enum StepStatus {
     Pending,
     InProgress,
     Completed,
+}
+
+/// Where a question card came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionSource {
+    /// The app found a question with choices at the end of the agent's finished reply; the
+    /// chosen answer is sent as the next prompt.
+    Reply,
+    /// The agent asked through its question tool; the answer goes back over the protocol. Also
+    /// what a source from a newer build reads as.
+    #[default]
+    #[serde(other)]
+    Agent,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

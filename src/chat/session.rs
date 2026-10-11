@@ -5253,6 +5253,7 @@ mod tests {
                     text: leak.clone(),
                 },
                 Event::QuestionRequested {
+                    source: Default::default(),
                     questions: vec![agent_core::event::Question {
                         id: "q".into(),
                         header: leak.clone(),
