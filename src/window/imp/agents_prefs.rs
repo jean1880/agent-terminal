@@ -52,6 +52,10 @@ const ENV_FILE_HELP: &str =
     "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
 
+const PERMISSION_SOURCES_HELP: &str =
+    "Extra permissions.toml files to import from and export to, separated by ':' (absolute or \
+     ~/ paths to existing files). Blank: none";
+
 fn validation_row() -> adw::ActionRow {
     adw::ActionRow::builder()
         .title("Not Saved")
@@ -179,6 +183,11 @@ fn env_file_ok(text: &str) -> bool {
 }
 
 impl AgentTerminalWindow {
+    /// The permission files the user named in Settings, `~/` expanded.
+    fn permission_sources(&self) -> Vec<std::path::PathBuf> {
+        self.config.borrow().permission_source_paths()
+    }
+
     /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
     fn edit_agent_profile(&self, driver: Driver, edit: impl FnOnce(&mut Profile)) {
         {
@@ -352,6 +361,17 @@ impl AgentTerminalWindow {
         ));
         group.add(&confirm_row);
 
+        // Extra permission files to import from and export to; none unless the user names them.
+        let sources_row = adw::EntryRow::builder()
+            .title("Permission Sources")
+            .tooltip_text(PERMISSION_SOURCES_HELP)
+            .text(self.config.borrow().permission_sources.join(":"))
+            .build();
+        let sources_error = validation_row();
+        show_validation(&sources_row, &sources_error, PERMISSION_SOURCES_HELP, None);
+        group.add(&sources_row);
+        group.add(&sources_error);
+
         // Warning row: shown prominently when rules differ between Agent Terminal and agent configs
         let warning_row = adw::ActionRow::builder()
             .title("Permissions Out of Sync")
@@ -424,17 +444,24 @@ impl AgentTerminalWindow {
             export_btn,
             #[weak]
             manage_row,
+            #[weak]
+            obj,
             move || {
                 if let Some(path) = crate::always_allow::path() {
                     let rules = crate::always_allow::AlwaysRules::load(&path);
+                    manage_row.set_subtitle(&format!(
+                        "{} active rules stored in {}",
+                        rules.rules.len(),
+                        crate::always_allow::FILE_NAME
+                    ));
+                    let status = rules.check_sync_status(None, &obj.imp().permission_sources());
                     Self::update_sync_indicator(
-                        &rules,
+                        &status,
                         &warning_row,
                         &import_row,
                         &import_btn,
                         &export_row,
                         &export_btn,
-                        &manage_row,
                     );
                 }
             }
@@ -442,6 +469,29 @@ impl AgentTerminalWindow {
 
         // Initial sync state check
         sync_cb();
+
+        // Applied as it is typed once valid; an invalid draft keeps the saved list in use.
+        let on_sources = sync_cb.clone();
+        sources_row.connect_changed(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            sources_error,
+            move |row| match crate::config::parse_permission_sources(&row.text()) {
+                Ok(parsed) => {
+                    show_validation(row, &sources_error, PERMISSION_SOURCES_HELP, None);
+                    let imp = obj.imp();
+                    if imp.config.borrow().permission_sources != parsed {
+                        imp.config.borrow_mut().permission_sources = parsed;
+                        imp.schedule_config_save();
+                        on_sources();
+                    }
+                }
+                Err(reason) => {
+                    show_validation(row, &sources_error, PERMISSION_SOURCES_HELP, Some(&reason));
+                }
+            }
+        ));
 
         let on_sync_for_diff = sync_cb.clone();
         view_diff_btn.connect_clicked(glib::clone!(
@@ -474,7 +524,8 @@ impl AgentTerminalWindow {
                     let imp = obj.imp();
                     if let Some(path) = crate::always_allow::path() {
                         let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                        let added_count = rules.import_agent_permissions(None);
+                        let added_count =
+                            rules.import_agent_permissions(None, &imp.permission_sources());
                         if added_count > 0 {
                             let _ = rules.save(&path);
                             imp.show_toast(&format!(
@@ -528,7 +579,8 @@ impl AgentTerminalWindow {
                     let imp = obj.imp();
                     if let Some(path) = crate::always_allow::path() {
                         let rules = crate::always_allow::AlwaysRules::load(&path);
-                        let exported_count = rules.export_agent_permissions(None);
+                        let exported_count =
+                            rules.export_agent_permissions(None, &imp.permission_sources());
                         if exported_count > 0 {
                             imp.show_toast(&format!(
                                 "Exported {exported_count} permission rules to agent configurations"
@@ -576,21 +628,13 @@ impl AgentTerminalWindow {
     }
 
     fn update_sync_indicator(
-        rules: &crate::always_allow::AlwaysRules,
+        status: &crate::always_allow::PermissionSyncStatus,
         warning_row: &adw::ActionRow,
         import_row: &adw::ActionRow,
         import_btn: &gtk4::Button,
         export_row: &adw::ActionRow,
         export_btn: &gtk4::Button,
-        manage_row: &adw::ActionRow,
     ) {
-        manage_row.set_subtitle(&format!(
-            "{} active rules stored in {}",
-            rules.rules.len(),
-            crate::always_allow::FILE_NAME
-        ));
-
-        let status = rules.check_sync_status(None);
         if status.is_out_of_sync() {
             warning_row.set_subtitle(&status.summary());
             warning_row.set_visible(true);
@@ -661,7 +705,7 @@ impl AgentTerminalWindow {
             return;
         };
         let rules = crate::always_allow::AlwaysRules::load(&path);
-        let status = rules.check_sync_status(None);
+        let status = rules.check_sync_status(None, &self.permission_sources());
 
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
         content.set_margin_top(12);
@@ -755,7 +799,7 @@ impl AgentTerminalWindow {
             return;
         };
         let rules = crate::always_allow::AlwaysRules::load(&path);
-        let status = rules.check_sync_status(None);
+        let status = rules.check_sync_status(None, &self.permission_sources());
 
         let subtitle = if status.is_out_of_sync() {
             format!(
@@ -861,7 +905,7 @@ impl AgentTerminalWindow {
                 match response.as_str() {
                     "import" => {
                         let mut rules = crate::always_allow::AlwaysRules::load(&p);
-                        let count = rules.import_agent_permissions(None);
+                        let count = rules.import_agent_permissions(None, &imp.permission_sources());
                         if count > 0 {
                             let _ = rules.save(&p);
                             imp.show_toast(&format!(
@@ -876,7 +920,7 @@ impl AgentTerminalWindow {
                     }
                     "export" => {
                         let rules = crate::always_allow::AlwaysRules::load(&p);
-                        let count = rules.export_agent_permissions(None);
+                        let count = rules.export_agent_permissions(None, &imp.permission_sources());
                         if count > 0 {
                             imp.show_toast(&format!(
                                 "Exported {count} permission rules to agent configurations"
