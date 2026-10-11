@@ -258,5 +258,6 @@ undoes it.
 
 ## Log
 
+- 2026-10-11: All four lanes merged on master (`bc3a03fb`), gate green (16 native cases). Reviews: rust-reviewer APPROVE/PASS per lane; fresh red-teams SHIP (L1-core after 3 rounds: symlink judging, swap-proof session grants with an Allow-time re-check and canonical-path renames, same-card writes; L2 after 2 rounds: all-or-nothing import incl. our own file, pinned programs with a root-owned chain, safe symlink following); Codex peer SHIP on the final targeted re-check; agy peer findings SEC-01..14 addressed (confirmation run pending). Live: `live_smoke.py --agent codex` 16/16. NOT verified live: the `**` summary render (current model shares no summary on short turns; covered by tests on the recorded shape), how Codex applies an exported allow inside a compound `bash -lc` script (needs writing the user's real `~/.codex/rules` or copying Codex's credentials; left UNVERIFIED, the export warning says matching commands run without asking). Added mid-way at the user's request: an animated closing screen (lane-closing-animation), in progress.
 - 2026-10-11: Wave 0 contract written (`form.rs`, `FormRequested`/`FormResolved`, `SubmitForm`,
   `QuestionSource`); workspace builds, clippy clean, agent-core tests pass.
