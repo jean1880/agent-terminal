@@ -50,14 +50,14 @@ pub(super) fn parse_argv(text: &str) -> Result<Vec<String>, String> {
         .map_err(|e| e.message().to_owned())
 }
 
-/// The tool a field's text describes: a preset when the argv is exactly one, else a custom tool
-/// named after its program. `Err` is the reason to show; `Ok(None)` is an empty field.
 /// The Command field's title while its text is wrong. Row titles are Pango markup, and `why`
 /// can quote what was typed (`&`, `<`, an unbalanced quote), so it is escaped.
 fn command_error_title(why: &str) -> String {
     format!("Command — {}", gtk4::glib::markup_escape_text(why))
 }
 
+/// The tool a field's text describes: a preset when the argv is exactly one, else a custom tool
+/// named after its program. `Err` is the reason to show; `Ok(None)` is an empty field.
 pub(super) fn tool_from_text(text: &str) -> Result<Option<DiffTool>, String> {
     let argv = parse_argv(text)?;
     if argv.is_empty() {
