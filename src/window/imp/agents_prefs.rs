@@ -280,6 +280,35 @@ impl AgentTerminalWindow {
         dialog.add(&page);
     }
 
+    /// A dropdown row's selected value is never cut short: the value label stops ellipsizing,
+    /// so a long subtitle wraps instead of squeezing it ("Agent T…" for a theme name). The
+    /// label is made when the row is first shown, so this runs again then and on every change.
+    pub(super) fn keep_value_whole(row: &adw::ComboRow) {
+        Self::whole_value_now(row);
+        row.connect_map(Self::whole_value_now);
+        row.connect_selected_notify(Self::whole_value_now);
+    }
+
+    fn whole_value_now(row: &adw::ComboRow) {
+        let selected = row
+            .selected_item()
+            .and_downcast::<gtk4::StringObject>()
+            .map(|s| s.string());
+        let mut stack = vec![row.clone().upcast::<gtk4::Widget>()];
+        while let Some(widget) = stack.pop() {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                if selected.as_deref() == Some(label.text().as_str()) {
+                    label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+    }
+
     /// The "Default Agent for New Threads" dropdown. Applies on change.
     pub(super) fn default_agent_row(&self) -> adw::ComboRow {
         let obj = self.obj();
@@ -292,6 +321,7 @@ impl AgentTerminalWindow {
             .model(&gtk4::StringList::new(&names))
             .selected(choices.iter().position(|(d, _)| *d == current).unwrap_or(0) as u32)
             .build();
+        Self::keep_value_whole(&default_row);
         default_row.connect_selected_notify(glib::clone!(
             #[weak]
             obj,
@@ -1739,9 +1769,8 @@ pub(super) mod tests {
     /// Every row and group title under `root` is non-empty and, when Pango reads it as markup,
     /// valid markup: a bare `&` makes the parse fail and the title renders blank (F20).
     pub(crate) fn assert_titles_render(root: &impl IsA<gtk4::Widget>, what: &str) {
-        let mut stack = vec![root.clone().upcast::<gtk4::Widget>()];
         let mut checked = 0;
-        while let Some(widget) = stack.pop() {
+        for widget in crate::testutil::descendants(root.upcast_ref()) {
             let titled = if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
                 Some((row.title().to_string(), row.uses_markup()))
             } else {
@@ -1762,13 +1791,57 @@ pub(super) mod tests {
                     checked += 1;
                 }
             }
-            let mut child = widget.first_child();
-            while let Some(widget) = child {
-                child = widget.next_sibling();
-                stack.push(widget);
-            }
         }
         assert!(checked > 0, "{what}: no titled rows found");
+    }
+
+    /// A dropdown row shows its whole selected value, even in a narrow window beside a long
+    /// subtitle (ui-audit #9: "Agent T…", "Auto…").
+    #[test]
+    #[ignore = "native GTK layout; run alone in an isolated display"]
+    fn native_dropdown_rows_show_their_whole_value() {
+        gtk4::init().expect("GTK must be available for the native gate");
+        adw::init().expect("libadwaita init");
+        crate::load_css();
+        let ctx = glib::MainContext::default();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.Dropdowns")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>)
+            .expect("registering a non-unique application");
+        let win = super::super::super::AgentTerminalWindow::new(&app);
+        let rows: Vec<adw::ComboRow> = vec![win.imp().default_agent_row()];
+        for width in [360, 1400] {
+            for row in &rows {
+                let window = gtk4::Window::new();
+                window.set_default_size(width, 300);
+                let list = gtk4::ListBox::new();
+                list.append(row);
+                window.set_child(Some(&list));
+                window.present();
+                crate::testutil::settle(&ctx);
+                let selected = row
+                    .selected_item()
+                    .and_downcast::<gtk4::StringObject>()
+                    .expect("a selected item")
+                    .string();
+                let value = crate::testutil::descendants(row.upcast_ref())
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk4::Label>().ok())
+                    .find(|l| l.text() == selected && l.is_mapped())
+                    .expect("the value label");
+                assert!(
+                    !value.layout().is_ellipsized(),
+                    "{selected:?} is truncated at {width}px in {:?}",
+                    row.title()
+                );
+                list.remove(row);
+                window.destroy();
+            }
+        }
     }
 
     /// Called by the window smoke test on GTK's thread.

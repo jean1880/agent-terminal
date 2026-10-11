@@ -201,10 +201,7 @@ fn native_ux_matrix() {
             .set_activity(&model::Activity::WaitingForWorkers {
                 names: vec!["a-very-long-worker-name".into(); 3],
             });
-        for _ in 0..30 {
-            while ctx.iteration(false) {}
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        crate::testutil::settle(&ctx);
         let (edge, available) = inner.header.right_edge();
         if width == 360 {
             assert!(
@@ -266,10 +263,7 @@ fn shown_view(
 
 /// Lets layout, scrolling and idle work run.
 fn settle(ctx: &glib::MainContext) {
-    for _ in 0..40 {
-        while ctx.iteration(false) {}
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    crate::testutil::settle(ctx);
 }
 
 /// Where a press at the centre of `w` lands in `window`. A selectable label there would claim
@@ -729,10 +723,16 @@ fn native_toasts_clear_the_composer() {
                 .title("Copied the whole thing")
                 .build(),
         );
-        for _ in 0..40 {
-            while ctx.iteration(false) {}
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let on_screen = |overlay: &adw::ToastOverlay| {
+            crate::testutil::descendants(overlay.upcast_ref())
+                .into_iter()
+                .any(|w| w.type_().name() == "AdwToastWidget" && w.is_mapped())
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || on_screen(&overlay)),
+            "the toast never appeared"
+        );
+        crate::testutil::settle(&ctx);
         let toast = crate::testutil::descendants(overlay.upcast_ref())
             .into_iter()
             .find(|w| w.type_().name() == "AdwToastWidget" && w.is_mapped())
