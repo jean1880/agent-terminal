@@ -2624,6 +2624,7 @@ impl AgentTerminalWindow {
         view.set_model_source(ModelCatalog::shared());
         view.set_account_status(AccountStatus::shared());
         view.set_diff_source(diffs);
+        view.set_workspace(std::path::Path::new(&dir));
         if demo.is_some() {
             crate::chat::view::demo::configure_demo_view(&view);
         }

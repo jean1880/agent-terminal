@@ -15,6 +15,7 @@ use agent_core::event::{Decision, Envelope};
 
 pub mod session;
 pub mod view;
+pub mod workspace_files;
 
 /// What the view can ask of a thread. Results come back as envelopes through the sink given
 /// to the backend at construction (including `ControlResult` for `control`).

@@ -32,6 +32,8 @@ mod typeahead;
 pub mod usage;
 
 #[cfg(test)]
+mod gap_tests;
+#[cfg(test)]
 mod ux_tests;
 
 use std::cell::{Cell, RefCell};
@@ -46,6 +48,7 @@ use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
+use super::workspace_files;
 use super::{ChatBackend, DiffAsk, DiffSource, EnvelopeSink, ModelSource, SessionStatus};
 use crate::account_status::AccountStatus;
 use cards::{RowEvent, RowSink};
@@ -177,6 +180,10 @@ pub(crate) struct Inner {
     subagent_panel: RefCell<Option<Rc<subagents::SubagentPanel>>>,
     /// Sub-agent items (and their steps) changed since the last flush.
     subagent_changes: RefCell<Vec<String>>,
+    /// The thread's folder: what the app's own `@` file index lists for agents that do not
+    /// answer `Control::FileSuggestions` themselves.
+    workspace: RefCell<Option<std::path::PathBuf>>,
+    file_seq: Cell<u64>,
 }
 
 impl ChatView {
@@ -237,6 +244,8 @@ impl ChatView {
                 subagent_shelf,
                 subagent_panel: RefCell::new(None),
                 subagent_changes: RefCell::new(Vec::new()),
+                workspace: RefCell::new(None),
+                file_seq: Cell::new(0),
             }
         });
 
@@ -367,6 +376,14 @@ impl ChatView {
     pub fn connect_action(&self, f: impl Fn(&ViewAction) + 'static) {
         if let Some(inner) = self.inner() {
             inner.actions.borrow_mut().push(Rc::new(f));
+        }
+    }
+
+    /// Tells the view the thread's folder, so `@` lists its files for agents that do not list
+    /// them themselves (agy, Codex).
+    pub fn set_workspace(&self, dir: &std::path::Path) {
+        if let Some(inner) = self.inner() {
+            *inner.workspace.borrow_mut() = Some(dir.to_path_buf());
         }
     }
 
@@ -518,6 +535,9 @@ impl Inner {
         }
         let changes = self.model.borrow_mut().apply(env, driver);
         self.handle(changes);
+        if matches!(env.event, Event::TurnCompleted { .. }) && polls_context(driver) {
+            self.poll_context_soon();
+        }
         // Phase changes are discrete events: never walk the transcript for each text delta.
         if matches!(
             env.event,
@@ -674,6 +694,22 @@ impl Inner {
             return;
         }
         self.requests.resolve(request, result);
+    }
+
+    /// Asks the agent for its context occupancy once this turn has unwound, so the gauge fills
+    /// without the user opening `/context`. The reply is a `UsageUpdated` from the adapter; the
+    /// request itself needs no answer here.
+    fn poll_context_soon(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(inner) = weak.upgrade() else { return };
+            if !inner.backend.status().capabilities.context_usage {
+                return;
+            }
+            inner
+                .requests
+                .ask(inner.backend.as_ref(), Control::ContextUsage, |_| {});
+        });
     }
 
     fn refresh_status(&self) {
@@ -965,6 +1001,13 @@ impl Inner {
     }
 }
 
+/// Whether the host must ask for the context gauge itself after each turn. Codex pushes its
+/// occupancy (`thread/tokenUsage/updated`); Claude and agy report it only when asked
+/// (`get_context_usage`, agy's running token count), which left Claude's gauge empty (F11).
+fn polls_context(driver: Driver) -> bool {
+    !matches!(driver, Driver::Codex)
+}
+
 /// The notice for a whole prompt that is a built-in this agent cannot back (`/mcp` on Codex):
 /// what it lacks, as the greyed-control tooltip would say. `None` for anything else, including
 /// a command the agent lists itself (that one is the agent's to run).
@@ -1075,12 +1118,32 @@ impl ComposerHost for Inner {
     }
 
     fn request_files(&self, query: &str) -> Option<String> {
-        if !self.backend.status().capabilities.file_suggestions {
-            return None;
+        if self.backend.status().capabilities.file_suggestions {
+            return Some(self.backend.control(Control::FileSuggestions {
+                query: query.to_owned(),
+            }));
         }
-        Some(self.backend.control(Control::FileSuggestions {
-            query: query.to_owned(),
-        }))
+        // The agent lists no files: the app's own index of the thread's folder answers, off the
+        // main thread. The reply goes through the same request id path as the agent's.
+        let root = self.workspace.borrow().clone()?;
+        let id = {
+            self.file_seq.set(self.file_seq.get() + 1);
+            format!("app-files-{}", self.file_seq.get())
+        };
+        let weak = self
+            .view()
+            .and_then(|v| v.inner())
+            .map(|i| Rc::downgrade(&i))?;
+        let (reply_id, query) = (id.clone(), query.to_owned());
+        glib::spawn_future_local(async move {
+            let files = gtk4::gio::spawn_blocking(move || workspace_files::suggest(&root, &query))
+                .await
+                .unwrap_or_default();
+            if let Some(inner) = weak.upgrade() {
+                inner.composer.file_reply(&reply_id, files);
+            }
+        });
+        Some(id)
     }
 
     fn placeholder(&self) -> String {
@@ -1094,10 +1157,8 @@ impl ComposerHost for Inner {
 
 /// The composer's hint for the thread's CURRENT agent: its name and the triggers it backs.
 fn placeholder_text(status: &SessionStatus) -> String {
-    let mut tips = vec!["/ commands"];
-    if status.capabilities.file_suggestions {
-        tips.push("@ files");
-    }
+    // `@` works for every agent: the agent's own list (Claude) or the app's index of the folder.
+    let mut tips = vec!["/ commands", "@ files"];
     if status
         .commands
         .iter()
