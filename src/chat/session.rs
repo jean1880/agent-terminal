@@ -2707,8 +2707,7 @@ impl Inner {
             workspace: PathBuf::from(self.open.borrow().cwd.clone()),
             homes: codex_policy::child_homes(
                 &self.launch_env.borrow(),
-                std::env::var_os("HOME"),
-                std::env::var_os("CODEX_HOME"),
+                crate::codex_home::process_env(),
             ),
             project_writable: mode == Mode::AcceptEdits
                 || self.wanted_mode.get() == Mode::AcceptEdits,

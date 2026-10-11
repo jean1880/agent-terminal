@@ -39,17 +39,6 @@ pub(super) struct ChildHomes {
     pub codex: Option<PathBuf>,
 }
 
-/// The value of `name` in the Codex child's environment: the profile's env file wins, then a
-/// `clear_env` removal, then what the app inherited. Empty counts as unset (as Codex reads it).
-fn child_var(env: &AgentEnv, name: &str, inherited: Option<OsString>) -> Option<OsString> {
-    let value = match env.env.iter().rev().find(|(k, _)| k == name) {
-        Some((_, v)) => Some(OsString::from(v)),
-        None if env.unset.iter().any(|k| k == name) => None,
-        None => inherited,
-    };
-    value.filter(|v| !v.is_empty())
-}
-
 /// An absolute path with no `.` or `..` component: one that names one place as written.
 fn plain_absolute(path: PathBuf) -> Option<PathBuf> {
     (path.is_absolute()
@@ -59,19 +48,21 @@ fn plain_absolute(path: PathBuf) -> Option<PathBuf> {
     .then_some(path)
 }
 
-/// `HOME` and `CODEX_HOME` as the Codex child sees them (`inherited_*`: the app's own values).
-/// A relative value, or one with `.` or `..`, is unknown; `CODEX_HOME` unset is `$HOME/.codex`.
-/// The same order as the rules lane's `codex_home::resolve`, which this can be swapped for.
-pub(super) fn child_homes(
-    env: &AgentEnv,
-    inherited_home: Option<OsString>,
-    inherited_codex: Option<OsString>,
-) -> ChildHomes {
-    let home = child_var(env, "HOME", inherited_home).and_then(|h| plain_absolute(h.into()));
-    let codex = match child_var(env, "CODEX_HOME", inherited_codex) {
-        Some(value) => plain_absolute(value.into()),
-        None => home.as_ref().map(|h| h.join(".codex")),
-    };
+/// `HOME` and `CODEX_HOME` as the Codex child sees them, through the one resolver the rules
+/// lane uses too ([`crate::codex_home`]): `inherited` is the app's own environment, `env` the
+/// thread's (its profile's variables and what `clear_env` removes). A relative value, or one
+/// with `.` or `..`, is unknown; `CODEX_HOME` unset is `$HOME/.codex`.
+pub(super) fn child_homes(env: &AgentEnv, inherited: Vec<(String, String)>) -> ChildHomes {
+    let child = crate::codex_home::child_env(&crate::codex_home::Inputs {
+        inherited,
+        shell_path: None,
+        env_file: env.env.clone(),
+        clear: env.unset.clone(),
+    });
+    let home = crate::codex_home::get(&child, "HOME").and_then(|h| plain_absolute(h.into()));
+    let codex = crate::codex_home::resolve(&child)
+        .ok()
+        .and_then(plain_absolute);
     ChildHomes { home, codex }
 }
 
@@ -684,24 +675,27 @@ mod tests {
                 .collect(),
             unset: unset.iter().map(|k| (*k).into()).collect(),
         };
-        let gui_home = Some(OsString::from("/home/gui"));
-        let gui_codex = Some(OsString::from("/opt/gui-codex"));
+        // The app's own environment.
+        let app = |codex: Option<&str>| -> Vec<(String, String)> {
+            let mut vars = vec![("HOME".to_owned(), "/home/gui".to_owned())];
+            vars.extend(codex.map(|c| ("CODEX_HOME".to_owned(), c.to_owned())));
+            vars
+        };
         assert_eq!(
-            child_homes(&env(&[], &[]), gui_home.clone(), None),
+            child_homes(&env(&[], &[]), app(None)),
             ChildHomes {
                 home: Some("/home/gui".into()),
                 codex: Some("/home/gui/.codex".into())
             }
         );
         assert_eq!(
-            child_homes(&env(&[], &[]), gui_home.clone(), gui_codex.clone()).codex,
+            child_homes(&env(&[], &[]), app(Some("/opt/gui-codex"))).codex,
             Some("/opt/gui-codex".into())
         );
         assert_eq!(
             child_homes(
                 &env(&[("HOME", "/home/p"), ("CODEX_HOME", "/p/codex")], &[]),
-                gui_home.clone(),
-                gui_codex.clone()
+                app(Some("/opt/gui-codex"))
             ),
             ChildHomes {
                 home: Some("/home/p".into()),
@@ -710,42 +704,26 @@ mod tests {
         );
         // clear_env removes the inherited value: back to the default under the child's home.
         assert_eq!(
-            child_homes(
-                &env(&[], &["CODEX_HOME"]),
-                gui_home.clone(),
-                gui_codex.clone()
-            )
-            .codex,
+            child_homes(&env(&[], &["CODEX_HOME"]), app(Some("/opt/gui-codex"))).codex,
             Some("/home/gui/.codex".into())
         );
         // Relative, `..` or a missing home: unknown, never guessed.
+        for codex in ["rel/codex", "/opt/x/../codex"] {
+            assert_eq!(
+                child_homes(&env(&[("CODEX_HOME", codex)], &[]), app(None)).codex,
+                None,
+                "{codex}"
+            );
+        }
         assert_eq!(
-            child_homes(
-                &env(&[("CODEX_HOME", "rel/codex")], &[]),
-                gui_home.clone(),
-                None
-            )
-            .codex,
-            None
-        );
-        assert_eq!(
-            child_homes(
-                &env(&[("CODEX_HOME", "/opt/x/../codex")], &[]),
-                gui_home.clone(),
-                None
-            )
-            .codex,
-            None
-        );
-        assert_eq!(
-            child_homes(&env(&[], &["HOME"]), gui_home.clone(), None),
+            child_homes(&env(&[], &["HOME"]), app(None)),
             ChildHomes {
                 home: None,
                 codex: None
             }
         );
         assert_eq!(
-            child_homes(&env(&[("HOME", "")], &[]), None, None).home,
+            child_homes(&env(&[("HOME", "")], &[]), Vec::new()).home,
             None
         );
     }
