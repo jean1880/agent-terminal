@@ -1,7 +1,9 @@
 # Weekly dependency updates. Minor and patch bumps arrive as one grouped PR per ecosystem;
 # majors stay separate so each can be read on its own. The gtk-rs crates move in lockstep
 # (gtk4, libadwaita, vte4, sourceview5 and glib-build-tools all pin the same glib), so they
-# are grouped across every update type: a lone bump of one of them can never build.
+# are grouped across every update type: a lone bump of one of them can never build. The group
+# includes their indirect -sys crates: gtk4 0.11.5 needs gtk4-sys 0.11.5, but only requires
+# "0.11", so bumping the wrapper alone leaves the lockfile on a -sys crate it cannot compile with.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -10,16 +12,27 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    # Indirect dependencies too, so the -sys crates (and other lockfile-only crates) can move.
+    allow:
+      - dependency-type: all
     commit-message:
       prefix: "chore(deps)"
     groups:
       gtk-rs:
         patterns:
-          - "gtk4"
-          - "libadwaita"
-          - "vte4"
-          - "sourceview5"
-          - "glib-build-tools"
+          - "gtk4*"
+          - "gdk4*"
+          - "gsk4*"
+          - "gdk-pixbuf*"
+          - "glib*"
+          - "gio*"
+          - "gobject-sys"
+          - "pango*"
+          - "cairo*"
+          - "graphene*"
+          - "libadwaita*"
+          - "vte4*"
+          - "sourceview5*"
       cargo-minor-patch:
         update-types: [minor, patch]
 
