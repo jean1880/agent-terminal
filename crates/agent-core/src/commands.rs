@@ -9,7 +9,7 @@
 
 use std::ops::Range;
 
-use crate::caps::Capabilities;
+use crate::caps::{Capabilities, Feature};
 use crate::event::{AgentCommand, AgentCommandKind};
 
 // ---------------------------------------------------------------------------------------------
@@ -115,20 +115,25 @@ impl Builtin {
     /// Whether the agent behind `caps` can back this command. Commands that need a native panel
     /// the agent cannot answer are hidden rather than offered and failed.
     pub fn available(&self, caps: &Capabilities) -> bool {
+        self.feature().is_none_or(|f| caps.supports(f))
+    }
+
+    /// The capability this command needs, if any. Compact falls back to handoff-to-self, so it
+    /// needs none and is always offered.
+    pub fn feature(&self) -> Option<Feature> {
         match self.action {
-            BuiltinAction::OpenModelPicker => caps.model_list,
-            BuiltinAction::OpenMcpPanel => caps.mcp_panel,
-            BuiltinAction::OpenSettings => caps.settings_panel,
-            BuiltinAction::OpenUsage => caps.usage,
-            BuiltinAction::OpenContext => caps.context_usage,
-            // Compact falls back to handoff-to-self, so it is always offered.
+            BuiltinAction::OpenModelPicker => Some(Feature::ModelList),
+            BuiltinAction::OpenMcpPanel => Some(Feature::McpPanel),
+            BuiltinAction::OpenSettings => Some(Feature::SettingsPanel),
+            BuiltinAction::OpenUsage => Some(Feature::Usage),
+            BuiltinAction::OpenContext => Some(Feature::ContextUsage),
             BuiltinAction::Compact
             | BuiltinAction::Handoff
             | BuiltinAction::Fork
             | BuiltinAction::SetMode
             | BuiltinAction::Rewind
             | BuiltinAction::NewThread
-            | BuiltinAction::Help => true,
+            | BuiltinAction::Help => None,
         }
     }
 }
@@ -237,6 +242,16 @@ pub fn resolve_alias(name: &str, caps: &Capabilities) -> Option<&'static Builtin
         .iter()
         .find(|b| b.answers_to(&name))
         .filter(|b| b.available(caps))
+}
+
+/// A typed name or alias that is a built-in the agent CANNOT back, with the missing feature:
+/// the caller answers with [`Capabilities::unsupported_note`] instead of sending the line to
+/// the agent as a prompt.
+pub fn unavailable_builtin(name: &str, caps: &Capabilities) -> Option<(&'static Builtin, Feature)> {
+    let name = normalize_name(name);
+    let builtin = BUILTINS.iter().find(|b| b.answers_to(&name))?;
+    let feature = builtin.feature().filter(|f| !caps.supports(*f))?;
+    Some((builtin, feature))
 }
 
 /// The text to send the agent for a compaction (Claude `/compact`), or `None` when it has no such

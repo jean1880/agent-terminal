@@ -645,6 +645,19 @@ impl Composer {
         true
     }
 
+    /// The `@` rows the popup shows right now.
+    #[cfg(test)]
+    pub fn file_entries(&self) -> Vec<String> {
+        self.entries
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                Entry::File(path) => Some(path.clone()),
+                Entry::Command(_) => None,
+            })
+            .collect()
+    }
+
     pub fn is_waiting_for(&self, request: &str) -> bool {
         self.files.borrow().is_waiting_for(request)
     }
