@@ -31,6 +31,9 @@ pub struct Capabilities {
     pub questions: bool,
     /// Has a read-only planning mode (`Mode::Plan`).
     pub plan_mode: bool,
+    /// Passes forms from its tool servers (MCP elicitation) to the UI to fill in or decline.
+    #[serde(default)]
+    pub forms: bool,
 }
 
 impl Capabilities {
@@ -60,6 +63,8 @@ impl Capabilities {
             streams_reasoning: true,
             questions: true,
             plan_mode: true,
+            // The stream-json control protocol raises no MCP elicitation the adapter maps.
+            forms: false,
         }
     }
 
@@ -82,6 +87,8 @@ impl Capabilities {
             streams_reasoning: true,
             questions: false,
             plan_mode: true,
+            // Headless agy has no channel for a tool server's form.
+            forms: false,
         }
     }
 
@@ -114,6 +121,8 @@ impl Capabilities {
             questions: true,
             // Plan = read-only sandbox and never escalate (`codex.rs`, "Modes").
             plan_mode: true,
+            // `mcpServer/elicitation/request` is a live server request answered by the form card.
+            forms: true,
         }
     }
 }
@@ -138,10 +147,11 @@ pub enum Feature {
     StreamsReasoning,
     Questions,
     PlanMode,
+    Forms,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 14] = [
+    pub const ALL: [Feature; 15] = [
         Feature::ModelSwitch,
         Feature::LiveApprovals,
         Feature::InterruptKeepsProcess,
@@ -156,6 +166,7 @@ impl Feature {
         Feature::StreamsReasoning,
         Feature::Questions,
         Feature::PlanMode,
+        Feature::Forms,
     ];
 
     /// Where the app renders this fact (for people reading the contract test; the test checks
@@ -178,6 +189,7 @@ impl Feature {
             Feature::StreamsReasoning => "thought-process rows",
             Feature::Questions => "question cards",
             Feature::PlanMode => "mode picker: Plan",
+            Feature::Forms => "form cards (a tool server's form or link)",
         }
     }
 }
@@ -200,6 +212,7 @@ impl Capabilities {
             Feature::StreamsReasoning => self.streams_reasoning,
             Feature::Questions => self.questions,
             Feature::PlanMode => self.plan_mode,
+            Feature::Forms => self.forms,
         }
     }
 
@@ -232,6 +245,10 @@ impl Capabilities {
             Feature::StreamsReasoning => format!("{agent} shows no reasoning."),
             Feature::Questions => format!("{agent} asks no structured questions."),
             Feature::PlanMode => format!("{agent} has no read-only planning mode."),
+            Feature::Forms => format!(
+                "{agent} does not pass on forms from its tool servers; a tool that needs one \
+                 asks in the reply instead."
+            ),
         })
     }
 }
@@ -260,6 +277,7 @@ mod tests {
             streams_reasoning: _,
             questions: _,
             plan_mode: _,
+            forms: _,
         } = Capabilities::claude();
         let mut seen = std::collections::HashSet::new();
         assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
@@ -285,7 +303,8 @@ mod tests {
                 StreamsText => Some(StreamsReasoning),
                 StreamsReasoning => Some(Questions),
                 Questions => Some(PlanMode),
-                PlanMode => None,
+                PlanMode => Some(Forms),
+                Forms => None,
             }
         }
         let mut walked = vec![ModelSwitch];
@@ -334,5 +353,12 @@ mod tests {
         );
         // `usage` is the /usage panel; Codex's quota meter does not depend on it.
         assert!(!codex.supports(Feature::Usage));
+        // Only Codex passes on its tool servers' forms; the others say why there is no card.
+        assert!(codex.supports(Feature::Forms));
+        for (caps, agent) in [(Capabilities::claude(), "Claude"), (agy, "Antigravity")] {
+            assert!(caps
+                .unsupported_note(Feature::Forms, agent)
+                .is_some_and(|n| n.contains("forms from its tool servers")));
+        }
     }
 }
