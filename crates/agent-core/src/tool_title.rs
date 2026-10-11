@@ -8,7 +8,7 @@
 //! native tool name for Claude and the most telling parameter for agy, and its input), so stored
 //! history from any build gets the same titles. agy's transcript stores each argument as a
 //! JSON-encoded string with its quotes ([`decode_agy_args`]); [`classify`] reads such values
-//! decoded too. Codex runs every command as `/usr/bin/zsh -lc '…'`: [`unwrap_shell_wrapper`]
+//! decoded too. Codex runs every command as `/usr/bin/zsh -lc '…'`: [`wrapper_body_for_display`]
 //! takes the one strict wrapper shape apart for display, and [`from_command_actions`] reads
 //! Codex's `commandActions` once its adapter passes them in the item's input.
 
@@ -299,28 +299,35 @@ pub fn from_command_actions(actions: &Value) -> Option<ToolTitle> {
 }
 
 /// A command as the user would type it: the body of the one strict wrapper shape
-/// ([`unwrap_shell_wrapper`]), else the command itself.
+/// ([`wrapper_body_for_display`]), else the command itself.
 pub fn display_command(command: &str) -> String {
-    unwrap_shell_wrapper(command).unwrap_or_else(|| command.trim().to_owned())
+    wrapper_body_for_display(command).unwrap_or_else(|| command.trim().to_owned())
 }
 
-/// The command line inside `sh|bash|zsh` (bare, `/bin/` or `/usr/bin/`), `-c` or `-lc`, and
-/// exactly one argument: `/usr/bin/zsh -lc 'ls -la'` is `ls -la`. The shape is the one
-/// `always_allow`'s strict unwrap accepts; unlike it, the body is returned verbatim whatever it
-/// holds (this is for display: matching a rule must still refuse shell syntax in the body).
-/// Any other shape (options, several arguments, unquoted shell syntax, unbalanced quotes) is
-/// `None`.
-pub fn unwrap_shell_wrapper(command: &str) -> Option<String> {
-    let words = shell_words(command)?;
-    let [shell, flag, body] = words.as_slice() else {
-        return None;
-    };
+/// The one shell-wrapper shape that is ever unwrapped: `sh|bash|zsh` (bare, `/bin/` or
+/// `/usr/bin/`) then `-c` or `-lc` (Codex runs every command as `/usr/bin/zsh -lc '…'`). The
+/// single definition: the app's fail-closed `always_allow::unwrap_shell_wrapper` (rules) and
+/// [`wrapper_body_for_display`] (titles) both judge the shape by it.
+pub fn is_strict_wrapper(shell: &str, flag: &str) -> bool {
     let known = ["", "/bin/", "/usr/bin/"].iter().any(|dir| {
         shell
             .strip_prefix(dir)
             .is_some_and(|name| ["sh", "bash", "zsh"].contains(&name))
     });
-    (known && (flag == "-c" || flag == "-lc")).then(|| body.clone())
+    known && (flag == "-c" || flag == "-lc")
+}
+
+/// The command line a strict wrapper ([`is_strict_wrapper`] plus exactly one argument) runs,
+/// verbatim, for display: `/usr/bin/zsh -lc 'ls; id'` titles as `ls; id`. Unlike the app's
+/// `always_allow::unwrap_shell_wrapper`, which refuses shell syntax anywhere because a rule is
+/// made from its result, this keeps any body. Any other shape (options, several arguments,
+/// unquoted shell syntax, unbalanced quotes) is `None`.
+pub fn wrapper_body_for_display(command: &str) -> Option<String> {
+    let words = shell_words(command)?;
+    let [shell, flag, body] = words.as_slice() else {
+        return None;
+    };
+    is_strict_wrapper(shell, flag).then(|| body.clone())
 }
 
 /// POSIX-style words: single quotes literal, double quotes with `\` escaping `"`, `\`, `$`,
@@ -779,7 +786,11 @@ mod tests {
             ("/bin/sh -c \"echo \\\"hi\\\"\"", "echo \"hi\""),
             ("zsh -lc 'echo '\\''quoted'\\'''", "echo 'quoted'"),
         ] {
-            assert_eq!(unwrap_shell_wrapper(line).as_deref(), Some(body), "{line}");
+            assert_eq!(
+                wrapper_body_for_display(line).as_deref(),
+                Some(body),
+                "{line}"
+            );
         }
         for line in [
             "ls -la",
@@ -791,7 +802,7 @@ mod tests {
             "zsh -lc a; id",
             "zsh -lc $(id)",
         ] {
-            assert_eq!(unwrap_shell_wrapper(line), None, "{line}");
+            assert_eq!(wrapper_body_for_display(line), None, "{line}");
         }
         assert_eq!(display_command("  git status "), "git status");
         assert_eq!(

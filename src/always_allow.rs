@@ -46,11 +46,6 @@ const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh",
 ];
 
-/// The only wrapper shapes unwrapped (Codex runs every command as `/usr/bin/zsh -lc '…'`).
-const STRICT_SHELLS: &[&str] = &["sh", "bash", "zsh"];
-const STRICT_SHELL_DIRS: &[&str] = &["", "/bin/", "/usr/bin/"];
-const STRICT_FLAGS: &[&str] = &["-c", "-lc"];
-
 /// The argv of a simple command, or `None` (so it asks) for anything else: any of
 /// [`SHELL_SYNTAX`] or a control character anywhere, an unquoted glob or comment, unbalanced
 /// quotes, a leading `NAME=value` environment prefix, or nothing at all. Single and double quotes
@@ -128,18 +123,14 @@ fn is_wrapped(tokens: &[String]) -> bool {
         })
 }
 
-/// The quoted body of the one wrapper shape that is unwrapped: `sh|bash|zsh` (bare, `/bin/` or
-/// `/usr/bin/`), then `-c` or `-lc`, then exactly one argument.
+/// The quoted body of the one wrapper shape that is unwrapped
+/// ([`agent_core::tool_title::is_strict_wrapper`], shared with the card titles), then exactly
+/// one argument.
 fn strict_wrapper_body(tokens: &[String]) -> Option<&str> {
     let [shell, flag, body] = tokens else {
         return None;
     };
-    let known_shell = STRICT_SHELL_DIRS.iter().any(|dir| {
-        shell
-            .strip_prefix(dir)
-            .is_some_and(|name| STRICT_SHELLS.contains(&name))
-    });
-    (known_shell && STRICT_FLAGS.contains(&flag.as_str())).then_some(body.as_str())
+    agent_core::tool_title::is_strict_wrapper(shell, flag).then_some(body.as_str())
 }
 
 /// The command line a strict shell wrapper runs (`/usr/bin/zsh -lc 'ls -la'` gives `ls -la`), or

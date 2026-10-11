@@ -361,7 +361,20 @@ impl AgyAdapter {
             .or(info.name.clone())
             .unwrap_or_else(|| "tool".to_owned());
         let kind = tool_kind(&name);
-        let mut params = info.parameters.clone();
+        // Stdout's parameters, else the transcript's record of the same call (W3.4: decoded, so
+        // the card title reads `/etc/hostname`, not `"/etc/hostname"`).
+        let mut params = info
+            .parameters
+            .clone()
+            .filter(|p| p.as_object().is_some_and(|o| !o.is_empty()))
+            .or_else(|| {
+                step.transcript_calls
+                    .iter()
+                    .find(|c| c.get("name").and_then(Value::as_str) == Some(name.as_str()))
+                    .and_then(|c| c.get("args"))
+                    .map(crate::tool_title::decode_agy_args)
+            })
+            .or_else(|| info.parameters.clone());
         if let Some(p) = params.as_mut().and_then(Value::as_object_mut) {
             if !p.contains_key("tool_name") {
                 p.insert("tool_name".to_string(), Value::String(name.clone()));
@@ -925,6 +938,10 @@ struct Step {
     tool_name: Option<String>,
     #[serde(default)]
     tool_info: Option<ToolInfo>,
+    /// The step's tool calls as agy's transcript recorded them, args decoded (`{name, args}`):
+    /// put on the step by the session's transcript reader.
+    #[serde(default)]
+    transcript_calls: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1719,6 +1736,43 @@ mod tests {
         )));
         assert!(events.iter().any(|e| matches!(&e.event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "Now explain what was found")));
         assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Assistant, text } if text == "The file looks good.")));
+    }
+
+    /// W3.4: a step whose stdout carries no parameters takes them from the transcript's record of
+    /// the call (W0 `transcript-view-file.jsonl`, quoted values), decoded, and titles
+    /// `Read /etc/hostname`.
+    #[test]
+    fn w0_transcript_calls_fill_a_bare_step_and_title_it() {
+        let transcript: Value = serde_json::from_str(
+            include_str!("../../../tests/fixtures/real/agy/transcript-view-file.jsonl").trim(),
+        )
+        .expect("transcript line");
+        let calls = transcript["tool_calls"].clone();
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        let step = json!({"event": "step_update", "conversation_id": "c1", "step_update": {
+            "step_type": "tool", "step_index": 2, "state": "ACTIVE", "tool_name": "view_file",
+            "tool_info": {"name": "view_file"}, "transcript_calls": calls}});
+        let out = a.feed(&step.to_string());
+        let (kind, title, input) = out
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ItemStarted {
+                    kind: kind @ ItemKind::FileRead,
+                    title,
+                    input,
+                    ..
+                } => Some((*kind, title.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("tool item");
+        let input = input.expect("input from the transcript");
+        assert_eq!(input["AbsolutePath"], "/etc/hostname");
+        assert_eq!(
+            crate::tool_title::classify(kind, &title, Some(&input)).text(),
+            "Read /etc/hostname"
+        );
     }
 
     /// W3.1 contract, from the W0 agy frames (`read-outside-project.jsonl`) with the thinking the
