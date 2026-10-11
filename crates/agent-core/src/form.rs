@@ -243,7 +243,7 @@ pub fn answer(
 fn blank(v: &Value) -> bool {
     match v {
         Value::Null => true,
-        Value::String(s) => s.is_empty(),
+        Value::String(s) => s.trim().is_empty(),
         Value::Array(a) => a.is_empty(),
         _ => false,
     }
@@ -428,8 +428,23 @@ pub fn link_host(url: &str) -> Option<String> {
         return None;
     }
     let host = match authority.strip_prefix('[') {
-        // An IPv6 literal keeps its brackets; its colons are not a port.
-        Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
+        // An IPv6 literal keeps its brackets; its colons are not a port. It must close, hold
+        // only hex digits, `:` and `.` (an embedded IPv4), and be followed by nothing or a port.
+        Some(v6) => {
+            let (address, after) = v6.split_once(']')?;
+            let port_ok = after.is_empty()
+                || after
+                    .strip_prefix(':')
+                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+            let address_ok = address.contains(':')
+                && address
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+            if !port_ok || !address_ok {
+                return None;
+            }
+            format!("[{address}]")
+        }
         None => authority
             .split(':')
             .next()
@@ -460,17 +475,22 @@ pub fn link_concern(url: &str) -> Option<&'static str> {
                         .strip_prefix("0x")
                         .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit())))
         });
-    if local {
-        Some("This link goes to this computer or your local network.")
-    } else if ip {
-        Some("This link goes to a bare IP address, not a named site.")
-    } else if url
+    let plain = url
         .get(..7)
-        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
-    {
-        Some("This link is not encrypted (http, not https).")
-    } else {
-        None
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    match (local, ip, plain) {
+        (true, _, true) => Some(
+            "This link goes to this computer or your local network, and is not encrypted (http, \
+             not https).",
+        ),
+        (true, _, false) => Some("This link goes to this computer or your local network."),
+        (false, true, true) => Some(
+            "This link goes to a bare IP address, not a named site, and is not encrypted (http, \
+             not https).",
+        ),
+        (false, true, false) => Some("This link goes to a bare IP address, not a named site."),
+        (false, false, true) => Some("This link is not encrypted (http, not https)."),
+        (false, false, false) => None,
     }
 }
 
@@ -505,6 +525,10 @@ pub fn asks_for_secret(field: &FormField) -> bool {
         "2fa",
         "pat",
         "pin",
+        "bearer",
+        "sshkey",
+        "authkey",
+        "signingkey",
     ];
     /// Two or three words read together.
     const PHRASES: &[&str] = &[
@@ -523,6 +547,10 @@ pub fn asks_for_secret(field: &FormField) -> bool {
         "onetimepassword",
         "motdepasse",
         "personalaccesstoken",
+        "sshkey",
+        "authkey",
+        "signingkey",
+        "authtoken",
     ];
     let mut words: Vec<String> = Vec::new();
     for text in [
@@ -728,6 +756,11 @@ mod tests {
             ["name", "tags"],
             "empty text and an empty selection do not satisfy required"
         );
+        assert_eq!(
+            names(validate(&fields, &json!({"name": " \t ", "tags": ["a"]}))),
+            ["name"],
+            "whitespace is not an answer"
+        );
     }
 
     #[test]
@@ -926,9 +959,36 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(
-            link_concern("http://localhost./"),
+            link_concern("https://localhost./"),
             Some("This link goes to this computer or your local network."),
             "a trailing dot does not hide localhost"
+        );
+        for broken in [
+            "https://[attacker.com/",
+            "https://[evil.com]/",
+            "https://[::1]evil.com/",
+            "https://[::1]:/",
+        ] {
+            assert_eq!(link_host(broken), None, "{broken}");
+        }
+        assert_eq!(
+            link_host("https://[::ffff:127.0.0.1]:9/").as_deref(),
+            Some("[::ffff:127.0.0.1]")
+        );
+        assert_eq!(
+            link_concern("http://localhost:3000/callback"),
+            Some(
+                "This link goes to this computer or your local network, and is not encrypted \
+                 (http, not https)."
+            ),
+            "both concerns are named"
+        );
+        assert_eq!(
+            link_concern("http://192.168.1.1/"),
+            Some(
+                "This link goes to a bare IP address, not a named site, and is not encrypted \
+                 (http, not https)."
+            )
         );
         assert_eq!(
             link_concern("https://2130706433/"),
@@ -937,7 +997,7 @@ mod tests {
         );
         assert_eq!(link_concern("https://github.com/login"), None);
         for local in [
-            "http://localhost:3000/callback",
+            "https://localhost:3000/callback",
             "https://printer.local/",
             "https://nas.lan/",
         ] {
@@ -949,7 +1009,7 @@ mod tests {
         }
         for ip in [
             "https://192.168.1.1/",
-            "http://0x7f.1/",
+            "https://0x7f.1/",
             "https://[::1]/",
             "https://10.0.0.1:8443/",
         ] {
@@ -989,6 +1049,11 @@ mod tests {
             ("access_key", None),
             ("OTPCode", None),
             ("pat", None),
+            ("APIToken", None),
+            ("DBPassword", None),
+            ("SSHPrivateKey", None),
+            ("signing_key", None),
+            ("x", Some("Bearer")),
             ("x", Some("Passwort")),
             ("x", Some("Mot de passe")),
             ("x", Some("Verification code")),
