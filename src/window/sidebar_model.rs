@@ -2,6 +2,7 @@
 //! and relative time. No GTK, so it is tested without a display.
 
 use agent_core::adapter::{Driver, Mode};
+use agent_core::event::{Event, ItemKind, TurnState};
 
 /// What a sidebar row opens.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -315,6 +316,25 @@ pub fn safe_handoff_target(
     handoff_target(from, |d| usable(d) && !unasked(d))
         .map(|d| (d, false))
         .or_else(|| handoff_target(from, &usable).map(|d| (d, unasked(d))))
+}
+
+/// Whether `event` shows a rate-limited agent answering again, so its banner (and its
+/// "Continue in …") can go: an item of its own, or a turn that completed with output. A turn
+/// merely starting is not: Claude starts one itself to read a finished task, and a retry the
+/// limit refuses starts one too; hiding the banner then took the offer away (2026-10-11). Only a
+/// top-level item counts: a sub-agent started before the limit can still stream under it.
+pub fn limit_over(event: &Event) -> bool {
+    match event {
+        Event::ItemStarted {
+            kind, parent: None, ..
+        } => *kind != ItemKind::UserMessage,
+        Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: Some(usage),
+            ..
+        } => usage.output_tokens > 0,
+        _ => false,
+    }
 }
 
 /// The "Continue in a new thread" button for a target from [`safe_handoff_target`].
@@ -1175,6 +1195,53 @@ mod tests {
             assert_ne!(handoff_target(d, |_| true), Some(d));
         }
         assert_eq!(driver_label(Driver::Codex), "Codex");
+    }
+
+    /// The 2026-10-11 sequence: the limit, then a turn Claude started itself (no output), then a
+    /// retry the limit refused. None of those ends the limit; an answer does.
+    #[test]
+    fn only_an_answer_ends_a_rate_limit() {
+        use agent_core::event::Usage;
+        let completed = |output_tokens| Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: Some(Usage {
+                output_tokens,
+                ..Usage::default()
+            }),
+            cost_usd: None,
+            error: None,
+        };
+        let started = |kind| Event::ItemStarted {
+            kind,
+            title: String::new(),
+            input: None,
+            parent: None,
+        };
+        for still in [
+            Event::TurnStarted { model: None },
+            completed(0),
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                usage: None,
+                cost_usd: None,
+                error: Some("You've hit your session limit".into()),
+            },
+            started(ItemKind::UserMessage),
+            Event::Notice {
+                text: "You've hit your session limit".into(),
+            },
+        ] {
+            assert!(!limit_over(&still), "{still:?}");
+        }
+        // A sub-agent still running from before the limit is not the agent answering.
+        assert!(!limit_over(&Event::ItemStarted {
+            kind: ItemKind::AssistantMessage,
+            title: String::new(),
+            input: None,
+            parent: Some("task-1".into()),
+        }));
+        assert!(limit_over(&completed(12)));
+        assert!(limit_over(&started(ItemKind::AssistantMessage)));
     }
 
     #[test]

@@ -35,8 +35,8 @@ use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
     badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, group_rows,
-    held_finish_due, is_busy, needs_attention, parse_driver, react, relative_time, resume_as,
-    row_tooltip, safe_handoff_target, stop_heading, stored_model, thread_title,
+    held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, relative_time,
+    resume_as, row_tooltip, safe_handoff_target, stop_heading, stored_model, thread_title,
     turn_finishes_thread, Attention, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
@@ -2930,13 +2930,15 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
+            if chat.rate_limited && limit_over(&env.event) {
+                chat.rate_limited = false;
+                chat.rate_banner.set_revealed(false);
+            }
             let after = match &env.event {
                 Event::TurnStarted { .. } => {
                     chat.running = true;
                     // This turn finishes the thread (or holds it again) when it ends.
                     chat.finish_held = false;
-                    chat.rate_limited = false;
-                    chat.rate_banner.set_revealed(false);
                     // The state of the files before the turn, for "View diff".
                     chat.diffs.turn_started(self.config.borrow().checkpoints);
                     After::Sidebar

@@ -285,6 +285,12 @@ pub fn is_rate_limit_or_quota(text: &str) -> bool {
         || lower.contains("insufficient tokens")
         || lower.contains("capacity exceeded")
         || lower.contains("out of credits")
+        // Claude's own wording: "You've hit your session limit · resets 2:10pm", and the
+        // weekly and usage variants.
+        || lower.contains("session limit")
+        || lower.contains("weekly limit")
+        || lower.contains("usage limit")
+        || lower.contains("hit your limit")
 }
 
 // ---------------------------------------------------------------------------------------------

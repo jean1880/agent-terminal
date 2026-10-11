@@ -1051,6 +1051,20 @@ impl ClaudeAdapter {
                 .item(item)
             })
             .collect();
+        // A turn refused for the account's limit ("You've hit your session limit · resets …")
+        // comes with no `rate_limit_event` when it is not the first refusal: say so from the
+        // result itself, so the UI can offer another agent whatever the wording.
+        if state == TurnState::Failed && limit_refusal(v) {
+            let info = v.pointer("/api_error_params/rate_limit_info").cloned();
+            out.push(Envelope::new(Event::RateLimited {
+                resets_at: info
+                    .as_ref()
+                    .and_then(|i| i.get("resetsAt"))
+                    .and_then(Value::as_u64)
+                    .map(|s| s.to_string()),
+                detail: info,
+            }));
+        }
         out.push(Envelope::new(Event::TurnCompleted {
             state,
             usage,
@@ -1632,6 +1646,16 @@ fn usage_of(u: &Value) -> Usage {
     }
 }
 
+/// Whether a failed `result` is the account's limit: HTTP 429, or the CLI's `api_error`
+/// `usage_limit_reached` / `rate_limit` (as recorded 2026-10-11).
+fn limit_refusal(v: &Value) -> bool {
+    v.get("api_error_status").and_then(Value::as_u64) == Some(429)
+        || matches!(
+            str_of(v, "api_error"),
+            Some("usage_limit_reached" | "rate_limit")
+        )
+}
+
 /// Why a turn failed. `subtype: "success"` with `is_error` is a real failure (401, 429, 529).
 fn failure_text(v: &Value) -> String {
     if let Some(r) = str_of(v, "result").filter(|r| !r.is_empty()) {
@@ -2143,6 +2167,45 @@ mod tests {
                 .expect("turn end");
             assert_eq!(state, expected, "{decision:?}");
         }
+    }
+
+    /// 2026-10-11: a retry refused for the account's limit ends with a 429 `result` and no
+    /// `rate_limit_event`; the result itself raises the rate limit, with the reset when it has one.
+    /// Any other failure (a 529 overload) does not.
+    #[test]
+    fn a_turn_refused_for_the_limit_raises_a_rate_limit() {
+        let limited = |frame: Value| {
+            ClaudeAdapter::new()
+                .feed(&frame.to_string())
+                .into_iter()
+                .find_map(|e| match e.event {
+                    Event::RateLimited { resets_at, .. } => Some(resets_at),
+                    _ => None,
+                })
+        };
+        let refused = json!({"type": "result", "subtype": "success", "is_error": true,
+            "result": "You've hit your session limit · resets 2:10pm (America/Toronto)",
+            "api_error": "usage_limit_reached", "api_error_status": 429,
+            "api_error_params": {"rate_limit_info": {"status": "rejected",
+                "rateLimitType": "five_hour", "resetsAt": 1_791_742_200u64}}});
+        assert_eq!(limited(refused), Some(Some("1791742200".to_owned())));
+        assert_eq!(
+            limited(
+                json!({"type": "result", "subtype": "success", "is_error": true, "result": "",
+                       "api_error_status": 429})
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            limited(
+                json!({"type": "result", "subtype": "success", "is_error": true, "result": "",
+                       "api_error_status": 529})
+            ),
+            None
+        );
+        assert!(crate::quota::is_rate_limit_or_quota(
+            "You've hit your session limit · resets 2:10pm (America/Toronto)"
+        ));
     }
 
     #[test]
