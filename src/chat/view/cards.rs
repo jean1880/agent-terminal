@@ -1626,40 +1626,11 @@ impl ApprovalCard {
                 if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
-                    let initial_cmd = match tool.as_str() {
-                        "run_command" | "Bash" | "bash" | "command_execution" => input_val
-                            .get("CommandLine")
-                            .or_else(|| input_val.get("command"))
-                            .or_else(|| input_val.get("cmd"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        "call_mcp_tool" => {
-                            let s = input_val
-                                .get("ServerName")
-                                .or_else(|| input_val.get("server_name"))
-                                .and_then(Value::as_str);
-                            let t = input_val
-                                .get("ToolName")
-                                .or_else(|| input_val.get("tool_name"))
-                                .and_then(Value::as_str);
-                            match (s, t) {
-                                (Some(s), Some(t)) => format!("{s}/{t}"),
-                                _ => String::new(),
-                            }
-                        }
-                        tool_name
-                            if crate::approval_server::classify(tool_name)
-                                == crate::approval_server::ToolClass::Edit =>
-                        {
-                            crate::approval_server::edit_targets(&input_val)
-                                .first()
-                                .copied()
-                                .unwrap_or("")
-                                .to_string()
-                        }
-                        _ => a.remembers.clone().unwrap_or_default(),
-                    };
+                    let initial_cmd = crate::always_allow::dialog_prefill(
+                        &tool,
+                        &input_val,
+                        a.remembers.as_deref(),
+                    );
                     let cwd_str = input_val
                         .get("Cwd")
                         .or_else(|| input_val.get("cwd"))
@@ -1931,7 +1902,7 @@ pub(crate) fn build_approval_suggestions(
     }
 
     let mut suggestions: Vec<ApprovalSuggestion> = Vec::new();
-    let is_shell_cmd = matches!(tool, "run_command" | "Bash" | "bash");
+    let is_shell_cmd = matches!(tool, "run_command" | "Bash" | "bash" | "command_execution");
 
     let exact_desc = if is_shell_cmd {
         "Exact command"
@@ -2036,6 +2007,74 @@ fn confirm_approval_rule(
     sink: Rc<dyn Fn(RowEvent)>,
     decision: Decision,
 ) {
+    let (dialog, entry, global_check) = rule_dialog(&tool, &initial_pattern, decision);
+    let root = parent.root();
+    let req = request;
+    let t = tool;
+    let c = cwd;
+
+    glib::MainContext::default().spawn_local(async move {
+        let response = dialog.choose_future(root.as_ref()).await;
+        match response.as_str() {
+            "save" => {
+                let user_pattern = entry.text().trim().to_string();
+                let pattern = if user_pattern.is_empty() {
+                    initial_pattern
+                } else {
+                    user_pattern
+                };
+                let workspace = if global_check.is_active() {
+                    "*".to_string()
+                } else {
+                    c.unwrap_or_default()
+                };
+                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
+                sink(RowEvent::Approve {
+                    request: req,
+                    decision,
+                    custom_rule: Some(rule),
+                });
+            }
+            "save_session" => {
+                let user_pattern = entry.text().trim().to_string();
+                let pattern = if user_pattern.is_empty() {
+                    initial_pattern
+                } else {
+                    user_pattern
+                };
+                let workspace = if global_check.is_active() {
+                    "*".to_string()
+                } else {
+                    c.unwrap_or_default()
+                };
+                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
+                sink(RowEvent::Approve {
+                    request: req,
+                    decision: Decision::AllowForSession,
+                    custom_rule: Some(rule),
+                });
+            }
+            "allow_once" => {
+                sink(RowEvent::Approve {
+                    request: req,
+                    decision: Decision::Allow,
+                    custom_rule: None,
+                });
+            }
+            _ => {
+                // Cancelled: leave pending.
+            }
+        }
+    });
+}
+
+/// The rule dialog for `decision`, its pattern entry prefilled with `initial_pattern`, and the
+/// "all workspaces" check.
+fn rule_dialog(
+    tool: &str,
+    initial_pattern: &str,
+    decision: Decision,
+) -> (adw::AlertDialog, gtk4::Entry, gtk4::CheckButton) {
     let (title, subtitle, save_label) = if decision == Decision::AllowForSession {
         (
             "Confirm Session Approval Rule",
@@ -2061,14 +2100,14 @@ fn confirm_approval_rule(
     content_box.set_margin_end(12);
 
     let entry = gtk4::Entry::builder()
-        .text(&initial_pattern)
+        .text(initial_pattern)
         .placeholder_text("e.g. cargo test* or git diff*")
         .activates_default(true)
         .hexpand(true)
         .build();
     content_box.append(&entry);
 
-    let suggestions = build_approval_suggestions(&tool, &initial_pattern);
+    let suggestions = build_approval_suggestions(tool, initial_pattern);
     if suggestions.len() > 1 {
         let flow = gtk4::FlowBox::new();
         flow.set_selection_mode(gtk4::SelectionMode::None);
@@ -2187,65 +2226,7 @@ fn confirm_approval_rule(
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("save"));
     dialog.set_close_response("cancel");
-
-    let root = parent.root();
-    let req = request;
-    let t = tool;
-    let c = cwd;
-
-    glib::MainContext::default().spawn_local(async move {
-        let response = dialog.choose_future(root.as_ref()).await;
-        match response.as_str() {
-            "save" => {
-                let user_pattern = entry.text().trim().to_string();
-                let pattern = if user_pattern.is_empty() {
-                    initial_pattern
-                } else {
-                    user_pattern
-                };
-                let workspace = if global_check.is_active() {
-                    "*".to_string()
-                } else {
-                    c.unwrap_or_default()
-                };
-                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
-                sink(RowEvent::Approve {
-                    request: req,
-                    decision,
-                    custom_rule: Some(rule),
-                });
-            }
-            "save_session" => {
-                let user_pattern = entry.text().trim().to_string();
-                let pattern = if user_pattern.is_empty() {
-                    initial_pattern
-                } else {
-                    user_pattern
-                };
-                let workspace = if global_check.is_active() {
-                    "*".to_string()
-                } else {
-                    c.unwrap_or_default()
-                };
-                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
-                sink(RowEvent::Approve {
-                    request: req,
-                    decision: Decision::AllowForSession,
-                    custom_rule: Some(rule),
-                });
-            }
-            "allow_once" => {
-                sink(RowEvent::Approve {
-                    request: req,
-                    decision: Decision::Allow,
-                    custom_rule: None,
-                });
-            }
-            _ => {
-                // Cancelled: leave pending.
-            }
-        }
-    });
+    (dialog, entry, global_check)
 }
 
 #[cfg(test)]
@@ -2464,6 +2445,31 @@ pub(crate) mod tests {
         assert!(files.contains("/w/fixture.txt"), "{files}");
         assert!(diff_shown && diff.contains("hello there"), "{diff}");
         assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
+        rule_dialog_prefills_the_bare_w0_command();
+    }
+
+    /// Plan 2.3 (F7), from the W0 Codex frame: the rule dialog's entry holds the bare command,
+    /// not the wrapper and not the card's footer sentence.
+    fn rule_dialog_prefills_the_bare_w0_command() {
+        let params = include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["frame"]["method"] == "item/commandExecution/requestApproval")
+            .expect("W0 frame")["frame"]["params"]
+            .clone();
+        assert_eq!(params["command"], "/usr/bin/zsh -lc 'ls -la'");
+        let footer = "`/usr/bin/zsh -lc 'ls -la'` in /tmp/w0-sandbox";
+        let prefill =
+            crate::always_allow::dialog_prefill("command_execution", &params, Some(footer));
+        assert_eq!(prefill, "ls -la");
+        for decision in [Decision::AllowAlways, Decision::AllowForSession] {
+            let (_, entry, global) = rule_dialog("command_execution", &prefill, decision);
+            assert_eq!(entry.text(), "ls -la");
+            assert!(!global.is_active());
+        }
+        let s = build_approval_suggestions("command_execution", &prefill);
+        assert_eq!(s[0].pattern, "ls -la");
+        assert_eq!(s[0].description.as_deref(), Some("Exact command"));
     }
 
     #[test]

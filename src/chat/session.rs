@@ -4607,6 +4607,76 @@ mod tests {
         });
     }
 
+    /// Plan 2.3, from the W0 Codex frame: "Always allow" saved with the dialog's prefill (the
+    /// bare `ls -la`) is a rule a new session matches the same wrapped request with.
+    #[test]
+    fn codex_always_rule_from_the_prefill_matches_the_w0_request_next_time() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let frame = |id: u64, item: &str| {
+                let mut f = W0_CODEX_SHELL
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .find(|r| r["frame"]["method"] == "item/commandExecution/requestApproval")
+                    .expect("W0 frame")["frame"]
+                    .clone();
+                f["id"] = serde_json::json!(id);
+                f["params"]["itemId"] = serde_json::json!(item);
+                f["params"]["cwd"] = serde_json::json!(cwd);
+                f
+            };
+            let card = |seen: &Seen, item: &str| {
+                seen.borrow()
+                    .iter()
+                    .find_map(|e| match &e.event {
+                        Event::ApprovalRequested { tool, input, .. }
+                            if e.item.as_deref() == Some(item) =>
+                        {
+                            Some((
+                                e.request.clone().expect("request"),
+                                tool.clone(),
+                                input.clone(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .expect("card")
+            };
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            feed(&session, &frame(0, "item-a").to_string());
+            let (request, tool, input) = card(&seen, "item-a");
+            assert!(offered(&seen, &request).contains(&Decision::AllowAlways));
+            let prefill = crate::always_allow::dialog_prefill(&tool, &input, None);
+            assert_eq!(prefill, "ls -la");
+            let rule = crate::always_allow::Rule::new("", tool, prefill);
+            session.respond_approval_with_rule(&request, Decision::AllowAlways, Some(rule));
+            assert_eq!(resolution(&seen, &request), Some(Decision::AllowAlways));
+            let saved = crate::always_allow::AlwaysRules::open(
+                &tmp.path().join(crate::always_allow::FILE_NAME),
+            )
+            .expect("saved");
+            assert_eq!(saved.rules.len(), 1);
+            assert_eq!(saved.rules[0].detail(), "ls -la");
+            drop(session);
+
+            // Next time: a new session, no session rules, only the saved one.
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            feed(&session, &frame(0, "item-b").to_string());
+            let (again, _, _) = card(&seen, "item-b");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &again).is_some()));
+            assert_eq!(resolution(&seen, &again), Some(Decision::Allow));
+        });
+    }
+
     /// D2a: an unusable rules file is kept byte-for-byte, saved rules are off with a notice
     /// naming it, and "Always allow" still holds for the session.
     #[test]

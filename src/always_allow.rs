@@ -142,16 +142,25 @@ fn strict_wrapper_body(tokens: &[String]) -> Option<&str> {
     (known_shell && STRICT_FLAGS.contains(&flag.as_str())).then_some(body.as_str())
 }
 
+/// The command line a strict shell wrapper runs (`/usr/bin/zsh -lc 'ls -la'` gives `ls -la`), or
+/// `None` when `command` is not exactly that shape. The one unwrap: rules are created from it
+/// (the approval dialog's prefill) and matched through it ([`command_tokens`]), so a saved rule
+/// matches the request it was made from.
+pub fn unwrap_shell_wrapper(command: &str) -> Option<String> {
+    let tokens = simple_command_tokens(command)?;
+    strict_wrapper_body(&tokens).map(str::to_owned)
+}
+
 /// The argv a command line is matched by: [`simple_command_tokens`], with the one strict wrapper
-/// shape unwrapped (its body must pass the same check, and may not be a wrapper itself). Any
-/// other wrapped command (`bash -c "…"` with options, `sh -ec`, a wrapper inside a wrapper) is
-/// `None`: it never auto-matches.
+/// shape unwrapped ([`unwrap_shell_wrapper`]; its body must pass the same check, and may not be
+/// a wrapper itself). Any other wrapped command (`bash -c "…"` with options, `sh -ec`, a wrapper
+/// inside a wrapper) is `None`: it never auto-matches.
 pub fn command_tokens(command: &str) -> Option<Vec<String>> {
     let tokens = simple_command_tokens(command)?;
     if !is_wrapped(&tokens) {
         return Some(tokens);
     }
-    let body = simple_command_tokens(strict_wrapper_body(&tokens)?)?;
+    let body = simple_command_tokens(&unwrap_shell_wrapper(command)?)?;
     (!is_wrapped(&body)).then_some(body)
 }
 
@@ -608,6 +617,20 @@ impl Rule {
             (Target::Argv { .. }, None) => format!("`{}`", self.detail()),
             _ => self.detail(),
         }
+    }
+}
+
+/// What the approval rule dialog starts from for a request (`tool` and `input` as the agent sent
+/// them): the bare command (a strict `zsh -lc '…'` wrapper unwrapped by
+/// [`unwrap_shell_wrapper`], the same function matching uses, so the saved rule matches this
+/// request again), the one edited path, or `server/tool`. Anything else falls back to
+/// `remembers`, what the card says Always keeps.
+pub fn dialog_prefill(tool: &str, input: &Value, remembers: Option<&str>) -> String {
+    match Action::of(tool, input) {
+        Some(Action::Shell { command }) => unwrap_shell_wrapper(&command).unwrap_or(command),
+        Some(Action::Edit { path }) => path,
+        Some(Action::Mcp { server, tool }) => format!("{server}/{tool}"),
+        Some(Action::Read { .. }) | None => remembers.unwrap_or_default().to_owned(),
     }
 }
 
@@ -1224,6 +1247,19 @@ mod tests {
         assert_eq!(
             command_tokens("bash run.sh").expect("script"),
             ["bash", "run.sh"]
+        );
+        // The one unwrap the dialog prefills from: a rule made from its result matches the
+        // wrapped request again (plan 2.3).
+        assert_eq!(
+            unwrap_shell_wrapper("/usr/bin/zsh -lc 'ls -la'").as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(unwrap_shell_wrapper("ls -la"), None);
+        assert_eq!(unwrap_shell_wrapper("bash -ec 'ls'"), None);
+        assert_eq!(
+            unwrap_shell_wrapper("zsh -lc 'ls; id'"),
+            None,
+            "shell syntax anywhere: not unwrapped, never a rule"
         );
     }
 
