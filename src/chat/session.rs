@@ -206,6 +206,9 @@ struct Inner {
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
     last_enriched_step: Cell<Option<u64>>,
+    /// How long a Claude permission request may wait for the user before it is denied (agy's
+    /// socket has the same bound). Injectable for tests.
+    approval_deadline: Cell<Duration>,
 }
 
 struct QueuedPrompt {
@@ -427,6 +430,7 @@ impl ChatSession {
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
+            approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -986,6 +990,7 @@ impl Inner {
             let (env, auto) = self.gate_approval(env);
             self.emit(env.clone());
             self.watch_tool_step(&env);
+            self.arm_approval_deadline(&env);
             if auto {
                 self.auto_approve(&env);
             }
@@ -1161,6 +1166,59 @@ impl Inner {
                 .insert(request, (action, cwd));
         }
         (env, auto)
+    }
+
+    /// Claude blocks on a `can_use_tool` request for as long as the app stays silent. A request
+    /// still unanswered at the deadline is denied with a notice (fail closed), as agy's socket
+    /// does. A request answered, cancelled or expired by then is no longer pending: nothing is
+    /// sent.
+    fn arm_approval_deadline(self: &Rc<Self>, env: &Envelope) {
+        if self.adapter.borrow().driver() != Driver::Claude
+            || !matches!(env.event, Event::ApprovalRequested { .. })
+        {
+            return;
+        }
+        let Some(request) = env.request.clone() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let deadline = self.approval_deadline.get();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(deadline).await;
+            if let Some(inner) = weak.upgrade() {
+                inner.expire_approval(&request);
+            }
+        });
+    }
+
+    fn expire_approval(self: &Rc<Self>, request: &str) {
+        if !self
+            .adapter
+            .borrow()
+            .pending_request_ids()
+            .iter()
+            .any(|id| id == request)
+        {
+            return;
+        }
+        self.pending_rules.borrow_mut().remove(request);
+        let denied = self.command(Command::Approve {
+            request: request.to_owned(),
+            decision: Decision::Deny,
+            updated_input: None,
+            message: Some("No answer in agent-terminal before the deadline; denied.".to_owned()),
+        });
+        if denied {
+            self.emit(
+                Envelope::new(Event::ApprovalResolved {
+                    decision: Decision::Deny,
+                })
+                .request(request),
+            );
+            self.emit(Envelope::new(Event::Notice {
+                text: "A permission request got no answer in time and was denied.".to_owned(),
+            }));
+        }
     }
 
     /// Answers `env`'s request Allow once its card is out (the card then shows it resolved).
@@ -4587,6 +4645,51 @@ mod tests {
             session.send_prompt(&format!("use {secret} please"));
             let all = serde_json::to_string(&*seen.borrow()).expect("json");
             assert!(!all.contains(secret), "a secret reached the sink: {all}");
+        });
+    }
+
+    /// W1b 1.6: a Claude request nobody answers is denied at the deadline, with a deny frame to
+    /// the agent and a notice; one answered in time sends nothing more.
+    #[test]
+    fn an_unanswered_claude_request_is_denied_at_the_deadline() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            session
+                .inner
+                .approval_deadline
+                .set(Duration::from_millis(60));
+            feed(&session, &can_use_tool("late", "touch b.tmp"));
+            feed(&session, &can_use_tool("prompt", "touch c.tmp"));
+            session.respond_approval("prompt", Decision::Allow);
+            assert!(pump_until(ctx, 10, || resolution(&seen, "late").is_some()));
+            assert_eq!(resolution(&seen, "late"), Some(Decision::Deny));
+            assert!(pump_until(ctx, 10, || stdin_log(tmp.path()).contains("\"late\"")));
+            let log = stdin_log(tmp.path());
+            let frame = log
+                .lines()
+                .find(|l| l.contains("\"late\""))
+                .expect("a frame for the late request");
+            assert!(frame.contains("\"behavior\":\"deny\""), "{frame}");
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("denied"))
+            ));
+            assert_eq!(
+                log.matches("\"request_id\":\"prompt\"").count(),
+                1,
+                "the answered request is not answered twice: {log}"
+            );
+            assert!(session
+                .inner
+                .adapter
+                .borrow()
+                .pending_request_ids()
+                .is_empty());
         });
     }
 

@@ -303,6 +303,12 @@ pub trait Adapter {
     fn drain_outbox(&mut self) -> Outbox {
         Outbox::default()
     }
+    /// Ids of the permission requests the agent is blocked on and the app has not answered.
+    /// Only Claude waits for the app indefinitely, so the host uses this to fail a request
+    /// closed at a deadline; the rest report none.
+    fn pending_request_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
