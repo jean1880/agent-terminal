@@ -2041,6 +2041,10 @@ impl Inner {
         if let Some(handle) = self.approval() {
             if handle.respond_with_rule(request, decision, custom_rule.clone()) {
                 self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+                // Stop turn: the hook was denied; end the turn as the stop button does (D4).
+                if decision == Decision::Cancel {
+                    self.command(Command::Interrupt);
+                }
                 return;
             }
         }
@@ -4566,6 +4570,60 @@ mod tests {
             assert_eq!(session.status().mode, Mode::Plan);
             assert!(session.status().alive);
             assert!(!socket.exists(), "the approval socket is closed");
+        });
+    }
+
+    #[test]
+    fn agy_stop_turn_denies_the_hook_and_interrupts_the_turn() {
+        in_loop(|ctx| {
+            use std::io::{BufRead as _, Write as _};
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            let mut hook = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+            let query = agent_core::approval::ApprovalQuery {
+                id: "h1".into(),
+                conversation_id: "c1".into(),
+                tool: "run_command".into(),
+                args: serde_json::json!({"CommandLine": "git push"}),
+                cwd: None,
+            };
+            writeln!(
+                hook,
+                "{}",
+                agent_core::approval::encode_query(&query).expect("enc")
+            )
+            .expect("send");
+            assert!(pump_until(ctx, 10, || has(&seen, |e| {
+                matches!(e, Event::ApprovalRequested { options, .. } if options.contains(&Decision::Cancel))
+            })));
+            session.respond_approval("h1", Decision::Cancel);
+            assert_eq!(resolution(&seen, "h1"), Some(Decision::Cancel));
+            assert!(
+                log.borrow().iter().any(|c| matches!(c, Command::Interrupt)),
+                "the turn is interrupted like the stop button"
+            );
+            hook.set_nonblocking(true).expect("nonblocking");
+            let mut reader = std::io::BufReader::new(&hook);
+            let mut reply = String::new();
+            assert!(pump_until(ctx, 10, || {
+                let _ = reader.read_line(&mut reply);
+                reply.ends_with('\n')
+            }));
+            let reply = agent_core::approval::parse_reply(&reply).expect("reply");
+            assert_eq!(reply.decision, Decision::Deny, "agy hears a deny");
         });
     }
 

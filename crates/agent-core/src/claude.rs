@@ -805,12 +805,14 @@ impl ClaudeAdapter {
         let input = req.get("input").cloned().unwrap_or(Value::Null);
         // "Allow for session" and "Always allow" are the app's (plan D1): it records the rule
         // and answers later matching requests itself, so Claude's `permission_suggestions` are
-        // never forwarded. The app narrows these options to what a rule can describe.
+        // never forwarded. The app narrows these options to what a rule can describe. Stop turn
+        // (Cancel) denies with `interrupt`, ending the turn (D4: the same five buttons).
         let options = vec![
             Decision::Allow,
             Decision::AllowForSession,
             Decision::AllowAlways,
             Decision::Deny,
+            Decision::Cancel,
         ];
         self.pending.insert(
             request_id.to_owned(),
@@ -1143,7 +1145,15 @@ impl Adapter for ClaudeAdapter {
                 decision,
                 updated_input,
                 message,
-            } => self.answer_line(&request, decision, updated_input, message)?,
+            } => {
+                let line = self.answer_line(&request, decision, updated_input, message)?;
+                // Stop turn: the deny carries `interrupt`, so the result that follows is the
+                // user's stop, like Command::Interrupt's (D4).
+                if decision == Decision::Cancel {
+                    self.interrupt_pending = self.turn_open;
+                }
+                line
+            }
             Command::Answer { request, answers } => {
                 let input = self
                     .pending
@@ -2092,6 +2102,41 @@ mod tests {
         // The interrupt's own ack is a control result.
         assert!(out.iter().any(|e| e.request.as_deref() == Some("int-1")
             && matches!(e.event, Event::ControlResult { error: None, .. })));
+    }
+
+    /// D4: Claude's card offers Stop turn; answering it denies with `interrupt` and the error
+    /// result that follows ends the turn Interrupted, not Failed. Deny alone does not.
+    #[test]
+    fn stop_turn_on_an_approval_ends_the_turn_interrupted() {
+        for (decision, expected) in [
+            (Decision::Cancel, TurnState::Interrupted),
+            (Decision::Deny, TurnState::Failed),
+        ] {
+            let mut a = ClaudeAdapter::new();
+            a.feed(&json!({"type": "system", "subtype": "init", "model": "m"}).to_string());
+            let out = a.feed(
+                &json!({"type": "control_request", "request_id": "r1", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1",
+                    "input": {"command": "rm -rf build"}}})
+                .to_string(),
+            );
+            assert!(matches!(&out[0].event,
+                Event::ApprovalRequested { options, .. } if options.contains(&Decision::Cancel)));
+            let line = written(&mut a, approve(decision, "r1"));
+            assert_eq!(line["response"]["response"]["behavior"], "deny");
+            let state = a
+                .feed(
+                    &json!({"type": "result", "subtype": "error_during_execution", "is_error": true})
+                        .to_string(),
+                )
+                .into_iter()
+                .find_map(|e| match e.event {
+                    Event::TurnCompleted { state, .. } => Some(state),
+                    _ => None,
+                })
+                .expect("turn end");
+            assert_eq!(state, expected, "{decision:?}");
+        }
     }
 
     #[test]
@@ -3047,7 +3092,8 @@ mod tests {
                             Decision::Allow,
                             Decision::AllowForSession,
                             Decision::AllowAlways,
-                            Decision::Deny
+                            Decision::Deny,
+                            Decision::Cancel
                         ]
                     );
                     assert_eq!(remembers, &None, "the app says what it keeps");
