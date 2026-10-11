@@ -2497,6 +2497,10 @@ impl AgentTerminalWindow {
         );
         menu.append_section(None, &threads);
         menu.append_section(None, &self.build_session_section());
+        // Last, on its own: a recovery tool for a stuck or misbehaving agent, rarely needed.
+        let recovery = gtk4::gio::Menu::new();
+        recovery.append(Some("Restart Agent"), Some("win.restart-tab"));
+        menu.append_section(None, &recovery);
         menu
     }
 
@@ -3116,13 +3120,17 @@ impl AgentTerminalWindow {
         let Some(tab_view) = self.tab_view.borrow().clone() else {
             return;
         };
-        // A thread restarts its agent itself (on the next prompt); there is no page to swap.
-        if self
+        // A thread keeps its page: its agent process restarts on the same conversation.
+        let chat = self
             .tabs
             .borrow()
             .iter()
-            .any(|t| &t.page == page && t.chat.is_some())
-        {
+            .find(|t| &t.page == page)
+            .and_then(|t| t.chat.as_ref().map(|c| c.view.clone()));
+        if let Some(view) = chat {
+            if let Some(view) = view {
+                view.restart_agent();
+            }
             return;
         }
         let (dir, session_id, profile) = self
@@ -6343,10 +6351,21 @@ mod tests {
         crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
         animated_menu::tests::gtk_checks();
+        let menu = window.imp().build_new_menu();
         assert_eq!(
-            window.imp().build_new_menu().n_items(),
-            2,
-            "menu has only threads and sessions sections, no terminal section"
+            menu.n_items(),
+            3,
+            "menu has threads, sessions and recovery sections, no terminal section"
+        );
+        let recovery = menu
+            .item_link(2, gtk4::gio::MENU_LINK_SECTION)
+            .expect("recovery section");
+        assert_eq!(
+            recovery
+                .item_attribute_value(0, "action", None)
+                .and_then(|v| v.get::<String>()),
+            Some("win.restart-tab".into()),
+            "Restart Agent sits last, in the window menu"
         );
         chat_shell_opens_threads_and_lists_them(&window);
         environment_review::tests::confirmation_preserves_target(&window);

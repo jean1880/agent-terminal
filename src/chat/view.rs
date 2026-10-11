@@ -456,6 +456,15 @@ impl ChatView {
         }
     }
 
+    /// Stops the thread's agent process and starts it again on the same conversation (a
+    /// recovery tool: Restart Agent in the window menu).
+    pub fn restart_agent(&self) {
+        if let Some(inner) = self.inner() {
+            inner.backend.reload_session();
+            inner.refresh_status();
+        }
+    }
+
     /// Goes to the newest message and follows the stream again.
     pub fn scroll_to_end(&self) {
         if let Some(inner) = self.inner() {
@@ -739,11 +748,9 @@ impl Inner {
             agent_core::caps::Feature::InterruptKeepsProcess,
             cards::driver_name(status.driver),
         );
-        self.header
-            .set_reload_running(running, stop_note.as_deref());
         self.thinking
             .set(&activity, cards::driver_name(status.driver));
-        self.composer.set_running(running);
+        self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
         self.header
             .set_mode(self.model.borrow().mode.unwrap_or(status.mode));
@@ -790,18 +797,6 @@ impl Inner {
         self.header.gauge.connect_clicked(move |_| {
             if let Some(inner) = weak.upgrade() {
                 inner.run_action(BuiltinAction::OpenContext, "");
-            }
-        });
-        let weak = Rc::downgrade(self);
-        self.header.reload.connect_clicked(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                let running = inner.backend.status().running_turn || inner.model.borrow().running;
-                if running {
-                    inner.backend.interrupt();
-                } else {
-                    inner.backend.reload_session();
-                }
-                inner.refresh_status();
             }
         });
         let weak = Rc::downgrade(self);

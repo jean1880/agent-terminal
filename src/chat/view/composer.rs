@@ -338,20 +338,29 @@ impl Composer {
         self.history.borrow_mut().replace(entries);
     }
 
-    /// Send ⇄ stop.
-    pub fn set_running(&self, running: bool) {
+    /// Send ⇄ stop. `stop_note` is what stopping does to this agent when it is more than ending
+    /// the turn (agy exits, and restarts on the next message).
+    pub fn set_running(&self, running: bool, stop_note: Option<&str>) {
         if running {
             self.send.set_icon_name("at-media-playback-stop-symbolic");
             self.send.add_css_class("stop");
-            self.send.set_tooltip_text(Some("Stop (Esc)"));
-            self.send
-                .update_property(&[gtk4::accessible::Property::Label("Stop turn")]);
+            let tooltip = match stop_note {
+                Some(note) => format!("Stop (Esc). {note}"),
+                None => "Stop (Esc)".to_owned(),
+            };
+            self.send.set_tooltip_text(Some(&tooltip));
+            self.send.update_property(&[
+                gtk4::accessible::Property::Label("Stop turn"),
+                gtk4::accessible::Property::Description(&tooltip),
+            ]);
         } else {
             self.send.set_icon_name("at-go-up-symbolic");
             self.send.remove_css_class("stop");
             self.send.set_tooltip_text(Some("Send (Enter)"));
-            self.send
-                .update_property(&[gtk4::accessible::Property::Label("Send message")]);
+            self.send.update_property(&[
+                gtk4::accessible::Property::Label("Send message"),
+                gtk4::accessible::Property::Description("Send (Enter)"),
+            ]);
         }
     }
 
@@ -931,7 +940,7 @@ pub(super) mod tests {
         let host_trait: Rc<dyn ComposerHost> = host.clone();
         let composer = Composer::new();
         composer.set_host(Rc::downgrade(&host_trait));
-        composer.set_running(true);
+        composer.set_running(true, None);
         composer.set_text("Keep this unfinished draft 📝");
         composer.send.emit_clicked();
         assert_eq!(host.interrupts.get(), 1, "Stop interrupts the running turn");

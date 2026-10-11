@@ -62,11 +62,6 @@ const HIDE_GAUGE_BELOW: f64 = 760.0;
 const COMPACT_BELOW: f64 = 500.0;
 /// The narrowest the strip supports: the whole window at its minimum.
 const MIN_WIDTH: i32 = 340;
-/// The idle session button's name, and what it does said plainly: an icon alone does not.
-const RESTART_LABEL: &str = "Restart agent";
-const RESTART_TOOLTIP: &str = "Restart agent: stops this thread's agent process and starts it \
-     again on the same conversation. Use it after changing the agent's settings, environment \
-     file, MCP servers or hooks, or when it stops responding. Queued prompts are dropped.";
 
 pub struct Header {
     /// What the view packs: the strip in its breakpoint bin.
@@ -81,7 +76,6 @@ pub struct Header {
     /// Set while the view changes the dropdown itself, so that is not taken as a user choice.
     pub mode_guard: Rc<Cell<bool>>,
     breakpoints: [adw::Breakpoint; 3],
-    pub reload: gtk4::Button,
     /// The "Extra access" chip: shown while the user has granted Codex session-long access.
     access: gtk4::MenuButton,
     access_list: gtk4::Label,
@@ -175,17 +169,6 @@ impl Header {
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         root.append(&spacer);
-
-        let reload = gtk4::Button::from_icon_name("at-view-refresh-symbolic");
-        reload.add_css_class("flat");
-        reload.add_css_class("session-reload");
-        reload.set_valign(gtk4::Align::Center);
-        reload.set_tooltip_text(Some(RESTART_TOOLTIP));
-        reload.update_property(&[
-            gtk4::accessible::Property::Label(RESTART_LABEL),
-            gtk4::accessible::Property::Description(RESTART_TOOLTIP),
-        ]);
-        root.append(&reload);
 
         // What the user allowed Codex beyond its usual limits for this session. A menu button,
         // so the list is one keypress away, not only in a tooltip.
@@ -356,7 +339,6 @@ impl Header {
             pending_mode,
             mode_guard,
             breakpoints: [words_off, gauge_off, compact],
-            reload,
             access,
             access_list,
             shown_access: RefCell::new(Vec::new()),
@@ -456,32 +438,6 @@ impl Header {
                 hint.as_deref().unwrap_or("Effective interaction mode"),
             )]);
         self.fit_height();
-    }
-
-    /// The session control stops an active turn, or restarts an idle session's agent process so
-    /// it picks up current launch configuration. `stop_note` is what stopping does to this agent
-    /// when it is more than ending the turn (agy exits, and restarts on the next message).
-    pub fn set_reload_running(&self, running: bool, stop_note: Option<&str>) {
-        let (icon, tooltip) = if running {
-            ("at-media-playback-stop-symbolic", "Stop current turn")
-        } else {
-            ("at-view-refresh-symbolic", RESTART_TOOLTIP)
-        };
-        let full = match stop_note.filter(|_| running) {
-            Some(note) => format!("{tooltip}. {note}"),
-            None => tooltip.to_owned(),
-        };
-        self.reload.set_icon_name(icon);
-        self.reload.set_tooltip_text(Some(&full));
-        let name = if running {
-            full.as_str()
-        } else {
-            RESTART_LABEL
-        };
-        self.reload.update_property(&[
-            gtk4::accessible::Property::Label(name),
-            gtk4::accessible::Property::Description(&full),
-        ]);
     }
 
     /// Shows the "Extra access" chip while `grants` (one line each) is not empty, and lists
