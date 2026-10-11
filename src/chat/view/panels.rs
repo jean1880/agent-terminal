@@ -660,6 +660,50 @@ pub fn settings_panel(ctx: &PanelCtx) {
     d.present(Some(&ctx.parent));
 }
 
+/// Quota windows from agy's `/usage` document as `(group, title, detail)` rows, e.g.
+/// `("Gemini Models", "Weekly", "43 % used · resets in 3 h 47 min")`. Empty when the document
+/// is not agy's quota shape (the panel then shows it as the plain key/value page).
+fn usage_rows(v: &Value, now: i64) -> Vec<(String, String, String)> {
+    agent_core::quota::agy_usage(v)
+        .iter()
+        .map(|w| {
+            let mut detail = format!("{} used", super::usage::percent_text(w.used));
+            if let Some(reset) = super::usage::resets_text(w, now) {
+                detail.push_str(" · ");
+                detail.push_str(&reset);
+            }
+            (
+                w.group.clone().unwrap_or_else(|| "Plan usage".to_owned()),
+                w.label.clone(),
+                detail,
+            )
+        })
+        .collect()
+}
+
+fn usage_page(rows: &[(String, String, String)]) -> gtk4::Widget {
+    let page = adw::PreferencesPage::new();
+    let mut groups: Vec<(String, adw::PreferencesGroup)> = Vec::new();
+    for (group, title, detail) in rows {
+        let g = match groups.iter().find(|(name, _)| name == group) {
+            Some((_, g)) => g.clone(),
+            None => {
+                let g = adw::PreferencesGroup::new();
+                g.set_title(&glib::markup_escape_text(group));
+                page.add(&g);
+                groups.push((group.clone(), g.clone()));
+                g
+            }
+        };
+        let row = adw::ActionRow::new();
+        row.set_use_markup(false);
+        row.set_title(title);
+        row.set_subtitle(detail);
+        g.add(&row);
+    }
+    page.upcast()
+}
+
 pub fn usage_panel(ctx: &PanelCtx) {
     let (d, stack) = dialog("Usage", 520, 520);
     ctx.requests.ask(
@@ -669,7 +713,15 @@ pub fn usage_panel(ctx: &PanelCtx) {
             #[weak]
             stack,
             move |result| match result {
-                Ok(v) => replace_page(&stack, "page", &json_page(&v, None)),
+                Ok(v) => {
+                    let rows = usage_rows(&v, super::usage::now_epoch());
+                    let page = if rows.is_empty() {
+                        json_page(&v, None)
+                    } else {
+                        usage_page(&rows)
+                    };
+                    replace_page(&stack, "page", &page);
+                }
                 Err(e) => show_error(&stack, &e),
             }
         ),
@@ -913,6 +965,30 @@ pub(crate) mod tests {
             choice(&sonnet, Some("high"), false, &st),
             ("sonnet".to_owned(), Some("high".to_owned()))
         );
+    }
+
+    #[test]
+    fn agys_usage_document_becomes_readable_rows_and_anything_else_stays_plain() {
+        let doc = serde_json::json!({"command": {"data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.57,
+                 "reset_time": "2026-10-17T00:00:00Z"},
+                {"window": "5h", "remaining_fraction": 1.0}
+            ]}
+        ]}}});
+        let now = 1_791_590_400; // 2026-10-10T00:00:00Z
+        let rows = usage_rows(&doc, now);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "Gemini Models");
+        assert_eq!(rows[0].1, "Weekly");
+        assert!(
+            rows[0].2.starts_with("43 % used · resets in"),
+            "{}",
+            rows[0].2
+        );
+        assert_eq!(rows[1].2, "0 % used");
+        // Not agy's shape: no rows, so the panel shows the document as it is.
+        assert!(usage_rows(&serde_json::json!({"windows": []}), now).is_empty());
     }
 
     #[test]
