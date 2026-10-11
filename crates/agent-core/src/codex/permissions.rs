@@ -516,6 +516,65 @@ fn grant(typed: &Typed) -> Value {
     Value::Object(grant)
 }
 
+/// `grant` with literal paths renamed to where they really lead: `paths` maps a path the grant
+/// holds (in `read`/`write` or a `path` entry) to an absolute path with no `.` or `..`. Only
+/// names change: a key the grant does not hold, or a target that is not a plain absolute path,
+/// is an error and nothing is rewritten. Globs and special places are never touched.
+pub(super) fn rewrite_paths(grant: &Value, paths: &Value) -> Result<Value, String> {
+    let paths = paths.as_object().ok_or("the path renames are not a map")?;
+    for (from, to) in paths {
+        let to = to.as_str().ok_or("a renamed path is not text")?;
+        let p = Path::new(to);
+        if !displayable(to)
+            || !p.is_absolute()
+            || !p
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+        {
+            return Err(format!("{to:?} is not a plain absolute path"));
+        }
+        if from.is_empty() {
+            return Err("an empty path cannot be renamed".to_owned());
+        }
+    }
+    let mut out = grant.clone();
+    let mut used = std::collections::HashSet::new();
+    let mut rename = |v: &mut Value| {
+        if let Some(to) = v.as_str().and_then(|s| paths.get(s)) {
+            used.insert(v.as_str().unwrap_or_default().to_owned());
+            *v = to.clone();
+        }
+    };
+    if let Some(fs) = out.get_mut("fileSystem").and_then(Value::as_object_mut) {
+        for key in ["read", "write"] {
+            for v in fs
+                .get_mut(key)
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                rename(v);
+            }
+        }
+        for entry in fs
+            .get_mut("entries")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if entry["path"]["type"] == "path" {
+                if let Some(v) = entry.get_mut("path").and_then(|p| p.get_mut("path")) {
+                    rename(v);
+                }
+            }
+        }
+    }
+    match paths.keys().find(|k| !used.contains(*k)) {
+        Some(k) => Err(format!("the grant holds no path {k:?}")),
+        None => Ok(out),
+    }
+}
+
 /// One target in words: its path, its pattern, or the special place's name.
 fn words(target: &Target) -> String {
     match target {
@@ -909,6 +968,42 @@ mod tests {
             ]}}),
         ] {
             assert!(!parse(&req(perms.clone())).renderable, "{perms}");
+        }
+    }
+
+    /// The session may name a granted path by where it really leads; nothing else can change.
+    #[test]
+    fn a_grant_can_only_rename_the_paths_it_holds() {
+        let p = parse(&req(json!({"fileSystem": {
+            "write": ["/work/repo/out"],
+            "entries": [
+                entry("read", json!({"type": "path", "path": "/work/repo/link"})),
+                entry("read", json!({"type": "glob_pattern", "pattern": "/work/repo/link/*"})),
+            ],
+        }})));
+        let renamed = rewrite_paths(
+            &p.grant,
+            &json!({"/work/repo/out": "/real/out", "/work/repo/link": "/real/link"}),
+        )
+        .expect("renamed");
+        assert_eq!(renamed["fileSystem"]["write"], json!(["/real/out"]));
+        assert_eq!(
+            renamed["fileSystem"]["entries"][0]["path"]["path"],
+            "/real/link"
+        );
+        assert_eq!(
+            renamed["fileSystem"]["entries"][1]["path"]["pattern"], "/work/repo/link/*",
+            "a pattern is never rewritten"
+        );
+        for bad in [
+            json!({"/not/held": "/x"}),
+            json!({"/work/repo/out": "relative"}),
+            json!({"/work/repo/out": "/a/../b"}),
+            json!({"/work/repo/out": "/a\u{202e}"}),
+            json!({"/work/repo/out": 3}),
+            json!(["/work/repo/out"]),
+        ] {
+            assert!(rewrite_paths(&p.grant, &bad).is_err(), "{bad}");
         }
     }
 }

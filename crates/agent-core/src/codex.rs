@@ -2161,11 +2161,14 @@ impl Adapter for CodexAdapter {
                 Ok(vec![Action::Write(vec![line])])
             }
             Command::Approve {
-                request, decision, ..
+                request,
+                decision,
+                updated_input,
+                ..
             } => {
                 // Checked before it is removed: a refused decision leaves the request answerable.
                 // `decline` is never refused: Codex accepts it unoffered (W0, plan D4).
-                match self.approvals.get(&request) {
+                let rewritten = match self.approvals.get(&request) {
                     None => {
                         return Err(AdapterError::Invalid(format!(
                             "no pending approval {request}"
@@ -2179,15 +2182,26 @@ impl Adapter for CodexAdapter {
                             decision_wire(decision)
                         )));
                     }
-                    Some(_) => {}
-                }
+                    // A permission grant may name its paths by where they really lead (the
+                    // card showed both); nothing else about it can change.
+                    Some(PendingApproval {
+                        grant: Some(grant), ..
+                    }) => match &updated_input {
+                        Some(paths) => Some(
+                            permissions::rewrite_paths(grant, paths)
+                                .map_err(AdapterError::Invalid)?,
+                        ),
+                        None => None,
+                    },
+                    Some(_) => None,
+                };
                 let Some(approval) = self.approvals.remove(&request) else {
                     return Err(AdapterError::Invalid(format!(
                         "no pending approval {request}"
                     )));
                 };
                 self.remember_settled_request(request, approval.scope.clone());
-                let Some(grant) = approval.grant else {
+                let Some(grant) = rewritten.or(approval.grant) else {
                     let line = json!({
                         "id": approval.rpc_id,
                         "result": {"decision": decision_wire(decision)},
@@ -6125,5 +6139,35 @@ mod tests {
         assert!(a
             .feed(&form_frame(json!(last), None, repo_form()))
             .is_empty());
+    }
+
+    /// The session sends a granted path by where it really leads (`updated_input`); a rename the
+    /// grant does not hold is refused and the request stays answerable.
+    #[test]
+    fn an_allow_can_name_a_granted_path_by_where_it_leads() {
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(
+            12,
+            json!({"fileSystem": {"write": ["out"]}}),
+        )));
+        let approve = |paths: Value| Command::Approve {
+            request: request.clone(),
+            decision: Decision::AllowForSession,
+            updated_input: Some(paths),
+            message: None,
+        };
+        assert!(matches!(
+            a.encode(approve(json!({"/elsewhere": "/x"}))),
+            Err(AdapterError::Invalid(_))
+        ));
+        let w = one_write(
+            a.encode(approve(json!({"/work/repo/out": "/data/real-out"})))
+                .expect("allow"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 12, "result": {"scope": "session",
+                "permissions": {"fileSystem": {"write": ["/data/real-out"]}}}})
+        );
     }
 }

@@ -9,6 +9,17 @@
 //! a path the sensitive list names in any component. Globs and places Codex resolves itself
 //! (the temp folder, `/tmp`, system libraries, the whole filesystem) get Allow for this turn
 //! only. Anything that cannot be checked withholds it (fail closed).
+//!
+//! A session grant names a path, and Codex resolves that name again on every later command. So
+//! a name whose folder Codex can write (the project under Accept edits, or a place an earlier
+//! session grant covers) is turn-only: Codex could swap it for a link later. A hard-linked file
+//! is turn-only too. A folder is looked into one level deep only: the project root, or a folder
+//! whose own entries include `.git`, agent instructions or tool configs, is turn-only; deeper
+//! contents are not listed.
+//!
+//! Assumption: the app and Codex see the same filesystem (same user, same machine, same mount
+//! namespace). A Codex run in another namespace or container would resolve names differently,
+//! and these checks would not describe what it opens.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -64,7 +75,22 @@ pub(super) fn child_homes(
     ChildHomes { home, codex }
 }
 
-/// What [`judge`] decided for one card.
+/// What a card is judged against: the card's `input` (the adapter's shape) and the thread as
+/// it is now.
+#[derive(Debug, Clone)]
+pub(super) struct Check {
+    pub input: Value,
+    /// The thread's folder.
+    pub workspace: PathBuf,
+    pub homes: ChildHomes,
+    /// The agent may write inside the project without asking (Accept edits: `workspaceWrite`).
+    pub project_writable: bool,
+    /// Where earlier session grants already let Codex write (resolved).
+    pub granted: Vec<PathBuf>,
+}
+
+/// What [`judge`] decided for one card. Two verdicts for the same card compare equal only if
+/// nothing a grant depends on moved in between (see the answer-time re-check).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct Verdict {
     pub session_allowed: bool,
@@ -72,6 +98,14 @@ pub(super) struct Verdict {
     /// For each entry of `input.entries`, where it really leads when that differs from what it
     /// says (a symlink on the way).
     pub resolved: Vec<Option<String>>,
+    /// For each entry, the identity of what it really names on disk (device, inode, link count)
+    /// when it exists.
+    pub marks: Vec<Option<(u64, u64, u64)>>,
+    /// Literal path entries (`kind: "path"`) that lead elsewhere: as written → as resolved. The
+    /// grant names them as resolved, which the card showed.
+    pub renames: Vec<(String, String)>,
+    /// The resolved targets of write entries, for later parent checks.
+    pub writes: Vec<PathBuf>,
 }
 
 /// `path` with every symlink resolved: the nearest existing ancestor is canonicalised and the
@@ -125,11 +159,16 @@ struct Findings {
     scope: Vec<String>,
     /// A granted folder holds the project's settings or history (or is the project root).
     settings: bool,
+    /// A granted file has hard links elsewhere.
+    linked: bool,
+    /// Codex can write the folder holding a granted name, so it could swap that name later.
+    renameable: bool,
 }
 
-/// Said when a grant takes in the project's own settings and history.
-const SETTINGS_WARNING: &str =
-    "This includes the project's own settings and history (.git, agent instructions).";
+/// Said when a grant takes in the project's own settings and history. Only a folder's own
+/// entries are looked at, so it says "directly".
+const SETTINGS_WARNING: &str = "This includes the project's own settings and history (.git, \
+     agent instructions) kept directly in this folder.";
 
 /// Most entries listed when looking for settings in a folder; a larger one is not vouched for.
 const MAX_LISTED: usize = 10_000;
@@ -202,11 +241,30 @@ impl Findings {
     }
 }
 
-/// Judges a card's `input` (the adapter's shape) for a thread in `workspace`, with the child's
-/// `homes`. Blocking: it reads the filesystem.
+/// Said when Codex could swap a granted name for something else later.
+const RENAME_NOTE: &str =
+    "Codex could rename this place later, so it is allowed for this turn only.";
+/// Said when a granted file has hard links.
+const LINKED_NOTE: &str = "This file has other names elsewhere on disk.";
+
+/// [`judge_check`] for a thread in Ask mode with no earlier session grants.
+#[cfg(test)]
 pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verdict {
+    judge_check(&Check {
+        input: input.clone(),
+        workspace: workspace.to_owned(),
+        homes: homes.clone(),
+        project_writable: false,
+        granted: Vec::new(),
+    })
+}
+
+/// Judges a card. Blocking: it reads the filesystem, in the app's own mount namespace, which is
+/// assumed to be the one Codex sees (both run as the same user on the same machine).
+pub(super) fn judge_check(check: &Check) -> Verdict {
     let mut f = Findings::default();
-    let entries = input
+    let entries = check
+        .input
         .get("entries")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
@@ -218,30 +276,30 @@ pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verd
             .flatten()
             .collect()
     };
-    let homes_known = both(&homes.home);
-    let codex_known = both(&homes.codex);
-    if homes.home.is_none() {
+    let homes_known = both(&check.homes.home);
+    let codex_known = both(&check.homes.codex);
+    if check.homes.home.is_none() {
         f.scope("agent-terminal cannot tell which home folder Codex uses");
     }
-    if homes.codex.is_none() {
+    if check.homes.codex.is_none() {
         f.scope("agent-terminal cannot tell where Codex keeps its settings");
     }
-    let workspace_real = real(workspace);
+    let workspace_real = real(&check.workspace);
     if workspace_real.is_none() {
         f.scope("the thread's folder could not be checked");
     }
-    let mut resolved = Vec::with_capacity(entries.len());
+    let mut v = Verdict::default();
     for entry in entries {
-        resolved.push(None);
+        v.resolved.push(None);
+        v.marks.push(None);
         if entry.get("access").and_then(Value::as_str) == Some("deny") {
             continue; // a deny restricts
         }
+        let write = entry.get("access").and_then(Value::as_str) == Some("write");
         let target = &entry["target"];
+        let kind = target.get("kind").and_then(Value::as_str);
         let path = target.get("path").and_then(Value::as_str);
-        match (
-            target.get("kind").and_then(Value::as_str),
-            target.get("name").and_then(Value::as_str),
-        ) {
+        match (kind, target.get("name").and_then(Value::as_str)) {
             (Some("glob"), _) => {
                 let pattern = target["pattern"].as_str().unwrap_or_default();
                 let base = glob_base(pattern);
@@ -287,12 +345,26 @@ pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verd
             continue;
         };
         f.reaches(&actual, &homes_known, &codex_known, false);
+        let meta = std::fs::metadata(&actual).ok();
+        if let (Some(mark), Some(meta)) = (v.marks.last_mut(), &meta) {
+            use std::os::unix::fs::MetadataExt;
+            *mark = Some((meta.dev(), meta.ino(), meta.nlink()));
+        }
+        if write {
+            v.writes.push(actual.clone());
+        }
         let inside = workspace_real
             .as_ref()
             .is_some_and(|w| actual.starts_with(w));
         if actual != lexical {
-            if let Some(last) = resolved.last_mut() {
+            if let Some(last) = v.resolved.last_mut() {
                 *last = Some(actual.to_string_lossy().into_owned());
+            }
+            if kind == Some("path") {
+                v.renames.push((
+                    lexical.to_string_lossy().into_owned(),
+                    actual.to_string_lossy().into_owned(),
+                ));
             }
             if !inside {
                 f.danger(format!(
@@ -302,15 +374,34 @@ pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verd
                 ));
             }
         }
-        if !inside && !std::fs::metadata(&actual).is_ok_and(|m| m.is_file()) {
+        let is_file = meta.as_ref().is_some_and(|m| m.is_file());
+        if !inside && !is_file {
             f.scope(format!(
                 "{} is outside the project and is not a single existing file",
                 lexical.display()
             ));
         }
-        // A folder holding the project's settings or history: the project root itself, or one
-        // whose own entries include .git, agent instructions or tool configs.
-        if std::fs::metadata(&actual).is_ok_and(|m| m.is_dir()) {
+        if is_file
+            && meta.as_ref().is_some_and(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.nlink() > 1
+            })
+        {
+            f.linked = true;
+        }
+        // Whoever can write the folder holding the granted name can swap that name later.
+        let parent = actual.parent().unwrap_or(Path::new("/"));
+        let parent_in_project = workspace_real
+            .as_ref()
+            .is_some_and(|w| parent.starts_with(w));
+        if (check.project_writable && parent_in_project)
+            || check.granted.iter().any(|g| parent.starts_with(g))
+        {
+            f.renameable = true;
+        }
+        // A folder holding the project's settings or history directly (one level deep): the
+        // project root itself, or one whose own entries include .git or agent instructions.
+        if meta.as_ref().is_some_and(|m| m.is_dir()) {
             let root = workspace_real.as_ref().is_some_and(|w| *w == actual);
             match holds_settings(&actual) {
                 Some(false) if !root => {}
@@ -319,35 +410,33 @@ pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verd
             }
         }
     }
-    let mut warning = String::new();
+    let mut parts: Vec<String> = Vec::new();
     if f.settings {
-        warning.push_str(SETTINGS_WARNING);
+        parts.push(SETTINGS_WARNING.to_owned());
     }
     if !f.danger.is_empty() {
-        if !warning.is_empty() {
-            warning.push(' ');
-        }
-        warning.push_str(&format!(
+        parts.push(format!(
             "This reaches {}. Allow it for this turn only if you trust it.",
             agent_core::codex::sentence(&f.danger)
         ));
     }
+    if f.linked {
+        parts.push(LINKED_NOTE.to_owned());
+    }
+    if f.renameable {
+        parts.push(RENAME_NOTE.to_owned());
+    }
     if !f.scope.is_empty() {
-        if !warning.is_empty() {
-            warning.push(' ');
-        }
-        warning.push_str(&format!(
+        parts.push(format!(
             "Allow for session is not offered: {}.",
             agent_core::codex::sentence(&f.scope)
         ));
-    } else if !f.danger.is_empty() || f.settings {
-        warning.push_str(" Allow for session is not offered.");
+    } else if !parts.is_empty() && !f.renameable {
+        parts.push("Allow for session is not offered.".to_owned());
     }
-    Verdict {
-        session_allowed: f.danger.is_empty() && f.scope.is_empty() && !f.settings,
-        warning: (!warning.is_empty()).then(|| agent_core::codex::clip(&warning, MAX_WARNING)),
-        resolved,
-    }
+    v.session_allowed = parts.is_empty();
+    v.warning = (!parts.is_empty()).then(|| agent_core::codex::clip(&parts.join(" "), MAX_WARNING));
+    v
 }
 
 #[cfg(test)]
@@ -659,5 +748,82 @@ mod tests {
             child_homes(&env(&[("HOME", "")], &[]), None, None).home,
             None
         );
+    }
+
+    fn check(input: Value, project: &Path, home: &Path) -> Check {
+        Check {
+            input,
+            workspace: project.to_owned(),
+            homes: homes(home),
+            project_writable: false,
+            granted: Vec::new(),
+        }
+    }
+
+    /// Red-team #400: a hard-linked file names the same data as another path.
+    #[test]
+    fn a_hard_linked_file_is_turn_only() {
+        let (_dir, home, project) = tree();
+        let file = project.join("src/data.txt");
+        std::fs::write(&file, "x").expect("file");
+        let plain = judge(&one("read", path(&file)), &project, &homes(&home));
+        assert!(plain.session_allowed, "{plain:?}");
+        std::fs::hard_link(&file, home.join("other-name")).expect("hard link");
+        let v = judge(&one("read", path(&file)), &project, &homes(&home));
+        assert!(!v.session_allowed);
+        assert!(v.warning.is_some_and(|w| w.contains(LINKED_NOTE)));
+        assert_ne!(
+            plain.marks, v.marks,
+            "the link count is part of the verdict"
+        );
+    }
+
+    /// Red-team #399: Codex re-resolves a granted name on every later command, so a name in a
+    /// folder Codex may write (Accept edits in the project, or an earlier session grant) could
+    /// be swapped for a link later.
+    #[test]
+    fn a_name_codex_could_rename_is_turn_only() {
+        let (_dir, home, project) = tree();
+        let target = one("write", path(&project.join("src/gen")));
+        assert!(judge_check(&check(target.clone(), &project, &home)).session_allowed);
+        let writable = Check {
+            project_writable: true,
+            ..check(target.clone(), &project, &home)
+        };
+        let v = judge_check(&writable);
+        assert!(!v.session_allowed);
+        assert_eq!(v.warning.as_deref(), Some(RENAME_NOTE));
+        let granted = Check {
+            granted: vec![real(&project.join("src")).expect("real")],
+            ..check(target, &project, &home)
+        };
+        assert!(!judge_check(&granted).session_allowed);
+        // Network only stays session-grantable in either case.
+        let network = Check {
+            project_writable: true,
+            ..check(card(json!([])), &project, &home)
+        };
+        assert!(judge_check(&network).session_allowed);
+    }
+
+    /// A literal path that leads elsewhere is granted by where it leads.
+    #[test]
+    fn a_path_through_a_link_is_renamed_to_where_it_leads() {
+        let (_dir, home, project) = tree();
+        std::os::unix::fs::symlink(project.join("src"), project.join("alias")).expect("link");
+        let v = judge(
+            &one("write", path(&project.join("alias/x"))),
+            &project,
+            &homes(&home),
+        );
+        let real_x = real(&project.join("src/x")).expect("real");
+        assert_eq!(
+            v.renames,
+            [(
+                project.join("alias/x").to_string_lossy().into_owned(),
+                real_x.to_string_lossy().into_owned()
+            )]
+        );
+        assert_eq!(v.writes, [real_x]);
     }
 }

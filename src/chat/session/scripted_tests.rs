@@ -1079,11 +1079,156 @@ fn scripted_a_symlinked_target_is_shown_resolved_and_never_session_granted() {
         assert!(fixture.results().is_empty());
         session.respond_approval(&request, Decision::Allow);
         fixture.wait_finished(ctx);
-        let lexical = format!("{}/out", fixture.dir.path().display());
+        // The grant names the place by where it really leads, as the card showed it.
         assert_eq!(
             fixture.results(),
-            [json!({"scope": "turn", "permissions": {"fileSystem": {"write": [lexical]}}})]
+            [json!({"scope": "turn", "permissions": {"fileSystem": {"write": [real]}}})]
         );
+        session.shutdown(false);
+    });
+}
+
+/// A Codex permission frame for the fixture's running turn, fed straight to the session.
+fn permission_line(fixture: &Fixture, id: u64) -> String {
+    json!({"id": id, "method": "item/permissions/requestApproval", "params": {
+        "threadId": "fixture-thread", "turnId": "connection-1-turn-1", "itemId": format!("p{id}"),
+        "startedAtMs": 1, "cwd": fixture.dir.path(), "permissions": {"network": {"enabled": true}},
+    }})
+    .to_string()
+}
+
+fn permission_cards(fixture: &Fixture) -> usize {
+    fixture
+        .seen
+        .borrow()
+        .iter()
+        .filter(|e| {
+            matches!(&e.event, Event::ApprovalRequested { tool, .. }
+            if tool == agent_core::codex::PERMISSIONS_TOOL)
+        })
+        .count()
+}
+
+/// Lets every held check finish (they are quick; this outlasts them).
+fn settle(ctx: &glib::MainContext) {
+    pump_until(ctx, 1, || false);
+}
+
+/// Rust review #397: a card whose request ends while its targets are being checked is never
+/// shown, whether the agent resolved it or the process went away; a duplicate shows once.
+#[test]
+fn scripted_a_held_permission_card_never_outlives_its_request() {
+    in_loop(|ctx| {
+        // Resolved by the agent while held.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        fixture.wait_pending(ctx);
+        let generation = session.inner.generation.get();
+        session
+            .inner
+            .on_line(generation, &permission_line(&fixture, 900), false);
+        session.inner.on_line(
+            generation,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"fixture-thread","requestId":900}}"#,
+            false,
+        );
+        settle(ctx);
+        assert_eq!(permission_cards(&fixture), 0, "expired while held");
+        assert!(session.inner.held_permissions.borrow().is_empty());
+        session.shutdown(false);
+
+        // The process ends while held.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        fixture.wait_pending(ctx);
+        let generation = session.inner.generation.get();
+        session
+            .inner
+            .on_line(generation, &permission_line(&fixture, 901), false);
+        session.shutdown(false);
+        settle(ctx);
+        assert_eq!(
+            permission_cards(&fixture),
+            0,
+            "the process ended while held"
+        );
+
+        // The same request twice while held: one card.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        fixture.wait_pending(ctx);
+        let generation = session.inner.generation.get();
+        for _ in 0..2 {
+            session
+                .inner
+                .on_line(generation, &permission_line(&fixture, 902), false);
+        }
+        settle(ctx);
+        assert_eq!(permission_cards(&fixture), 1);
+        session
+            .inner
+            .on_line(generation, &permission_line(&fixture, 902), false);
+        settle(ctx);
+        assert_eq!(
+            permission_cards(&fixture),
+            1,
+            "a shown card is not shown twice"
+        );
+        session.shutdown(false);
+    });
+}
+
+/// Red-team #401: an Allow is checked on disk again; if the place changed (here, swapped for a
+/// link) nothing is sent and the card is shown again under a new id, as it is now.
+#[test]
+fn scripted_a_request_that_changed_while_waiting_is_shown_again_not_sent() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        let (request, options, _) = fixture.wait_card(ctx);
+        assert!(options.contains(&Decision::AllowForSession));
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), fixture.dir.path().join("build"))
+            .expect("swap the name for a link");
+        session.respond_approval(&request, Decision::AllowForSession);
+        fixture.wait(ctx, "the card shown again", || {
+            permission_card(&fixture.seen).is_some_and(|(r, ..)| r != request)
+        });
+        assert!(fixture.results().is_empty(), "nothing was sent");
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(request.as_str())
+                && e.event == Event::ApprovalExpired));
+        let (again, options, input) = permission_card(&fixture.seen).expect("card");
+        assert!(!options.contains(&Decision::AllowForSession));
+        assert!(input["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(super::CHECK_CHANGED)));
+        session.respond_approval(&again, Decision::Allow);
+        fixture.wait_finished(ctx);
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {"fileSystem": {"write": [real]}}})]
+        );
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(again.as_str())
+                && e.event
+                    == Event::ApprovalResolved {
+                        decision: Decision::Allow
+                    }));
         session.shutdown(false);
     });
 }
