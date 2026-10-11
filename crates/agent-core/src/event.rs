@@ -109,6 +109,15 @@ pub enum Event {
         #[serde(default)]
         error: Option<String>,
     },
+    /// The state of a reasoning item (`Envelope::item` is its id; its text still arrives as
+    /// [`StreamKind::Reasoning`] content). Every agent's reasoning is one block in one of
+    /// [`ReasoningState`]'s states; `label` says what the model shares (Claude and agy: its
+    /// thinking; Codex: a summary of it).
+    Reasoning {
+        state: ReasoningState,
+        #[serde(default)]
+        label: ReasoningLabel,
+    },
     PlanUpdated {
         steps: Vec<PlanStep>,
     },
@@ -272,6 +281,38 @@ pub enum StreamKind {
     Reasoning,
     ToolInput,
     ToolOutput,
+}
+
+/// Where a reasoning block is in its life ([`Event::Reasoning`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningState {
+    /// Text is arriving as the model thinks (Claude `thinking_delta`, Codex summary deltas).
+    Streaming,
+    /// The whole block is in: streamed and closed, or delivered in one piece (agy reads it from
+    /// its transcript; it is never streamed for show).
+    Complete,
+    /// Shown from stored history, not from the live agent. Set by the view on replay; an
+    /// adapter never emits it.
+    Replayed,
+    /// The model reasoned but did not share it (a signature-only or redacted block, or a CLI
+    /// that refused the option that shares it).
+    Unavailable,
+    /// A state from a newer build.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a reasoning block holds, which sets its wording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningLabel {
+    /// A summary of its reasoning (Codex reasoning summaries).
+    Summary,
+    /// The model's own thinking (Claude, agy); also what a label from a newer build reads as.
+    #[default]
+    #[serde(other)]
+    Thinking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +552,41 @@ mod tests {
         assert_eq!(tasks[0].kind, BackgroundTaskKind::Other);
         assert_eq!(tasks[0].tool_use_id, None);
         assert_eq!(tasks[1].kind, BackgroundTaskKind::Other);
+    }
+
+    #[test]
+    fn reasoning_events_keep_their_stored_shape_and_tolerate_newer_values() {
+        let env = Envelope::new(Event::Reasoning {
+            state: ReasoningState::Streaming,
+            label: ReasoningLabel::Summary,
+        })
+        .item("r1");
+        let json = serde_json::to_value(&env).expect("serialize");
+        assert_eq!(
+            json["event"],
+            serde_json::json!({"type": "reasoning", "state": "streaming", "label": "summary"})
+        );
+        let back: Envelope = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(env, back);
+        let event: Event =
+            serde_json::from_str(r#"{"type":"reasoning","state":"pondering","label":"musings"}"#)
+                .expect("decode");
+        assert_eq!(
+            event,
+            Event::Reasoning {
+                state: ReasoningState::Unknown,
+                label: ReasoningLabel::Thinking
+            }
+        );
+        let event: Event = serde_json::from_str(r#"{"type":"reasoning","state":"unavailable"}"#)
+            .expect("label defaults");
+        assert_eq!(
+            event,
+            Event::Reasoning {
+                state: ReasoningState::Unavailable,
+                label: ReasoningLabel::Thinking
+            }
+        );
     }
 
     #[test]

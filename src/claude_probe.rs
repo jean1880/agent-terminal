@@ -6,8 +6,15 @@
 //! ever sent, so no turn runs and nothing is billed. [`probe_shared`] coalesces concurrent
 //! callers onto ONE process. Nothing is logged but the outcome; frame bodies may hold the
 //! account email.
+//!
+//! The probe also runs `claude --version` beside it and remembers the answer per binary
+//! ([`known_version`]); a thread's session adds what its own `init` reports
+//! ([`note_version`]). That version gates `--thinking-display summarized`
+//! ([`thinking_display_allowed`], W3.2): the flag is hidden, so it is passed only to a Claude
+//! known to take it, and a binary that refused it once is not offered it again this run.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -28,6 +35,9 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `get_usage` may take after that; its failure is not an error.
 const USAGE_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
+/// How long `claude --version` may still take once the requests are answered (it started with
+/// them, so it is normally done by then).
+const VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClaudeProbe {
@@ -36,6 +46,43 @@ pub struct ClaudeProbe {
     pub windows: Vec<QuotaWindow>,
     /// No one is signed in (a fresh install, or a login that was removed).
     pub signed_out: bool,
+    /// `claude --version`, when it answered with one.
+    pub version: Option<String>,
+}
+
+thread_local! {
+    /// Binary → the Claude Code version it last reported (probe or a session's `init`).
+    static VERSIONS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Binaries that refused `--thinking-display` at start this run.
+    static THINKING_REFUSED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// Remembers the version `program` reported. Text with no version in it is ignored.
+pub fn note_version(program: &str, version: &str) {
+    if agent_core::claude::parse_version(version).is_none() {
+        return;
+    }
+    VERSIONS.with(|v| {
+        v.borrow_mut()
+            .insert(program.to_owned(), version.trim().to_owned())
+    });
+}
+
+/// The version `program` last reported, if any.
+pub fn known_version(program: &str) -> Option<String> {
+    VERSIONS.with(|v| v.borrow().get(program).cloned())
+}
+
+/// `program` exited at start refusing `--thinking-display`: never offer it again this run.
+pub fn note_thinking_refused(program: &str) {
+    THINKING_REFUSED.with(|r| r.borrow_mut().insert(program.to_owned()));
+}
+
+/// Whether a session of `program` passes `--thinking-display summarized`: its version is known
+/// and accepts it, and it has not refused it. An unknown version does not.
+pub fn thinking_display_allowed(program: &str) -> bool {
+    !THINKING_REFUSED.with(|r| r.borrow().contains(program))
+        && known_version(program).is_some_and(|v| agent_core::claude::accepts_thinking_display(&v))
 }
 
 pub type ProbeResult = Result<ClaudeProbe, &'static str>;
@@ -101,6 +148,28 @@ pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
         let exited = exited.clone();
         move |_| exited.set(true)
     };
+    // `claude --version`, side by side with the requests.
+    let version: Rc<RefCell<Option<String>>> = Rc::default();
+    let version_exited = Rc::new(Cell::new(false));
+    let version_proc = {
+        let spec = SpawnSpec {
+            argv: vec![program.to_owned(), "--version".to_owned()],
+            ..spec.clone()
+        };
+        let (slot, exited) = (version.clone(), version_exited.clone());
+        AgentProcess::spawn(
+            &spec,
+            move |line: &str| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(line.trim().to_owned());
+                }
+            },
+            |_| {},
+            move |_| exited.set(true),
+        )
+        .ok()
+    };
     let proc =
         AgentProcess::spawn(&spec, on_line, |_| {}, on_exit).map_err(|_| "claude did not start")?;
     proc.write_line(&request(INIT_ID, "initialize"));
@@ -122,6 +191,21 @@ pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
     }
     // Dropping `proc` would terminate it too; do it explicitly so the intent is visible.
     proc.terminate();
+    if let Some(version_proc) = version_proc {
+        let mut waited = Duration::ZERO;
+        while version.borrow().is_none() && !version_exited.get() && waited < VERSION_TIMEOUT {
+            glib::timeout_future(POLL).await;
+            waited += POLL;
+        }
+        version_proc.terminate();
+    }
+    let version = version
+        .borrow_mut()
+        .take()
+        .filter(|v| agent_core::claude::parse_version(v).is_some());
+    if let Some(v) = &version {
+        note_version(program, v);
+    }
 
     let init = init.borrow_mut().take();
     let Some(init) = init else {
@@ -141,6 +225,7 @@ pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
         account: claude_account(&init),
         windows,
         signed_out: claude_signed_out(&init),
+        version,
     })
 }
 
@@ -281,9 +366,13 @@ pub(crate) mod tests {
     #[test]
     fn concurrent_callers_share_one_process() {
         let dir = tempfile::tempdir().unwrap();
-        // Counts its own launches in a file next to the script.
+        // Counts its own launches in a file next to the script (not the `--version` runs).
         let count = dir.path().join("launches");
-        let body = format!("echo x >> '{}'\n{}", count.display(), answering());
+        let body = format!(
+            "[ \"$1\" = --version ] && exit 0\necho x >> '{}'\n{}",
+            count.display(),
+            answering()
+        );
         let program = fake_claude(dir.path(), &body);
         let got = in_loop(|ctx| {
             let got = Rc::new(Cell::new(0));
@@ -300,6 +389,38 @@ pub(crate) mod tests {
         assert_eq!(got, 3);
         let launches = std::fs::read_to_string(count).unwrap();
         assert_eq!(launches.lines().count(), 1, "one process for three callers");
+    }
+
+    /// W3.2: the probe learns the binary's version from `claude --version`, which gates
+    /// `--thinking-display`; an old, unknown or refusing binary is not offered it.
+    #[test]
+    fn the_probe_learns_the_version_that_gates_thinking_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "[ \"$1\" = --version ] && echo '2.1.293 (Claude Code)' && exit 0\n{}",
+            answering()
+        );
+        let program = fake_claude(dir.path(), &body);
+        assert!(!thinking_display_allowed(&program), "unknown version");
+        let p = run_probe(program.clone()).expect("probe");
+        assert_eq!(p.version.as_deref(), Some("2.1.293 (Claude Code)"));
+        assert_eq!(
+            known_version(&program).as_deref(),
+            Some("2.1.293 (Claude Code)")
+        );
+        assert!(thinking_display_allowed(&program));
+        note_thinking_refused(&program);
+        assert!(!thinking_display_allowed(&program), "refused once");
+
+        note_version("/old/claude", "2.1.200");
+        assert!(!thinking_display_allowed("/old/claude"), "too old");
+        note_version("/odd/claude", "no version here");
+        assert_eq!(known_version("/odd/claude"), None);
+        // The fakes above print a frame for `--version`: no version, nothing remembered.
+        let other = tempfile::tempdir().unwrap();
+        let fake = fake_claude(other.path(), &answering());
+        assert_eq!(run_probe(fake.clone()).expect("probe").version, None);
+        assert!(!thinking_display_allowed(&fake));
     }
 
     #[test]

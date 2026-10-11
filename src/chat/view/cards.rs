@@ -612,8 +612,17 @@ impl Row {
                 md.set_markdown(text);
                 caret.set_visible(*streaming);
             }
-            (Self::Reasoning(r), Body::Reasoning { text, streaming }) => {
-                r.update(text, *streaming, item.expanded);
+            (
+                Self::Reasoning(r),
+                Body::Reasoning {
+                    text,
+                    streaming,
+                    state,
+                    label,
+                },
+            ) => {
+                let view = super::model::reasoning_view(text, *streaming, *state, *label);
+                r.update(text, &view, item.expanded);
             }
             (Self::Tool(t), Body::Tool(_)) => t.update(item),
             (Self::Approval(a), Body::Approval(_)) => a.update(item),
@@ -778,6 +787,7 @@ fn divider(text: &str, class: &str, driver: Option<Driver>) -> gtk4::Widget {
 
 pub struct ReasoningRow {
     root: gtk4::Box,
+    toggle: gtk4::Button,
     title: gtk4::Label,
     chevron: gtk4::Image,
     revealer: gtk4::Revealer,
@@ -822,6 +832,7 @@ impl ReasoningRow {
         ));
         Self {
             root,
+            toggle,
             title,
             chevron,
             revealer,
@@ -867,18 +878,30 @@ impl ReasoningRow {
         }
     }
 
-    fn update(&self, text: &str, streaming: bool, expanded: bool) {
+    /// One widget, four states ([`super::model::reasoning_view`]): streaming, complete, replayed
+    /// from history, and not shared by the model (a dim, closed line with nothing to open).
+    fn update(&self, text: &str, view: &super::model::ReasoningView, expanded: bool) {
+        use agent_core::event::ReasoningState;
         let text = text.trim();
-        // Claude often withholds its reasoning: the thinking block arrives (signature only) and
-        // no text ever streams. Such a card takes no space at all, so it cannot make the
-        // transcript jump; the header's "Working…" already says the agent is busy. It shows
-        // as soon as there is reasoning to read.
-        self.root.set_visible(!text.is_empty());
-        self.title.set_text(if streaming {
-            "Thinking…"
-        } else {
-            "Thought process"
-        });
+        // A block with no words yet takes no space at all, so it cannot make the transcript
+        // jump; the header's "Working…" already says the agent is busy.
+        self.root.set_visible(view.visible);
+        self.title.set_text(view.title);
+        self.toggle.set_tooltip_text(view.hint);
+        self.toggle.set_sensitive(view.expandable);
+        for (state, class) in [
+            (ReasoningState::Streaming, "reasoning-streaming"),
+            (ReasoningState::Replayed, "reasoning-replayed"),
+            (ReasoningState::Unavailable, "reasoning-unavailable"),
+        ] {
+            if view.state == state {
+                self.root.add_css_class(class);
+            } else {
+                self.root.remove_css_class(class);
+            }
+        }
+        let expanded = expanded && view.expandable;
+        self.chevron.set_visible(view.expandable);
         // A collapsed card's text is not drawn, but a label in a closed revealer is still
         // measured whenever it changes: streaming into it cost as much as into an open one. Its
         // text is put in only while open (opening it updates the row, with all of it).

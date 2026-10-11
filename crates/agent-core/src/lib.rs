@@ -19,4 +19,5 @@ pub mod handoff_budget;
 pub mod import;
 pub mod quota;
 pub mod redact;
+pub mod tool_title;
 pub mod transition;

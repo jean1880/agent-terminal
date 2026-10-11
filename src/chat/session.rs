@@ -223,6 +223,20 @@ struct Inner {
     /// How long a Claude permission request may wait for the user before it is denied (agy's
     /// socket has the same bound). Injectable for tests.
     approval_deadline: Cell<Duration>,
+    /// Claude's `--thinking-display summarized` for the running process (W3.2).
+    thinking: ThinkingFlag,
+}
+
+/// Whether the running Claude process got `--thinking-display summarized`, and how it took it.
+/// The flag is hidden, so a CLI that refuses it at start is retried once without it.
+#[derive(Default)]
+struct ThinkingFlag {
+    /// The running process was started with the flag.
+    passed: Cell<bool>,
+    /// It said on stderr that it does not take the flag.
+    refused: Cell<bool>,
+    /// The one retry without the flag was spent: this thread never passes it again.
+    retried: Cell<bool>,
 }
 
 struct QueuedPrompt {
@@ -403,6 +417,7 @@ impl ChatSession {
             agy_deferred_exit: Cell::new(None),
             agy_hold: RefCell::new(std::collections::VecDeque::new()),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
+            thinking: ThinkingFlag::default(),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -839,7 +854,17 @@ impl Inner {
         let approval = self.approval();
         self.open.borrow_mut().approval_hook = approval.is_some();
         let open = self.open.borrow();
-        let argv = self.adapter.borrow().argv(&open);
+        let mut argv = self.adapter.borrow().argv(&open);
+        // W3.2: Claude shares its thinking only with this hidden flag, so it goes only to a
+        // version known to take it (`claude_probe`), and never after the one retry without it.
+        let thinking = self.adapter.borrow().driver() == Driver::Claude
+            && !self.thinking.retried.get()
+            && crate::claude_probe::thinking_display_allowed(&open.program);
+        if thinking {
+            argv.extend(agent_core::claude::THINKING_DISPLAY_ARGS.map(str::to_owned));
+        }
+        self.thinking.passed.set(thinking);
+        self.thinking.refused.set(false);
         let launch = self.launch_env.borrow();
         // The profile's environment first, so it can never override the approval socket.
         let mut env = launch.env.clone();
@@ -1079,6 +1104,23 @@ impl Inner {
     fn dispatch_line(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
         if generation != self.generation.get() {
             return;
+        }
+        if stderr
+            && self.thinking.passed.get()
+            && agent_core::claude::refuses_thinking_display(line)
+        {
+            // Not the user's error: the exit that follows is retried without the flag.
+            warn!("claude refused --thinking-display; retrying without it");
+            self.thinking.refused.set(true);
+            return;
+        }
+        if !stderr && line.contains("\"claude_code_version\"") {
+            // What a Claude `init` says it is: the next launch's thinking-flag gate.
+            if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(version) = agent_core::claude::session_version(&frame) {
+                    crate::claude_probe::note_version(&self.open.borrow().program, version);
+                }
+            }
         }
         let envelopes = if stderr {
             self.adapter.borrow_mut().feed_stderr(line)
@@ -1522,6 +1564,9 @@ impl Inner {
             return;
         }
         info!(code = ?code, "agent exited");
+        if self.retry_without_thinking(code) {
+            return;
+        }
         self.finish_process(code, false);
         // A switch's new agent that died before it ever started: back to the old one. Taken
         // first, as in start_process.
@@ -1533,6 +1578,43 @@ impl Inner {
             };
             self.roll_back(previous, &reason);
         }
+    }
+
+    /// W3.2: Claude exited refusing `--thinking-display`. Restarts it ONCE without the flag (the
+    /// session never fails to start over it) and shows the thread's reasoning as not shared.
+    /// False when this exit is anything else.
+    fn retry_without_thinking(self: &Rc<Self>, code: Option<i32>) -> bool {
+        let flag = &self.thinking;
+        if !(flag.passed.get() && flag.refused.get()) || flag.retried.get() {
+            return false;
+        }
+        flag.retried.set(true);
+        let program = self.open.borrow().program.clone();
+        crate::claude_probe::note_thinking_refused(&program);
+        // The app restarts it, so the exit is not reported as a failure.
+        self.finish_process(code, true);
+        let id = format!("thinking-unavailable-{}", self.generation.get());
+        for env in [
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Reasoning,
+                title: "Thinking".to_owned(),
+                input: None,
+                parent: None,
+            }),
+            Envelope::new(Event::Reasoning {
+                state: agent_core::event::ReasoningState::Unavailable,
+                label: agent_core::event::ReasoningLabel::Thinking,
+            }),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            }),
+        ] {
+            self.emit(env.item(id.clone()));
+        }
+        self.start_process();
+        true
     }
 
     /// Closes out the current process: adapter exit envelopes, status, pending approvals.
@@ -4223,6 +4305,79 @@ mod tests {
         }
     }
 
+    /// W3.2: a Claude known to take `--thinking-display` gets it; one that exits at start with
+    /// an unknown-option error is restarted ONCE without it, its reasoning shows as not shared,
+    /// and the session starts with no error shown.
+    #[test]
+    fn claude_refusing_the_thinking_flag_restarts_once_without_it() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let open = scripted(
+                tmp.path(),
+                "case \"$*\" in *--thinking-display*) \
+                 echo \"error: unknown option '--thinking-display'\" >&2; exit 1;; esac\n\
+                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 exec sleep 30",
+            );
+            // The probe said this binary is a version that takes the flag.
+            crate::claude_probe::note_version(&open.program, "2.1.293 (Claude Code)");
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                open,
+                store,
+                thread,
+                sink,
+                None,
+            );
+            let log = tmp.path().join("args.log");
+            assert!(pump_until(ctx, 10, || {
+                session.status().alive
+                    && std::fs::read_to_string(&log).is_ok_and(|l| l.lines().count() == 2)
+            }));
+            let launches = std::fs::read_to_string(&log).expect("args");
+            let launches: Vec<&str> = launches.lines().collect();
+            assert!(
+                launches[0].contains("--thinking-display summarized"),
+                "{launches:?}"
+            );
+            assert!(!launches[1].contains("--thinking-display"), "{launches:?}");
+            let seen = seen.borrow();
+            assert!(
+                seen.iter().any(|e| e.event
+                    == Event::Reasoning {
+                        state: agent_core::event::ReasoningState::Unavailable,
+                        label: agent_core::event::ReasoningLabel::Thinking,
+                    }
+                    && e.item
+                        .as_deref()
+                        .is_some_and(|i| i.starts_with("thinking-unavailable"))),
+                "the block says the thinking is not shared"
+            );
+            assert!(
+                !seen.iter().any(|e| matches!(&e.event, Event::Error { .. })
+                    || matches!(
+                        e.event,
+                        Event::SessionExited {
+                            expected: false,
+                            ..
+                        }
+                    )),
+                "no error for the refused flag: {seen:?}"
+            );
+            drop(seen);
+            // Never passed again in this thread, and the binary is not offered it either.
+            assert!(!session
+                .launch_spec()
+                .argv
+                .iter()
+                .any(|a| a == "--thinking-display"));
+            assert!(!crate::claude_probe::thinking_display_allowed("/bin/sh"));
+        });
+    }
+
     fn bound_handle(dir: &Path) -> ApprovalHandle {
         ApprovalHandle::bind(
             &dir.join("rt"),
@@ -5785,8 +5940,9 @@ mod tests {
             assert!(session.inner.agy_reading.get().is_none());
             assert!(session.inner.agy_hold.borrow().is_empty());
 
+            // Whole, as a snapshot: agy's thinking is never streamed for show (W3.1).
             let reasoning_delta = seen.borrow().iter().find_map(|env| {
-                if let Event::ContentDelta {
+                if let Event::ContentSnapshot {
                     stream: StreamKind::Reasoning,
                     text,
                 } = &env.event

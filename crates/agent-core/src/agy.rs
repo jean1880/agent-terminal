@@ -18,7 +18,10 @@ use crate::adapter::{
     Outbox,
 };
 use crate::caps::Capabilities;
-use crate::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState, Usage};
+use crate::event::{
+    Envelope, Event, ItemKind, ItemStatus, ReasoningLabel, ReasoningState, StreamKind, TurnState,
+    Usage,
+};
 
 /// Read-only slash commands the CLI answers itself. Inside a stream-json session they fail and
 /// the process exits, so they are never forwarded: each runs as its own `agy -p /cmd` process.
@@ -184,6 +187,20 @@ impl AgyAdapter {
         );
     }
 
+    /// Opens a thinking item. agy hands over each thinking block whole (its transcript has it,
+    /// stdout does not stream it), so the block is Complete from the start: never streamed for
+    /// show.
+    fn start_thinking(&mut self, out: &mut Vec<Envelope>, id: &str) {
+        self.start_item(out, id, ItemKind::Reasoning, "Thinking".to_owned());
+        out.push(
+            Envelope::new(Event::Reasoning {
+                state: ReasoningState::Complete,
+                label: ReasoningLabel::Thinking,
+            })
+            .item(id),
+        );
+    }
+
     fn complete_item(
         &mut self,
         out: &mut Vec<Envelope>,
@@ -280,15 +297,9 @@ impl AgyAdapter {
             let think_id = self.item_id("think", index);
             if !self.completed_thinks.contains(&think_id) {
                 if !self.open_items.contains(&think_id) {
-                    self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
+                    self.start_thinking(out, &think_id);
                 }
-                out.push(
-                    Envelope::new(Event::ContentDelta {
-                        stream: StreamKind::Reasoning,
-                        text: think_text.to_owned(),
-                    })
-                    .item(&think_id),
-                );
+                out.push(thinking_text(&think_id, think_text));
                 if step.state == "DONE" {
                     self.completed_thinks.insert(think_id.clone());
                     self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
@@ -336,14 +347,8 @@ impl AgyAdapter {
             if !self.completed_thinks.contains(&think_id) {
                 self.completed_thinks.insert(think_id.clone());
                 if !self.open_items.contains(&think_id) {
-                    self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
-                    out.push(
-                        Envelope::new(Event::ContentDelta {
-                            stream: StreamKind::Reasoning,
-                            text: think_text.to_owned(),
-                        })
-                        .item(&think_id),
-                    );
+                    self.start_thinking(out, &think_id);
+                    out.push(thinking_text(&think_id, think_text));
                     self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
                 }
             }
@@ -356,7 +361,20 @@ impl AgyAdapter {
             .or(info.name.clone())
             .unwrap_or_else(|| "tool".to_owned());
         let kind = tool_kind(&name);
-        let mut params = info.parameters.clone();
+        // Stdout's parameters, else the transcript's record of the same call (W3.4: decoded, so
+        // the card title reads `/etc/hostname`, not `"/etc/hostname"`).
+        let mut params = info
+            .parameters
+            .clone()
+            .filter(|p| p.as_object().is_some_and(|o| !o.is_empty()))
+            .or_else(|| {
+                step.transcript_calls
+                    .iter()
+                    .find(|c| c.get("name").and_then(Value::as_str) == Some(name.as_str()))
+                    .and_then(|c| c.get("args"))
+                    .map(crate::tool_title::decode_agy_args)
+            })
+            .or_else(|| info.parameters.clone());
         if let Some(p) = params.as_mut().and_then(Value::as_object_mut) {
             if !p.contains_key("tool_name") {
                 p.insert("tool_name".to_string(), Value::String(name.clone()));
@@ -760,6 +778,16 @@ fn env(event: Event) -> Envelope {
     Envelope::new(event)
 }
 
+/// A thinking block's whole text: a snapshot, so a repeated step update replaces it rather than
+/// appending it again.
+fn thinking_text(id: &str, text: &str) -> Envelope {
+    Envelope::new(Event::ContentSnapshot {
+        stream: StreamKind::Reasoning,
+        text: text.to_owned(),
+    })
+    .item(id)
+}
+
 fn unknown(raw: Value) -> Envelope {
     Envelope::new(Event::Unknown).raw(raw)
 }
@@ -910,6 +938,10 @@ struct Step {
     tool_name: Option<String>,
     #[serde(default)]
     tool_info: Option<ToolInfo>,
+    /// The step's tool calls as agy's transcript recorded them, args decoded (`{name, args}`):
+    /// put on the step by the session's transcript reader.
+    #[serde(default)]
+    transcript_calls: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1684,7 +1716,7 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "Let me inspect the file")));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "Let me inspect the file")));
         assert!(events.iter().any(|e| matches!(
             &e.event,
             Event::ItemStarted {
@@ -1702,7 +1734,92 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "Now explain what was found")));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "Now explain what was found")));
         assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Assistant, text } if text == "The file looks good.")));
+    }
+
+    /// W3.4: a step whose stdout carries no parameters takes them from the transcript's record of
+    /// the call (W0 `transcript-view-file.jsonl`, quoted values), decoded, and titles
+    /// `Read /etc/hostname`.
+    #[test]
+    fn w0_transcript_calls_fill_a_bare_step_and_title_it() {
+        let transcript: Value = serde_json::from_str(
+            include_str!("../../../tests/fixtures/real/agy/transcript-view-file.jsonl").trim(),
+        )
+        .expect("transcript line");
+        let calls = transcript["tool_calls"].clone();
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        let step = json!({"event": "step_update", "conversation_id": "c1", "step_update": {
+            "step_type": "tool", "step_index": 2, "state": "ACTIVE", "tool_name": "view_file",
+            "tool_info": {"name": "view_file"}, "transcript_calls": calls}});
+        let out = a.feed(&step.to_string());
+        let (kind, title, input) = out
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ItemStarted {
+                    kind: kind @ ItemKind::FileRead,
+                    title,
+                    input,
+                    ..
+                } => Some((*kind, title.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("tool item");
+        let input = input.expect("input from the transcript");
+        assert_eq!(input["AbsolutePath"], "/etc/hostname");
+        assert_eq!(
+            crate::tool_title::classify(kind, &title, Some(&input)).text(),
+            "Read /etc/hostname"
+        );
+    }
+
+    /// W3.1 contract, from the W0 agy frames (`read-outside-project.jsonl`) with the thinking the
+    /// session reads from agy's transcript put on the step, as `enrich_agy_step` does: one
+    /// reasoning block, Complete at once (never Streaming), its text whole, delivered once even
+    /// though the step is reported twice (ACTIVE, then DONE).
+    #[test]
+    fn w0_agy_thinking_is_one_whole_block_never_streamed() {
+        let fixture = include_str!("../../../tests/fixtures/real/agy/read-outside-project.jsonl");
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        let mut out = Vec::new();
+        for line in fixture.lines() {
+            let mut frame: Value = serde_json::from_str(line).expect("fixture line");
+            if let Some(step) = frame.get_mut("step_update").and_then(Value::as_object_mut) {
+                step.insert("thinking".into(), json!("Reading the hostname file."));
+            }
+            out.extend(a.feed(&frame.to_string()));
+        }
+        let states: Vec<ReasoningState> = out
+            .iter()
+            .filter_map(|e| match e.event {
+                Event::Reasoning { state, label } => {
+                    assert_eq!(label, ReasoningLabel::Thinking);
+                    Some(state)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, [ReasoningState::Complete]);
+        assert!(!out.iter().any(|e| matches!(
+            e.event,
+            Event::ContentDelta {
+                stream: StreamKind::Reasoning,
+                ..
+            }
+        )));
+        let texts: Vec<&str> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ContentSnapshot {
+                    stream: StreamKind::Reasoning,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Reading the hostname file."]);
     }
 }

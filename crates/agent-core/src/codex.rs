@@ -97,8 +97,17 @@ use crate::adapter::{
 use crate::caps::Capabilities;
 use crate::event::{
     Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, QuestionOption,
-    ResponseCapability, StepStatus, StreamKind, TurnState, Usage, WorkerSnapshot, WorkerState,
+    ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind, TurnState, Usage,
+    WorkerSnapshot, WorkerState,
 };
+
+/// A Codex reasoning item's state: Codex shares a summary of its reasoning (label "summary").
+fn reasoning_state(state: ReasoningState) -> Envelope {
+    Envelope::new(Event::Reasoning {
+        state,
+        label: ReasoningLabel::Summary,
+    })
+}
 
 /// Page size asked of `model/list`.
 const MODEL_PAGE: u32 = 200;
@@ -835,8 +844,20 @@ impl CodexAdapter {
             }
             _ => None,
         };
+        let shared = snapshot.as_ref().is_some_and(|(_, t)| !t.trim().is_empty());
         if let Some((stream, text)) = snapshot.filter(|(_, t)| !t.is_empty()) {
             out.push(Envelope::new(Event::ContentSnapshot { stream, text }).item(id));
+        }
+        if s(item, "type") == Some("reasoning") {
+            // W3.1: a reasoning item with no summary is one the model did not share.
+            out.push(
+                reasoning_state(if shared {
+                    ReasoningState::Complete
+                } else {
+                    ReasoningState::Unavailable
+                })
+                .item(id),
+            );
         }
         let (status, output, error) = item_result(item);
         self.complete_item(out, id, status, output, error);
@@ -859,6 +880,10 @@ impl CodexAdapter {
             _ => (ItemKind::AssistantMessage, "assistant"),
         };
         self.start_item(out, id, kind, title.to_owned(), None);
+        if stream == StreamKind::Reasoning && !self.reasoning.contains_key(id) {
+            // W3.1: Codex shares a summary of its reasoning, streamed.
+            out.push(reasoning_state(ReasoningState::Streaming).item(id));
+        }
         let acc = match stream {
             StreamKind::Reasoning => &mut self.reasoning,
             _ => &mut self.texts,
@@ -2137,7 +2162,15 @@ fn item_info(item: &Value) -> (ItemKind, String, Option<Value>) {
         "reasoning" => (ItemKind::Reasoning, "reasoning".to_owned(), None),
         "commandExecution" => {
             let command = s(item, "command").unwrap_or("command").to_owned();
-            let input = json!({"command": command, "cwd": item.get("cwd")});
+            let mut input = json!({"command": command, "cwd": item.get("cwd")});
+            // W3.4: Codex's own reading of the command titles the card
+            // (`tool_title::from_command_actions`); the wrapped command is unwrapped for display.
+            if let Some(actions) = item
+                .get("commandActions")
+                .filter(|a| a.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                input["commandActions"] = actions.clone();
+            }
             (ItemKind::Command, command, Some(input))
         }
         "fileChange" => {
@@ -2966,9 +2999,11 @@ mod tests {
                 "session_started",
                 "turn_started",
                 "item_started:rs_1:Reasoning",
+                "Reasoning { state: Streaming, label: Summary }",
                 "delta:rs_1:Reasoning",
                 "delta:rs_1:Reasoning",
                 "snapshot:rs_1:Reasoning",
+                "Reasoning { state: Complete, label: Summary }",
                 "item_completed:rs_1:Completed",
                 "item_started:msg_1:AssistantMessage",
                 "delta:msg_1:Assistant",
@@ -2996,9 +3031,9 @@ mod tests {
         );
         // The reasoning summary is the snapshot, not the sum of its deltas' framing.
         assert!(
-            matches!(&ev[5].event, Event::ContentSnapshot { text, .. } if text == "**Planning** the listing")
+            matches!(&ev[6].event, Event::ContentSnapshot { text, .. } if text == "**Planning** the listing")
         );
-        let approval = &ev[13];
+        let approval = &ev[15];
         assert!(approval.request.as_deref().is_some_and(|request| {
             request.starts_with("codex:item/commandExecution/requestApproval:")
         }));
@@ -3008,18 +3043,18 @@ mod tests {
         } if tool == "command_execution" && t == "ls -la" && r.contains("outside")
             && options == &ALL_DECISIONS.to_vec() && input["command"] == "ls -la" && rem.contains("ls -la")));
         assert!(
-            matches!(&ev[15].event, Event::ItemCompleted { output: Some(o), error: None, .. }
+            matches!(&ev[17].event, Event::ItemCompleted { output: Some(o), error: None, .. }
             if o.starts_with("total 8"))
         );
         assert!(matches!(
-            &ev[16].event,
+            &ev[18].event,
             Event::UsageUpdated {
                 used: 1500,
                 max: Some(272000),
                 ..
             }
         ));
-        match &ev[21].event {
+        match &ev[23].event {
             Event::TurnCompleted {
                 state: TurnState::Completed,
                 usage: Some(u),
@@ -5014,19 +5049,74 @@ mod tests {
                 r#"{{"method":"item/reasoning/summaryTextDelta","params":{{"threadId":"th-1","turnId":"tu","itemId":"rs","delta":"{text}","summaryIndex":{idx}}}}}"#
             )
         };
-        a.feed(&delta(0, "first"));
+        let first = a.feed(&delta(0, "first"));
+        // W3.1: one Streaming state, labelled "summary", when the first words arrive.
+        let summary = |state| Event::Reasoning {
+            state,
+            label: crate::event::ReasoningLabel::Summary,
+        };
+        assert!(first
+            .iter()
+            .any(|e| e.event == summary(ReasoningState::Streaming)));
         let part = a.feed(
             r#"{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"th-1","turnId":"tu","itemId":"rs","summaryIndex":1}}"#,
         );
         assert!(
             matches!(&part[0].event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "\n\n")
         );
-        a.feed(&delta(1, "second"));
+        let second = a.feed(&delta(1, "second"));
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e.event, Event::Reasoning { .. })),
+            "said once per item"
+        );
         let done = a.feed(
             r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"reasoning","id":"rs","summary":["first","second"],"content":[]}}}"#,
         );
         assert!(
             matches!(&done[0].event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "first\n\nsecond")
+        );
+        assert_eq!(done[1].event, summary(ReasoningState::Complete));
+        // A reasoning item with no summary at all was not shared.
+        let bare = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"reasoning","id":"rs2","summary":[],"content":[]}}}"#,
+        );
+        assert!(bare
+            .iter()
+            .any(|e| e.event == summary(ReasoningState::Unavailable)
+                && e.item.as_deref() == Some("rs2")));
+    }
+
+    /// W3.4: the W0 command item carries its `commandActions` on, and titles through the shared
+    /// grammar: the wrapped `/usr/bin/zsh -lc 'ls -la'` is `Run ls -la` (its one `listFiles`
+    /// action has no path); a `read` action titles `Read <path>`.
+    #[test]
+    fn w0_command_items_title_through_the_shared_grammar() {
+        let item = W0_SHELL
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find_map(|r| {
+                let item = &r["frame"]["params"]["item"];
+                (item["type"] == "commandExecution").then(|| item.clone())
+            })
+            .expect("W0 commandExecution item");
+        let (kind, title, input) = item_info(&item);
+        assert_eq!(
+            input.as_ref().unwrap()["commandActions"],
+            item["commandActions"]
+        );
+        assert_eq!(
+            crate::tool_title::classify(kind, &title, input.as_ref()).text(),
+            "Run ls -la"
+        );
+        let mut read = item.clone();
+        read["commandActions"] =
+            json!([{"type": "read", "command": "cat a.rs", "name": "a.rs", "path": "/w/a.rs"}]);
+        let (kind, title, input) = item_info(&read);
+        assert_eq!(
+            crate::tool_title::classify(kind, &title, input.as_ref()).text(),
+            "Read /w/a.rs"
         );
     }
 

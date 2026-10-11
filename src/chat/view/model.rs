@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use agent_core::adapter::{Driver, Mode};
 use agent_core::event::{
     BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
-    Question, ResponseCapability, StepStatus, StreamKind, TurnState, WorkerSnapshot, WorkerState,
+    Question, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind,
+    TurnState, WorkerSnapshot, WorkerState,
 };
 use serde_json::Value;
 
@@ -40,6 +41,11 @@ pub enum Body {
     Reasoning {
         text: String,
         streaming: bool,
+        /// What the adapter last said of the block ([`Event::Reasoning`]), or `Replayed` once
+        /// the view loaded it from history. `None`: the adapter said nothing (Codex, until it
+        /// maps its summaries; history stored before W3.1), so it follows `streaming`.
+        state: Option<ReasoningState>,
+        label: ReasoningLabel,
     },
     Tool(Tool),
     Notice {
@@ -69,6 +75,84 @@ pub enum Body {
         steps: Vec<PlanStep>,
         outcome: Option<TurnState>,
     },
+}
+
+impl Body {
+    /// A reasoning block before anything is known of it.
+    pub(super) fn new_reasoning() -> Self {
+        Self::Reasoning {
+            text: String::new(),
+            streaming: true,
+            state: None,
+            label: ReasoningLabel::Thinking,
+        }
+    }
+}
+
+/// How the one reasoning widget shows a block: the four states of the UX contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningView {
+    pub state: ReasoningState,
+    pub title: &'static str,
+    /// A tooltip saying where the text came from, when the title does not.
+    pub hint: Option<&'static str>,
+    /// Shown at all. A block still waiting for its first words takes no space, so the
+    /// transcript does not jump; the header's "Working…" says the agent is busy.
+    pub visible: bool,
+    /// It has text to open.
+    pub expandable: bool,
+}
+
+/// The view of a reasoning block (pure; the widget only applies it).
+pub fn reasoning_view(
+    text: &str,
+    streaming: bool,
+    state: Option<ReasoningState>,
+    label: ReasoningLabel,
+) -> ReasoningView {
+    let has_text = !text.trim().is_empty();
+    let state = match state {
+        // A live block that closed: the adapter's last word stands unless it was cut off.
+        Some(ReasoningState::Streaming) if !streaming => ReasoningState::Complete,
+        Some(ReasoningState::Unknown) | None if streaming => ReasoningState::Streaming,
+        Some(ReasoningState::Unknown) | None => ReasoningState::Complete,
+        Some(s) => s,
+    };
+    // Text that did arrive is shown, whatever was said before it.
+    let state = if state == ReasoningState::Unavailable && has_text {
+        ReasoningState::Complete
+    } else {
+        state
+    };
+    let summary = label == ReasoningLabel::Summary;
+    let (title, hint) = match state {
+        ReasoningState::Streaming if summary => ("Summarizing reasoning…", None),
+        ReasoningState::Streaming => ("Thinking…", None),
+        ReasoningState::Complete | ReasoningState::Unknown if summary => {
+            ("Reasoning summary", None)
+        }
+        ReasoningState::Complete | ReasoningState::Unknown => ("Thought process", None),
+        ReasoningState::Replayed if summary => (
+            "Reasoning summary",
+            Some("Replayed from this thread's history"),
+        ),
+        ReasoningState::Replayed => (
+            "Thought process",
+            Some("Replayed from this thread's history"),
+        ),
+        ReasoningState::Unavailable => (
+            "Thinking not shared by this model",
+            Some("The model reasoned before answering but did not share its reasoning"),
+        ),
+    };
+    ReasoningView {
+        state,
+        title,
+        hint,
+        // An explicit "not shared" is worth a line; any other empty block is not.
+        visible: has_text || state == ReasoningState::Unavailable,
+        expandable: has_text,
+    }
 }
 
 /// Empty plans and wholly completed plans do not occupy the active-work shelf.
@@ -1024,6 +1108,24 @@ impl Transcript {
         changed
     }
 
+    /// Marks every finished reasoning block loaded from history as Replayed (it did not come
+    /// from the live agent). A block the model did not share stays Unavailable, and one still
+    /// streaming (a live session resumed mid-block) is left to its agent.
+    pub fn mark_replayed(&mut self) {
+        for item in self.items.values_mut() {
+            if let Body::Reasoning {
+                streaming: false,
+                state,
+                ..
+            } = &mut item.body
+            {
+                if *state != Some(ReasoningState::Unavailable) {
+                    *state = Some(ReasoningState::Replayed);
+                }
+            }
+        }
+    }
+
     pub fn set_expanded(&mut self, id: &str, expanded: bool) {
         if let Some(item) = self.items.get_mut(id) {
             item.expanded = expanded;
@@ -1228,10 +1330,7 @@ impl Transcript {
                         driver,
                         streaming: true,
                     },
-                    ItemKind::Reasoning => Body::Reasoning {
-                        text: String::new(),
-                        streaming: true,
-                    },
+                    ItemKind::Reasoning => Body::new_reasoning(),
                     _ => Body::Tool(Tool {
                         kind: *kind,
                         title: title.clone(),
@@ -1311,6 +1410,23 @@ impl Transcript {
                     _ => {}
                 }
                 out.push(Change::Updated(id));
+            }
+            Event::Reasoning { state, label } => {
+                let Some(id) = env.item.clone() else {
+                    return out;
+                };
+                if let Some(Body::Reasoning {
+                    state: current,
+                    label: current_label,
+                    ..
+                }) = self.items.get_mut(&id).map(|i| &mut i.body)
+                {
+                    if *current != Some(*state) || current_label != label {
+                        *current = Some(*state);
+                        *current_label = *label;
+                        out.push(Change::Updated(id));
+                    }
+                }
             }
             Event::PlanUpdated { steps } => {
                 // A terminal turn owns no active plan. Delayed provider updates must not
@@ -1616,10 +1732,7 @@ impl Transcript {
                 driver,
                 streaming: true,
             },
-            StreamKind::Reasoning => Body::Reasoning {
-                text: String::new(),
-                streaming: true,
-            },
+            StreamKind::Reasoning => Body::new_reasoning(),
             // Tool text for a tool we never saw start: nothing to attach it to.
             StreamKind::ToolInput | StreamKind::ToolOutput => return None,
         };
@@ -1700,6 +1813,149 @@ mod tests {
 
     fn ev(e: Event) -> Envelope {
         Envelope::new(e)
+    }
+
+    /// The reasoning items' views, in transcript order.
+    fn reasoning_views(t: &Transcript) -> Vec<(ReasoningView, String)> {
+        let mut items: Vec<&Item> = t.items.values().collect();
+        items.sort_by_key(|i| t.order.iter().position(|id| *id == i.id));
+        items
+            .into_iter()
+            .filter_map(|i| match &i.body {
+                Body::Reasoning {
+                    text,
+                    streaming,
+                    state,
+                    label,
+                } => Some((
+                    reasoning_view(text, *streaming, *state, *label),
+                    text.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// W3.1/3.2: the recorded W0 Claude turn (`--thinking-display summarized` on 2.1.293),
+    /// through the adapter into the model, renders each thinking block as a non-empty Complete
+    /// "Thought process"; the same events loaded from the store render Replayed.
+    #[test]
+    fn w0_claude_thinking_renders_complete_live_and_replayed_from_history() {
+        use agent_core::adapter::Adapter;
+        let fixture = include_str!("../../../tests/fixtures/real/claude/thinking-and-touch.jsonl");
+        let mut adapter = agent_core::claude::ClaudeAdapter::new();
+        let envs: Vec<Envelope> = fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|rec| rec["dir"] == "out")
+            .flat_map(|rec| adapter.feed(&rec["frame"].to_string()))
+            .collect();
+        let mut live = Transcript::new();
+        for env in &envs {
+            live.apply(env, Driver::Claude);
+        }
+        let views = reasoning_views(&live);
+        assert_eq!(views.len(), 2);
+        for (view, text) in &views {
+            assert!(!text.trim().is_empty());
+            assert_eq!(view.state, ReasoningState::Complete);
+            assert_eq!(view.title, "Thought process");
+            assert!(view.visible && view.expandable);
+        }
+        let mut replayed = Transcript::new();
+        for env in &envs {
+            replayed.apply(env, Driver::Claude);
+        }
+        replayed.mark_replayed();
+        for (view, text) in reasoning_views(&replayed) {
+            assert!(!text.trim().is_empty());
+            assert_eq!(view.state, ReasoningState::Replayed);
+            assert!(view.hint.is_some() && view.expandable);
+        }
+    }
+
+    /// The one widget's four states, and its fallbacks when the adapter says nothing.
+    #[test]
+    fn reasoning_view_covers_the_four_states() {
+        use ReasoningLabel::{Summary, Thinking};
+        use ReasoningState::*;
+        let v = |text: &str, streaming, state, label| reasoning_view(text, streaming, state, label);
+        let streaming = v("hm", true, Some(Streaming), Thinking);
+        assert_eq!((streaming.state, streaming.title), (Streaming, "Thinking…"));
+        let complete = v("hm", false, Some(Complete), Thinking);
+        assert_eq!(
+            (complete.state, complete.title),
+            (Complete, "Thought process")
+        );
+        let replayed = v("hm", false, Some(Replayed), Thinking);
+        assert_eq!(replayed.state, Replayed);
+        assert!(replayed.hint.is_some() && replayed.expandable);
+        let unavailable = v("", false, Some(Unavailable), Thinking);
+        assert_eq!(unavailable.state, Unavailable);
+        assert_eq!(unavailable.title, "Thinking not shared by this model");
+        assert!(unavailable.visible && !unavailable.expandable);
+        // Codex's label.
+        assert_eq!(v("s", true, None, Summary).title, "Summarizing reasoning…");
+        assert_eq!(v("s", false, None, Summary).title, "Reasoning summary");
+        // Nothing said: follows `streaming`; an empty block takes no space.
+        assert_eq!(v("x", true, None, Thinking).state, Streaming);
+        assert_eq!(v("x", false, None, Thinking).state, Complete);
+        assert!(!v("", false, None, Thinking).visible);
+        assert!(!v("", true, Some(Streaming), Thinking).visible);
+        // Cut off mid-stream: no longer "Thinking…".
+        assert_eq!(v("x", false, Some(Streaming), Thinking).state, Complete);
+        // Text that arrived wins over "not shared".
+        assert_eq!(v("x", false, Some(Unavailable), Thinking).state, Complete);
+    }
+
+    #[test]
+    fn reasoning_events_set_the_blocks_state_and_replay_keeps_not_shared() {
+        let mut t = Transcript::new();
+        for (id, state) in [
+            ("r1", ReasoningState::Complete),
+            ("r2", ReasoningState::Unavailable),
+        ] {
+            t.apply(&started(id, ItemKind::Reasoning, None), Driver::Agy);
+            let changes = t.apply(
+                &ev(Event::Reasoning {
+                    state,
+                    label: ReasoningLabel::Thinking,
+                })
+                .item(id),
+                Driver::Agy,
+            );
+            assert_eq!(changes, [Change::Updated(id.into())]);
+            t.apply(
+                &ev(Event::ContentSnapshot {
+                    stream: StreamKind::Reasoning,
+                    text: if id == "r1" {
+                        "whole".into()
+                    } else {
+                        String::new()
+                    },
+                })
+                .item(id),
+                Driver::Agy,
+            );
+            t.apply(
+                &ev(Event::ItemCompleted {
+                    status: ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item(id),
+                Driver::Agy,
+            );
+        }
+        t.mark_replayed();
+        let states: Vec<ReasoningState> = reasoning_views(&t)
+            .into_iter()
+            .map(|(v, _)| v.state)
+            .collect();
+        assert_eq!(
+            states,
+            [ReasoningState::Replayed, ReasoningState::Unavailable]
+        );
     }
 
     fn plan_steps(status: StepStatus) -> Vec<PlanStep> {

@@ -259,9 +259,10 @@ pub fn tool_summary(kind: ItemKind, input: Option<&Value>, input_text: &str) -> 
     Some(out)
 }
 
-/// Derives the clean action label (e.g. "Read", "Edit", "Run", "Search") and the target summary
-/// (e.g. file path, command, query) so card headers clearly explain what is happening without
-/// ever showing just a bare file name.
+/// A tool card's action and target in the one title grammar every agent shares
+/// (`agent_core::tool_title`, W3.4): `Read <path>`, `Search <pattern>`, `Run <command>`,
+/// `Edit <path>`, `Create <path>`, `Fetch <url>`, `<server>/<tool>`. Streamed input that is not
+/// parsed yet titles by the tool alone; the raw input stays under the card's details.
 pub fn card_title_and_summary(
     kind: ItemKind,
     raw_title: &str,
@@ -276,156 +277,8 @@ pub fn card_title_and_summary(
             parsed.as_ref()
         }
     };
-
-    let summary = tool_summary(kind, val, input_text).unwrap_or_default();
-
-    match kind {
-        ItemKind::Command => {
-            let cmd = if !summary.is_empty() {
-                summary
-            } else if !raw_title.is_empty() && raw_title != "command" && raw_title != "Bash" {
-                raw_title.to_owned()
-            } else {
-                String::new()
-            };
-            ("Run".to_owned(), cmd)
-        }
-        ItemKind::FileRead => {
-            let lower_title = raw_title.to_ascii_lowercase();
-            let action = if lower_title.contains("grep")
-                || lower_title.contains("search")
-                || val
-                    .and_then(|v| v.get("pattern").or_else(|| v.get("SearchPath")))
-                    .is_some()
-            {
-                "Search".to_owned()
-            } else if lower_title.contains("list")
-                || lower_title.contains("glob")
-                || val.and_then(|v| v.get("DirectoryPath")).is_some()
-            {
-                "List".to_owned()
-            } else if lower_title.contains("find") {
-                "Find".to_owned()
-            } else {
-                "Read".to_owned()
-            };
-            let target = if !summary.is_empty() {
-                summary
-            } else if looks_like_path(raw_title) {
-                raw_title.to_owned()
-            } else {
-                String::new()
-            };
-            (action, target)
-        }
-        ItemKind::FileChange => {
-            let lower_title = raw_title.to_ascii_lowercase();
-            let is_write = lower_title.contains("write")
-                || val
-                    .and_then(|v| v.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.contains("write"))
-                || (val.is_some_and(|v| {
-                    (v.get("content").is_some() || v.get("CodeContent").is_some())
-                        && v.get("old_string").is_none()
-                        && v.get("TargetContent").is_none()
-                }));
-            let action = if is_write {
-                "Write".to_owned()
-            } else {
-                "Edit".to_owned()
-            };
-            let paths = val
-                .map(agent_kit::editdiff::paths_from_input)
-                .unwrap_or_default();
-            let target = if !paths.is_empty() {
-                paths.join(", ")
-            } else if !summary.is_empty() {
-                summary
-            } else if looks_like_path(raw_title) {
-                raw_title.to_owned()
-            } else {
-                String::new()
-            };
-            (action, target)
-        }
-        ItemKind::WebSearch => {
-            let lower_title = raw_title.to_ascii_lowercase();
-            let is_fetch = lower_title.contains("fetch")
-                || lower_title.contains("read_url")
-                || (val.is_some_and(|v| v.get("url").is_some() && v.get("query").is_none()));
-            let action = if is_fetch {
-                "Fetch".to_owned()
-            } else {
-                "Search".to_owned()
-            };
-            (action, summary)
-        }
-        ItemKind::McpTool => {
-            let tool_name = if raw_title.starts_with("mcp__") {
-                raw_title.strip_prefix("mcp__").unwrap().replace("__", ".")
-            } else if raw_title == "call_mcp_tool" {
-                if let Some(v) = val {
-                    let server = str_field(v, &["ServerName", "server"]).unwrap_or("mcp");
-                    let tool = str_field(v, &["ToolName", "tool"]).unwrap_or("tool");
-                    format!("{server}.{tool}")
-                } else {
-                    "call_mcp_tool".to_owned()
-                }
-            } else if !raw_title.is_empty() && raw_title != "tool" {
-                raw_title.to_owned()
-            } else {
-                "MCP Tool".to_owned()
-            };
-            (tool_name, summary)
-        }
-        ItemKind::Subagent => ("Subagent".to_owned(), summary),
-        ItemKind::Reasoning => ("Thinking".to_owned(), summary),
-        _ => {
-            let title = if looks_like_path(raw_title) {
-                if let Some(v) = val {
-                    if v.get("TargetContent").is_some() || v.get("old_string").is_some() {
-                        "Edit".to_owned()
-                    } else if v.get("AbsolutePath").is_some() || v.get("file_path").is_some() {
-                        "Read".to_owned()
-                    } else {
-                        "Tool".to_owned()
-                    }
-                } else {
-                    "Tool".to_owned()
-                }
-            } else if !raw_title.is_empty() {
-                raw_title.to_owned()
-            } else {
-                "Tool".to_owned()
-            };
-            let target = if !summary.is_empty() {
-                summary
-            } else if looks_like_path(raw_title) {
-                raw_title.to_owned()
-            } else {
-                String::new()
-            };
-            (title, target)
-        }
-    }
-}
-
-fn looks_like_path(s: &str) -> bool {
-    let s = s.trim();
-    if s.is_empty() {
-        return false;
-    }
-    s.contains('/')
-        || s.contains('\\')
-        || s.ends_with(".rs")
-        || s.ends_with(".py")
-        || s.ends_with(".ts")
-        || s.ends_with(".js")
-        || s.ends_with(".toml")
-        || s.ends_with(".json")
-        || s.ends_with(".md")
-        || s.ends_with(".txt")
+    let title = agent_core::tool_title::classify(kind, raw_title, val);
+    (title.action, title.target)
 }
 
 /// Pretty, human-readable input for a card body: command lines, clear action/target summaries,
@@ -731,7 +584,7 @@ mod tests {
             Some(&json!({"DirectoryPath": "src/chat/view"})),
             "",
         );
-        assert_eq!(action, "List");
+        assert_eq!(action, "Read");
         assert_eq!(target, "src/chat/view");
 
         let (action, target) = card_title_and_summary(
@@ -758,7 +611,7 @@ mod tests {
             Some(&json!({"TargetFile": "src/new.rs", "CodeContent": "fn main() {}"})),
             "",
         );
-        assert_eq!(action, "Write");
+        assert_eq!(action, "Create");
         assert_eq!(target, "src/new.rs");
 
         let (action, target) = card_title_and_summary(
@@ -785,8 +638,20 @@ mod tests {
             Some(&json!({"ServerName": "unraid", "ToolName": "unraid_containers"})),
             "",
         );
-        assert_eq!(action, "unraid.unraid_containers");
-        assert_eq!(target, "unraid_containers");
+        assert_eq!(action, "unraid/unraid_containers");
+        assert_eq!(
+            target, "",
+            "an MCP title is <server>/<tool>; arguments are details"
+        );
+
+        // Codex's wrapped command shows as typed (W3.4).
+        let (action, target) = card_title_and_summary(
+            ItemKind::Command,
+            "/usr/bin/zsh -lc 'ls -la'",
+            Some(&json!({"command": "/usr/bin/zsh -lc 'ls -la'", "cwd": "/w"})),
+            "",
+        );
+        assert_eq!((action.as_str(), target.as_str()), ("Run", "ls -la"));
     }
 
     #[test]

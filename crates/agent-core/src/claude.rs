@@ -35,8 +35,8 @@ use crate::adapter::{
 use crate::caps::Capabilities;
 use crate::event::{
     AgentCommand, AgentCommandKind, BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event,
-    ItemKind, ItemStatus, Question, QuestionOption, ResponseCapability, StreamKind, TurnState,
-    Usage,
+    ItemKind, ItemStatus, Question, QuestionOption, ReasoningLabel, ReasoningState,
+    ResponseCapability, StreamKind, TurnState, Usage,
 };
 
 /// Dedup window for replayed frames (see the module notes).
@@ -55,6 +55,8 @@ struct Block {
     item: String,
     /// Tool blocks finish on their `tool_result`; text and thinking blocks on `content_block_stop`.
     tool: bool,
+    /// A thinking block: its stop says whether its reasoning was shared ([`Event::Reasoning`]).
+    reasoning: bool,
 }
 
 /// The Claude Code stream-json adapter.
@@ -79,6 +81,10 @@ pub struct ClaudeAdapter {
     snap_counts: HashMap<String, u64>,
     started_items: HashSet<String>,
     open_items: Vec<String>,
+    /// Thinking items that received any text: one that closes without is
+    /// [`ReasoningState::Unavailable`] (Claude sends a signature-only block when it withholds
+    /// its thinking, as it does without `--thinking-display summarized`).
+    reasoning_shared: HashSet<String>,
     /// Backgrounded sub-agents (`Agent` tool uses) still running: they outlive the turn that
     /// launched them and finish on their `task_notification`.
     background: HashSet<String>,
@@ -137,6 +143,7 @@ impl ClaudeAdapter {
             snap_counts: HashMap::new(),
             started_items: HashSet::new(),
             open_items: Vec::new(),
+            reasoning_shared: HashSet::new(),
             background: HashSet::new(),
             background_children: HashMap::new(),
             tasks: Vec::new(),
@@ -506,23 +513,40 @@ impl ClaudeAdapter {
                     _ => return Vec::new(),
                 };
                 match text {
-                    Some(t) if !t.is_empty() => vec![Envelope::new(Event::ContentDelta {
-                        stream,
-                        text: t.to_owned(),
-                    })
-                    .item(block.item)],
+                    Some(t) if !t.is_empty() => {
+                        if block.reasoning {
+                            self.reasoning_shared.insert(block.item.clone());
+                        }
+                        vec![Envelope::new(Event::ContentDelta {
+                            stream,
+                            text: t.to_owned(),
+                        })
+                        .item(block.item)]
+                    }
                     _ => Vec::new(),
                 }
             }
             "content_block_stop" => match self.blocks.get(&(parent, index)).cloned() {
                 Some(block) if !block.tool => {
                     self.close_item(&block.item);
-                    vec![Envelope::new(Event::ItemCompleted {
-                        status: ItemStatus::Completed,
-                        output: None,
-                        error: None,
-                    })
-                    .item(block.item)]
+                    let mut out = Vec::new();
+                    if block.reasoning {
+                        let state = if self.reasoning_shared.remove(&block.item) {
+                            ReasoningState::Complete
+                        } else {
+                            ReasoningState::Unavailable
+                        };
+                        out.push(reasoning(state).item(block.item.clone()));
+                    }
+                    out.push(
+                        Envelope::new(Event::ItemCompleted {
+                            status: ItemStatus::Completed,
+                            output: None,
+                            error: None,
+                        })
+                        .item(block.item),
+                    );
+                    out
                 }
                 _ => Vec::new(),
             },
@@ -562,21 +586,27 @@ impl ClaudeAdapter {
             }
             _ => return vec![Envelope::new(Event::Unknown)],
         };
+        let is_reasoning = kind == ItemKind::Reasoning;
         self.blocks.insert(
             (parent.clone(), index),
             Block {
                 item: item.clone(),
                 tool,
+                reasoning: is_reasoning,
             },
         );
         self.open_child(&item, parent.as_deref());
-        vec![Envelope::new(Event::ItemStarted {
+        let mut out = vec![Envelope::new(Event::ItemStarted {
             kind,
             title,
             input,
             parent,
         })
-        .item(item)]
+        .item(item.clone())];
+        if is_reasoning {
+            out.push(reasoning(ReasoningState::Streaming).item(item));
+        }
+        out
     }
 
     fn assistant(&mut self, v: &Value) -> Vec<Envelope> {
@@ -628,6 +658,7 @@ impl ClaudeAdapter {
                     }
                     let item = format!("{msg_id}:{index}");
                     let fresh = !self.started_items.contains(&item);
+                    let is_reasoning = kind == ItemKind::Reasoning;
                     if fresh {
                         self.open_item(&item);
                         out.push(
@@ -639,6 +670,13 @@ impl ClaudeAdapter {
                             })
                             .item(item.clone()),
                         );
+                        if is_reasoning {
+                            // Delivered whole, with no stream before it.
+                            out.push(reasoning(ReasoningState::Complete).item(item.clone()));
+                        }
+                    } else if is_reasoning {
+                        // The streamed block's own stop closes it as shared.
+                        self.reasoning_shared.insert(item.clone());
                     }
                     out.push(
                         Envelope::new(Event::ContentSnapshot {
@@ -953,6 +991,7 @@ impl ClaudeAdapter {
         self.turn_open = false;
         let interrupted_by_us = std::mem::take(&mut self.interrupt_pending);
         self.blocks.clear();
+        self.reasoning_shared.clear();
         self.msg_ids.clear();
         self.snap_counts.clear();
         self.started_items.clear();
@@ -1272,6 +1311,7 @@ impl Adapter for ClaudeAdapter {
         }
         out.push(Envelope::new(Event::SessionExited { code, expected }));
         self.blocks.clear();
+        self.reasoning_shared.clear();
         self.started_items.clear();
         out
     }
@@ -1370,6 +1410,64 @@ fn control_request_body(control: &Control) -> Value {
         Control::ContextUsage => json!({"subtype": "get_context_usage"}),
         Control::Usage => json!({"subtype": "get_usage"}),
     }
+}
+
+// ----- `--thinking-display summarized` (W3.2) -----
+//
+// Without it Claude sends signature-only thinking blocks (nothing to read). The flag is hidden
+// (absent from `--help`), so it is passed only to versions known to accept it, and a CLI that
+// refuses it at start is retried once without it (the host's job; these are the pure parts).
+
+/// The arguments that make Claude share (a summary of) its thinking as `thinking_delta` text.
+pub const THINKING_DISPLAY_ARGS: [&str; 2] = ["--thinking-display", "summarized"];
+
+/// The oldest Claude Code version known to accept [`THINKING_DISPLAY_ARGS`] (verified live in
+/// W0 on 2.1.293, `tests/fixtures/real/claude/thinking-and-touch.jsonl`).
+pub const THINKING_DISPLAY_MIN_VERSION: (u32, u32, u32) = (2, 1, 293);
+
+/// The first `major.minor.patch` in `text` (`claude --version` prints "2.1.293 (Claude Code)";
+/// `init` carries `claude_code_version: "2.1.293"`). A pre-release suffix is ignored.
+pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    text.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .find_map(|word| {
+            let core = word.trim_start_matches('v').split(['-', '+']).next()?;
+            let mut parts = core.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next()?.parse().ok()?;
+            parts.next().is_none().then_some((major, minor, patch))
+        })
+}
+
+/// Whether a Claude of `version` is known to accept [`THINKING_DISPLAY_ARGS`]. An unreadable
+/// version is not.
+pub fn accepts_thinking_display(version: &str) -> bool {
+    parse_version(version).is_some_and(|v| v >= THINKING_DISPLAY_MIN_VERSION)
+}
+
+/// Whether a stderr line is the CLI refusing [`THINKING_DISPLAY_ARGS`] (commander's
+/// "error: unknown option '--thinking-display'", or a value it does not take).
+pub fn refuses_thinking_display(stderr_line: &str) -> bool {
+    let lower = stderr_line.to_ascii_lowercase();
+    lower.contains("thinking-display")
+        && ["unknown option", "unrecognized", "invalid", "not allowed"]
+            .iter()
+            .any(|w| lower.contains(w))
+}
+
+/// The Claude Code version an `init` frame reports (`claude_code_version`).
+pub fn session_version(frame: &Value) -> Option<&str> {
+    (str_of(frame, "type") == Some("system") && str_of(frame, "subtype") == Some("init"))
+        .then(|| str_of(frame, "claude_code_version"))
+        .flatten()
+}
+
+/// A Claude thinking block's state (Claude shares its thinking, never a summary of it).
+fn reasoning(state: ReasoningState) -> Envelope {
+    Envelope::new(Event::Reasoning {
+        state,
+        label: ReasoningLabel::Thinking,
+    })
 }
 
 fn tool_kind(name: &str) -> ItemKind {
@@ -2791,6 +2889,131 @@ mod tests {
 
     const W0_TOUCH: &str =
         include_str!("../../../tests/fixtures/real/claude/thinking-and-touch.jsonl");
+
+    /// Every frame the CLI sent in a W0 recording, fed in order.
+    fn replay_w0(fixture: &str) -> Vec<Envelope> {
+        let mut a = ClaudeAdapter::new();
+        fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|rec| rec["dir"] == "out")
+            .flat_map(|rec| a.feed(&rec["frame"].to_string()))
+            .collect()
+    }
+
+    /// W3.1 contract, from the W0 frames of `--thinking-display summarized` on 2.1.293: each
+    /// thinking block is one reasoning item that goes Streaming → Complete with non-empty text.
+    #[test]
+    fn w0_thinking_blocks_stream_then_complete_with_their_text() {
+        let out = replay_w0(W0_TOUCH);
+        let items: Vec<String> = out
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    Event::ItemStarted {
+                        kind: ItemKind::Reasoning,
+                        ..
+                    }
+                )
+            })
+            .filter_map(|e| e.item.clone())
+            .collect();
+        assert_eq!(items.len(), 2, "two thinking blocks in the recording");
+        for item in &items {
+            let states: Vec<ReasoningState> = out
+                .iter()
+                .filter(|e| e.item.as_ref() == Some(item))
+                .filter_map(|e| match e.event {
+                    Event::Reasoning { state, label } => {
+                        assert_eq!(label, ReasoningLabel::Thinking);
+                        Some(state)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                states,
+                [ReasoningState::Streaming, ReasoningState::Complete],
+                "{item}"
+            );
+            let text: String = out
+                .iter()
+                .filter(|e| e.item.as_ref() == Some(item))
+                .filter_map(|e| match &e.event {
+                    Event::ContentDelta {
+                        stream: StreamKind::Reasoning,
+                        text,
+                    } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(!text.trim().is_empty(), "{item}: thinking text streamed");
+        }
+    }
+
+    /// A signature-only thinking block (Claude withholding its thinking) closes Unavailable.
+    #[test]
+    fn a_thinking_block_with_no_text_is_unavailable() {
+        let mut a = ClaudeAdapter::new();
+        let ev = |e: Value| json!({"type": "stream_event", "event": e}).to_string();
+        a.feed(&ev(
+            json!({"type": "message_start", "message": {"id": "m1"}}),
+        ));
+        let start = a.feed(&ev(
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        ));
+        assert!(start.iter().any(|e| e.event
+            == Event::Reasoning {
+                state: ReasoningState::Streaming,
+                label: ReasoningLabel::Thinking
+            }));
+        a.feed(&ev(
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "abc"}}),
+        ));
+        let stop = a.feed(&ev(json!({"type": "content_block_stop", "index": 0})));
+        assert_eq!(
+            stop[0].event,
+            Event::Reasoning {
+                state: ReasoningState::Unavailable,
+                label: ReasoningLabel::Thinking
+            }
+        );
+        assert_eq!(stop[0].item.as_deref(), Some("m1:0"));
+        assert!(matches!(stop[1].event, Event::ItemCompleted { .. }));
+    }
+
+    /// W3.2: the version gate and the refusal check behind `--thinking-display summarized`.
+    #[test]
+    fn thinking_display_is_gated_on_known_versions() {
+        assert_eq!(parse_version("2.1.293 (Claude Code)"), Some((2, 1, 293)));
+        assert_eq!(parse_version("v2.2.0-beta.1"), Some((2, 2, 0)));
+        assert_eq!(parse_version("Claude Code"), None);
+        assert!(accepts_thinking_display("2.1.293"));
+        assert!(accepts_thinking_display("2.1.300 (Claude Code)"));
+        assert!(accepts_thinking_display("3.0.0"));
+        assert!(!accepts_thinking_display("2.1.292"));
+        assert!(!accepts_thinking_display("1.9.999"));
+        assert!(!accepts_thinking_display("unknown"));
+        assert!(refuses_thinking_display(
+            "error: unknown option '--thinking-display'"
+        ));
+        assert!(refuses_thinking_display(
+            "error: option '--thinking-display <mode>' argument 'summarized' is invalid."
+        ));
+        assert!(!refuses_thinking_display("error: unknown option '--foo'"));
+        assert!(!refuses_thinking_display("thinking-display summarized"));
+        // The W0 init frame names its version.
+        let init = W0_TOUCH
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|rec| rec["frame"]["subtype"] == "init")
+            .expect("W0 init")["frame"]
+            .clone();
+        assert_eq!(session_version(&init), Some("2.1.293"));
+        assert_eq!(session_version(&json!({"type": "assistant"})), None);
+        assert_eq!(THINKING_DISPLAY_ARGS, ["--thinking-display", "summarized"]);
+    }
 
     /// D1: session and always scope are the app's. Whatever Claude suggests (the W0 frame offers
     /// `addRules`, `addDirectories` and `setMode acceptEdits`), every allow is a plain allow with
