@@ -1626,7 +1626,7 @@ impl ApprovalCard {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
                     let initial_cmd = match tool.as_str() {
-                        "run_command" | "Bash" | "bash" => input_val
+                        "run_command" | "Bash" | "bash" | "command_execution" => input_val
                             .get("CommandLine")
                             .or_else(|| input_val.get("command"))
                             .or_else(|| input_val.get("cmd"))

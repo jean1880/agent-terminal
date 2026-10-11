@@ -18,7 +18,7 @@
 //! read through a bounded buffer.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -332,86 +332,29 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
-/// A command line safe to remember verbatim: no shell syntax that runs or redirects something
-/// else, no leading `NAME=value`, no interpreter or wrapper, no `find -exec/-delete`.
-fn rememberable_command(command: &str) -> bool {
-    const SHELL_SYNTAX: &[&str] = &[";", "&", "|", "`", "$", ">", "<", "\n", "\r"];
-    if SHELL_SYNTAX.iter().any(|c| command.contains(c)) {
+/// A command line a plain (pattern-less) "Allow for session" or "Always allow" may remember as
+/// its exact argv: a simple command ([`crate::always_allow::command_tokens`], the one fail-closed
+/// shell-syntax list), no leading `NAME=value`, no interpreter or wrapper, no build runner, only
+/// safe git subcommands, no `find -exec/-delete`. Ceiling: the exact argv is trusted again, so a
+/// program the model rewrote between two runs still runs; runners are refused for that reason.
+pub(crate) fn rememberable_command(command: &str) -> bool {
+    let Some(tokens) = crate::always_allow::command_tokens(command) else {
         return false;
-    }
-    let mut words = command.split_whitespace();
-    let Some(first) = words.next() else {
+    };
+    let words: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let Some(first) = words.first().copied() else {
         return false;
     };
     if is_assignment(first) || is_wrapper(first) {
         return false;
     }
     if first == "git" {
-        let all: Vec<&str> = command.split_whitespace().collect();
-        return git_is_safe(&all);
+        return git_is_safe(&words);
     }
     !(first == "find"
-        && words.any(|w| matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete")))
-}
-
-/// What "allow for the session" remembers, and only ever an exact match:
-/// - `run_command`: the working directory plus the full `CommandLine` (never a prefix) when
-///   [`rememberable_command`]. Ceiling: the exact approved string is trusted again, so a
-///   program the model rewrote between two runs of the same line still runs. Programs given by
-///   path, build/test/package runners and most git subcommands are never remembered because
-///   they run model-editable files; the upgrade path is hashing the resolved binary too;
-/// - `call_mcp_tool`: the server and tool name;
-/// - file edits: the exact target path (absolute, no `..`, symlinks resolved);
-/// - everything else (subagents, network, unknown tools, `send_command_input`): never.
-pub fn session_key(query: &ApprovalQuery) -> Option<(String, String)> {
-    let text = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| query.args.get(*k).and_then(Value::as_str))
-            .filter(|s| !s.trim().is_empty())
-    };
-    let detail = match query.tool.as_str() {
-        "run_command" => {
-            let command = query.args.get("CommandLine").and_then(Value::as_str)?;
-            if !rememberable_command(command) {
-                return None;
-            }
-            format!("{}\n{command}", query.cwd.as_deref().unwrap_or_default())
-        }
-        "call_mcp_tool" => {
-            let server = text(&["ServerName", "server_name", "server", "Server"])?;
-            let tool = text(&["ToolName", "tool_name", "tool", "Name"])?;
-            format!("{server}/{tool}")
-        }
-        tool if classify(tool) == ToolClass::Edit => {
-            let targets = edit_targets(&query.args);
-            let [target] = targets.as_slice() else {
-                return None;
-            };
-            let path = Path::new(target);
-            let full_path = if path.is_absolute() {
-                path.to_path_buf()
-            } else if let Some(cwd) = &query.cwd {
-                Path::new(cwd).join(path)
-            } else {
-                return None;
-            };
-            if has_parent_dir(&full_path) {
-                return None;
-            }
-            resolve(&full_path).to_string_lossy().into_owned()
-        }
-        _ => return None,
-    };
-    Some((query.tool.clone(), detail))
-}
-
-/// What "Always allow" may keep beyond the session: only an exact shell command line in an exact
-/// folder (a [`session_key`] for `run_command`, so never a runner, wrapper or shell syntax).
-/// Never a file edit (a permanent allow on a path such as `~/.bashrc`, a git hook or the rules
-/// file itself would be a standing write grant) and never an MCP tool (its key ignores the
-/// arguments). Those stay "for this session" at most.
-pub fn always_key(key: &(String, String)) -> Option<(String, String)> {
-    (key.0 == "run_command").then(|| key.clone())
+        && words
+            .iter()
+            .any(|w| matches!(*w, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete")))
 }
 
 /// Resolves symlinks in the longest existing ancestor of an absolute, `..`-free path.
@@ -447,10 +390,14 @@ type Sink = Rc<dyn Fn(Envelope)>;
 
 struct Pending {
     conn: gio::SocketConnection,
-    key: Option<(String, String)>,
-    tool: String,
-    detail: Option<String>,
+    /// The call in canonical terms, when a rule can describe it.
+    action: Option<crate::always_allow::Action>,
+    cwd: Option<String>,
 }
+
+/// One thread's session rules, shared by its chat session (which clears them on a cross-agent
+/// switch) and agy's approval server.
+pub type SessionRules = Rc<RefCell<crate::always_allow::AlwaysRules>>;
 
 struct ServerInner {
     path: PathBuf,
@@ -458,7 +405,6 @@ struct ServerInner {
     listener: gio::SocketListener,
     sink: RefCell<Option<Sink>>,
     pending: RefCell<HashMap<String, Pending>>,
-    allowed: RefCell<HashSet<(String, String)>>,
     mode: Cell<Mode>,
     workspaces: Vec<PathBuf>,
     /// The user's home, for the dotfile rule of [`sensitive_target`]; `None` applies no such rule.
@@ -468,8 +414,10 @@ struct ServerInner {
     queries: RefCell<HashMap<String, u32>>,
     /// Where "Always allow" rules are kept ([`crate::always_allow`]); `None` offers no "Always".
     always: RefCell<Option<PathBuf>>,
-    /// Active rules scoped to this session only.
-    session_rules: RefCell<crate::always_allow::AlwaysRules>,
+    /// The thread's session rules (its own until a chat session shares its set).
+    session_rules: RefCell<SessionRules>,
+    /// The unusable-rules-file notice was already shown by this server.
+    blocked_noticed: Cell<bool>,
 }
 
 impl Drop for ServerInner {
@@ -518,25 +466,16 @@ impl ApprovalHandle {
         Ok(handle)
     }
 
-    /// Keeps "Always allow" rules in `path`: offers "Always allow" from now on and treats this
-    /// workspace's remembered rules as already allowed (an exact match, like the session's).
-    /// The file is a few rules of JSON; reading it is not worth a worker.
+    /// Keeps "Always allow" rules in `path`: offers "Always allow" from now on and auto-allows
+    /// what its rules match (read at each request: a few rules of JSON, not worth a worker).
     pub fn use_always_rules(&self, path: PathBuf) {
-        let rules = crate::always_allow::AlwaysRules::load(&path);
-        // Only kinds "Always" may keep, whatever a hand-edited file says.
-        self.inner.allowed.borrow_mut().extend(
-            rules
-                .keys_for(&self.workspace_key())
-                .iter()
-                .filter_map(always_key),
-        );
         *self.inner.always.borrow_mut() = Some(path);
     }
 
-    /// The workspace as rules name it: its real path, so a symlink re-pointed later does not
-    /// carry old rules to another folder.
-    fn workspace_key(&self) -> String {
-        self.inner.workspace_key()
+    /// Uses the chat session's session rules (so a same-agent restart keeps them and a
+    /// cross-agent switch clears them).
+    pub fn share_session_rules(&self, rules: SessionRules) {
+        *self.inner.session_rules.borrow_mut() = rules;
     }
 
     /// Binds `dir/approval-<pid>-<thread>.sock`. `workspace` bounds `AcceptEdits` auto-allows.
@@ -636,14 +575,14 @@ impl ApprovalHandle {
             listener: listener.clone(),
             sink: RefCell::new(None),
             pending: RefCell::new(HashMap::new()),
-            allowed: RefCell::new(HashSet::new()),
             mode: Cell::new(mode),
             workspaces: vec![workspace.to_owned()],
             home,
             deadline,
             queries: RefCell::new(HashMap::new()),
             always: RefCell::new(None),
-            session_rules: RefCell::new(crate::always_allow::AlwaysRules::default()),
+            session_rules: RefCell::new(SessionRules::default()),
+            blocked_noticed: Cell::new(false),
         });
         // From here `Drop` removes the file, including on the early return below.
         std::fs::set_permissions(&inner.path, std::fs::Permissions::from_mode(0o600))
@@ -726,40 +665,7 @@ impl ApprovalHandle {
             return false;
         };
         if matches!(decision, Decision::AllowForSession | Decision::AllowAlways) {
-            if decision == Decision::AllowAlways {
-                if let Some(mut rule) = custom_rule.clone() {
-                    if rule.workspace.is_empty() {
-                        rule.workspace = self.workspace_key();
-                    }
-                    self.save_custom_rule(rule.clone());
-                    self.inner.session_rules.borrow_mut().add(rule);
-                } else if let Some(key) = &pending.key {
-                    if let Some(always) = always_key(key) {
-                        self.remember_always(&always);
-                    }
-                } else if let Some(detail) = &pending.detail {
-                    self.remember_always_custom(&pending.tool, detail);
-                }
-            } else if decision == Decision::AllowForSession {
-                if let Some(mut rule) = custom_rule {
-                    if rule.workspace.is_empty() {
-                        rule.workspace = self.workspace_key();
-                    }
-                    self.inner.session_rules.borrow_mut().add(rule);
-                } else if let Some(detail) = &pending.detail {
-                    self.inner
-                        .session_rules
-                        .borrow_mut()
-                        .add(crate::always_allow::Rule::new(
-                            self.workspace_key(),
-                            pending.tool.clone(),
-                            detail.clone(),
-                        ));
-                }
-            }
-            if let Some(key) = pending.key {
-                self.inner.allowed.borrow_mut().insert(key);
-            }
+            self.inner.remember(&pending, decision, custom_rule);
         }
         reply(
             pending.conn,
@@ -775,41 +681,6 @@ impl ApprovalHandle {
     #[allow(dead_code)]
     pub fn respond(&self, request: &str, decision: Decision) -> bool {
         self.respond_with_rule(request, decision, None)
-    }
-
-    fn save_custom_rule(&self, rule: crate::always_allow::Rule) {
-        let Some(path) = self.inner.always.borrow().clone() else {
-            return;
-        };
-        let mut rules = crate::always_allow::AlwaysRules::load(&path);
-        let tool = rule.tool.clone();
-        let detail = rule.detail.clone();
-        let added = rules.add(rule);
-        if added {
-            match rules.save(&path) {
-                Ok(()) => {
-                    info!(tool = %tool, detail = %detail, "remembered custom always-allow rule")
-                }
-                Err(e) => warn!(error = %e, "could not save custom always-allow rule"),
-            }
-        }
-    }
-
-    fn remember_always_custom(&self, tool: &str, detail: &str) {
-        self.save_custom_rule(crate::always_allow::Rule::new(
-            self.workspace_key(),
-            tool.to_string(),
-            detail.to_string(),
-        ));
-    }
-
-    /// Adds `key` to this workspace's "Always allow" rules on disk. A failed write is logged:
-    /// the call is still allowed, and the rule still holds for this session.
-    ///
-    /// Load, add, save with no lock: two sessions remembering at the same instant can lose one
-    /// rule, and the cost is being asked again.
-    fn remember_always(&self, (tool, detail): &(String, String)) {
-        self.remember_always_custom(tool, detail);
     }
 
     /// Denies and expires everything still pending (the agent exited or restarted).
@@ -830,16 +701,92 @@ impl ApprovalHandle {
 }
 
 impl ServerInner {
-    fn workspace_key(&self) -> String {
-        self.workspaces
-            .first()
-            .map(|w| {
-                std::fs::canonicalize(w)
-                    .unwrap_or_else(|_| w.clone())
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_default()
+    /// Where a call is judged by the rules: agy, the session's workspace, the call's cwd.
+    fn context<'a>(&'a self, cwd: Option<&'a str>) -> Option<crate::always_allow::Context<'a>> {
+        Some(crate::always_allow::Context {
+            driver: "agy",
+            workspace: self.workspaces.first()?,
+            cwd,
+            home: self.home.as_deref(),
+        })
+    }
+
+    /// The Always rules, or `None` (no file configured, or one that cannot be used: then saved
+    /// rules are off and the notice names the file, once per server).
+    fn saved_rules(&self) -> Option<crate::always_allow::AlwaysRules> {
+        let path = self.always.borrow().clone()?;
+        match crate::always_allow::AlwaysRules::open(&path) {
+            Ok(rules) => Some(rules),
+            Err(e) => {
+                warn!(error = %e, "approval rules file unusable; saved rules are off");
+                if !self.blocked_noticed.replace(true) {
+                    self.emit(Envelope::new(Event::Notice {
+                        text: crate::always_allow::blocked_notice(&path, &e),
+                    }));
+                }
+                None
+            }
+        }
+    }
+
+    /// Whether a session rule (agy's own) or an Always rule allows `action`.
+    fn rules_allow(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool {
+        let Some(ctx) = self.context(cwd) else {
+            return false;
+        };
+        if self
+            .session_rules
+            .borrow()
+            .borrow()
+            .matches_session(action, &ctx)
+        {
+            return true;
+        }
+        self.saved_rules()
+            .is_some_and(|rules| rules.matches_any(action, &ctx))
+    }
+
+    /// Records what "Allow for session" / "Always allow" keeps for `pending`: the user's pattern
+    /// (`custom`) or the exact call. A rule that cannot be made is said, and the call is allowed
+    /// once. An Always rule also holds for the session, so an unusable file loses nothing now.
+    fn remember(
+        &self,
+        pending: &Pending,
+        decision: Decision,
+        custom: Option<crate::always_allow::Rule>,
+    ) {
+        let Some(ctx) = self.context(pending.cwd.as_deref()) else {
+            return;
+        };
+        let rule = match (custom, &pending.action) {
+            (Some(rule), _) => rule.complete(&ctx),
+            (None, Some(action)) => crate::always_allow::Rule::from_action(action, &ctx),
+            (None, None) => Err("nothing in this request can be remembered".to_owned()),
+        };
+        let rule = match rule {
+            Ok(rule) => rule,
+            Err(why) => {
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!("Allowed once; no rule was kept: {why}."),
+                }));
+                return;
+            }
+        };
+        if decision == Decision::AllowAlways {
+            let path = self.always.borrow().clone();
+            if let Some(path) = path {
+                match crate::always_allow::AlwaysRules::remember(&path, rule.clone()) {
+                    Ok(_) => info!(rule = %rule.summary(), "remembered an always-allow rule"),
+                    Err(e) => {
+                        warn!(error = %e, "always-allow rule not saved");
+                        self.emit(Envelope::new(Event::Notice {
+                            text: crate::always_allow::blocked_notice(&path, &e),
+                        }));
+                    }
+                }
+            }
+        }
+        self.session_rules.borrow().borrow_mut().add(rule);
     }
 
     fn emit(&self, env: Envelope) {
@@ -949,111 +896,14 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         Verdict::Deny(why) => return deny(conn, why),
         Verdict::Ask => {}
     }
-    let ws = inner.workspace_key();
-    let auto_matched = {
-        let cmd = if query.tool == "run_command" {
-            query
-                .args
-                .get("CommandLine")
-                .or_else(|| query.args.get("command"))
-                .and_then(Value::as_str)
-        } else {
-            None
-        };
-        let mcp_target = if query.tool == "call_mcp_tool" {
-            let server = query
-                .args
-                .get("ServerName")
-                .or_else(|| query.args.get("server"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let tool = query
-                .args
-                .get("ToolName")
-                .or_else(|| query.args.get("tool"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            Some(format!("{server}/{tool}"))
-        } else {
-            None
-        };
-        let edit_target = if classify(&query.tool) == ToolClass::Edit {
-            let targets = edit_targets(&query.args);
-            if let [target] = targets.as_slice() {
-                let path = Path::new(target);
-                if path.is_absolute() {
-                    Some(target.to_string())
-                } else if let Some(cwd) = &query.cwd {
-                    Some(Path::new(cwd).join(path).to_string_lossy().into_owned())
-                } else {
-                    Some(target.to_string())
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(target) = cmd {
-            if inner
-                .session_rules
-                .borrow()
-                .matches_any(&ws, "run_command", target)
-            {
-                true
-            } else if let Some(always_path) = inner.always.borrow().as_ref() {
-                let rules = crate::always_allow::AlwaysRules::load(always_path);
-                rules.matches_any(&ws, "run_command", target)
-            } else {
-                false
-            }
-        } else if let Some(target) = mcp_target.as_deref() {
-            if inner
-                .session_rules
-                .borrow()
-                .matches_any(&ws, "call_mcp_tool", target)
-            {
-                true
-            } else if let Some(always_path) = inner.always.borrow().as_ref() {
-                let rules = crate::always_allow::AlwaysRules::load(always_path);
-                rules.matches_any(&ws, "call_mcp_tool", target)
-            } else {
-                false
-            }
-        } else if let Some(target) = edit_target.as_deref() {
-            if inner
-                .session_rules
-                .borrow()
-                .matches_any(&ws, &query.tool, target)
-            {
-                true
-            } else if let Some(always_path) = inner.always.borrow().as_ref() {
-                let rules = crate::always_allow::AlwaysRules::load(always_path);
-                rules.matches_any(&ws, &query.tool, target)
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
-
-    if auto_matched {
-        info!(tool = %query.tool, "auto-approving action matching pattern rules");
-        return reply(
-            conn,
-            ApprovalReply {
-                decision: Decision::Allow,
-                reason: None,
-            },
-        );
-    }
-    let key = session_key(&query);
-    if key
+    // One matcher for every agent (`always_allow`): the call in canonical terms, judged by the
+    // thread's session rules (agy's own) and the Always rules.
+    let action = crate::always_allow::Action::of(&query.tool, &query.args);
+    if action
         .as_ref()
-        .is_some_and(|k| inner.allowed.borrow().contains(k))
+        .is_some_and(|a| inner.rules_allow(a, query.cwd.as_deref()))
     {
+        info!(tool = %query.tool, "auto-approving a call a remembered rule matches");
         return reply(
             conn,
             ApprovalReply {
@@ -1070,50 +920,18 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     }
 
     let id = query.id.clone();
-    let (remembers, detail) = if query.tool == "run_command" {
-        let cmd = query
-            .args
-            .get("CommandLine")
-            .or_else(|| query.args.get("command"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        const SHELL_SYNTAX: &[&str] = &[";", "&", "|", "`", "$", ">", "<", "\n", "\r"];
-        if SHELL_SYNTAX.iter().any(|c| cmd.contains(c)) {
-            (None, None)
-        } else {
-            let cwd = query.cwd.as_deref().unwrap_or_default();
-            let rem = if inner.always.borrow().is_some() {
-                Some(format!("`{cmd}` in {cwd}"))
-            } else {
-                None
-            };
-            (rem, Some(cmd.to_string()))
-        }
-    } else {
-        let rem = key
-            .as_ref()
-            .filter(|_| inner.always.borrow().is_some())
-            .and_then(always_key)
-            .map(|(_, detail)| match detail.split_once('\n') {
-                Some((cwd, command)) => format!("`{command}` in {cwd}"),
-                None => detail.clone(),
-            });
-        let det = key.as_ref().map(|(_, d)| d.clone());
-        (rem, det)
-    };
-    let mut options = vec![Decision::Allow, Decision::AllowForSession];
-    if remembers.is_some() {
-        options.push(Decision::AllowAlways);
-    }
-    options.push(Decision::Deny);
+    let (options, remembers) = rule_options(
+        action.as_ref(),
+        inner.context(query.cwd.as_deref()).as_ref(),
+        inner.always.borrow().is_some(),
+    );
     // Registered before the envelope goes out: the sink may answer synchronously.
     inner.pending.borrow_mut().insert(
         id.clone(),
         Pending {
             conn: conn.clone(),
-            key,
-            tool: query.tool.clone(),
-            detail,
+            action,
+            cwd: query.cwd.clone(),
         },
     );
     let title = query
@@ -1148,6 +966,70 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         deny(pending.conn, "no answer in agent-terminal");
     }
     inner.emit(Envelope::new(Event::ApprovalExpired).request(id));
+}
+
+/// Whether a call naming `target` may be matched by a path rule: [`contained`] in `workspace`
+/// (absolute, no `..`, no symlink or extra hard link on the way) and not a [`sensitive_target`].
+/// The rule engine's path check; the same one agy's Accept-edits policy uses.
+pub(crate) fn path_auto_matchable(target: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+    contained(target, workspace) && !sensitive_target(target, workspace, home)
+}
+
+/// `path` with symlinks resolved in its longest existing ancestor: how path rules are compared.
+pub(crate) fn canonical_target(path: &Path) -> PathBuf {
+    resolve(path)
+}
+
+/// Whether "Always allow" applies to this kind of call: a shell command only. A permanent allow
+/// on a path (`~/.bashrc`, a git hook, the rules file) would be a standing write grant, and an
+/// MCP rule ignores the tool's arguments; those stay "for this session" at most.
+pub(crate) fn always_offerable(action: &crate::always_allow::Action) -> bool {
+    action.kind() == crate::always_allow::ActionKind::Shell
+}
+
+/// The buttons agy's card offers, and what "Always allow" would keep: Allow; "Allow for
+/// session" when a rule could match the call ([`crate::always_allow::offerable`]: no secret, a
+/// simple command, a contained path); "Always allow" when that call is a shell command and a
+/// rules file is configured; Deny.
+fn rule_options(
+    action: Option<&crate::always_allow::Action>,
+    ctx: Option<&crate::always_allow::Context>,
+    always: bool,
+) -> (Vec<Decision>, Option<String>) {
+    let mut options = vec![Decision::Allow];
+    let mut remembers = None;
+    if let (Some(action), Some(ctx)) = (action, ctx) {
+        if crate::always_allow::offerable(action, ctx) {
+            options.push(Decision::AllowForSession);
+            if always && always_offerable(action) {
+                options.push(Decision::AllowAlways);
+                remembers = Some(remembers_text(action, ctx));
+            }
+        }
+    }
+    options.push(Decision::Deny);
+    (options, remembers)
+}
+
+/// What an approval card says "Always allow" keeps for `action`.
+pub(crate) fn remembers_text(
+    action: &crate::always_allow::Action,
+    ctx: &crate::always_allow::Context,
+) -> String {
+    match action {
+        crate::always_allow::Action::Shell { command } => {
+            let words = crate::always_allow::command_tokens(command)
+                .map_or_else(|| command.clone(), |argv| argv.join(" "));
+            let cwd = ctx
+                .cwd
+                .map_or_else(|| ctx.workspace.to_string_lossy(), std::borrow::Cow::from);
+            format!("`{words}` in {cwd}")
+        }
+        crate::always_allow::Action::Edit { path } | crate::always_allow::Action::Read { path } => {
+            path.clone()
+        }
+        crate::always_allow::Action::Mcp { server, tool } => format!("{server}/{tool}"),
+    }
 }
 
 #[cfg(test)]
@@ -1423,18 +1305,9 @@ mod tests {
     }
 
     #[test]
-    fn session_keys_are_exact_and_refuse_wrappers() {
-        let key = |l: &str| session_key(&cmd(l));
-        // Exact full command line, never a prefix.
-        assert_eq!(
-            key("git status --short"),
-            Some(("run_command".into(), "\ngit status --short".into()))
-        );
-        assert_ne!(key("git status --short"), key("git status"));
-        // The working directory is part of the key.
-        let mut elsewhere = cmd("git status --short");
-        elsewhere.cwd = Some("/other".into());
-        assert_ne!(session_key(&elsewhere), key("git status --short"));
+    fn plain_rules_refuse_wrappers_runners_and_shell_syntax() {
+        assert!(rememberable_command("git status --short"));
+        assert!(rememberable_command("/usr/bin/zsh -lc 'git status'"));
         for refused in [
             "make test",
             "cargo build",
@@ -1466,7 +1339,8 @@ mod tests {
             "python3.12 script.py",
             "/usr/bin/python3 -c x",
             "node -e x",
-            "bash -c ls",
+            "bash -xc ls",
+            "bash -c 'make test'",
             "sh run.sh",
             "env FOO=1 ls",
             "sudo ls",
@@ -1479,11 +1353,11 @@ mod tests {
             "find . -name x -exec rm {} +",
             "find . -delete",
         ] {
-            assert_eq!(key(refused), None, "{refused}");
+            assert!(!rememberable_command(refused), "{refused}");
         }
         // Plain find is fine.
-        assert!(key("find . -name x").is_some());
-        // send_command_input, subagents, network and unknown tools are never remembered.
+        assert!(rememberable_command("find . -name x"));
+        // send_command_input, subagents, network and unknown tools are no action a rule names.
         for tool in [
             "send_command_input",
             "start_subagent",
@@ -1493,48 +1367,30 @@ mod tests {
             "mystery",
         ] {
             let args = serde_json::json!({"CommandLine": "ls", "TargetFile": "/x"});
-            assert_eq!(session_key(&q(tool, args)), None, "{tool}");
+            assert_eq!(crate::always_allow::Action::of(tool, &args), None, "{tool}");
         }
     }
 
     #[test]
-    fn mcp_keys_are_per_server_and_tool() {
-        let mcp = |server: &str, tool: &str| {
-            q(
-                "call_mcp_tool",
-                serde_json::json!({"ServerName": server, "ToolName": tool}),
-            )
-        };
-        let a = session_key(&mcp("fs", "read")).expect("key");
-        assert_eq!(a, ("call_mcp_tool".to_owned(), "fs/read".to_owned()));
-        assert_ne!(Some(a.clone()), session_key(&mcp("fs", "delete")));
-        assert_ne!(Some(a), session_key(&mcp("other", "read")));
-        assert_eq!(
-            session_key(&q("call_mcp_tool", serde_json::json!({}))),
-            None
-        );
-    }
-
-    #[test]
-    fn edit_keys_are_the_exact_resolved_path() {
+    fn edit_rules_are_the_exact_canonical_path_inside_the_workspace() {
+        use crate::always_allow::{Action, Context, Rule};
         let tmp = tempfile::tempdir().expect("tmp");
         let real = std::fs::canonicalize(tmp.path()).expect("canon");
-        let a = real.join("a.rs").to_string_lossy().into_owned();
-        let b = real.join("b.rs").to_string_lossy().into_owned();
-        let ka = session_key(&edit("write_to_file", &a)).expect("key a");
-        let kb = session_key(&edit("write_to_file", &b)).expect("key b");
-        assert_eq!(ka, ("write_to_file".to_owned(), a.clone()));
-        assert_ne!(ka, kb);
-        // The same file through a symlink is the same key; a different tool is another key.
-        let link = real.join("link");
-        std::os::unix::fs::symlink(&real, &link).expect("link");
-        let via = link.join("a.rs").to_string_lossy().into_owned();
-        assert_eq!(session_key(&edit("write_to_file", &via)), Some(ka.clone()));
-        assert_ne!(session_key(&edit("sed_file", &a)), Some(ka));
-        // Relative and `..` paths are never remembered.
-        assert_eq!(session_key(&edit("write_to_file", "a.rs")), None);
-        let dotdot = format!("{}/x/../a.rs", real.display());
-        assert_eq!(session_key(&edit("write_to_file", &dotdot)), None);
+        let ctx = Context {
+            driver: "agy",
+            workspace: &real,
+            cwd: None,
+            home: None,
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let a = Rule::from_action(&edit(&real.join("a.rs")), &ctx).expect("rule a");
+        assert!(a.matches(&edit(&real.join("a.rs")), &ctx));
+        assert!(!a.matches(&edit(&real.join("b.rs")), &ctx));
+        // Relative (no cwd) and `..` paths are never remembered.
+        assert!(Rule::from_action(&edit(Path::new("a.rs")), &ctx).is_err());
+        assert!(Rule::from_action(&edit(&real.join("x/../a.rs")), &ctx).is_err());
     }
 
     #[test]
@@ -1707,12 +1563,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let rules_path = tmp.path().join("always-allow.json");
             let mut rules = crate::always_allow::AlwaysRules::default();
-            rules.add(crate::always_allow::Rule::with_kind(
+            assert!(rules.add(crate::always_allow::Rule::new(
                 "*",
                 "run_command",
                 "cargo test*",
-                crate::always_allow::PatternKind::Wildcard,
-            ));
+            )));
             rules.save(&rules_path).expect("save");
 
             let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
