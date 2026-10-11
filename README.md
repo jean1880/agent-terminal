@@ -9,7 +9,7 @@ A native Linux desktop app for working with AI coding agents. Claude Code, Antig
 A terminal is always one keystroke away. It's written in Rust with GTK4 and libadwaita,
 and it ships as a single binary.
 
-![A chat thread continued in Antigravity after Claude ran out of quota, with an approval waiting](docs/screenshots/chat.png)
+![The thread sidebar beside a chat continued in Antigravity, with a command waiting for approval](docs/screenshots/chat.png)
 
 > Agent Terminal is an independent project, not affiliated with Anthropic, Google or OpenAI.
 > It drives their command-line tools, which you install and sign in to yourself.
@@ -26,9 +26,8 @@ and it ships as a single binary.
 ## Contents
 
 - [Highlights](#highlights)
-- [Screenshots](#screenshots)
 - [Install](#install)
-- [Quick start](#quick-start)
+- [Walkthrough](#walkthrough)
 - [Features](#features)
 - [Command-line options](#command-line-options)
 - [Keyboard shortcuts](#keyboard-shortcuts)
@@ -52,8 +51,11 @@ and it ships as a single binary.
 - **One window for three agents.** Claude, Antigravity and Codex threads live in one
   sidebar, grouped by folder and searchable. Claude and agy sessions you already ran
   in those CLIs show up there too.
-- **You stay in control.** Inline approvals for commands and edits, a plan panel, and
-  questions the agent asks you as cards with answers to pick.
+- **You stay in control.** One approval card for every agent (Allow, Allow for session,
+  Always allow, Deny, Stop turn), a plan panel, and questions the agent asks you as cards
+  with answers to pick.
+- **Approval rules you own.** Session and always rules live in Agent Terminal, kept exactly
+  as you write them, and answer matching requests from Claude, Antigravity and Codex alike.
 - **Review your multi-agent setup.** One confirmed action opens a review in the exact
   work folder, with a scorecard, skill and MCP recommendations, and an ordered
   improvement guide.
@@ -62,17 +64,6 @@ and it ships as a single binary.
   Your branch, index and stash are never touched.
 - **Your desktop, your colours.** The bundled Agent Terminal theme, six classics, or
   **Use System Theme** to follow your desktop's GTK theme, light or dark.
-
-## Screenshots
-
-| | |
-|---|---|
-| ![Markdown, code and a table in a Claude reply](docs/screenshots/chat-markdown.png) | ![A model switch, a rate limit and a question card](docs/screenshots/chat-question.png) |
-| Replies render markdown, code and tables. | Model switches, rate limits, and questions with answers to pick. |
-| ![Settings: the theme list, Use System Theme first](docs/screenshots/settings-theme.png) | ![The window under Use System Theme on a light desktop](docs/screenshots/system-theme.png) |
-| Themes apply to the whole app, live. | **Use System Theme** on a light desktop. |
-| ![The first-start walkthrough](docs/screenshots/setup-welcome.png) | |
-| A first start walks you through your agents. | |
 
 ## Install
 
@@ -141,23 +132,105 @@ guarantee its enforcement outcome. The integration may work today, but that is n
 approval, assurance of compliance, or guarantee of future availability. Review the
 terms yourself and do not use this integration if they do not permit your intended use.
 
-## Quick start
+## Walkthrough
 
-1. **Launch Agent Terminal** from your app menu, or run `agent-terminal`.
-2. **The first start opens a short setup.** It shows which agents are installed,
-   lets you switch off any you don't use, and offers **Sign In…** for any agent nobody
-   is signed in to. It also asks which agent new threads start on. Run it again any
-   time from Settings → General → Setup.
-3. **Start a thread** with `Ctrl+Shift+T` (or the **+** button). It opens in the
-   current folder; **+** → New Thread in Existing Folder… picks another.
-4. **Type a request** and press Enter. Use `/` for commands, `@` to mention files and
-   `$` for skills. When the agent wants to run a command or edit a file, approve or
-   deny it inline. The mode picker in the thread's header switches between
-   **Ask before edits**, **Accept edits** and **Plan**.
-5. **See and undo changes.** `Ctrl+Shift+D` opens the diff panel. Its undo arrow puts
-   the last turn's changes back. `` Ctrl+` `` opens a shell in the thread's folder.
-6. **Using agy?** Install its [approval hook](#agys-approval-hook) so it asks before
-   it acts.
+The screenshots below come from the app's demo mode (`AGENT_TERMINAL_DEMO_THREADS=1`):
+scripted threads, no agent running.
+
+### 1. First start
+
+Launch Agent Terminal from your app menu, or run `agent-terminal`. The first start opens
+a short setup. It shows which agents are installed, lets you switch off any you don't use,
+offers **Sign In…** for any agent nobody is signed in to, and asks which agent new threads
+start on. Run it again any time from Settings → General → **Run Setup Again…**.
+
+![The welcome screen of the first-start setup](docs/screenshots/setup-welcome.png)
+
+### 2. Start a thread and ask
+
+Start a thread with `Ctrl+Shift+T` or the **+** button. It opens in the current folder;
+the menu (☰) → **New Thread in Existing Folder…** picks another, and **New Thread in
+Isolated Git Worktree…** gives the agent its own checkout. Type a request and press
+Enter. `/` lists commands, `@` mentions files and `$` picks skills. The mode picker
+beside the agent switches between **Ask before edits**, **Accept edits** and **Plan**.
+
+![The composer's typeahead listing slash commands](docs/screenshots/typeahead.png)
+
+### 3. Follow the work
+
+Replies render markdown, code and tables. Every tool call is a card with the same
+grammar for every agent (`Read <path>`, `Run <command>`, `Edit <path>`, `<server>/<tool>`),
+marked done, failed or declined, with its input, output and errors behind it. Reasoning,
+the plan and sub-agents each get their own block.
+
+| | |
+|---|---|
+| ![A Claude reply with a heading, a list, a code block and a table](docs/screenshots/chat-markdown.png) | ![Edit, Create and Run cards, one declined and one failed with its output](docs/screenshots/chat-tools.png) |
+| Markdown, code and tables. | Tool cards: done, declined and failed. |
+
+### 4. Approve, deny or make a rule
+
+When the agent wants to run a command or edit a file, an approval card shows exactly
+what it asks for. **Allow** answers once, **More** offers **Allow for session** and
+**Always allow**, **Deny** lets the agent see the refusal and carry on, and **Stop turn**
+ends the turn. A panel above the composer keeps the pending approval within reach while
+you scroll. See [Approvals and rules](#approvals-and-rules).
+
+![An approval card for cargo clean with More open on Always allow and Allow for session](docs/screenshots/approval.png)
+
+### 5. Answer questions, queue follow-ups
+
+Questions the agent asks come as cards with answers to pick. A prompt you send while a
+turn is running waits in a queue pinned under the reply and goes out when the turn ends;
+`Up` in an empty composer takes the last one back to edit.
+
+| | |
+|---|---|
+| ![A model switch, a rate-limit notice and a question card with two questions](docs/screenshots/chat-question.png) | ![A running reply with two queued prompts pinned under it](docs/screenshots/queue.png) |
+| Model switches, rate limits and a question. | Queued prompts. |
+
+### 6. Switch model or agent
+
+The chip at the left of the thread's header (or `/model`) opens one picker for every
+installed agent, with search and effort levels. Pick a model from another agent and the
+thread carries on there, with the conversation handed over. Models that Antigravity
+serves on Google's quota are marked *via Antigravity*. Usage for each agent sits beside
+the picker and at the foot of the sidebar. See
+[Switching agents](#switching-agents-mid-conversation).
+
+![The Model and Agent picker listing Antigravity and Claude models with effort levels](docs/screenshots/model-picker.png)
+
+### 7. When Codex needs more
+
+Codex can ask for access beyond its sandbox, and tool servers behind it can ask for
+details or a sign-in. Each request is a card that says exactly what is asked: what it
+would read or write, what stays blocked, whether it wants the network, and which host a
+link opens.
+
+| | |
+|---|---|
+| ![A Codex permission card listing places to read and write, what stays blocked, and network use](docs/screenshots/codex-permission.png) | ![A tool-server form with required fields, choices and checkboxes](docs/screenshots/codex-form.png) |
+| Extra access, for this turn or this session. | A tool server's form. |
+
+### 8. See and undo changes
+
+`Ctrl+Shift+D` opens the diff panel: uncommitted work, the last turn, everything since
+the thread opened, or the target branch. Its undo arrow puts the last turn's changes back,
+and the undo can itself be undone. `` Ctrl+` `` opens a shell in the thread's folder.
+See [Git safety net](#git-safety-net).
+
+### 9. Make it yours
+
+Settings (`Ctrl+,`) apply as you change them. Pick the bundled theme, one of six classics,
+or **Use System Theme** to follow your desktop, light or dark.
+
+| | |
+|---|---|
+| ![Settings → General with the theme list open](docs/screenshots/settings-theme.png) | ![The window under Use System Theme on a light desktop](docs/screenshots/system-theme.png) |
+| Themes apply to the whole app, live. | **Use System Theme** on a light desktop. |
+
+**Using Antigravity?** Install its [approval hook](#agys-approval-hook) so it asks
+before it acts.
 
 ## Features
 
@@ -235,6 +308,12 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Pending approvals stay within reach.** A panel above the composer keeps approval
   controls available while you scroll, with extra choices in a popover when the
   agent supports them. Pending questions offer a jump back to their answer card.
+- **Queued prompts.** A prompt sent while a turn is running waits, pinned at the bottom of
+  the transcript, and goes out when the turn ends. `Up` in an empty composer takes the
+  last one back for editing.
+- **Quick replies.** When a Codex or Antigravity reply ends with a question and a short
+  list of choices, the choices appear under it; one click puts the answer in the composer,
+  ready to send or edit. Turn them off from the replies themselves or in Settings → General.
 - **One model picker for every agent.** See
   [Switching agents](#switching-agents-mid-conversation). Models that agy serves on
   Google's quota are marked *via Antigravity*.
@@ -242,13 +321,43 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   foot of the sidebar, and update every turn.
 - `/rewind` undoes the last turn's changes.
 
+### Approvals and rules
+
+- **One card for every agent.** **Allow** (once), **Allow for session**, **Always allow**,
+  **Deny** and **Stop turn** mean the same thing for Claude, Antigravity and Codex. Deny
+  lets the agent see the refusal and continue; Stop turn ends the turn.
+- **Rules live in Agent Terminal**, in `~/.local/state/agent-terminal/approval-rules.json`,
+  and answer matching requests from every agent. Always rules match across agents by kind:
+  a shell command, one file inside the workspace, or one MCP tool. Session rules end when
+  the thread switches agent, and the switch notice says how many ended.
+- **Your rules mean what you write.** `git *` covers every git command and `cargo test *`
+  every `cargo test`. When a rule allows more than reading (a program that runs code, an
+  option such as `git -c`, a file outside the workspace), a notice says so when it is kept.
+  A command with shell syntax (`;`, `&&`, `|`, `$(`, redirection, …) never matches a rule,
+  and a secret is never written into one.
+- **Allow for session on a read covers the next read.** For read-only programs (`ls`,
+  `cat`, `grep`, `rg`, `git status`/`log`/`diff`, …) the session grant keeps the program
+  for the workspace, as long as every path it names stays inside it and away from `.git`,
+  secret-looking files and home dotfiles.
+- **Import and export.** Settings → Agents imports the rules your agents already have
+  (Claude, Antigravity, Codex's `~/.codex/rules` and any permission files you list) and
+  exports Agent Terminal's global rules back. **View Differences…** shows what is not yet
+  in step. **Manage Rules…** lists the saved rules, and removes any you no longer want.
+- **Codex requests.** When Codex asks for extra filesystem or network access, the card
+  lists exactly what it asks for. A session grant is offered only for places Codex cannot
+  rename later, and never covers the filesystem root, your home folder or a project's
+  settings. A header chip shows extra access while it lasts. Tool-server forms and sign-in
+  links become cards too; nothing is sent or opened until you choose.
+- **Secrets are masked** in approval cards, tool cards, questions and notices, not only in
+  the store.
+
 ### Git safety net
 
 - **Turn checkpoints**: in a git repository, the working tree is snapshotted into
   hidden refs when a turn ends. Your branch, index and stash stay as they were.
   See [Turn checkpoints](#turn-checkpoints).
-- **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, or everything since
-  the thread opened. Open any file in your own diff tool. See [Diff panel](#diff-panel).
+- **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, everything since
+  the thread opened, or the target branch. Open any file in your own diff tool. See [Diff panel](#diff-panel).
 - **Undo a turn**, which saves the current state first, so the undo can itself be undone.
   See [Undoing a turn](#undoing-a-turn).
 - **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can
@@ -316,7 +425,7 @@ agent-terminal --resume <id> --dir ~/git/some-project
 |---|---|
 | `RUST_LOG` | Log level and filters (default `info`). |
 | `XDG_CONFIG_HOME` | Where `agent-terminal/config.json` lives (default `~/.config`). Point it at a scratch folder to run an isolated copy. |
-| `XDG_STATE_HOME` | Where the thread store, hand-off briefs and agy's always-allow rules live (default `~/.local/state`). |
+| `XDG_STATE_HOME` | Where the thread store, hand-off briefs and approval rules live (default `~/.local/state`). |
 | `AGENT_TERMINAL_HOOK_BIN` | The binary agy's approval hook runs (default `agent-terminal` on `PATH`). |
 | `AGENT_TERMINAL_DEMO_THREADS` | Set to `1` for demo threads in place of yours (in memory, no agents run). |
 
@@ -357,7 +466,7 @@ can only be set there: profiles, status indicators and the cleared environment.
 | `~/.config/agent-terminal/config.json` | Settings, profiles, indicators. Written atomically, `0600`. |
 | `~/.local/state/agent-terminal/threads.db` | The thread store (SQLite). Every stored event is redacted. |
 | `~/.local/state/agent-terminal/handoffs/` | Hand-off briefs: `0700` folder, `0600` files, pruned after 7 days. |
-| `~/.local/state/agent-terminal/always-allow.json` | agy actions you chose to always allow, per folder. |
+| `~/.local/state/agent-terminal/approval-rules.json` | Approval rules (session and always) for every agent. Written `0600`. |
 
 A settings file that can't be parsed is copied aside (`config.json.invalid-…`) and
 reported before defaults replace it. An edit that doesn't parse yet suspends saving
@@ -381,6 +490,10 @@ until it is fixed.
 | `reopen_last_thread` | `false` | Start with the threads open at the last close |
 | `restore_session` | `false` | Reopen the last terminal threads, as fresh sessions |
 | `skip_load_animation` | `false` | Show the window as soon as it is ready |
+| `pattern_auto_approval` | `true` | Answer requests that match a saved approval rule without asking |
+| `confirm_rule_modification` | `true` | Confirm, or loosen, a rule's pattern when choosing Always allow |
+| `permission_sources` | `[]` | Extra `permissions.toml`-style files that import reads and export writes (absolute or `~/`) |
+| `suggest_quick_replies` | `true` | Offer quick replies under a Codex or Antigravity reply that ends with a question |
 | `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font and zoom |
 | `cursor_shape`, `cursor_blink` | `block`, `true` | Terminal cursor |
 | `scrollback_lines` | `10000` | Terminal scrollback |
@@ -591,6 +704,7 @@ unified diff. The dropdown picks what to compare against:
 | **Uncommitted** | HEAD against the working tree now, untracked files included |
 | **Last turn** | What the thread's latest checkpoint changed |
 | **This thread** | Everything since the state the thread's first checkpoint was taken on top of |
+| **Target branch** | Every change against the primary branch (`origin/HEAD`, `main` or `master`) |
 
 The panel refreshes when it opens, when a checkpoint is taken, when the base changes,
 and on its refresh button. It never polls. Git's external diff and textconv drivers
