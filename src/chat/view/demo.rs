@@ -360,6 +360,8 @@ impl DemoBackend {
             diff_review_script()
         } else if scene == "queue" {
             queue_script()
+        } else if scene == "requests" || scene == "requests-risky" {
+            requests_script(scene == "requests-risky")
         } else if matches!(scene.as_str(), "workers" | "usage")
             || std::env::var("AGENT_TERMINAL_DEMO_CODEX_WORKERS").as_deref() == Ok("1")
         {
@@ -539,6 +541,21 @@ impl ChatBackend for DemoBackend {
             Step::Wait(300),
             Step::Emit(Envelope::new(Event::ApprovalResolved { decision }).request(request)),
         ]);
+    }
+
+    fn respond_form(
+        &self,
+        request: &str,
+        action: agent_core::form::FormAction,
+        content: Option<Value>,
+    ) -> bool {
+        // The demo never keeps what was typed: only the outcome comes back.
+        let _ = content;
+        self.push([
+            Step::Wait(300),
+            Step::Emit(Envelope::new(Event::FormResolved { action }).request(request)),
+        ]);
+        true
     }
 
     fn answer_questions(&self, request: &str, answers: Value) {
@@ -1140,6 +1157,235 @@ fn diff_review_script() -> Vec<Step> {
     ]
 }
 
+/// `AGENT_TERMINAL_DEMO_SCENE=requests`: a Codex turn stopped on a permission request, a form
+/// and a sign-in link, each left open to read and try. `requests-risky` swaps the request for
+/// one that reaches the whole filesystem and one the card cannot read, for the same review.
+fn requests_script(risky: bool) -> Vec<Step> {
+    use agent_core::form::{ChoiceOption, FieldInput, Form, FormField};
+    let options = |labels: &[&str]| -> Vec<ChoiceOption> {
+        labels
+            .iter()
+            .map(|l| ChoiceOption {
+                value: l.to_lowercase().replace(' ', "-"),
+                label: (*l).to_owned(),
+            })
+            .collect()
+    };
+    let field = |name: &str, title: Option<&str>, about: Option<&str>, required, input| FormField {
+        name: name.into(),
+        title: title.map(str::to_owned),
+        description: about.map(str::to_owned),
+        required,
+        input,
+    };
+    let mut s = vec![
+        Step::SetDriver(Driver::Codex, Some("gpt-5-codex".into())),
+        Step::Emit(Envelope::new(Event::SessionStarted {
+            native_id: "codex-requests".into(),
+            model: Some("gpt-5-codex".into()),
+            cwd: None,
+        })),
+        Step::Emit(started("rq-user", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot(
+            "rq-user",
+            StreamKind::Assistant,
+            "Set up the release build, create the repository and sign in to the registry.",
+        )),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        Step::Emit(started(
+            "rq-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        )),
+        Step::Emit(snapshot(
+            "rq-reply",
+            StreamKind::Assistant,
+            "Three things need you before I can go on: the build wants to write outside the \
+             project, the **github** tool server wants some details, and the registry wants you \
+             to sign in.",
+        )),
+        Step::Emit(completed("rq-reply", ItemStatus::Completed, None, None)),
+    ];
+    let permission = if risky {
+        json!({
+            "cwd": "~/git/agent-terminal", "reason": "Clean every stale build output",
+            "renderable": true, "session_allowed": false,
+            "warning": "This includes your home folder.",
+            "entries": [
+                {"access": "write", "target": {"kind": "special", "name": "root", "path": null}},
+                {"access": "deny", "target": {"kind": "path", "path": "~/.ssh"}}
+            ],
+            "network": null, "requested": {}
+        })
+    } else {
+        json!({
+            "cwd": "~/git/agent-terminal", "reason": "The release build keeps its cache outside the project",
+            "renderable": true, "session_allowed": true, "warning": null,
+            "entries": [
+                {"access": "write", "target": {"kind": "path", "path": "~/.cache/agent-terminal-build"}},
+                {"access": "write", "target": {"kind": "special", "name": "slash_tmp", "path": null}},
+                {"access": "read", "target": {"kind": "glob", "pattern": "~/git/shared-assets/**/*.svg"}},
+                {"access": "deny", "target": {"kind": "path", "path": "~/git/agent-terminal/.git"}}
+            ],
+            "network": true, "requested": {}
+        })
+    };
+    let (title, options_of) = if risky {
+        (
+            "Codex asks to write to 1 place",
+            vec![Decision::Allow, Decision::Deny, Decision::Cancel],
+        )
+    } else {
+        (
+            "Codex asks to write to 2 places, read 1 place and use the network",
+            vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel,
+            ],
+        )
+    };
+    s.push(Step::Emit(
+        Envelope::new(Event::ApprovalRequested {
+            tool: "codex_permissions".into(),
+            title: Some(title.into()),
+            input: permission,
+            reason: None,
+            options: options_of,
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .request("rq-permission"),
+    ));
+    if risky {
+        s.push(Step::Emit(
+            Envelope::new(Event::ApprovalRequested {
+                tool: "codex_permissions".into(),
+                title: Some("Codex asks for extra permissions".into()),
+                input: json!({
+                    "cwd": "~/git/agent-terminal", "renderable": false,
+                    "entries": [{"access": "read", "target": {"kind": "future-kind"}}],
+                    "requested": {"fileSystem": {"entries": [{"access": "read", "path": {"type": "future-kind"}}]}}
+                }),
+                reason: Some("A newer Codex described this in a way agent-terminal does not know".into()),
+                options: vec![Decision::Deny, Decision::Cancel],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("rq-unreadable"),
+        ));
+    }
+    s.push(Step::Emit(
+        Envelope::new(Event::FormRequested {
+            server: "github".into(),
+            message: "I need a few details to create the repository.".into(),
+            form: Form::Fields {
+                fields: vec![
+                    field(
+                        "repo_name",
+                        None,
+                        Some("Lowercase letters, digits and dashes."),
+                        true,
+                        FieldInput::Text {
+                            format: None,
+                            min_length: Some(3),
+                            max_length: Some(40),
+                            default: None,
+                        },
+                    ),
+                    field(
+                        "visibility",
+                        None,
+                        None,
+                        true,
+                        FieldInput::Choice {
+                            options: options(&["Public", "Private", "Internal"]),
+                            multi: false,
+                            min_items: None,
+                            max_items: None,
+                            default: Vec::new(),
+                        },
+                    ),
+                    field(
+                        "license",
+                        None,
+                        None,
+                        false,
+                        FieldInput::Choice {
+                            options: options(&[
+                                "MIT",
+                                "Apache 2.0",
+                                "GPL 3",
+                                "LGPL 3",
+                                "BSD 2",
+                                "BSD 3",
+                                "MPL 2.0",
+                                "Unlicense",
+                            ]),
+                            multi: false,
+                            min_items: None,
+                            max_items: None,
+                            default: Vec::new(),
+                        },
+                    ),
+                    field(
+                        "topics",
+                        None,
+                        None,
+                        false,
+                        FieldInput::Choice {
+                            options: options(&["GTK", "Rust", "Terminal", "AI", "Packaging"]),
+                            multi: true,
+                            min_items: Some(1),
+                            max_items: Some(3),
+                            default: Vec::new(),
+                        },
+                    ),
+                    field(
+                        "initial_commit",
+                        Some("Create an initial commit"),
+                        None,
+                        false,
+                        FieldInput::Boolean { default: None },
+                    ),
+                    field(
+                        "team_size",
+                        None,
+                        None,
+                        false,
+                        FieldInput::Number {
+                            integer: true,
+                            minimum: Some(1.0),
+                            maximum: Some(50.0),
+                            default: None,
+                        },
+                    ),
+                ],
+            },
+        })
+        .request("rq-form"),
+    ));
+    s.push(Step::Emit(
+        Envelope::new(Event::FormRequested {
+            server: "registry".into(),
+            message: "Sign in to publish the package.".into(),
+            form: Form::Link {
+                url: if risky {
+                    "http://192.168.1.50:8080/device?user_code=WXYZ-1234".into()
+                } else {
+                    "https://registry.example.com/login/device?user_code=WXYZ-1234".into()
+                },
+            },
+        })
+        .request("rq-link"),
+    ));
+    s
+}
+
 /// `AGENT_TERMINAL_DEMO_SCENE=queue`: a turn still running, two prompts waiting behind it
 /// (one long), and the reply growing above them. The queue stays pinned under the reply.
 fn queue_script() -> Vec<Step> {
@@ -1438,6 +1684,34 @@ pub fn play_demo(backend: Rc<DemoBackend>, sink: EnvelopeSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request scenes leave a permission request, a form and a link open, all answerable,
+    /// and the risky variant's unreadable request is still only refusable.
+    #[test]
+    fn the_requests_scenes_leave_every_card_open_and_answerable() {
+        use crate::chat::view::model::{Body, FormState, Transcript};
+        for risky in [false, true] {
+            let mut t = Transcript::new();
+            for step in requests_script(risky) {
+                if let Step::Emit(env) = step {
+                    t.apply(&env, Driver::Codex);
+                }
+            }
+            for id in ["form:rq-form", "form:rq-link"] {
+                match &t.get(id).expect("card").body {
+                    Body::Form(f) => assert_eq!(f.state, FormState::Pending, "{id}"),
+                    _ => panic!("{id} is not a form"),
+                }
+            }
+            let permission = match &t.get("approval:rq-permission").expect("card").body {
+                Body::Approval(a) => crate::chat::view::permission::Request::parse(&a.input),
+                _ => panic!("not an approval"),
+            };
+            assert!(permission.renderable);
+            assert_eq!(permission.reaches_everything(), risky);
+            assert_eq!(t.get("approval:rq-unreadable").is_some(), risky);
+        }
+    }
 
     #[test]
     fn review_diff_scene_contains_real_in_memory_changes() {

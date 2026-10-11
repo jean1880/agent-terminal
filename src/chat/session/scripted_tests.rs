@@ -110,7 +110,8 @@ impl Fixture {
     fn pending(&self) -> Option<String> {
         self.model.borrow().pending_interruption().map(|p| match p {
             PendingInterruption::Approval { request, .. }
-            | PendingInterruption::Question { request, .. } => request,
+            | PendingInterruption::Question { request, .. }
+            | PendingInterruption::Form { request, .. } => request,
         })
     }
 

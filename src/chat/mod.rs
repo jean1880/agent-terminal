@@ -37,15 +37,17 @@ pub trait ChatBackend {
     }
     fn answer_questions(&self, request: &str, answers: serde_json::Value);
     /// Answers a form ([`agent_core::event::Event::FormRequested`]). `content` is what
-    /// [`agent_core::form::answer`] returned, for an accepted field form only. A backend that
-    /// never raises forms ignores it.
+    /// [`agent_core::form::answer`] returned, for an accepted field form only. Returns whether
+    /// the adapter accepted the answer; `false` (refused, or no session) leaves the card to
+    /// reopen. A backend that never raises forms refuses.
     fn respond_form(
         &self,
         request: &str,
         action: agent_core::form::FormAction,
         content: Option<serde_json::Value>,
-    ) {
+    ) -> bool {
         let _ = (request, action, content);
+        false
     }
     /// Switch model and/or agent. Same agent: in-session or restart per capabilities;
     /// other agent: budgeted, redacted handoff into a new provider thread.

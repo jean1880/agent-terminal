@@ -77,6 +77,10 @@ pub struct Header {
     pub mode_guard: Rc<Cell<bool>>,
     breakpoints: [adw::Breakpoint; 3],
     pub reload: gtk4::Button,
+    /// The "Extra access" chip: shown while the user has granted Codex session-long access.
+    access: gtk4::MenuButton,
+    access_list: gtk4::Label,
+    shown_access: RefCell<Vec<String>>,
     activity: gtk4::Box,
     /// Where [`Self::set_usage`] and [`Self::set_subagents`] put their widgets, so the
     /// breakpoints can drop each.
@@ -175,6 +179,41 @@ impl Header {
         reload.update_property(&[gtk4::accessible::Property::Label("Reload session")]);
         root.append(&reload);
 
+        // What the user allowed Codex beyond its usual limits for this session. A menu button,
+        // so the list is one keypress away, not only in a tooltip.
+        let access = gtk4::MenuButton::new();
+        access.add_css_class("flat");
+        access.add_css_class("extra-access");
+        access.set_valign(gtk4::Align::Center);
+        let access_inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        access_inner.append(&gtk4::Image::from_icon_name("at-security-medium-symbolic"));
+        let access_text = label("Extra access", &["extra-access-text"]);
+        access_inner.append(&access_text);
+        access.set_child(Some(&access_inner));
+        let access_list = label("", &["extra-access-list"]);
+        access_list.set_wrap(true);
+        access_list.set_max_width_chars(48);
+        access_list.set_selectable(false);
+        let access_pop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        access_pop_box.set_margin_top(8);
+        access_pop_box.set_margin_bottom(8);
+        access_pop_box.set_margin_start(10);
+        access_pop_box.set_margin_end(10);
+        access_pop_box.append(&label(
+            "Allowed for this Codex session",
+            &["extra-access-title"],
+        ));
+        access_pop_box.append(&access_list);
+        access_pop_box.append(&label(
+            "This lasts until this thread's Codex session restarts.",
+            &["dim-label"],
+        ));
+        let access_pop = gtk4::Popover::new();
+        access_pop.set_child(Some(&access_pop_box));
+        access.set_popover(Some(&access_pop));
+        access.set_visible(false);
+        root.append(&access);
+
         let activity = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         activity.add_css_class("activity");
         let spinner = gtk4::Spinner::new();
@@ -259,6 +298,8 @@ impl Header {
             agent.upcast_ref(),
             // The spinner stays; the words are in the activity's tooltip and the shelf.
             activity_text.upcast_ref(),
+            // The shield stays, with the list in its menu and its accessible name.
+            access_text.upcast_ref(),
         ] {
             compact.add_setter(slot, "visible", Some(&hidden));
         }
@@ -305,6 +346,9 @@ impl Header {
             mode_guard,
             breakpoints: [usage, gauge_off, compact],
             reload,
+            access,
+            access_list,
+            shown_access: RefCell::new(Vec::new()),
             activity,
             usage_slot,
             subagent_slot,
@@ -421,6 +465,37 @@ impl Header {
         self.reload.set_tooltip_text(Some(&full));
         self.reload
             .update_property(&[gtk4::accessible::Property::Label(&full)]);
+    }
+
+    /// Shows the "Extra access" chip while `grants` (one line each) is not empty, and lists
+    /// them in its tooltip and menu. Cheap to call on every change.
+    pub fn set_extra_access(&self, grants: &[String]) {
+        if *self.shown_access.borrow() == grants {
+            return;
+        }
+        *self.shown_access.borrow_mut() = grants.to_vec();
+        let list = grants.join("\n");
+        self.access_list.set_text(&list);
+        self.access.set_visible(!grants.is_empty());
+        let tip = format!("Allowed for this Codex session:\n{list}");
+        self.access.set_tooltip_text(Some(&tip));
+        self.access
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Extra access for this Codex session: {}",
+                grants.join(", ")
+            ))]);
+        self.fit_height();
+    }
+
+    /// The chip's list while it shows, else `None` (tests).
+    #[cfg(test)]
+    pub fn extra_access_shown(&self) -> Option<(String, String)> {
+        self.access.is_visible().then(|| {
+            (
+                self.access_list.text().to_string(),
+                self.access.tooltip_text().unwrap_or_default().to_string(),
+            )
+        })
     }
 
     /// Shows what the thread is doing: the main agent working, only background work left (its

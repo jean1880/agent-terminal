@@ -222,10 +222,9 @@ impl ChatBackend for SessionSlot {
         request: &str,
         action: agent_core::form::FormAction,
         content: Option<serde_json::Value>,
-    ) {
-        if let Some(s) = self.get() {
-            s.respond_form(request, action, content);
-        }
+    ) -> bool {
+        self.get()
+            .is_some_and(|s| s.respond_form(request, action, content))
     }
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         if let Some(s) = self.get() {
@@ -3025,7 +3024,11 @@ impl AgentTerminalWindow {
                     let r = react(Attention::Asked, in_view, focused, false);
                     chat.unread |= r.unread;
                     if r.notify {
-                        let question = matches!(env.event, Event::QuestionRequested { .. });
+                        // A tool server's form is a question for the user, not an approval.
+                        let question = matches!(
+                            env.event,
+                            Event::QuestionRequested { .. } | Event::FormRequested { .. }
+                        );
                         ask = Some((page, question));
                     }
                     After::Sidebar
@@ -3037,7 +3040,9 @@ impl AgentTerminalWindow {
                     chat.unread |= react(Attention::Expired, in_view, focused, false).unread;
                     After::Sidebar
                 }
-                Event::ApprovalResolved { .. } | Event::QuestionResolved { .. } => {
+                Event::ApprovalResolved { .. }
+                | Event::QuestionResolved { .. }
+                | Event::FormResolved { .. } => {
                     chat.approval = false;
                     withdraw_ask = true;
                     After::Sidebar
@@ -4357,12 +4362,14 @@ fn forget_stale_resolutions() {
 }
 
 /// Whether an event waits on the user: an approval, or a question the agent asked. A question
-/// the app found in a reply ([`agent_core::event::QuestionSource::Reply`]) waits for nothing.
+/// the app found in a reply ([`agent_core::event::QuestionSource::Reply`]) waits for nothing. A
+/// form waits only if the card can answer it (the same check the transcript makes).
 fn is_interruption(event: &Event) -> bool {
     use agent_core::event::QuestionSource;
     match event {
         Event::ApprovalRequested { .. } => true,
         Event::QuestionRequested { source, .. } => *source != QuestionSource::Reply,
+        Event::FormRequested { form, .. } => crate::chat::view::model::form_answerable(form),
         _ => false,
     }
 }
