@@ -575,18 +575,16 @@ impl Inner {
             warn!(error = %e, "could not persist an event");
         }
         self.apply(&env);
-        // Secrets are masked on the way to the view; the rules above judged the real call.
+        // Every event is masked on the way to the view (not only approvals: tool input and
+        // output, errors, notices and questions carry secrets too); the rules judged the real
+        // call. A secret split across two streaming deltas is only caught at persistence.
         (self.sink)(&crate::approval_server::masked_for_view(env));
     }
 
     /// Delivers without persisting (the store already has it).
     fn deliver(&self, env: &Envelope) {
         self.apply(env);
-        if matches!(env.event, Event::ApprovalRequested { .. }) {
-            (self.sink)(&crate::approval_server::masked_for_view(env.clone()));
-        } else {
-            (self.sink)(env);
-        }
+        (self.sink)(&crate::approval_server::masked_for_view(env.clone()));
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -1173,6 +1171,7 @@ impl Inner {
     /// does. A request answered, cancelled or expired by then is no longer pending: nothing is
     /// sent.
     fn arm_approval_deadline(self: &Rc<Self>, env: &Envelope) {
+        // AskUserQuestion arrives as `QuestionRequested`, which is intentionally not timed.
         if self.adapter.borrow().driver() != Driver::Claude
             || !matches!(env.event, Event::ApprovalRequested { .. })
         {
@@ -4711,6 +4710,53 @@ mod tests {
             );
 
             session.send_prompt(&format!("use {secret} please"));
+            // Every other event kind is masked too, not only approvals.
+            let leak = format!("key {secret} here");
+            for event in [
+                Event::ItemStarted {
+                    kind: ItemKind::Command,
+                    title: leak.clone(),
+                    input: Some(serde_json::json!({"command": leak})),
+                    parent: None,
+                },
+                Event::ItemCompleted {
+                    status: ItemStatus::Failed,
+                    output: Some(leak.clone()),
+                    error: Some(leak.clone()),
+                },
+                Event::ContentDelta {
+                    stream: StreamKind::Assistant,
+                    text: leak.clone(),
+                },
+                Event::QuestionRequested {
+                    questions: vec![agent_core::event::Question {
+                        id: "q".into(),
+                        header: leak.clone(),
+                        question: leak.clone(),
+                        options: vec![agent_core::event::QuestionOption {
+                            label: leak.clone(),
+                            description: Some(leak.clone()),
+                        }],
+                        multi_select: false,
+                    }],
+                },
+                Event::Notice { text: leak.clone() },
+                Event::Error {
+                    message: leak.clone(),
+                },
+                Event::TurnCompleted {
+                    state: TurnState::Failed,
+                    usage: None,
+                    cost_usd: None,
+                    error: Some(leak.clone()),
+                },
+            ] {
+                session.inner.emit(Envelope::new(event).item("i1"));
+            }
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("****6789"))
+            ));
             let all = serde_json::to_string(&*seen.borrow()).expect("json");
             assert!(!all.contains(secret), "a secret reached the sink: {all}");
         });

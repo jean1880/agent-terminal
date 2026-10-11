@@ -428,6 +428,9 @@ impl AgentTerminalWindow {
             .css_classes(["pill"])
             .build();
 
+        // The rules file and the permission files are read off the main thread; only the newest
+        // result is shown.
+        let sync_generation = Rc::new(std::cell::Cell::new(0u64));
         let sync_cb = Rc::new(glib::clone!(
             #[weak]
             warning_row,
@@ -443,52 +446,135 @@ impl AgentTerminalWindow {
             manage_row,
             #[weak]
             obj,
+            #[strong]
+            sync_generation,
             move || {
-                if let Some(path) = crate::always_allow::path() {
-                    let rules = crate::always_allow::AlwaysRules::load(&path);
-                    manage_row.set_subtitle(&format!(
-                        "{} active rules stored in {}",
-                        rules.rules.len(),
-                        crate::always_allow::FILE_NAME
-                    ));
-                    let status = rules.check_sync_status(None, &obj.imp().permission_sources());
-                    Self::update_sync_indicator(
-                        &status,
-                        &warning_row,
-                        &import_row,
-                        &import_btn,
-                        &export_row,
-                        &export_btn,
-                    );
-                }
+                let Some(path) = crate::always_allow::path() else {
+                    return;
+                };
+                let sources = obj.imp().permission_sources();
+                let current = sync_generation.get().wrapping_add(1);
+                sync_generation.set(current);
+                let sync_generation = sync_generation.clone();
+                glib::spawn_future_local(glib::clone!(
+                    #[weak]
+                    warning_row,
+                    #[weak]
+                    import_row,
+                    #[weak]
+                    import_btn,
+                    #[weak]
+                    export_row,
+                    #[weak]
+                    export_btn,
+                    #[weak]
+                    manage_row,
+                    async move {
+                        let computed = gtk4::gio::spawn_blocking(move || {
+                            let rules = crate::always_allow::AlwaysRules::load(&path);
+                            let status = rules.check_sync_status(None, &sources);
+                            (rules.rules.len(), status)
+                        })
+                        .await;
+                        let Ok((count, status)) = computed else {
+                            return;
+                        };
+                        if sync_generation.get() != current {
+                            return;
+                        }
+                        manage_row.set_subtitle(&format!(
+                            "{count} active rules stored in {}",
+                            crate::always_allow::FILE_NAME
+                        ));
+                        Self::update_sync_indicator(
+                            &status,
+                            &warning_row,
+                            &import_row,
+                            &import_btn,
+                            &export_row,
+                            &export_btn,
+                        );
+                    }
+                ));
             }
         ));
 
         // Initial sync state check
         sync_cb();
 
-        // Applied as it is typed once valid; an invalid draft keeps the saved list in use.
+        // Applied once valid, ~400 ms after typing stops (the file checks run off the main
+        // thread) or at once when focus leaves. An invalid draft stays in the entry with its
+        // error shown inline, and the previously saved list stays in use; nothing reverts.
         let on_sources = sync_cb.clone();
-        sources_row.connect_changed(glib::clone!(
+        let typing = Rc::new(std::cell::Cell::new(0u64));
+        let validate = Rc::new(glib::clone!(
             #[weak]
             obj,
             #[weak]
+            sources_row,
+            #[weak]
             sources_error,
-            move |row| match crate::config::parse_permission_sources(&row.text()) {
-                Ok(parsed) => {
-                    show_validation(row, &sources_error, PERMISSION_SOURCES_HELP, None);
-                    let imp = obj.imp();
-                    if imp.config.borrow().permission_sources != parsed {
-                        imp.config.borrow_mut().permission_sources = parsed;
-                        imp.schedule_config_save();
-                        on_sources();
+            #[strong]
+            typing,
+            move |wait: bool| {
+                let current = typing.get().wrapping_add(1);
+                typing.set(current);
+                let text = sources_row.text().to_string();
+                let typing = typing.clone();
+                let on_sources = on_sources.clone();
+                glib::spawn_future_local(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[weak]
+                    sources_row,
+                    #[weak]
+                    sources_error,
+                    async move {
+                        if wait {
+                            glib::timeout_future(std::time::Duration::from_millis(400)).await;
+                            if typing.get() != current {
+                                return;
+                            }
+                        }
+                        let checked = gtk4::gio::spawn_blocking(move || {
+                            crate::config::parse_permission_sources(&text)
+                        })
+                        .await;
+                        let Ok(checked) = checked else { return };
+                        if typing.get() != current {
+                            return; // typed on meanwhile; that edit has its own check
+                        }
+                        match checked {
+                            Ok(parsed) => {
+                                show_validation(
+                                    &sources_row,
+                                    &sources_error,
+                                    PERMISSION_SOURCES_HELP,
+                                    None,
+                                );
+                                let imp = obj.imp();
+                                if imp.config.borrow().permission_sources != parsed {
+                                    imp.config.borrow_mut().permission_sources = parsed;
+                                    imp.schedule_config_save();
+                                    on_sources();
+                                }
+                            }
+                            Err(reason) => show_validation(
+                                &sources_row,
+                                &sources_error,
+                                PERMISSION_SOURCES_HELP,
+                                Some(&reason),
+                            ),
+                        }
                     }
-                }
-                Err(reason) => {
-                    show_validation(row, &sources_error, PERMISSION_SOURCES_HELP, Some(&reason));
-                }
+                ));
             }
         ));
+        let on_change = validate.clone();
+        sources_row.connect_changed(move |_| on_change(true));
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| validate(false));
+        sources_row.add_controller(focus);
 
         let on_sync_for_diff = sync_cb.clone();
         view_diff_btn.connect_clicked(glib::clone!(
