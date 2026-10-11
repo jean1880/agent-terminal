@@ -215,8 +215,13 @@ fn main() -> glib::ExitCode {
     // The old side of any file opened in an external diff tool is deleted with the app, and no
     // agent outlives it.
     app.connect_shutdown(|_| {
+        let started = std::time::Instant::now();
         diff_tool::remove_own();
         agent_proc::terminate_all();
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            "shutdown: agents stopped"
+        );
     });
 
     app.connect_activate(|app| {
@@ -329,6 +334,8 @@ fn handle_command_line(
     let window = app
         .active_window()
         .and_downcast::<AgentTerminalWindow>()
+        // A window that is closing takes no new thread.
+        .filter(|w| !w.is_closing())
         .unwrap_or_else(|| AgentTerminalWindow::new(app));
     window.resume_session(session_id, dir);
     window.present();
@@ -566,6 +573,23 @@ fn load_css() {
         headerbar .subtitle {
             font-size: 9pt;
             color: @at_fg_soft;
+        }
+        /* The closing screen: the animation and one calm line below it. */
+        .closing-screen {
+            background-color: @at_bg;
+        }
+        .closing-step {
+            color: @at_fg_soft;
+            font-size: 11pt;
+        }
+        button.closing-quit {
+            font-size: 9.5pt;
+            color: @at_fg_dim;
+            padding: 2px 10px;
+            min-height: 0;
+        }
+        button.closing-quit:hover {
+            color: @at_fg;
         }
         ",
     );

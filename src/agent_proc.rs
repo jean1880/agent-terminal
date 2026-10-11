@@ -50,6 +50,21 @@ pub struct SpawnSpec {
 }
 
 type ExitCallback = Box<dyn FnOnce(Option<i32>)>;
+type PhaseCallback = Rc<dyn Fn(StopPhase)>;
+
+/// How far an agent process is through being stopped, for a caller watching it leave
+/// ([`ExitWatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopPhase {
+    /// Running, and nobody asked it to stop.
+    Running,
+    /// Sent SIGTERM; waiting for it to leave on its own.
+    Stopping,
+    /// It ignored SIGTERM past the grace (or the user would not wait): sent SIGKILL.
+    Killing,
+    /// Gone (reaped).
+    Exited,
+}
 
 struct Shared {
     subprocess: gio::Subprocess,
@@ -65,9 +80,52 @@ struct Shared {
     exit_code: Cell<Option<Option<i32>>>,
     on_exit: RefCell<Option<ExitCallback>>,
     name: String,
+    /// SIGTERM was sent ([`terminate`]).
+    stopping: Cell<bool>,
+    /// SIGKILL was sent.
+    killed: Cell<bool>,
+    /// Told of every phase change ([`ExitWatch::connect_phase`]); dropped once it has exited.
+    watchers: RefCell<Vec<PhaseCallback>>,
 }
 
 impl Shared {
+    fn phase(&self) -> StopPhase {
+        if self.exited.get() {
+            StopPhase::Exited
+        } else if self.killed.get() {
+            StopPhase::Killing
+        } else if self.stopping.get() {
+            StopPhase::Stopping
+        } else {
+            StopPhase::Running
+        }
+    }
+
+    /// Tells the watchers the current phase. Cloned out first: a watcher may connect another.
+    fn notify(&self) {
+        let phase = self.phase();
+        let watchers: Vec<PhaseCallback> = if phase == StopPhase::Exited {
+            std::mem::take(&mut *self.watchers.borrow_mut())
+        } else {
+            self.watchers.borrow().clone()
+        };
+        for watcher in watchers {
+            watcher(phase);
+        }
+    }
+
+    /// SIGKILL to the group now, unless it is already gone (its pid could be reused).
+    fn kill(&self) {
+        if self.exited.get() {
+            return;
+        }
+        let first = !self.killed.replace(true);
+        self.signal(SIGKILL);
+        if first {
+            self.notify();
+        }
+    }
+
     /// Signals the agent's whole process group; falls back to the agent alone.
     ///
     /// Ceiling: a tool child that called `setsid` itself (a daemon) is in another group and is
@@ -212,6 +270,9 @@ impl AgentProcess {
             exit_code: Cell::new(None),
             on_exit: RefCell::new(Some(Box::new(on_exit))),
             name,
+            stopping: Cell::new(false),
+            killed: Cell::new(false),
+            watchers: RefCell::new(Vec::new()),
         });
         spawn_reader(shared.clone(), stdout, Box::new(on_stdout), "stdout");
         spawn_reader(shared.clone(), stderr, Box::new(on_stderr), "stderr");
@@ -248,6 +309,44 @@ impl AgentProcess {
     pub fn terminate(&self) {
         terminate(&self.shared);
     }
+
+    /// A handle that follows this process to its exit, and outlives this value: dropping the
+    /// `AgentProcess` starts its termination, and the watch sees it through.
+    pub fn exit_watch(&self) -> ExitWatch {
+        ExitWatch {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Follows one agent process until it has exited: its [`StopPhase`], a callback on each change,
+/// and an immediate kill. Closing the window waits on these instead of blocking in
+/// [`terminate_all`].
+#[derive(Clone)]
+pub struct ExitWatch {
+    shared: Rc<Shared>,
+}
+
+impl ExitWatch {
+    pub fn phase(&self) -> StopPhase {
+        self.shared.phase()
+    }
+
+    /// `f` is called on the main thread with every later phase, ending with
+    /// [`StopPhase::Exited`] (after which it is dropped). Not called for the current phase.
+    pub fn connect_phase(&self, f: impl Fn(StopPhase) + 'static) {
+        if !self.shared.exited.get() {
+            self.shared.watchers.borrow_mut().push(Rc::new(f));
+        }
+    }
+
+    /// SIGKILL to the process group now, without waiting out the grace.
+    pub fn kill_now(&self) {
+        if !self.shared.exited.get() {
+            warn!(program = %self.shared.name, "killing an agent without waiting for it");
+        }
+        self.shared.kill();
+    }
 }
 
 impl Drop for AgentProcess {
@@ -257,16 +356,19 @@ impl Drop for AgentProcess {
 }
 
 fn terminate(shared: &Rc<Shared>) {
-    if shared.exited.get() {
+    // Already gone, or already on its way out (a second terminate would arm a second timer).
+    if shared.exited.get() || shared.stopping.get() || shared.killed.get() {
         return;
     }
+    shared.stopping.set(true);
     shared.signal(SIGTERM);
+    shared.notify();
     let shared = shared.clone();
     glib::spawn_future_local(async move {
         glib::timeout_future(TERM_GRACE).await;
-        if !shared.exited.get() {
+        if !shared.exited.get() && !shared.killed.get() {
             warn!(program = %shared.name, "agent ignored SIGTERM; killing it");
-            shared.signal(SIGKILL);
+            shared.kill();
         }
     });
 }
@@ -364,6 +466,7 @@ fn spawn_waiter(shared: Rc<Shared>) {
         shared.exited.set(true);
         shared.queue.borrow_mut().clear();
         shared.exit_code.set(Some(code));
+        shared.notify();
         if shared.readers_open.get() == 0 {
             shared.finish();
         } else {
@@ -668,6 +771,70 @@ mod tests {
             // Nothing is left to stop.
             assert!(LIVE.with(|l| l.borrow().is_empty()));
             drop((polite, stubborn));
+        });
+    }
+
+    /// Closing the window waits on these watches: they must report SIGTERM, the SIGKILL that
+    /// follows the grace for an agent that ignores it, and the exit, and leave nothing for
+    /// `terminate_all` to wait on.
+    #[test]
+    fn an_exit_watch_follows_a_stubborn_agent_through_the_kill_to_its_exit() {
+        in_loop(|ctx| {
+            let (proc, out, _, _) = start(&sh("trap '' TERM; echo ready; exec sleep 30"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            let watch = proc.exit_watch();
+            assert_eq!(watch.phase(), StopPhase::Running);
+            let seen: Rc<RefCell<Vec<StopPhase>>> = Rc::default();
+            let s = seen.clone();
+            watch.connect_phase(move |p| s.borrow_mut().push(p));
+            let started = std::time::Instant::now();
+            // As closing a thread does: the process is dropped, the watch sees it out.
+            drop(proc);
+            assert_eq!(watch.phase(), StopPhase::Stopping);
+            assert!(pump_until(ctx, 10, || watch.phase() == StopPhase::Exited));
+            assert!(
+                started.elapsed() >= TERM_GRACE,
+                "killed before the grace: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                *seen.borrow(),
+                [StopPhase::Stopping, StopPhase::Killing, StopPhase::Exited]
+            );
+            // Nothing is left alive, so quitting returns at once.
+            let quit = std::time::Instant::now();
+            terminate_all();
+            assert!(quit.elapsed() < Duration::from_millis(100));
+        });
+    }
+
+    #[test]
+    fn kill_now_does_not_wait_out_the_grace() {
+        in_loop(|ctx| {
+            let (proc, out, _, _) = start(&sh("trap '' TERM; echo ready; exec sleep 30"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            let watch = proc.exit_watch();
+            let started = std::time::Instant::now();
+            drop(proc);
+            watch.kill_now();
+            assert_eq!(watch.phase(), StopPhase::Killing);
+            assert!(pump_until(ctx, 10, || watch.phase() == StopPhase::Exited));
+            assert!(started.elapsed() < TERM_GRACE, "{:?}", started.elapsed());
+            // Killing what is gone is a no-op, not a signal to a reused pid.
+            watch.kill_now();
+            assert_eq!(watch.phase(), StopPhase::Exited);
+        });
+    }
+
+    #[test]
+    fn terminate_all_returns_at_once_when_nothing_is_alive() {
+        in_loop(|ctx| {
+            let (proc, _, _, exit) = start(&sh("exit 0"));
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            let started = std::time::Instant::now();
+            terminate_all();
+            assert!(started.elapsed() < Duration::from_millis(100));
+            drop(proc);
         });
     }
 

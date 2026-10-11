@@ -2,9 +2,11 @@
 
 mod agents_prefs;
 mod animated_menu;
+mod closing;
 mod diff_prefs;
 mod diffs;
 mod environment_review;
+mod pack_animation;
 mod setup;
 mod thread_menu;
 mod threads;
@@ -963,6 +965,13 @@ pub struct AgentTerminalWindow {
     unasked_prompt_open: std::cell::Cell<bool>,
     /// The user agreed to stop busy threads: the next close request goes through.
     close_confirmed: std::cell::Cell<bool>,
+    /// The window is waiting for its agents to exit before it goes ([`closing`]).
+    closing: RefCell<Option<std::rc::Rc<closing::Closing>>>,
+    /// The wait is over: the next close request destroys the window.
+    close_done: std::cell::Cell<bool>,
+    /// Extra processes the next close waits on, as if they were threads' agents (tests).
+    #[cfg(test)]
+    test_stops: RefCell<Vec<closing::StopTarget>>,
     /// A change arrived while a reload was running: load again when it ends.
     summaries_stale: std::cell::Cell<bool>,
     /// The sidebar's "Show archived" toggle.
@@ -1029,8 +1038,16 @@ impl WidgetImpl for AgentTerminalWindow {}
 
 impl WindowImpl for AgentTerminalWindow {
     /// Flushes any debounced config save before the window goes away, so a quick
-    /// zoom-then-quit does not lose the change it was still waiting to write.
+    /// zoom-then-quit does not lose the change it was still waiting to write. Agents still
+    /// leaving are waited for with the window up ([`closing`]), never by blocking at quit.
     fn close_request(&self) -> glib::Propagation {
+        if self.close_done.get() {
+            return self.parent_close_request();
+        }
+        // Already closing: the closing screen has its own way out (Quit Now).
+        if self.is_closing() {
+            return glib::Propagation::Stop;
+        }
         // Threads mid-turn or waiting for an answer: ask before stopping them.
         if !self.close_confirmed.get() && self.confirm_close_busy() {
             return glib::Propagation::Stop;
@@ -1038,16 +1055,30 @@ impl WindowImpl for AgentTerminalWindow {
         // Both before the window goes: a quick zoom-then-quit must not lose the
         // change still waiting on the debounce timer, and the tab layout is only
         // knowable while the tabs still exist.
+        let started = std::time::Instant::now();
         self.save_session();
         self.flush_pending_save();
+        tracing::debug!(ms = started.elapsed().as_millis(), "close: session saved");
         // Every live thread session closes its history out before the window (and, on the last
         // window, `terminate_all`) takes the processes down. The envelopes are stored before
         // they reach the sink, so the view going away does not lose them.
-        self.shutdown_thread_sessions();
+        let mut stopping = self.shutdown_thread_sessions();
+        stopping.extend(self.demo_stop_targets());
+        #[cfg(test)]
+        stopping.extend(self.test_stops.take());
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            agents = stopping.len(),
+            "close: sessions shut down"
+        );
         // GNOME keeps a notification after its app exits, counted on the dock
         // badge until withdrawn, and nothing would be left to act on it.
         self.withdraw_notifications();
-        self.parent_close_request()
+        if stopping.is_empty() {
+            return self.parent_close_request();
+        }
+        self.begin_closing(stopping);
+        glib::Propagation::Stop
     }
 }
 impl ApplicationWindowImpl for AgentTerminalWindow {}
