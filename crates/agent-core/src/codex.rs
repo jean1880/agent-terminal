@@ -730,6 +730,8 @@ impl CodexAdapter {
 
     fn close_all(&mut self, out: &mut Vec<Envelope>) {
         for id in std::mem::take(&mut self.open_items) {
+            // An item cut short never completes: its patch must not outlive it.
+            self.file_changes.remove(&id);
             for (stream, text) in [
                 (StreamKind::Assistant, self.texts.remove(&id)),
                 (StreamKind::Reasoning, self.reasoning.remove(&id)),
@@ -1527,7 +1529,11 @@ impl CodexAdapter {
                     && error.to_ascii_lowercase().contains("no rollout found") =>
             {
                 // The thread never completed a turn, so Codex kept nothing to resume. Start a
-                // new one; the app carries the thread's history into it (plan 2.5).
+                // new one; the app carries the thread's history into it (plan 2.5). The text is
+                // Codex 0.161's, seen live, not in W0: parity report F9
+                // (`docs/feature-parity-report.md`), where fail_startup surfaced it as
+                // "Could not switch to …: no rollout found for thread id …" and "Turn failed: no
+                // rollout found for thread id …". Any other resume error still fails startup.
                 if let Some(params) = self.resume_fallback.take() {
                     let line = self.request(Pending::ThreadStart, "thread/start", params);
                     self.write(line);
@@ -4147,6 +4153,36 @@ mod tests {
         // Still pending: an offered decision goes through.
         let w = one_write(a.encode(approve(Decision::Deny)).expect("offered"));
         assert_eq!(w, json!({"id": 5, "result": {"decision": "decline"}}));
+    }
+
+    /// A patch whose item never completes (the turn was interrupted or failed, or the process
+    /// exited) leaves no stored change behind for a later approval to borrow.
+    #[test]
+    fn file_changes_of_items_cut_short_are_dropped() {
+        let begin = |a: &mut CodexAdapter, id: &str| {
+            a.feed(
+                &json!({"method": "item/started", "params": {"threadId": "th-1", "turnId": "tu",
+                "item": {"type": "fileChange", "id": id, "status": "inProgress",
+                    "changes": [{"path": "/w/a", "kind": {"type": "update"}, "diff": "@@"}]}}})
+                .to_string(),
+            );
+        };
+        for end in ["interrupted", "failed"] {
+            let mut a = started(Mode::Ask);
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+            begin(&mut a, "p1");
+            assert!(a.file_changes.contains_key("p1"));
+            a.feed(
+                &json!({"method": "turn/completed", "params": {"threadId": "th-1",
+                "turn": {"id": "tu", "status": end}}})
+                .to_string(),
+            );
+            assert!(a.file_changes.is_empty(), "{end}");
+        }
+        let mut a = started(Mode::Ask);
+        begin(&mut a, "p2");
+        a.on_exit(Some(1));
+        assert!(a.file_changes.is_empty(), "exit");
     }
 
     /// The W0 frames from a fixture, replayed: server frames are fed (collecting the events),
