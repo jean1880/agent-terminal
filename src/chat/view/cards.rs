@@ -3806,10 +3806,17 @@ pub(crate) mod tests {
             None,
         );
         let width = card.root.measure(gtk4::Orientation::Horizontal, -1).0;
-        let buttons_natural = card.buttons.measure(gtk4::Orientation::Horizontal, -1).1;
+        // The buttons side by side, from each one's own natural width: a flow box's own
+        // natural width differs between GTK versions (CI's GTK reports one row's worth less).
+        let mut in_a_row = 0;
+        let mut child = card.buttons.first_child();
+        while let Some(c) = child {
+            in_a_row += c.measure(gtk4::Orientation::Horizontal, -1).1;
+            child = c.next_sibling();
+        }
         assert!(
-            width < buttons_natural,
-            "the minimum width ({width}) is below the buttons' natural width ({buttons_natural})"
+            width < in_a_row,
+            "the card's minimum width ({width}) must be below the buttons in one row ({in_a_row})"
         );
     }
 }
