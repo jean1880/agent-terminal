@@ -190,85 +190,17 @@ pub fn effective_settings(v: &Value) -> &Value {
     v.get("effective").unwrap_or(v)
 }
 
-/// One line for a tool card's header: the command, the path, the query.
-pub fn tool_summary(kind: ItemKind, input: Option<&Value>, input_text: &str) -> Option<String> {
-    let parsed;
-    let input = match input {
-        Some(v) if !v.is_null() => v,
-        _ => {
-            parsed = serde_json::from_str::<Value>(input_text).ok()?;
-            &parsed
-        }
-    };
-    if kind == ItemKind::FileRead {
-        if let Some(pat) = str_field(input, &["pattern", "query"]) {
-            let path = str_field(
-                input,
-                &[
-                    "SearchPath",
-                    "path",
-                    "file_path",
-                    "DirectoryPath",
-                    "directory",
-                ],
-            );
-            let s = match path {
-                Some(p) if !p.is_empty() && p != "." => format!("{pat} in {p}"),
-                _ => pat.to_owned(),
-            };
-            let line = s.lines().next().unwrap_or(&s).trim();
-            let mut out: String = line.chars().take(140).collect();
-            if line.chars().count() > 140 || s.lines().count() > 1 {
-                out.push('…');
-            }
-            return Some(out);
-        }
-    }
-    let keys: &[&str] = match kind {
-        ItemKind::Command => &["command", "CommandLine", "cmd"],
-        ItemKind::FileChange | ItemKind::FileRead => &[
-            "file_path",
-            "path",
-            "TargetFile",
-            "AbsolutePath",
-            "notebook_path",
-            "DirectoryPath",
-            "SearchPath",
-            "filePath",
-            "filepath",
-        ],
-        ItemKind::WebSearch => &["query", "url"],
-        ItemKind::Subagent => &["description", "subagent_type", "prompt"],
-        ItemKind::McpTool => &["ToolName", "tool", "query", "command"],
-        _ => &[
-            "command",
-            "file_path",
-            "path",
-            "query",
-            "url",
-            "pattern",
-            "description",
-        ],
-    };
-    let s = str_field(input, keys)?;
-    let line = s.lines().next().unwrap_or(s).trim();
-    let mut out: String = line.chars().take(140).collect();
-    if line.chars().count() > 140 || s.lines().count() > 1 {
-        out.push('…');
-    }
-    Some(out)
-}
-
-/// A tool card's action and target in the one title grammar every agent shares
-/// (`agent_core::tool_title`, W3.4): `Read <path>`, `Search <pattern>`, `Run <command>`,
-/// `Edit <path>`, `Create <path>`, `Fetch <url>`, `<server>/<tool>`. Streamed input that is not
+/// A tool call's title in the one grammar every agent shares (`agent_core::tool_title`, W3.4):
+/// `Read <path>`, `Search <pattern>`, `Run <command>`, `Edit <path>`, `Create <path>`,
+/// `Fetch <url>`, `<server>/<tool>`. The card header, the approval preview and the sub-agent
+/// shelf all take their text from here, so they always agree. Streamed input that is not
 /// parsed yet titles by the tool alone; the raw input stays under the card's details.
-pub fn card_title_and_summary(
+pub fn tool_title(
     kind: ItemKind,
     raw_title: &str,
     input: Option<&Value>,
     input_text: &str,
-) -> (String, String) {
+) -> agent_core::tool_title::ToolTitle {
     let parsed;
     let val = match input {
         Some(v) if !v.is_null() => Some(v),
@@ -277,7 +209,17 @@ pub fn card_title_and_summary(
             parsed.as_ref()
         }
     };
-    let title = agent_core::tool_title::classify(kind, raw_title, val);
+    agent_core::tool_title::classify(kind, raw_title, val)
+}
+
+/// [`tool_title`] as the card header's (action, target) pair.
+pub fn card_title_and_summary(
+    kind: ItemKind,
+    raw_title: &str,
+    input: Option<&Value>,
+    input_text: &str,
+) -> (String, String) {
+    let title = tool_title(kind, raw_title, input, input_text);
     (title.action, title.target)
 }
 
@@ -549,14 +491,24 @@ mod tests {
     fn tool_summaries() {
         let cmd = json!({"command": "cargo test\n--all"});
         assert_eq!(
-            tool_summary(ItemKind::Command, Some(&cmd), "").as_deref(),
-            Some("cargo test…")
+            tool_title(ItemKind::Command, "Bash", Some(&cmd), "").text(),
+            "Run cargo test…"
+        );
+        // Streamed input, parsed once whole; a fragment titles by the tool alone.
+        assert_eq!(
+            tool_title(
+                ItemKind::FileRead,
+                "Read",
+                None,
+                r#"{"file_path":"src/a.rs"}"#
+            )
+            .text(),
+            "Read src/a.rs"
         );
         assert_eq!(
-            tool_summary(ItemKind::FileRead, None, r#"{"file_path":"src/a.rs"}"#).as_deref(),
-            Some("src/a.rs")
+            tool_title(ItemKind::FileRead, "Read", None, "{\"file_pa").text(),
+            "Read"
         );
-        assert_eq!(tool_summary(ItemKind::FileRead, None, "{\"file_pa"), None);
         assert_eq!(
             tool_input_text(ItemKind::Command, Some(&json!({"command": "ls"})), ""),
             "$ ls"
