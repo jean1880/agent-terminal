@@ -184,6 +184,8 @@ pub(crate) struct Inner {
     /// answer `Control::FileSuggestions` themselves.
     workspace: RefCell<Option<std::path::PathBuf>>,
     file_seq: Cell<u64>,
+    /// The folder's file list, reused for a few seconds between keystrokes.
+    file_index: RefCell<workspace_files::Index>,
 }
 
 impl ChatView {
@@ -246,6 +248,7 @@ impl ChatView {
                 subagent_changes: RefCell::new(Vec::new()),
                 workspace: RefCell::new(None),
                 file_seq: Cell::new(0),
+                file_index: RefCell::new(workspace_files::Index::default()),
             }
         });
 
@@ -1134,13 +1137,38 @@ impl ComposerHost for Inner {
             .view()
             .and_then(|v| v.inner())
             .map(|i| Rc::downgrade(&i))?;
-        let (reply_id, query) = (id.clone(), query.to_owned());
+        let (reply_id, query, seq) = (id.clone(), query.to_owned(), self.file_seq.get());
         glib::spawn_future_local(async move {
-            let files = gtk4::gio::spawn_blocking(move || workspace_files::suggest(&root, &query))
+            // The folder's list is reused for a few seconds and only re-ranked per keystroke.
+            // A newer query supersedes this one at each step, so stale work is dropped.
+            let superseded = |inner: &Inner| inner.file_seq.get() != seq;
+            let Some(inner) = weak.upgrade() else { return };
+            let cached = inner.file_index.borrow().fresh(&root);
+            let list = match cached {
+                Some(list) => list,
+                None => {
+                    drop(inner);
+                    let walked = root.clone();
+                    let list = gtk4::gio::spawn_blocking(move || {
+                        std::sync::Arc::new(workspace_files::list(&walked))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.file_index.borrow_mut().store(&root, list.clone());
+                    if superseded(&inner) {
+                        return;
+                    }
+                    list
+                }
+            };
+            let ranked = gtk4::gio::spawn_blocking(move || workspace_files::rank(&list, &query))
                 .await
                 .unwrap_or_default();
             if let Some(inner) = weak.upgrade() {
-                inner.composer.file_reply(&reply_id, files);
+                if !superseded(&inner) {
+                    inner.composer.file_reply(&reply_id, ranked);
+                }
             }
         });
         Some(id)
