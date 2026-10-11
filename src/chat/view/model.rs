@@ -12,6 +12,7 @@ use agent_core::event::{
     Question, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind,
     TurnState, WorkerSnapshot, WorkerState,
 };
+use agent_core::form::{self, Form, FormAction};
 use serde_json::Value;
 
 pub type ItemId = String;
@@ -70,6 +71,8 @@ pub enum Body {
     },
     Approval(Approval),
     Question(QuestionCard),
+    /// A form or link an agent's tool server asked the user for. Never holds an answer.
+    Form(FormCard),
     /// The provider's last step statuses, retained in history after the active tracker retires.
     Plan {
         steps: Vec<PlanStep>,
@@ -358,6 +361,30 @@ pub enum QuestionState {
     Expired,
 }
 
+/// A form (or link) a tool server asked for. What the user typed is never kept here: the card
+/// sends it and only the outcome is stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormCard {
+    pub request: String,
+    /// The tool server asking, as the agent names it.
+    pub server: String,
+    pub message: String,
+    pub form: Form,
+    pub state: FormState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormState {
+    Pending,
+    /// The user answered; the agent has not confirmed yet.
+    Sent,
+    Resolved(FormAction),
+    /// Never answered, and the agent that asked is gone.
+    Expired,
+    /// A form this build cannot show or answer (a newer kind, or one that fails the checks).
+    Unanswerable,
+}
+
 /// An unhandled approval or question requiring operator attention.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingInterruption {
@@ -373,6 +400,14 @@ pub enum PendingInterruption {
         request: String,
         item_id: ItemId,
         questions: Vec<Question>,
+    },
+    Form {
+        request: String,
+        item_id: ItemId,
+        server: String,
+        message: String,
+        /// A link to open rather than fields to fill in.
+        link: bool,
     },
 }
 
@@ -572,6 +607,10 @@ pub struct Transcript {
     last_model: Option<String>,
     /// The assistant/reasoning item that item-less deltas belong to.
     open_text: Option<ItemId>,
+    /// What the user allowed Codex for the rest of its session (permission requests answered
+    /// "Allow for this session"), one line each: the header's "Extra access" chip. Cleared when
+    /// the session restarts or exits, which is when Codex forgets the grant.
+    extra_access: Vec<String>,
     seq: u64,
 }
 
@@ -641,6 +680,15 @@ impl Transcript {
                             questions: q.questions.clone(),
                         });
                     }
+                    Body::Form(f) if f.state == FormState::Pending => {
+                        return Some(PendingInterruption::Form {
+                            request: f.request.clone(),
+                            item_id: id.clone(),
+                            server: f.server.clone(),
+                            message: f.message.clone(),
+                            link: matches!(f.form, Form::Link { .. }),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -698,6 +746,11 @@ impl Transcript {
         self.requests.get(request)
     }
 
+    /// Extra access the user granted Codex for its session, one line each (empty: none).
+    pub fn extra_access(&self) -> &[String] {
+        &self.extra_access
+    }
+
     pub fn current_model(&self) -> Option<&str> {
         self.last_model.as_deref()
     }
@@ -708,7 +761,9 @@ impl Transcript {
         if let Some(pending) = self.pending_interruption() {
             return match pending {
                 PendingInterruption::Approval { .. } => Activity::NeedsApproval,
-                PendingInterruption::Question { .. } => Activity::NeedsAnswer,
+                PendingInterruption::Question { .. } | PendingInterruption::Form { .. } => {
+                    Activity::NeedsAnswer
+                }
             };
         }
         let agents = self.subagents();
@@ -970,7 +1025,7 @@ impl Transcript {
     /// Inserts an item (nested under `parent` when that item exists) and returns its id.
     fn insert(&mut self, id: ItemId, body: Body, parent: Option<ItemId>) -> ItemId {
         let expanded = matches!(&body, Body::Tool(t) if t.kind == ItemKind::Subagent)
-            || matches!(&body, Body::Approval(_) | Body::Question(_));
+            || matches!(&body, Body::Approval(_) | Body::Question(_) | Body::Form(_));
         let parent = parent.filter(|p| self.items.contains_key(p));
         match &parent {
             Some(p) => {
@@ -1058,6 +1113,20 @@ impl Transcript {
         }
     }
 
+    /// The user submitted or declined a form card; it shows as sent until the agent confirms.
+    pub fn mark_form_sent(&mut self, request: &str) -> Vec<Change> {
+        let Some(id) = self.requests.get(request).cloned() else {
+            return Vec::new();
+        };
+        match self.items.get_mut(&id).map(|i| &mut i.body) {
+            Some(Body::Form(f)) if f.state == FormState::Pending => {
+                f.state = FormState::Sent;
+                vec![Change::Updated(id)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Closes out what replayed history left open when no agent is alive to finish it: a thread
     /// stored by an older build (or cut off by a crash) can end mid-turn, with no
     /// `TurnCompleted`. The turn stops running, streaming text ends, Running tool and sub-agent
@@ -1102,9 +1171,15 @@ impl Transcript {
                     q.state = QuestionState::Expired;
                     changed = true;
                 }
+                Body::Form(f) if matches!(f.state, FormState::Pending | FormState::Sent) => {
+                    f.state = FormState::Expired;
+                    changed = true;
+                }
                 _ => {}
             }
         }
+        // No Codex session is alive to remember a grant.
+        changed |= !std::mem::take(&mut self.extra_access).is_empty();
         changed
     }
 
@@ -1159,6 +1234,8 @@ impl Transcript {
         let mut out = Vec::new();
         match &env.event {
             Event::SessionStarted { model, .. } => {
+                // A new process knows nothing of what the last one was allowed.
+                self.extra_access.clear();
                 let agent_changed = self.last_driver.is_some_and(|d| d != driver);
                 if agent_changed && self.settle_workers() {
                     out.push(Change::Workers);
@@ -1177,6 +1254,7 @@ impl Transcript {
                 }
             }
             Event::SessionExited { code, expected } => {
+                self.extra_access.clear();
                 out.extend(self.retire_plan(Some(if *expected {
                     TurnState::Interrupted
                 } else {
@@ -1494,6 +1572,9 @@ impl Transcript {
                 out.push(Change::Added(self.insert_before(id, body, step.as_deref())));
             }
             Event::ApprovalResolved { decision } => {
+                if *decision == Decision::AllowForSession {
+                    self.note_session_grant(env);
+                }
                 out.extend(self.update_approval(env, |a| {
                     a.state = ApprovalState::Resolved(*decision);
                 }));
@@ -1638,8 +1719,56 @@ impl Transcript {
             }
             // The session's own bookkeeping: the notice beside it is what the user sees.
             Event::HandoffSeeded { .. } | Event::ModeChosen { .. } => {}
-            // Lane L1 (plans/2026-10-11_codex-requests-rules-and-reply-questions.md) renders forms.
-            Event::FormRequested { .. } | Event::FormResolved { .. } => {}
+            Event::FormRequested {
+                server,
+                message,
+                form,
+            } => {
+                let request = env.request.clone().unwrap_or_else(|| self.next_id("req"));
+                if self.requests.contains_key(&request) {
+                    return out;
+                }
+                // Fail closed: a form this build cannot show exactly is never answerable.
+                let answerable = match form {
+                    Form::Fields { fields } => form::check_form(fields).is_ok(),
+                    Form::Link { url } => form::openable_link(url),
+                    Form::Unknown => false,
+                };
+                let id = format!("form:{request}");
+                let body = Body::Form(FormCard {
+                    request: request.clone(),
+                    server: server.clone(),
+                    message: message.clone(),
+                    form: form.clone(),
+                    state: if answerable {
+                        FormState::Pending
+                    } else {
+                        FormState::Unanswerable
+                    },
+                });
+                self.requests.insert(request, id.clone());
+                out.push(Change::Added(self.insert(id, body, None)));
+            }
+            Event::FormResolved { action } => {
+                let target = env
+                    .request
+                    .as_ref()
+                    .and_then(|r| self.requests.get(r))
+                    .cloned();
+                if let Some(id) = target {
+                    if let Some(Body::Form(f)) = self.items.get_mut(&id).map(|i| &mut i.body) {
+                        // A cancel the user never made (the server settled it elsewhere, the
+                        // turn ended, the process exited) is an expiry, not a dismissal.
+                        f.state = if f.state == FormState::Pending && *action == FormAction::Cancel
+                        {
+                            FormState::Expired
+                        } else {
+                            FormState::Resolved(*action)
+                        };
+                        out.push(Change::Updated(id));
+                    }
+                }
+            }
             // Background tasks are thread state, not transcript rows: the full list each time.
             Event::BackgroundTasks { tasks } => {
                 if self.background != *tasks {
@@ -1770,6 +1899,33 @@ impl Transcript {
             target.push_str(text);
         }
         true
+    }
+
+    /// A permission request answered "Allow for this session": what it granted joins the
+    /// header's "Extra access" list (each line once).
+    fn note_session_grant(&mut self, env: &Envelope) {
+        let Some(Body::Approval(a)) = env
+            .request
+            .as_ref()
+            .and_then(|r| self.requests.get(r))
+            .and_then(|id| self.items.get(id))
+            .map(|i| &i.body)
+        else {
+            return;
+        };
+        if a.tool != super::permission::TOOL {
+            return;
+        }
+        let granted = super::permission::Request::parse(&a.input);
+        // An unreadable request was never grantable, whatever was sent.
+        if !granted.renderable {
+            return;
+        }
+        for line in granted.grant_lines() {
+            if !self.extra_access.contains(&line) {
+                self.extra_access.push(line);
+            }
+        }
     }
 
     fn update_approval(&mut self, env: &Envelope, f: impl FnOnce(&mut Approval)) -> Vec<Change> {
@@ -2852,6 +3008,261 @@ mod tests {
             Body::Question(q) => assert_eq!(q.state, QuestionState::Answered),
             _ => panic!("not a question"),
         }
+    }
+
+    fn form_event(form: Form) -> Envelope {
+        ev(Event::FormRequested {
+            server: "github".into(),
+            message: "Which repo?".into(),
+            form,
+        })
+        .request("f")
+    }
+
+    fn one_field_form() -> Form {
+        Form::Fields {
+            fields: vec![form::FormField {
+                name: "repo".into(),
+                title: None,
+                description: None,
+                required: true,
+                input: form::FieldInput::Text {
+                    format: None,
+                    min_length: None,
+                    max_length: None,
+                    default: None,
+                },
+            }],
+        }
+    }
+
+    fn form_state(t: &Transcript) -> FormState {
+        match &t.get("form:f").expect("form card").body {
+            Body::Form(f) => f.state,
+            _ => panic!("not a form"),
+        }
+    }
+
+    /// A form blocks the turn like a question: it is the pending interruption (shelf, sidebar
+    /// badge, notification, composer hint) and the thread says it needs an answer.
+    #[test]
+    fn a_form_is_a_pending_interruption_and_needs_an_answer() {
+        let mut t = Transcript::new();
+        t.apply(&form_event(one_field_form()), Driver::Codex);
+        assert_eq!(
+            t.pending_interruption(),
+            Some(PendingInterruption::Form {
+                request: "f".into(),
+                item_id: "form:f".into(),
+                server: "github".into(),
+                message: "Which repo?".into(),
+                link: false,
+            })
+        );
+        assert_eq!(t.activity(true), Activity::NeedsAnswer);
+        assert!(t.get("form:f").expect("card").expanded);
+
+        t.mark_form_sent("f");
+        assert_eq!(form_state(&t), FormState::Sent);
+        assert!(
+            t.pending_interruption().is_none(),
+            "answered: nothing left to ask"
+        );
+        t.apply(
+            &ev(Event::FormResolved {
+                action: FormAction::Accept,
+            })
+            .request("f"),
+            Driver::Codex,
+        );
+        assert_eq!(form_state(&t), FormState::Resolved(FormAction::Accept));
+        assert_ne!(t.activity(true), Activity::NeedsAnswer);
+    }
+
+    /// A cancel the view did not start expires the card; the user's own is a dismissal.
+    #[test]
+    fn a_cancel_the_user_did_not_make_is_an_expiry() {
+        let cancel = ev(Event::FormResolved {
+            action: FormAction::Cancel,
+        })
+        .request("f");
+        let mut t = Transcript::new();
+        t.apply(&form_event(one_field_form()), Driver::Codex);
+        t.apply(&cancel, Driver::Codex);
+        assert_eq!(form_state(&t), FormState::Expired);
+        assert!(t.pending_interruption().is_none());
+
+        let mut own = Transcript::new();
+        own.apply(&form_event(one_field_form()), Driver::Codex);
+        own.mark_form_sent("f");
+        own.apply(&cancel, Driver::Codex);
+        assert_eq!(form_state(&own), FormState::Resolved(FormAction::Cancel));
+    }
+
+    /// A link form reports itself as a link, and a repeated request id is not a second card.
+    #[test]
+    fn a_link_form_is_pending_once() {
+        let mut t = Transcript::new();
+        let link = Form::Link {
+            url: "https://example.com/login".into(),
+        };
+        t.apply(&form_event(link.clone()), Driver::Codex);
+        t.apply(&form_event(link), Driver::Codex);
+        assert_eq!(t.len(), 1);
+        assert!(matches!(
+            t.pending_interruption(),
+            Some(PendingInterruption::Form { link: true, .. })
+        ));
+    }
+
+    /// Fail closed: a form kind this build does not know, a link that is not a plain web address
+    /// and fields that fail the checks are never answerable, so never an interruption.
+    #[test]
+    fn forms_it_cannot_answer_are_closed_not_pending() {
+        for form in [
+            Form::Unknown,
+            Form::Link {
+                url: "javascript:alert(1)".into(),
+            },
+            Form::Link {
+                url: "https://user:pw@example.com/".into(),
+            },
+            Form::Fields {
+                fields: vec![
+                    form::FormField {
+                        name: "a".into(),
+                        title: None,
+                        description: None,
+                        required: false,
+                        input: form::FieldInput::Unknown,
+                    },
+                    form::FormField {
+                        name: "a".into(),
+                        title: None,
+                        description: None,
+                        required: false,
+                        input: form::FieldInput::Unknown,
+                    },
+                ],
+            },
+        ] {
+            let mut t = Transcript::new();
+            t.apply(&form_event(form.clone()), Driver::Codex);
+            assert_eq!(form_state(&t), FormState::Unanswerable, "{form:?}");
+            assert!(t.pending_interruption().is_none(), "{form:?}");
+            assert_ne!(t.activity(false), Activity::NeedsAnswer);
+        }
+    }
+
+    /// History replay: an answered form replays as resolved; one left open with no live agent
+    /// expires and is never answerable; no typed answer exists anywhere in the model.
+    #[test]
+    fn replayed_forms_are_resolved_or_expired_never_answerable() {
+        let mut answered = Transcript::new();
+        answered.apply(&form_event(one_field_form()), Driver::Codex);
+        answered.apply(
+            &ev(Event::FormResolved {
+                action: FormAction::Decline,
+            })
+            .request("f"),
+            Driver::Codex,
+        );
+        assert!(!answered.settle_stale(), "already settled");
+        assert_eq!(
+            form_state(&answered),
+            FormState::Resolved(FormAction::Decline)
+        );
+
+        let mut open = Transcript::new();
+        open.apply(&form_event(one_field_form()), Driver::Codex);
+        assert!(open.settle_stale());
+        assert_eq!(form_state(&open), FormState::Expired);
+        assert!(open.pending_interruption().is_none());
+        assert_ne!(open.activity(false), Activity::NeedsAnswer);
+    }
+
+    fn permission_request(request: &str, entries: Value, renderable: bool) -> Envelope {
+        ev(Event::ApprovalRequested {
+            tool: "codex_permissions".into(),
+            title: None,
+            input: json!({
+                "cwd": "/w", "reason": null, "renderable": renderable, "entries": entries,
+                "network": true, "session_allowed": true, "warning": null, "requested": {}
+            }),
+            reason: None,
+            options: vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel,
+            ],
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .request(request)
+    }
+
+    /// "Extra access" follows what the user allowed for the session, and only that: a turn-long
+    /// grant, a refusal or an unreadable request add nothing, and a new or ended Codex session
+    /// forgets the lot.
+    #[test]
+    fn extra_access_follows_session_grants_until_the_session_ends() {
+        let entries = json!([{"access": "write", "target": {"kind": "path", "path": "/w/out"}}]);
+        let resolve = |t: &mut Transcript, request: &str, decision| {
+            t.apply(
+                &ev(Event::ApprovalResolved { decision }).request(request),
+                Driver::Codex,
+            );
+        };
+        let mut t = Transcript::new();
+        t.apply(
+            &permission_request("a", entries.clone(), true),
+            Driver::Codex,
+        );
+        t.apply(
+            &permission_request("b", entries.clone(), true),
+            Driver::Codex,
+        );
+        t.apply(
+            &permission_request("c", entries.clone(), false),
+            Driver::Codex,
+        );
+        t.apply(&permission_request("d", entries, true), Driver::Codex);
+        resolve(&mut t, "a", Decision::Allow);
+        resolve(&mut t, "b", Decision::Deny);
+        resolve(&mut t, "c", Decision::AllowForSession);
+        assert!(
+            t.extra_access().is_empty(),
+            "turn grants, refusals and unreadable requests are not session access"
+        );
+        resolve(&mut t, "d", Decision::AllowForSession);
+        assert_eq!(t.extra_access(), ["Write: /w/out", "Network access"]);
+        resolve(&mut t, "d", Decision::AllowForSession);
+        assert_eq!(t.extra_access().len(), 2, "listed once");
+
+        t.apply(
+            &ev(Event::SessionStarted {
+                native_id: "n".into(),
+                model: None,
+                cwd: None,
+            }),
+            Driver::Codex,
+        );
+        assert!(t.extra_access().is_empty(), "a new process forgets it");
+
+        t.apply(&permission_request("e", json!([]), true), Driver::Codex);
+        let more = json!([{"access": "read", "target": {"kind": "path", "path": "/r"}}]);
+        t.apply(&permission_request("f", more, true), Driver::Codex);
+        resolve(&mut t, "f", Decision::AllowForSession);
+        assert_eq!(t.extra_access(), ["Read: /r", "Network access"]);
+        t.apply(
+            &ev(Event::SessionExited {
+                code: Some(0),
+                expected: true,
+            }),
+            Driver::Codex,
+        );
+        assert!(t.extra_access().is_empty(), "an ended session forgets it");
     }
 
     /// What a reduced thread shows of its agents: who each reply is credited to, and each

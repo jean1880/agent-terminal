@@ -3019,12 +3019,18 @@ impl AgentTerminalWindow {
                     withdraw_ask = true;
                     After::Sidebar
                 }
-                Event::ApprovalRequested { .. } | Event::QuestionRequested { .. } => {
+                Event::ApprovalRequested { .. }
+                | Event::QuestionRequested { .. }
+                | Event::FormRequested { .. } => {
                     chat.approval = true;
                     let r = react(Attention::Asked, in_view, focused, false);
                     chat.unread |= r.unread;
                     if r.notify {
-                        let question = matches!(env.event, Event::QuestionRequested { .. });
+                        // A tool server's form is a question for the user, not an approval.
+                        let question = matches!(
+                            env.event,
+                            Event::QuestionRequested { .. } | Event::FormRequested { .. }
+                        );
                         ask = Some((page, question));
                     }
                     After::Sidebar
@@ -3036,7 +3042,9 @@ impl AgentTerminalWindow {
                     chat.unread |= react(Attention::Expired, in_view, focused, false).unread;
                     After::Sidebar
                 }
-                Event::ApprovalResolved { .. } | Event::QuestionResolved { .. } => {
+                Event::ApprovalResolved { .. }
+                | Event::QuestionResolved { .. }
+                | Event::FormResolved { .. } => {
                     chat.approval = false;
                     withdraw_ask = true;
                     After::Sidebar

@@ -12,6 +12,7 @@ use gtk4::prelude::*;
 use super::cards::{decision_label, label, RowEvent, RowSink};
 use super::model::{PendingInterruption, Transcript};
 use super::payload;
+use super::permission;
 
 pub struct InterruptionShelf {
     pub revealer: gtk4::Revealer,
@@ -109,8 +110,13 @@ impl InterruptionShelf {
             allow_btn.connect_clicked(move |_| {
                 // Copied out before the sink runs: answering resolves the approval at once,
                 // which updates this shelf (`update` replaces `active`) while still in here.
+                // A permission request is never allowed from here: the shelf cuts its list.
                 let request = match active.borrow().as_ref() {
-                    Some(PendingInterruption::Approval { request, .. }) => Some(request.clone()),
+                    Some(PendingInterruption::Approval { request, tool, .. })
+                        if tool != permission::TOOL =>
+                    {
+                        Some(request.clone())
+                    }
                     _ => None,
                 };
                 if let Some(request) = request {
@@ -160,8 +166,9 @@ impl InterruptionShelf {
                     .borrow()
                     .as_ref()
                     .map(|interruption| match interruption {
-                        PendingInterruption::Approval { item_id, .. } => item_id.clone(),
-                        PendingInterruption::Question { item_id, .. } => item_id.clone(),
+                        PendingInterruption::Approval { item_id, .. }
+                        | PendingInterruption::Question { item_id, .. }
+                        | PendingInterruption::Form { item_id, .. } => item_id.clone(),
                     });
                 if let Some(item_id) = item_id {
                     jump(item_id);
@@ -210,7 +217,10 @@ impl InterruptionShelf {
                 self.preview.set_text(&prev);
                 self.preview.set_visible(!prev.is_empty());
 
-                let has_allow = options.contains(&Decision::Allow);
+                // A permission grant is a list of places: the shelf cuts lists, so it never
+                // offers a one-click Allow for one. It points at the card instead.
+                let permission = tool == permission::TOOL;
+                let has_allow = options.contains(&Decision::Allow) && !permission;
                 let has_deny =
                     options.contains(&Decision::Deny) || options.contains(&Decision::Cancel);
                 self.allow_btn.set_visible(has_allow);
@@ -231,7 +241,7 @@ impl InterruptionShelf {
                 let extra_decisions: Vec<Decision> =
                     [Decision::AllowForSession, Decision::AllowAlways]
                         .into_iter()
-                        .filter(|d| options.contains(d))
+                        .filter(|d| options.contains(d) && !permission)
                         .collect();
 
                 for d in &extra_decisions {
@@ -261,19 +271,55 @@ impl InterruptionShelf {
                 }
                 self.more_btn.set_visible(!extra_decisions.is_empty());
 
-                self.jump_btn.set_label("");
-                self.jump_btn.set_icon_name("at-go-bottom-symbolic");
-                self.jump_btn.remove_css_class("suggested-action");
-                self.jump_btn.remove_css_class("pill");
-                self.jump_btn.add_css_class("flat");
-                self.jump_btn
-                    .set_tooltip_text(Some("Jump to card in transcript"));
-                self.jump_btn
-                    .update_property(&[gtk4::accessible::Property::Label(
-                        "Jump to card in transcript",
-                    )]);
-                self.jump_btn.set_visible(true);
+                if permission {
+                    self.jump_as_action(
+                        "Review in transcript ↓",
+                        "Read the whole request in the transcript",
+                        "Review the permission request",
+                    );
+                } else {
+                    self.jump_as_icon();
+                }
 
+                self.revealer.set_reveal_child(true);
+            }
+            Some(PendingInterruption::Form {
+                server,
+                message,
+                link,
+                ..
+            }) => {
+                self.more_btn.set_visible(false);
+                self.card.add_css_class("is-question");
+                self.icon.set_icon_name(Some("at-dialog-question-symbolic"));
+                self.title.set_text(if link {
+                    "A tool server wants you to open a link"
+                } else {
+                    "A tool server wants information"
+                });
+                // Whose words they are comes first: the server's, not the app's or the agent's.
+                let first = message.lines().map(str::trim).find(|l| !l.is_empty());
+                let preview = match first {
+                    Some(line) => format!("{server}: {line}"),
+                    None => server,
+                };
+                self.preview.set_text(&preview);
+                self.preview.set_visible(true);
+                self.allow_btn.set_visible(false);
+                self.deny_btn.set_visible(false);
+                self.jump_as_action(
+                    if link {
+                        "Review in transcript ↓"
+                    } else {
+                        "Answer in transcript ↓"
+                    },
+                    "Jump to the form in the transcript",
+                    if link {
+                        "Review the link in the transcript"
+                    } else {
+                        "Answer in the transcript"
+                    },
+                );
                 self.revealer.set_reveal_child(true);
             }
             Some(PendingInterruption::Question { questions, .. }) => {
@@ -297,22 +343,11 @@ impl InterruptionShelf {
 
                 self.allow_btn.set_visible(false);
                 self.deny_btn.set_visible(false);
-                // The label alone: a button holds a label or an icon, and setting an (empty)
-                // icon after it replaced the text with nothing, a blank pill.
-                self.jump_btn.set_icon_name("");
-                self.jump_btn.set_label("Answer in transcript ↓");
-                // Ellipsizes rather than widening the shelf at a large text scale.
-                if let Some(text) = self.jump_btn.child().and_downcast::<gtk4::Label>() {
-                    text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                }
-                self.jump_btn.remove_css_class("flat");
-                self.jump_btn.add_css_class("pill");
-                self.jump_btn.add_css_class("suggested-action");
-                self.jump_btn
-                    .set_tooltip_text(Some("Jump to question in transcript"));
-                self.jump_btn
-                    .update_property(&[gtk4::accessible::Property::Label("Answer in transcript")]);
-                self.jump_btn.set_visible(true);
+                self.jump_as_action(
+                    "Answer in transcript ↓",
+                    "Jump to question in transcript",
+                    "Answer in transcript",
+                );
 
                 self.revealer.set_reveal_child(true);
             }
@@ -322,11 +357,54 @@ impl InterruptionShelf {
             }
         }
     }
+
+    /// The jump button as a small icon beside the approval's own buttons.
+    fn jump_as_icon(&self) {
+        self.jump_btn.set_label("");
+        self.jump_btn.set_icon_name("at-go-bottom-symbolic");
+        self.jump_btn.remove_css_class("suggested-action");
+        self.jump_btn.remove_css_class("pill");
+        self.jump_btn.add_css_class("flat");
+        self.jump_btn
+            .set_tooltip_text(Some("Jump to card in transcript"));
+        self.jump_btn
+            .update_property(&[gtk4::accessible::Property::Label(
+                "Jump to card in transcript",
+            )]);
+        self.jump_btn.set_visible(true);
+    }
+
+    /// The jump button as the shelf's one suggested action, labelled with what it does.
+    fn jump_as_action(&self, text: &str, tooltip: &str, accessible: &str) {
+        // The label alone: a button holds a label or an icon, and setting an (empty)
+        // icon after it replaced the text with nothing, a blank pill.
+        self.jump_btn.set_icon_name("");
+        self.jump_btn.set_label(text);
+        // Ellipsizes rather than widening the shelf at a large text scale.
+        if let Some(text) = self.jump_btn.child().and_downcast::<gtk4::Label>() {
+            text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        }
+        self.jump_btn.remove_css_class("flat");
+        self.jump_btn.add_css_class("pill");
+        self.jump_btn.add_css_class("suggested-action");
+        self.jump_btn.set_tooltip_text(Some(tooltip));
+        self.jump_btn
+            .update_property(&[gtk4::accessible::Property::Label(accessible)]);
+        self.jump_btn.set_visible(true);
+    }
 }
 
 /// The shelf's one line for a pending approval: the call's card title (W3.4, `Run <command>`,
 /// `Edit <path>`, …), else the first file an edit names, else nothing.
 fn approval_preview(tool: &str, input: &serde_json::Value) -> String {
+    if tool == permission::TOOL {
+        let request = permission::Request::parse(input);
+        return if request.renderable {
+            request.one_line()
+        } else {
+            "Part of this request could not be summarised. Review it before answering.".to_owned()
+        };
+    }
     let called = payload::tool_title(ItemKind::Tool, tool, Some(input), "");
     if !called.target.is_empty() || called.kind == agent_core::tool_title::ToolKind::Mcp {
         return called.text();
@@ -502,5 +580,143 @@ pub(crate) mod tests {
             session_approved.get(),
             "Allow for session answered the approval"
         );
+    }
+
+    /// The shelf never grants a permission request unseen, and points at the form it cannot fill.
+    #[test]
+    fn a_permission_request_is_summarised_in_one_line() {
+        let input = serde_json::json!({
+            "cwd": "/w", "reason": null, "renderable": true,
+            "entries": [
+                {"access": "write", "target": {"kind": "path", "path": "/w/out"}},
+                {"access": "read", "target": {"kind": "path", "path": "/data"}}
+            ],
+            "network": true, "session_allowed": true, "warning": null, "requested": {}
+        });
+        assert_eq!(
+            approval_preview(permission::TOOL, &input),
+            "Write /w/out; Read /data; network"
+        );
+        assert!(
+            approval_preview(permission::TOOL, &serde_json::json!({"renderable": false}))
+                .contains("could not be summarised")
+        );
+    }
+
+    /// GTK: the shelf for a permission request has no one-click Allow (and no menu with a
+    /// session grant); it offers Deny and a Review button. A form is a shelf entry too.
+    pub(crate) fn the_shelf_holds_requests_it_must_not_grant_unseen() {
+        let answered: Rc<RefCell<Vec<Decision>>> = Rc::default();
+        let sink: RowSink = {
+            let answered = answered.clone();
+            Rc::new(move |event| {
+                if let RowEvent::Approve { decision, .. } = event {
+                    answered.borrow_mut().push(decision);
+                }
+            })
+        };
+        let shelf = InterruptionShelf::new(sink, |_| {});
+        let mut transcript = Transcript::new();
+        transcript.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: permission::TOOL.into(),
+                title: Some("Codex asks to write to 1 place".into()),
+                input: serde_json::json!({
+                    "cwd": "/w", "reason": null, "renderable": true,
+                    "entries": [{"access": "write", "target": {"kind": "path", "path": "/w/out"}}],
+                    "network": null, "session_allowed": true, "warning": null, "requested": {}
+                }),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::Deny,
+                    Decision::Cancel,
+                ],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("p"),
+            Driver::Codex,
+        );
+        shelf.update(&transcript);
+        assert!(shelf.revealer.reveals_child());
+        assert!(!shelf.allow_btn.is_visible(), "no one-click Allow");
+        assert!(!shelf.more_btn.is_visible(), "no session grant in a menu");
+        assert!(shelf.deny_btn.is_visible());
+        assert_eq!(shelf.preview.text(), "Write /w/out");
+        assert_eq!(
+            shelf.jump_btn.label().as_deref(),
+            Some("Review in transcript ↓")
+        );
+        shelf.deny_btn.emit_clicked();
+        assert_eq!(*answered.borrow(), [Decision::Deny]);
+        shelf.allow_btn.emit_clicked();
+        assert_eq!(
+            *answered.borrow(),
+            [Decision::Deny],
+            "even a stray click on the hidden Allow grants nothing"
+        );
+
+        // An ordinary approval keeps its Allow.
+        let mut command = Transcript::new();
+        command.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command": "ls"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("b"),
+            Driver::Codex,
+        );
+        shelf.update(&command);
+        assert!(shelf.allow_btn.is_visible());
+        assert!(shelf.jump_btn.icon_name().is_some());
+
+        // A form: whose words, and the way to the card.
+        let mut form = Transcript::new();
+        form.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: "Which repo?\nSecond line".into(),
+                form: agent_core::form::Form::Link {
+                    url: "https://example.com/a".into(),
+                },
+            })
+            .request("f"),
+            Driver::Codex,
+        );
+        shelf.update(&form);
+        assert!(shelf.revealer.reveals_child());
+        assert_eq!(shelf.title.text(), "A tool server wants you to open a link");
+        assert_eq!(shelf.preview.text(), "github: Which repo?");
+        assert!(!shelf.allow_btn.is_visible() && !shelf.deny_btn.is_visible());
+        assert_eq!(
+            shelf.jump_btn.label().as_deref(),
+            Some("Review in transcript ↓")
+        );
+        let mut fields = Transcript::new();
+        fields.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: String::new(),
+                form: agent_core::form::Form::Fields { fields: vec![] },
+            })
+            .request("g"),
+            Driver::Codex,
+        );
+        shelf.update(&fields);
+        assert_eq!(shelf.title.text(), "A tool server wants information");
+        assert_eq!(shelf.preview.text(), "github", "no empty quote");
+        assert_eq!(
+            shelf.jump_btn.label().as_deref(),
+            Some("Answer in transcript ↓")
+        );
+        shelf.update(&Transcript::new());
+        assert!(!shelf.revealer.reveals_child());
     }
 }

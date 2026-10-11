@@ -13,9 +13,11 @@ use serde_json::Value;
 use sourceview5::prelude::*;
 
 use super::difftext::{self, DiffText};
+use super::form_card::FormCardWidget;
 use super::markdown::{self, Block, TextKind};
 use super::model::{format_tokens, ApprovalState, Body, Item, QuestionState, Tone, ToolStatus};
 use super::payload;
+use super::permission;
 use crate::chat::DiffReply;
 use crate::diff_tool::{self, DiffTools};
 
@@ -33,6 +35,13 @@ pub enum RowEvent {
     Answer {
         request: String,
         answers: Value,
+    },
+    /// A form card was submitted (`content` is what the form's check returned), declined or
+    /// dismissed.
+    Form {
+        request: String,
+        action: agent_core::form::FormAction,
+        content: Option<Value>,
     },
     /// A file-change card was asked to show its diff.
     LoadDiff {
@@ -160,7 +169,7 @@ pub(super) fn wrapping(l: &gtk4::Label) {
 }
 
 /// A selectable, wrapping monospace label for tool input and output.
-fn mono(text: &str) -> gtk4::Label {
+pub(super) fn mono(text: &str) -> gtk4::Label {
     let l = label(text, &["mono-text"]);
     wrapping(&l);
     l.set_selectable(true);
@@ -446,6 +455,7 @@ pub enum Row {
     Static(gtk4::Widget),
     Approval(ApprovalCard),
     Question(QuestionCardWidget),
+    Form(FormCardWidget),
     Plan {
         root: gtk4::Expander,
         steps: gtk4::Box,
@@ -511,6 +521,7 @@ impl Row {
             }
             Body::Approval(_) => Self::Approval(ApprovalCard::new(sink)),
             Body::Question(q) => Self::Question(QuestionCardWidget::new(q, sink)),
+            Body::Form(f) => Self::Form(FormCardWidget::new(f, sink)),
             Body::Plan { .. } => {
                 let root = gtk4::Expander::new(None);
                 let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -550,6 +561,7 @@ impl Row {
             Self::Static(w) => w.clone(),
             Self::Approval(a) => a.root.clone().upcast(),
             Self::Question(q) => q.root.clone().upcast(),
+            Self::Form(f) => f.root().clone().upcast(),
             Self::Plan { root, .. } => root.clone().upcast(),
         }
     }
@@ -564,6 +576,8 @@ impl Row {
             Self::Question(q) if q.submit.is_visible() && q.options.is_sensitive() => {
                 q.options.clone().upcast::<gtk4::Widget>()
             }
+            // The first field, else the first button: the user asked to be taken here.
+            Self::Form(f) => return f.focus_first(),
             _ => return false,
         };
         fn focus_button(widget: &gtk4::Widget) -> bool {
@@ -627,6 +641,7 @@ impl Row {
             (Self::Tool(t), Body::Tool(_)) => t.update(item),
             (Self::Approval(a), Body::Approval(_)) => a.update(item),
             (Self::Question(q), Body::Question(card)) => q.update(card.state),
+            (Self::Form(f), Body::Form(card)) => f.update(card),
             (
                 Self::Plan {
                     root,
@@ -1582,11 +1597,127 @@ pub struct ApprovalCard {
     raw_section: Section,
     /// What "Always allow" would save, when it is offered.
     remembers: gtk4::Label,
-    buttons: gtk4::Box,
+    /// A permission request's places, grouped, one per line (hidden for every other request).
+    places: Rc<Places>,
+    /// A permission request's warning, or why it can only be refused.
+    warning: gtk4::Label,
+    /// What the permission buttons last (dim, under the request).
+    note: gtk4::Label,
+    buttons: gtk4::FlowBox,
     outcome: gtk4::Label,
     request: RefCell<String>,
     built_buttons: Cell<bool>,
+    /// The raw request was opened for the user once already (an unreadable permission request).
+    raw_forced: Cell<bool>,
     sink: RowSink,
+}
+
+/// A row of buttons that wraps onto more lines when the card is narrow, in the order given.
+pub(super) fn button_row() -> gtk4::FlowBox {
+    let flow = gtk4::FlowBox::new();
+    flow.set_selection_mode(gtk4::SelectionMode::None);
+    flow.set_homogeneous(false);
+    flow.set_column_spacing(8);
+    flow.set_row_spacing(8);
+    flow.set_min_children_per_line(1);
+    flow.set_max_children_per_line(8);
+    flow.set_activate_on_single_click(false);
+    flow.set_halign(gtk4::Align::End);
+    flow.set_valign(gtk4::Align::Center);
+    flow
+}
+
+/// Adds `button` to a [`button_row`]. The flow box's own wrapper takes no focus, so Tab goes
+/// from button to button.
+pub(super) fn add_button(flow: &gtk4::FlowBox, button: &impl IsA<gtk4::Widget>) {
+    flow.insert(button, -1);
+    if let Some(wrapper) = button.parent() {
+        wrapper.set_focusable(false);
+    }
+}
+
+/// The buttons of a [`button_row`], in order (tests).
+#[cfg(test)]
+pub(super) fn row_buttons(flow: &gtk4::FlowBox) -> Vec<gtk4::Widget> {
+    let mut out = Vec::new();
+    let mut child = flow.first_child();
+    while let Some(wrapper) = child {
+        out.extend(wrapper.first_child());
+        child = wrapper.next_sibling();
+    }
+    out
+}
+
+/// The places a permission request names, as a capped monospace list with "Show all".
+struct Places {
+    root: gtk4::Box,
+    body: gtk4::Label,
+    more: gtk4::Button,
+    full: RefCell<String>,
+    expanded: Cell<bool>,
+}
+
+impl Places {
+    fn new() -> Rc<Self> {
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        root.add_css_class("places-section");
+        let frame = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        frame.add_css_class("mono-scroller");
+        let body = mono("");
+        body.update_property(&[gtk4::accessible::Property::Label("Places Codex asks for")]);
+        frame.append(&body);
+        root.append(&frame);
+        let more = gtk4::Button::with_label("Show all");
+        more.add_css_class("flat");
+        more.add_css_class("section-more");
+        more.set_halign(gtk4::Align::Start);
+        more.set_visible(false);
+        root.append(&more);
+        root.set_visible(false);
+        let places = Rc::new(Self {
+            root,
+            body,
+            more,
+            full: RefCell::new(String::new()),
+            expanded: Cell::new(false),
+        });
+        places.more.connect_clicked({
+            let places = Rc::downgrade(&places);
+            move |_| {
+                if let Some(places) = places.upgrade() {
+                    places.expanded.set(!places.expanded.get());
+                    places.show();
+                }
+            }
+        });
+        places
+    }
+
+    fn set(&self, lines: &[String]) {
+        *self.full.borrow_mut() = lines.join("\n");
+        self.show();
+    }
+
+    fn show(&self) {
+        let full = self.full.borrow();
+        let (head, cut) = head_lines_in(
+            &full,
+            APPROVAL_VISIBLE_LINES,
+            APPROVAL_LINE_CHARS,
+            "Show all",
+        );
+        self.more.set_visible(cut || self.expanded.get());
+        self.more.set_label(if self.expanded.get() {
+            "Show fewer"
+        } else {
+            "Show all"
+        });
+        self.body.set_text(&if self.expanded.get() {
+            full.clone()
+        } else {
+            head
+        });
+    }
 }
 
 pub fn decision_label(d: Decision) -> &'static str {
@@ -1597,6 +1728,24 @@ pub fn decision_label(d: Decision) -> &'static str {
         Decision::Deny => "Deny",
         // Ends the whole turn (Codex `cancel`); Deny lets the agent see the refusal and go on.
         Decision::Cancel => "Stop turn",
+    }
+}
+
+/// The button for `d` on a card for `tool`. A permission request's Allow lasts the turn, not
+/// "once", and its session grant is a button, not a menu item.
+fn button_label(tool: &str, d: Decision) -> &'static str {
+    match (tool == permission::TOOL, d) {
+        (true, Decision::Allow) => "Allow for this turn",
+        (true, Decision::AllowForSession) => "Allow for this session",
+        _ => decision_label(d),
+    }
+}
+
+fn outcome_text(tool: &str, d: Decision) -> &'static str {
+    match (tool == permission::TOOL, d) {
+        (true, Decision::Allow) => "Allowed for this turn",
+        (true, Decision::AllowForSession) => "Allowed for this Codex session",
+        _ => decision_outcome(d),
     }
 }
 
@@ -1658,6 +1807,11 @@ fn approval_input_text(tool: &str, input: &Value) -> (String, bool) {
 /// The first `max` lines of `text`, each cut to `width` characters, with a note of what "Show
 /// raw" holds; true when anything was cut.
 fn head_lines(text: &str, max: usize, width: usize) -> (String, bool) {
+    head_lines_in(text, max, width, "Show raw")
+}
+
+/// [`head_lines`], naming the control (`rest_in`) that holds what was cut.
+fn head_lines_in(text: &str, max: usize, width: usize, rest_in: &str) -> (String, bool) {
     let total = text.lines().count();
     let keep = if total <= max {
         total
@@ -1675,11 +1829,11 @@ fn head_lines(text: &str, max: usize, width: usize) -> (String, bool) {
             }
             cut = true;
             let head: String = line.chars().take(width).collect();
-            format!("{head}… ({} more characters in Show raw)", chars - width)
+            format!("{head}… ({} more characters in {rest_in})", chars - width)
         })
         .collect();
     if total > keep {
-        lines.push(format!("… {} more lines in Show raw", total - keep));
+        lines.push(format!("… {} more lines in {rest_in}", total - keep));
     }
     (lines.join("\n"), cut)
 }
@@ -1703,6 +1857,13 @@ impl ApprovalCard {
         col.append(&reason);
         head.append(&col);
         root.append(&head);
+        // A warning shown prominently, in words, never by colour alone.
+        let warning = content_label("", &["approval-warning"]);
+        wrapping(&warning);
+        warning.set_visible(false);
+        root.append(&warning);
+        let places = Places::new();
+        root.append(&places.root);
         let input = mono("");
         let input_section = Section::new("Request", &input);
         root.append(input_section.widget());
@@ -1725,11 +1886,17 @@ impl ApprovalCard {
         remembers.set_selectable(true);
         remembers.set_visible(false);
         root.append(&remembers);
-        let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let note = label("", &["approval-note", "dim-label"]);
+        wrapping(&note);
+        note.set_visible(false);
+        root.append(&note);
+        // The outcome above the buttons, not beside them: the buttons wrap, and a wrapping label
+        // beside a wrapping row is where GTK's height-for-width measuring disagrees with itself.
+        let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         let outcome = content_label("", &["approval-outcome"]);
-        outcome.set_hexpand(true);
-        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        buttons.set_halign(gtk4::Align::End);
+        wrapping(&outcome);
+        outcome.set_visible(false);
+        let buttons = button_row();
         footer.append(&outcome);
         footer.append(&buttons);
         root.append(&footer);
@@ -1743,10 +1910,14 @@ impl ApprovalCard {
             raw,
             raw_section,
             remembers,
+            places,
+            warning,
+            note,
             buttons,
             outcome,
             request: RefCell::new(String::new()),
             built_buttons: Cell::new(false),
+            raw_forced: Cell::new(false),
             sink: sink.clone(),
         }
     }
@@ -1768,13 +1939,31 @@ impl ApprovalCard {
             return;
         };
         a.request.clone_into(&mut self.request.borrow_mut());
+        // A Codex permission request is read once, here: everything below follows it.
+        let permission = (a.tool == permission::TOOL).then(|| permission::Request::parse(&a.input));
         let title = a
             .title
             .clone()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| permission.as_ref().map(permission::Request::title))
             .unwrap_or_else(|| format!("Allow {}?", a.tool));
         self.title.set_text(&title);
-        self.reason.set_text(a.reason.as_deref().unwrap_or(""));
-        self.reason.set_visible(a.reason.is_some());
+        let reason = a
+            .reason
+            .clone()
+            .or_else(|| permission.as_ref().and_then(|p| p.reason.clone()))
+            .filter(|r| !r.trim().is_empty());
+        self.reason.set_text(reason.as_deref().unwrap_or(""));
+        self.reason.set_visible(reason.is_some());
+        let pending = a.state == ApprovalState::Pending;
+        match &permission {
+            Some(request) => self.show_permission(request, pending, &a.options),
+            None => {
+                self.places.root.set_visible(false);
+                self.warning.set_visible(false);
+                self.note.set_visible(false);
+            }
+        }
         // A file edit is shown as the diff it proposes (computed from the request alone), a plan
         // (Claude's ExitPlanMode) as markdown, a command as its bare command line and working
         // directory, anything else as a few lines of its input. The JSON is one click away.
@@ -1785,6 +1974,9 @@ impl ApprovalCard {
             .filter(|p| !p.trim().is_empty());
         let (input, cut) = if let Some(plan) = plan {
             self.plan.set_markdown(plan);
+            (String::new(), false)
+        } else if permission.is_some() {
+            // Said by the places list above, not dumped as JSON.
             (String::new(), false)
         } else if preview.is_empty() {
             approval_input_text(&a.tool, &a.input)
@@ -1801,20 +1993,22 @@ impl ApprovalCard {
         self.input_section.set_text(&input);
         // No "Show raw" only when the card already shows all of it, uncut (a bare command and its
         // folder): whatever is cut is never approved unseen.
-        let shown_whole =
-            !cut && a.input.as_object().is_some_and(|o| {
+        let shown_whole = permission.is_none()
+            && !cut
+            && a.input.as_object().is_some_and(|o| {
                 o.keys().all(|k| {
                     ["command", "CommandLine", "cmd", "cwd", "Cwd", "description"]
                         .contains(&k.as_str())
                 })
-            }) && preview.is_empty()
-                && plan.is_none()
-                && ["command", "CommandLine", "cmd"].iter().all(|k| {
-                    a.input
-                        .get(*k)
-                        .and_then(Value::as_str)
-                        .is_none_or(|c| crate::always_allow::unwrap_shell_wrapper(c).is_none())
-                });
+            })
+            && preview.is_empty()
+            && plan.is_none()
+            && ["command", "CommandLine", "cmd"].iter().all(|k| {
+                a.input
+                    .get(*k)
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| crate::always_allow::unwrap_shell_wrapper(c).is_none())
+            });
         let raw = match &a.input {
             Value::Null => String::new(),
             _ if shown_whole => String::new(),
@@ -1823,6 +2017,14 @@ impl ApprovalCard {
         // The Raw section caps what it shows (Show full, Copy takes all of it).
         self.raw_section.set_text(&raw);
         self.raw.set_visible(!raw.is_empty());
+        // What cannot be summarised is shown as sent, open: the user can only refuse it, and
+        // refuses (or stops) knowing what it said.
+        if pending
+            && permission.as_ref().is_some_and(|p| !p.renderable)
+            && !self.raw_forced.replace(true)
+        {
+            self.raw.set_expanded(true);
+        }
         if preview.is_empty() || plan.is_some() {
             self.diff.widget().set_visible(false);
         } else {
@@ -1853,6 +2055,24 @@ impl ApprovalCard {
                 Decision::AllowForSession => 3,
                 Decision::Allow => 4,
             });
+            // A permission request offers only what its card can honestly show: nothing but a
+            // refusal when it cannot be read, and no session grant when it may not last one.
+            // Its grants are plain buttons: there is no rule to save, so no menu and no dialog.
+            if let Some(request) = &permission {
+                order.retain(|d| match d {
+                    Decision::Cancel | Decision::Deny => true,
+                    Decision::Allow => request.renderable,
+                    // A broad grant (anything warned about) is for this turn only.
+                    Decision::AllowForSession => {
+                        request.renderable
+                            && request.session_allowed
+                            && request.warnings().is_empty()
+                    }
+                    Decision::AllowAlways => false,
+                });
+            }
+            let rule_menu = permission.is_none();
+            let calm = permission.as_ref().is_none_or(|p| p.allow_is_calm());
             let extra = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
             extra.set_margin_top(6);
             extra.set_margin_bottom(6);
@@ -1868,17 +2088,17 @@ impl ApprovalCard {
             more.set_popover(Some(&popover));
             let mut added_more = false;
             for d in order {
-                let b = gtk4::Button::with_label(decision_label(d));
+                let b = gtk4::Button::with_label(button_label(&a.tool, d));
                 b.add_css_class("pill");
                 match d {
-                    Decision::Allow => b.add_css_class("suggested-action"),
+                    Decision::Allow if calm => b.add_css_class("suggested-action"),
                     Decision::Deny => b.add_css_class("destructive-action"),
                     _ => {}
                 }
                 let sink = self.sink.clone();
                 let request = a.request.clone();
                 let popover = popover.clone();
-                if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
+                if rule_menu && matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
                     let initial_cmd = crate::always_allow::dialog_prefill(
@@ -1924,14 +2144,14 @@ impl ApprovalCard {
                         });
                     });
                 }
-                if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
+                if rule_menu && matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     if !added_more {
-                        self.buttons.append(&more);
+                        add_button(&self.buttons, &more);
                         added_more = true;
                     }
                     extra.append(&b);
                 } else {
-                    self.buttons.append(&b);
+                    add_button(&self.buttons, &b);
                 }
             }
         }
@@ -1948,10 +2168,18 @@ impl ApprovalCard {
         }
         let (class, outcome, sensitive, show_buttons) = match a.state {
             ApprovalState::Pending => ("pending", String::new(), true, true),
-            ApprovalState::Sent(d) => ("pending", format!("{}…", decision_label(d)), false, true),
-            ApprovalState::Resolved(d) => {
-                ("resolved", decision_outcome(d).to_owned(), false, false)
-            }
+            ApprovalState::Sent(d) => (
+                "pending",
+                format!("{}…", button_label(&a.tool, d)),
+                false,
+                true,
+            ),
+            ApprovalState::Resolved(d) => (
+                "resolved",
+                outcome_text(&a.tool, d).to_owned(),
+                false,
+                false,
+            ),
             ApprovalState::Expired => (
                 "expired",
                 "Expired: the agent that asked has exited".to_owned(),
@@ -1961,6 +2189,7 @@ impl ApprovalCard {
         };
         self.root.add_css_class(class);
         self.outcome.set_text(&outcome);
+        self.outcome.set_visible(!outcome.is_empty());
         self.buttons.set_sensitive(sensitive);
         self.buttons.set_visible(show_buttons);
         // While the choice is open, say exactly what "Always allow" would keep.
@@ -1974,6 +2203,85 @@ impl ApprovalCard {
             }
             None => self.remembers.set_visible(false),
         }
+    }
+
+    /// A Codex permission request: the places it names, its warning (or why it can only be
+    /// refused), and what each grant lasts.
+    fn show_permission(&self, request: &permission::Request, pending: bool, options: &[Decision]) {
+        self.places.root.set_visible(request.renderable);
+        if request.renderable {
+            self.places.set(&request.lines());
+        }
+        let warning = if request.renderable {
+            request.warnings().join("\n")
+        } else {
+            "Some of this request could not be summarised, so it can only be denied. It is \
+             shown below exactly as Codex sent it."
+                .to_owned()
+        };
+        self.warning.set_text(&warning);
+        self.warning.set_visible(!warning.is_empty());
+        let session = options.contains(&Decision::AllowForSession)
+            && request.session_allowed
+            && request.warnings().is_empty();
+        let note = match (request.renderable, session) {
+            (false, _) => String::new(),
+            (true, true) => "“Allow for this turn” lasts until the turn ends. “Allow for this \
+                             session” lasts until Codex restarts for this thread."
+                .to_owned(),
+            (true, false) => "“Allow for this turn” lasts until the turn ends.".to_owned(),
+        };
+        self.note.set_text(&note);
+        self.note.set_visible(pending && !note.is_empty());
+    }
+
+    /// What the card shows of a permission request (tests): the places text, the warning, the
+    /// note, and whether the raw request is open.
+    #[cfg(test)]
+    pub(super) fn permission_view(&self) -> (String, String, String, bool) {
+        (
+            if self.places.root.is_visible() {
+                self.places.body.text().to_string()
+            } else {
+                String::new()
+            },
+            if self.warning.is_visible() {
+                self.warning.text().to_string()
+            } else {
+                String::new()
+            },
+            if self.note.is_visible() {
+                self.note.text().to_string()
+            } else {
+                String::new()
+            },
+            self.raw.is_visible() && self.raw.is_expanded(),
+        )
+    }
+
+    /// The labels of the card's direct buttons, in order (tests).
+    #[cfg(test)]
+    pub(super) fn button_labels(&self) -> Vec<String> {
+        row_buttons(&self.buttons)
+            .iter()
+            .filter_map(|w| {
+                w.downcast_ref::<gtk4::Button>()
+                    .and_then(|b| b.label())
+                    .or_else(|| w.downcast_ref::<gtk4::MenuButton>().and_then(|b| b.label()))
+                    .map(|l| l.to_string())
+            })
+            .collect()
+    }
+
+    /// Presses the direct button labelled `label` (tests); false when there is none.
+    #[cfg(test)]
+    pub(super) fn press(&self, label: &str) -> bool {
+        row_buttons(&self.buttons)
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk4::Button>())
+            .find(|b| b.label().as_deref() == Some(label))
+            .map(|b| b.emit_clicked())
+            .is_some()
     }
 
     /// Whether the buttons show and can be pressed, and the outcome line (tests).
@@ -2696,28 +3004,26 @@ pub(crate) mod tests {
         );
         let approval = ApprovalCard::new(&sink);
         approval.update(transcript.get("approval:approval").expect("approval card"));
-        let deny = approval
-            .buttons
-            .first_child()
-            .expect("deny")
+        let direct = row_buttons(&approval.buttons);
+        assert_eq!(
+            direct.len(),
+            3,
+            "long-lived grants do not widen direct controls"
+        );
+        let deny = direct[0]
+            .clone()
             .downcast::<gtk4::Button>()
             .expect("direct deny");
         assert_eq!(deny.label().as_deref(), Some("Deny"));
-        let more = deny
-            .next_sibling()
-            .expect("more")
+        let more = direct[1]
+            .clone()
             .downcast::<gtk4::MenuButton>()
             .expect("advanced choices");
-        let allow = more
-            .next_sibling()
-            .expect("allow")
+        let allow = direct[2]
+            .clone()
             .downcast::<gtk4::Button>()
             .expect("direct allow");
         assert_eq!(allow.label().as_deref(), Some("Allow"));
-        assert!(
-            allow.next_sibling().is_none(),
-            "long-lived grants do not widen direct controls"
-        );
         let extra = more
             .popover()
             .expect("advanced menu")
@@ -2750,6 +3056,8 @@ pub(crate) mod tests {
         );
         chat_labels_are_selectable();
         codex_approval_card_checks();
+        permission_cards_say_what_is_asked();
+        approval_buttons_wrap();
     }
 
     /// A Codex-shaped approval: one card, `transcript` resolved by `resolution` (or pending).
@@ -2791,15 +3099,11 @@ pub(crate) mod tests {
     }
 
     fn direct_labels(card: &ApprovalCard) -> Vec<String> {
-        let mut labels = Vec::new();
-        let mut child = card.buttons.first_child();
-        while let Some(w) = child {
-            if let Some(b) = w.downcast_ref::<gtk4::Button>() {
-                labels.push(b.label().map(|l| l.to_string()).unwrap_or_default());
-            }
-            child = w.next_sibling();
-        }
-        labels
+        row_buttons(&card.buttons)
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk4::Button>())
+            .map(|b| b.label().map(|l| l.to_string()).unwrap_or_default())
+            .collect()
     }
 
     /// Plan W2: Codex cards carry Deny and a separate Stop turn; a refusal is styled as one.
@@ -2814,10 +3118,9 @@ pub(crate) mod tests {
         let shell = serde_json::json!({"command": "/usr/bin/zsh -lc 'ls -la'", "cwd": "/w"});
         let (card, events) = codex_card("command_execution", shell.clone(), all.clone(), None);
         assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
-        let stop = card
-            .buttons
-            .first_child()
-            .and_downcast::<gtk4::Button>()
+        let stop = row_buttons(&card.buttons)
+            .first()
+            .and_then(|w| w.clone().downcast::<gtk4::Button>().ok())
             .expect("stop turn");
         stop.emit_clicked();
         assert!(matches!(
@@ -3224,6 +3527,268 @@ pub(crate) mod tests {
         assert_eq!(
             crate::testutil::selectable_labels_in_click_targets(flow.upcast_ref()),
             Vec::<String>::new()
+        );
+    }
+
+    fn permission_input(entries: Value, network: Value, session_allowed: bool) -> Value {
+        serde_json::json!({
+            "cwd": "/w", "reason": "The build writes its cache", "renderable": true,
+            "entries": entries, "network": network, "session_allowed": session_allowed,
+            "warning": null, "requested": {"fileSystem": {"write": ["/w/out"]}}
+        })
+    }
+
+    fn entry(access: &str, path: &str) -> Value {
+        serde_json::json!({"access": access, "target": {"kind": "path", "path": path}})
+    }
+
+    const ALL_FOUR: [Decision; 4] = [
+        Decision::Allow,
+        Decision::AllowForSession,
+        Decision::Deny,
+        Decision::Cancel,
+    ];
+
+    /// A Codex permission request is the same approval card with a summary of what it asks:
+    /// the places grouped one per line, what each button lasts, and no rule machinery.
+    pub(crate) fn permission_cards_say_what_is_asked() {
+        let input = permission_input(
+            serde_json::json!([
+                entry("write", "/w/out"),
+                entry("read", "/data"),
+                entry("deny", "/w/.git"),
+                {"access": "read", "target": {"kind": "special", "name": "project", "path": null}},
+            ]),
+            serde_json::json!(true),
+            true,
+        );
+        let (card, events) = codex_card(permission::TOOL, input.clone(), ALL_FOUR.to_vec(), None);
+        assert_eq!(
+            card.title.text(),
+            "Codex asks to write to 1 place, read 2 places and use the network"
+        );
+        assert_eq!(card.reason.text(), "The build writes its cache");
+        let (places, warning, note, raw_open) = card.permission_view();
+        assert_eq!(
+            places,
+            "Read\n  /data\n  the project\nWrite\n  /w/out\nStill blocked\n  /w/.git\nUse the network"
+        );
+        assert_eq!(warning, "");
+        assert!(note.contains("Allow for this turn") && note.contains("until Codex restarts"));
+        assert!(!raw_open, "a request it can say is not dumped open");
+        assert!(!card.input_section.root.is_visible(), "no JSON dump");
+
+        // Every grant is a plain button: no hidden More menu, and Allow for this session is
+        // one click away, not a menu item.
+        assert_eq!(
+            card.button_labels(),
+            [
+                "Stop turn",
+                "Deny",
+                "Allow for this session",
+                "Allow for this turn"
+            ]
+        );
+        assert!(
+            row_buttons(&card.buttons)
+                .iter()
+                .all(|w| !w.is::<gtk4::MenuButton>()),
+            "nothing is behind a More menu"
+        );
+        let suggested: Vec<String> = row_buttons(&card.buttons)
+            .iter()
+            .filter(|w| w.has_css_class("suggested-action"))
+            .filter_map(|w| w.downcast_ref::<gtk4::Button>()?.label())
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(suggested, ["Allow for this turn"]);
+
+        // No rule: the dialog has nothing to prefill, and the session grant is sent straight.
+        assert_eq!(
+            crate::always_allow::dialog_prefill(permission::TOOL, &input, None),
+            ""
+        );
+        assert!(card.press("Allow for this session"));
+        assert!(matches!(
+            events.borrow().last(),
+            Some(RowEvent::Approve {
+                decision: Decision::AllowForSession,
+                custom_rule: None,
+                ..
+            })
+        ));
+        assert!(card.press("Allow for this turn"));
+        assert!(matches!(
+            events.borrow().last(),
+            Some(RowEvent::Approve {
+                decision: Decision::Allow,
+                custom_rule: None,
+                ..
+            })
+        ));
+        assert!(card.press("Stop turn"));
+        assert!(matches!(
+            events.borrow().last(),
+            Some(RowEvent::Approve {
+                decision: Decision::Cancel,
+                ..
+            })
+        ));
+
+        // The outcome lines say how long the grant lasts.
+        for (decision, outcome) in [
+            (Decision::Allow, "Allowed for this turn"),
+            (Decision::AllowForSession, "Allowed for this Codex session"),
+            (Decision::Deny, "Denied"),
+            (Decision::Cancel, "Turn stopped"),
+        ] {
+            let (card, _) = codex_card(
+                permission::TOOL,
+                input.clone(),
+                ALL_FOUR.to_vec(),
+                Some(decision),
+            );
+            assert_eq!(card.outcome.text(), outcome);
+            assert_eq!(
+                card.root.has_css_class("denied"),
+                matches!(decision, Decision::Deny | Decision::Cancel)
+            );
+        }
+        // The command card's wording is untouched.
+        assert_eq!(button_label("Bash", Decision::Allow), "Allow");
+        assert_eq!(outcome_text("Bash", Decision::Allow), "Allowed once");
+
+        // A request that may not last the session offers no session button, even if listed.
+        let turn_only = permission_input(
+            serde_json::json!([entry("write", "/w/out")]),
+            serde_json::json!(null),
+            false,
+        );
+        let (card, _) = codex_card(permission::TOOL, turn_only, ALL_FOUR.to_vec(), None);
+        assert_eq!(
+            card.button_labels(),
+            ["Stop turn", "Deny", "Allow for this turn"]
+        );
+        assert!(!card.permission_view().2.contains("session"));
+
+        permission_cards_fail_closed();
+        permission_lists_are_bounded();
+    }
+
+    /// Anything the card cannot say exactly, or that reaches everything, is not made easy to
+    /// grant: the raw request opens, only a refusal is offered, or Allow loses its emphasis.
+    fn permission_cards_fail_closed() {
+        let mut unreadable = permission_input(
+            serde_json::json!([{"access": "read", "target": {"kind": "mystery"}}]),
+            serde_json::json!(null),
+            true,
+        );
+        unreadable["renderable"] = serde_json::json!(false);
+        let (card, _) = codex_card(
+            permission::TOOL,
+            unreadable.clone(),
+            ALL_FOUR.to_vec(),
+            None,
+        );
+        assert_eq!(
+            card.button_labels(),
+            ["Stop turn", "Deny"],
+            "an unreadable request can only be refused, whatever the adapter listed"
+        );
+        let (places, warning, note, raw_open) = card.permission_view();
+        assert_eq!(places, "", "no partial summary");
+        assert!(warning.contains("can only be denied"), "{warning}");
+        assert_eq!(note, "");
+        assert!(raw_open, "the raw request opens by default");
+        assert!(card
+            .raw_section
+            .full
+            .borrow()
+            .contains("\"kind\": \"mystery\""));
+        // The adapter's own refusal list is honoured too.
+        let (card, _) = codex_card(
+            permission::TOOL,
+            unreadable,
+            vec![Decision::Deny, Decision::Cancel],
+            None,
+        );
+        assert_eq!(card.button_labels(), ["Stop turn", "Deny"]);
+
+        // The whole filesystem: a plain warning, Allow not suggested, Deny still first.
+        let root = permission_input(
+            serde_json::json!([{"access": "write", "target": {"kind": "special", "name": "root", "path": null}}]),
+            serde_json::json!(null),
+            true,
+        );
+        let (card, _) = codex_card(permission::TOOL, root, ALL_FOUR.to_vec(), None);
+        let (places, warning, note, _) = card.permission_view();
+        assert!(places.contains("the whole filesystem"), "{places}");
+        assert!(warning.contains("whole filesystem"), "{warning}");
+        assert!(
+            !note.contains("session"),
+            "a broad grant is for this turn only: {note}"
+        );
+        assert!(
+            row_buttons(&card.buttons)
+                .iter()
+                .all(|w| !w.has_css_class("suggested-action")),
+            "Allow is not the suggested action"
+        );
+        assert_eq!(card.button_labels()[1], "Deny");
+
+        // The adapter's own warning is shown as written.
+        let mut warned = permission_input(
+            serde_json::json!([entry("write", "/home/me")]),
+            serde_json::json!(null),
+            false,
+        );
+        warned["warning"] = serde_json::json!("This includes your home folder.");
+        let (card, _) = codex_card(permission::TOOL, warned, ALL_FOUR.to_vec(), None);
+        assert!(card.permission_view().1.contains("home folder"));
+    }
+
+    /// Two hundred paths do not make a two-hundred-line card: twelve lines, then Show all.
+    fn permission_lists_are_bounded() {
+        let many: Vec<Value> = (0..200)
+            .map(|i| entry("write", &format!("/w/out/{i:03}")))
+            .collect();
+        let input = permission_input(Value::Array(many), serde_json::json!(null), true);
+        let (card, _) = codex_card(permission::TOOL, input, ALL_FOUR.to_vec(), None);
+        assert_eq!(
+            card.title.text(),
+            "Codex asks to write to 200 places",
+            "the count is in the title"
+        );
+        let shown = card.places.body.text().to_string();
+        assert!(shown.lines().count() <= APPROVAL_VISIBLE_LINES, "{shown}");
+        assert!(shown.ends_with("more lines in Show all"), "{shown}");
+        assert!(card.places.more.is_visible());
+        card.places.more.emit_clicked();
+        assert_eq!(card.places.body.text().lines().count(), 201);
+        assert_eq!(card.places.more.label().as_deref(), Some("Show fewer"));
+        card.places.more.emit_clicked();
+        assert!(card.places.body.text().lines().count() <= APPROVAL_VISIBLE_LINES);
+    }
+
+    /// Buttons wrap instead of setting the transcript's minimum width.
+    pub(crate) fn approval_buttons_wrap() {
+        let (card, _) = codex_card(
+            "command_execution",
+            serde_json::json!({"command": "ls"}),
+            vec![
+                Decision::Allow,
+                Decision::AllowAlways,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel,
+            ],
+            None,
+        );
+        let width = card.root.measure(gtk4::Orientation::Horizontal, -1).0;
+        let buttons_natural = card.buttons.measure(gtk4::Orientation::Horizontal, -1).1;
+        assert!(
+            width < buttons_natural,
+            "the minimum width ({width}) is below the buttons' natural width ({buttons_natural})"
         );
     }
 }
