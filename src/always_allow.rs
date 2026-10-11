@@ -1932,9 +1932,66 @@ impl CodexRead {
     }
 }
 
+/// Whether a linked rules file or folder may be trusted: owned by the user or root, and
+/// neither group- nor world-writable.
+fn owned_safely(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    (meta.uid() == 0 || meta.uid() == me) && meta.mode() & 0o022 == 0
+}
+
+/// Where a `.rules` entry (or the rules folder, `dir`) leads: the entry itself when it is not a
+/// symbolic link (the read then refuses anything but a regular file), else the canonical path
+/// it resolves to, which must be a regular file (or, for `dir`, a folder) that
+/// [`owned_safely`] accepts and, for a file, is not agent-terminal's own export. A dangling
+/// link, a loop, or a link to a FIFO, a device or a file others can write is refused, named.
+fn follow_rules_link(path: &Path, dir: bool) -> Result<PathBuf, String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let is_link = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("{name} cannot be read ({e})"))?
+        .file_type()
+        .is_symlink();
+    if !is_link {
+        return Ok(path.to_path_buf());
+    }
+    let real = std::fs::canonicalize(path)
+        .map_err(|e| format!("{name} is a link that does not resolve ({e})"))?;
+    let meta = std::fs::metadata(&real).map_err(|e| {
+        format!(
+            "{name} links to {} that cannot be read ({e})",
+            real.display()
+        )
+    })?;
+    if !dir
+        && real
+            .file_name()
+            .is_some_and(|n| n == codex_rules::EXPORT_FILE)
+    {
+        return Err(format!("{name} links to agent-terminal's own export"));
+    }
+    let kind_ok = if dir { meta.is_dir() } else { meta.is_file() };
+    if !kind_ok {
+        return Err(format!(
+            "{name} links to {}, which is not a regular {}",
+            real.display(),
+            if dir { "folder" } else { "file" }
+        ));
+    }
+    if !owned_safely(&meta) {
+        return Err(format!(
+            "{name} links to {}, which another user or group can change",
+            real.display()
+        ));
+    }
+    Ok(real)
+}
+
 /// `file`'s text, read without following a link or blocking on a FIFO: the opened descriptor
-/// must be a regular file, and at most `cap` bytes are taken. Blocking I/O.
-fn read_bounded(file: &Path, cap: u64) -> Result<String, String> {
+/// must be a regular file (and, with `owner_checked`, one [`owned_safely`] accepts, so a file
+/// swapped after [`follow_rules_link`] checked it is still refused), and at most `cap` bytes
+/// are taken. Blocking I/O.
+fn read_bounded(file: &Path, cap: u64, owner_checked: bool) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let name = file.file_name().unwrap_or_default().to_string_lossy();
@@ -1942,9 +1999,15 @@ fn read_bounded(file: &Path, cap: u64) -> Result<String, String> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(file)
-        .map_err(|e| format!("{name} cannot be opened ({e}; links are not followed)"))?;
-    if !opened.metadata().is_ok_and(|m| m.is_file()) {
+        .map_err(|e| format!("{name} cannot be opened ({e})"))?;
+    let meta = opened
+        .metadata()
+        .map_err(|e| format!("{name} cannot be read ({e})"))?;
+    if !meta.is_file() {
         return Err(format!("{name} is not a regular file"));
+    }
+    if owner_checked && !owned_safely(&meta) {
+        return Err(format!("{name} can be changed by another user or group"));
     }
     let mut bytes = Vec::new();
     opened
@@ -1966,6 +2029,10 @@ fn read_bounded(file: &Path, cap: u64) -> Result<String, String> {
 /// names why nothing is imported. A missing folder holds nothing. Blocking I/O.
 fn read_codex_rules(target: &CodexTarget) -> Result<CodexRead, String> {
     let dir = target.rules_dir();
+    if std::fs::symlink_metadata(&dir).is_err() {
+        return Ok(CodexRead::default());
+    }
+    let dir = follow_rules_link(&dir, true)?;
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CodexRead::default()),
@@ -1996,7 +2063,8 @@ fn read_codex_rules(target: &CodexTarget) -> Result<CodexRead, String> {
     let mut patterns = 0usize;
     for file in &files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
-        let text = read_bounded(file, CODEX_FILE_CAP)?;
+        let real = follow_rules_link(file, false)?;
+        let text = read_bounded(&real, CODEX_FILE_CAP, real != *file)?;
         total += text.len() as u64;
         if total > CODEX_TOTAL_CAP {
             return Err(format!(
@@ -2302,7 +2370,7 @@ impl AlwaysRules {
         let file = target.export_file();
         let shown = tilde(&file);
         let parsed = match std::fs::symlink_metadata(&file) {
-            Ok(_) => match read_bounded(&file, CODEX_FILE_CAP) {
+            Ok(_) => match read_bounded(&file, CODEX_FILE_CAP, false) {
                 Ok(text) => Some(codex_rules::parse(&text)),
                 Err(_) => {
                     return vec![format!(
@@ -4156,23 +4224,63 @@ host_executable(name="ls", paths=["/bin/ls"])
         std::fs::write(rules_dir.join("c-more.rules"), &half).expect("more");
         assert!(refused("too many patterns").contains("2000"));
         std::fs::remove_file(rules_dir.join("c-more.rules")).expect("rm");
-        // A link or a FIFO is never followed or waited on.
+        // A link is followed only to a regular file the user or root owns that no one else can
+        // change; a FIFO is never waited on.
         std::fs::remove_file(&other).expect("rm");
-        let elsewhere = dir.path().join("elsewhere.rules");
-        std::fs::write(&elsewhere, "prefix_rule([\"cat\"])\n").expect("elsewhere");
+        let elsewhere = dir.path().join("dotfiles-wc.rules");
+        std::fs::write(&elsewhere, "prefix_rule([\"wc\"])\n").expect("elsewhere");
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
         std::os::unix::fs::symlink(&elsewhere, &other).expect("link");
-        refused("a symbolic link");
+        let mut stowed = AlwaysRules::default();
+        let imported = stowed.import_codex_rules(&target);
+        assert_eq!(
+            (imported.added, imported.codex_refused.clone()),
+            (2, None),
+            "a stow-style link is read: {imported:?}"
+        );
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o664))
+            .expect("chmod");
+        assert!(refused("a link to a group-writable file").contains("another user or group"));
         std::fs::remove_file(&other).expect("rm");
+        std::os::unix::fs::symlink(dir.path().join("missing.rules"), &other).expect("dangling");
+        assert!(refused("a dangling link").contains("does not resolve"));
+        std::fs::remove_file(&other).expect("rm");
+        std::os::unix::fs::symlink(&other, &other).expect("loop");
+        refused("a link loop");
+        std::fs::remove_file(&other).expect("rm");
+        std::fs::write(target.export_file(), "prefix_rule([\"uname\"])\n").expect("own");
+        std::os::unix::fs::symlink(target.export_file(), &other).expect("link to own");
+        assert!(refused("a link to our own export").contains("own export"));
+        std::fs::remove_file(&other).expect("rm");
+        std::fs::remove_file(target.export_file()).expect("rm own");
+        let fifo_target = dir.path().join("pipe");
         let fifo = std::process::Command::new("mkfifo")
-            .arg(&other)
+            .arg(&fifo_target)
             .status()
             .is_ok_and(|s| s.success());
         if fifo {
+            std::os::unix::fs::symlink(&fifo_target, &other).expect("link to fifo");
             let started = std::time::Instant::now();
+            assert!(refused("a link to a FIFO").contains("not a regular file"));
+            std::fs::remove_file(&other).expect("rm");
+            std::fs::rename(&fifo_target, &other).expect("fifo in place");
             refused("a FIFO");
             assert!(started.elapsed() < std::time::Duration::from_secs(5));
             std::fs::remove_file(&other).expect("rm");
         }
+        // The rules folder may itself be a link, under the same rules.
+        let real_dir = dir.path().join("dotfiles-rules");
+        std::fs::rename(&rules_dir, &real_dir).expect("move");
+        std::os::unix::fs::symlink(&real_dir, &rules_dir).expect("link dir");
+        std::fs::set_permissions(&real_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let linked = AlwaysRules::default().import_codex_rules(&target);
+        assert_eq!(linked.added, 1, "{linked:?}");
+        std::fs::set_permissions(&real_dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(refused("a link to a world-writable folder").contains("another user or group"));
+        std::fs::set_permissions(&real_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::remove_file(&rules_dir).expect("unlink");
+        std::fs::rename(&real_dir, &rules_dir).expect("move back");
         // With a codex binary, Codex's own parser must load the same set.
         let fake = dir.path().join("fake-codex");
         std::fs::write(&fake, "#!/bin/sh\necho 'policy rejected' >&2\nexit 1\n").expect("fake");
