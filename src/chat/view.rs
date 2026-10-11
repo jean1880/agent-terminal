@@ -18,12 +18,15 @@ mod cards;
 mod composer;
 pub mod demo;
 mod difftext;
+mod form_card;
+mod form_draft;
 mod header;
 mod interruption;
 mod markdown;
 pub mod model;
 mod panels;
 mod payload;
+mod permission;
 mod quick_replies;
 mod subagent_shelf;
 mod subagents;
@@ -360,6 +363,7 @@ impl ChatView {
             inner.header.set_mode(mode);
         }
         inner.header.set_pending_mode(model.pending_mode);
+        inner.header.set_extra_access(model.extra_access());
         inner.composer.set_history(model.user_messages());
         drop(model);
         inner.refresh_status();
@@ -557,6 +561,8 @@ impl Inner {
                 | Event::ApprovalExpired
                 | Event::QuestionRequested { .. }
                 | Event::QuestionResolved { .. }
+                | Event::FormRequested { .. }
+                | Event::FormResolved { .. }
         ) {
             self.refresh_status();
         }
@@ -627,6 +633,8 @@ impl Inner {
         }
         // Model and agent changes arrive as several event kinds; the header is cheap to redo.
         self.refresh_agent_chip();
+        self.header
+            .set_extra_access(self.model.borrow().extra_access());
         self.interruption.update(&self.model.borrow());
     }
 
@@ -880,6 +888,21 @@ impl Inner {
                 self.handle(changes);
                 self.backend.answer_questions(&request, answers);
                 self.composer.grab_focus();
+            }
+            RowEvent::Form {
+                request,
+                action,
+                content,
+            } => {
+                let changes = self.model.borrow_mut().mark_form_sent(&request);
+                self.handle(changes);
+                if self.backend.respond_form(&request, action, content) {
+                    self.composer.grab_focus();
+                } else {
+                    // Refused: the card is answerable again, with a line saying so.
+                    let changes = self.model.borrow_mut().mark_form_refused(&request);
+                    self.handle(changes);
+                }
             }
             RowEvent::QuickReply { text } => self.composer.fill(&text),
             RowEvent::DismissQuickReplies => self.dismiss_quick_replies(),
@@ -1197,8 +1220,17 @@ impl ComposerHost for Inner {
     }
 
     fn placeholder(&self) -> String {
-        if self.model.borrow().pending_interruption().is_some() {
-            "Awaiting approval above...".to_owned()
+        // The question or form is above the composer, and typing is not the way to answer it.
+        let waiting = match self.model.borrow().pending_interruption() {
+            Some(model::PendingInterruption::Approval { .. }) => Some("Awaiting approval above..."),
+            Some(model::PendingInterruption::Question { .. })
+            | Some(model::PendingInterruption::Form { .. }) => {
+                Some("Awaiting your answer above...")
+            }
+            None => None,
+        };
+        if let Some(waiting) = waiting {
+            waiting.to_owned()
         } else {
             placeholder_text(&self.backend.status())
         }
@@ -1808,16 +1840,235 @@ pub(crate) mod tests {
         );
     }
 
+    /// A backend that remembers how the user answered an approval or a form.
+    pub(super) struct AnswerLog {
+        pub(super) status: RefCell<SessionStatus>,
+        pub(super) approvals: RefCell<Vec<(String, Decision)>>,
+        /// Answer `false` to `respond_form`, as an adapter that refused it does.
+        pub(super) refuse: Cell<bool>,
+        pub(super) forms: RefCell<
+            Vec<(
+                String,
+                agent_core::form::FormAction,
+                Option<serde_json::Value>,
+            )>,
+        >,
+    }
+
+    impl AnswerLog {
+        pub(super) fn new(driver: Driver) -> Rc<Self> {
+            Rc::new(Self {
+                status: RefCell::new(status_of(driver)),
+                approvals: RefCell::default(),
+                refuse: Cell::new(false),
+                forms: RefCell::default(),
+            })
+        }
+    }
+
+    impl ChatBackend for AnswerLog {
+        fn send_prompt(&self, _: &str) {}
+        fn interrupt(&self) {}
+        fn respond_approval(&self, request: &str, decision: Decision) {
+            self.approvals
+                .borrow_mut()
+                .push((request.to_owned(), decision));
+        }
+        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
+        fn respond_form(
+            &self,
+            request: &str,
+            action: agent_core::form::FormAction,
+            content: Option<serde_json::Value>,
+        ) -> bool {
+            self.forms
+                .borrow_mut()
+                .push((request.to_owned(), action, content));
+            !self.refuse.get()
+        }
+        fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
+        fn reload_session(&self) {}
+        fn set_mode(&self, _: Mode) {}
+        fn control(&self, _: Control) -> String {
+            String::new()
+        }
+        fn status(&self) -> SessionStatus {
+            self.status.borrow().clone()
+        }
+    }
+
+    /// Forms and permission requests through the whole view: the shelf, the thread's status,
+    /// the composer's hint, the answer reaching the backend, and the "Extra access" chip.
+    pub(crate) fn requests_ui_checks() {
+        use agent_core::form::{FieldInput, Form, FormAction, FormField};
+        use serde_json::json;
+
+        let backend = AnswerLog::new(Driver::Codex);
+        let view = ChatView::new(backend.clone());
+        let inner = view.inner().expect("inner");
+        let hint = || inner.composer.placeholder_text();
+        let form_row = |id: &str| {
+            inner.transcript.with_row(id, |row| match row {
+                cards::Row::Form(card) => Some((card.entry(0), card.status(), card.buttons())),
+                _ => None,
+            })
+        };
+
+        view.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: "Which repo?".into(),
+                form: Form::Fields {
+                    fields: vec![FormField {
+                        name: "repo_name".into(),
+                        title: None,
+                        description: None,
+                        required: true,
+                        input: FieldInput::Text {
+                            format: None,
+                            min_length: None,
+                            max_length: None,
+                            default: None,
+                        },
+                    }],
+                },
+            })
+            .request("f"),
+        );
+        assert!(
+            inner.interruption.revealer.reveals_child(),
+            "a form is a shelf entry"
+        );
+        assert_eq!(
+            inner.header.activity_shown().as_deref(),
+            Some("Needs your answer")
+        );
+        assert!(hint().starts_with("Awaiting your answer"), "{}", hint());
+        let (entry, status, buttons) = form_row("form:f").flatten().expect("form card");
+        assert_eq!(status, "Fill in Repo name");
+        assert_eq!(buttons, ["Submit", "Decline"]);
+        let entry = entry.expect("entry");
+        entry.emit_activate();
+        assert!(backend.forms.borrow().is_empty(), "invalid: nothing sent");
+        entry.set_text("octo");
+        // An answer the adapter refuses must not strand the card at "Sending…".
+        backend.refuse.set(true);
+        entry.emit_activate();
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+        assert_eq!(backend.forms.borrow().len(), 1, "it was tried");
+        let refusal = inner
+            .transcript
+            .with_row("form:f", |row| match row {
+                cards::Row::Form(card) => Some((card.refusal(), card.buttons())),
+                _ => None,
+            })
+            .flatten()
+            .expect("form card");
+        assert_eq!(
+            refusal.0.as_deref(),
+            Some("Codex did not accept that answer. Try again, or decline.")
+        );
+        assert_eq!(refusal.1, ["Submit", "Decline"], "answerable again");
+        assert!(
+            inner.interruption.revealer.reveals_child(),
+            "still waiting on the user"
+        );
+        backend.refuse.set(false);
+        entry.emit_activate();
+        assert_eq!(
+            backend.forms.borrow()[1],
+            (
+                "f".to_owned(),
+                FormAction::Accept,
+                Some(json!({"repo_name": "octo"}))
+            )
+        );
+        assert!(
+            !inner.interruption.revealer.reveals_child(),
+            "answered: the shelf lets go"
+        );
+        view.apply(
+            &Envelope::new(Event::FormResolved {
+                action: FormAction::Accept,
+            })
+            .request("f"),
+        );
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+        let (_, status, buttons) = form_row("form:f").flatten().expect("form card");
+        assert_eq!((status.as_str(), buttons.len()), ("Submitted", 0));
+        assert!(hint().starts_with("Message Codex"), "{}", hint());
+
+        // A permission request answered for the session: one click, no rule, and a chip.
+        view.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "codex_permissions".into(),
+                title: Some("Codex asks to write to 1 place".into()),
+                input: json!({
+                    "cwd": "/w", "reason": null, "renderable": true,
+                    "entries": [{"access": "write", "target": {"kind": "path", "path": "/w/out"}}],
+                    "network": null, "session_allowed": true, "warning": null, "requested": {}
+                }),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::Deny,
+                    Decision::Cancel,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("p"),
+        );
+        assert!(
+            inner.header.extra_access_shown().is_none(),
+            "nothing granted yet"
+        );
+        assert!(!inner.interruption.allow_btn.is_visible());
+        let pressed = inner.transcript.with_row("approval:p", |row| match row {
+            cards::Row::Approval(card) => Some(card.press("Allow for this session")),
+            _ => None,
+        });
+        assert_eq!(pressed, Some(Some(true)));
+        assert_eq!(
+            *backend.approvals.borrow(),
+            [("p".to_owned(), Decision::AllowForSession)]
+        );
+        view.apply(
+            &Envelope::new(Event::ApprovalResolved {
+                decision: Decision::AllowForSession,
+            })
+            .request("p"),
+        );
+        let (list, tip) = inner.header.extra_access_shown().expect("the chip shows");
+        assert_eq!(list, "Write: /w/out");
+        assert!(tip.contains("Write: /w/out"), "{tip}");
+        view.apply(&Envelope::new(Event::SessionStarted {
+            native_id: "n2".into(),
+            model: None,
+            cwd: None,
+        }));
+        assert!(
+            inner.header.extra_access_shown().is_none(),
+            "a new Codex process forgets the grant"
+        );
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
         model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();
+        interruption::tests::the_shelf_holds_requests_it_must_not_grant_unseen();
+        requests_ui_checks();
         thinking_strip_follows_the_turn();
         composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
         panels::tests::changing_effort_does_not_switch_until_row_activation();
         usage::tests::compact_scope_does_not_filter_provider_comparison();
         cards::tests::file_changes_and_permission_details_have_distinct_actions();
+        form_card::tests::form_and_link_cards();
         cards::tests::click_targets_hold_no_selectable_labels();
         cards::tests::blocks_copy_and_long_output_shows_full();
         whole_view_has_no_dead_click_targets();
