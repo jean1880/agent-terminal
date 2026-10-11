@@ -911,9 +911,38 @@ impl ServerInner {
     fn emit(&self, env: Envelope) {
         let sink = self.sink.borrow().clone();
         if let Some(sink) = sink {
-            sink(env);
+            sink(masked_for_view(env));
         }
     }
+}
+
+/// An approval request with every secret masked (title, input, reason, raw), for the view. The
+/// answer path keeps the unmasked call; only what is shown is scrubbed. Other events pass
+/// through. Masking is idempotent.
+pub(crate) fn masked_for_view(env: Envelope) -> Envelope {
+    if !matches!(env.event, Event::ApprovalRequested { .. }) {
+        return env;
+    }
+    agent_kit::store::scrub_envelope(env.clone()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not mask an approval request");
+        // Fail closed: keep the tool and the buttons, drop everything free-form.
+        let mut env = env;
+        if let Event::ApprovalRequested {
+            title,
+            input,
+            reason,
+            remembers,
+            ..
+        } = &mut env.event
+        {
+            *title = None;
+            *input = Value::Null;
+            *reason = None;
+            *remembers = None;
+        }
+        env.raw = None;
+        env
+    })
 }
 
 fn spawn_accept_loop(weak: Weak<ServerInner>, listener: gio::SocketListener) {

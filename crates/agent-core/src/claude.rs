@@ -1028,6 +1028,12 @@ impl Adapter for ClaudeAdapter {
         &self.caps
     }
 
+    fn pending_request_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.pending.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     fn argv(&self, session: &OpenSession) -> Vec<String> {
         let mut argv = vec![session.program.clone()];
         argv.extend(session.extra_args.iter().cloned());

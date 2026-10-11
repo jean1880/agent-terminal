@@ -314,6 +314,12 @@ impl AgentTerminalWindow {
             return;
         };
         let title = self.thread_title_of(&thread);
+        // The new thread keeps this one's mode; only a thread with no session yet falls back to
+        // the profile's.
+        let mode = self
+            .slot_of(&thread)
+            .and_then(|s| s.get())
+            .map(|s| s.wanted_mode());
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let loaded = store_job({
@@ -345,6 +351,7 @@ impl AgentTerminalWindow {
                 effort,
                 title: Some(continued_title(&title, driver)),
                 handoff: Some((handoff, format!("“{title}”"))),
+                mode,
                 ..NewThread::new(driver)
             });
         });
