@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use agent_core::adapter::{Driver, Mode};
 use agent_core::event::{
     BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
-    Question, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind,
-    TurnState, WorkerSnapshot, WorkerState,
+    Question, QuestionSource, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus,
+    StreamKind, TurnState, WorkerSnapshot, WorkerState,
 };
 use serde_json::Value;
 
@@ -70,6 +70,9 @@ pub enum Body {
     },
     Approval(Approval),
     Question(QuestionCard),
+    /// Quick replies under the reply that ended with a question. Not an interruption: it is
+    /// never a [`PendingInterruption`], and nothing waits for it.
+    QuickReplies(QuickReplies),
     /// The provider's last step statuses, retained in history after the active tracker retires.
     Plan {
         steps: Vec<PlanStep>,
@@ -348,6 +351,15 @@ pub struct QuestionCard {
     pub state: QuestionState,
 }
 
+/// The choices a reply ended with ([`agent_core::event::QuestionSource::Reply`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuickReplies {
+    /// `reply:<assistant item id>`.
+    pub request: String,
+    /// Each option as rendered plain text: exactly what a chip puts in the composer.
+    pub options: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionState {
     Pending,
@@ -604,6 +616,53 @@ impl Transcript {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Shows the choices a reply ended with, replacing any chips still showing. Nothing pends on
+    /// them: they are no [`PendingInterruption`], no request is registered, and a question
+    /// without options offers nothing.
+    fn offer_quick_replies(
+        &mut self,
+        request: Option<&str>,
+        questions: &[Question],
+    ) -> Vec<Change> {
+        let mut out = self.dismiss_quick_replies();
+        let options: Vec<String> = questions
+            .first()
+            .map(|q| q.options.iter().map(|o| o.label.clone()).collect())
+            .unwrap_or_default();
+        if options.is_empty() {
+            return out;
+        }
+        let request = request.map_or_else(|| self.next_id("reply"), str::to_owned);
+        let id = format!("replies:{request}");
+        let body = Body::QuickReplies(QuickReplies { request, options });
+        out.push(Change::Added(self.insert(id, body, None)));
+        out
+    }
+
+    /// Takes the quick-reply chips away (the user sent a prompt, a turn began, or they chose
+    /// Dismiss).
+    pub fn dismiss_quick_replies(&mut self) -> Vec<Change> {
+        let ids: Vec<ItemId> = self
+            .order
+            .iter()
+            .filter(|id| {
+                self.items
+                    .get(*id)
+                    .is_some_and(|i| matches!(i.body, Body::QuickReplies(_)))
+            })
+            .cloned()
+            .collect();
+        ids.iter().flat_map(|id| self.remove_item(id)).collect()
+    }
+
+    /// Whether quick-reply chips are showing.
+    #[cfg(test)]
+    fn has_quick_replies(&self) -> bool {
+        self.items
+            .values()
+            .any(|i| matches!(i.body, Body::QuickReplies(_)))
     }
 
     /// Removes an item from the transcript (e.g. popping a queued user message).
@@ -1215,6 +1274,8 @@ impl Transcript {
                 // A later turn never resurrects the preceding turn's active shelf.
                 out.extend(self.retire_plan(None));
                 self.last_outcome = None;
+                // The quick replies answered the last turn's reply; a new turn replaces them.
+                out.extend(self.dismiss_quick_replies());
                 if self.last_driver.is_none() {
                     self.on_driver(driver);
                 }
@@ -1311,6 +1372,10 @@ impl Transcript {
                         }
                     }
                     return out;
+                }
+                if *kind == ItemKind::UserMessage {
+                    // Whatever the user sends supersedes the suggestions, typed or not.
+                    out.extend(self.dismiss_quick_replies());
                 }
                 let body = match kind {
                     ItemKind::UserMessage => {
@@ -1505,6 +1570,10 @@ impl Transcript {
                     }
                 }));
             }
+            Event::QuestionRequested {
+                questions,
+                source: QuestionSource::Reply,
+            } => out.extend(self.offer_quick_replies(env.request.as_deref(), questions)),
             Event::QuestionRequested { questions, .. } => {
                 let request = env.request.clone().unwrap_or_else(|| self.next_id("req"));
                 if self.requests.contains_key(&request) {
@@ -2852,6 +2921,143 @@ mod tests {
             Body::Question(q) => assert_eq!(q.state, QuestionState::Answered),
             _ => panic!("not a question"),
         }
+    }
+
+    fn reply_chips(request: &str, options: &[&str]) -> Envelope {
+        ev(Event::QuestionRequested {
+            questions: vec![Question {
+                id: "reply".into(),
+                header: "Quick replies".into(),
+                question: "Which?".into(),
+                options: options
+                    .iter()
+                    .map(|o| agent_core::event::QuestionOption {
+                        label: (*o).into(),
+                        description: None,
+                    })
+                    .collect(),
+                multi_select: false,
+            }],
+            source: QuestionSource::Reply,
+        })
+        .request(request)
+    }
+
+    /// A transcript with one finished reply and quick replies under it.
+    fn with_chips() -> Transcript {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        t.apply(
+            &started("a1", ItemKind::AssistantMessage, None),
+            Driver::Codex,
+        );
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+            Driver::Codex,
+        );
+        t.apply(
+            &reply_chips("reply:a1", &["Keep it", "Drop it"]),
+            Driver::Codex,
+        );
+        t
+    }
+
+    /// A reply question is not an interruption: no shelf entry, no NeedsAnswer, and the thread
+    /// reads as idle. (The old behaviour rendered every `QuestionRequested` as a pending card.)
+    #[test]
+    fn a_reply_question_is_not_an_interruption() {
+        let t = with_chips();
+        assert!(t.has_quick_replies());
+        assert_eq!(t.pending_interruption(), None);
+        assert!(!matches!(t.activity(false), Activity::NeedsAnswer));
+        assert!(t
+            .order()
+            .iter()
+            .all(|id| !matches!(t.get(id).map(|i| &i.body), Some(Body::Question(_)))));
+        // An agent's own question still is one.
+        let mut t = t;
+        t.apply(
+            &ev(Event::QuestionRequested {
+                questions: vec![],
+                source: QuestionSource::Agent,
+            })
+            .request("q"),
+            Driver::Codex,
+        );
+        assert!(matches!(
+            t.pending_interruption(),
+            Some(PendingInterruption::Question { .. })
+        ));
+    }
+
+    #[test]
+    fn the_chips_hold_the_option_text_exactly_and_replace_earlier_ones() {
+        let mut t = with_chips();
+        t.apply(
+            &reply_chips("reply:a2", &["One", "Two", "Three"]),
+            Driver::Codex,
+        );
+        let chips: Vec<_> = t
+            .order()
+            .iter()
+            .filter_map(|id| match &t.get(id)?.body {
+                Body::QuickReplies(q) => Some((q.request.clone(), q.options.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chips,
+            vec![(
+                "reply:a2".to_owned(),
+                vec!["One".to_owned(), "Two".to_owned(), "Three".to_owned()]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_question_with_no_options_offers_nothing() {
+        let mut t = Transcript::new();
+        t.apply(&reply_chips("reply:a1", &[]), Driver::Codex);
+        assert!(!t.has_quick_replies());
+    }
+
+    #[test]
+    fn the_chips_go_when_the_user_sends_a_prompt() {
+        let mut t = with_chips();
+        let changes = t.apply(&started("u1", ItemKind::UserMessage, None), Driver::Codex);
+        assert!(!t.has_quick_replies());
+        assert!(changes.iter().any(|c| matches!(c, Change::Removed(_))));
+    }
+
+    #[test]
+    fn the_chips_go_when_a_new_turn_starts() {
+        let mut t = with_chips();
+        let changes = t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        assert!(!t.has_quick_replies());
+        assert!(changes.iter().any(|c| matches!(c, Change::Removed(_))));
+    }
+
+    #[test]
+    fn dismiss_takes_the_chips_away_and_a_second_dismiss_is_a_no_op() {
+        let mut t = with_chips();
+        assert_eq!(t.dismiss_quick_replies().len(), 1);
+        assert!(!t.has_quick_replies());
+        assert!(t.dismiss_quick_replies().is_empty());
+    }
+
+    #[test]
+    fn a_replayed_start_of_an_existing_prompt_leaves_the_chips() {
+        // History replays events the transcript already holds; only a new prompt supersedes.
+        let mut t = Transcript::new();
+        t.apply(&started("u1", ItemKind::UserMessage, None), Driver::Codex);
+        t.apply(&reply_chips("reply:a1", &["A", "B"]), Driver::Codex);
+        t.apply(&started("u1", ItemKind::UserMessage, None), Driver::Codex);
+        assert!(t.has_quick_replies());
     }
 
     /// What a reduced thread shows of its agents: who each reply is credited to, and each

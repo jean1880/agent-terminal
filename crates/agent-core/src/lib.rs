@@ -18,6 +18,7 @@ pub mod event;
 pub mod form;
 pub mod handoff_budget;
 pub mod import;
+pub mod question_extract;
 pub mod quota;
 pub mod redact;
 pub mod tool_title;
