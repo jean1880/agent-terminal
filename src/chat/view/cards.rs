@@ -1439,7 +1439,8 @@ pub fn decision_label(d: Decision) -> &'static str {
         Decision::AllowForSession => "Allow for session",
         Decision::AllowAlways => "Always allow",
         Decision::Deny => "Deny",
-        Decision::Cancel => "Cancel",
+        // Ends the whole turn (Codex `cancel`); Deny lets the agent see the refusal and go on.
+        Decision::Cancel => "Stop turn",
     }
 }
 
@@ -1449,7 +1450,7 @@ fn decision_outcome(d: Decision) -> &'static str {
         Decision::AllowForSession => "Allowed for this session",
         Decision::AllowAlways => "Always allowed here",
         Decision::Deny => "Denied",
-        Decision::Cancel => "Cancelled",
+        Decision::Cancel => "Turn stopped",
     }
 }
 
@@ -1709,8 +1710,15 @@ impl ApprovalCard {
             }
         }
 
-        for class in ["pending", "resolved", "expired"] {
+        for class in ["pending", "resolved", "expired", "denied"] {
             self.root.remove_css_class(class);
+        }
+        // A refusal is never shown in the "allowed" green (F12).
+        if matches!(
+            a.state,
+            ApprovalState::Resolved(Decision::Deny | Decision::Cancel)
+        ) {
+            self.root.add_css_class("denied");
         }
         let (class, outcome, sensitive, show_buttons) = match a.state {
             ApprovalState::Pending => ("pending", String::new(), true, true),
@@ -2355,6 +2363,107 @@ pub(crate) mod tests {
             "scope explanation is retained"
         );
         chat_labels_are_selectable();
+        codex_approval_card_checks();
+    }
+
+    /// A Codex-shaped approval: one card, `transcript` resolved by `resolution` (or pending).
+    fn codex_card(
+        tool: &str,
+        input: Value,
+        options: Vec<Decision>,
+        resolution: Option<Decision>,
+    ) -> (ApprovalCard, Rc<RefCell<Vec<RowEvent>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let sink: RowSink = Rc::new(move |event| received.borrow_mut().push(event));
+        let mut transcript = super::super::model::Transcript::new();
+        transcript.apply(
+            &agent_core::event::Envelope::new(agent_core::event::Event::ApprovalRequested {
+                tool: tool.into(),
+                title: None,
+                input,
+                reason: None,
+                options,
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("c"),
+            Driver::Codex,
+        );
+        if let Some(decision) = resolution {
+            transcript.apply(
+                &agent_core::event::Envelope::new(agent_core::event::Event::ApprovalResolved {
+                    decision,
+                })
+                .request("c"),
+                Driver::Codex,
+            );
+        }
+        let card = ApprovalCard::new(&sink);
+        card.update(transcript.get("approval:c").expect("approval card"));
+        (card, events)
+    }
+
+    fn direct_labels(card: &ApprovalCard) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut child = card.buttons.first_child();
+        while let Some(w) = child {
+            if let Some(b) = w.downcast_ref::<gtk4::Button>() {
+                labels.push(b.label().map(|l| l.to_string()).unwrap_or_default());
+            }
+            child = w.next_sibling();
+        }
+        labels
+    }
+
+    /// Plan W2: Codex cards carry Deny and a separate Stop turn; a refusal is styled as one.
+    fn codex_approval_card_checks() {
+        let all = vec![
+            Decision::Allow,
+            Decision::AllowAlways,
+            Decision::AllowForSession,
+            Decision::Deny,
+            Decision::Cancel,
+        ];
+        let shell = serde_json::json!({"command": "/usr/bin/zsh -lc 'ls -la'", "cwd": "/w"});
+        let (card, events) = codex_card("command_execution", shell.clone(), all.clone(), None);
+        assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
+        let stop = card
+            .buttons
+            .first_child()
+            .and_downcast::<gtk4::Button>()
+            .expect("stop turn");
+        stop.emit_clicked();
+        assert!(matches!(
+            events.borrow().last(),
+            Some(RowEvent::Approve {
+                decision: Decision::Cancel,
+                ..
+            })
+        ));
+        for (decision, denied, outcome) in [
+            (Decision::Deny, true, "Denied"),
+            (Decision::Cancel, true, "Turn stopped"),
+            (Decision::Allow, false, "Allowed once"),
+        ] {
+            let (card, _) = codex_card(
+                "command_execution",
+                shell.clone(),
+                all.clone(),
+                Some(decision),
+            );
+            assert_eq!(card.root.has_css_class("denied"), denied, "{outcome}");
+            assert_eq!(card.outcome.text(), outcome);
+        }
+        // A patch approval carries the change its item started with: shown as a diff.
+        let edit = serde_json::json!({"itemId": "e", "changes": [
+            {"path": "/w/fixture.txt", "kind": {"type": "update"},
+             "diff": "@@ -1 +1 @@\n-hello world\n+hello there\n"}]});
+        let (card, _) = codex_card("file_change", edit, all, None);
+        let (files, diff_shown, _, diff) = card.diff_view();
+        assert!(files.contains("/w/fixture.txt"), "{files}");
+        assert!(diff_shown && diff.contains("hello there"), "{diff}");
+        assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
     }
 
     #[test]
