@@ -182,6 +182,46 @@ fn env_file_ok(text: &str) -> bool {
     text.is_empty() || std::path::Path::new(&crate::utils::expand_tilde(text)).is_file()
 }
 
+/// Where Codex's rules are, resolved as the Codex threads would ([`crate::codex_home`]: the
+/// Codex profile's env file, then `clear_env`, then the app's own variable), with the binary
+/// that checks an export. Off the main thread (the env file is sourced by a shell). `Err`: why
+/// it cannot be known (always under test: no test reads the real `~/.codex`).
+async fn codex_target(
+    (profile, clear): (Profile, Vec<String>),
+) -> Result<crate::always_allow::CodexTarget, String> {
+    let Some((inherited, home)) = crate::codex_home::process_inputs() else {
+        return Err("Codex's folder is not resolved under test".to_owned());
+    };
+    let resolved = super::threads::resolve_agent(profile).await;
+    let home =
+        crate::codex_home::resolve(&resolved.env, &clear, inherited.as_deref(), home.as_deref())?;
+    Ok(crate::always_allow::CodexTarget {
+        home,
+        program: resolved.program.map(std::path::PathBuf::from),
+        env: resolved.env,
+    })
+}
+
+/// What the rules list shows, read off the main thread.
+struct RulesView {
+    rules: crate::always_allow::AlwaysRules,
+    /// Why the rules file cannot be used, if it cannot.
+    blocked: Option<String>,
+    status: crate::always_allow::PermissionSyncStatus,
+    /// The export confirmation's text.
+    warning: String,
+}
+
+/// What the agent files are called in Settings, Codex included only when it is a source and
+/// target.
+fn source_names(codex: bool) -> &'static str {
+    if codex {
+        "Claude, Antigravity, Codex and permissions.toml"
+    } else {
+        "Claude, Antigravity and permissions.toml"
+    }
+}
+
 impl AgentTerminalWindow {
     /// The permission files the user named in Settings, `~/` expanded.
     fn permission_sources(&self) -> Vec<std::path::PathBuf> {
@@ -197,53 +237,83 @@ impl AgentTerminalWindow {
         let sources = self.permission_sources();
         let obj = self.obj().downgrade();
         let target = path.clone();
-        Self::store_job(
-            move || crate::always_allow::AlwaysRules::import_into(&target, &sources),
-            move |result| {
-                if let Some(obj) = obj.upgrade() {
-                    let imp = obj.imp();
-                    match result {
-                        Some(Ok(imported)) => imp.show_toast(&imported.summary()),
-                        Some(Err(e)) => {
-                            imp.show_toast(&crate::always_allow::blocked_notice(&path, &e))
+        let codex_inputs = self.codex_inputs();
+        glib::spawn_future_local(async move {
+            let codex = codex_target(codex_inputs).await.ok();
+            Self::store_job(
+                move || {
+                    crate::always_allow::AlwaysRules::import_into(&target, &sources, codex.as_ref())
+                },
+                move |result| {
+                    if let Some(obj) = obj.upgrade() {
+                        let imp = obj.imp();
+                        match result {
+                            Some(Ok(imported)) => imp.show_toast(&imported.summary()),
+                            Some(Err(e)) => {
+                                imp.show_toast(&crate::always_allow::blocked_notice(&path, &e))
+                            }
+                            None => imp.show_toast("The import did not finish"),
                         }
-                        None => imp.show_toast("The import did not finish"),
                     }
-                }
-                done();
-            },
-        );
+                    done();
+                },
+            );
+        });
     }
 
     /// Exports the global rules off the main thread (the caller has shown
-    /// [`crate::always_allow::EXPORT_WARNING`]). `done` runs on the main thread once the job has
-    /// finished.
+    /// [`crate::always_allow::export_warning`]), Codex's file included when Codex's folder
+    /// resolves. `done` runs on the main thread once the job has finished.
     fn export_rules(&self, path: &std::path::Path, done: impl FnOnce() + 'static) {
         let path = path.to_owned();
         let sources = self.permission_sources();
         let obj = self.obj().downgrade();
         let target = path.clone();
-        Self::store_job(
-            move || crate::always_allow::AlwaysRules::export_from(&target, &sources),
-            move |result| {
-                if let Some(obj) = obj.upgrade() {
-                    let imp = obj.imp();
-                    match result {
-                        Some(Ok(0)) => {
-                            imp.show_toast("Agent configurations are already up to date")
+        let codex_inputs = self.codex_inputs();
+        glib::spawn_future_local(async move {
+            let codex = codex_target(codex_inputs).await;
+            let unresolved = codex.as_ref().err().cloned();
+            let codex = codex.ok();
+            Self::store_job(
+                move || {
+                    crate::always_allow::AlwaysRules::export_from(&target, &sources, codex.as_ref())
+                },
+                move |result| {
+                    if let Some(obj) = obj.upgrade() {
+                        let imp = obj.imp();
+                        match result {
+                            Some(Ok(exported)) => {
+                                let mut text = exported.summary();
+                                if let Some(reason) = unresolved {
+                                    text.push_str(&format!(
+                                        ". Codex rules were not exported: {reason}"
+                                    ));
+                                }
+                                imp.show_toast(&text)
+                            }
+                            Some(Err(e)) => {
+                                imp.show_toast(&crate::always_allow::blocked_notice(&path, &e))
+                            }
+                            None => imp.show_toast("The export did not finish"),
                         }
-                        Some(Ok(n)) => imp.show_toast(&format!(
-                            "Exported {n} global rules to agent configurations"
-                        )),
-                        Some(Err(e)) => {
-                            imp.show_toast(&crate::always_allow::blocked_notice(&path, &e))
-                        }
-                        None => imp.show_toast("The export did not finish"),
                     }
-                }
-                done();
-            },
-        );
+                    done();
+                },
+            );
+        });
+    }
+
+    /// What resolving Codex's folder needs from the config: the Codex profile (its command and
+    /// env file) and `clear_env`.
+    fn codex_inputs(&self) -> (Profile, Vec<String>) {
+        let config = self.config.borrow();
+        (
+            config
+                .agent_profile(Driver::Codex)
+                .cloned()
+                .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Codex)),
+            config.clear_env.clone(),
+        )
     }
 
     /// Runs a rules-store `job` on a worker thread (it may wait for the store lock) and
@@ -549,6 +619,18 @@ impl AgentTerminalWindow {
             .css_classes(["pill"])
             .build();
 
+        // Codex's rules folder, as the Codex threads resolve it: shown so the user can see
+        // where import reads and export writes.
+        let codex_row = adw::ActionRow::builder()
+            .title("Codex Rules")
+            .use_markup(false)
+            .subtitle("Looking for Codex's rules folder…")
+            .subtitle_selectable(true)
+            .build();
+
+        // What the export confirmation says, counts included, from the newest check.
+        let export_text = Rc::new(RefCell::new(crate::always_allow::EXPORT_WARNING.to_owned()));
+
         // The rules file and the permission files are read off the main thread; only the newest
         // result is shown.
         let sync_generation = Rc::new(std::cell::Cell::new(0u64));
@@ -566,17 +648,23 @@ impl AgentTerminalWindow {
             #[weak]
             manage_row,
             #[weak]
+            codex_row,
+            #[weak]
             obj,
             #[strong]
             sync_generation,
+            #[strong]
+            export_text,
             move || {
                 let Some(path) = crate::always_allow::path() else {
                     return;
                 };
                 let sources = obj.imp().permission_sources();
+                let codex_inputs = obj.imp().codex_inputs();
                 let current = sync_generation.get().wrapping_add(1);
                 sync_generation.set(current);
                 let sync_generation = sync_generation.clone();
+                let export_text = export_text.clone();
                 glib::spawn_future_local(glib::clone!(
                     #[weak]
                     warning_row,
@@ -590,7 +678,10 @@ impl AgentTerminalWindow {
                     export_btn,
                     #[weak]
                     manage_row,
+                    #[weak]
+                    codex_row,
                     async move {
+                        let codex = codex_target(codex_inputs).await;
                         let computed = gtk4::gio::spawn_blocking(move || {
                             // An unusable file is named, never shown as "0 rules".
                             let opened = crate::always_allow::AlwaysRules::open(&path);
@@ -599,11 +690,29 @@ impl AgentTerminalWindow {
                                 .err()
                                 .map(|e| crate::always_allow::blocked_notice(&path, e));
                             let rules = opened.unwrap_or_default();
-                            let status = rules.check_sync_status(None, &sources);
-                            (rules.rules.len(), blocked, status)
+                            let target = codex.as_ref().ok();
+                            let status = rules.check_sync_status(None, &sources, target);
+                            let available = target.is_some_and(|t| t.available());
+                            let plan = rules.codex_plan();
+                            let warning = crate::always_allow::export_warning(
+                                target.filter(|_| available).map(|t| (t, &plan)),
+                            );
+                            let described = match &codex {
+                                Ok(t) => t.describe(),
+                                Err(reason) => format!("Codex's rules folder is unknown: {reason}"),
+                            };
+                            (
+                                rules.rules.len(),
+                                blocked,
+                                status,
+                                available,
+                                warning,
+                                described,
+                            )
                         })
                         .await;
-                        let Ok((count, blocked, status)) = computed else {
+                        let Ok((count, blocked, status, available, warning, described)) = computed
+                        else {
                             return;
                         };
                         if sync_generation.get() != current {
@@ -615,8 +724,11 @@ impl AgentTerminalWindow {
                                 crate::always_allow::FILE_NAME
                             )
                         }));
+                        codex_row.set_subtitle(&described);
+                        *export_text.borrow_mut() = warning;
                         Self::update_sync_indicator(
                             &status,
+                            available,
                             &warning_row,
                             &import_row,
                             &import_btn,
@@ -752,11 +864,13 @@ impl AgentTerminalWindow {
         export_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
+            #[strong]
+            export_text,
             move |clicked| {
                 let Some(btn) = export_btn_weak.upgrade() else {
                     return;
                 };
-                if !confirm_export_first(clicked) {
+                if !confirm_export_first(clicked, &export_text.borrow()) {
                     return;
                 }
                 btn.set_sensitive(false);
@@ -781,6 +895,7 @@ impl AgentTerminalWindow {
         ));
         export_row.add_suffix(&export_btn);
         group.add(&export_row);
+        group.add(&codex_row);
 
         let on_sync = sync_cb.clone();
         manage_btn.connect_clicked(glib::clone!(
@@ -799,12 +914,24 @@ impl AgentTerminalWindow {
 
     fn update_sync_indicator(
         status: &crate::always_allow::PermissionSyncStatus,
+        codex: bool,
         warning_row: &adw::ActionRow,
         import_row: &adw::ActionRow,
         import_btn: &gtk4::Button,
         export_row: &adw::ActionRow,
         export_btn: &gtk4::Button,
     ) {
+        let import_idle = format!(
+            "One-way import: pull allowlisted commands and tools from {}",
+            source_names(codex)
+        );
+        let export_idle = if codex {
+            "One-way export: push Agent Terminal's saved rules to permissions.toml, agent \
+             configurations and Codex's agent-terminal.rules"
+        } else {
+            "One-way export: push Agent Terminal's saved rules to permissions.toml and agent \
+             configurations"
+        };
         if status.is_out_of_sync() {
             warning_row.set_subtitle(&status.summary());
             warning_row.set_visible(true);
@@ -812,21 +939,20 @@ impl AgentTerminalWindow {
             if status.unimported_count > 0 {
                 import_row.add_css_class("warning");
                 import_row.set_subtitle(&format!(
-                    "One-way import: pull {} unimported rule{} from agent configurations",
+                    "One-way import: pull {} unimported rule{} from {}",
                     status.unimported_count,
                     if status.unimported_count == 1 {
-                        " is"
+                        ""
                     } else {
-                        "s are"
-                    }
+                        "s"
+                    },
+                    source_names(codex)
                 ));
                 import_btn.set_sensitive(true);
                 import_btn.set_label("Import Now");
             } else {
                 import_row.remove_css_class("warning");
-                import_row.set_subtitle(
-                    "One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml",
-                );
+                import_row.set_subtitle(&import_idle);
                 import_btn.set_sensitive(false);
                 import_btn.set_label("Synced");
             }
@@ -846,37 +972,56 @@ impl AgentTerminalWindow {
                 export_btn.set_label("Export Now");
             } else {
                 export_row.remove_css_class("warning");
-                export_row.set_subtitle(
-                    "One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations",
-                );
+                export_row.set_subtitle(export_idle);
                 export_btn.set_sensitive(false);
                 export_btn.set_label("Synced");
             }
         } else {
             warning_row.set_visible(false);
             import_row.remove_css_class("warning");
-            import_row.set_subtitle(
-                "One-way import: pull allowlisted commands and tools from Claude, Antigravity, and permissions.toml",
-            );
+            import_row.set_subtitle(&import_idle);
             import_btn.set_sensitive(false);
             import_btn.set_label("Synced");
 
             export_row.remove_css_class("warning");
-            export_row.set_subtitle(
-                "One-way export: push Agent Terminal's saved rules to permissions.toml and agent configurations",
-            );
+            export_row.set_subtitle(export_idle);
             export_btn.set_sensitive(false);
             export_btn.set_label("Synced");
         }
     }
 
+    /// Lists the differences between the rules file and every agent's own (Codex's folder
+    /// included when it resolves), read off the main thread.
     fn show_sync_differences_dialog(&self, parent: &gtk4::Widget, _on_sync: Rc<dyn Fn()>) {
         let Some(path) = crate::always_allow::path() else {
             return;
         };
-        let rules = crate::always_allow::AlwaysRules::load(&path);
-        let status = rules.check_sync_status(None, &self.permission_sources());
+        let sources = self.permission_sources();
+        let codex_inputs = self.codex_inputs();
+        let parent = parent.downgrade();
+        glib::spawn_future_local(async move {
+            let codex = codex_target(codex_inputs).await.ok();
+            let computed = gtk4::gio::spawn_blocking(move || {
+                let rules = crate::always_allow::AlwaysRules::load(&path);
+                let available = codex.as_ref().is_some_and(|t| t.available());
+                (
+                    rules.check_sync_status(None, &sources, codex.as_ref()),
+                    available,
+                )
+            })
+            .await;
+            let (Ok((status, codex)), Some(parent)) = (computed, parent.upgrade()) else {
+                return;
+            };
+            Self::present_sync_differences(&parent, &status, codex);
+        });
+    }
 
+    fn present_sync_differences(
+        parent: &gtk4::Widget,
+        status: &crate::always_allow::PermissionSyncStatus,
+        codex: bool,
+    ) {
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
         content.set_margin_top(12);
         content.set_margin_bottom(12);
@@ -892,9 +1037,10 @@ impl AgentTerminalWindow {
             label.set_halign(gtk4::Align::Start);
             content.append(&label);
 
-            let desc = gtk4::Label::new(Some(
-                "These rules exist in Claude, Antigravity, or permissions.toml but are missing in Agent Terminal:"
-            ));
+            let desc = gtk4::Label::new(Some(&format!(
+                "These rules exist in {} but are missing in Agent Terminal:",
+                source_names(codex)
+            )));
             desc.set_wrap(true);
             desc.set_halign(gtk4::Align::Start);
             desc.add_css_class("dim-label");
@@ -903,7 +1049,7 @@ impl AgentTerminalWindow {
             let list = gtk4::ListBox::new();
             list.add_css_class("boxed-list");
             for r in &status.unimported_rules {
-                let row = adw::ActionRow::builder().title(r).build();
+                let row = adw::ActionRow::builder().use_markup(false).title(r).build();
                 let icon = gtk4::Image::from_icon_name("at-go-down-symbolic");
                 row.add_prefix(&icon);
                 list.append(&row);
@@ -920,9 +1066,10 @@ impl AgentTerminalWindow {
             label.set_halign(gtk4::Align::Start);
             content.append(&label);
 
-            let desc = gtk4::Label::new(Some(
-                "These rules exist in Agent Terminal but have not been exported to external agent configs:"
-            ));
+            let desc = gtk4::Label::new(Some(&format!(
+                "What the next export changes in {}:",
+                source_names(codex)
+            )));
             desc.set_wrap(true);
             desc.set_halign(gtk4::Align::Start);
             desc.add_css_class("dim-label");
@@ -931,7 +1078,7 @@ impl AgentTerminalWindow {
             let list = gtk4::ListBox::new();
             list.add_css_class("boxed-list");
             for r in &status.unexported_rules {
-                let row = adw::ActionRow::builder().title(r).build();
+                let row = adw::ActionRow::builder().use_markup(false).title(r).build();
                 let icon = gtk4::Image::from_icon_name("at-go-up-symbolic");
                 row.add_prefix(&icon);
                 list.append(&row);
@@ -964,18 +1111,66 @@ impl AgentTerminalWindow {
         dialog.present(Some(parent));
     }
 
+    /// Opens the rules list once the rules file and the agents' files (Codex's folder included
+    /// when it resolves) have been read off the main thread.
     fn show_rules_dialog(&self, parent: &gtk4::Widget, on_changed: Option<Rc<dyn Fn()>>) {
         let Some(path) = crate::always_allow::path() else {
             return;
         };
-        let opened = crate::always_allow::AlwaysRules::open(&path);
-        let blocked = opened
-            .as_ref()
-            .err()
-            .map(|e| crate::always_allow::blocked_notice(&path, e));
-        let rules = opened.unwrap_or_default();
-        let status = rules.check_sync_status(None, &self.permission_sources());
+        let sources = self.permission_sources();
+        let codex_inputs = self.codex_inputs();
+        let parent = parent.downgrade();
+        let obj = self.obj().downgrade();
+        glib::spawn_future_local(async move {
+            let codex = codex_target(codex_inputs).await.ok();
+            let target = path.clone();
+            let computed = gtk4::gio::spawn_blocking(move || {
+                let opened = crate::always_allow::AlwaysRules::open(&target);
+                let blocked = opened
+                    .as_ref()
+                    .err()
+                    .map(|e| crate::always_allow::blocked_notice(&target, e));
+                let rules = opened.unwrap_or_default();
+                let status = rules.check_sync_status(None, &sources, codex.as_ref());
+                let plan = rules.codex_plan();
+                let warning = crate::always_allow::export_warning(
+                    codex.as_ref().filter(|t| t.available()).map(|t| (t, &plan)),
+                );
+                (rules, blocked, status, warning)
+            })
+            .await;
+            let (Ok((rules, blocked, status, warning)), Some(parent), Some(obj)) =
+                (computed, parent.upgrade(), obj.upgrade())
+            else {
+                return;
+            };
+            obj.imp().present_rules_dialog(
+                &parent,
+                path,
+                RulesView {
+                    rules,
+                    blocked,
+                    status,
+                    warning,
+                },
+                on_changed,
+            );
+        });
+    }
 
+    fn present_rules_dialog(
+        &self,
+        parent: &gtk4::Widget,
+        path: std::path::PathBuf,
+        view: RulesView,
+        on_changed: Option<Rc<dyn Fn()>>,
+    ) {
+        let RulesView {
+            rules,
+            blocked,
+            status,
+            warning,
+        } = view;
         let subtitle = if let Some(blocked) = blocked {
             blocked
         } else if status.is_out_of_sync() {
@@ -1106,7 +1301,7 @@ impl AgentTerminalWindow {
                     "export" => {
                         let confirm = adw::AlertDialog::new(
                             Some("Export rules outside agent-terminal?"),
-                            Some(crate::always_allow::EXPORT_WARNING),
+                            Some(&warning),
                         );
                         confirm.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
                         confirm.set_response_appearance(
@@ -1689,17 +1884,14 @@ fn mark_synced(button: &glib::WeakRef<Button>, refresh: impl Fn() + 'static) {
 const EXPORT_CONFIRMED: &str = "export-confirmed";
 
 /// Export writes standing grants outside agent-terminal, so it is confirmed first: the first
-/// click shows [`crate::always_allow::EXPORT_WARNING`] and returns false; choosing Export there
+/// click shows `warning` ([`crate::always_allow::export_warning`]) and returns false; choosing Export there
 /// clicks `button` again, marked confirmed, and that click returns true.
-fn confirm_export_first(button: &Button) -> bool {
+fn confirm_export_first(button: &Button, warning: &str) -> bool {
     if button.widget_name() == EXPORT_CONFIRMED {
         button.set_widget_name("");
         return true;
     }
-    let dialog = adw::AlertDialog::new(
-        Some("Export rules outside agent-terminal?"),
-        Some(crate::always_allow::EXPORT_WARNING),
-    );
+    let dialog = adw::AlertDialog::new(Some("Export rules outside agent-terminal?"), Some(warning));
     dialog.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
     dialog.set_response_appearance("export", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
@@ -2080,7 +2272,7 @@ pub(super) mod tests {
             let seen = finished.clone();
             let target = path.clone();
             AgentTerminalWindow::store_job(
-                move || AlwaysRules::import_into(&target, &[source]),
+                move || AlwaysRules::import_into(&target, &[source], None),
                 move |result| seen.set(Some(result.and_then(Result::ok).map_or(0, |i| i.added))),
             );
             for _ in 0..20 {

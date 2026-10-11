@@ -18,6 +18,7 @@ mod approval_server;
 mod availability;
 mod chat;
 mod claude_probe;
+mod codex_home;
 mod codex_probe;
 pub mod config;
 mod diff_tool;

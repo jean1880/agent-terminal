@@ -21,10 +21,18 @@
 //! through the atomic writer. The 3.3 `always-allow.json` is ignored (beta: no migration). A rules
 //! file that cannot be parsed, or that a newer build wrote, is never overwritten: saved rules are
 //! off while it is so, and the caller tells the user which file it is.
+//!
+//! Import and export also reach Codex's rules folder (`<codex_home>/rules`, resolved through the
+//! Codex profile's environment by [`crate::codex_home`]). Codex's `allow` rules are read by the
+//! fail-closed [`agent_core::codex_rules`] reader and kept only as "Always allow" would keep
+//! them. Export writes one file, [`codex_rules::EXPORT_FILE`], whole: global prefix rules only,
+//! never for a program whose options are checked at match time (a Codex prefix rule cannot
+//! carry those checks), validated by Codex's own parser before it replaces the old file.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use agent_core::codex_rules;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -417,8 +425,20 @@ const EXEC_SHORT: &[(&str, &str)] = &[
     ("zip", "T"),
 ];
 
+/// The program [`FIND_ACTIONS`] belong to.
+const FIND_PROGRAM: &str = "find";
+
 /// find's actions that run, delete or write files (single-dash words, not clusters).
 const FIND_ACTIONS: &[&str] = &["-exec", "-ok", "-delete", "-fprint", "-fls"];
+
+/// Whether [`exec_option`] guards `program` at match time ([`EXEC_LONG`], [`EXEC_SHORT`] or
+/// [`FIND_ACTIONS`] name it). A Codex prefix rule cannot carry those checks, so such a program
+/// never exports there: derived from the tables, never a second list.
+fn has_option_checks(program: &str) -> bool {
+    (program == FIND_PROGRAM && !FIND_ACTIONS.is_empty())
+        || EXEC_LONG.iter().any(|(p, _)| *p == program)
+        || EXEC_SHORT.iter().any(|(p, _)| *p == program)
+}
 
 /// The first option in `argv` that lets its program run other code: [`EXEC_LONG`],
 /// [`EXEC_SHORT`] letters in any cluster (and tar's dashless first argument), [`FIND_ACTIONS`],
@@ -463,7 +483,7 @@ pub fn exec_option(argv: &[String]) -> Option<&str> {
         .enumerate()
         .map(|(i, w)| (i, w.as_str()))
         .find_map(|(i, word)| {
-            if program == "find" {
+            if program == FIND_PROGRAM {
                 return FIND_ACTIONS
                     .iter()
                     .any(|a| word.starts_with(a))
@@ -1315,8 +1335,9 @@ impl AlwaysRules {
 
     /// Imports permission rules from available agent configuration files:
     /// 1. each of `sources` (the user's permission sources, `permissions.toml` form)
-    /// 2. `~/.claude/settings.json`
-    /// 3. `~/.gemini/antigravity-cli/settings.json`
+    /// 2. Codex's rules folder, when `codex` is available ([`Self::import_codex_rules`])
+    /// 3. `~/.claude/settings.json`
+    /// 4. `~/.gemini/antigravity-cli/settings.json`
     ///
     /// Every imported rule must be one "Always allow" could keep ([`Rule::check`] with
     /// [`Scope::Always`], C6): the rest are skipped and counted.
@@ -1324,13 +1345,17 @@ impl AlwaysRules {
         &mut self,
         home: Option<&Path>,
         sources: &[PathBuf],
+        codex: Option<&CodexTarget>,
     ) -> Imported {
-        // The configured sources need no home directory; the agents' own files do.
+        // The configured sources and Codex need no home directory; the agents' own files do.
         let mut imported = Imported::default();
         for source in sources {
             if let Ok(content) = std::fs::read_to_string(source) {
                 imported += self.import_permissions_toml(&content);
             }
+        }
+        if let Some(target) = codex.filter(|t| t.available()) {
+            imported += self.import_codex_rules(&target.rules_dir());
         }
         let Some(home) = home_dir(home) else {
             return imported;
@@ -1346,26 +1371,39 @@ impl AlwaysRules {
 
     /// Exports global shell and MCP rules to the same files, one way: never alters the rules
     /// file. These become standing grants in each agent's own configuration, which removing the
-    /// rule here does not revoke ([`EXPORT_WARNING`]). Returns the number of entries added.
-    pub fn export_agent_permissions(&self, home: Option<&Path>, sources: &[PathBuf]) -> usize {
-        let Some(home) = home_dir(home) else {
-            return 0;
-        };
-        let mut added = 0;
-        for (path, sync) in self.targets(&home, sources) {
-            if path.exists() {
-                added += sync(self, &path, true).unwrap_or(0);
+    /// rule here does not revoke ([`EXPORT_WARNING`]). Codex's rules folder, when `codex` is
+    /// available, gets [`codex_rules::EXPORT_FILE`] rewritten whole ([`Self::export_codex`],
+    /// checked by the real Codex parser when one is found).
+    pub fn export_agent_permissions(
+        &self,
+        home: Option<&Path>,
+        sources: &[PathBuf],
+        codex: Option<&CodexTarget>,
+    ) -> Exported {
+        let mut exported = Exported::default();
+        if let Some(home) = home_dir(home) {
+            for (path, sync) in self.targets(&home, sources) {
+                if path.exists() {
+                    exported.added += sync(self, &path, true).unwrap_or(0);
+                }
             }
         }
-        added
+        if let Some(target) = codex.filter(|t| t.available()) {
+            exported.codex = Some(self.export_codex(target, &|tmp| codex_check(target, tmp)));
+        }
+        exported
     }
 
     /// Imports the agent configurations' rules into the rules file at `path` (read, import, save,
     /// under the store lock). An unusable file is an error and is left untouched. Blocking I/O.
-    pub fn import_into(path: &Path, sources: &[PathBuf]) -> Result<Imported, StoreError> {
+    pub fn import_into(
+        path: &Path,
+        sources: &[PathBuf],
+        codex: Option<&CodexTarget>,
+    ) -> Result<Imported, StoreError> {
         with_store_lock(path, || {
             let (mut rules, snapshot) = Self::read(path)?;
-            let imported = rules.import_agent_permissions(None, sources);
+            let imported = rules.import_agent_permissions(None, sources, codex);
             if imported.added > 0 {
                 rules.save_over(path, &snapshot)?;
             }
@@ -1374,11 +1412,15 @@ impl AlwaysRules {
     }
 
     /// Exports the global rules of the file at `path` ([`Self::export_agent_permissions`]), under
-    /// the store lock; an unusable rules file is an error, never "nothing to export". Blocking
-    /// I/O.
-    pub fn export_from(path: &Path, sources: &[PathBuf]) -> Result<usize, StoreError> {
+    /// the store lock (Codex's file is written under it too); an unusable rules file is an
+    /// error, never "nothing to export". Blocking I/O.
+    pub fn export_from(
+        path: &Path,
+        sources: &[PathBuf],
+        codex: Option<&CodexTarget>,
+    ) -> Result<Exported, StoreError> {
         with_store_lock(path, || {
-            Ok(Self::open(path)?.export_agent_permissions(None, sources))
+            Ok(Self::open(path)?.export_agent_permissions(None, sources, codex))
         })
     }
 
@@ -1433,16 +1475,20 @@ impl AlwaysRules {
         &self,
         home: Option<&Path>,
         sources: &[PathBuf],
+        codex: Option<&CodexTarget>,
     ) -> PermissionSyncStatus {
         let mut scratch = self.clone();
-        let unimported_count = scratch.import_agent_permissions(home, sources).added;
+        let unimported_count = scratch.import_agent_permissions(home, sources, codex).added;
         let unimported_rules: Vec<String> = scratch
             .rules
             .iter()
             .filter(|r| !self.rules.iter().any(|mine| mine.same_as(r)))
-            .map(Rule::summary)
+            .map(|r| format!("{} (from {})", r.summary(), r.origin))
             .collect();
-        let unexported_rules = self.collect_unexported_rules(home, sources);
+        let mut unexported_rules = self.collect_unexported_rules(home, sources);
+        if let Some(target) = codex.filter(|t| t.available()) {
+            unexported_rules.extend(self.codex_differences(target));
+        }
         let unexported_count = unexported_rules.len();
         PermissionSyncStatus {
             unimported_count,
@@ -1569,11 +1615,11 @@ impl AlwaysRules {
         match rule {
             Ok(rule) => Imported {
                 added: usize::from(self.add(rule)),
-                skipped: 0,
+                ..Imported::default()
             },
             Err(_) => Imported {
-                added: 0,
                 skipped: 1,
+                ..Imported::default()
             },
         }
     }
@@ -1652,28 +1698,46 @@ impl AlwaysRules {
     }
 }
 
-/// What an import did: rules added, and entries skipped because no rule may hold them (C6).
+/// What an import did: rules added, entries skipped because no rule may hold them (C6), and
+/// Codex rules the reader could not read ([`codex_rules::parse`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Imported {
     pub added: usize,
     pub skipped: usize,
+    pub unreadable: usize,
 }
 
 impl Imported {
-    /// What the import toast says, skipped entries included (C6).
+    /// What the import toast says, skipped and unreadable entries included (C6).
     pub fn summary(&self) -> String {
-        let added = match self.added {
+        let mut out = match self.added {
             0 => "Permission rules are already up to date".to_owned(),
             1 => "Imported 1 permission rule from agent configurations".to_owned(),
             n => format!("Imported {n} permission rules from agent configurations"),
         };
-        match self.skipped {
-            0 => added,
-            n => format!(
-                "{added}. {n} rule{} skipped: they run workspace code or carry credentials",
-                if n == 1 { "" } else { "s" }
-            ),
+        if self.skipped > 0 {
+            out.push_str(&format!(
+                ". {} rule{} skipped as too broad or unsafe",
+                self.skipped,
+                plural(self.skipped)
+            ));
         }
+        if self.unreadable > 0 {
+            out.push_str(&format!(
+                ". {} Codex rule{} could not be read (only plain prefix_rule calls are understood)",
+                self.unreadable,
+                plural(self.unreadable)
+            ));
+        }
+        out
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -1681,7 +1745,494 @@ impl std::ops::AddAssign for Imported {
     fn add_assign(&mut self, other: Self) {
         self.added += other.added;
         self.skipped += other.skipped;
+        self.unreadable += other.unreadable;
     }
+}
+
+// ---- Codex rules (D: L2) ----
+
+/// Where Codex keeps its rules, resolved through the Codex profile's environment
+/// ([`crate::codex_home`]), never the GUI process's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexTarget {
+    /// The Codex home: `$CODEX_HOME` as the Codex threads see it, else `~/.codex`.
+    pub home: PathBuf,
+    /// The codex binary the threads run, to validate an export (`None`: not found, so the
+    /// export is written unchecked).
+    pub program: Option<PathBuf>,
+    /// The profile's environment additions, for running that check where threads run.
+    pub env: Vec<(String, String)>,
+}
+
+impl CodexTarget {
+    /// `<codex_home>/rules`, every `.rules` file of which Codex loads.
+    pub fn rules_dir(&self) -> PathBuf {
+        self.home.join("rules")
+    }
+
+    /// The one file export writes.
+    pub fn export_file(&self) -> PathBuf {
+        self.rules_dir().join(codex_rules::EXPORT_FILE)
+    }
+
+    /// Whether Codex is a source and target at all: its home is a folder (its rules folder is
+    /// then read when present, and created on export when not). Blocking: a `stat`.
+    pub fn available(&self) -> bool {
+        self.home.is_dir()
+    }
+
+    /// What Settings says about this folder. Blocking: a `stat` or two.
+    pub fn describe(&self) -> String {
+        let rules = tilde(&self.rules_dir());
+        if !self.available() {
+            return format!(
+                "{} does not exist, so Codex rules are not imported or exported",
+                tilde(&self.home)
+            );
+        }
+        match std::fs::symlink_metadata(self.rules_dir()) {
+            Ok(m) if m.file_type().is_symlink() => format!(
+                "{rules} is a symbolic link: Codex rules are read from it, but export never \
+                 writes through a link"
+            ),
+            Ok(m) if m.is_dir() => format!(
+                "{rules}: import reads every .rules file there; export writes {}",
+                codex_rules::EXPORT_FILE
+            ),
+            Ok(_) => format!("{rules} is not a folder, so export cannot write there"),
+            Err(_) => format!(
+                "{rules} does not exist yet; export creates it and writes {}",
+                codex_rules::EXPORT_FILE
+            ),
+        }
+    }
+}
+
+/// `path` with the home folder shown as `~` (the full path under test, where there is none).
+fn tilde(path: &Path) -> String {
+    match home_dir(None) {
+        Some(home) => match path.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        },
+        None => path.display().to_string(),
+    }
+}
+
+/// The most of one `.rules` file the reader takes; a larger one is unreadable.
+const CODEX_FILE_CAP: u64 = 1 << 20;
+/// The most `.rules` files read from one folder; the rest are unreadable.
+const CODEX_FILES_CAP: usize = 256;
+
+/// Codex's own rules (every `.rules` file but [`codex_rules::EXPORT_FILE`]), as the reader
+/// understands them.
+#[derive(Debug, Default)]
+struct CodexRead {
+    /// `allow` patterns, alternatives expanded.
+    allow: Vec<Vec<String>>,
+    /// `prompt` and `forbidden` patterns: an allow overlapping one is never imported.
+    guarded: Vec<Vec<String>>,
+    unreadable: usize,
+}
+
+/// Reads `dir`'s `.rules` files (sorted, regular files only, each at most
+/// [`CODEX_FILE_CAP`]). A missing folder holds nothing. Blocking I/O.
+fn read_codex_rules(dir: &Path) -> CodexRead {
+    let mut read = CodexRead::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return read;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "rules")
+                && p.file_name().is_some_and(|n| n != codex_rules::EXPORT_FILE)
+        })
+        .collect();
+    files.sort();
+    for (i, file) in files.iter().enumerate() {
+        let text = std::fs::metadata(file)
+            .ok()
+            .filter(|m| i < CODEX_FILES_CAP && m.is_file() && m.len() <= CODEX_FILE_CAP)
+            .and_then(|_| std::fs::read_to_string(file).ok());
+        let Some(text) = text else {
+            read.unreadable += 1;
+            continue;
+        };
+        let parsed = codex_rules::parse(&text);
+        read.unreadable += parsed.unreadable;
+        for rule in parsed.rules {
+            match rule.decision {
+                codex_rules::Decision::Allow => read.allow.extend(rule.patterns),
+                _ => read.guarded.extend(rule.patterns),
+            }
+        }
+    }
+    read
+}
+
+/// What export would write to Codex, and what it leaves out (each rule counted once, for the
+/// first reason that applies).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CodexPlan {
+    /// The argv prefixes written, one `prefix_rule` each.
+    pub rules: Vec<Vec<String>>,
+    /// Exact rules: Codex has no exact match, so writing one would widen it.
+    pub exact: usize,
+    /// Rules that could run other programs: refused by [`Rule::check`], or for a program whose
+    /// options the app checks at match time ([`has_option_checks`]).
+    pub unsafe_programs: usize,
+    /// Rules with a word that is not printable ASCII.
+    pub unsupported: usize,
+}
+
+impl CodexPlan {
+    /// The left-out counts as a sentence fragment (`None`: nothing left out).
+    fn left_out(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.exact > 0 {
+            parts.push(format!(
+                "{} exact rule{} (Codex rules only match prefixes)",
+                self.exact,
+                plural(self.exact)
+            ));
+        }
+        if self.unsafe_programs > 0 {
+            parts.push(format!(
+                "{} rule{} that could run other programs",
+                self.unsafe_programs,
+                plural(self.unsafe_programs)
+            ));
+        }
+        if self.unsupported > 0 {
+            parts.push(format!(
+                "{} rule{} with characters Codex rules cannot hold",
+                self.unsupported,
+                plural(self.unsupported)
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// What a Codex export did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexExported {
+    pub file: PathBuf,
+    pub plan: CodexPlan,
+    /// `Ok(true)`: written; `Ok(false)`: already held exactly this; `Err`: not written (the old
+    /// file, if any, is untouched), and why.
+    pub outcome: Result<bool, String>,
+}
+
+impl CodexExported {
+    pub fn summary(&self) -> String {
+        let file = tilde(&self.file);
+        let mut out = match &self.outcome {
+            Err(e) => return format!("Codex rules were not written: {e}"),
+            Ok(changed) => {
+                let n = self.plan.rules.len();
+                let verb = if *changed { "written to" } else { "already in" };
+                format!("Codex: {n} rule{} {verb} {file}", plural(n))
+            }
+        };
+        if let Some(left_out) = self.plan.left_out() {
+            out.push_str(&format!("; skipped {left_out}"));
+        }
+        out
+    }
+}
+
+/// What an export did: entries added to the other agents' files, and Codex's outcome when
+/// Codex is a target.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Exported {
+    pub added: usize,
+    pub codex: Option<CodexExported>,
+}
+
+impl Exported {
+    /// What the export toast says.
+    pub fn summary(&self) -> String {
+        let others = match self.added {
+            0 => "Agent configurations are already up to date".to_owned(),
+            1 => "Exported 1 global rule to agent configurations".to_owned(),
+            n => format!("Exported {n} global rules to agent configurations"),
+        };
+        match &self.codex {
+            Some(codex) => format!("{others}. {}", codex.summary()),
+            None => others,
+        }
+    }
+}
+
+/// The export confirmation's text: [`EXPORT_WARNING`], then what Codex would get, with counts.
+pub fn export_warning(codex: Option<(&CodexTarget, &CodexPlan)>) -> String {
+    let Some((target, plan)) = codex else {
+        return EXPORT_WARNING.to_owned();
+    };
+    let n = plan.rules.len();
+    let mut out = format!(
+        "{EXPORT_WARNING}\n\nCodex: {n} rule{} will be written to {}",
+        plural(n),
+        tilde(&target.export_file())
+    );
+    match plan.left_out() {
+        Some(left_out) => out.push_str(&format!("; left out: {left_out}.")),
+        None => out.push('.'),
+    }
+    out
+}
+
+impl AlwaysRules {
+    /// What a Codex export writes: global prefix shell rules that pass [`Rule::check`] for
+    /// "Always allow", whose program has no match-time option checks ([`has_option_checks`]:
+    /// a Codex prefix rule would allow `find . -exec …` or `rg --pre …`), with printable-ASCII
+    /// words only.
+    pub fn codex_plan(&self) -> CodexPlan {
+        let mut plan = CodexPlan::default();
+        for rule in &self.rules {
+            let Target::Argv { argv, prefix } = &rule.target else {
+                continue;
+            };
+            if rule.workspace != "*" || rule.kind != ActionKind::Shell {
+                continue;
+            }
+            let program = argv.first().map(String::as_str).unwrap_or_default();
+            if !prefix {
+                plan.exact += 1;
+            } else if rule.check(Scope::Always).is_err()
+                || program.contains('/')
+                || has_option_checks(basename(program))
+            {
+                plan.unsafe_programs += 1;
+            } else if !argv.iter().all(|t| codex_rules::plain_token(t)) {
+                plan.unsupported += 1;
+            } else if !plan.rules.contains(argv) {
+                plan.rules.push(argv.clone());
+            }
+        }
+        plan
+    }
+
+    /// Imports Codex's `allow` rules from `dir` (every `.rules` file but agent-terminal's own,
+    /// whose entries came from here). Each pattern becomes the prefix rule `<words> *` through
+    /// [`Self::import_one`]; one overlapping a `prompt` or `forbidden` pattern is skipped (the
+    /// app would allow what Codex asks about). Blocking I/O.
+    pub fn import_codex_rules(&mut self, dir: &Path) -> Imported {
+        let read = read_codex_rules(dir);
+        let mut imported = Imported {
+            unreadable: read.unreadable,
+            ..Imported::default()
+        };
+        for pattern in &read.allow {
+            let overlaps = read
+                .guarded
+                .iter()
+                .any(|g| g.starts_with(pattern) || pattern.starts_with(g));
+            if overlaps {
+                imported.skipped += 1;
+                continue;
+            }
+            imported +=
+                self.import_one("codex", "run_command", &format!("{} *", argv_text(pattern)));
+        }
+        imported
+    }
+
+    /// Writes [`codex_rules::EXPORT_FILE`] from [`Self::codex_plan`], checked by `validate`
+    /// before it replaces anything ([`write_codex_rules`]).
+    fn export_codex(
+        &self,
+        target: &CodexTarget,
+        validate: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> CodexExported {
+        let plan = self.codex_plan();
+        let outcome = match codex_rules::render(&plan.rules) {
+            Some(text) => write_codex_rules(target, &text, validate),
+            None => Err("a rule could not be written as a Codex rule".to_owned()),
+        };
+        if let Err(e) = &outcome {
+            tracing::warn!(error = %e, "Codex rules were not exported");
+        }
+        CodexExported {
+            file: target.export_file(),
+            plan,
+            outcome,
+        }
+    }
+
+    /// How agent-terminal's Codex file differs from what export would write, described for
+    /// View Differences. Blocking I/O.
+    fn codex_differences(&self, target: &CodexTarget) -> Vec<String> {
+        let plan = self.codex_plan();
+        let file = target.export_file();
+        let shown = tilde(&file);
+        let text = match std::fs::symlink_metadata(&file) {
+            Ok(m) if !m.is_file() => {
+                return vec![format!(
+                    "Codex: {shown} is not a regular file; export will refuse to replace it"
+                )]
+            }
+            Ok(_) => std::fs::read_to_string(&file).ok(),
+            Err(_) => None,
+        };
+        let parsed = text.as_deref().map(codex_rules::parse);
+        if parsed
+            .as_ref()
+            .is_some_and(|p| p.broken || p.unreadable > 0)
+        {
+            return vec![format!(
+                "Codex: {shown} was edited and cannot be read; the next export replaces it"
+            )];
+        }
+        let current: Vec<Vec<String>> = parsed
+            .into_iter()
+            .flat_map(|p| p.rules)
+            .filter(|r| r.decision == codex_rules::Decision::Allow)
+            .flat_map(|r| r.patterns)
+            .collect();
+        let mut out: Vec<String> = plan
+            .rules
+            .iter()
+            .filter(|r| !current.contains(r))
+            .map(|r| format!("Codex: {} *", argv_text(r)))
+            .collect();
+        out.extend(current.iter().filter(|r| !plan.rules.contains(r)).map(|r| {
+            format!(
+                "Codex: {} * is no longer saved; the next export removes it",
+                argv_text(r)
+            )
+        }));
+        out
+    }
+}
+
+/// Replaces `target`'s [`codex_rules::EXPORT_FILE`] with `content`, atomically: a `0600` temp
+/// file beside it (named so Codex never loads it), `sync_all`, `validate` (Codex's own parser),
+/// then a rename. The rules folder is created `0700` only when absent; a symbolic link (the
+/// folder or the file) or anything that is not a folder or regular file is refused. A failed
+/// check leaves the old file as it was. `Ok(false)`: the file already held `content`.
+/// Blocking I/O.
+fn write_codex_rules(
+    target: &CodexTarget,
+    content: &str,
+    validate: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<bool, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if !target.available() {
+        return Err(format!("{} does not exist", tilde(&target.home)));
+    }
+    let dir = target.rules_dir();
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!(
+                "{} is a symbolic link; agent-terminal does not write through links",
+                tilde(&dir)
+            ))
+        }
+        Ok(m) if !m.is_dir() => return Err(format!("{} is not a folder", tilde(&dir))),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| format!("{} could not be created ({e})", tilde(&dir)))?,
+        Err(e) => return Err(format!("{} cannot be read ({e})", tilde(&dir))),
+    }
+    let file = target.export_file();
+    match std::fs::symlink_metadata(&file) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!(
+                "{} is a symbolic link; agent-terminal does not write through links",
+                tilde(&file)
+            ))
+        }
+        Ok(m) if !m.is_file() => return Err(format!("{} is not a regular file", tilde(&file))),
+        Ok(_) => {
+            if std::fs::read(&file).is_ok_and(|old| old == content.as_bytes()) {
+                return Ok(false);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{} cannot be read ({e})", tilde(&file))),
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Hidden and not ending in `.rules`: Codex never loads a half-written or unchecked file.
+    let tmp = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        codex_rules::EXPORT_FILE,
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| {
+        // `create_new` (O_EXCL) never follows a link planted at the temp name.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("a temporary file could not be created ({e})"))?;
+        f.write_all(content.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|e| format!("the file could not be written ({e})"))?;
+        drop(f);
+        validate(&tmp).map_err(|e| {
+            format!("Codex could not read the new rules ({e}); the previous file was kept")
+        })?;
+        std::fs::rename(&tmp, &file).map_err(|e| format!("the file could not be replaced ({e})"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    } else {
+        let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
+    }
+    result.map(|()| true)
+}
+
+/// How long `codex execpolicy check` may take.
+const CODEX_CHECK_TIMEOUT_SECS: u64 = 15;
+
+/// Codex's own parser on a candidate file: `codex execpolicy check --rules <file> -- true`, run
+/// where the Codex threads run (the profile's variables, `CODEX_HOME` set to the target). It
+/// parses and evaluates; it writes no rules. No codex binary: nothing to check against, so the
+/// file stands on the writer's escaping. Blocking: it runs a process, with a timeout.
+fn codex_check(target: &CodexTarget, file: &Path) -> Result<(), String> {
+    let Some(program) = &target.program else {
+        return Ok(());
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("execpolicy")
+        .arg("check")
+        .arg("--rules")
+        .arg(file)
+        .arg("--")
+        .arg("true")
+        .envs(target.env.iter().map(|(k, v)| (k, v)))
+        .env("CODEX_HOME", &target.home);
+    let output = agent_kit::exec::run_command(cmd, "codex", CODEX_CHECK_TIMEOUT_SECS)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("WARNING:"))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let reason: String = agent_core::redact::redact(&reason)
+        .chars()
+        .take(300)
+        .collect();
+    Err(if reason.is_empty() {
+        format!("codex exited with {}", output.status)
+    } else {
+        reason
+    })
 }
 
 /// Runs `f` holding an exclusive advisory lock on `<path>.lock` (beside the rules file; the
@@ -1713,9 +2264,12 @@ fn with_store_lock<T>(
 }
 
 /// What an export confirmation must say before it writes anything.
-pub const EXPORT_WARNING: &str = "Export writes your global rules into permissions.toml and into \
-    Claude's and Antigravity's own settings files. There they are standing grants that \
-    agent-terminal does not manage: removing a rule here does not remove it there.";
+pub const EXPORT_WARNING: &str = "Export writes your global rules into permissions.toml, into \
+    Claude's and Antigravity's own settings files, and into Codex's rules folder. There they are \
+    standing grants that agent-terminal does not manage: removing a rule here does not remove it \
+    there (Codex's agent-terminal.rules is rewritten on the next export). Codex follows these \
+    rules outside agent-terminal too. Exact rules and rules for programs that can run other \
+    programs are never written to Codex.";
 
 /// A TOML basic string: quotes, backslashes and control characters escaped.
 fn toml_string(s: &str) -> String {
@@ -2942,7 +3496,8 @@ mcp = [
             imported,
             Imported {
                 added: 5,
-                skipped: 5
+                skipped: 5,
+                unreadable: 0
             }
         );
         assert!(
@@ -2967,7 +3522,8 @@ mcp = [
             rules.import_claude_settings(claude_sample),
             Imported {
                 added: 2,
-                skipped: 2
+                skipped: 2,
+                unreadable: 0
             }
         );
         assert!(rules.matches_any(&shell("rg TODO src"), &c));
@@ -3118,8 +3674,13 @@ mcp = [
 
         let sources = vec![home.join("sources/permissions.toml")];
         let mut rules = AlwaysRules::default();
-        assert_eq!(rules.check_sync_status(Some(home), &[]).unimported_count, 2);
-        let status = rules.check_sync_status(Some(home), &sources);
+        assert_eq!(
+            rules
+                .check_sync_status(Some(home), &[], None)
+                .unimported_count,
+            2
+        );
+        let status = rules.check_sync_status(Some(home), &sources, None);
         assert_eq!(status.unimported_count, 3);
         assert_eq!(status.unexported_count, 0);
         assert!(status
@@ -3127,17 +3688,508 @@ mcp = [
             .contains("3 external rules are not imported"));
 
         assert_eq!(
-            rules.import_agent_permissions(Some(home), &sources).added,
+            rules
+                .import_agent_permissions(Some(home), &sources, None)
+                .added,
             3
         );
-        let status = rules.check_sync_status(Some(home), &sources);
+        let status = rules.check_sync_status(Some(home), &sources, None);
         assert_eq!(status.unimported_count, 0);
         assert!(status.unexported_count > 0);
 
-        assert!(rules.export_agent_permissions(Some(home), &sources) > 0);
-        let status = rules.check_sync_status(Some(home), &sources);
+        assert!(
+            rules
+                .export_agent_permissions(Some(home), &sources, None)
+                .added
+                > 0
+        );
+        let status = rules.check_sync_status(Some(home), &sources, None);
         assert_eq!(status.unexported_count, 0, "{status:?}");
         assert_eq!(status.unimported_count, 0, "{status:?}");
         assert!(!status.is_out_of_sync());
+    }
+
+    // ---- Codex rules ----
+
+    /// A Codex home in a temp folder (never the user's `~/.codex`), with no binary to check
+    /// against unless a test sets one.
+    fn codex_home(dir: &Path) -> CodexTarget {
+        let home = dir.join("codex-home");
+        std::fs::create_dir_all(&home).expect("home");
+        CodexTarget {
+            home,
+            program: None,
+            env: Vec::new(),
+        }
+    }
+
+    fn global(pattern: &str) -> Rule {
+        let c = ctx("agy", Path::new("/ws"), Some("/ws"));
+        Rule::new("*", "run_command", pattern)
+            .complete(&c)
+            .expect(pattern)
+    }
+
+    /// A rule as the file could hold it, whatever the dialog would have accepted.
+    fn raw_prefix(words: &[&str]) -> Rule {
+        Rule {
+            workspace: "*".to_owned(),
+            cwd: None,
+            origin: "import".to_owned(),
+            kind: ActionKind::Shell,
+            target: Target::Argv {
+                argv: argv(words),
+                prefix: true,
+            },
+        }
+    }
+
+    fn rules_of(list: Vec<Rule>) -> AlwaysRules {
+        AlwaysRules { rules: list }
+    }
+
+    fn no_check(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Every imported Codex rule becomes `<words> *` and goes through `check(Always)`; an allow
+    /// that overlaps a prompt or forbidden rule, an unreadable call, an oversized file and
+    /// agent-terminal's own file are never imported.
+    #[test]
+    fn codex_rules_import_through_the_always_checks() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = codex_home(dir.path());
+        let rules_dir = target.rules_dir();
+        std::fs::create_dir_all(&rules_dir).expect("rules dir");
+        std::fs::write(
+            rules_dir.join("default.rules"),
+            r#"# the user's rules
+prefix_rule(["git", "push"])
+prefix_rule(["ls"])
+prefix_rule(pattern=["git", ["status", "log"]], justification="read")
+prefix_rule(pattern=["cat"], decision="forbidden")
+prefix_rule(pattern=["head"])
+prefix_rule(pattern=["head", "-c"], decision="prompt")
+prefix_rule(pattern=[CMD])
+X = 1
+"#,
+        )
+        .expect("default");
+        std::fs::write(
+            rules_dir.join(codex_rules::EXPORT_FILE),
+            "prefix_rule([\"uname\"])\n",
+        )
+        .expect("own file");
+        std::fs::write(rules_dir.join("notes.txt"), "prefix_rule([\"pwd\"])\n").expect("txt");
+        std::fs::write(
+            rules_dir.join("huge.rules"),
+            "#".repeat(usize::try_from(CODEX_FILE_CAP).expect("cap") + 1),
+        )
+        .expect("huge");
+
+        let mut rules = AlwaysRules::default();
+        let imported = rules.import_codex_rules(&rules_dir);
+        // ls and git status import; git push and git log are too broad for Always; head
+        // overlaps a prompt rule; the CMD call and the huge file are unreadable.
+        assert_eq!(
+            imported,
+            Imported {
+                added: 2,
+                skipped: 3,
+                unreadable: 2
+            }
+        );
+        let details: Vec<String> = rules.rules.iter().map(Rule::detail).collect();
+        assert_eq!(details, ["ls *", "git status *"]);
+        assert!(rules.rules.iter().all(|r| r.origin == "codex"));
+        let c = ctx("codex", Path::new("/w"), Some("/w"));
+        assert!(rules.matches_any(&shell("ls -la"), &c));
+        assert!(rules.matches_any(&shell("git status --short"), &c));
+        assert!(!rules.matches_any(&shell("git push origin"), &c));
+        assert!(
+            !rules.matches_any(&shell("uname -a"), &c),
+            "own file not read"
+        );
+        assert!(!rules.matches_any(&shell("pwd"), &c));
+        let summary = imported.summary();
+        assert!(summary.contains("Imported 2 permission rules"), "{summary}");
+        assert!(
+            summary.contains("3 rules skipped as too broad or unsafe"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("2 Codex rules could not be read"),
+            "{summary}"
+        );
+
+        // Through the whole import path: Codex is a source only when its home exists.
+        let mut via = AlwaysRules::default();
+        assert_eq!(
+            via.import_agent_permissions(None, &[], Some(&target)).added,
+            2
+        );
+        let gone = CodexTarget {
+            home: dir.path().join("no-such-home"),
+            ..target
+        };
+        assert_eq!(
+            AlwaysRules::default().import_agent_permissions(None, &[], Some(&gone)),
+            Imported::default()
+        );
+        // A broken file contributes nothing, and says so.
+        std::fs::write(
+            rules_dir.join("default.rules"),
+            "prefix_rule([\"ls\"])\nprefix_rule([\"a\\q\"])\n",
+        )
+        .expect("broken");
+        std::fs::remove_file(rules_dir.join("huge.rules")).expect("rm");
+        let imported = AlwaysRules::default().import_codex_rules(&rules_dir);
+        assert_eq!((imported.added, imported.unreadable), (0, 2));
+    }
+
+    /// Red-team #364: only prefix rules whose program has no match-time option checks export.
+    /// The exclusion is derived from EXEC_LONG, EXEC_SHORT and FIND_ACTIONS, never hand-listed.
+    #[test]
+    fn codex_export_eligibility_is_derived_from_the_option_tables() {
+        let mut guarded: Vec<&str> = EXEC_LONG
+            .iter()
+            .chain(EXEC_SHORT)
+            .map(|(p, _)| *p)
+            .collect();
+        guarded.push(FIND_PROGRAM);
+        for program in guarded.iter().copied() {
+            assert!(has_option_checks(program), "{program}");
+            let plan =
+                rules_of(vec![raw_prefix(&[program]), raw_prefix(&[program, "x"])]).codex_plan();
+            assert!(plan.rules.is_empty(), "{program} never exports: {plan:?}");
+            assert_eq!(plan.unsafe_programs, 2, "{program}");
+        }
+        for program in [
+            "ls", "cat", "head", "tail", "wc", "grep", "stat", "echo", "uname",
+        ] {
+            assert!(!has_option_checks(program), "{program}");
+        }
+
+        let c = ctx("agy", Path::new("/ws"), Some("/ws"));
+        let rules = rules_of(vec![
+            global("ls *"),
+            global("find *"),
+            global("rg *"),
+            global("jq *"),
+            global("git log *"),
+            global("git status *"),
+            global("cat *"),
+            global("echo café *"),
+            global("pwd"),
+            global("ls *"),
+            raw_prefix(&["/usr/bin/ls"]),
+            Rule::new("", "run_command", "head *")
+                .complete(&c)
+                .expect("workspace rule"),
+            Rule::new("*", "call_mcp_tool", "srv/tool")
+                .complete(&c)
+                .expect("mcp"),
+        ]);
+        let plan = rules.codex_plan();
+        assert_eq!(plan.rules, vec![argv(&["ls"]), argv(&["cat"])]);
+        assert_eq!(plan.exact, 1, "pwd");
+        assert_eq!(
+            plan.unsafe_programs, 6,
+            "find, rg, jq, git log, git status, a path"
+        );
+        assert_eq!(plan.unsupported, 1, "café");
+        let nowhere = CodexTarget {
+            home: PathBuf::from("/nowhere"),
+            program: None,
+            env: Vec::new(),
+        };
+        let warning = export_warning(Some((&nowhere, &plan)));
+        assert!(warning.starts_with(EXPORT_WARNING));
+        assert!(
+            warning.contains("Codex: 2 rules will be written to"),
+            "{warning}"
+        );
+        assert!(warning.contains("1 exact rule (Codex rules only match prefixes)"));
+        assert!(warning.contains("6 rules that could run other programs"));
+        assert!(EXPORT_WARNING.contains("Codex follows these rules outside agent-terminal too."));
+        assert_eq!(export_warning(None), EXPORT_WARNING);
+    }
+
+    /// The file holds the header and one prefix_rule per rule, `0600` in a `0700` folder made
+    /// only when absent; an export with nothing eligible rewrites it to the header alone.
+    #[test]
+    fn codex_export_writes_its_own_file_and_empties_to_the_header() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = codex_home(dir.path());
+        let rules = rules_of(vec![global("ls *"), global("pwd"), global("find *")]);
+        let out = rules.export_codex(&target, &no_check);
+        assert_eq!(out.outcome, Ok(true));
+        let text = std::fs::read_to_string(target.export_file()).expect("written");
+        assert_eq!(
+            text,
+            format!(
+                "{}\nprefix_rule(pattern=[\"ls\"], decision=\"allow\", \
+                 justification=\"agent-terminal\")\n",
+                codex_rules::HEADER
+            )
+        );
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode(&target.export_file()), 0o600);
+        assert_eq!(mode(&target.rules_dir()), 0o700);
+        let summary = out.summary();
+        assert!(summary.starts_with("Codex: 1 rule written to"), "{summary}");
+        assert!(summary.contains("1 exact rule"), "{summary}");
+        assert!(
+            summary.contains("1 rule that could run other programs"),
+            "{summary}"
+        );
+
+        // Unchanged: nothing is rewritten.
+        assert_eq!(rules.export_codex(&target, &no_check).outcome, Ok(false));
+        // An existing folder keeps its mode.
+        std::fs::set_permissions(target.rules_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        // The last rule removed: the header alone, so it stops applying.
+        let out = AlwaysRules::default().export_codex(&target, &no_check);
+        assert_eq!(out.outcome, Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(target.export_file()).expect("read"),
+            format!("{}\n", codex_rules::HEADER)
+        );
+        assert_eq!(mode(&target.rules_dir()), 0o755);
+        let names: Vec<_> = std::fs::read_dir(target.rules_dir())
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, [codex_rules::EXPORT_FILE], "no temp file left");
+
+        // Through export_from: under the store lock, Codex counted in the result.
+        let store = dir.path().join(FILE_NAME);
+        rules_of(vec![global("cat *")]).save(&store).expect("store");
+        let exported = AlwaysRules::export_from(
+            &store,
+            &[],
+            Some(&CodexTarget {
+                program: None,
+                ..target.clone()
+            }),
+        )
+        .expect("export");
+        let codex = exported.codex.as_ref().expect("Codex is a target");
+        assert_eq!(codex.plan.rules, vec![argv(&["cat"])]);
+        assert!(exported.summary().contains("Codex: 1 rule written to"));
+    }
+
+    /// Export never writes through a symbolic link: not a linked rules folder, not a linked
+    /// file. The link's target is left alone.
+    #[test]
+    fn codex_export_refuses_symlinks() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = codex_home(dir.path());
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, target.rules_dir()).expect("link dir");
+        let out = rules_of(vec![global("ls *")]).export_codex(&target, &no_check);
+        assert!(
+            out.outcome
+                .as_ref()
+                .is_err_and(|e| e.contains("symbolic link")),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read_dir(&elsewhere).expect("dir").count(), 0);
+
+        std::fs::remove_file(target.rules_dir()).expect("unlink");
+        std::fs::create_dir(target.rules_dir()).expect("real dir");
+        let victim = dir.path().join("bashrc");
+        std::fs::write(&victim, "original").expect("victim");
+        std::os::unix::fs::symlink(&victim, target.export_file()).expect("link file");
+        let out = rules_of(vec![global("ls *")]).export_codex(&target, &no_check);
+        assert!(
+            out.outcome
+                .as_ref()
+                .is_err_and(|e| e.contains("symbolic link")),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "original");
+        assert!(out.summary().starts_with("Codex rules were not written"));
+    }
+
+    /// A file Codex's parser rejects never replaces the old one, and leaves no temp file.
+    #[test]
+    fn a_failed_codex_check_keeps_the_old_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = codex_home(dir.path());
+        std::fs::create_dir_all(target.rules_dir()).expect("dir");
+        std::fs::write(target.export_file(), "old contents\n").expect("old");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let reject = |tmp: &Path| {
+            seen.borrow_mut().push((
+                tmp.to_path_buf(),
+                std::fs::read_to_string(tmp).expect("candidate"),
+            ));
+            Err("starlark error: Parse error".to_owned())
+        };
+        let out = rules_of(vec![global("ls *")]).export_codex(&target, &reject);
+        let error = out.outcome.clone().expect_err("rejected");
+        assert!(error.contains("the previous file was kept"), "{error}");
+        assert!(error.contains("starlark error"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(target.export_file()).expect("read"),
+            "old contents\n"
+        );
+        let seen = seen.into_inner();
+        let (tmp, candidate) = &seen[0];
+        assert!(candidate.contains("prefix_rule(pattern=[\"ls\"]"));
+        let name = tmp
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with('.') && !name.ends_with(".rules"),
+            "Codex never loads the candidate: {name}"
+        );
+        let names: Vec<_> = std::fs::read_dir(target.rules_dir())
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, [codex_rules::EXPORT_FILE], "no temp file left");
+    }
+
+    /// View Differences lists what export would add to Codex, and what it would remove.
+    #[test]
+    fn codex_differences_show_in_the_sync_status() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = codex_home(dir.path());
+        let rules = rules_of(vec![global("ls *"), global("cat *")]);
+        let status = rules.check_sync_status(None, &[], Some(&target));
+        assert_eq!(status.unexported_rules, ["Codex: ls *", "Codex: cat *"]);
+        rules
+            .export_codex(&target, &no_check)
+            .outcome
+            .expect("export");
+        assert!(!rules
+            .check_sync_status(None, &[], Some(&target))
+            .is_out_of_sync());
+
+        let fewer = rules_of(vec![global("ls *")]);
+        let status = fewer.check_sync_status(None, &[], Some(&target));
+        assert_eq!(
+            status.unexported_rules,
+            ["Codex: cat * is no longer saved; the next export removes it"]
+        );
+        std::fs::write(target.export_file(), "prefix_rule(oops\n").expect("edit");
+        let status = fewer.check_sync_status(None, &[], Some(&target));
+        assert_eq!(status.unexported_count, 1);
+        assert!(status.unexported_rules[0].contains("cannot be read"));
+
+        // The user's own Codex rules show as unimported, with where they came from.
+        std::fs::write(
+            target.rules_dir().join("mine.rules"),
+            "prefix_rule([\"wc\"])\n",
+        )
+        .expect("mine");
+        let status = fewer.check_sync_status(None, &[], Some(&target));
+        assert_eq!(
+            status.unimported_rules,
+            ["[Global] Shell: wc * (from codex)"]
+        );
+        // No Codex home: Codex is neither a source nor a target.
+        let gone = CodexTarget {
+            home: dir.path().join("none"),
+            ..target
+        };
+        assert!(!rules_of(vec![global("ls *")])
+            .check_sync_status(None, &[], Some(&gone))
+            .is_out_of_sync());
+    }
+
+    /// The codex binary on PATH, for the tests that run the real parser.
+    fn codex_on_path() -> Option<PathBuf> {
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("codex"))
+            .find(|p| p.is_file())
+    }
+
+    /// What `codex execpolicy check` decides for `command` under `rules` (`None`: no rule
+    /// matched).
+    fn codex_decides(codex: &Path, home: &Path, rules: &Path, command: &[&str]) -> Option<String> {
+        let mut cmd = std::process::Command::new(codex);
+        cmd.args(["execpolicy", "check", "--rules"])
+            .arg(rules)
+            .arg("--")
+            .args(command)
+            .env("CODEX_HOME", home);
+        let out = agent_kit::exec::run_command(cmd, "codex", 30).expect("codex runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: Value = serde_json::from_slice(&out.stdout).expect("json");
+        value["decision"].as_str().map(str::to_owned)
+    }
+
+    /// The generated file against the REAL Codex parser (skipped when codex is not on PATH):
+    /// it parses, an exported rule allows its command, and nothing lets `find -exec`, `rg --pre`
+    /// or `git log --output` through. A file the parser rejects is never installed.
+    #[test]
+    fn exported_rules_pass_the_real_codex_parser() {
+        let Some(codex) = codex_on_path() else {
+            eprintln!("skipped: codex is not on PATH");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = CodexTarget {
+            program: Some(codex.clone()),
+            ..codex_home(dir.path())
+        };
+        let rules = rules_of(vec![
+            global("ls *"),
+            global("cat *"),
+            global("echo 'a \"q\" b' *"),
+            global("find *"),
+            global("rg *"),
+            global("git log *"),
+            global("git status *"),
+            global("pwd"),
+        ]);
+        let out = rules.export_codex(&target, &|tmp| codex_check(&target, tmp));
+        assert_eq!(out.outcome, Ok(true), "{out:?}");
+        let file = target.export_file();
+        let decide = |command: &[&str]| codex_decides(&codex, &target.home, &file, command);
+        assert_eq!(decide(&["ls", "-la"]).as_deref(), Some("allow"));
+        assert_eq!(decide(&["cat", "x"]).as_deref(), Some("allow"));
+        assert_eq!(
+            decide(&["echo", "a \"q\" b", "x"]).as_deref(),
+            Some("allow")
+        );
+        for refused in [
+            &["find", ".", "-exec", "sh", "-c", "curl x", ";"][..],
+            &["rg", "--pre", "./evil.sh", "x"],
+            &["git", "log", "--output=/tmp/x"],
+            &["git", "status"],
+            &["pwd"],
+            &["true"],
+        ] {
+            assert_ne!(decide(refused).as_deref(), Some("allow"), "{refused:?}");
+        }
+
+        // A file the parser rejects is never installed.
+        let before = std::fs::read_to_string(&file).expect("read");
+        let bad = format!(
+            "{}\nprefix_rule(pattern=[\"a\\u{{202e}}\"])\n",
+            codex_rules::HEADER
+        );
+        let result = write_codex_rules(&target, &bad, &|tmp| codex_check(&target, tmp));
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.contains("previous file was kept")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), before);
     }
 }
