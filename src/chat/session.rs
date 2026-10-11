@@ -2474,10 +2474,15 @@ impl ChatBackend for ChatSession {
     }
 
     fn answer_questions(&self, request: &str, answers: serde_json::Value) {
-        self.inner.command(Command::Answer {
+        // No agent acknowledges an answer (F19): once the adapter has accepted and written it,
+        // the card is resolved here, or it would sit at "Sending…" for good.
+        if self.inner.command(Command::Answer {
             request: request.to_owned(),
             answers,
-        });
+        }) {
+            self.inner
+                .emit(Envelope::new(Event::QuestionResolved { answered: true }).request(request));
+        }
     }
 
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {

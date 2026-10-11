@@ -712,3 +712,42 @@ fn scripted_resume_with_no_rollout_continues_in_a_new_codex_thread() {
         session.shutdown(false);
     });
 }
+
+/// Plan 2.7 (F19): an answered question card leaves "Sending…" for "Answered" once the adapter
+/// has accepted the answer; the agent never acknowledges it. A refused answer stays sent.
+#[test]
+fn scripted_an_accepted_answer_moves_the_question_card_to_answered() {
+    use crate::chat::view::model::QuestionState;
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        let state = |request: &str| {
+            let model = fixture.model.borrow();
+            model
+                .order()
+                .iter()
+                .find_map(|id| match model.get(id).map(|i| &i.body) {
+                    Some(Body::Question(q)) if q.request == request => Some(q.state),
+                    _ => None,
+                })
+        };
+        fixture.prompt(&session, "question");
+        let question = fixture.wait_pending(ctx);
+        fixture.model.borrow_mut().mark_questions_sent(&question);
+        assert_eq!(state(&question), Some(QuestionState::Sent));
+        // An answer the adapter refuses (no such question) resolves nothing.
+        session.answer_questions("no-such-question", json!({"Continue?": "Yes"}));
+        assert_eq!(state(&question), Some(QuestionState::Sent));
+        session.answer_questions(&question, json!({"Continue?": "Yes"}));
+        assert_eq!(state(&question), Some(QuestionState::Answered));
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(question.as_str())
+                && e.event == Event::QuestionResolved { answered: true }));
+        fixture.wait_finished(ctx);
+        assert_eq!(state(&question), Some(QuestionState::Answered));
+        session.shutdown(false);
+    });
+}
