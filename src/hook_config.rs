@@ -40,10 +40,13 @@ pub fn hooks_path(home: Option<&str>) -> Option<PathBuf> {
 
 /// True when some `PreToolUse` entry runs `--approval-hook` and matches every tool: a matcher
 /// of `.*`, or none. A narrower matcher leaves tools ungated, so it does not count.
+#[cfg(test)]
 pub fn approval_hook_installed(json: &str) -> bool {
-    let Ok(root) = serde_json::from_str::<Value>(json) else {
-        return false;
-    };
+    serde_json::from_str::<Value>(json).is_ok_and(|root| value_installed(&root))
+}
+
+/// [`approval_hook_installed`] on an already parsed file.
+fn value_installed(root: &Value) -> bool {
     let Some(groups) = root.as_object() else {
         return false;
     };
@@ -75,19 +78,91 @@ fn entry_gates_everything(entry: &Value) -> bool {
             .is_some_and(|hooks| hooks.iter().any(runs_hook))
 }
 
+/// What reading `hooks.json` found. "Could not tell" is its own case, never folded into
+/// [`HookProbe::Missing`] or [`HookProbe::Installed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookProbe {
+    Installed,
+    /// The file is absent or readable but has no gating approval entry.
+    Missing(String),
+    /// `HOME` unset, the file unreadable (permissions, I/O), or not valid JSON.
+    Unreadable(String),
+}
+
+/// Reads the real file and classifies what is there.
+pub fn probe(home: Option<&str>) -> HookProbe {
+    let Some(path) = hooks_path(home) else {
+        return HookProbe::Unreadable("HOME is not set".to_owned());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return HookProbe::Missing(missing_message(&path));
+        }
+        Err(e) => {
+            return HookProbe::Unreadable(format!("cannot read {}: {e}", path.display()));
+        }
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        return HookProbe::Unreadable(format!("{} is not valid JSON", path.display()));
+    };
+    if value_installed(&root) {
+        HookProbe::Installed
+    } else {
+        HookProbe::Missing(missing_message(&path))
+    }
+}
+
+fn missing_message(path: &std::path::Path) -> String {
+    format!(
+        "{} has no approval hook entry. Add this top-level key:\n{}",
+        path.display(),
+        install_entry_json()
+    )
+}
+
 /// Reads the real file. `Err` carries the reason to show the user.
 pub fn check_installed(home: Option<&str>) -> Result<(), String> {
-    let path = hooks_path(home).ok_or_else(|| "HOME is not set".to_owned())?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if approval_hook_installed(&text) {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} has no approval hook entry. Add this top-level key:\n{}",
-            path.display(),
-            install_entry_json()
-        ))
+    match probe(home) {
+        HookProbe::Installed => Ok(()),
+        HookProbe::Missing(why) | HookProbe::Unreadable(why) => Err(why),
+    }
+}
+
+/// What the Settings row shows for agy's hook: three states, per the repo's indicator rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookBadge {
+    /// Hook entry present and the runtime directory available. (Not a live-gate proof: that is
+    /// the per-thread socket bind and the session canary.)
+    Ready,
+    /// No gating entry in `hooks.json`.
+    Missing,
+    /// Could not tell: unreadable file, bad JSON, or no socket to bind.
+    Unreadable,
+}
+
+/// `socket_bound`: whether the approval socket is (or can be) bound. An installed hook with no
+/// socket is not ready, so it is `Unreadable`, never `Ready`.
+pub fn badge(probe: &HookProbe, socket_bound: bool) -> HookBadge {
+    match probe {
+        HookProbe::Installed if socket_bound => HookBadge::Ready,
+        HookProbe::Installed | HookProbe::Unreadable(_) => HookBadge::Unreadable,
+        HookProbe::Missing(_) => HookBadge::Missing,
+    }
+}
+
+/// Writes the verdict to the journal (`info` when ready, `warn` otherwise).
+pub fn log_verdict(badge: HookBadge, probe: &HookProbe, socket_bound: bool) {
+    match badge {
+        HookBadge::Ready => {
+            tracing::info!("agy approval hook ready (entry present, runtime dir ok)")
+        }
+        HookBadge::Missing => {
+            tracing::warn!("agy approval hook missing: agy cannot ask before acting")
+        }
+        HookBadge::Unreadable => {
+            tracing::warn!(socket_bound, probe = ?probe, "agy approval hook could not be verified");
+        }
     }
 }
 
@@ -163,6 +238,51 @@ mod tests {
         assert!(!approval_hook_installed(
             r#"{"g":{"PreToolUse":[{"matcher":7,"command":"--approval-hook"}]}}"#
         ));
+    }
+
+    #[test]
+    fn probe_separates_missing_from_unreadable() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().to_string_lossy().into_owned();
+        assert!(
+            matches!(probe(Some(&home)), HookProbe::Missing(_)),
+            "no file"
+        );
+        assert!(matches!(probe(None), HookProbe::Unreadable(_)), "no HOME");
+        let dir = tmp.path().join(".gemini/config");
+        std::fs::create_dir_all(&dir).expect("mk");
+        std::fs::write(dir.join("hooks.json"), "not json").expect("write");
+        assert!(
+            matches!(probe(Some(&home)), HookProbe::Unreadable(_)),
+            "bad json"
+        );
+        std::fs::write(dir.join("hooks.json"), "{}").expect("write");
+        assert!(
+            matches!(probe(Some(&home)), HookProbe::Missing(_)),
+            "no entry"
+        );
+        std::fs::write(dir.join("hooks.json"), GOOD).expect("write");
+        assert_eq!(probe(Some(&home)), HookProbe::Installed);
+        // A directory where the file should be is a read error, not "missing".
+        std::fs::remove_file(dir.join("hooks.json")).expect("rm");
+        std::fs::create_dir(dir.join("hooks.json")).expect("mkdir");
+        assert!(
+            matches!(probe(Some(&home)), HookProbe::Unreadable(_)),
+            "dir"
+        );
+    }
+
+    #[test]
+    fn badge_has_three_states_and_unreadable_is_never_healthy() {
+        let installed = HookProbe::Installed;
+        let missing = HookProbe::Missing("m".into());
+        let unreadable = HookProbe::Unreadable("u".into());
+        assert_eq!(badge(&installed, true), HookBadge::Ready);
+        assert_eq!(badge(&installed, false), HookBadge::Unreadable);
+        assert_eq!(badge(&missing, true), HookBadge::Missing);
+        assert_eq!(badge(&missing, false), HookBadge::Missing);
+        assert_eq!(badge(&unreadable, true), HookBadge::Unreadable);
+        assert_eq!(badge(&unreadable, false), HookBadge::Unreadable);
     }
 
     #[test]

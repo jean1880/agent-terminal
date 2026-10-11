@@ -246,6 +246,113 @@ fn auto_allowed(targets: &[&str], workspaces: &[PathBuf], home: Option<&Path>) -
         })
 }
 
+/// Extra argument names the read tools use for the directory or file they look at.
+const READ_PATH_KEYS: [&str; 6] = [
+    "DirectoryPath",
+    "directory_path",
+    "SearchPath",
+    "search_path",
+    "SearchDirectory",
+    "Directory",
+];
+
+/// Argument names whose value is a list of paths (`codebase_search` takes `TargetDirectories`).
+const READ_LIST_KEYS: [&str; 5] = [
+    "TargetDirectories",
+    "target_directories",
+    "SearchPaths",
+    "Paths",
+    "Directories",
+];
+
+/// Tools that walk a tree and read file contents: pointing one at `$HOME` (or above) reads
+/// `~/.ssh` and `~/.gemini_env` without ever naming them.
+fn searches_recursively(tool: &str) -> bool {
+    matches!(tool, "grep_search" | "find_by_name" | "codebase_search")
+}
+
+/// Every path a read call names, or `None` when any of them is not text we can judge: a present
+/// key whose value is not a string (or a list of strings) fails closed.
+fn named_paths(args: &Value) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    for key in TARGET_KEYS.iter().chain(READ_PATH_KEYS.iter()) {
+        if let Some(v) = args.get(*key) {
+            out.push(v.as_str()?);
+        }
+    }
+    for key in READ_LIST_KEYS {
+        if let Some(v) = args.get(key) {
+            for item in v.as_array()? {
+                out.push(item.as_str()?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Whether `dir` is `home` or one of its ancestors (compared resolved as well as lexically).
+fn is_home_or_above(dir: &Path, home: &Path) -> bool {
+    let real_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+    home.starts_with(dir) || real_home.starts_with(&real_dir)
+}
+
+/// Whether a read-only call may run unasked: every path it names is inside a workspace root,
+/// with no symlink or `..` on the way, and not a [`sensitive_target`]. Relative paths are taken
+/// from `cwd`. Fails closed on non-text values, empty strings, `~` and `$` (which no shell
+/// expansion here will resolve), `read_resource` (a URI can name any file) and tools that must
+/// name a path but do not. A search with no path searches `cwd`, which must then be inside a
+/// workspace; a recursive search never runs unasked from `$HOME` or an ancestor of it.
+fn read_allowed(query: &ApprovalQuery, workspaces: &[PathBuf], home: Option<&Path>) -> bool {
+    let tool = query.tool.as_str();
+    if tool == "read_resource" {
+        return false;
+    }
+    let Some(named) = named_paths(&query.args) else {
+        return false;
+    };
+    if named
+        .iter()
+        .any(|t| t.trim().is_empty() || t.starts_with('~') || t.contains('$'))
+    {
+        return false;
+    }
+    let inside = |full: &Path| {
+        workspaces
+            .iter()
+            .any(|w| contained(full, w) && !sensitive_target(full, w, home))
+    };
+    let cwd = query.cwd.as_deref().map(Path::new);
+    let mut fulls: Vec<PathBuf> = Vec::new();
+    for t in &named {
+        let path = Path::new(t);
+        fulls.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(cwd) = cwd {
+            cwd.join(path)
+        } else {
+            return false;
+        });
+    }
+    if named.is_empty() {
+        match tool {
+            // No path argument at all: nothing to disclose.
+            "list_resources" => return true,
+            "grep_search" | "find_by_name" | "codebase_search" => {
+                let Some(cwd) = cwd else { return false };
+                fulls.push(cwd.to_path_buf());
+            }
+            _ => return false,
+        }
+    }
+    if searches_recursively(tool)
+        && home.is_some_and(|h| fulls.iter().any(|f| is_home_or_above(f, h)))
+    {
+        return false;
+    }
+    fulls.iter().all(|f| inside(f))
+}
+
 /// [`policy_with_home`] with no home directory (tests of the workspace rules alone).
 #[cfg(test)]
 pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verdict {
@@ -257,9 +364,9 @@ pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verd
 ///
 /// | mode | read-only | file edit | command / network / MCP / subagent | unknown |
 /// |---|---|---|---|---|
-/// | Plan | allow | deny | deny (network reads: ask) | ask |
-/// | Ask | allow | ask | ask | ask |
-/// | AcceptEdits | allow | allow inside the workspace unless sensitive, else ask | ask | ask |
+/// | Plan | allow inside the workspace unless sensitive, else ask | deny | deny (network reads: ask) | ask |
+/// | Ask | allow inside the workspace unless sensitive, else ask | ask | ask | ask |
+/// | AcceptEdits | allow inside the workspace unless sensitive, else ask | allow inside the workspace unless sensitive, else ask | ask | ask |
 pub fn policy_with_home(
     mode: Mode,
     query: &ApprovalQuery,
@@ -268,7 +375,10 @@ pub fn policy_with_home(
 ) -> Verdict {
     let class = classify(&query.tool);
     match (class, mode) {
-        (ToolClass::ReadOnly, _) => Verdict::Allow,
+        (ToolClass::ReadOnly, _) if read_allowed(query, workspaces, home) => Verdict::Allow,
+        // Reads outside the workspace, of sensitive targets or through a symlink ask in every
+        // mode, Plan included: plan mode refuses mutation, not disclosure.
+        (ToolClass::ReadOnly, _) => Verdict::Ask,
         (_, Mode::Plan) if mutates(&query.tool) => Verdict::Deny("plan mode is read-only"),
         (ToolClass::Edit, Mode::AcceptEdits)
             if auto_allowed(&edit_targets(&query.args), workspaces, home) =>
@@ -439,6 +549,15 @@ fn resolve(path: &Path) -> PathBuf {
 pub fn runtime_dir(xdg_runtime_dir: Option<&str>) -> Option<PathBuf> {
     let base = xdg_runtime_dir.filter(|v| Path::new(v).is_absolute())?;
     Some(PathBuf::from(base).join("agent-terminal"))
+}
+
+/// Whether an approval socket can be bound here: `$XDG_RUNTIME_DIR` is an absolute directory.
+/// (Binding itself happens per thread; this is the settings-time proof the runtime is usable.)
+pub fn socket_bindable() -> bool {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    runtime_dir(xdg.as_deref())
+        .and_then(|d| d.parent().map(Path::to_owned))
+        .is_some_and(|base| base.is_dir())
 }
 
 // ---- server ----
@@ -1199,7 +1318,10 @@ mod tests {
             "list_resources",
         ] {
             for mode in [plan, ask, acc] {
-                assert_eq!(policy(mode, &q(tool, Value::Null), &w), Allow, "{tool}");
+                // A read that names no path: allowed only where the path is optional.
+                // Searches with no path and no cwd, and read_resource, ask too.
+                let want = if tool == "list_resources" { Allow } else { Ask };
+                assert_eq!(policy(mode, &q(tool, Value::Null), &w), want, "{tool}");
             }
         }
         for tool in [
@@ -1230,6 +1352,211 @@ mod tests {
             assert_eq!(policy(mode, &q("get_secrets", Value::Null), &w), Ask);
             assert_eq!(policy(mode, &q("brand_new_tool", Value::Null), &w), Ask);
             assert_eq!(policy(mode, &q("", Value::Null), &w), Ask);
+        }
+    }
+
+    #[test]
+    fn policy_table_read_containment() {
+        use Verdict::{Allow, Ask};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("mk");
+        std::fs::create_dir_all(tmp.path().join("repo-sibling")).expect("mk");
+        std::fs::write(repo.join("src/a.rs"), "x").expect("write");
+        std::fs::write(tmp.path().join("repo-sibling/secret"), "x").expect("write");
+        std::os::unix::fs::symlink("/etc/hostname", repo.join("link")).expect("link");
+        std::os::unix::fs::symlink(tmp.path().join("repo-sibling"), repo.join("dirlink"))
+            .expect("link");
+        std::fs::create_dir_all(repo.join(".git")).expect("mk");
+        let w = vec![repo.clone()];
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("mk");
+        let read = |p: &str| q("view_file", serde_json::json!({"AbsolutePath": p}));
+        let at = |rel: &str| repo.join(rel).to_string_lossy().into_owned();
+        let ssh = home.join(".ssh/id_rsa").to_string_lossy().into_owned();
+        let sibling = tmp
+            .path()
+            .join("repo-sibling/secret")
+            .to_string_lossy()
+            .into_owned();
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+            let check = |query: &ApprovalQuery| policy_with_home(mode, query, &w, Some(&home));
+            assert_eq!(check(&read(&at("src/a.rs"))), Allow, "{mode:?} in project");
+            assert_eq!(
+                check(&read(&at("src/new.rs"))),
+                Allow,
+                "{mode:?} not yet there"
+            );
+            assert_eq!(check(&read(&ssh)), Ask, "{mode:?} ssh key");
+            assert_eq!(check(&read(&sibling)), Ask, "{mode:?} sibling dir");
+            assert_eq!(check(&read("/etc/hostname")), Ask, "{mode:?} etc");
+            assert_eq!(check(&read(&at("link"))), Ask, "{mode:?} symlink file");
+            assert_eq!(
+                check(&read(&at("dirlink/secret"))),
+                Ask,
+                "{mode:?} symlink dir"
+            );
+            assert_eq!(
+                check(&read(&at("../repo-sibling/secret"))),
+                Ask,
+                "{mode:?} dotdot"
+            );
+            assert_eq!(check(&read(&at(".git/config"))), Ask, "{mode:?} sensitive");
+            assert_eq!(check(&read("src/a.rs")), Ask, "{mode:?} relative, no cwd");
+            // One bad path among several spoils the call.
+            let two = q(
+                "list_dir",
+                serde_json::json!({"DirectoryPath": at("src"), "Path": "/etc"}),
+            );
+            assert_eq!(check(&two), Ask, "{mode:?} mixed");
+            let list = q("list_dir", serde_json::json!({"DirectoryPath": at("src")}));
+            assert_eq!(check(&list), Allow, "{mode:?} list in project");
+            let mut rel = read("src/a.rs");
+            rel.cwd = Some(repo.to_string_lossy().into_owned());
+            assert_eq!(check(&rel), Allow, "{mode:?} relative with cwd");
+        }
+    }
+
+    #[test]
+    fn read_containment_fails_closed_on_odd_arguments() {
+        use Verdict::{Allow, Ask};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("mk");
+        let w = vec![repo.clone()];
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mk");
+        let inside = repo.join("src").to_string_lossy().into_owned();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let with_cwd = |tool: &str, args: Value, cwd: &str| {
+            let mut query = q(tool, args);
+            query.cwd = Some(cwd.to_owned());
+            query
+        };
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+            let check = |query: &ApprovalQuery| policy_with_home(mode, query, &w, Some(&home));
+            let view = |v: Value| q("view_file", serde_json::json!({ "AbsolutePath": v }));
+            // `~` and `$` are never expanded here.
+            assert_eq!(check(&view("~/.ssh/id_rsa".into())), Ask, "{mode:?} tilde");
+            assert_eq!(check(&view("$HOME/.bashrc".into())), Ask, "{mode:?} dollar");
+            assert_eq!(
+                check(&view(format!("{inside}/$X").into())),
+                Ask,
+                "{mode:?} $ inside"
+            );
+            // Non-text, empty and list values.
+            assert_eq!(check(&view(serde_json::json!(7))), Ask, "{mode:?} number");
+            assert_eq!(check(&view(Value::Null)), Ask, "{mode:?} null");
+            assert_eq!(
+                check(&view(serde_json::json!(["/etc/passwd"]))),
+                Ask,
+                "{mode:?} array"
+            );
+            assert_eq!(check(&view("".into())), Ask, "{mode:?} empty");
+            assert_eq!(check(&view("   ".into())), Ask, "{mode:?} blank");
+            // A list of paths is judged element by element.
+            let dirs = |v: Value| {
+                q(
+                    "codebase_search",
+                    serde_json::json!({"TargetDirectories": v}),
+                )
+            };
+            assert_eq!(
+                check(&dirs(serde_json::json!([inside]))),
+                Allow,
+                "{mode:?} list ok"
+            );
+            assert_eq!(
+                check(&dirs(serde_json::json!([inside, "/etc"]))),
+                Ask,
+                "{mode:?} list outside"
+            );
+            assert_eq!(
+                check(&dirs(serde_json::json!([inside, 3]))),
+                Ask,
+                "{mode:?} list non-string"
+            );
+            assert_eq!(
+                check(&dirs(serde_json::json!("x"))),
+                Ask,
+                "{mode:?} list as string"
+            );
+            // A search path outside the workspace.
+            let grep = |p: &str| q("grep_search", serde_json::json!({"SearchPath": p}));
+            assert_eq!(check(&grep(&inside)), Allow, "{mode:?} grep inside");
+            assert_eq!(check(&grep("/etc")), Ask, "{mode:?} grep outside");
+            // No path: the cwd decides.
+            let bare = |cwd: &str| with_cwd("grep_search", serde_json::json!({"Query": "x"}), cwd);
+            assert_eq!(check(&bare(&repo_s)), Allow, "{mode:?} cwd inside");
+            assert_eq!(check(&bare("/etc")), Ask, "{mode:?} cwd outside");
+            assert_eq!(
+                check(&q("find_by_name", Value::Null)),
+                Ask,
+                "{mode:?} no cwd"
+            );
+            // Resources: a URI can name any file.
+            let res = q(
+                "read_resource",
+                serde_json::json!({"Uri": "file:///etc/shadow"}),
+            );
+            assert_eq!(check(&res), Ask, "{mode:?} read_resource");
+            assert_eq!(
+                check(&q("list_resources", Value::Null)),
+                Allow,
+                "{mode:?} list_resources"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_search_from_home_or_above_asks_but_list_dir_does_not() {
+        use Verdict::{Allow, Ask};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("proj")).expect("mk");
+        // The workspace is the home directory itself.
+        let w = vec![home.clone()];
+        let home_s = home.to_string_lossy().into_owned();
+        let proj = home.join("proj").to_string_lossy().into_owned();
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+            let check = |query: &ApprovalQuery| policy_with_home(mode, query, &w, Some(&home));
+            for tool in ["grep_search", "find_by_name", "codebase_search"] {
+                let at = |p: &str| q(tool, serde_json::json!({"SearchPath": p}));
+                assert_eq!(check(&at(&home_s)), Ask, "{mode:?} {tool} home");
+                assert_eq!(
+                    check(&at(&tmp.path().to_string_lossy())),
+                    Ask,
+                    "{mode:?} {tool} above home"
+                );
+                assert_eq!(
+                    check(&at(&proj)),
+                    Allow,
+                    "{mode:?} {tool} project below home"
+                );
+                let mut bare = q(tool, serde_json::json!({"Query": "x"}));
+                bare.cwd = Some(home_s.clone());
+                assert_eq!(check(&bare), Ask, "{mode:?} {tool} bare in home");
+            }
+            let list = q("list_dir", serde_json::json!({"DirectoryPath": proj}));
+            assert_eq!(check(&list), Allow, "{mode:?} list_dir below home");
+        }
+    }
+
+    #[test]
+    fn w0_agy_fixture_read_outside_the_project_asks_in_every_mode() {
+        let raw = include_str!("../tests/fixtures/real/agy/read-outside-project.jsonl");
+        let step: Value = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["step_update"]["tool_name"] == "view_file")
+            .expect("view_file step in fixture");
+        let info = &step["step_update"]["tool_info"];
+        let query = q("view_file", info["parameters"].clone());
+        assert_eq!(edit_targets(&query.args), vec!["/etc/hostname"]);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let w = vec![tmp.path().to_owned()];
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+            assert_eq!(policy(mode, &query, &w), Verdict::Ask, "{mode:?}");
         }
     }
 
@@ -1819,7 +2146,14 @@ mod tests {
             let r = wait_reply(ctx, &rx);
             assert_eq!(r.decision, Decision::Deny);
             assert!(r.reason.is_some_and(|s| s.contains("plan")));
-            let rx = client(path.clone(), with_id(q("view_file", Value::Null), "p2"));
+            let inside = tmp.path().join("a.txt").to_string_lossy().into_owned();
+            let rx = client(
+                path.clone(),
+                with_id(
+                    q("view_file", serde_json::json!({"AbsolutePath": inside})),
+                    "p2",
+                ),
+            );
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
             assert!(seen.borrow().is_empty());
 

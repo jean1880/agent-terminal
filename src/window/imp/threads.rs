@@ -924,6 +924,16 @@ pub(super) async fn check_hook() -> Result<(), String> {
     verdict
 }
 
+/// Remembers the verdict of a probe made elsewhere (Settings), so one file read serves both.
+pub(super) fn remember_hook_probe(probe: &crate::hook_config::HookProbe) {
+    use crate::hook_config::HookProbe;
+    let verdict = match probe {
+        HookProbe::Installed => Ok(()),
+        HookProbe::Missing(why) | HookProbe::Unreadable(why) => Err(why.clone()),
+    };
+    HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(verdict));
+}
+
 /// The last [`check_hook`] verdict. Fail-closed: before any check has finished it is an `Err`, so
 /// agy starts without the skip flag rather than guess. (A stale `Ok` is safe too: the session's
 /// canary stops agy and restarts it without the flag when a tool runs without a hook query.)
