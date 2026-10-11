@@ -3235,6 +3235,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// F8: `/fork` is a built-in for every agent, run locally, never sent to the agent as text.
+    #[test]
+    fn slash_fork_is_a_local_builtin_for_every_agent() {
+        use agent_core::adapter::Driver;
+        for driver in Driver::ALL {
+            let caps = agent_core::caps::Capabilities::of(driver);
+            for typed in ["/fork", "  /fork  ", "/FORK"] {
+                let line = typeahead::parse_command_line(typed, &caps).expect("a built-in");
+                assert_eq!(
+                    line.builtin.action,
+                    BuiltinAction::Fork,
+                    "{driver:?} {typed}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn codex_says_it_has_no_mcp_panel() {
         let status = SessionStatus {
