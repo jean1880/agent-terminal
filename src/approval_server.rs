@@ -1881,11 +1881,9 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             let rules_path = tmp.path().join("always-allow.json");
             let mut rules = crate::always_allow::AlwaysRules::default();
-            assert!(rules.add(crate::always_allow::Rule::new(
-                "*",
-                "run_command",
-                "cargo test*",
-            )));
+            assert!(rules.add(
+                crate::always_allow::Rule::new("*", "run_command", "cargo test*").expect("rule")
+            ));
             rules.save(&rules_path).expect("save");
 
             let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
@@ -2180,7 +2178,8 @@ mod tests {
             );
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
             // The user loosens the pattern to "ls *" for every workspace.
-            let custom_rule = crate::always_allow::Rule::new("*", "run_command", "ls *");
+            let custom_rule =
+                crate::always_allow::Rule::new("*", "run_command", "ls *").expect("rule");
             assert!(handle.respond_with_rule("q_custom", Decision::AllowAlways, Some(custom_rule)));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
             assert!(pump_until(ctx, 10, || {
@@ -2232,13 +2231,15 @@ mod tests {
 
             let rx = ask("a1", "cargo test --bin foo");
             assert!(!card_options("a1").contains(&Decision::AllowAlways));
-            let typed = crate::always_allow::Rule::new("*", "run_command", "cargo test*");
+            let typed =
+                crate::always_allow::Rule::new("*", "run_command", "cargo test*").expect("rule");
             assert!(handle.respond_with_rule("a1", Decision::AllowAlways, Some(typed)));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow, "downgraded");
             assert!(!rules.exists(), "nothing saved");
 
             let rx = ask("a2", "cargo test --bin foo");
-            let loose = crate::always_allow::Rule::new("*", "run_command", "cargo *");
+            let loose =
+                crate::always_allow::Rule::new("*", "run_command", "cargo *").expect("rule");
             assert!(handle.respond_with_rule("a2", Decision::AllowForSession, Some(loose)));
             assert_eq!(
                 wait_reply(ctx, &rx).decision,

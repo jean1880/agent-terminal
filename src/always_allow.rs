@@ -624,36 +624,19 @@ pub struct Rule {
     pub origin: String,
     pub kind: ActionKind,
     pub target: Target,
-    /// Why this pattern cannot be a rule (set by [`Rule::new`]); such a rule matches nothing and
-    /// is never stored.
-    #[serde(skip)]
-    refused: Option<String>,
 }
 
 impl Rule {
     /// The rule the user typed in the approval dialog: `pattern` for `tool` (a provider tool
     /// name), in `workspace` (empty: the thread's; `*`: all). A shell pattern may end in `*` (the
-    /// command starts with these words). Never fails: a pattern that cannot be a rule makes a
-    /// rule that matches nothing, which [`Self::complete`] reports.
+    /// command starts with these words). `Err` says why the pattern cannot be a rule, so the
+    /// dialog can show it inline before anything is sent.
     pub fn new(
-        workspace: impl Into<String>,
-        tool: impl Into<String>,
-        pattern: impl Into<String>,
-    ) -> Self {
-        let workspace = workspace.into();
-        let tool = tool.into();
-        let pattern = pattern.into();
-        Self::parse(&workspace, &tool, &pattern).unwrap_or_else(|why| Self {
-            workspace,
-            cwd: None,
-            origin: String::new(),
-            kind: ActionKind::of_tool(&tool).unwrap_or(ActionKind::Shell),
-            target: Target::Argv {
-                argv: Vec::new(),
-                prefix: false,
-            },
-            refused: Some(why),
-        })
+        workspace: impl AsRef<str>,
+        tool: impl AsRef<str>,
+        pattern: impl AsRef<str>,
+    ) -> Result<Self, String> {
+        Self::parse(workspace.as_ref(), tool.as_ref(), pattern.as_ref())
     }
 
     fn parse(workspace: &str, tool: &str, pattern: &str) -> Result<Self, String> {
@@ -713,7 +696,6 @@ impl Rule {
             origin: String::new(),
             kind,
             target,
-            refused: None,
         })
     }
 
@@ -764,7 +746,6 @@ impl Rule {
             origin: ctx.driver.to_owned(),
             kind: action.kind(),
             target,
-            refused: None,
         })
     }
 
@@ -773,9 +754,6 @@ impl Rule {
     /// rule, a canonical path (which must pass the containment check), and the agent it is
     /// created on.
     pub fn complete(mut self, ctx: &Context) -> Result<Self, String> {
-        if let Some(why) = self.refused.take() {
-            return Err(why);
-        }
         self.origin = ctx.driver.to_owned();
         if self.workspace != "*" {
             self.workspace = ctx.workspace_key();
@@ -799,9 +777,6 @@ impl Rule {
     /// for session" on a runner, wrapper or interpreter only as the exact command, never a
     /// pattern.
     pub fn check(&self, scope: Scope) -> Result<(), String> {
-        if let Some(why) = &self.refused {
-            return Err(why.clone());
-        }
         let Target::Argv { argv, prefix } = &self.target else {
             return Ok(());
         };
@@ -841,7 +816,7 @@ impl Rule {
     }
 
     fn matches_probe(&self, action: &Action, probe: &Probe) -> bool {
-        if self.refused.is_some() || self.kind != action.kind() {
+        if self.kind != action.kind() {
             return false;
         }
         if self.workspace != "*" && self.workspace != probe.workspace_key {
@@ -1131,10 +1106,9 @@ impl AlwaysRules {
         Ok(true)
     }
 
-    /// Adds a rule unless an identical one exists or it is not a rule ([`Rule::new`] refused it);
-    /// returns whether it was added.
+    /// Adds a rule unless the same permission is already there; returns whether it was added.
     pub fn add(&mut self, rule: Rule) -> bool {
-        if rule.refused.is_some() || self.rules.iter().any(|r| r.same_as(&rule)) {
+        if self.rules.iter().any(|r| r.same_as(&rule)) {
             return false;
         }
         self.rules.push(rule);
@@ -1290,9 +1264,7 @@ impl AlwaysRules {
     /// workspace never leaves agent-terminal (it would become a grant in every project).
     fn exportable(&self) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(|r| {
-            r.workspace == "*"
-                && r.refused.is_none()
-                && matches!(r.target, Target::Argv { .. } | Target::Mcp { .. })
+            r.workspace == "*" && matches!(r.target, Target::Argv { .. } | Target::Mcp { .. })
         })
     }
 
@@ -1680,6 +1652,17 @@ mod tests {
         }
     }
 
+    /// `Rule::new(..)` then [`Rule::complete`], in one step.
+    trait CompleteExt {
+        fn complete(self, ctx: &Context) -> Result<Rule, String>;
+    }
+
+    impl CompleteExt for Result<Rule, String> {
+        fn complete(self, ctx: &Context) -> Result<Rule, String> {
+            self.and_then(|rule| rule.complete(ctx))
+        }
+    }
+
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| (*w).to_owned()).collect()
     }
@@ -1782,7 +1765,7 @@ mod tests {
             "run_command",
             "printf %s 'sk-'abcdefghijklmnopqrstuvwx",
         );
-        assert!(custom.check(Scope::Session).is_err());
+        assert!(custom.map_or(true, |r| r.check(Scope::Session).is_err()));
     }
 
     /// B1: a prefix (or exact) rule never covers an option that runs other code, and never
@@ -1857,12 +1840,12 @@ mod tests {
                 decide(Some(&action), None, Scope::Always, &c).is_err(),
                 "{command}"
             );
-            let typed = Rule::new("", "Bash", command);
+            let typed = Rule::new("", "Bash", command).expect("a plain pattern");
             assert!(
                 decide(Some(&action), Some(typed), Scope::Always, &c).is_err(),
                 "dialog path: {command}"
             );
-            let star = Rule::new("", "Bash", format!("{command} *"));
+            let star = Rule::new("", "Bash", format!("{command} *")).expect("a plain pattern");
             assert!(
                 decide(Some(&action), Some(star), Scope::Session, &c).is_err(),
                 "a session pattern: {command}"
@@ -1932,7 +1915,7 @@ mod tests {
                 "{refused:?}"
             );
         }
-        let typed_outside = Rule::new("", "Edit", "/etc/hosts");
+        let typed_outside = Rule::new("", "Edit", "/etc/hosts").expect("an absolute path");
         assert!(decide(Some(&inside), Some(typed_outside), Scope::Always, &c).is_err());
         let mcp = Action::Mcp {
             server: "fs".into(),
@@ -2321,9 +2304,10 @@ mod tests {
                 "{bad:?}"
             );
         }
-        let refused = Rule::new("*", "run_command", "a; b");
-        let mut set = AlwaysRules::default();
-        assert!(!set.add(refused), "a refused pattern is never stored");
+        assert!(
+            Rule::new("*", "run_command", "a; b").is_err_and(|why| why.contains("shell syntax")),
+            "the reason the dialog shows inline"
+        );
         assert!(Rule::new("*", "WebFetch", "x").complete(&c).is_err());
         let mcp = Rule::new("*", "call_mcp_tool", "hive/*")
             .complete(&c)

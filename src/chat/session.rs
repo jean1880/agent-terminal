@@ -4848,7 +4848,7 @@ mod tests {
             );
             feed(&session, &can_use_tool("r1", "touch b.tmp"));
             assert!(offered(&seen, "r1").contains(&Decision::AllowForSession));
-            let pattern = crate::always_allow::Rule::new("", "Bash", "touch b.tmp");
+            let pattern = crate::always_allow::Rule::new("", "Bash", "touch b.tmp").expect("rule");
             session.respond_approval_with_rule("r1", Decision::AllowForSession, Some(pattern));
             assert_eq!(resolution(&seen, "r1"), Some(Decision::AllowForSession));
             assert!(pump_until(ctx, 10, || stdin_log(tmp.path()).contains("\"r1\"")));
@@ -5348,7 +5348,7 @@ mod tests {
             assert!(offered(&seen, &request).contains(&Decision::AllowAlways));
             let prefill = crate::always_allow::dialog_prefill(&tool, &input, None);
             assert_eq!(prefill, "ls -la");
-            let rule = crate::always_allow::Rule::new("", tool, prefill);
+            let rule = crate::always_allow::Rule::new("", tool, prefill).expect("rule");
             session.respond_approval_with_rule(&request, Decision::AllowAlways, Some(rule));
             assert_eq!(resolution(&seen, &request), Some(Decision::AllowAlways));
             let saved = saved_rules_once(ctx, tmp.path(), 1);
@@ -5480,7 +5480,7 @@ mod tests {
             feed(&session, &can_use_tool("r1", "ls -la"));
             assert!(pump_until(ctx, 10, || resolution(&seen, "r1").is_some()));
             assert_eq!(resolution(&seen, "r1"), Some(Decision::Deny));
-            let pattern = crate::always_allow::Rule::new("", "Bash", "ls *");
+            let pattern = crate::always_allow::Rule::new("", "Bash", "ls *").expect("rule");
             session.respond_approval_with_rule("r1", Decision::AllowAlways, Some(pattern));
             assert!(session.inner.session_rules.borrow().rules.is_empty());
             // Give a stray save every chance to land.

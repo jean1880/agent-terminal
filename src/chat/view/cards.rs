@@ -2323,8 +2323,13 @@ fn confirm_approval_rule(
 
     glib::MainContext::default().spawn_local(async move {
         let response = dialog.choose_future(root.as_ref()).await;
+        let chosen = match response.as_str() {
+            "save" => Some(decision),
+            "save_session" => Some(Decision::AllowForSession),
+            _ => None,
+        };
         match response.as_str() {
-            "save" => {
+            "save" | "save_session" => {
                 let user_pattern = entry.text().trim().to_string();
                 let pattern = if user_pattern.is_empty() {
                     initial_pattern
@@ -2336,30 +2341,17 @@ fn confirm_approval_rule(
                 } else {
                     c.unwrap_or_default()
                 };
-                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
+                // Save is disabled while the pattern is invalid (inline validation), so an
+                // `Err` here is only a race; it never becomes a different rule: allow once.
+                let (decision, custom_rule) =
+                    match crate::always_allow::Rule::new(workspace, t, pattern) {
+                        Ok(rule) => (chosen.unwrap_or(decision), Some(rule)),
+                        Err(_) => (Decision::Allow, None),
+                    };
                 sink(RowEvent::Approve {
                     request: req,
                     decision,
-                    custom_rule: Some(rule),
-                });
-            }
-            "save_session" => {
-                let user_pattern = entry.text().trim().to_string();
-                let pattern = if user_pattern.is_empty() {
-                    initial_pattern
-                } else {
-                    user_pattern
-                };
-                let workspace = if global_check.is_active() {
-                    "*".to_string()
-                } else {
-                    c.unwrap_or_default()
-                };
-                let rule = crate::always_allow::Rule::new(workspace, t, pattern);
-                sink(RowEvent::Approve {
-                    request: req,
-                    decision: Decision::AllowForSession,
-                    custom_rule: Some(rule),
+                    custom_rule,
                 });
             }
             "allow_once" => {
@@ -2387,14 +2379,14 @@ fn rule_dialog(
         (
             "Confirm Session Approval Rule",
             "Modify the pattern below to loosen or tighten what will be approved for the \
-             remainder of this session. Wildcards (* and ?) are supported.",
+             remainder of this session. A final * covers any further arguments.",
             "Save for Session & Allow",
         )
     } else {
         (
             "Confirm Auto-Approval Rule",
             "Modify the pattern below to loosen or tighten what will be automatically approved \
-             in future sessions. Wildcards (* and ?) are supported.",
+             in future sessions. A final * covers any further arguments.",
             "Save Always & Allow",
         )
     };
@@ -2409,11 +2401,19 @@ fn rule_dialog(
 
     let entry = gtk4::Entry::builder()
         .text(initial_pattern)
-        .placeholder_text("e.g. cargo test* or git diff*")
+        .placeholder_text("e.g. ls -la or git status *")
         .activates_default(true)
         .hexpand(true)
         .build();
     content_box.append(&entry);
+    // Inline validation: a pattern no rule can hold says why, and cannot be saved.
+    let error = gtk4::Label::builder()
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["error", "caption"])
+        .visible(false)
+        .build();
+    content_box.append(&error);
 
     if let Some(flow) = suggestion_flow(&entry, tool, initial_pattern) {
         content_box.append(&flow);
@@ -2452,7 +2452,49 @@ fn rule_dialog(
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("save"));
     dialog.set_close_response("cancel");
+
+    let validate = {
+        let dialog = dialog.downgrade();
+        let error = error.downgrade();
+        let tool = tool.to_owned();
+        let initial = initial_pattern.to_owned();
+        move |entry: &gtk4::Entry| {
+            let (Some(dialog), Some(error)) = (dialog.upgrade(), error.upgrade()) else {
+                return;
+            };
+            let why = pattern_error(&tool, &entry.text(), &initial);
+            for response in ["save", "save_session"] {
+                if dialog.has_response(response) {
+                    dialog.set_response_enabled(response, why.is_none());
+                }
+            }
+            match why {
+                Some(why) => {
+                    error.set_text(&why);
+                    error.set_visible(true);
+                    entry.add_css_class("error");
+                }
+                None => {
+                    error.set_visible(false);
+                    entry.remove_css_class("error");
+                }
+            }
+        }
+    };
+    validate(&entry);
+    entry.connect_changed(validate);
     (dialog, entry, global_check)
+}
+
+/// Why the dialog's pattern cannot be a rule for `tool` (an empty entry means the prefilled
+/// pattern), or `None` when it can.
+pub(super) fn pattern_error(tool: &str, text: &str, initial: &str) -> Option<String> {
+    let pattern = if text.trim().is_empty() {
+        initial
+    } else {
+        text
+    };
+    crate::always_allow::Rule::new("", tool, pattern).err()
 }
 
 #[cfg(test)]
@@ -2725,7 +2767,37 @@ pub(crate) mod tests {
         assert!(diff_shown && diff.contains("hello there"), "{diff}");
         assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
         rule_dialog_prefills_the_bare_w0_command();
+        rule_dialog_validates_the_pattern_inline();
         approval_cards_show_the_command_and_cap_the_rest();
+    }
+
+    /// `Rule::new` is a `Result`: the rule dialog shows why a pattern cannot be a rule as it is
+    /// typed, and Save (and Save for Session) stay disabled until it can.
+    fn rule_dialog_validates_the_pattern_inline() {
+        let (dialog, entry, _) = rule_dialog("command_execution", "ls -la", Decision::AllowAlways);
+        let enabled = |d: &adw::AlertDialog| {
+            (
+                d.is_response_enabled("save"),
+                d.is_response_enabled("save_session"),
+            )
+        };
+        assert_eq!(enabled(&dialog), (true, true));
+        assert!(!entry.has_css_class("error"));
+        for bad in ["ls; id", "FOO=1 ls", "printf %s =sh", "ls\u{00A0}-la", "*"] {
+            entry.set_text(bad);
+            assert_eq!(enabled(&dialog), (false, false), "{bad:?}");
+            assert!(entry.has_css_class("error"), "{bad:?}");
+        }
+        entry.set_text("ls *");
+        assert_eq!(enabled(&dialog), (true, true));
+        assert!(!entry.has_css_class("error"));
+        entry.set_text("");
+        assert_eq!(enabled(&dialog), (true, true), "empty means the prefill");
+
+        assert!(pattern_error("command_execution", "git status *", "").is_none());
+        assert!(pattern_error("write_to_file", "*.rs", "").is_some());
+        assert!(pattern_error("call_mcp_tool", "fs/read", "").is_none());
+        assert!(pattern_error("WebFetch", "x", "").is_some());
     }
 
     /// Plan 2.6 (ui-audit #5, F15): a Codex command card shows the bare command and its folder,
