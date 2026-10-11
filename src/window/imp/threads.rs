@@ -217,6 +217,16 @@ impl ChatBackend for SessionSlot {
             s.answer_questions(request, answers);
         }
     }
+    fn respond_form(
+        &self,
+        request: &str,
+        action: agent_core::form::FormAction,
+        content: Option<serde_json::Value>,
+    ) {
+        if let Some(s) = self.get() {
+            s.respond_form(request, action, content);
+        }
+    }
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         if let Some(s) = self.get() {
             s.switch(driver, model, effort);

@@ -2770,6 +2770,24 @@ impl ChatBackend for ChatSession {
         }
     }
 
+    fn respond_form(
+        &self,
+        request: &str,
+        action: agent_core::form::FormAction,
+        content: Option<serde_json::Value>,
+    ) {
+        // Like a question: nothing acknowledges the answer, so the card is resolved once the
+        // adapter has accepted and written it. A refused answer leaves the card open.
+        if self.inner.command(Command::SubmitForm {
+            request: request.to_owned(),
+            action,
+            content,
+        }) {
+            self.inner
+                .emit(Envelope::new(Event::FormResolved { action }).request(request));
+        }
+    }
+
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         self.inner.switch(driver, model, effort);
     }

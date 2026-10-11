@@ -36,6 +36,17 @@ pub trait ChatBackend {
         self.respond_approval(request, decision);
     }
     fn answer_questions(&self, request: &str, answers: serde_json::Value);
+    /// Answers a form ([`agent_core::event::Event::FormRequested`]). `content` is what
+    /// [`agent_core::form::answer`] returned, for an accepted field form only. A backend that
+    /// never raises forms ignores it.
+    fn respond_form(
+        &self,
+        request: &str,
+        action: agent_core::form::FormAction,
+        content: Option<serde_json::Value>,
+    ) {
+        let _ = (request, action, content);
+    }
     /// Switch model and/or agent. Same agent: in-session or restart per capabilities;
     /// other agent: budgeted, redacted handoff into a new provider thread.
     /// `effort: None` keeps the current effort (same agent) or the agent's own (other agent).
