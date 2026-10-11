@@ -81,6 +81,7 @@ pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
             }
             if interruption {
                 if let Some(bounds) = widget.compute_bounds(&widget) {
+                    // 34 px: the plan's HIG minimum for primary actions (ui-audit.md #8).
                     if bounds.width() < 34.0 || bounds.height() < 34.0 {
                         out.push(format!(
                             "permission target is {}×{}; needs 34×34",
@@ -334,4 +335,18 @@ pub fn shown(widget: &gtk4::Widget) -> bool {
         at = w.parent();
     }
     true
+}
+
+/// Runs the loop until nothing has happened for 100 ms (layout, scrolling and idle work have
+/// finished), giving up after 1 s (a spinner never goes quiet). A bounded poll on quiescence, not a fixed sleep.
+pub fn settle(ctx: &glib::MainContext) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut quiet_since = Instant::now();
+    while Instant::now() < deadline && quiet_since.elapsed() < Duration::from_millis(100) {
+        if ctx.iteration(false) {
+            quiet_since = Instant::now();
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }

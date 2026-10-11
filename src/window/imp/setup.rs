@@ -232,12 +232,7 @@ mod tests {
             window.set_default_size(width, height);
             window.present();
             window.imp().show_setup();
-            let settle = || {
-                for _ in 0..50 {
-                    while ctx.iteration(false) {}
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            };
+            let settle = || crate::testutil::settle(&ctx);
             settle();
             let start = crate::testutil::descendants(window.upcast_ref())
                 .into_iter()
