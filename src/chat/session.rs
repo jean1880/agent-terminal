@@ -1160,8 +1160,9 @@ impl Inner {
 
     /// The app's own approval gate for Claude and Codex (agy's is its socket, D1). For an
     /// `ApprovalRequested` envelope it sets the buttons that mean the same everywhere ("Allow for
-    /// session" only where a rule could match the call; "Always allow" only for a shell command
-    /// with a rules file), says what Always keeps, records the call for the answer, and returns
+    /// session" only where a rule could match the call; "Always allow" also needs a rules file and
+    /// a kind it applies to: shell, a contained edit, an MCP tool), says what Always keeps,
+    /// records the call for the answer, and returns
     /// whether a session rule of this agent or an Always rule already allows it.
     fn gate_approval(&self, mut env: Envelope) -> (Envelope, bool) {
         let driver = self.adapter.borrow().driver();
@@ -1197,7 +1198,7 @@ impl Inner {
             && self.rules_path.borrow().is_some()
             && action
                 .as_ref()
-                .is_some_and(crate::approval_server::always_offerable);
+                .is_some_and(crate::always_allow::always_offerable);
         options.retain(|d| match d {
             Decision::AllowForSession => offer,
             Decision::AllowAlways => always,
@@ -4731,6 +4732,101 @@ mod tests {
             Event::ApprovalRequested { tool, .. } if tool == method_tool => e.request.clone(),
             _ => None,
         })
+    }
+
+    const W0_CODEX_EDIT: &str =
+        include_str!("../../tests/fixtures/real/codex/ask-edit-decline.jsonl");
+
+    fn claude_tool(id: &str, tool: &str, input: serde_json::Value) -> String {
+        serde_json::json!({"type": "control_request", "request_id": id, "request": {
+            "subtype": "can_use_tool", "tool_name": tool, "tool_use_id": format!("tu-{id}"),
+            "input": input}})
+        .to_string()
+    }
+
+    /// U2 and D4: Session and Always are offered for a contained edit (a Codex patch's path
+    /// comes from its `item/started` frame, W0 `ask-edit-decline.jsonl`) and for one MCP tool.
+    /// The Always rule is matched by kind: a new Codex session and a Claude session both have
+    /// the same edit answered by the app. An edit outside the workspace is offered neither.
+    #[test]
+    fn always_rules_cover_contained_edits_and_mcp_tools_across_agents() {
+        let methods = ["item/started", "item/fileChange/requestApproval"];
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let codex = || Box::new(agent_core::codex::CodexAdapter::new());
+            let claude = || Box::new(agent_core::claude::ClaudeAdapter::new());
+            let target = tmp.path().join("fixture.txt");
+
+            let (session, seen) = recording(ctx, tmp.path(), codex());
+            for f in w0_frames(W0_CODEX_EDIT, tmp.path(), &methods) {
+                feed(&session, &f);
+            }
+            let edit = request_for(&seen, "file_change").expect("edit card");
+            let options = offered(&seen, &edit);
+            assert!(options.contains(&Decision::AllowForSession), "{options:?}");
+            assert!(options.contains(&Decision::AllowAlways), "{options:?}");
+            session.respond_approval(&edit, Decision::AllowAlways);
+            assert_eq!(resolution(&seen, &edit), Some(Decision::AllowAlways));
+            let saved = crate::always_allow::AlwaysRules::open(
+                &tmp.path().join(crate::always_allow::FILE_NAME),
+            )
+            .expect("saved");
+            assert_eq!(saved.rules.len(), 1);
+            assert_eq!(saved.rules[0].kind, crate::always_allow::ActionKind::Edit);
+            assert_eq!(saved.rules[0].origin, "codex");
+            drop(session);
+
+            // A new Codex session: the same patch is accepted by the app.
+            let (session, seen) = recording(ctx, tmp.path(), codex());
+            for f in w0_frames(W0_CODEX_EDIT, tmp.path(), &methods) {
+                feed(&session, &f);
+            }
+            let again = request_for(&seen, "file_change").expect("edit card");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &again).is_some()));
+            assert_eq!(resolution(&seen, &again), Some(Decision::Allow));
+            drop(session);
+
+            // Claude editing the same file is matched by kind; an MCP tool can be Always too.
+            let (session, seen) = recording(ctx, tmp.path(), claude());
+            let input =
+                serde_json::json!({"file_path": target, "old_string": "a", "new_string": "b"});
+            feed(&session, &claude_tool("e1", "Edit", input));
+            assert!(pump_until(ctx, 10, || resolution(&seen, "e1").is_some()));
+            assert_eq!(resolution(&seen, "e1"), Some(Decision::Allow));
+            feed(
+                &session,
+                &claude_tool("m1", "mcp__fs__write", serde_json::json!({"p": 1})),
+            );
+            assert!(offered(&seen, "m1").contains(&Decision::AllowAlways));
+            session.respond_approval("m1", Decision::AllowAlways);
+            drop(session);
+            let (session, seen) = recording(ctx, tmp.path(), claude());
+            feed(
+                &session,
+                &claude_tool("m2", "mcp__fs__write", serde_json::json!({"p": 2})),
+            );
+            assert!(pump_until(ctx, 10, || resolution(&seen, "m2").is_some()));
+            assert_eq!(resolution(&seen, "m2"), Some(Decision::Allow));
+            feed(
+                &session,
+                &claude_tool("m3", "mcp__fs__delete", serde_json::json!({})),
+            );
+            // Outside the workspace: neither Session nor Always.
+            let outside = serde_json::json!({"file_path": "/etc/hosts", "old_string": "a", "new_string": "b"});
+            feed(&session, &claude_tool("e2", "Edit", outside));
+            let e2 = offered(&seen, "e2");
+            assert!(
+                !e2.contains(&Decision::AllowAlways) && !e2.contains(&Decision::AllowForSession),
+                "{e2:?}"
+            );
+            pump_until(ctx, 1, || false);
+            assert_eq!(
+                resolution(&seen, "m3"),
+                None,
+                "another tool of the server asks"
+            );
+            assert_eq!(resolution(&seen, "e2"), None);
+        });
     }
 
     /// Plan 2.4 (D5), replaying `codex/untrusted-workspacewrite.jsonl`: in Accept edits the

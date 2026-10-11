@@ -1099,17 +1099,10 @@ pub(crate) fn canonical_target(path: &Path) -> PathBuf {
     resolve(path)
 }
 
-/// Whether "Always allow" applies to this kind of call: a shell command only. A permanent allow
-/// on a path (`~/.bashrc`, a git hook, the rules file) would be a standing write grant, and an
-/// MCP rule ignores the tool's arguments; those stay "for this session" at most.
-pub(crate) fn always_offerable(action: &crate::always_allow::Action) -> bool {
-    action.kind() == crate::always_allow::ActionKind::Shell
-}
-
 /// The buttons agy's card offers, and what "Always allow" would keep: Allow; "Allow for
 /// session" when a rule could match the call ([`crate::always_allow::offerable`]: no secret, a
-/// simple command, a contained path); "Always allow" when that call is a shell command and a
-/// rules file is configured; Deny.
+/// simple command, a contained path); "Always allow" when a rules file is configured and the
+/// kind allows it ([`crate::always_allow::always_offerable`]); Deny.
 fn rule_options(
     action: Option<&crate::always_allow::Action>,
     ctx: Option<&crate::always_allow::Context>,
@@ -1120,7 +1113,7 @@ fn rule_options(
     if let (Some(action), Some(ctx)) = (action, ctx) {
         if crate::always_allow::offerable(action, ctx) {
             options.push(Decision::AllowForSession);
-            if always && always_offerable(action) {
+            if always && crate::always_allow::always_offerable(action) {
                 options.push(Decision::AllowAlways);
                 remembers = Some(remembers_text(action, ctx));
             }
@@ -1833,15 +1826,15 @@ mod tests {
             assert!(!options(2).contains(&Decision::AllowAlways));
             assert!(handle.respond("q2", Decision::Deny));
             wait_reply(ctx, &rx);
-            // Never for a file edit (a standing write grant on a path) or an MCP tool (any
-            // arguments), even though both can be allowed for the session.
+            // U2: also for an edit of one contained path and for one MCP tool, as for every
+            // agent (an edit outside the workspace or of a sensitive file gets neither).
             let target = tmp.path().join("a.rs").to_string_lossy().into_owned();
             let rx = client(
                 handle.socket_path().to_owned(),
                 with_id(edit("write_to_file", &target), "q2e"),
             );
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
-            assert!(!options(3).contains(&Decision::AllowAlways));
+            assert!(options(3).contains(&Decision::AllowAlways));
             assert!(options(3).contains(&Decision::AllowForSession));
             assert!(handle.respond("q2e", Decision::Deny));
             wait_reply(ctx, &rx);
@@ -1851,7 +1844,7 @@ mod tests {
             );
             let rx = client(handle.socket_path().to_owned(), with_id(mcp, "q2m"));
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 5));
-            assert!(!options(4).contains(&Decision::AllowAlways));
+            assert!(options(4).contains(&Decision::AllowAlways));
             assert!(handle.respond("q2m", Decision::Deny));
             wait_reply(ctx, &rx);
             drop(handle);
