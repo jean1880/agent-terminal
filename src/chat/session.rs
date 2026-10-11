@@ -35,6 +35,7 @@ use gtk4::glib;
 use tracing::{debug, info, warn};
 
 mod agy_transcript;
+mod codex_policy;
 mod reply_questions;
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
@@ -226,8 +227,47 @@ struct Inner {
     approval_deadline: Cell<Duration>,
     /// Claude's `--thinking-display summarized` for the running process (W3.2).
     thinking: ThinkingFlag,
+    /// Open Codex permission requests, by request id: what the answer may be (see
+    /// [`Inner::gate_codex_permissions`]). Never a rule.
+    codex_permissions: RefCell<HashMap<String, PermissionCard>>,
+    /// What Codex was allowed for its session (`scope: "session"`), said plainly; held by the
+    /// app-server process, so forgotten when it ends.
+    codex_grants: RefCell<Vec<String>>,
+    /// Codex permission cards whose targets are being checked on disk (`hold_codex_permissions`).
+    held_permissions: RefCell<HashSet<String>>,
+    /// A Codex permission card shown again under a new id: adapter id → the id shown.
+    codex_shown: RefCell<HashMap<String, String>>,
+    /// Where session grants let Codex write (resolved), for later rename checks.
+    codex_grant_paths: RefCell<Vec<PathBuf>>,
+    /// Where this turn's grants let Codex write (resolved); cleared when the turn ends.
+    codex_turn_grant_paths: RefCell<Vec<PathBuf>>,
     /// What the current turn said, for the quick replies offered when it completes.
     reply_turn: RefCell<reply_questions::ReplyTurn>,
+}
+
+/// What the session decided about one Codex permission request, keyed by the id the view knows
+/// it by.
+#[derive(Debug, Clone)]
+struct PermissionCard {
+    /// The adapter's request id (the card's own id, unless it was shown again).
+    wire: String,
+    /// The card as the adapter sent it, before any narrowing: what is checked again.
+    original: Envelope,
+    /// What the disk check found when the card was shown; an answer is sent only if a fresh
+    /// check finds the same.
+    verdict: codex_policy::Verdict,
+    /// An answer is being checked again.
+    checking: bool,
+    /// How many times the card was shown again.
+    round: u32,
+    /// Allow (this turn) may be sent: the card showed the request exactly.
+    allow: bool,
+    /// Allow for session may be sent: nothing it reaches is too broad or sensitive.
+    session_allowed: bool,
+    /// Why Allow for session is not offered, when it is not.
+    warning: Option<String>,
+    /// What the request grants, for the session-grant notice.
+    summary: String,
 }
 
 /// Whether the running Claude process got `--thinking-display summarized`, and how it took it.
@@ -424,6 +464,12 @@ impl ChatSession {
             agy_hold: RefCell::new(std::collections::VecDeque::new()),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
             thinking: ThinkingFlag::default(),
+            codex_permissions: RefCell::new(HashMap::new()),
+            codex_grants: RefCell::new(Vec::new()),
+            held_permissions: RefCell::new(HashSet::new()),
+            codex_shown: RefCell::new(HashMap::new()),
+            codex_grant_paths: RefCell::new(Vec::new()),
+            codex_turn_grant_paths: RefCell::new(Vec::new()),
             reply_turn: RefCell::default(),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
@@ -563,6 +609,7 @@ impl Inner {
 
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
+        let env = self.route_codex_permission(env);
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
         if let Err(e) = self.store.append_event(&self.thread, provider, &env) {
@@ -647,6 +694,8 @@ impl Inner {
                 self.prompt_in_flight.set(false);
                 self.state.borrow_mut().running_turn = false;
                 self.last_enriched_step.set(None);
+                // Codex's turn-scoped permission grants ended with the turn.
+                self.codex_turn_grant_paths.borrow_mut().clear();
                 // A completed turn is the proof the new agent read the handoff it carried; any
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
@@ -756,6 +805,8 @@ impl Inner {
             Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
                 if let Some(req) = &env.request {
                     self.pending_rules.borrow_mut().remove(req);
+                    self.codex_permissions.borrow_mut().remove(req);
+                    self.held_permissions.borrow_mut().remove(req);
                 }
             }
             _ => {}
@@ -1142,6 +1193,12 @@ impl Inner {
             self.adapter.borrow_mut().feed(line)
         };
         for env in envelopes {
+            let Some(env) = self.gate_form(env) else {
+                continue; // declined before it was shown; the notice is out
+            };
+            let Some(env) = self.hold_codex_permissions(generation, env) else {
+                continue; // shown once its targets are checked on disk
+            };
             let (env, auto) = self.gate_approval(env);
             let lost_resume = self.is_lost_codex_resume(&env);
             self.emit(env.clone());
@@ -1339,6 +1396,12 @@ impl Inner {
         let driver = self.adapter.borrow().driver();
         if driver == Driver::Agy {
             return (env, false);
+        }
+        // A Codex permission request is never matched, answered or remembered by a rule.
+        if matches!(&env.event, Event::ApprovalRequested { tool, .. }
+            if tool == agent_core::codex::PERMISSIONS_TOOL)
+        {
+            return (env, false); // narrowed by `hold_codex_permissions`
         }
         let Some(request) = env.request.clone() else {
             return (env, false);
@@ -1651,9 +1714,17 @@ impl Inner {
         // process cannot leave the chip claiming its model change is still in progress.
         self.reject_model_change();
         self.pending_rules.borrow_mut().clear();
+        // The app-server process held Codex's session grants; they ended with it.
+        self.codex_permissions.borrow_mut().clear();
+        self.held_permissions.borrow_mut().clear();
+        self.codex_grants.borrow_mut().clear();
+        self.codex_grant_paths.borrow_mut().clear();
+        self.codex_turn_grant_paths.borrow_mut().clear();
         for env in envelopes {
             self.emit(env);
         }
+        // After the expiries above, which still need the ids cards were shown again under.
+        self.codex_shown.borrow_mut().clear();
         if let Some(a) = self.approval() {
             a.expire_all("the agent exited");
         }
@@ -2042,6 +2113,11 @@ impl Inner {
         decision: Decision,
         custom_rule: Option<crate::always_allow::Rule>,
     ) {
+        let permission = self.codex_permissions.borrow().get(request).cloned();
+        if let Some(card) = permission {
+            self.respond_codex_permissions(request, decision, &card);
+            return;
+        }
         if let Some(handle) = self.approval() {
             if handle.respond_with_rule(request, decision, custom_rule.clone()) {
                 self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
@@ -2086,7 +2162,10 @@ impl Inner {
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
-        self.wanted_mode.set(mode);
+        let previous = self.wanted_mode.replace(mode);
+        if previous != mode {
+            self.note_grants_outlive_mode();
+        }
         self.record_chosen_mode();
         if self.ask_unavailable() {
             if mode == Mode::Ask {
@@ -2597,6 +2676,473 @@ pub(crate) struct Handoff {
     /// Messages carried, of `total` in the thread.
     pub carried: usize,
     pub total: usize,
+}
+
+// ---- Codex permission requests and MCP forms (plan 2026-10-11, lane L1) ----
+//
+// The adapter types each request; the session adds what only it knows: the home folder, the
+// sensitive-path list, Codex's own folder, what masking would change. Nothing here keeps or
+// matches an app rule.
+
+/// How long the on-disk check of a permission card may take (a hung network mount must not hide
+/// the card for ever).
+const PERMISSION_CHECK_DEADLINE: Duration = Duration::from_secs(3);
+/// Said on a card whose places could not be checked in time (when shown or when answered).
+const CHECK_FAILED: &str =
+    "Could not check these places on disk in time, so it can only be denied.";
+/// Said on a card shown again because what it asks for changed while it waited for an answer.
+const CHECK_CHANGED: &str = "This request changed while it was waiting; check it again.";
+
+/// Runs `job` (a disk check) off the main thread, giving up after `deadline`. `None`: it did not
+/// finish in time, or panicked: nothing can be vouched for.
+async fn run_permission_check<F>(job: F, deadline: Duration) -> Option<codex_policy::Verdict>
+where
+    F: FnOnce() -> codex_policy::Verdict + Send + 'static,
+{
+    match glib::future_with_timeout(deadline, gtk4::gio::spawn_blocking(job)).await {
+        Ok(Ok(verdict)) => Some(verdict),
+        _ => None,
+    }
+}
+
+/// [`run_permission_check`] of [`codex_policy::judge_check`] with the standard deadline.
+async fn check_permissions(check: codex_policy::Check) -> Option<codex_policy::Verdict> {
+    run_permission_check(
+        move || codex_policy::judge_check(&check),
+        PERMISSION_CHECK_DEADLINE,
+    )
+    .await
+}
+
+impl Inner {
+    /// What a card is judged against now: its input, the thread's folder, the Codex child's
+    /// homes, whether Codex may write the project unasked, and where grants already let it
+    /// write. Writability is the sandbox the running (or next) turn was sent, as the adapter
+    /// reports it (unknown counts as writable), or Accept edits chosen for later turns, where a
+    /// session grant still holds. Grants are this session's and this turn's write grants.
+    fn permission_check(&self, input: &serde_json::Value) -> codex_policy::Check {
+        let live = self.adapter.borrow().workspace_writable().unwrap_or(true);
+        let mut granted = self.codex_grant_paths.borrow().clone();
+        granted.extend(self.codex_turn_grant_paths.borrow().iter().cloned());
+        codex_policy::Check {
+            input: input.clone(),
+            workspace: PathBuf::from(self.open.borrow().cwd.clone()),
+            homes: codex_policy::child_homes(
+                &self.launch_env.borrow(),
+                crate::codex_home::process_env(),
+            ),
+            project_writable: live || self.wanted_mode.get() == Mode::AcceptEdits,
+            granted,
+        }
+    }
+
+    /// Takes a Codex permission card out of the stream while its targets are checked on disk
+    /// (off the main thread, with a deadline), then shows it narrowed
+    /// ([`Self::show_codex_permissions`]). Returns the envelope to deliver now: anything else
+    /// unchanged, or a card with no request id narrowed to Deny and Stop turn (it cannot be
+    /// answered, but it must not offer what it could not grant). `None`: held, or a duplicate of
+    /// a card already held or shown.
+    fn hold_codex_permissions(self: &Rc<Self>, generation: u64, env: Envelope) -> Option<Envelope> {
+        let Event::ApprovalRequested { tool, input, .. } = &env.event else {
+            return Some(env);
+        };
+        if tool != agent_core::codex::PERMISSIONS_TOOL {
+            return Some(env);
+        }
+        let Some(request) = env.request.clone() else {
+            return Some(Self::deny_only(env, None));
+        };
+        let shown = self
+            .codex_permissions
+            .borrow()
+            .values()
+            .any(|c| c.wire == request);
+        if shown || !self.held_permissions.borrow_mut().insert(request.clone()) {
+            return None;
+        }
+        let check = self.permission_check(input);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let verdict = check_permissions(check).await;
+            let Some(inner) = weak.upgrade() else { return };
+            // Answered by the agent, expired or replaced while it was checked: nothing to show.
+            if inner.generation.get() != generation
+                || !inner.held_permissions.borrow_mut().remove(&request)
+            {
+                return;
+            }
+            let shown = inner.show_codex_permissions(&env, &request, verdict, None);
+            inner.emit(shown);
+        });
+        None
+    }
+
+    /// `env` with only Deny and Stop turn offered, marked unrenderable, with `warning`.
+    fn deny_only(mut env: Envelope, warning: Option<String>) -> Envelope {
+        if let Event::ApprovalRequested { input, options, .. } = &mut env.event {
+            options.retain(|d| matches!(d, Decision::Deny | Decision::Cancel));
+            if let Some(fields) = input.as_object_mut() {
+                fields.insert("renderable".to_owned(), false.into());
+                fields.insert("session_allowed".to_owned(), false.into());
+                if let Some(text) = warning {
+                    fields.insert("warning".to_owned(), text.into());
+                }
+            }
+        }
+        env
+    }
+
+    /// The card to show for `original` (the adapter's envelope) under the id `shown`, narrowed
+    /// by `verdict` (`None`: not checked in time, so Deny and Stop turn only), with `note` before
+    /// its warning; records what its answer may be. A card that masking would change (it shows
+    /// a secret) can only be denied: what is granted must be what is shown. Where an entry
+    /// really leads elsewhere, its target gains `"resolved"`.
+    fn show_codex_permissions(
+        &self,
+        original: &Envelope,
+        shown: &str,
+        verdict: Option<codex_policy::Verdict>,
+        note: Option<&str>,
+    ) -> Envelope {
+        let wire = original.request.clone().unwrap_or_default();
+        let mut env = original.clone();
+        env.request = Some(shown.to_owned());
+        let masked = crate::approval_server::masked_for_view(original.clone());
+        let shown_exactly = matches!((&masked.event, &original.event), (
+            Event::ApprovalRequested { title: mt, input: mi, .. },
+            Event::ApprovalRequested { title, input, .. },
+        ) if mt == title && mi == input);
+        let renderable = matches!(&original.event, Event::ApprovalRequested { input, options, .. }
+            if input.get("renderable") == Some(&serde_json::Value::Bool(true))
+                && options.contains(&Decision::Allow));
+        let summary = match &original.event {
+            Event::ApprovalRequested { input, .. } => input
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("what it asked for")
+                .to_owned(),
+            _ => String::new(),
+        };
+        let with_note = |warning: Option<String>| match (note, warning) {
+            (Some(note), Some(w)) => Some(format!("{note} {w}")),
+            (Some(note), None) => Some(note.to_owned()),
+            (None, w) => w,
+        };
+        let refused = if !renderable {
+            Some(None)
+        } else if !shown_exactly {
+            Some(Some(
+                "Part of this request looks like a secret, so agent-terminal cannot show it \
+                 exactly; it can only be denied."
+                    .to_owned(),
+            ))
+        } else if verdict.is_none() {
+            Some(Some(CHECK_FAILED.to_owned()))
+        } else {
+            None
+        };
+        let (env, card) = match (refused, verdict) {
+            (refused @ Some(_), _) | (refused @ None, None) => {
+                let warning = with_note(refused.flatten());
+                let card = PermissionCard {
+                    wire,
+                    original: original.clone(),
+                    allow: false,
+                    session_allowed: false,
+                    warning: warning.clone(),
+                    summary,
+                    verdict: codex_policy::Verdict::default(),
+                    checking: false,
+                    round: 0,
+                };
+                (Self::deny_only(env, warning), card)
+            }
+            (None, Some(verdict)) => {
+                let warning = with_note(verdict.warning.clone());
+                if let Event::ApprovalRequested { input, options, .. } = &mut env.event {
+                    options.retain(|d| match d {
+                        Decision::AllowForSession => verdict.session_allowed,
+                        Decision::AllowAlways => false,
+                        _ => true,
+                    });
+                    if let Some(fields) = input.as_object_mut() {
+                        fields.insert("session_allowed".to_owned(), verdict.session_allowed.into());
+                        if let Some(text) = &warning {
+                            fields.insert("warning".to_owned(), text.clone().into());
+                        }
+                        if let Some(entries) = fields
+                            .get_mut("entries")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            for (entry, resolved) in entries.iter_mut().zip(&verdict.resolved) {
+                                if let (Some(target), Some(resolved)) = (
+                                    entry
+                                        .get_mut("target")
+                                        .and_then(serde_json::Value::as_object_mut),
+                                    resolved,
+                                ) {
+                                    target.insert("resolved".to_owned(), resolved.clone().into());
+                                }
+                            }
+                        }
+                    }
+                }
+                let card = PermissionCard {
+                    wire,
+                    original: original.clone(),
+                    allow: true,
+                    session_allowed: verdict.session_allowed,
+                    warning,
+                    summary,
+                    verdict,
+                    checking: false,
+                    round: 0,
+                };
+                (env, card)
+            }
+        };
+        self.codex_permissions
+            .borrow_mut()
+            .insert(shown.to_owned(), card);
+        env
+    }
+
+    /// Answers a Codex permission card shown as `shown`. Refused, with a notice and nothing
+    /// sent: Always allow (never offered), Allow for a card that can only be denied, Allow for
+    /// session where it was withheld. An Allow is checked on disk again first; if anything a
+    /// grant depends on moved, nothing is sent and the card is shown again with the new verdict.
+    fn respond_codex_permissions(
+        self: &Rc<Self>,
+        shown: &str,
+        decision: Decision,
+        card: &PermissionCard,
+    ) {
+        let refusal = match decision {
+            Decision::AllowAlways => Some(
+                "Codex permission requests cannot be always allowed; choose Allow or Deny."
+                    .to_owned(),
+            ),
+            Decision::Allow | Decision::AllowForSession if !card.allow => Some(
+                "This permission request can only be denied: agent-terminal could not show it \
+                 exactly or check it."
+                    .to_owned(),
+            ),
+            Decision::AllowForSession if !card.session_allowed => Some(format!(
+                "Allow for session is not available for this request. {}",
+                card.warning
+                    .as_deref()
+                    .unwrap_or("Choose Allow to grant it for this turn, or Deny.")
+            )),
+            _ => None,
+        };
+        if let Some(text) = refusal {
+            self.emit(Envelope::new(Event::Notice { text }));
+            return;
+        }
+        if !matches!(decision, Decision::Allow | Decision::AllowForSession) {
+            self.send_codex_permissions(shown, decision, card);
+            return;
+        }
+        if card.checking {
+            return; // the same answer is already being checked
+        }
+        if let Some(open) = self.codex_permissions.borrow_mut().get_mut(shown) {
+            open.checking = true;
+        }
+        let input = match &card.original.event {
+            Event::ApprovalRequested { input, .. } => input.clone(),
+            _ => serde_json::Value::Null,
+        };
+        let check = self.permission_check(&input);
+        let generation = self.generation.get();
+        let shown = shown.to_owned();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let verdict = check_permissions(check).await;
+            let Some(inner) = weak.upgrade() else { return };
+            let card = inner.codex_permissions.borrow().get(&shown).cloned();
+            let Some(card) = card.filter(|_| inner.generation.get() == generation) else {
+                return; // expired or answered meanwhile
+            };
+            if verdict.as_ref() == Some(&card.verdict) {
+                inner.send_codex_permissions(&shown, decision, &card);
+                return;
+            }
+            // Something moved: nothing is sent; the card is shown again, as it is now.
+            let round = card.round + 1;
+            let again = format!("{}~{round}", card.wire);
+            inner.codex_permissions.borrow_mut().remove(&shown);
+            inner.emit(Envelope::new(Event::ApprovalExpired).request(shown.as_str()));
+            inner
+                .codex_shown
+                .borrow_mut()
+                .insert(card.wire.clone(), again.clone());
+            let env = inner.show_codex_permissions(
+                &card.original,
+                &again,
+                verdict.clone(),
+                verdict.is_some().then_some(CHECK_CHANGED),
+            );
+            if let Some(next) = inner.codex_permissions.borrow_mut().get_mut(&again) {
+                next.round = round;
+            }
+            inner.emit(env);
+        });
+    }
+
+    /// Sends a checked answer: the grant names literal paths by where they really lead (the
+    /// card showed both). A session grant is said in a notice and remembered until the Codex
+    /// process ends, with where it lets Codex write.
+    fn send_codex_permissions(
+        self: &Rc<Self>,
+        shown: &str,
+        decision: Decision,
+        card: &PermissionCard,
+    ) {
+        let allow = matches!(decision, Decision::Allow | Decision::AllowForSession);
+        let renames = (allow && !card.verdict.renames.is_empty()).then(|| {
+            serde_json::Value::Object(
+                card.verdict
+                    .renames
+                    .iter()
+                    .map(|(from, to)| (from.clone(), serde_json::Value::String(to.clone())))
+                    .collect(),
+            )
+        });
+        let sent = self.command(Command::Approve {
+            request: card.wire.clone(),
+            decision,
+            updated_input: renames,
+            message: None,
+        });
+        if !sent {
+            if let Some(open) = self.codex_permissions.borrow_mut().get_mut(shown) {
+                open.checking = false;
+            }
+            return;
+        }
+        self.codex_permissions.borrow_mut().remove(shown);
+        self.codex_shown.borrow_mut().remove(&card.wire);
+        if decision == Decision::Allow {
+            // A later session grant beneath this turn's grant could be renamed through it.
+            self.codex_turn_grant_paths
+                .borrow_mut()
+                .extend(card.verdict.writes.iter().cloned());
+        }
+        if decision == Decision::AllowForSession {
+            self.codex_grants.borrow_mut().push(card.summary.clone());
+            self.codex_grant_paths
+                .borrow_mut()
+                .extend(card.verdict.writes.iter().cloned());
+            self.emit(Envelope::new(Event::Notice {
+                text: format!(
+                    "Codex has extra access for this session: {}. It lasts until this thread's \
+                     Codex session restarts.",
+                    card.summary
+                ),
+            }));
+        }
+        self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(shown));
+    }
+
+    /// The id the view knows a Codex permission card by, for an envelope that names the
+    /// adapter's request (the card may have been shown again under a new id).
+    fn route_codex_permission(&self, mut env: Envelope) -> Envelope {
+        if matches!(
+            env.event,
+            Event::ApprovalExpired | Event::ApprovalResolved { .. }
+        ) {
+            if let Some(shown) = env
+                .request
+                .as_ref()
+                .and_then(|wire| self.codex_shown.borrow().get(wire).cloned())
+            {
+                env.request = Some(shown);
+            }
+        }
+        env
+    }
+
+    /// A mode change does not take back what Codex was allowed for its session: say so.
+    fn note_grants_outlive_mode(&self) {
+        if self.adapter.borrow().driver() != Driver::Codex {
+            return;
+        }
+        let grants = self.codex_grants.borrow().clone();
+        if grants.is_empty() {
+            return;
+        }
+        self.emit(Envelope::new(Event::Notice {
+            text: format!(
+                "The extra access Codex was allowed for this session still applies in the new \
+                 mode until this thread's Codex session restarts: {}.",
+                grants.join("; ")
+            ),
+        }));
+    }
+
+    /// Declines, before it is shown, a Codex form whose link or field names masking would change
+    /// (they carry what looks like a secret: the card could not show what is answered). Returns
+    /// the envelope to deliver, or `None` when it was declined (the notice is out).
+    fn gate_form(self: &Rc<Self>, env: Envelope) -> Option<Envelope> {
+        let Event::FormRequested { server, form, .. } = &env.event else {
+            return Some(env);
+        };
+        let Some(request) = env.request.clone() else {
+            return Some(env);
+        };
+        let masked = crate::approval_server::masked_for_view(env.clone());
+        let Event::FormRequested {
+            form: masked_form, ..
+        } = &masked.event
+        else {
+            return Some(env);
+        };
+        let text = match (form, masked_form) {
+            (agent_core::form::Form::Link { url }, agent_core::form::Form::Link { url: shown })
+                if url != shown =>
+            {
+                agent_core::codex::refused_link_notice(
+                    server,
+                    "asked you to open a link that carries what looks like a secret",
+                    shown,
+                )
+            }
+            (
+                agent_core::form::Form::Fields { fields },
+                agent_core::form::Form::Fields { fields: shown },
+            ) if form_keys(fields) != form_keys(shown) => format!(
+                "The {server} tool server sent a form whose field names or choices look like \
+                 secrets; it was declined."
+            ),
+            _ => return Some(env),
+        };
+        let server = server.clone();
+        info!(server = %server, "declining a form masking would change");
+        self.command(Command::SubmitForm {
+            request,
+            action: agent_core::form::FormAction::Decline,
+            content: None,
+        });
+        self.emit(Envelope::new(Event::Notice { text }));
+        None
+    }
+}
+
+/// The names and choice values a form's answer is keyed on.
+fn form_keys(fields: &[agent_core::form::FormField]) -> Vec<String> {
+    fields
+        .iter()
+        .flat_map(|f| {
+            let values = match &f.input {
+                agent_core::form::FieldInput::Choice { options, .. } => {
+                    options.iter().map(|o| o.value.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+            std::iter::once(f.name.clone()).chain(values)
+        })
+        .collect()
 }
 
 /// The handoff a thread still owes its current agent, from its stored history: the latest

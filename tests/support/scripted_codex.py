@@ -20,6 +20,8 @@ scenario = None
 pending = None
 ordinal = 0
 turn_number = 0
+# The current turn already ended (an interrupt after a Stop turn answer only acknowledges).
+ended = False
 
 
 def record(direction, frame):
@@ -38,8 +40,9 @@ def notify(method, **params):
 
 
 def complete(status="completed", error=None):
-    global pending
+    global pending, ended
     pending = None
+    ended = True
     notify("turn/completed", turn={"id": turn, "status": status,
                                     "error": {"message": error} if error else None})
 
@@ -54,6 +57,16 @@ def request():
         params["questions"] = [{"id": "choice", "header": "Choice",
                                 "question": "Continue?",
                                 "options": [{"label": "Yes"}, {"label": "No"}]}]
+    elif scenario.startswith("permissions:"):
+        # "permissions:<RequestPermissionProfile JSON>", asked from the test's directory.
+        method = "item/permissions/requestApproval"
+        params.update(cwd=str(root), startedAtMs=1, reason="Synthetic permissions",
+                      permissions=json.loads(scenario.split(":", 1)[1]))
+    elif scenario.startswith("form:"):
+        # "form:<mode fields JSON>" from a synthetic tool server.
+        method = "mcpServer/elicitation/request"
+        params = {"threadId": thread, "turnId": turn, "serverName": "synthetic",
+                  "message": "Synthetic form", **json.loads(scenario.split(":", 1)[1])}
     else:
         method = "item/commandExecution/requestApproval"
         params.update(command="printf synthetic", reason="Synthetic approval")
@@ -104,6 +117,7 @@ for line in sys.stdin:
         turn = f"connection-{connection}-turn-{turn_number}"
         scenario = frame["params"]["input"][0]["text"]
         ordinal = 0
+        ended = False
         emit({"id": frame["id"], "result": {"turn": {"id": turn}}})
         notify("turn/started", turn={"id": turn, "status": "inProgress"})
         if scenario in ("denied", "ssh-error"):
@@ -121,12 +135,17 @@ for line in sys.stdin:
             request()
     elif method == "turn/interrupt":
         emit({"id": frame["id"], "result": {}})
-        complete("interrupted")
+        if not ended:
+            complete("interrupted")
     elif method is None and "result" in frame:
         assert pending is not None, "unsolicited response"
         assert type(frame["id"]) is type(pending) and frame["id"] == pending, "wrong request ID"
         if scenario == "question":
             assert frame["result"] == {"answers": {"choice": {"answers": ["Yes"]}}}
+        elif scenario.startswith("permissions:"):
+            assert set(frame["result"]) <= {"permissions", "scope"}
+        elif scenario.startswith("form:"):
+            assert frame["result"]["action"] in ("accept", "decline", "cancel")
         else:
             assert frame["result"]["decision"] in ("accept", "decline", "cancel")
         pending = None

@@ -79,13 +79,45 @@
 //! - The legacy `execCommandApproval` / `applyPatchApproval` server requests (turns started over
 //!   the pre-v2 API) are not served: turns here always use `turn/start`, which only raises the
 //!   v2 requests. They get a JSON-RPC error reply so the server never waits on them.
-//! - `item/permissions/requestApproval`, `mcpServer/elicitation/request` and `item/tool/call` are
-//!   answered with a JSON-RPC error and a [`Event::Notice`]; map them once the UI has a place for
-//!   them. `item/tool/requestUserInput` is mapped to the native question card.
+//! - `item/tool/call` is answered with a JSON-RPC error and a [`Event::Notice`]; map it once the
+//!   UI has a place for it. `item/tool/requestUserInput` is mapped to the native question card.
 //! - Approval decisions that carry a payload (`acceptWithExecpolicyAmendment`,
 //!   `applyNetworkPolicyAmendment`) and `acceptForSession` are never sent: session and always
-//!   scope are agent-terminal's own rules (plan D1), answered with a plain `accept`.
+//!   scope of commands and edits are agent-terminal's own rules (plan D1), answered with a plain
+//!   `accept`.
+//!
+//! # Permission requests (`item/permissions/requestApproval`)
+//!
+//! Mapped to an [`Event::ApprovalRequested`] with tool `codex_permissions` (see
+//! [`permissions`] for the `input` shape). The request is typed entry by entry; one that cannot
+//! be typed exactly is unrenderable and offers only Deny and Stop turn. Allow sends the grant
+//! rebuilt from the typed entries with `scope: "turn"`, Allow for session the same with
+//! `scope: "session"` (Codex's own grant, kept by the app-server process until it exits; nothing
+//! on disk); Deny grants nothing (`{"permissions": {}}`, the protocol has no refusal value);
+//! Stop turn grants nothing, then sends `turn/interrupt` when the request belongs to the active
+//! turn. `strictAutoReview` is never sent (its behaviour is unverified). No Always allow: the
+//! app keeps no rule for these. The session narrows Allow for session further (home, root,
+//! Codex's own folder, sensitive paths) because only it knows those places.
+//!
+//! # MCP forms (`mcpServer/elicitation/request`)
+//!
+//! `mode: "form"` becomes [`Event::FormRequested`] with [`crate::form::Form::Fields`] (the
+//! server's field order is read from the raw frame); `mode: "url"` with a plain web link becomes
+//! [`crate::form::Form::Link`]. The adapter declines, with a notice naming the server and the
+//! reason, a form it cannot show safely (see [`elicitation`]); `openai/form` / `openaiForm` are
+//! declined as not shown yet. Declined, never errored: the server and the turn carry on.
+//! [`Command::SubmitForm`] sends exactly what [`crate::form::answer`] returns; Cancel also stops
+//! the turn, but only when the form named the active turn. A form without a `turnId` is not
+//! tied to any turn: a turn ending does not expire it, and answering it never interrupts one.
+//! An open form expires (resolved as [`crate::form::FormAction::Cancel`], nothing sent) when the
+//! server resolves it elsewhere, its turn ends, its worker closes or the process exits. The
+//! session emits `FormResolved` for an answer the adapter accepted; the adapter never does.
 //! - stderr (Codex's tracing output) is ignored.
+
+mod elicitation;
+mod permissions;
+
+pub use permissions::{clip, is_plain_absolute, sentence};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
@@ -116,6 +148,9 @@ const MODEL_PAGE: u32 = 200;
 // Bound retired-turn history on long-lived connections; settled active-turn requests retire
 // with their scope, so delayed frames do not require keeping the entire conversation here.
 const TURN_TOMBSTONE_LIMIT: usize = 128;
+
+/// How many answered turnless requests are remembered against retransmission.
+const TURNLESS_SETTLED_LIMIT: usize = 256;
 
 /// Notifications that carry nothing the UI renders (bookkeeping, or covered by another frame):
 /// dropped without an [`Event::Unknown`], which would only add noise to every turn.
@@ -175,6 +210,21 @@ struct PendingApproval {
     /// The decisions the server offered (`availableDecisions`, or all of ours when it named
     /// none we know). A decision outside this is refused rather than sent.
     options: Vec<Decision>,
+    /// A permission request: the grant an Allow sends (rebuilt from the typed entries the card
+    /// showed). `None` for command and patch approvals, which answer with a decision.
+    grant: Option<Value>,
+}
+
+/// An unanswered MCP form (`mcpServer/elicitation/request`).
+#[derive(Debug, Clone)]
+struct PendingForm {
+    /// The JSON-RPC id to put in the response, verbatim (number or string).
+    rpc_id: Value,
+    /// The thread and the turn the request named; `turn` is `None` for a turnless form, which
+    /// no turn's end expires and whose Cancel interrupts nothing.
+    scope: RequestScope,
+    /// The fields an Accept is judged against; `None` for a link.
+    fields: Option<Vec<crate::form::FormField>>,
 }
 
 /// An unanswered `request_user_input` server request.
@@ -230,6 +280,9 @@ pub struct CodexAdapter {
     outbox: Outbox,
     approvals: HashMap<String, PendingApproval>,
     questions: HashMap<String, PendingQuestion>,
+    forms: HashMap<String, PendingForm>,
+    /// Settled turnless request keys, oldest first (see `remember_settled_request`).
+    turnless_settled: VecDeque<String>,
     /// Keep every settled identity until its turn ends, then retire that scope. Retention
     /// grows with active work, not connection lifetime; evicting an active identity would
     /// make an old answer valid again. Child scopes retire only with child terminal evidence.
@@ -298,6 +351,8 @@ impl CodexAdapter {
             outbox: Outbox::default(),
             approvals: HashMap::new(),
             questions: HashMap::new(),
+            forms: HashMap::new(),
+            turnless_settled: VecDeque::new(),
             settled_requests: HashMap::new(),
             ended_turns: HashSet::new(),
             ended_turn_order: VecDeque::new(),
@@ -1069,6 +1124,8 @@ impl CodexAdapter {
                             .request(key),
                     );
                 }
+                let request_id = params.get("requestId").cloned();
+                self.expire_forms(|p| Some(&p.rpc_id) == request_id.as_ref(), out);
             }
             "model/rerouted" => match s(params, "toModel") {
                 Some(model) => {
@@ -1223,7 +1280,34 @@ impl CodexAdapter {
                 );
             }
         }
+        // A turnless form belongs to no turn, so no turn's end (not even one with no id) takes it.
+        if scope.turn.is_some() {
+            self.expire_forms(|p| p.scope == scope, out);
+        }
         self.settled_requests.retain(|_, settled| *settled != scope);
+    }
+
+    /// Expires the open forms `which` picks, in key order: each card closes as cancelled, and
+    /// nothing is sent (the server has resolved it, or the connection is gone).
+    fn expire_forms(&mut self, which: impl Fn(&PendingForm) -> bool, out: &mut Vec<Envelope>) {
+        let mut keys: Vec<String> = self
+            .forms
+            .iter()
+            .filter(|(_, p)| which(p))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        for key in keys {
+            if let Some(form) = self.forms.remove(&key) {
+                self.remember_settled_request(key.clone(), form.scope);
+                out.push(
+                    Envelope::new(Event::FormResolved {
+                        action: crate::form::FormAction::Cancel,
+                    })
+                    .request(key),
+                );
+            }
+        }
     }
 
     fn retire_thread_requests(&mut self, thread: &str, out: &mut Vec<Envelope>) {
@@ -1240,6 +1324,8 @@ impl CodexAdapter {
         for scope in scopes {
             self.retire_turn_requests(scope, out);
         }
+        // The thread is gone: its forms go too, turnless ones included.
+        self.expire_forms(|p| p.scope.thread.as_deref() == Some(thread), out);
     }
 
     fn on_token_usage(&mut self, params: &Value, out: &mut Vec<Envelope>) {
@@ -1265,7 +1351,24 @@ impl CodexAdapter {
 
     // ---- server requests ----
 
+    /// Remembers an answered or expired request so a retransmission cannot revive it. A turn's
+    /// requests are forgotten when the turn retires; a turnless one (a form with no `turnId`)
+    /// never retires, so only the latest [`TURNLESS_SETTLED_LIMIT`] are kept.
     fn remember_settled_request(&mut self, key: String, scope: RequestScope) {
+        if scope.turn.is_none() {
+            self.turnless_settled.push_back(key.clone());
+            while self.turnless_settled.len() > TURNLESS_SETTLED_LIMIT {
+                if let Some(oldest) = self.turnless_settled.pop_front() {
+                    if self
+                        .settled_requests
+                        .get(&oldest)
+                        .is_some_and(|s| s.turn.is_none())
+                    {
+                        self.settled_requests.remove(&oldest);
+                    }
+                }
+            }
+        }
         self.settled_requests.insert(key, scope);
     }
 
@@ -1329,10 +1432,20 @@ impl CodexAdapter {
         id: &Value,
         method: &str,
         params: &Value,
+        raw: &str,
         out: &mut Vec<Envelope>,
     ) {
+        if method == "mcpServer/elicitation/request" {
+            let order = elicitation::property_order(raw);
+            self.on_elicitation(id, params, order.as_deref(), out);
+            return;
+        }
         if self.stale_explicit_turn(params) {
             return; // an unseen old request must not create a live interruption
+        }
+        if method == "item/permissions/requestApproval" {
+            self.on_permissions_request(id, method, params, out);
+            return;
         }
         if method == "item/tool/requestUserInput" {
             let key = self.server_request_key(id, method, params);
@@ -1511,6 +1624,7 @@ impl CodexAdapter {
                 item: item.clone(),
                 scope: self.request_scope(params),
                 options: options.clone(),
+                grant: None,
             },
         );
         out.push(
@@ -1526,6 +1640,204 @@ impl CodexAdapter {
             .item(item)
             .request(key),
         );
+    }
+
+    /// `item/permissions/requestApproval`: a card the user answers (see the module docs).
+    fn on_permissions_request(
+        &mut self,
+        id: &Value,
+        method: &str,
+        params: &Value,
+        out: &mut Vec<Envelope>,
+    ) {
+        let key = self.server_request_key(id, method, params);
+        if self.settled_requests.contains_key(&key) {
+            return;
+        }
+        let item = s(params, "itemId").unwrap_or_default().to_owned();
+        let parsed = permissions::parse(params, self.cwd.as_deref());
+        // No Always allow: the app keeps no rule for a permission grant.
+        let options = if parsed.renderable {
+            vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel,
+            ]
+        } else {
+            vec![Decision::Deny, Decision::Cancel]
+        };
+        self.approvals.insert(
+            key.clone(),
+            PendingApproval {
+                rpc_id: id.clone(),
+                item: item.clone(),
+                scope: self.request_scope(params),
+                options: options.clone(),
+                grant: Some(parsed.grant),
+            },
+        );
+        out.push(
+            Envelope::new(Event::ApprovalRequested {
+                tool: PERMISSIONS_TOOL.to_owned(),
+                title: Some(parsed.title),
+                input: parsed.input,
+                reason: s(params, "reason").map(str::to_owned),
+                options,
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .item(item)
+            .request(key),
+        );
+    }
+
+    /// `mcpServer/elicitation/request`: a form card, or a decline with a notice.
+    fn on_elicitation(
+        &mut self,
+        id: &Value,
+        params: &Value,
+        order: Option<&[String]>,
+        out: &mut Vec<Envelope>,
+    ) {
+        let turn = s(params, "turnId").map(str::to_owned);
+        let thread = s(params, "threadId")
+            .or(self.thread_id.as_deref())
+            .map(str::to_owned);
+        // Only a form that names a turn can be stale by turn; a turnless one is not tied to any.
+        let stale = (turn.is_some() && self.stale_explicit_turn(params))
+            || thread.as_deref().is_some_and(|t| {
+                self.workers
+                    .get(t)
+                    .is_some_and(|w| w.state == WorkerState::Closed)
+            });
+        if stale {
+            // Nobody will see it, but its tool call still waits: decline it so it carries on.
+            self.write(json!({"id": id, "result": {"action": "decline"}}).to_string());
+            return;
+        }
+        let scope = RequestScope { thread, turn };
+        let key = format!(
+            "codex:mcpServer/elicitation/request:{}",
+            json!([
+                scope.thread,
+                scope.turn,
+                s(params, "serverName"),
+                s(params, "elicitationId"),
+                id
+            ])
+        );
+        if self.settled_requests.contains_key(&key) || self.forms.contains_key(&key) {
+            return; // answered, declined or already shown
+        }
+        let server = elicitation::server_name(params);
+        match elicitation::parse(params, order) {
+            elicitation::Elicitation::Show { message, form } => {
+                let fields = match &form {
+                    crate::form::Form::Fields { fields } => Some(fields.clone()),
+                    _ => None,
+                };
+                self.forms.insert(
+                    key.clone(),
+                    PendingForm {
+                        rpc_id: id.clone(),
+                        scope,
+                        fields,
+                    },
+                );
+                out.push(
+                    Envelope::new(Event::FormRequested {
+                        server,
+                        message,
+                        form,
+                    })
+                    .request(key),
+                );
+            }
+            elicitation::Elicitation::Decline { reason, link } => {
+                self.write(json!({"id": id, "result": {"action": "decline"}}).to_string());
+                self.remember_settled_request(key, scope);
+                let text = match link {
+                    Some(url) => refused_link_notice(&server, &reason, &url),
+                    None => format!("The {server} tool server {reason}; it was declined."),
+                };
+                out.push(Envelope::new(Event::Notice { text }));
+            }
+        }
+    }
+
+    /// `turn/interrupt` for the active turn, when `scope` is that turn; `None` otherwise (a
+    /// request of another thread, a turnless form, or no turn running).
+    fn interrupt_scope(&mut self, scope: &RequestScope) -> Option<String> {
+        let thread = self.thread_id.clone()?;
+        let turn = self.turn_id.clone()?;
+        if scope.thread.as_deref() != Some(thread.as_str())
+            || scope.turn.as_deref() != Some(turn.as_str())
+        {
+            return None;
+        }
+        let mut updates = Vec::new();
+        self.clear_worker_waits(&mut updates);
+        self.outbox.events.extend(updates);
+        self.interrupt_sent = true;
+        Some(self.request(
+            Pending::Interrupt,
+            "turn/interrupt",
+            json!({"threadId": thread, "turnId": turn}),
+        ))
+    }
+
+    /// `Command::SubmitForm`: checked in full before anything is removed or written.
+    fn submit_form(
+        &mut self,
+        request: String,
+        action: crate::form::FormAction,
+        content: Option<Value>,
+    ) -> Result<Vec<Action>, AdapterError> {
+        use crate::form::FormAction;
+        let Some(form) = self.forms.get(&request) else {
+            return Err(AdapterError::Invalid(format!(
+                "no pending Codex form {request}"
+            )));
+        };
+        let result = match action {
+            FormAction::Accept => match &form.fields {
+                Some(fields) => {
+                    let sent =
+                        crate::form::answer(fields, content.as_ref().unwrap_or(&Value::Null))
+                            .map_err(|errors| {
+                                AdapterError::Invalid(format!(
+                                    "the form answer was not sent: {}",
+                                    errors
+                                        .iter()
+                                        .map(|e| e.message.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                ))
+                            })?;
+                    json!({"action": "accept", "content": sent})
+                }
+                None if content.as_ref().is_some_and(|c| !c.is_null()) => {
+                    return Err(AdapterError::Invalid(
+                        "a link form takes no content".to_owned(),
+                    ));
+                }
+                None => json!({"action": "accept"}),
+            },
+            FormAction::Decline => json!({"action": "decline"}),
+            FormAction::Cancel => json!({"action": "cancel"}),
+        };
+        let Some(form) = self.forms.remove(&request) else {
+            return Err(AdapterError::Invalid(format!(
+                "no pending Codex form {request}"
+            )));
+        };
+        self.remember_settled_request(request, form.scope.clone());
+        let mut lines = vec![json!({"id": form.rpc_id, "result": result}).to_string()];
+        if action == FormAction::Cancel {
+            lines.extend(self.interrupt_scope(&form.scope));
+        }
+        Ok(vec![Action::Write(lines)])
     }
 
     // ---- responses ----
@@ -1718,7 +2030,9 @@ impl Adapter for CodexAdapter {
         self.interrupt_sent = false;
         self.approvals.clear();
         self.questions.clear();
+        self.forms.clear();
         self.settled_requests.clear();
+        self.turnless_settled.clear();
         self.ended_turns.clear();
         self.ended_turn_order.clear();
         self.open_items.clear();
@@ -1847,11 +2161,14 @@ impl Adapter for CodexAdapter {
                 Ok(vec![Action::Write(vec![line])])
             }
             Command::Approve {
-                request, decision, ..
+                request,
+                decision,
+                updated_input,
+                ..
             } => {
                 // Checked before it is removed: a refused decision leaves the request answerable.
                 // `decline` is never refused: Codex accepts it unoffered (W0, plan D4).
-                match self.approvals.get(&request) {
+                let rewritten = match self.approvals.get(&request) {
                     None => {
                         return Err(AdapterError::Invalid(format!(
                             "no pending approval {request}"
@@ -1865,20 +2182,49 @@ impl Adapter for CodexAdapter {
                             decision_wire(decision)
                         )));
                     }
-                    Some(_) => {}
-                }
+                    // A permission grant may name its paths by where they really lead (the
+                    // card showed both); nothing else about it can change.
+                    Some(PendingApproval {
+                        grant: Some(grant), ..
+                    }) => match &updated_input {
+                        Some(paths) => Some(
+                            permissions::rewrite_paths(grant, paths)
+                                .map_err(AdapterError::Invalid)?,
+                        ),
+                        None => None,
+                    },
+                    Some(_) => None,
+                };
                 let Some(approval) = self.approvals.remove(&request) else {
                     return Err(AdapterError::Invalid(format!(
                         "no pending approval {request}"
                     )));
                 };
                 self.remember_settled_request(request, approval.scope.clone());
-                let line = json!({
-                    "id": approval.rpc_id,
-                    "result": {"decision": decision_wire(decision)},
-                })
-                .to_string();
-                Ok(vec![Action::Write(vec![line])])
+                let Some(grant) = rewritten.or(approval.grant) else {
+                    let line = json!({
+                        "id": approval.rpc_id,
+                        "result": {"decision": decision_wire(decision)},
+                    })
+                    .to_string();
+                    return Ok(vec![Action::Write(vec![line])]);
+                };
+                // A permission request: the grant the card showed, or nothing. The options check
+                // above already refused Always (never offered) and Allow on an unrenderable one.
+                let result = match decision {
+                    Decision::Allow => json!({"permissions": grant, "scope": "turn"}),
+                    Decision::AllowForSession => json!({"permissions": grant, "scope": "session"}),
+                    Decision::AllowAlways | Decision::Deny | Decision::Cancel => {
+                        json!({"permissions": {}})
+                    }
+                };
+                let mut lines = vec![json!({"id": approval.rpc_id, "result": result}).to_string()];
+                // No refusal value stops a turn here, so Stop turn interrupts it, as the
+                // command approval's `cancel` does.
+                if decision == Decision::Cancel {
+                    lines.extend(self.interrupt_scope(&approval.scope));
+                }
+                Ok(vec![Action::Write(lines)])
             }
             Command::Answer { request, answers } => {
                 let Some(question) = self.questions.get(&request).cloned() else {
@@ -1944,11 +2290,11 @@ impl Adapter for CodexAdapter {
                 }
                 Ok(Vec::new())
             }
-            // Lane L1 (plans/2026-10-11_codex-requests-rules-and-reply-questions.md) answers
-            // `mcpServer/elicitation/request` here.
-            Command::SubmitForm { .. } => Err(AdapterError::Unsupported(
-                "Codex forms are not answered yet",
-            )),
+            Command::SubmitForm {
+                request,
+                action,
+                content,
+            } => self.submit_form(request, action, content),
             Command::Control { id, control } => match control {
                 Control::ListModels => {
                     let line = self.request(
@@ -1993,7 +2339,9 @@ impl Adapter for CodexAdapter {
         let params = raw.get("params").cloned().unwrap_or(Value::Null);
         let mut out = Vec::new();
         match (method, id) {
-            (Some(method), Some(id)) => self.on_server_request(&id, &method, &params, &mut out),
+            (Some(method), Some(id)) => {
+                self.on_server_request(&id, &method, &params, line, &mut out)
+            }
             (Some(method), None) => self.on_notification(&method, &params, &mut out),
             (None, Some(id)) => self.on_response(&id, &raw, &mut out),
             (None, None) => out.push(Envelope::new(Event::Unknown)),
@@ -2014,6 +2362,7 @@ impl Adapter for CodexAdapter {
 
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         self.settled_requests.clear();
+        self.turnless_settled.clear();
         self.worker_turns.clear();
         let expected = self.interrupt_sent;
         let mut out = Vec::new();
@@ -2051,6 +2400,7 @@ impl Adapter for CodexAdapter {
                     .request(request),
             );
         }
+        self.expire_forms(|_| true, &mut out);
         let mut controls: Vec<String> = self
             .pending
             .drain()
@@ -2093,6 +2443,40 @@ impl Adapter for CodexAdapter {
     fn drain_outbox(&mut self) -> Outbox {
         std::mem::take(&mut self.outbox)
     }
+
+    /// The `sandboxPolicy` sent on the active or pending `turn/start` (else the one the next
+    /// turn gets): `workspaceWrite` lets Codex write, and so rename, inside the workspace.
+    fn workspace_writable(&self) -> Option<bool> {
+        let mode = self.effective_mode.unwrap_or(self.mode);
+        Some(mode_policy(mode).1["type"] == "workspaceWrite")
+    }
+}
+
+/// The approval tool name of a Codex permission request. The session keeps no rule for it and
+/// never answers it on its own.
+pub const PERMISSIONS_TOOL: &str = "codex_permissions";
+
+/// The notice for a link a tool server asked the user to open that is not offered: the server,
+/// why, the link as inert text (anything but printable ASCII escaped, at most 300 characters),
+/// and what the user can do.
+pub fn refused_link_notice(server: &str, why: &str, url: &str) -> String {
+    use std::fmt::Write as _;
+    let mut shown = String::new();
+    for c in url.chars().take(300) {
+        if c.is_ascii_graphic() {
+            shown.push(c);
+        } else {
+            // Writing to a String cannot fail.
+            let _ = write!(shown, "\\u{{{:x}}}", c as u32);
+        }
+    }
+    if url.chars().nth(300).is_some() {
+        shown.push('…');
+    }
+    format!(
+        "The {server} tool server {why}, so it was declined. The link: {shown}\nOpen it yourself \
+         only if you trust it, then tell the agent."
+    )
 }
 
 const ALL_DECISIONS: [Decision; 5] = [
@@ -5315,8 +5699,514 @@ mod tests {
         assert!(c.model_switch_in_session && c.live_approvals && c.interrupt_keeps_process);
         assert!(c.streams_text && c.streams_reasoning && c.plan_mode);
         assert!(c.model_list && c.context_usage);
-        assert!(c.questions);
+        assert!(c.questions && c.forms);
         assert!(!c.file_suggestions && !c.mcp_panel && !c.settings_panel && !c.usage);
         assert_eq!(c.compact_command.as_deref(), Some("/compact"));
+    }
+
+    // ---- permission requests ----
+
+    /// A started adapter with turn `tu-1` running.
+    fn in_turn() -> CodexAdapter {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.drain_outbox();
+        a
+    }
+
+    fn permissions_frame(id: u64, permissions: Value) -> String {
+        json!({"id": id, "method": "item/permissions/requestApproval", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "itemId": "perm-1", "startedAtMs": 1,
+            "cwd": "/work/repo", "reason": "build needs the cache", "permissions": permissions,
+        }})
+        .to_string()
+    }
+
+    fn card(events: &[Envelope]) -> (String, Option<String>, Value, Vec<Decision>) {
+        match events.first().map(|e| (&e.event, e.request.clone())) {
+            Some((
+                Event::ApprovalRequested {
+                    tool,
+                    title,
+                    input,
+                    options,
+                    remembers,
+                    ..
+                },
+                Some(request),
+            )) => {
+                assert_eq!(tool, PERMISSIONS_TOOL);
+                assert!(remembers.is_none(), "no rule is ever described");
+                (request, title.clone(), input.clone(), options.clone())
+            }
+            other => panic!("expected a permission card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_permission_request_is_a_card_whose_grant_is_what_it_shows() {
+        let asked = json!({
+            "fileSystem": {
+                "write": ["cache"],
+                "entries": [{"access": "read", "path": {"type": "glob_pattern", "pattern": "/opt/sdk/**"}}],
+            },
+            "network": {"enabled": true},
+        });
+        for (decision, scope) in [
+            (Decision::Allow, "turn"),
+            (Decision::AllowForSession, "session"),
+        ] {
+            let mut a = in_turn();
+            let (request, title, input, options) =
+                card(&a.feed(&permissions_frame(9, asked.clone())));
+            assert_eq!(
+                options,
+                [
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::Deny,
+                    Decision::Cancel
+                ]
+            );
+            assert_eq!(
+                title.as_deref(),
+                Some("Codex asks to write to /work/repo/cache, read files matching /opt/sdk/** and use the network")
+            );
+            assert_eq!(input["renderable"], true);
+            assert_eq!(
+                input["requested"], asked,
+                "the raw request rides along for Details"
+            );
+            assert!(
+                matches!(
+                    a.encode(approve_cmd(&request, Decision::AllowAlways)),
+                    Err(AdapterError::Invalid(_))
+                ),
+                "no Always allow"
+            );
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("allow"));
+            assert_eq!(
+                w,
+                json!({"id": 9, "result": {"scope": scope, "permissions": {
+                    "fileSystem": {
+                        "write": ["/work/repo/cache"],
+                        "entries": [{"access": "read", "path": {"type": "glob_pattern", "pattern": "/opt/sdk/**"}}],
+                    },
+                    "network": {"enabled": true},
+                }}})
+            );
+            // Grant equals shown: every granted path is one the card listed.
+            assert_eq!(
+                input["entries"][0]["target"]["path"],
+                w["result"]["permissions"]["fileSystem"]["write"][0]
+            );
+            assert!(w["result"].get("strictAutoReview").is_none());
+        }
+    }
+
+    #[test]
+    fn deny_grants_nothing_and_stop_turn_grants_nothing_then_interrupts() {
+        let asked = json!({"network": {"enabled": true}});
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(3, asked.clone())));
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Deny))
+                .expect("deny"),
+        );
+        assert_eq!(w, json!({"id": 3, "result": {"permissions": {}}}));
+
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(4, asked)));
+        let w = writes(
+            &a.encode(approve_cmd(&request, Decision::Cancel))
+                .expect("stop"),
+        );
+        assert_eq!(w[0], json!({"id": 4, "result": {"permissions": {}}}));
+        assert_eq!(w[1]["method"], "turn/interrupt");
+        assert_eq!(
+            w[1]["params"],
+            json!({"threadId": "th-1", "turnId": "tu-1"})
+        );
+        assert_eq!(w.len(), 2);
+    }
+
+    #[test]
+    fn an_unrenderable_permission_request_can_only_be_denied() {
+        let mut a = in_turn();
+        let (request, title, input, options) = card(&a.feed(&permissions_frame(
+            5,
+            json!({"fileSystem": {"entries": [{"access": "write", "path": {"type": "special",
+                "value": {"kind": "unknown", "path": "/", "subpath": null}}}]}}),
+        )));
+        assert_eq!(options, [Decision::Deny, Decision::Cancel]);
+        assert_eq!(input["renderable"], false);
+        assert!(title.is_some_and(|t| !t.contains("write")));
+        for refused in [Decision::Allow, Decision::AllowForSession] {
+            assert!(matches!(
+                a.encode(approve_cmd(&request, refused)),
+                Err(AdapterError::Invalid(_))
+            ));
+        }
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Deny))
+                .expect("deny"),
+        );
+        assert_eq!(w, json!({"id": 5, "result": {"permissions": {}}}));
+    }
+
+    #[test]
+    fn a_permission_request_expires_with_its_turn_like_any_approval() {
+        let mut a = in_turn();
+        let (request, ..) =
+            card(&a.feed(&permissions_frame(6, json!({"network": {"enabled": true}}))));
+        let out = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#);
+        assert!(out
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_deref() == Some(&request)));
+        assert!(a.encode(approve_cmd(&request, Decision::Allow)).is_err());
+    }
+
+    // ---- forms ----
+
+    fn form_frame(id: Value, turn: Option<&str>, mode_fields: Value) -> String {
+        let mut params = json!({"serverName": "github", "threadId": "th-1", "turnId": turn,
+                                "message": "Which repository?"});
+        for (k, v) in mode_fields.as_object().expect("fields") {
+            params[k] = v.clone();
+        }
+        json!({"id": id, "method": "mcpServer/elicitation/request", "params": params}).to_string()
+    }
+
+    fn repo_form() -> Value {
+        json!({"mode": "form", "requestedSchema": {"type": "object", "required": ["repo"],
+        "properties": {
+            "repo": {"type": "string", "oneOf": [{"const": "a/b", "title": "A B"}, {"const": "c/d", "title": "C D"}]},
+            "private": {"type": "boolean"},
+        }}})
+    }
+
+    fn form_request(events: &[Envelope]) -> (String, crate::form::Form) {
+        match events.first() {
+            Some(Envelope {
+                event:
+                    Event::FormRequested {
+                        server,
+                        message,
+                        form,
+                    },
+                request: Some(request),
+                ..
+            }) => {
+                assert_eq!(server, "github");
+                assert_eq!(message, "Which repository?");
+                (request.clone(), form.clone())
+            }
+            other => panic!("expected a form, got {other:?}"),
+        }
+    }
+
+    fn submit(request: &str, action: crate::form::FormAction, content: Option<Value>) -> Command {
+        Command::SubmitForm {
+            request: request.to_owned(),
+            action,
+            content,
+        }
+    }
+
+    #[test]
+    fn a_form_is_shown_and_accept_sends_exactly_the_checked_answer() {
+        use crate::form::{FieldInput, Form, FormAction};
+        let mut a = in_turn();
+        let (request, form) =
+            form_request(&a.feed(&form_frame(json!(11), Some("tu-1"), repo_form())));
+        let Form::Fields { fields } = form else {
+            panic!("fields")
+        };
+        // (`json!` sorts keys, so this frame's order is alphabetical; `elicitation` tests order.)
+        assert_eq!(fields[0].name, "private");
+        assert!(matches!(
+            fields[0].input,
+            FieldInput::Boolean { default: None }
+        ));
+        assert_eq!(fields[1].name, "repo");
+        assert!(fields[1].required);
+        // An answer the form would refuse is never sent, and the form stays answerable.
+        for bad in [
+            None,
+            Some(json!({"repo": "x/y"})),
+            Some(json!({"repo": "a/b", "token": "t"})),
+        ] {
+            assert!(matches!(
+                a.encode(submit(&request, FormAction::Accept, bad)),
+                Err(AdapterError::Invalid(_))
+            ));
+        }
+        assert!(a.drain_outbox().is_empty(), "nothing written");
+        let w = one_write(
+            a.encode(submit(
+                &request,
+                FormAction::Accept,
+                Some(json!({"repo": "a/b", "private": null})),
+            ))
+            .expect("accept"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 11, "result": {"action": "accept", "content": {"repo": "a/b"}}})
+        );
+        assert!(
+            a.drain_outbox().events.is_empty(),
+            "the session resolves the card, not the adapter"
+        );
+        assert!(a
+            .encode(submit(&request, FormAction::Decline, None))
+            .is_err());
+        assert!(
+            a.feed(&form_frame(json!(11), Some("tu-1"), repo_form()))
+                .is_empty(),
+            "a retransmitted answered form is inert"
+        );
+    }
+
+    #[test]
+    fn decline_and_cancel_answer_and_cancel_stops_only_its_own_turn() {
+        use crate::form::FormAction;
+        let mut a = in_turn();
+        let (request, _) =
+            form_request(&a.feed(&form_frame(json!("f"), Some("tu-1"), repo_form())));
+        let w = one_write(
+            a.encode(submit(&request, FormAction::Decline, None))
+                .expect("decline"),
+        );
+        assert_eq!(w, json!({"id": "f", "result": {"action": "decline"}}));
+
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(2), Some("tu-1"), repo_form())));
+        let w = writes(
+            &a.encode(submit(&request, FormAction::Cancel, None))
+                .expect("cancel"),
+        );
+        assert_eq!(w[0], json!({"id": 2, "result": {"action": "cancel"}}));
+        assert_eq!(w[1]["method"], "turn/interrupt");
+
+        // Turnless: cancelled without touching the running turn, and no turn's end expires it.
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(3), None, repo_form())));
+        let ended = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert!(!ended
+            .iter()
+            .any(|e| matches!(e.event, Event::FormResolved { .. })));
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        let w = one_write(
+            a.encode(submit(&request, FormAction::Cancel, None))
+                .expect("cancel"),
+        );
+        assert_eq!(w, json!({"id": 3, "result": {"action": "cancel"}}));
+        assert!(a.turn_id.as_deref() == Some("tu-2") && !a.interrupt_sent);
+    }
+
+    #[test]
+    fn open_forms_expire_with_their_turn_their_resolution_and_the_process() {
+        use crate::form::FormAction;
+        let expired = |out: &[Envelope], request: &str| {
+            out.iter().any(|e| {
+                e.event
+                    == Event::FormResolved {
+                        action: FormAction::Cancel,
+                    }
+                    && e.request.as_deref() == Some(request)
+            })
+        };
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(1), Some("tu-1"), repo_form())));
+        let out = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert!(expired(&out, &request));
+        assert!(a
+            .encode(submit(&request, FormAction::Decline, None))
+            .is_err());
+
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(7), None, repo_form())));
+        let out = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":7}}"#,
+        );
+        assert!(expired(&out, &request));
+
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(8), None, repo_form())));
+        assert!(expired(&a.on_exit(Some(0)), &request));
+    }
+
+    #[test]
+    fn a_link_form_is_accepted_without_content() {
+        use crate::form::{Form, FormAction};
+        let mut a = in_turn();
+        let (request, form) = form_request(&a.feed(&form_frame(
+            json!(4),
+            None,
+            json!({"mode": "url", "url": "https://example.com/auth", "elicitationId": "e1"}),
+        )));
+        assert_eq!(
+            form,
+            Form::Link {
+                url: "https://example.com/auth".into()
+            }
+        );
+        assert!(a
+            .encode(submit(&request, FormAction::Accept, Some(json!({"x": 1}))))
+            .is_err());
+        let w = one_write(
+            a.encode(submit(&request, FormAction::Accept, None))
+                .expect("done"),
+        );
+        assert_eq!(w, json!({"id": 4, "result": {"action": "accept"}}));
+    }
+
+    #[test]
+    fn a_form_the_adapter_cannot_show_is_declined_with_a_notice_naming_the_server() {
+        let cases = [
+            (
+                json!({"mode": "form", "requestedSchema": {"type": "object", "properties": {
+                    "password": {"type": "string"}}}}),
+                "never passes secrets",
+            ),
+            (
+                json!({"mode": "openai/form", "requestedSchema": {}}),
+                "cannot show yet",
+            ),
+            (
+                json!({"mode": "url", "url": "javascript:alert(1)\u{202e}", "elicitationId": "e"}),
+                "Open it yourself only if you trust it",
+            ),
+        ];
+        for (fields, says) in cases {
+            let mut a = in_turn();
+            let out = a.feed(&form_frame(json!(5), Some("tu-1"), fields.clone()));
+            let text = match out.as_slice() {
+                [Envelope {
+                    event: Event::Notice { text },
+                    ..
+                }] => text.clone(),
+                other => panic!("{other:?}"),
+            };
+            assert!(text.starts_with("The github tool server "), "{text}");
+            assert!(text.contains(says), "{text}");
+            assert!(
+                !text.contains('\u{202e}'),
+                "the refused link is inert text: {text}"
+            );
+            let outbox = a.drain_outbox();
+            assert_eq!(
+                writes(&outbox.actions),
+                [json!({"id": 5, "result": {"action": "decline"}})]
+            );
+            assert!(
+                a.feed(&form_frame(json!(5), Some("tu-1"), fields))
+                    .is_empty(),
+                "a declined request is settled"
+            );
+        }
+        assert!(
+            refused_link_notice("s", "why", "https://x/\u{202e}").contains("https://x/\\u{202e}")
+        );
+        let long = refused_link_notice("s", "why", &format!("https://x/{}", "a".repeat(1_000)));
+        assert!(long.contains("a…\n"), "the link is cut at 300 characters");
+    }
+
+    /// A form nobody will see (its turn ended, or its worker closed) is still answered, so the
+    /// tool call that raised it does not wait for its own timeout.
+    #[test]
+    fn a_form_for_an_ended_turn_is_declined_not_dropped() {
+        let mut a = in_turn();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        a.drain_outbox();
+        assert!(a
+            .feed(&form_frame(json!(9), Some("tu-1"), repo_form()))
+            .is_empty());
+        assert_eq!(
+            writes(&a.drain_outbox().actions),
+            [json!({"id": 9, "result": {"action": "decline"}})]
+        );
+    }
+
+    /// Turnless forms never retire with a turn, so their settled keys are bounded.
+    #[test]
+    fn settled_turnless_forms_are_bounded() {
+        use crate::form::FormAction;
+        let mut a = in_turn();
+        for id in 0..(TURNLESS_SETTLED_LIMIT + 50) {
+            let (request, _) = form_request(&a.feed(&form_frame(json!(id), None, repo_form())));
+            a.encode(submit(&request, FormAction::Decline, None))
+                .expect("decline");
+        }
+        assert_eq!(a.turnless_settled.len(), TURNLESS_SETTLED_LIMIT);
+        assert_eq!(a.settled_requests.len(), TURNLESS_SETTLED_LIMIT);
+        // The newest are still protected against retransmission.
+        let last = TURNLESS_SETTLED_LIMIT + 49;
+        assert!(a
+            .feed(&form_frame(json!(last), None, repo_form()))
+            .is_empty());
+    }
+
+    /// The session sends a granted path by where it really leads (`updated_input`); a rename the
+    /// grant does not hold is refused and the request stays answerable.
+    #[test]
+    fn an_allow_can_name_a_granted_path_by_where_it_leads() {
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(
+            12,
+            json!({"fileSystem": {"write": ["out"]}}),
+        )));
+        let approve = |paths: Value| Command::Approve {
+            request: request.clone(),
+            decision: Decision::AllowForSession,
+            updated_input: Some(paths),
+            message: None,
+        };
+        assert!(matches!(
+            a.encode(approve(json!({"/elsewhere": "/x"}))),
+            Err(AdapterError::Invalid(_))
+        ));
+        let w = one_write(
+            a.encode(approve(json!({"/work/repo/out": "/data/real-out"})))
+                .expect("allow"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 12, "result": {"scope": "session",
+                "permissions": {"fileSystem": {"write": ["/data/real-out"]}}}})
+        );
+    }
+
+    /// The session judges renames against the sandbox the running turn was sent, not the mode
+    /// picked since: a switch mid-turn applies from the next turn.
+    #[test]
+    fn workspace_writability_follows_the_live_turns_sandbox() {
+        let mut a = started(Mode::Ask);
+        assert_eq!(a.workspace_writable(), Some(false));
+        a.encode(Command::Prompt { text: "go".into() })
+            .expect("prompt");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        assert_eq!(
+            a.workspace_writable(),
+            Some(false),
+            "this turn keeps readOnly"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert_eq!(a.workspace_writable(), Some(true), "the next turn writes");
+        let mut b = started(Mode::AcceptEdits);
+        b.encode(Command::Prompt { text: "go".into() })
+            .expect("prompt");
+        b.encode(Command::SetMode { mode: Mode::Ask })
+            .expect("mode");
+        assert_eq!(
+            b.workspace_writable(),
+            Some(true),
+            "the pending turn was sent workspaceWrite"
+        );
     }
 }

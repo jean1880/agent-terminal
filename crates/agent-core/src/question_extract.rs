@@ -358,14 +358,7 @@ fn has_bare_link(text: &str) -> bool {
 /// whitespace. A reply that carries one in an option could hide what a click puts in the
 /// composer.
 fn is_hidden(c: char) -> bool {
-    matches!(c,
-        '\u{00A0}' | '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
-        | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
-        | '\u{1680}' | '\u{2800}' | '\u{2000}'..='\u{200F}' | '\u{2028}'..='\u{202F}'
-        | '\u{205F}'..='\u{206F}' | '\u{3000}' | '\u{3164}'
-        | '\u{FE00}'..='\u{FE0E}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFC}'
-        | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}'
-    ) || c.is_control()
+    crate::text::is_hidden(c)
 }
 
 /// A code span that is something to run rather than a name: several words, a shell sigil, a
