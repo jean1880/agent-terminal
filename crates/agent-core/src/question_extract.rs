@@ -103,8 +103,9 @@ pub fn extract_or_why(text: &str) -> Result<Question, Skip> {
     let (list, question) = tail_shape(&events, &blocks)?;
     let options = read_items(&events[list.0..list.1])?;
     let question = question_text(&events[question.0..question.1])?;
-    judge_options(&options)?;
-    judge_question(&question)?;
+    let strong_cue = judge_question(&question)?;
+    let ordered = matches!(events[list.0], Event::Start(Tag::List(Some(_))));
+    judge_options(&options, strong_cue, ordered)?;
     Ok(Question {
         id: "reply".into(),
         header: "Quick replies".into(),
@@ -210,7 +211,9 @@ fn ends_with_question(text: &str) -> bool {
 }
 
 /// The question's last sentence reads as a choice rather than a yes/no about something else.
-fn judge_question(question: &str) -> Result<(), Skip> {
+/// Returns whether the cue is a strong one ("which", "prefer", "or"): the question names
+/// alternatives, which is what lets short imperative items ("Use A", "Use B") pass as choices.
+fn judge_question(question: &str) -> Result<bool, Skip> {
     let body = question.trim_end_matches(|c: char| !c.is_alphanumeric());
     let sentence = body
         .rsplit(['.', '!', '?', '？', ':', '\n'])
@@ -244,8 +247,14 @@ fn judge_question(question: &str) -> Result<(), Skip> {
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
         .filter(|w| !w.is_empty())
         .collect();
-    if PHRASES.iter().any(|p| sentence.contains(p)) || words.iter().any(|w| WORDS.contains(w)) {
-        Ok(())
+    let strong = words
+        .iter()
+        .any(|w| matches!(*w, "which" | "prefer" | "or"));
+    if strong
+        || PHRASES.iter().any(|p| sentence.contains(p))
+        || words.iter().any(|w| WORDS.contains(w))
+    {
+        Ok(strong)
     } else {
         Err(Skip::NotAChoice)
     }
@@ -352,7 +361,7 @@ fn is_hidden(c: char) -> bool {
     matches!(c,
         '\u{00A0}' | '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
         | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
-        | '\u{2000}'..='\u{200F}' | '\u{2028}'..='\u{202F}'
+        | '\u{1680}' | '\u{2800}' | '\u{2000}'..='\u{200F}' | '\u{2028}'..='\u{202F}'
         | '\u{205F}'..='\u{206F}' | '\u{3000}' | '\u{3164}'
         | '\u{FE00}'..='\u{FE0E}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFC}'
         | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}'
@@ -419,7 +428,6 @@ const IMPERATIVES: &[&str] = &[
     "log",
     "sign",
     "visit",
-    "navigate",
     "extract",
     "unzip",
     "reboot",
@@ -440,26 +448,52 @@ fn first_word(item: &str) -> String {
 }
 
 /// The list is a set of alternatives, not steps, a report of what was done, or questions.
-fn judge_options(options: &[String]) -> Result<(), Skip> {
+fn judge_options(options: &[String], strong_cue: bool, ordered: bool) -> Result<(), Skip> {
     let n = options.len();
     let firsts: Vec<String> = options.iter().map(|o| first_word(o)).collect();
     // "Most" is more than half: two of two, two of three.
-    if firsts
-        .iter()
-        .filter(|w| IMPERATIVES.contains(&w.as_str()))
-        .count()
-        * 2
-        > n
-    {
-        return Err(Skip::Procedure);
+    let most = |count: usize| count * 2 > n;
+    if most(
+        firsts
+            .iter()
+            .filter(|w| IMPERATIVES.contains(&w.as_str()))
+            .count(),
+    ) {
+        // Steps run in sequence. Alternatives ("Use SQLite", "Use Postgres") pass only when the
+        // question names alternatives and either every item opens with the same verb, or the
+        // list is a bullet list of short items. A numbered list of different verbs is a procedure.
+        let same_verb = firsts.iter().all(|w| *w == firsts[0]);
+        let short = options.iter().all(|o| o.split_whitespace().count() <= 8);
+        if !(strong_cue && (same_verb || (!ordered && short))) {
+            return Err(Skip::Procedure);
+        }
     }
-    if firsts
+    // A report of what was done. Known past-tense verbs always count; any other "-ed" word
+    // ("Embedded", "Shared") only when the question names no alternatives.
+    const PAST: &[&str] = &[
+        "fixed",
+        "added",
+        "removed",
+        "updated",
+        "changed",
+        "renamed",
+        "reworked",
+        "moved",
+        "deleted",
+        "created",
+        "implemented",
+        "refactored",
+        "merged",
+        "replaced",
+        "ran",
+        "wrote",
+    ];
+    let known_past = firsts.iter().filter(|w| PAST.contains(&w.as_str())).count();
+    let any_ed = firsts
         .iter()
-        .filter(|w| w.chars().count() > 3 && w.ends_with("ed"))
-        .count()
-        * 2
-        > n
-    {
+        .filter(|w| PAST.contains(&w.as_str()) || (w.chars().count() > 4 && w.ends_with("ed")))
+        .count();
+    if most(known_past) || (!strong_cue && most(any_ed)) {
         return Err(Skip::NotAlternatives);
     }
     if options.iter().any(|o| ends_with_question(o)) {
@@ -544,6 +578,21 @@ mod tests {
             &["Merge now", "Wait for CI", "Open a draft PR"],
         ),
         (
+            "same leading verb across alternatives",
+            "Which database should I use?\n\n- Use SQLite\n- Use Postgres",
+            &["Use SQLite", "Use Postgres"],
+        ),
+        (
+            "short bullet alternatives with different verbs",
+            "Which do you prefer?\n\n- Remove the old flag\n- Replace it with a setting",
+            &["Remove the old flag", "Replace it with a setting"],
+        ),
+        (
+            "words that merely end in -ed are not past tense",
+            "Which do you prefer?\n\n- Shared cache across threads\n- Embedded cache per thread",
+            &["Shared cache across threads", "Embedded cache per thread"],
+        ),
+        (
             "entities decode to plain text",
             "Which do you prefer?\n\n- Fish &amp; chips\n- Soup &lt;hot&gt;",
             &["Fish & chips", "Soup <hot>"],
@@ -613,6 +662,18 @@ mod tests {
         (
             "zero-width space in an item",
             "Which do you prefer?\n\n- Keep it\n- Drop\u{200B} it",
+        ),
+        (
+            "numbered steps with different verbs and an either-or question",
+            "Here is the fix.\n\n1. Install the package\n2. Open the settings page\n3. Restart it\n\nShall I do it or will you?",
+        ),
+        (
+            "braille blank in an item",
+            "Which do you prefer?\n\n- Keep it\n- Drop\u{2800} it",
+        ),
+        (
+            "ogham space mark in an item",
+            "Which do you prefer?\n\n- Keep\u{1680}it\n- Drop it",
         ),
         (
             "bidi override in an item",

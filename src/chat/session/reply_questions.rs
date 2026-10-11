@@ -35,10 +35,27 @@ pub(super) struct ReplyTurn {
     nested: HashSet<String>,
 }
 
+/// Why no chips were offered: something about the turn, or something about the reply. Nothing
+/// is allocated to say it.
+#[derive(Clone, Copy)]
+pub(super) enum Why {
+    Turn(&'static str),
+    Reply(question_extract::Skip),
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Turn(text) => f.write_str(text),
+            Self::Reply(skip) => skip.fmt(f),
+        }
+    }
+}
+
 /// Why no chips were offered, or the chips.
 pub(super) enum Verdict {
     Offer { item: String, question: Question },
-    Skip(String),
+    Skip(Why),
 }
 
 impl ReplyTurn {
@@ -109,7 +126,7 @@ impl ReplyTurn {
         setting_on: bool,
         next_prompt_started: bool,
     ) -> Verdict {
-        let skip = |why: &str| Verdict::Skip(why.to_owned());
+        let skip = |why: &'static str| Verdict::Skip(Why::Turn(why));
         if !matches!(driver, Driver::Codex | Driver::Agy) {
             return skip("this agent asks with its own question tool");
         }
@@ -133,7 +150,7 @@ impl ReplyTurn {
                 item: item.clone(),
                 question,
             },
-            Err(why) => Verdict::Skip(why.to_string()),
+            Err(why) => Verdict::Skip(Why::Reply(why)),
         }
     }
 

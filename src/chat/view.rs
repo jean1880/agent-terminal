@@ -842,6 +842,13 @@ impl Inner {
         true
     }
 
+    /// Takes the quick-reply chips away and hands focus back to the composer.
+    fn dismiss_quick_replies(self: &Rc<Self>) {
+        let changes = self.model.borrow_mut().dismiss_quick_replies();
+        self.handle(changes);
+        self.composer.grab_focus();
+    }
+
     fn row_event(self: &Rc<Self>, e: RowEvent) {
         match e {
             RowEvent::Toggle { id, expanded } => {
@@ -875,15 +882,9 @@ impl Inner {
                 self.composer.grab_focus();
             }
             RowEvent::QuickReply { text } => self.composer.fill(&text),
-            RowEvent::DismissQuickReplies => {
-                let changes = self.model.borrow_mut().dismiss_quick_replies();
-                self.handle(changes);
-                self.composer.grab_focus();
-            }
+            RowEvent::DismissQuickReplies => self.dismiss_quick_replies(),
             RowEvent::StopQuickReplies => {
-                let changes = self.model.borrow_mut().dismiss_quick_replies();
-                self.handle(changes);
-                self.composer.grab_focus();
+                self.dismiss_quick_replies();
                 self.emit(ViewAction::StopQuickReplies);
             }
             RowEvent::LoadDiff { id } => self.load_diff(&id),

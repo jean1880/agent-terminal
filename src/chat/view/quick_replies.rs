@@ -25,6 +25,9 @@ pub(super) fn row(options: &[String], sink: &RowSink) -> gtk4::Box {
     flow.set_column_spacing(8);
     flow.set_row_spacing(8);
     flow.set_homogeneous(false);
+    // Chips take the width of their text, not an equal share of the row.
+    flow.set_halign(gtk4::Align::Start);
+    flow.set_hexpand(false);
     for text in options {
         let chip = gtk4::Button::new();
         chip.add_css_class("option-button");
