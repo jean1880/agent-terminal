@@ -128,6 +128,22 @@ impl Builder {
     }
 }
 
+/// One short passage of markdown as a single label's Pango markup (reasoning paragraphs, F17):
+/// the same renderer as transcript messages, so `**Planning**` is bold with no markers. Every
+/// piece of source text is escaped by [`parse`]; code blocks become escaped monospace, rules
+/// nothing. Blocks are joined by line breaks.
+pub fn passage_markup(markdown: &str) -> String {
+    parse(markdown)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Text { markup, .. } => Some(markup),
+            Block::Code { text, .. } => Some(format!("<tt>{}</tt>", escape(&text))),
+            Block::Rule => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Parses markdown into blocks.
 pub fn parse(markdown: &str) -> Vec<Block> {
     let options =
@@ -507,6 +523,22 @@ mod tests {
     fn empty_input_has_no_blocks() {
         assert!(parse("").is_empty());
         assert!(parse("   \n\n").is_empty());
+    }
+
+    #[test]
+    fn passage_markup_renders_reasoning_markdown_and_escapes_the_rest() {
+        // F17: Codex summaries arrive as markdown; the markers must not show.
+        assert_eq!(
+            passage_markup("**Planning** the listing"),
+            "<b>Planning</b> the listing"
+        );
+        // Plain-text safe: markup in the source is text, not Pango.
+        let hostile = passage_markup("<span foreground='red'>x</span> & **y**");
+        assert!(!hostile.contains("<span"), "{hostile}");
+        assert!(hostile.contains("&lt;span") && hostile.contains("&amp;"));
+        assert!(hostile.contains("<b>y</b>"));
+        assert_eq!(passage_markup("```\na < b\n```"), "<tt>a &lt; b</tt>");
+        assert_eq!(passage_markup(""), "");
     }
 
     #[test]

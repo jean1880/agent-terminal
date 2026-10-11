@@ -794,6 +794,8 @@ pub struct ReasoningRow {
     /// The text, one wrapping label per paragraph (see [`Self::show_text`]).
     body: gtk4::Box,
     paragraphs: RefCell<Vec<gtk4::Label>>,
+    /// The markdown source each paragraph label shows, to re-render only what changed.
+    sources: RefCell<Vec<String>>,
 }
 
 impl ReasoningRow {
@@ -838,6 +840,7 @@ impl ReasoningRow {
             revealer,
             body,
             paragraphs: RefCell::new(Vec::new()),
+            sources: RefCell::new(Vec::new()),
         }
     }
 
@@ -862,6 +865,7 @@ impl ReasoningRow {
         while labels.len() > parts.len() {
             if let Some(l) = labels.pop() {
                 self.body.remove(&l);
+                self.sources.borrow_mut().truncate(labels.len());
             }
         }
         while labels.len() < parts.len() {
@@ -871,9 +875,20 @@ impl ReasoningRow {
             self.body.append(&l);
             labels.push(l);
         }
-        for (l, part) in labels.iter().zip(parts) {
-            if l.text() != part {
-                l.set_text(part);
+        // Each paragraph is markdown (Codex summaries bold their headings, F17), rendered by the
+        // transcript's own renderer, which escapes every piece of source text. Only a paragraph
+        // whose source changed is parsed again.
+        let mut sources = self.sources.borrow_mut();
+        sources.resize(labels.len(), String::new());
+        for ((l, source), part) in labels.iter().zip(sources.iter_mut()).zip(parts) {
+            if source != part {
+                part.clone_into(source);
+                let markup = super::markdown::passage_markup(part);
+                if gtk4::pango::parse_markup(&markup, '\0').is_ok() {
+                    l.set_markup(&markup);
+                } else {
+                    l.set_text(part);
+                }
             }
         }
     }

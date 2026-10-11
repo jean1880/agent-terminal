@@ -2574,6 +2574,19 @@ pub(crate) mod tests {
             before, after,
             "the paragraphs' labels are kept, not rebuilt"
         );
+
+        // F17: a Codex summary's markdown renders (bold, no `**`), and markup in the text stays
+        // text.
+        delta("\n\n**Planning** the listing\n\n<b>not bold</b>");
+        while ctx.iteration(false) {}
+        let (texts, labels_now) = labels("long");
+        assert_eq!(texts[2], "Planning the listing", "no markers shown");
+        assert_eq!(labels_now[2].label(), "<b>Planning</b> the listing");
+        assert!(labels_now[2].uses_markup());
+        assert_eq!(
+            texts[3], "<b>not bold</b>",
+            "source markup is shown as text"
+        );
     }
 
     #[test]
