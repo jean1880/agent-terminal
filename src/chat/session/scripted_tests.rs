@@ -800,3 +800,478 @@ fn scripted_a_turn_with_an_item_confirms_the_new_codex_thread() {
         session.shutdown(false);
     });
 }
+
+// ---- Codex permission requests and forms (plan 2026-10-11, lane L1) ----
+
+/// The latest Codex permission card the view received: request, options and input.
+fn permission_card(seen: &RefCell<Vec<Envelope>>) -> Option<(String, Vec<Decision>, Value)> {
+    seen.borrow().iter().rev().find_map(|e| match &e.event {
+        Event::ApprovalRequested {
+            tool,
+            options,
+            input,
+            ..
+        } if tool == agent_core::codex::PERMISSIONS_TOOL => {
+            Some((e.request.clone()?, options.clone(), input.clone()))
+        }
+        _ => None,
+    })
+}
+
+fn notices(seen: &RefCell<Vec<Envelope>>, needle: &str) -> usize {
+    seen.borrow()
+        .iter()
+        .filter(|e| matches!(&e.event, Event::Notice { text } if text.contains(needle)))
+        .count()
+}
+
+impl Fixture {
+    fn results(&self) -> Vec<Value> {
+        self.incoming()
+            .into_iter()
+            .filter_map(|f| f.get("result").cloned())
+            .collect()
+    }
+
+    fn wait_card(&self, ctx: &glib::MainContext) -> (String, Vec<Decision>, Value) {
+        self.wait(ctx, "permission card", || {
+            permission_card(&self.seen).is_some()
+        });
+        permission_card(&self.seen).expect("card")
+    }
+
+    fn no_rules(&self, session: &ChatSession) {
+        assert!(session.inner.session_rules.borrow().rules.is_empty());
+        assert!(session.inner.pending_rules.borrow().is_empty());
+    }
+}
+
+#[test]
+fn scripted_a_sensitive_permission_request_never_offers_or_sends_a_session_grant() {
+    in_loop(|ctx| {
+        for (permissions, says) in [
+            (
+                json!({"fileSystem": {"entries": [{"access": "write",
+                    "path": {"type": "special", "value": {"kind": "root"}}}]}}),
+                "the whole filesystem",
+            ),
+            (json!({"fileSystem": {"write": [".git/hooks"]}}), ".git"),
+        ] {
+            let fixture = Fixture::new();
+            let session = fixture.session();
+            fixture.prompt(&session, &format!("permissions:{permissions}"));
+            let (request, options, input) = fixture.wait_card(ctx);
+            assert_eq!(options, [Decision::Allow, Decision::Deny, Decision::Cancel]);
+            assert_eq!(input["session_allowed"], false);
+            assert!(
+                input["warning"].as_str().is_some_and(|w| w.contains(says)),
+                "{input}"
+            );
+            // Refused at answer time too, whatever the card offered: nothing is written.
+            for refused in [Decision::AllowForSession, Decision::AllowAlways] {
+                session.respond_approval(&request, refused);
+                assert!(fixture.results().is_empty(), "{refused:?} sent nothing");
+            }
+            assert_eq!(
+                notices(&fixture.seen, "Allow for session is not available"),
+                1
+            );
+            assert_eq!(notices(&fixture.seen, "cannot be always allowed"), 1);
+            session.respond_approval(&request, Decision::Allow);
+            fixture.wait_finished(ctx);
+            let results = fixture.results();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["scope"], "turn");
+            assert!(results[0]["permissions"]["fileSystem"].is_object());
+            assert!(fixture.seen.borrow().iter().any(|e| e.request.as_deref()
+                == Some(request.as_str())
+                && e.event
+                    == Event::ApprovalResolved {
+                        decision: Decision::Allow
+                    }));
+            assert_eq!(notices(&fixture.seen, "extra access"), 0);
+            fixture.no_rules(&session);
+            session.shutdown(false);
+        }
+    });
+}
+
+#[test]
+fn scripted_a_session_grant_is_announced_and_outlives_a_mode_change_until_restart() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]},"network":{"enabled":true}}"#,
+        );
+        let (request, options, input) = fixture.wait_card(ctx);
+        assert_eq!(
+            options,
+            [
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel
+            ]
+        );
+        let build = format!("{}/build", fixture.dir.path().display());
+        assert_eq!(input["entries"][0]["target"]["path"], build.as_str());
+        session.respond_approval(&request, Decision::AllowForSession);
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "session", "permissions": {
+                "fileSystem": {"write": [build]}, "network": {"enabled": true}}})]
+        );
+        assert_eq!(
+            notices(
+                &fixture.seen,
+                &format!("Codex has extra access for this session: write to {build} and use the network. It lasts until this thread's Codex session restarts.")
+            ),
+            1
+        );
+        fixture.no_rules(&session);
+        session.set_mode(Mode::AcceptEdits);
+        assert_eq!(notices(&fixture.seen, "still applies in the new mode"), 1);
+        session.set_mode(Mode::AcceptEdits);
+        assert_eq!(
+            notices(&fixture.seen, "still applies"),
+            1,
+            "no change, no notice"
+        );
+        // A new app-server process holds no grant.
+        session.reload_session();
+        session.set_mode(Mode::Ask);
+        assert_eq!(notices(&fixture.seen, "still applies"), 1);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn scripted_stop_turn_on_a_permission_request_grants_nothing_and_interrupts() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, r#"permissions:{"network":{"enabled":true}}"#);
+        let (request, ..) = fixture.wait_card(ctx);
+        session.respond_approval(&request, Decision::Cancel);
+        fixture.wait(ctx, "interrupt", || {
+            fixture
+                .incoming()
+                .iter()
+                .any(|f| f["method"] == "turn/interrupt")
+        });
+        assert_eq!(fixture.results(), [json!({"permissions": {}})]);
+        fixture.wait_finished(ctx);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn scripted_forms_answer_through_the_adapter_and_a_link_with_a_secret_is_declined() {
+    use agent_core::form::{Form, FormAction};
+    in_loop(|ctx| {
+        let form_request = |fixture: &Fixture| {
+            fixture.seen.borrow().iter().find_map(|e| match &e.event {
+                Event::FormRequested { form, .. } => Some((e.request.clone()?, form.clone())),
+                _ => None,
+            })
+        };
+        let resolved = |fixture: &Fixture| {
+            fixture
+                .seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::FormResolved { .. }))
+                .count()
+        };
+
+        // A link whose masking would change it is never shown: declined with a notice.
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            &format!(
+                r#"form:{{"mode":"url","url":"https://example.com/cb?code={token}","elicitationId":"e1"}}"#
+            ),
+        );
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results(), [json!({"action": "decline"})]);
+        assert!(form_request(&fixture).is_none(), "no card");
+        assert_eq!(
+            notices(&fixture.seen, "Open it yourself only if you trust it"),
+            1
+        );
+        assert!(!fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| serde_json::to_string(e)
+                .unwrap_or_default()
+                .contains(&token)));
+        session.shutdown(false);
+
+        // A plain link: Done sends accept, and only the session resolves the card, once.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"form:{"mode":"url","url":"https://example.com/login","elicitationId":"e2"}"#,
+        );
+        fixture.wait(ctx, "link card", || form_request(&fixture).is_some());
+        let (request, form) = form_request(&fixture).expect("card");
+        assert!(matches!(form, Form::Link { .. }));
+        session.respond_form(&request, FormAction::Accept, None);
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results(), [json!({"action": "accept"})]);
+        assert_eq!(resolved(&fixture), 1);
+        session.shutdown(false);
+
+        // A field form: an answer the form refuses is not sent and leaves the card open.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"form:{"mode":"form","requestedSchema":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}}"#,
+        );
+        fixture.wait(ctx, "form card", || form_request(&fixture).is_some());
+        let (request, _) = form_request(&fixture).expect("card");
+        session.respond_form(&request, FormAction::Accept, Some(json!({})));
+        assert!(fixture.results().is_empty());
+        assert_eq!(resolved(&fixture), 0);
+        session.respond_form(&request, FormAction::Accept, Some(json!({"name": "Ada"})));
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            fixture.results(),
+            [json!({"action": "accept", "content": {"name": "Ada"}})]
+        );
+        assert_eq!(resolved(&fixture), 1);
+        session.shutdown(false);
+    });
+}
+
+/// Red-team #382: a link in the project that leads outside it is judged where it leads. The card
+/// shows the resolved target and offers no session grant; the grant itself is still exactly
+/// the path the card listed.
+#[test]
+fn scripted_a_symlinked_target_is_shown_resolved_and_never_session_granted() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), fixture.dir.path().join("out"))
+            .expect("symlink");
+        let session = fixture.session();
+        fixture.prompt(&session, r#"permissions:{"fileSystem":{"write":["out"]}}"#);
+        let (request, options, input) = fixture.wait_card(ctx);
+        assert_eq!(options, [Decision::Allow, Decision::Deny, Decision::Cancel]);
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        assert_eq!(
+            input["entries"][0]["target"]["resolved"],
+            real.to_string_lossy().as_ref()
+        );
+        assert_eq!(input["session_allowed"], false);
+        assert!(input["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("outside the project")));
+        session.respond_approval(&request, Decision::AllowForSession);
+        assert!(fixture.results().is_empty());
+        session.respond_approval(&request, Decision::Allow);
+        fixture.wait_finished(ctx);
+        // The grant names the place by where it really leads, as the card showed it.
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {"fileSystem": {"write": [real]}}})]
+        );
+        session.shutdown(false);
+    });
+}
+
+/// A Codex permission frame for the fixture's running turn, fed straight to the session.
+fn permission_line(fixture: &Fixture, id: u64) -> String {
+    json!({"id": id, "method": "item/permissions/requestApproval", "params": {
+        "threadId": "fixture-thread", "turnId": "connection-1-turn-1", "itemId": format!("p{id}"),
+        "startedAtMs": 1, "cwd": fixture.dir.path(), "permissions": {"network": {"enabled": true}},
+    }})
+    .to_string()
+}
+
+fn permission_cards(fixture: &Fixture) -> usize {
+    fixture
+        .seen
+        .borrow()
+        .iter()
+        .filter(|e| {
+            matches!(&e.event, Event::ApprovalRequested { tool, .. }
+            if tool == agent_core::codex::PERMISSIONS_TOOL)
+        })
+        .count()
+}
+
+/// Lets every held check finish (they are quick; this outlasts them).
+fn settle(ctx: &glib::MainContext) {
+    pump_until(ctx, 1, || false);
+}
+
+/// Rust review #397: a card whose request ends while its targets are being checked is never
+/// shown, whether the agent resolved it or the process went away; a duplicate shows once.
+#[test]
+fn scripted_a_held_permission_card_never_outlives_its_request() {
+    in_loop(|ctx| {
+        // Resolved by the agent while held.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        fixture.wait_pending(ctx);
+        let generation = session.inner.generation.get();
+        session
+            .inner
+            .on_line(generation, &permission_line(&fixture, 900), false);
+        session.inner.on_line(
+            generation,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"fixture-thread","requestId":900}}"#,
+            false,
+        );
+        settle(ctx);
+        assert_eq!(permission_cards(&fixture), 0, "expired while held");
+        assert!(session.inner.held_permissions.borrow().is_empty());
+        session.shutdown(false);
+
+        // The process ends while held.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        fixture.wait_pending(ctx);
+        let generation = session.inner.generation.get();
+        session
+            .inner
+            .on_line(generation, &permission_line(&fixture, 901), false);
+        session.shutdown(false);
+        settle(ctx);
+        assert_eq!(
+            permission_cards(&fixture),
+            0,
+            "the process ended while held"
+        );
+
+        // The same request twice while held: one card.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        fixture.wait_pending(ctx);
+        let generation = session.inner.generation.get();
+        for _ in 0..2 {
+            session
+                .inner
+                .on_line(generation, &permission_line(&fixture, 902), false);
+        }
+        settle(ctx);
+        assert_eq!(permission_cards(&fixture), 1);
+        session
+            .inner
+            .on_line(generation, &permission_line(&fixture, 902), false);
+        settle(ctx);
+        assert_eq!(
+            permission_cards(&fixture),
+            1,
+            "a shown card is not shown twice"
+        );
+        session.shutdown(false);
+    });
+}
+
+/// Red-team #401: an Allow is checked on disk again; if the place changed (here, swapped for a
+/// link) nothing is sent and the card is shown again under a new id, as it is now.
+#[test]
+fn scripted_a_request_that_changed_while_waiting_is_shown_again_not_sent() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        let (request, options, _) = fixture.wait_card(ctx);
+        assert!(options.contains(&Decision::AllowForSession));
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), fixture.dir.path().join("build"))
+            .expect("swap the name for a link");
+        session.respond_approval(&request, Decision::AllowForSession);
+        fixture.wait(ctx, "the card shown again", || {
+            permission_card(&fixture.seen).is_some_and(|(r, ..)| r != request)
+        });
+        assert!(fixture.results().is_empty(), "nothing was sent");
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(request.as_str())
+                && e.event == Event::ApprovalExpired));
+        let (again, options, input) = permission_card(&fixture.seen).expect("card");
+        assert!(!options.contains(&Decision::AllowForSession));
+        assert!(input["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(super::CHECK_CHANGED)));
+        session.respond_approval(&again, Decision::Allow);
+        fixture.wait_finished(ctx);
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {"fileSystem": {"write": [real]}}})]
+        );
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(again.as_str())
+                && e.event
+                    == Event::ApprovalResolved {
+                        decision: Decision::Allow
+                    }));
+        session.shutdown(false);
+    });
+}
+
+/// Rust review #403: a check that outlives its deadline vouches for nothing; one in time does.
+#[test]
+fn a_disk_check_past_its_deadline_vouches_for_nothing() {
+    in_loop(|ctx| {
+        let slow = super::run_permission_check(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                super::codex_policy::Verdict::default()
+            },
+            std::time::Duration::from_millis(30),
+        );
+        assert_eq!(ctx.block_on(slow), None);
+        let fast = super::run_permission_check(
+            super::codex_policy::Verdict::default,
+            std::time::Duration::from_secs(3),
+        );
+        assert!(ctx.block_on(fast).is_some());
+    });
+}
+
+/// Rust review #403: making a sub-folder inside a granted folder between showing the card and
+/// answering it is not a change: the Allow is sent.
+#[test]
+fn scripted_a_new_sub_folder_does_not_hold_back_an_allow() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.dir.path().join("build")).expect("build");
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        let (request, options, _) = fixture.wait_card(ctx);
+        assert!(options.contains(&Decision::AllowForSession));
+        std::fs::create_dir_all(fixture.dir.path().join("build/sub")).expect("sub");
+        session.respond_approval(&request, Decision::AllowForSession);
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results().len(), 1);
+        assert_eq!(fixture.results()[0]["scope"], "session");
+        session.shutdown(false);
+    });
+}

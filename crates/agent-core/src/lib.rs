@@ -22,5 +22,6 @@ pub mod import;
 pub mod question_extract;
 pub mod quota;
 pub mod redact;
+pub mod text;
 pub mod tool_title;
 pub mod transition;

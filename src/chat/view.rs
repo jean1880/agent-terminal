@@ -3551,8 +3551,13 @@ pub(crate) mod tests {
         let claude = help_text(&agent_core::caps::Capabilities::claude(), "claude");
         assert!(claude.contains("/mcp"));
         assert!(claude.contains("/mode plan|default|accept-edits"));
-        assert!(!claude.contains("Not available here"));
-        assert!(!claude.contains("restarts"));
+        // Claude lacks only tool-server forms (Codex passes them on): no built-in is missing.
+        let (claude_backed, claude_missing) = claude
+            .split_once("Not available here")
+            .expect("forms are explained");
+        assert!(claude_missing.contains("forms from its tool servers"));
+        assert!(!claude_missing.contains(" — "), "{claude_missing}");
+        assert!(!claude_backed.contains("restarts"));
         let agy = help_text(&agent_core::caps::Capabilities::agy(), "Antigravity");
         let (backed, missing) = agy
             .split_once("Not available here")

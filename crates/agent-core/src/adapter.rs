@@ -318,6 +318,11 @@ pub trait Adapter {
     fn pending_request_ids(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Whether the sandbox the running (or next) turn was sent lets the agent write the
+    /// workspace without asking. `None`: this adapter does not know (the host assumes it can).
+    fn workspace_writable(&self) -> Option<bool> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -246,6 +246,24 @@ fn sensitive_target(target: &Path, workspace: &Path, home: Option<&Path>) -> boo
         .is_some_and(|first| first.starts_with('.'))
 }
 
+/// Whether `target` (absolute) is one the sensitive list names wherever it is, not only inside a
+/// workspace: a component in [`SENSITIVE_NAMES`], `.github/workflows`, or a top-level dotfile
+/// or dot-directory of `home`. For grants that reach outside the workspace (Codex permission
+/// requests), where [`sensitive_target`]'s workspace-relative view would miss them.
+pub(crate) fn sensitive_anywhere(target: &Path, home: Option<&Path>) -> bool {
+    let parts = names(target);
+    if parts.iter().any(|p| SENSITIVE_NAMES.contains(&p.as_str()))
+        || parts
+            .windows(2)
+            .any(|w| w[0] == ".github" && w[1] == "workflows")
+    {
+        return true;
+    }
+    home.and_then(|home| relative_to(target, home))
+        .and_then(|rel| names(&rel).into_iter().next())
+        .is_some_and(|first| first.starts_with('.'))
+}
+
 /// Every named target is inside one workspace root (and there is at least one) and is not a
 /// [`sensitive_target`] there.
 fn auto_allowed(targets: &[&str], workspaces: &[PathBuf], home: Option<&Path>) -> bool {
