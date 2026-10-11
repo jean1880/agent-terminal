@@ -265,6 +265,40 @@ mod tests {
         assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
     }
 
+    /// `Feature::ALL` is hand-maintained. `next` has no wildcard, so a new variant does not
+    /// compile until it is chained in here; walking the chain must then give exactly `ALL`.
+    #[test]
+    fn feature_all_lists_every_variant_once_in_order() {
+        use Feature::*;
+        fn next(f: Feature) -> Option<Feature> {
+            match f {
+                ModelSwitch => Some(LiveApprovals),
+                LiveApprovals => Some(InterruptKeepsProcess),
+                InterruptKeepsProcess => Some(FileSuggestions),
+                FileSuggestions => Some(McpPanel),
+                McpPanel => Some(SettingsPanel),
+                SettingsPanel => Some(ModelList),
+                ModelList => Some(ContextUsage),
+                ContextUsage => Some(Usage),
+                Usage => Some(Compact),
+                Compact => Some(StreamsText),
+                StreamsText => Some(StreamsReasoning),
+                StreamsReasoning => Some(Questions),
+                Questions => Some(PlanMode),
+                PlanMode => None,
+            }
+        }
+        let mut walked = vec![ModelSwitch];
+        while let Some(f) = next(*walked.last().expect("non-empty")) {
+            walked.push(f);
+        }
+        assert_eq!(
+            walked,
+            Feature::ALL,
+            "ALL misses a variant or is out of order"
+        );
+    }
+
     #[test]
     fn every_missing_feature_explains_itself_and_every_feature_names_its_control() {
         for driver in Driver::ALL {

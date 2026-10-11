@@ -12,7 +12,9 @@ pub const MAX_SUGGESTIONS: usize = 50;
 /// The walk fallback (no git) stops here, so a huge folder cannot stall the worker.
 const MAX_WALKED: usize = 20_000;
 const MAX_DEPTH: usize = 8;
-/// The most paths kept from git's listing, and the most of its output looked at.
+/// The most paths kept from git's listing, and the most of its output parsed. `git_raw` has
+/// already buffered the whole of stdout by then: this bounds the candidates kept (and so the
+/// memory the index holds and re-ranks), not what git prints.
 const MAX_LISTED: usize = 50_000;
 const MAX_LISTING_BYTES: usize = 8 * 1024 * 1024;
 /// Never descended into by the walk fallback; git's own listing already honours .gitignore.
@@ -196,10 +198,19 @@ mod tests {
             .flat_map(|i| format!("f{i}\0").into_bytes())
             .collect();
         assert_eq!(parse_listing(&many).len(), MAX_LISTED);
-        let huge = vec![b'a'; MAX_LISTING_BYTES + 100];
-        assert!(parse_listing(&huge)
+        // 1000-byte paths: the byte cap, not the path cap, ends the listing, mid-way through
+        // the last path.
+        let entry = [vec![b'a'; 1000], vec![0]].concat();
+        let huge: Vec<u8> = entry
             .iter()
-            .all(|p| p.len() <= MAX_LISTING_BYTES));
+            .copied()
+            .cycle()
+            .take(MAX_LISTING_BYTES + 5000)
+            .collect();
+        let kept = parse_listing(&huge);
+        assert_eq!(kept.len(), MAX_LISTING_BYTES.div_ceil(entry.len()));
+        assert!(kept.len() < MAX_LISTED);
+        assert!(kept.iter().all(|p| p.len() <= 1000));
 
         let mut index = Index::default();
         let a = Path::new("/a");

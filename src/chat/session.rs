@@ -5678,7 +5678,6 @@ mod tests {
 
     #[test]
     fn enrich_agy_step_reads_thinking_from_native_transcript() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tmp");
         let conv_id = "test-conv-12345678";
         let logs_dir = tmp
@@ -5704,8 +5703,7 @@ mod tests {
         .expect("write transcript");
 
         // Set HOME temporarily so find_agy_thinking locates the test transcript
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
+        let _home = HomeGuard::set(tmp.path());
 
         in_loop(|ctx| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
@@ -5838,10 +5836,6 @@ mod tests {
                 .count();
             assert_eq!(reasoning_count, 1, "thinking item should not be duplicated");
         });
-
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        }
     }
 
     /// An agy session on a transcript with thinking for step 2, and a first `step_update` for
@@ -5900,12 +5894,38 @@ mod tests {
 
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Points `HOME` at a test directory for as long as it lives, one test at a time, and puts
+    /// it back on drop (removing it when it was unset), even if the test panics.
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        fn set(home: &Path) -> Self {
+            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[test]
     fn an_exit_during_a_transcript_read_fires_once_after_the_held_lines() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tmp");
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
+        let _home = HomeGuard::set(tmp.path());
         in_loop(|ctx| {
             let (session, seen) = agy_mid_read(tmp.path());
             let generation = session.inner.generation.get();
@@ -5934,17 +5954,12 @@ mod tests {
             assert!(unknown < exit, "the held line comes before the exit");
             assert!(session.inner.agy_deferred_exit.get().is_none());
         });
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        }
     }
 
     #[test]
     fn a_restart_during_a_transcript_read_drops_the_stale_read() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tmp");
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
+        let _home = HomeGuard::set(tmp.path());
         in_loop(|ctx| {
             let (session, seen) = agy_mid_read(tmp.path());
             let generation = session.inner.generation.get();
@@ -5967,8 +5982,5 @@ mod tests {
             assert_eq!(exited_count(&seen), 1, "only the stop's own exit");
             assert_eq!(seen.borrow().len(), before);
         });
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        }
     }
 }
