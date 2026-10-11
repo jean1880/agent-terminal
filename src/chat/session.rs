@@ -34,6 +34,8 @@ use agent_kit::store::{ProviderThreadId, Store, ThreadId, TranscriptMessage};
 use gtk4::glib;
 use tracing::{debug, info, warn};
 
+mod agy_transcript;
+
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
 use crate::approval_server::ApprovalHandle;
@@ -206,6 +208,12 @@ struct Inner {
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
     last_enriched_step: Cell<Option<u64>>,
+    /// The process generation whose agy transcript read is in flight (off the main thread).
+    /// Lines that arrive meanwhile wait in `agy_hold`, so the adapter still sees them in order.
+    agy_reading: Cell<Option<u64>>,
+    agy_hold: RefCell<std::collections::VecDeque<(String, bool)>>,
+    /// An exit that arrived during that read; handled once the held lines are in.
+    agy_deferred_exit: Cell<Option<(u64, Option<i32>)>>,
     /// How long a Claude permission request may wait for the user before it is denied (agy's
     /// socket has the same bound). Injectable for tests.
     approval_deadline: Cell<Duration>,
@@ -259,59 +267,11 @@ fn hookless_text(unbound: Option<&str>) -> String {
     }
 }
 
-/// Reads the thinking block for `target_index` from the native Antigravity transcript on disk.
-/// Antigravity CLI omits raw thinking strings from stdout in `--output-format stream-json`,
-/// but writes them synchronously to `~/.gemini/antigravity-cli/brain/<conv_id>/.system_generated/logs/transcript.jsonl`.
-fn find_agy_thinking(conv_id: &str, target_index: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let home = std::env::var("HOME").ok()?;
-    let home_path = Path::new(&home);
-    let paths = [
-        home_path
-            .join(".gemini/antigravity-cli/brain")
-            .join(conv_id)
-            .join(".system_generated/logs/transcript.jsonl"),
-        home_path
-            .join(".gemini/brain")
-            .join(conv_id)
-            .join(".system_generated/logs/transcript.jsonl"),
-    ];
-    let path = paths.iter().find(|p| p.exists())?;
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len == 0 {
-        return None;
-    }
-
-    // Read the tail of the transcript (up to 64 KiB), where recent steps live.
-    let to_read = len.min(65_536) as usize;
-    let seek_pos = len.saturating_sub(65_536);
-    file.seek(SeekFrom::Start(seek_pos)).ok()?;
-    let mut buf = vec![0u8; to_read];
-    file.read_exact(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-
-    for line in text.lines().rev() {
-        if !line.contains("\"thinking\"") {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(idx) = val.get("step_index").and_then(serde_json::Value::as_u64) {
-                if idx == target_index
-                    || (idx == target_index.saturating_sub(1) && target_index > 0)
-                {
-                    if let Some(th) = val.get("thinking").and_then(serde_json::Value::as_str) {
-                        let trimmed = th.trim();
-                        if !trimmed.is_empty() {
-                            return Some(trimmed.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+/// A transcript read for one agy `step_update` line: the parsed line and what to look up.
+struct AgyEnrichJob {
+    val: serde_json::Value,
+    conv_id: String,
+    step_index: u64,
 }
 
 /// One thread's chat backend. See the module docs.
@@ -430,6 +390,9 @@ impl ChatSession {
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
+            agy_reading: Cell::new(None),
+            agy_deferred_exit: Cell::new(None),
+            agy_hold: RefCell::new(std::collections::VecDeque::new()),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
@@ -900,89 +863,156 @@ impl Inner {
         self.approval.borrow().clone()
     }
 
-    /// Enriches an Antigravity `step_update` line with its thinking string from the native transcript.
-    /// `agy` streams token usage over stdout but omits the raw thinking block, persisting it to disk.
-    fn enrich_agy_step<'a>(&self, line: &'a str) -> std::borrow::Cow<'a, str> {
+    /// Whether an Antigravity `step_update` line needs its thinking (and tool-call args) read
+    /// from the native transcript. `agy` streams token usage over stdout but omits the raw
+    /// thinking block, persisting it to disk. Pure: the read itself is the caller's job, on a
+    /// worker thread.
+    fn agy_enrich_job(&self, line: &str) -> Option<AgyEnrichJob> {
         if self.adapter.borrow().driver() != Driver::Agy || !line.contains("\"step_update\"") {
-            return std::borrow::Cow::Borrowed(line);
+            return None;
         }
-
-        let mut val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return std::borrow::Cow::Borrowed(line),
-        };
-
+        let val: serde_json::Value = serde_json::from_str(line).ok()?;
         if val.get("event").and_then(serde_json::Value::as_str) != Some("step_update") {
-            return std::borrow::Cow::Borrowed(line);
+            return None;
         }
-
-        let step_obj = match val
-            .get_mut("step_update")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            Some(obj) => obj,
-            None => return std::borrow::Cow::Borrowed(line),
-        };
-
-        let has_thinking = step_obj
+        let step = val.get("step_update")?.as_object()?;
+        let has_thinking = step
             .get("thinking")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|t| !t.trim().is_empty());
         if has_thinking {
-            return std::borrow::Cow::Borrowed(line);
+            return None;
         }
-
-        let step_index = match step_obj
-            .get("step_index")
-            .and_then(serde_json::Value::as_u64)
-        {
-            Some(i) => i,
-            None => return std::borrow::Cow::Borrowed(line),
-        };
-
+        let step_index = step.get("step_index")?.as_u64()?;
         if self.last_enriched_step.get() == Some(step_index) {
-            return std::borrow::Cow::Borrowed(line);
+            return None;
         }
-
-        let conv_id = step_obj
+        let conv_id = step
             .get("conversation_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
-            .or_else(|| self.state.borrow().native_id.clone());
-
-        let Some(conv_id) = conv_id else {
-            return std::borrow::Cow::Borrowed(line);
-        };
-
-        if let Some(thinking) = find_agy_thinking(&conv_id, step_index) {
-            self.last_enriched_step.set(Some(step_index));
-            step_obj.insert(
-                "thinking".to_string(),
-                serde_json::Value::String(thinking.clone()),
-            );
-            if let Some(tool_info) = step_obj
-                .get_mut("tool_info")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                tool_info.insert("thinking".to_string(), serde_json::Value::String(thinking));
-            }
-            if let Ok(serialized) = serde_json::to_string(&val) {
-                return std::borrow::Cow::Owned(serialized);
-            }
-        }
-
-        std::borrow::Cow::Borrowed(line)
+            .or_else(|| self.state.borrow().native_id.clone())?;
+        Some(AgyEnrichJob {
+            val,
+            conv_id,
+            step_index,
+        })
     }
 
     fn on_line(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
         if generation != self.generation.get() {
             return;
         }
+        match self.agy_reading.get() {
+            Some(reading) if reading == generation => {
+                // A transcript read is in flight: keep the order the adapter must see.
+                self.agy_hold
+                    .borrow_mut()
+                    .push_back((line.to_owned(), stderr));
+                return;
+            }
+            Some(_) => {
+                // Left over from a replaced process.
+                self.agy_reading.set(None);
+                self.agy_hold.borrow_mut().clear();
+            }
+            None => {}
+        }
+        if !stderr {
+            if let Some(job) = self.agy_enrich_job(line) {
+                if let Ok(home) = std::env::var("HOME") {
+                    self.agy_reading.set(Some(generation));
+                    let me = Rc::clone(self);
+                    glib::spawn_future_local(async move {
+                        let (conv_id, step_index) = (job.conv_id.clone(), job.step_index);
+                        let record = gtk4::gio::spawn_blocking(move || {
+                            agy_transcript::read_step(Path::new(&home), &conv_id, step_index)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if me.agy_reading.get() != Some(generation) {
+                            return; // the process was replaced while the file was read
+                        }
+                        me.agy_reading.set(None);
+                        let enriched = me.apply_agy_record(job, record);
+                        me.dispatch_line(generation, &enriched, false);
+                        loop {
+                            if me.agy_reading.get().is_some() {
+                                break; // a later line started its own read; it drains the rest
+                            }
+                            let next = me.agy_hold.borrow_mut().pop_front();
+                            let Some((held, held_stderr)) = next else {
+                                break;
+                            };
+                            me.on_line(generation, &held, held_stderr);
+                        }
+                        if me.agy_reading.get().is_none() {
+                            if let Some((exit_gen, code)) = me.agy_deferred_exit.take() {
+                                me.on_exit(exit_gen, code);
+                            }
+                        }
+                    });
+                    return;
+                }
+            }
+        }
+        self.dispatch_line(generation, line, stderr);
+    }
+
+    /// Merges a transcript record into the step: its thinking, and its tool calls with args
+    /// decoded (`transcript_calls`), exposed for the card-title builder in agent-core.
+    fn apply_agy_record(&self, job: AgyEnrichJob, record: agy_transcript::StepRecord) -> String {
+        let AgyEnrichJob {
+            mut val,
+            step_index,
+            ..
+        } = job;
+        let original = val.to_string();
+        let Some(step) = val
+            .get_mut("step_update")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return original;
+        };
+        if record.is_empty() {
+            return original;
+        }
+        self.last_enriched_step.set(Some(step_index));
+        if let Some(thinking) = record.thinking {
+            if let Some(info) = step
+                .get_mut("tool_info")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                info.insert(
+                    "thinking".to_owned(),
+                    serde_json::Value::String(thinking.clone()),
+                );
+            }
+            step.insert("thinking".to_owned(), serde_json::Value::String(thinking));
+        }
+        if !record.calls.is_empty() {
+            let calls = record
+                .calls
+                .into_iter()
+                .map(|c| serde_json::json!({ "name": c.name, "args": c.args }))
+                .collect();
+            step.insert(
+                "transcript_calls".to_owned(),
+                serde_json::Value::Array(calls),
+            );
+        }
+        val.to_string()
+    }
+
+    /// Feeds one line to the adapter and handles what comes out.
+    fn dispatch_line(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
+        if generation != self.generation.get() {
+            return;
+        }
         let envelopes = if stderr {
             self.adapter.borrow_mut().feed_stderr(line)
         } else {
-            let enriched = self.enrich_agy_step(line);
-            self.adapter.borrow_mut().feed(&enriched)
+            self.adapter.borrow_mut().feed(line)
         };
         for env in envelopes {
             let (env, auto) = self.gate_approval(env);
@@ -1318,6 +1348,11 @@ impl Inner {
 
     fn on_exit(self: &Rc<Self>, generation: u64, code: Option<i32>) {
         if generation != self.generation.get() {
+            return;
+        }
+        if self.agy_reading.get() == Some(generation) {
+            // Lines are still waiting on the transcript read; they come before the exit.
+            self.agy_deferred_exit.set(Some((generation, code)));
             return;
         }
         info!(code = ?code, "agent exited");
@@ -4995,7 +5030,7 @@ mod tests {
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", tmp.path());
 
-        in_loop(|_| {
+        in_loop(|ctx| {
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
             let (sink, seen) = make_sink();
@@ -5039,17 +5074,39 @@ mod tests {
                 .inner
                 .on_line(session.inner.generation.get(), &stdout_frame, false);
 
-            // The session should have emitted a Reasoning ItemStarted + ContentDelta with the thinking text!
-            let has_reasoning = seen.borrow().iter().any(|env| {
-                matches!(
-                    &env.event,
-                    Event::ItemStarted {
-                        kind: ItemKind::Reasoning,
-                        ..
-                    }
-                )
-            });
-            assert!(has_reasoning, "expected ItemKind::Reasoning to be emitted");
+            // No file I/O on the main thread: on_line returns with the line held back, and the
+            // transcript is read on a worker before the adapter sees the step.
+            let reasoning_started = || {
+                seen.borrow().iter().any(|env| {
+                    matches!(
+                        &env.event,
+                        Event::ItemStarted {
+                            kind: ItemKind::Reasoning,
+                            ..
+                        }
+                    )
+                })
+            };
+            assert!(
+                session.inner.agy_reading.get().is_some(),
+                "the transcript read is in flight"
+            );
+            assert!(!reasoning_started(), "the step waits for the worker read");
+            // A line that arrives meanwhile queues behind it, keeping the adapter's order.
+            session.inner.on_line(
+                session.inner.generation.get(),
+                r#"{"event":"unknown_marker"}"#,
+                false,
+            );
+            assert_eq!(session.inner.agy_hold.borrow().len(), 1);
+
+            // The session emits a Reasoning ItemStarted + ContentDelta with the thinking text.
+            assert!(
+                pump_until(ctx, 5, reasoning_started),
+                "expected ItemKind::Reasoning to be emitted"
+            );
+            assert!(session.inner.agy_reading.get().is_none());
+            assert!(session.inner.agy_hold.borrow().is_empty());
 
             let reasoning_delta = seen.borrow().iter().find_map(|env| {
                 if let Event::ContentDelta {
