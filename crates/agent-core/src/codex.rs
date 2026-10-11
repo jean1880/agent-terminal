@@ -7,7 +7,8 @@
 //! # Provenance
 //!
 //! Real frames are recorded under `tests/fixtures/real/codex/` (codex-cli 0.161.0); the older
-//! `tests/fixtures/codex-synthetic-turn.ndjson` is SYNTHETIC. The mapping targets **codex-cli 0.160.1**: the method registry, the enums
+//! `tests/fixtures/codex-synthetic-turn.ndjson` is SYNTHETIC. The mapping was built against
+//! **codex-cli 0.160.1** and re-verified live against 0.161.0 (`tests/qa/live_smoke.py`): the method registry, the enums
 //! (`AskForApproval`, `ApprovalsReviewer`, `SandboxPolicy`, `ReasoningSummary`, the approval
 //! decisions) and `Model` were cross-checked against the JSON Schema that binary generates
 //! (`codex app-server generate-json-schema`, stable surface; it writes files only). The struct

@@ -226,7 +226,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   thread when the window is narrow. When hidden, its toggle still signals unread
   activity or a thread needing your attention.
 - **Your existing sessions.** Recent Claude and agy sessions appear as threads.
-  Opening one imports its history and resumes it. (Codex history is not imported yet.)
+  Opening one imports its history and resumes it. A Codex thread resumes its own Codex
+  thread; if Codex no longer has it, the next prompt continues in a new Codex thread with
+  the conversation carried over.
 - **A native transcript**: markdown, code blocks, tool cards, file-change cards with
   their diffs, inline approvals, a plan panel, sub-agent progress, questions with
   answers to pick, and a composer with typeahead.
