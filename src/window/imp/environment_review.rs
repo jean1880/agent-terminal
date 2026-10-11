@@ -104,9 +104,10 @@ pub(super) mod tests {
     ) {
         let ctx = glib::MainContext::default();
         let imp = window.imp();
-        // Libadwaita 1.5 (the minimum, and CI's) animates a dialog open and closed; closing it
-        // while that animation runs can leave it registered, so this check was flaky there
-        // and never locally on newer libadwaita. With animations off both happen at once.
+        // Libadwaita 1.5 (the minimum, and CI's) ignores an answer given before the dialog's
+        // sheet has finished opening, which failed this check on CI only (reproduced in an
+        // Ubuntu 24.04 container). `trigger` settles after mapping; animations are off so
+        // opening and closing take no animated time.
         let settings = gtk4::Settings::default();
         let animated = settings.as_ref().map(|s| s.is_gtk_enable_animations());
         if let Some(s) = &settings {
@@ -163,21 +164,30 @@ pub(super) mod tests {
                 .downcast::<adw::AlertDialog>()
                 .unwrap();
             assert!(crate::testutil::pump_until(&ctx, 5, || dialog.is_mapped()));
+            // Let the sheet finish opening (a user never answers within its first frames).
+            crate::testutil::settle(&ctx);
             dialog
         };
         let cancel = trigger();
         assert!(cancel.body().contains(&dir));
-        assert!(
-            cancel.close(),
-            "the review confirmation allows cancellation"
-        );
+        // Press the dialog's buttons as the user does. On libadwaita 1.5 a first programmatic
+        // `close()` returns true yet leaves an AlertDialog open (verified in an Ubuntu 24.04
+        // container), which is what made this check fail on CI only.
+        let press = |dialog: &adw::AlertDialog, label: &str| {
+            let button = crate::testutil::descendants(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+                .find(|b| b.label().as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("the confirmation has a {label:?} button"));
+            button.emit_clicked();
+        };
+        press(&cancel, "Cancel");
         assert!(crate::testutil::pump_until(&ctx, 5, || window
             .visible_dialog()
             .is_none()));
         assert_eq!(imp.tabs.borrow().len(), before);
         let review = trigger();
-        review.emit_by_name::<()>("response", &[&"review"]);
-        review.close();
+        press(&review, "Start Review");
         assert!(crate::testutil::pump_until(&ctx, 5, || imp
             .tabs
             .borrow()
