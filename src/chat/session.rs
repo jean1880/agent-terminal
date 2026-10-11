@@ -1256,22 +1256,17 @@ impl Inner {
         action: &crate::always_allow::Action,
         ctx: &crate::always_allow::Context,
     ) -> bool {
-        let mut cache = self.saved_rules.borrow_mut();
-        let Some(cache) = cache.as_mut() else {
-            return false;
-        };
-        let path = cache.path().to_owned();
-        let notice = match cache.rules() {
-            Ok(rules) => return rules.matches_any(action, ctx),
-            Err(e) => {
-                warn!(error = %e, "approval rules file unusable; saved rules are off");
-                crate::always_allow::blocked_notice(&path, e)
+        // The cache borrow ends inside the helper, before any notice goes out.
+        match crate::always_allow::saved_allow(&self.saved_rules, action, ctx) {
+            Ok(allowed) => allowed,
+            Err(notice) => {
+                warn!("approval rules file unusable; saved rules are off");
+                if !self.rules_blocked_noticed.replace(true) {
+                    self.emit(Envelope::new(Event::Notice { text: notice }));
+                }
+                false
             }
-        };
-        if !self.rules_blocked_noticed.replace(true) {
-            self.emit(Envelope::new(Event::Notice { text: notice }));
         }
-        false
     }
 
     /// Codex fields an approval request is known to carry (W0 fixtures). Any other field with a

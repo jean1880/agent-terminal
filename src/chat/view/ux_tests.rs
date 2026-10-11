@@ -644,7 +644,8 @@ fn native_click_matrix() {
 
     // The always-allow dialog's suggestions: the text of one fills the pattern field.
     let entry = gtk4::Entry::new();
-    let flow = cards::suggestion_flow(&entry, "Bash", "cargo test --workspace").expect("flow");
+    // A read-only command: a runner gets no patterns to choose between (C1).
+    let flow = cards::suggestion_flow(&entry, "Bash", "git log --oneline").expect("flow");
     let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     holder.append(&entry);
     holder.append(&flow);
