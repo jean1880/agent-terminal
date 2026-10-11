@@ -34,6 +34,14 @@ pub enum RowEvent {
         request: String,
         answers: Value,
     },
+    /// A quick-reply chip was chosen: its text goes in the composer, nothing is sent.
+    QuickReply {
+        text: String,
+    },
+    /// "Dismiss" on the quick-reply chips.
+    DismissQuickReplies,
+    /// "Don't suggest these" on the quick-reply chips.
+    StopQuickReplies,
     /// A file-change card was asked to show its diff.
     LoadDiff {
         id: String,
@@ -511,6 +519,9 @@ impl Row {
             }
             Body::Approval(_) => Self::Approval(ApprovalCard::new(sink)),
             Body::Question(q) => Self::Question(QuestionCardWidget::new(q, sink)),
+            Body::QuickReplies(q) => {
+                Self::Static(super::quick_replies::row(&q.options, sink).upcast())
+            }
             Body::Plan { .. } => {
                 let root = gtk4::Expander::new(None);
                 let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -1999,6 +2010,25 @@ impl ApprovalCard {
 // Question card
 // ---------------------------------------------------------------------------------------------
 
+/// What an option button holds: its label and, under it, a dim description. Shared by the
+/// question card and the quick-reply chips so both read alike. Wraps: a long option must not set
+/// the transcript's minimum width.
+pub(super) fn option_content(text: &str, description: Option<&str>) -> gtk4::Box {
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    let ol = label(text, &["option-label"]);
+    wrapping(&ol);
+    ol.set_hexpand(false);
+    ol.set_max_width_chars(36);
+    inner.append(&ol);
+    if let Some(d) = description {
+        let dl = label(d, &["option-desc"]);
+        wrapping(&dl);
+        dl.set_max_width_chars(36);
+        inner.append(&dl);
+    }
+    inner
+}
+
 pub struct QuestionCardWidget {
     root: gtk4::Box,
     submit: gtk4::Button,
@@ -2052,20 +2082,10 @@ impl QuestionCardWidget {
             for (oi, opt) in q.options.iter().enumerate() {
                 let b = gtk4::ToggleButton::new();
                 b.add_css_class("option-button");
-                let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-                // Wraps: a long option must not set the transcript's minimum width.
-                let ol = label(&opt.label, &["option-label"]);
-                wrapping(&ol);
-                ol.set_hexpand(false);
-                ol.set_max_width_chars(36);
-                inner.append(&ol);
-                if let Some(d) = &opt.description {
-                    let dl = label(d, &["option-desc"]);
-                    wrapping(&dl);
-                    dl.set_max_width_chars(36);
-                    inner.append(&dl);
-                }
-                b.set_child(Some(&inner));
+                b.set_child(Some(&option_content(
+                    &opt.label,
+                    opt.description.as_deref(),
+                )));
                 if !q.multi_select {
                     if let Some(first) = &group {
                         b.set_group(Some(first));

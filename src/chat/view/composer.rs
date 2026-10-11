@@ -308,6 +308,26 @@ impl Composer {
         self.refresh_trigger();
     }
 
+    /// Puts a suggested reply in the box with the cursor after it, and focuses the box. Nothing
+    /// is sent. A draft already there is kept: the suggestion follows it after a space, so a
+    /// click never throws typing away.
+    pub fn fill(&self, text: &str) {
+        let draft = self.text();
+        if draft.trim().is_empty() {
+            self.set_text(text);
+        } else {
+            self.set_text(&format!("{} {text}", draft.trim_end()));
+        }
+        self.buffer.place_cursor(&self.buffer.end_iter());
+        self.view.grab_focus();
+    }
+
+    /// Whether the cursor sits after the last character (tests).
+    #[cfg(test)]
+    pub fn cursor_at_end(&self) -> bool {
+        self.buffer.cursor_position() == self.buffer.char_count()
+    }
+
     pub fn clear(&self) {
         self.set_text("");
         self.close_popup();
