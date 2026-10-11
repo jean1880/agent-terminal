@@ -637,3 +637,78 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
         session.shutdown(false);
     });
 }
+
+/// Plan 2.5: a stored Codex thread id whose thread never completed a turn has no rollout. The
+/// reopened thread still works: the next prompt runs in a new Codex thread, carrying the
+/// thread's history as a handoff, with a notice, and only that completed turn stores the new id.
+#[test]
+fn scripted_resume_with_no_rollout_continues_in_a_new_codex_thread() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let pt = fixture
+            .store
+            .add_provider_thread(&fixture.thread, "codex", "synthetic-model")
+            .expect("provider thread");
+        fixture
+            .store
+            .set_active_provider_thread(&fixture.thread, &pt)
+            .expect("active");
+        fixture
+            .store
+            .set_native_id(&pt, "stale-thread")
+            .expect("stale id");
+        fixture
+            .store
+            .append_user_message(&fixture.thread, Some(&pt), "remember the blue door")
+            .expect("history");
+        let native = || {
+            fixture
+                .store
+                .provider_threads(&fixture.thread)
+                .expect("providers")
+                .into_iter()
+                .find(|p| p.id == pt)
+                .and_then(|p| p.native_id)
+        };
+
+        let session = fixture.session();
+        fixture.wait(ctx, "the new Codex thread", || {
+            session.inner.state.borrow().native_id.as_deref() == Some("fixture-thread")
+        });
+        assert!(fixture.seen.borrow().iter().any(|e| matches!(&e.event,
+            Event::Notice { text } if text.contains("new Codex session"))));
+        assert!(!fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| matches!(e.event, Event::Error { .. })));
+        assert_eq!(
+            native().as_deref(),
+            Some("stale-thread"),
+            "provisional until a turn completes"
+        );
+
+        fixture.prompt(&session, "success");
+        fixture.wait_finished(ctx);
+        let incoming = fixture.incoming();
+        let methods: Vec<&str> = incoming
+            .iter()
+            .filter_map(|f| f["method"].as_str())
+            .filter(|m| m.starts_with("thread/") || *m == "turn/start")
+            .collect();
+        assert_eq!(methods, ["thread/resume", "thread/start", "turn/start"]);
+        let turn = incoming
+            .iter()
+            .find(|f| f["method"] == "turn/start")
+            .expect("turn");
+        assert_eq!(turn["params"]["threadId"], "fixture-thread");
+        let text = turn["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.starts_with("Context handoff (HANDOFF-"), "{text}");
+        assert!(text.contains("remember the blue door"), "{text}");
+        assert!(text.ends_with("\nsuccess"), "{text}");
+        assert_eq!(native().as_deref(), Some("fixture-thread"));
+        session.shutdown(false);
+    });
+}

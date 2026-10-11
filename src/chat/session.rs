@@ -206,6 +206,9 @@ struct Inner {
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
     last_enriched_step: Cell<Option<u64>>,
+    /// A new Codex thread id and its provider thread, not stored until a turn completes: Codex
+    /// writes no rollout before that, so a stored id could not be resumed (plan 2.5).
+    provisional_native: RefCell<Option<(ProviderThreadId, String)>>,
 }
 
 struct QueuedPrompt {
@@ -427,6 +430,7 @@ impl ChatSession {
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
+            provisional_native: RefCell::new(None),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -602,13 +606,17 @@ impl Inner {
                     // A resume that started a new native session leaves the old one behind:
                     // it is this thread's history now, never a separate session to list.
                     let previous = self.state.borrow().native_id.clone();
+                    let resumed = previous.as_deref() == Some(native_id.as_str());
                     if let Some(old) = previous.filter(|old| old != native_id) {
                         let driver = driver_name(self.adapter.borrow().driver());
                         if let Err(e) = self.store.dismiss_native(driver, &old) {
                             warn!(error = %e, "could not record the replaced native session");
                         }
                     }
-                    if let Err(e) = self.store.set_native_id(&pt, native_id) {
+                    // A new Codex thread stays provisional until a turn completes (2.5).
+                    if self.adapter.borrow().driver() == Driver::Codex && !resumed {
+                        *self.provisional_native.borrow_mut() = Some((pt, native_id.clone()));
+                    } else if let Err(e) = self.store.set_native_id(&pt, native_id) {
                         warn!(error = %e, "could not record the native session id");
                     }
                     self.state.borrow_mut().native_id = Some(native_id.clone());
@@ -641,6 +649,9 @@ impl Inner {
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
                     *self.pending_handoff.borrow_mut() = None;
+                }
+                if *state == TurnState::Completed {
+                    self.confirm_provisional_native();
                 }
                 if let Some(queued) = self.queued_prompts.borrow_mut().pop_front() {
                     self.deliver(
@@ -747,6 +758,55 @@ impl Inner {
     fn set_model(&self, model: &str) {
         self.state.borrow_mut().model = Some(model.to_owned());
         self.open.borrow_mut().model = Some(model.to_owned());
+    }
+
+    /// Stores a provisional Codex thread id once a turn on it completed, if its provider thread
+    /// is still this thread's agent.
+    fn confirm_provisional_native(&self) {
+        let Some((pt, native)) = self.provisional_native.borrow_mut().take() else {
+            return;
+        };
+        if *self.provider_thread.borrow() != pt {
+            return;
+        }
+        if let Err(e) = self.store.set_native_id(&pt, &native) {
+            warn!(error = %e, "could not record the native session id");
+        }
+    }
+
+    /// Whether `env` starts a Codex thread other than the one this session asked to resume: the
+    /// adapter fell back to a new thread because the old one had no rollout (plan 2.5).
+    fn is_lost_codex_resume(&self, env: &Envelope) -> bool {
+        let Event::SessionStarted { native_id, .. } = &env.event else {
+            return false;
+        };
+        self.adapter.borrow().driver() == Driver::Codex
+            && !native_id.is_empty()
+            && self
+                .state
+                .borrow()
+                .native_id
+                .as_ref()
+                .is_some_and(|old| old != native_id)
+    }
+
+    /// The new Codex thread knows nothing of this one: its history rides on the next prompt,
+    /// like a switch's handoff, unless a handoff is already waiting.
+    fn hand_off_to_fresh_codex_thread(&self) {
+        if self.pending_handoff.borrow().is_some() {
+            return;
+        }
+        let messages = match self.store.transcript_messages(&self.thread) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "could not read the thread to carry it into a new Codex thread");
+                return;
+            }
+        };
+        let handoff = build_handoff(&messages, &format!("Codex thread {}", self.thread));
+        if handoff.carried > 0 {
+            self.arm_handoff(handoff);
+        }
     }
 
     fn prepare_model_change(&self, model: String, effort: Option<String>, restarting: bool) {
@@ -979,7 +1039,11 @@ impl Inner {
         };
         for env in envelopes {
             let (env, auto) = self.gate_approval(env);
+            let lost_resume = self.is_lost_codex_resume(&env);
             self.emit(env.clone());
+            if lost_resume {
+                self.hand_off_to_fresh_codex_thread();
+            }
             self.watch_tool_step(&env);
             if auto {
                 self.auto_approve(&env);

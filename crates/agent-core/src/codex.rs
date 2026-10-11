@@ -235,6 +235,9 @@ pub struct CodexAdapter {
     /// The `changes` of each open `fileChange` item: its approval request carries no path or
     /// diff (W0), so the card and the app's rules take them from here.
     file_changes: HashMap<String, Value>,
+    /// While a `thread/resume` is unanswered: the `thread/start` params to fall back on when it
+    /// finds no rollout (a thread that never completed a turn has none).
+    resume_fallback: Option<Value>,
     /// Worker identity is a thread id, independent of collaboration operation/item ids.
     workers: BTreeMap<String, WorkerSnapshot>,
     /// Current child turn ids: unscoped child requests must never borrow the parent's id.
@@ -292,6 +295,7 @@ impl CodexAdapter {
             texts: HashMap::new(),
             reasoning: HashMap::new(),
             file_changes: HashMap::new(),
+            resume_fallback: None,
             workers: BTreeMap::new(),
             worker_turns: HashMap::new(),
             worker_waits: BTreeMap::new(),
@@ -1514,7 +1518,27 @@ impl CodexAdapter {
             .map(|e| s(e, "message").map_or_else(|| e.to_string(), str::to_owned));
         match (pending, result, error) {
             (Pending::Initialize, Some(_), _) => {}
-            (Pending::ThreadStart, Some(result), _) => self.on_thread_ready(result, out),
+            (Pending::ThreadStart, Some(result), _) => {
+                self.resume_fallback = None;
+                self.on_thread_ready(result, out);
+            }
+            (Pending::ThreadStart, None, Some(error))
+                if self.resume_fallback.is_some()
+                    && error.to_ascii_lowercase().contains("no rollout found") =>
+            {
+                // The thread never completed a turn, so Codex kept nothing to resume. Start a
+                // new one; the app carries the thread's history into it (plan 2.5).
+                if let Some(params) = self.resume_fallback.take() {
+                    let line = self.request(Pending::ThreadStart, "thread/start", params);
+                    self.write(line);
+                }
+                out.push(Envelope::new(Event::Notice {
+                    text: "Codex kept no saved session for this thread (it ended before a turn \
+                           completed), so a new Codex session started. The thread's history \
+                           goes with your next message."
+                        .to_owned(),
+                }));
+            }
             (Pending::TurnStart(submitted), Some(result), _) => {
                 self.confirm_submitted_model(&submitted, out);
                 if self.turn_id.is_none() {
@@ -1666,6 +1690,7 @@ impl Adapter for CodexAdapter {
         self.texts.clear();
         self.reasoning.clear();
         self.file_changes.clear();
+        self.resume_fallback = None;
         // Reconnecting the same thread forgets live certainty, not its worker history. A newly
         // constructed adapter knows only workers observed on this connection; replaying UI
         // consumers preserve previously stored identities absent from these snapshots.
@@ -1716,6 +1741,7 @@ impl Adapter for CodexAdapter {
         let resume = session.and_then(|s| s.resume);
         let thread = match resume {
             Some(id) => {
+                self.resume_fallback = Some(Value::Object(params.clone()));
                 params.insert("threadId".into(), json!(id));
                 // The app keeps its own transcript; do not have the server send the history.
                 params.insert("excludeTurns".into(), json!(true));
@@ -3068,6 +3094,57 @@ mod tests {
                 "approvalsReviewer": "user",
                 "config": {"tools.update_plan.enabled": true}}})
         );
+    }
+
+    /// Plan 2.5: a resume of a thread that never completed a turn finds no rollout. The adapter
+    /// starts a new thread with the same settings (and says so) instead of failing, and a prompt
+    /// queued meanwhile goes to the new thread. Any other resume error still fails startup.
+    #[test]
+    fn a_resume_with_no_rollout_starts_a_new_thread() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-gone")));
+        a.handshake();
+        assert!(a
+            .encode(Command::Prompt { text: "hi".into() })
+            .expect("queued")
+            .is_empty());
+        let ev = a.feed(
+            r#"{"id":2,"error":{"code":-32600,"message":"no rollout found for thread id th-gone"}}"#,
+        );
+        assert!(
+            ev.iter().any(
+                |e| matches!(&e.event, Event::Notice { text } if text.contains("new Codex session"))
+            ),
+            "{ev:?}"
+        );
+        assert!(!ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        let start = writes(&a.drain_outbox().actions);
+        assert_eq!(start.len(), 1, "{start:?}");
+        assert_eq!(start[0]["method"], "thread/start");
+        assert_eq!(start[0]["params"]["cwd"], "/work/repo");
+        assert!(start[0]["params"].get("threadId").is_none());
+        assert!(start[0]["params"].get("excludeTurns").is_none());
+        let id = start[0]["id"].clone();
+        let ev = a.feed(&json!({"id": id, "result": {"thread": {"id": "th-new"}}}).to_string());
+        assert!(
+            matches!(&ev[0].event, Event::SessionStarted { native_id, .. } if native_id == "th-new")
+        );
+        let turn = writes(&a.drain_outbox().actions);
+        assert_eq!(turn[0]["method"], "turn/start");
+        assert_eq!(turn[0]["params"]["threadId"], "th-new");
+
+        // Not a missing rollout: startup fails as before, and a fresh start never falls back.
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        let ev = a.feed(r#"{"id":2,"error":{"code":-32600,"message":"permission denied"}}"#);
+        assert!(ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        assert!(writes(&a.drain_outbox().actions).is_empty());
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        let ev = a.feed(r#"{"id":2,"error":{"message":"no rollout found for thread id x"}}"#);
+        assert!(ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
     }
 
     #[test]
