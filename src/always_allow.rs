@@ -2302,11 +2302,22 @@ pub struct CodexExported {
     pub outcome: Result<bool, String>,
     /// Codex's own parser checked the file (`false`: no codex binary was found).
     pub checked: bool,
+    /// Why nothing could be exported, when the old file was cleared to its header so earlier
+    /// grants stop applying (fail closed revokes).
+    pub cleared: Option<String>,
 }
 
 impl CodexExported {
     pub fn summary(&self) -> String {
         let file = tilde(&self.file);
+        if let (Some(reason), Ok(_)) = (&self.cleared, &self.outcome) {
+            let fix = if reason.contains("PATH") {
+                "Fix Codex's PATH and export again"
+            } else {
+                "Export again once that is fixed"
+            };
+            return format!("Codex rules were cleared: {reason}. {fix}.");
+        }
         let changed = match &self.outcome {
             Err(e) => return format!("Codex rules were not written: {e}"),
             Ok(changed) => *changed,
@@ -2358,8 +2369,9 @@ pub fn export_warning(codex: Option<(&CodexTarget, &CodexPlan)>) -> String {
     };
     if let Some(problem) = target.path_problem() {
         return format!(
-            "{EXPORT_WARNING}\n\nNothing will be written to Codex: {problem}, so the programs \
-             Codex would run cannot be pinned."
+            "{EXPORT_WARNING}\n\nNo rules will be written to Codex: {problem}, so the programs \
+             Codex would run cannot be pinned. agent-terminal.rules is cleared instead, so \
+             earlier grants stop applying."
         );
     }
     let n = plan.rules.len();
@@ -2493,24 +2505,45 @@ impl AlwaysRules {
         validate: &dyn Fn(&Path) -> Result<(), String>,
     ) -> CodexExported {
         let plan = self.codex_plan(pin);
-        let outcome = match (
+        let refused = match (
             target.path_problem(),
             codex_rules::render(&plan.rules, &plan.hosts),
         ) {
-            (Some(problem), _) => Err(format!(
-                "{problem}, so the programs Codex would run cannot be pinned"
-            )),
-            (None, Some(text)) => write_codex_rules(target, &text, validate),
-            (None, None) => Err("a rule could not be written as a Codex rule".to_owned()),
+            (Some(problem), _) => {
+                format!("{problem}, so the programs Codex would run cannot be pinned")
+            }
+            (None, Some(text)) => {
+                let outcome = write_codex_rules(target, &text, validate);
+                if let Err(e) = &outcome {
+                    tracing::warn!(error = %e, "Codex rules were not exported");
+                }
+                return CodexExported {
+                    file: target.export_file(),
+                    plan,
+                    outcome,
+                    checked: target.program.is_some(),
+                    cleared: None,
+                };
+            }
+            (None, None) => "a rule could not be written as a Codex rule".to_owned(),
         };
-        if let Err(e) = &outcome {
-            tracing::warn!(error = %e, "Codex rules were not exported");
-        }
+        // Fail closed means revoke: nothing new is written, and earlier grants stop applying.
+        tracing::warn!(reason = %refused, "Codex rules were not exported");
+        let outcome = match std::fs::symlink_metadata(target.export_file()) {
+            Err(_) => Err(refused.clone()),
+            Ok(_) => match codex_rules::render(&[], &[]) {
+                Some(header) => write_codex_rules(target, &header, validate)
+                    .map_err(|e| format!("{refused}; clearing the old file failed too ({e})")),
+                None => Err(refused.clone()),
+            },
+        };
+        let cleared = outcome.is_ok().then_some(refused);
         CodexExported {
             file: target.export_file(),
-            plan,
+            plan: CodexPlan::default(),
             outcome,
             checked: target.program.is_some(),
+            cleared,
         }
     }
 
@@ -4306,7 +4339,8 @@ host_executable(name="ls", paths=["/bin/ls"])
             assert!(!target.export_file().exists(), "nothing written for {path}");
             let warning = rules.export_warning_for(Some(&target));
             assert!(
-                warning.contains("Nothing will be written to Codex"),
+                warning.contains("No rules will be written to Codex")
+                    && warning.contains("earlier grants stop applying"),
                 "{warning}"
             );
             assert!(target.describe().contains("Export is off"));
@@ -4315,6 +4349,46 @@ host_executable(name="ls", paths=["/bin/ls"])
         assert!(target.path_problem().is_some_and(|p| p.contains("no PATH")));
         target.env = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
         assert_eq!(target.path_problem(), None);
+
+        // Fail closed revokes: an earlier export is cleared to its header, so its grants stop.
+        let out = rules.export_codex(&target, &pinned, &no_check);
+        assert_eq!(out.outcome, Ok(true));
+        assert!(std::fs::read_to_string(target.export_file())
+            .expect("written")
+            .contains("prefix_rule"));
+        target.env = vec![("PATH".to_owned(), "/usr/bin::/bin".to_owned())];
+        let out = rules.export_codex(&target, &pinned, &no_check);
+        assert_eq!(out.outcome, Ok(true), "{out:?}");
+        assert!(out.cleared.is_some());
+        assert!(out.plan.rules.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(target.export_file()).expect("read"),
+            format!("{}\n", codex_rules::HEADER)
+        );
+        let summary = out.summary();
+        assert!(
+            summary.starts_with("Codex rules were cleared: Codex's PATH has an empty entry"),
+            "{summary}"
+        );
+        assert!(
+            summary.ends_with("Fix Codex's PATH and export again."),
+            "{summary}"
+        );
+        // A clear that Codex's parser rejects keeps the old file and says both failed.
+        std::fs::write(target.export_file(), "old\n").expect("old");
+        let reject = |_: &Path| Err("rejected".to_owned());
+        let out = rules.export_codex(&target, &pinned, &reject);
+        assert!(out.cleared.is_none());
+        assert!(
+            out.outcome
+                .as_ref()
+                .is_err_and(|e| e.contains("clearing the old file failed too")),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.export_file()).expect("read"),
+            "old\n"
+        );
     }
 
     /// A plain rules file or folder gets the same ownership check as a followed link.
