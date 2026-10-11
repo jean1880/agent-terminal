@@ -47,7 +47,6 @@ const SEEN_CAP: usize = 20_000;
 struct PendingApproval {
     tool_use_id: String,
     input: Value,
-    suggestions: Vec<Value>,
 }
 
 /// A content block opened by a `content_block_start` stream event.
@@ -766,22 +765,20 @@ impl ClaudeAdapter {
         let tool = str_of(req, "tool_name").unwrap_or("tool").to_owned();
         let tool_use_id = str_of(req, "tool_use_id").unwrap_or(request_id).to_owned();
         let input = req.get("input").cloned().unwrap_or(Value::Null);
-        let suggestions = array_of(req, "permission_suggestions");
-        // "Always allow" persists rules, so only when Claude suggested one (a `setMode` alone is
-        // not a rule worth writing to a settings file). The card shows exactly what it saves:
-        // Claude's rules are often prefixes (`git status:*`), broader than the call itself.
-        let remembers = rules_text(&suggestions);
-        let mut options = vec![Decision::Allow, Decision::AllowForSession];
-        if remembers.is_some() {
-            options.push(Decision::AllowAlways);
-        }
-        options.push(Decision::Deny);
+        // "Allow for session" and "Always allow" are the app's (plan D1): it records the rule
+        // and answers later matching requests itself, so Claude's `permission_suggestions` are
+        // never forwarded. The app narrows these options to what a rule can describe.
+        let options = vec![
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+            Decision::Deny,
+        ];
         self.pending.insert(
             request_id.to_owned(),
             PendingApproval {
                 tool_use_id: tool_use_id.clone(),
                 input: input.clone(),
-                suggestions,
             },
         );
 
@@ -799,7 +796,7 @@ impl ClaudeAdapter {
                 input,
                 options,
                 response: ResponseCapability::Live,
-                remembers,
+                remembers: None,
             }
         };
         vec![Envelope::new(event).item(tool_use_id).request(request_id)]
@@ -1283,16 +1280,6 @@ impl ClaudeAdapter {
         updated_input: Option<Value>,
         message: Option<String>,
     ) -> Result<String, AdapterError> {
-        // Checked before the request is taken, so a refused answer leaves it answerable.
-        let offered_always = self
-            .pending
-            .get(request)
-            .is_some_and(|p| p.suggestions.iter().any(is_rule_suggestion));
-        if decision == Decision::AllowAlways && !offered_always {
-            return Err(AdapterError::Invalid(format!(
-                "no rule to remember for approval {request}"
-            )));
-        }
         let p = self
             .pending
             .remove(request)
@@ -1305,26 +1292,9 @@ impl ClaudeAdapter {
                     "updatedInput".to_owned(),
                     updated_input.unwrap_or_else(|| p.input.clone()),
                 );
-                // The scope is ours to set, never whatever Claude suggested: "for session" stays
-                // in memory, "always" writes only rules, to the project's untracked
-                // `.claude/settings.local.json` (`localSettings`).
-                let scoped: Vec<Value> = match decision {
-                    Decision::AllowForSession => p
-                        .suggestions
-                        .iter()
-                        .map(|s| with_destination(s, "session"))
-                        .collect(),
-                    Decision::AllowAlways => p
-                        .suggestions
-                        .iter()
-                        .filter(|s| is_rule_suggestion(s))
-                        .map(|s| with_destination(s, "localSettings"))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                if !scoped.is_empty() {
-                    body.insert("updatedPermissions".to_owned(), Value::Array(scoped));
-                }
+                // Never `updatedPermissions`: the scope is the app's (D1). Claude gets no
+                // `setMode`, no `addRules` and no `addDirectories`, so its mode stays as the user
+                // set it and nothing is written to `.claude/settings.local.json`.
             }
             Decision::Deny | Decision::Cancel => {
                 body.insert("behavior".to_owned(), json!("deny"));
@@ -1351,40 +1321,6 @@ impl ClaudeAdapter {
 }
 
 // ----- free helpers -----
-
-/// A permission suggestion that adds allow rules (`{"type":"addRules","behavior":"allow",…}`),
-/// the only kind "Always allow" persists. The behaviour must say "allow": anything else (or
-/// nothing) is never saved as an allow.
-fn is_rule_suggestion(s: &Value) -> bool {
-    str_of(s, "type") == Some("addRules") && str_of(s, "behavior") == Some("allow")
-}
-
-/// What "Always allow" would save, as Claude writes rules (`Bash(git status:*)`, `WebFetch`),
-/// for the project; `None` when there is no rule to save.
-fn rules_text(suggestions: &[Value]) -> Option<String> {
-    let rules: Vec<String> = suggestions
-        .iter()
-        .filter(|s| is_rule_suggestion(s))
-        .flat_map(|s| array_of(s, "rules"))
-        .filter_map(|r| {
-            let tool = str_of(&r, "toolName")?;
-            Some(match str_of(&r, "ruleContent").filter(|c| !c.is_empty()) {
-                Some(content) => format!("{tool}({content})"),
-                None => tool.to_owned(),
-            })
-        })
-        .collect();
-    (!rules.is_empty()).then(|| format!("{} in this project", rules.join(", ")))
-}
-
-/// `s` with its `destination` (where Claude applies or saves it) replaced.
-fn with_destination(s: &Value, destination: &str) -> Value {
-    let mut s = s.clone();
-    if let Some(obj) = s.as_object_mut() {
-        obj.insert("destination".to_owned(), json!(destination));
-    }
-    s
-}
 
 fn unknown_request(id: &str) -> AdapterError {
     AdapterError::Invalid(format!(
@@ -2847,69 +2783,65 @@ mod tests {
         }
     }
 
+    const W0_TOUCH: &str =
+        include_str!("../../../tests/fixtures/real/claude/thinking-and-touch.jsonl");
+
+    /// D1: session and always scope are the app's. Whatever Claude suggests (the W0 frame offers
+    /// `addRules`, `addDirectories` and `setMode acceptEdits`), every allow is a plain allow with
+    /// no `updatedPermissions`, so Claude's mode and settings files are never changed.
     #[test]
-    fn always_allow_writes_only_rules_to_local_settings_and_session_stays_in_memory() {
+    fn allow_for_session_and_always_send_no_updated_permissions() {
+        let frame = W0_TOUCH
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|rec| rec["frame"]["request"]["subtype"] == "can_use_tool")
+            .expect("W0 can_use_tool frame")["frame"]
+            .to_string();
+        for decision in [
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+        ] {
+            let mut a = ClaudeAdapter::new();
+            let out = a.feed(&frame);
+            let request = out[0].request.clone().expect("request");
+            match &out[0].event {
+                Event::ApprovalRequested {
+                    options,
+                    remembers,
+                    input,
+                    ..
+                } => {
+                    assert_eq!(
+                        options,
+                        &[
+                            Decision::Allow,
+                            Decision::AllowForSession,
+                            Decision::AllowAlways,
+                            Decision::Deny
+                        ]
+                    );
+                    assert_eq!(remembers, &None, "the app says what it keeps");
+                    assert_eq!(input["command"], "touch x.tmp");
+                }
+                other => panic!("{other:?}"),
+            }
+            let line = written(&mut a, approve(decision, &request));
+            let body = &line["response"]["response"];
+            assert_eq!(body["behavior"], "allow", "{decision:?}");
+            assert!(
+                body.get("updatedPermissions").is_none(),
+                "{decision:?}: {line}"
+            );
+            assert_eq!(body["updatedInput"]["command"], "touch x.tmp");
+        }
+        // The same holds for a hand-written Bash request with a prefix suggestion.
         let mut a = ClaudeAdapter::new();
-        // Offered only when Claude suggested a rule.
-        let options = |out: &[Envelope]| match &out[0].event {
-            Event::ApprovalRequested { options, .. } => options.clone(),
-            other => panic!("{other:?}"),
-        };
-        let bash = pending_bash(&mut a);
-        assert!(options(&bash).contains(&Decision::AllowAlways));
-        // The card is told exactly what would be saved (a prefix rule, broader than the call).
-        assert!(
-            matches!(&bash[0].event, Event::ApprovalRequested { remembers: Some(r), .. }
-            if r == "Bash(git status:*) in this project")
-        );
-        // A rule without an explicit "allow" is never one to save.
-        let vague = a.feed(
-            &json!({"type": "control_request", "request_id": "r4", "request": {
-                "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "tu4",
-                "input": {"command": "ls"},
-                "permission_suggestions": [{"type": "addRules", "destination": "localSettings",
-                    "rules": [{"toolName": "Bash", "ruleContent": "ls:*"}]}]}})
-            .to_string(),
-        );
-        assert!(!options(&vague).contains(&Decision::AllowAlways));
-        let edit = a.feed(
-            &json!({"type": "control_request", "request_id": "r3", "request": {
-                "subtype": "can_use_tool", "tool_name": "Edit", "tool_use_id": "tu3",
-                "input": {"file_path": "/x"},
-                "permission_suggestions": [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]}})
-            .to_string(),
-        );
-        assert!(
-            !options(&edit).contains(&Decision::AllowAlways),
-            "a mode is not a rule"
-        );
-        // Refused where not offered, and the request stays answerable.
-        assert!(matches!(
-            a.encode(approve(Decision::AllowAlways, "r3")),
-            Err(AdapterError::Invalid(_))
-        ));
-        assert!(a.encode(approve(Decision::Allow, "r3")).is_ok());
-
-        let line = written(&mut a, approve(Decision::AllowAlways, "r2"));
-        assert_eq!(
-            line["response"]["response"]["updatedPermissions"],
-            json!([{"type": "addRules", "behavior": "allow", "destination": "localSettings",
-                    "rules": [{"toolName": "Bash", "ruleContent": "git status:*"}]}]),
-            "only the rule, never the mode change"
-        );
-
-        // "For session" never persists, whatever Claude suggested.
         pending_bash(&mut a);
-        let line = written(&mut a, approve(Decision::AllowForSession, "r2"));
-        let scoped = line["response"]["response"]["updatedPermissions"]
-            .as_array()
-            .expect("permissions")
-            .clone();
-        assert_eq!(scoped.len(), 2);
-        assert!(
-            scoped.iter().all(|s| s["destination"] == "session"),
-            "{scoped:?}"
-        );
+        let line = written(&mut a, approve(Decision::AllowAlways, "r2"));
+        assert!(line["response"]["response"]
+            .get("updatedPermissions")
+            .is_none());
     }
 
     #[test]
@@ -2941,8 +2873,7 @@ mod tests {
                 }
             ),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
-                "response": {"behavior": "allow", "updatedInput": {"file_path": "/y"}, "toolUseID": "tu1",
-                    "updatedPermissions": [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]}}})
+                "response": {"behavior": "allow", "updatedInput": {"file_path": "/y"}, "toolUseID": "tu1"}}})
         );
         pending_edit(&mut a);
         assert_eq!(
