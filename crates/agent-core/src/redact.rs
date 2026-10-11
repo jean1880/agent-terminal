@@ -88,122 +88,23 @@ fn mask_any(secret: &str) -> String {
     }
 }
 
-/// Header names whose value is a credential (compared lowercased).
+/// Header names whose value is a credential (compared lowercased). `authorization:` is left to
+/// [`redact_auth_schemes`] in free text, and handled as a header in a command's arguments.
 const CREDENTIAL_HEADERS: &[&str] = &["cookie:", "x-api-key:", "proxy-authorization:"];
 
-/// Masks the value of a credential header (`Cookie: …`, `X-Api-Key: …`,
-/// `Proxy-Authorization: …`) up to its closing quote or the end of the line.
-fn redact_header_values(line: &str) -> String {
-    let mut out = line.to_owned();
-    for header in CREDENTIAL_HEADERS {
-        let mut from = 0;
-        // ASCII lower-casing keeps byte positions, so offsets found there are char boundaries.
-        while let Some(pos) = out.to_ascii_lowercase()[from..].find(header) {
-            let start = from + pos + header.len();
-            let value_start = start + out[start..].len() - out[start..].trim_start().len();
-            let value_end = out[value_start..]
-                .find(['\'', '"'])
-                .map_or(out.len(), |q| value_start + q);
-            let value = out[value_start..value_end].to_owned();
-            if value.is_empty() || value.starts_with("****") {
-                from = value_end.max(start);
-                continue;
-            }
-            let masked = mask_any(&value);
-            out.replace_range(value_start..value_end, &masked);
-            from = value_start + masked.len();
-        }
-    }
-    out
-}
+/// Header names a command's header argument is judged by (lowercased).
+const COMMAND_HEADERS: &[&str] = &[
+    "authorization:",
+    "proxy-authorization:",
+    "cookie:",
+    "x-api-key:",
+];
 
-/// Masks credentials that command-line options carry: curl's `-u`/`--user`/`--proxy-user`
-/// `name:password` (the password part) and `--oauth2-bearer TOKEN`; `mysql`/`mariadb
-/// -pPASSWORD`; `sshpass -p PASSWORD`; and credential headers ([`redact_header_values`]).
-fn redact_credential_options(line: &str) -> String {
-    let line = redact_header_values(line);
-    let spans: Vec<(usize, usize)> = {
-        let mut spans = Vec::new();
-        let mut start = None;
-        for (i, b) in line.bytes().enumerate() {
-            match (b == b' ' || b == b'\t', start) {
-                (true, Some(s)) => {
-                    spans.push((s, i));
-                    start = None;
-                }
-                (false, None) => start = Some(i),
-                _ => {}
-            }
-        }
-        if let Some(s) = start {
-            spans.push((s, line.len()));
-        }
-        spans
-    };
-    let word = |i: usize| spans.get(i).map(|&(s, e)| &line[s..e]);
-    let unquoted = |w: &str| w.trim_matches(|c| c == '\'' || c == '"').to_owned();
-    let names = |n: &[&str]| {
-        (0..spans.len())
-            .any(|i| word(i).is_some_and(|w| n.contains(&w.rsplit('/').next().unwrap_or(w))))
-    };
-    let db = names(&["mysql", "mariadb", "mysqldump"]);
-    let sshpass = names(&["sshpass"]);
-    // (byte range in `line`, replacement)
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    // Masks what follows the first ':' of the word at `i` (`user:password`).
-    let after_colon = |i: usize, skip: usize, edits: &mut Vec<(usize, usize, String)>| {
-        let Some(&(s, e)) = spans.get(i) else { return };
-        let w = &line[s + skip..e];
-        let core = unquoted(w);
-        if let Some(colon) = core.find(':') {
-            let secret = &core[colon + 1..];
-            if !secret.is_empty() && !secret.starts_with("****") {
-                let at = s + skip + w.find(secret).unwrap_or(0);
-                edits.push((at, at + secret.len(), mask_any(secret)));
-            }
-        }
-    };
-    let whole = |i: usize, skip: usize, edits: &mut Vec<(usize, usize, String)>| {
-        let Some(&(s, e)) = spans.get(i) else { return };
-        let w = &line[s + skip..e];
-        let core = unquoted(w);
-        if !core.is_empty() && !core.starts_with("****") {
-            let at = s + skip + w.find(core.as_str()).unwrap_or(0);
-            edits.push((at, at + core.len(), mask_any(&core)));
-        }
-    };
-    for i in 0..spans.len() {
-        let w = word(i).unwrap_or_default();
-        match w {
-            "-u" | "--user" | "--proxy-user" => after_colon(i + 1, 0, &mut edits),
-            "--oauth2-bearer" => whole(i + 1, 0, &mut edits),
-            "-p" if sshpass => whole(i + 1, 0, &mut edits),
-            _ => {
-                if let Some(eq) = ["--user=", "--proxy-user="]
-                    .iter()
-                    .find(|o| w.starts_with(**o))
-                {
-                    after_colon(i, eq.len(), &mut edits);
-                } else if w.starts_with("--oauth2-bearer=") {
-                    whole(i, "--oauth2-bearer=".len(), &mut edits);
-                } else if w.starts_with("-u")
-                    && !w.starts_with("--")
-                    && w.len() > 2
-                    && w.contains(':')
-                {
-                    after_colon(i, 2, &mut edits);
-                } else if (db || sshpass)
-                    && w.starts_with("-p")
-                    && w.len() > 2
-                    && !w.starts_with("--")
-                {
-                    whole(i, 2, &mut edits);
-                }
-            }
-        }
-    }
+/// Applies `(start, end, replacement)` edits (byte ranges in `line`) in order; overlapping
+/// ones after the first are dropped.
+fn apply_edits(line: &str, mut edits: Vec<(usize, usize, String)>) -> String {
     if edits.is_empty() {
-        return line;
+        return line.to_owned();
     }
     edits.sort_by_key(|(s, _, _)| *s);
     let mut out = String::with_capacity(line.len());
@@ -218,6 +119,262 @@ fn redact_credential_options(line: &str) -> String {
     }
     out.push_str(&line[copied..]);
     out
+}
+
+/// The quote character open at byte `pos` of `line` (no escapes: `'` and `"` toggle).
+fn open_quote_at(line: &str, pos: usize) -> Option<char> {
+    let mut open: Option<char> = None;
+    for c in line[..pos].chars() {
+        match (open, c) {
+            (None, '\'' | '"') => open = Some(c),
+            (Some(q), c) if c == q => open = None,
+            _ => {}
+        }
+    }
+    open
+}
+
+/// Masks the value of a credential header (`Cookie: …`, `X-Api-Key: …`,
+/// `Proxy-Authorization: …`): to the close of the quotes the header sits in (so `Cookie:
+/// a="b c"` inside `'…'` is masked whole), else to the end of the line. The line is lowercased
+/// once.
+fn redact_header_values(line: &str) -> String {
+    // ASCII lower-casing keeps byte positions, so offsets found there are char boundaries.
+    let lower = line.to_ascii_lowercase();
+    let mut edits = Vec::new();
+    for header in CREDENTIAL_HEADERS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(header) {
+            let marker = from + pos;
+            let start = marker + header.len();
+            let value_start = start + line[start..].len() - line[start..].trim_start().len();
+            let value_end = match open_quote_at(line, marker) {
+                Some(q) => line[value_start..]
+                    .find(q)
+                    .map_or(line.len(), |at| value_start + at),
+                None => line.len(),
+            };
+            let value = &line[value_start..value_end];
+            if !value.is_empty() && !value.starts_with("****") {
+                edits.push((value_start, value_end, mask_any(value)));
+            }
+            from = value_end.max(start);
+        }
+    }
+    apply_edits(line, edits)
+}
+
+/// The shell words of `line` as byte spans, quote-aware (`'a b'` and `"a b"` stay one word; no
+/// escapes).
+fn shell_word_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                ' ' | '\t' => {
+                    if let Some(s) = start.take() {
+                        spans.push((s, i));
+                    }
+                }
+                '\'' | '"' => {
+                    quote = Some(c);
+                    start.get_or_insert(i);
+                }
+                _ => {
+                    start.get_or_insert(i);
+                }
+            },
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, line.len()));
+    }
+    spans
+}
+
+/// The bytes of `word` from `from` with one pair of surrounding quotes left out: the value's
+/// range within `word`.
+fn value_range(word: &str, from: usize) -> (usize, usize) {
+    let rest = &word[from..];
+    match rest.chars().next() {
+        Some(q @ ('\'' | '"')) => {
+            let start = from + 1;
+            let end = word[start..].find(q).map_or(word.len(), |at| start + at);
+            (start, end)
+        }
+        _ => (from, word.len()),
+    }
+}
+
+/// curl's short options that take a value: in a cluster, the first of these takes the rest of
+/// the word (or, at the end of the word, the next word).
+const CURL_VALUE_LETTERS: &str = "bcCdDeEFHKmoPQrtTuUwxXyYz";
+
+/// Where a credential sits in a command's arguments: for the program `program`, each
+/// `(word index, start, end)` byte range (within that word as written, quotes allowed) of a
+/// secret in `words`. Covers curl's `-u`/`-U`/`--user`/`--proxy-user` (the password after the
+/// colon), `--oauth2-bearer` and a `-H`/`--header` naming Authorization, Proxy-Authorization,
+/// Cookie or X-Api-Key (its value), short-option clusters included (`-su alice:pw`, `-vualice:pw`,
+/// `-HCookie:…`); wget's password options; `mysql`/`mariadb`/`mysqldump -p<password>` and
+/// `--password=`; and `sshpass -p`. The one parser behind both the live masking and the rule
+/// engine's refusal of such commands.
+pub fn credential_args(program: &str, words: &[&str]) -> Vec<(usize, usize, usize)> {
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let mut hits = Vec::new();
+    // The password after the first ':' of the value at (word, from).
+    let after_colon = |i: usize, from: usize, hits: &mut Vec<(usize, usize, usize)>| {
+        let Some(w) = words.get(i) else { return };
+        let (s, e) = value_range(w, from);
+        if let Some(colon) = w[s..e].find(':') {
+            let start = s + colon + 1;
+            if start < e {
+                hits.push((i, start, e));
+            }
+        }
+    };
+    let whole = |i: usize, from: usize, hits: &mut Vec<(usize, usize, usize)>| {
+        let Some(w) = words.get(i) else { return };
+        let (s, e) = value_range(w, from);
+        if s < e {
+            hits.push((i, s, e));
+        }
+    };
+    let header = |i: usize, from: usize, hits: &mut Vec<(usize, usize, usize)>| {
+        let Some(w) = words.get(i) else { return };
+        let (s, e) = value_range(w, from);
+        let value = &w[s..e];
+        let lower = value.trim_start().to_ascii_lowercase();
+        if COMMAND_HEADERS.iter().any(|h| lower.starts_with(h)) {
+            if let Some(colon) = value.find(':') {
+                let rest = &value[colon + 1..];
+                let start = s + colon + 1 + (rest.len() - rest.trim_start().len());
+                if start < e {
+                    hits.push((i, start, e));
+                }
+            }
+        }
+    };
+    for (i, w) in words.iter().enumerate() {
+        match program {
+            "curl" => match *w {
+                "--user" | "--proxy-user" => after_colon(i + 1, 0, &mut hits),
+                "--oauth2-bearer" => whole(i + 1, 0, &mut hits),
+                "--header" => header(i + 1, 0, &mut hits),
+                _ if w.starts_with("--user=") => after_colon(i, "--user=".len(), &mut hits),
+                _ if w.starts_with("--proxy-user=") => {
+                    after_colon(i, "--proxy-user=".len(), &mut hits)
+                }
+                _ if w.starts_with("--oauth2-bearer=") => {
+                    whole(i, "--oauth2-bearer=".len(), &mut hits)
+                }
+                _ if w.starts_with("--header=") => header(i, "--header=".len(), &mut hits),
+                _ if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 => {
+                    for (at, c) in w.char_indices().skip(1) {
+                        if !CURL_VALUE_LETTERS.contains(c) {
+                            continue;
+                        }
+                        let rest = at + c.len_utf8();
+                        let (word, from) = if rest < w.len() {
+                            (i, rest)
+                        } else {
+                            (i + 1, 0)
+                        };
+                        match c {
+                            'u' | 'U' => after_colon(word, from, &mut hits),
+                            'H' => header(word, from, &mut hits),
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            },
+            "wget" => {
+                for opt in [
+                    "--password",
+                    "--http-password",
+                    "--ftp-password",
+                    "--proxy-password",
+                ] {
+                    if *w == opt {
+                        whole(i + 1, 0, &mut hits);
+                    } else if let Some(rest) = w.strip_prefix(opt) {
+                        if rest.starts_with('=') {
+                            whole(i, opt.len() + 1, &mut hits);
+                        }
+                    }
+                }
+            }
+            "mysql" | "mariadb" | "mysqldump" => {
+                if w.starts_with("--password=") {
+                    whole(i, "--password=".len(), &mut hits);
+                } else if w.starts_with("-p") && w.len() > 2 {
+                    whole(i, 2, &mut hits);
+                }
+            }
+            "sshpass" => {
+                if *w == "-p" {
+                    whole(i + 1, 0, &mut hits);
+                } else if w.starts_with("-p") && w.len() > 2 {
+                    whole(i, 2, &mut hits);
+                }
+            }
+            _ => {}
+        }
+    }
+    hits
+}
+
+/// Command words that end one command and start the next on the same line.
+const COMMAND_SEPARATORS: &[&str] = &["|", "||", "&&", ";", "&"];
+
+/// Masks credentials that command-line options carry ([`credential_args`]): only in the words
+/// after a program that uses them (`curl`, `wget`, `mysql`/`mariadb`/`mysqldump`, `sshpass`),
+/// up to the next command separator, so `docker -u 1000:1000` or `mkdir -p dir` are left alone.
+/// Credential headers in any text are masked too ([`redact_header_values`]).
+fn redact_credential_options(line: &str) -> String {
+    let line = redact_header_values(line);
+    let spans = shell_word_spans(&line);
+    let words: Vec<&str> = spans.iter().map(|&(s, e)| &line[s..e]).collect();
+    let mut edits = Vec::new();
+    for (p, program) in words.iter().enumerate() {
+        let name = program.rsplit('/').next().unwrap_or(program);
+        if !matches!(
+            name,
+            "curl" | "wget" | "mysql" | "mariadb" | "mysqldump" | "sshpass"
+        ) {
+            continue;
+        }
+        // A separator word ends the command; a word ending in one (`db;`) is its last word.
+        let end = words[p + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(at, w)| {
+                if COMMAND_SEPARATORS.contains(w) {
+                    Some(p + 1 + at)
+                } else if w.ends_with([';', '|', '&']) {
+                    Some(p + 2 + at)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(words.len());
+        for (i, s, e) in credential_args(name, &words[p + 1..end]) {
+            let (word_start, _) = spans[p + 1 + i];
+            let secret = &line[word_start + s..word_start + e];
+            if !secret.starts_with("****") {
+                edits.push((word_start + s, word_start + e, mask_any(secret)));
+            }
+        }
+    }
+    apply_edits(&line, edits)
 }
 
 /// Masks a structured value whose key is known: a string under a sensitive
@@ -562,16 +719,50 @@ mod tests {
         }
         // Short passwords are never shown whole.
         assert!(!redact("curl -u a:pw1 https://x").contains("pw1"));
+        // D3: the offset comes from the colon, so a password equal to the user name goes too.
+        for (text, kept) in [
+            ("curl -u admin:admin https://x", "curl -u admin:****"),
+            ("curl -uroot:root https://x", "curl -uroot:****"),
+            ("curl --user=a:a https://x", "curl --user=a:****"),
+        ] {
+            let out = redact(text);
+            assert!(out.starts_with(kept), "{text}: {out}");
+        }
+        // D3: quoted values with spaces are masked whole.
+        let out = redact("curl --user 'alice:two words here' https://x");
+        assert!(!out.contains("two") && !out.contains("words"), "{out}");
+        let out = redact("curl -H 'Cookie: a=\"b c\"; sid=SESSIONVALUE99' https://x");
+        assert!(!out.contains("b c") && !out.contains("SESSIONVAL"), "{out}");
+        // D4: curl short-option clusters.
+        for text in [
+            "curl -su alice:DEMOPASS1 https://x",
+            "curl -vualice:DEMOPASS1 https://x",
+            "curl -sHCookie:sid=DEMOPASS1 https://x",
+        ] {
+            assert!(!redact(text).contains("DEMOPASS1"), "{text}");
+        }
         // Look-alikes stay readable.
+        // D5: `-u` and `-p` mean credentials only for the programs that use them that way.
         for text in [
             "sort -u names.txt",
             "mkdir -p build/out",
             "git log -p",
             "grep -u: x",
             "curl -H 'Accept: text/html' https://x",
+            "docker run -u 1000:1000 img",
+            "id -u root:root",
+            "mysql -u root db; mkdir -pall",
+            "curl -s https://x | grep -u root:root",
         ] {
             assert_eq!(redact(text), text);
         }
+        // The shared parser, as the rule engine sees an argv.
+        assert_eq!(credential_args("curl", &["-su", "alice:pw"]), [(1, 6, 8)]);
+        assert!(credential_args("docker", &["-u", "1000:1000"]).is_empty());
+        assert_eq!(
+            credential_args("/usr/bin/sshpass", &["-p", "pw"]),
+            [(1, 0, 2)]
+        );
     }
 
     #[test]
