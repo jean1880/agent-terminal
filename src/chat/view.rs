@@ -1144,12 +1144,15 @@ impl ComposerHost for Inner {
             // The folder's list is reused for a few seconds and only re-ranked per keystroke.
             // A newer query supersedes this one at each step, so stale work is dropped.
             let superseded = |inner: &Inner| inner.file_seq.get() != seq;
-            let Some(inner) = weak.upgrade() else { return };
-            let cached = inner.file_index.borrow().fresh(&root);
+            // No strong reference is held across an await: the view may go away meanwhile.
+            let cached = {
+                let Some(inner) = weak.upgrade() else { return };
+                let fresh = inner.file_index.borrow().fresh(&root);
+                fresh
+            };
             let list = match cached {
                 Some(list) => list,
                 None => {
-                    drop(inner);
                     let walked = root.clone();
                     let list = gtk4::gio::spawn_blocking(move || {
                         std::sync::Arc::new(workspace_files::list(&walked))
