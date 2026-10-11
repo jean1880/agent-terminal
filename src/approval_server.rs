@@ -180,6 +180,18 @@ const SENSITIVE_NAMES: &[&str] = &[
     ".gemini",
     ".agents",
     ".mcp.json",
+    ".codex",
+    // Other version control, editor and tool configs that run code.
+    ".hg",
+    ".zed",
+    ".exrc",
+    ".nvim.lua",
+    "mise.toml",
+    // Agent instruction files: the next agent run follows what they say. Names are compared
+    // lowercased.
+    "agents.md",
+    "claude.md",
+    "gemini.md",
 ];
 
 /// `target` below `base`, as components, trying `base` as given and then resolved (the target
@@ -273,7 +285,7 @@ fn searches_recursively(tool: &str) -> bool {
 
 /// Every path a read call names, or `None` when any of them is not text we can judge: a present
 /// key whose value is not a string (or a list of strings) fails closed.
-fn named_paths(args: &Value) -> Option<Vec<&str>> {
+pub(crate) fn named_paths(args: &Value) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     for key in TARGET_KEYS.iter().chain(READ_PATH_KEYS.iter()) {
         if let Some(v) = args.get(*key) {
@@ -389,84 +401,6 @@ pub fn policy_with_home(
     }
 }
 
-/// First words that run something else, so the line says nothing about what executes.
-const WRAPPERS: &[&str] = &[
-    "node", "nodejs", "ruby", "perl", "php", "lua", "deno", "bun", "npx", "bash", "sh", "zsh",
-    "dash", "ksh", "fish", "csh", "tcsh", "env", "sudo", "doas", "su", "xargs", "eval", "exec",
-    "nohup", "timeout", "watch", "command", "busybox", "nice", "ionice", "time", "setsid",
-    "stdbuf", "strace", "ssh", "awk", "gawk",
-];
-
-/// Build, test and package runners: they execute files the model may have just edited
-/// (Makefile, build.rs, package.json scripts, conftest.py, Dockerfile).
-const RUNNERS: &[&str] = &[
-    "make", "cargo", "npm", "pnpm", "yarn", "pip", "pip3", "uv", "go", "pytest", "just", "rake",
-    "gradle", "gradlew", "mvn", "docker", "podman", "bundle", "tox", "poetry", "dotnet", "cmake",
-    "ninja", "bazel", "mix", "composer", "sbt", "ant", "rustc", "gcc", "g++", "cc", "tsc",
-];
-
-/// The only git subcommands remembered; the rest can run hooks, pagers, textconv or diff
-/// drivers configured in files the model can edit.
-const GIT_SAFE: &[&str] = &[
-    "status",
-    "branch",
-    "rev-parse",
-    "ls-files",
-    "remote",
-    "describe",
-];
-
-fn is_wrapper(word: &str) -> bool {
-    word.contains('/')
-        || word.starts_with("python")
-        || WRAPPERS.contains(&word)
-        || RUNNERS.contains(&word)
-}
-
-fn git_is_safe(words: &[&str]) -> bool {
-    let mut rest = words.iter().skip(1);
-    let Some(sub) = rest.next() else { return false };
-    // Any option before the subcommand (`-c key=val`, `--exec-path`, `-C dir`) or a config
-    // override is refused outright.
-    GIT_SAFE.contains(sub)
-        && !words
-            .iter()
-            .any(|w| *w == "-c" || w.starts_with("--config"))
-}
-
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty()
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
-/// A command line a plain (pattern-less) "Allow for session" or "Always allow" may remember as
-/// its exact argv: a simple command ([`crate::always_allow::command_tokens`], the one fail-closed
-/// shell-syntax list), no leading `NAME=value`, no interpreter or wrapper, no build runner, only
-/// safe git subcommands, no `find -exec/-delete`. Ceiling: the exact argv is trusted again, so a
-/// program the model rewrote between two runs still runs; runners are refused for that reason.
-pub(crate) fn rememberable_command(command: &str) -> bool {
-    let Some(tokens) = crate::always_allow::command_tokens(command) else {
-        return false;
-    };
-    let words: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let Some(first) = words.first().copied() else {
-        return false;
-    };
-    if is_assignment(first) || is_wrapper(first) {
-        return false;
-    }
-    if first == "git" {
-        return git_is_safe(&words);
-    }
-    !(first == "find"
-        && words
-            .iter()
-            .any(|w| matches!(*w, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete")))
-}
-
 /// Resolves symlinks in the longest existing ancestor of an absolute, `..`-free path.
 fn resolve(path: &Path) -> PathBuf {
     let mut tail = Vec::new();
@@ -531,8 +465,9 @@ struct ServerInner {
     deadline: Duration,
     /// Queries received and not yet matched to a tool step by the session's canary.
     queries: RefCell<HashMap<String, u32>>,
-    /// Where "Always allow" rules are kept ([`crate::always_allow`]); `None` offers no "Always".
-    always: RefCell<Option<PathBuf>>,
+    /// The "Always allow" rules, cached ([`crate::always_allow::StoreCache`]); `None` offers no
+    /// "Always".
+    always: RefCell<Option<crate::always_allow::StoreCache>>,
     /// The thread's session rules (its own until a chat session shares its set).
     session_rules: RefCell<SessionRules>,
     /// The unusable-rules-file notice was already shown by this server.
@@ -588,7 +523,7 @@ impl ApprovalHandle {
     /// Keeps "Always allow" rules in `path`: offers "Always allow" from now on and auto-allows
     /// what its rules match (read at each request: a few rules of JSON, not worth a worker).
     pub fn use_always_rules(&self, path: PathBuf) {
-        *self.inner.always.borrow_mut() = Some(path);
+        *self.inner.always.borrow_mut() = Some(crate::always_allow::StoreCache::new(path));
     }
 
     /// Uses the chat session's session rules (so a same-agent restart keeps them and a
@@ -783,8 +718,11 @@ impl ApprovalHandle {
         let Some(pending) = self.inner.pending.borrow_mut().remove(request) else {
             return false;
         };
-        if matches!(decision, Decision::AllowForSession | Decision::AllowAlways) {
-            self.inner.remember(&pending, decision, custom_rule);
+        let mut decision = decision;
+        if matches!(decision, Decision::AllowForSession | Decision::AllowAlways)
+            && !self.inner.remember(&pending, decision, custom_rule)
+        {
+            decision = Decision::Allow;
         }
         reply(
             pending.conn,
@@ -820,30 +758,39 @@ impl ApprovalHandle {
 }
 
 impl ServerInner {
-    /// Where a call is judged by the rules: agy, the session's workspace, the call's cwd.
+    /// Where a call is judged by the rules: agy, the session's workspace, and the call's cwd (the
+    /// workspace when agy names none).
     fn context<'a>(&'a self, cwd: Option<&'a str>) -> Option<crate::always_allow::Context<'a>> {
+        let workspace = self.workspaces.first()?;
         Some(crate::always_allow::Context {
             driver: "agy",
-            workspace: self.workspaces.first()?,
-            cwd,
+            workspace,
+            cwd: cwd.or_else(|| workspace.to_str()),
             home: self.home.as_deref(),
         })
     }
 
-    /// The Always rules, or `None` (no file configured, or one that cannot be used: then saved
-    /// rules are off and the notice names the file, once per server).
-    fn saved_rules(&self) -> Option<crate::always_allow::AlwaysRules> {
-        let path = self.always.borrow().clone()?;
-        match crate::always_allow::AlwaysRules::open(&path) {
-            Ok(rules) => Some(rules),
+    /// Whether an Always rule allows `action` (from the cached store). An unusable file allows
+    /// nothing, and its notice names the file once per server.
+    fn saved_allow(
+        &self,
+        action: &crate::always_allow::Action,
+        ctx: &crate::always_allow::Context,
+    ) -> bool {
+        let mut cache = self.always.borrow_mut();
+        let Some(cache) = cache.as_mut() else {
+            return false;
+        };
+        let path = cache.path().to_owned();
+        match cache.rules() {
+            Ok(rules) => rules.matches_any(action, ctx),
             Err(e) => {
+                let notice = crate::always_allow::blocked_notice(&path, e);
                 warn!(error = %e, "approval rules file unusable; saved rules are off");
                 if !self.blocked_noticed.replace(true) {
-                    self.emit(Envelope::new(Event::Notice {
-                        text: crate::always_allow::blocked_notice(&path, &e),
-                    }));
+                    self.emit(Envelope::new(Event::Notice { text: notice }));
                 }
-                None
+                false
             }
         }
     }
@@ -853,59 +800,69 @@ impl ServerInner {
         let Some(ctx) = self.context(cwd) else {
             return false;
         };
-        if self
-            .session_rules
-            .borrow()
-            .borrow()
-            .matches_session(action, &ctx)
-        {
-            return true;
-        }
-        self.saved_rules()
-            .is_some_and(|rules| rules.matches_any(action, &ctx))
+        let session = self.session_rules.borrow().clone();
+        let in_session = session.borrow().matches_session(action, &ctx);
+        in_session || self.saved_allow(action, &ctx)
     }
 
-    /// Records what "Allow for session" / "Always allow" keeps for `pending`: the user's pattern
-    /// (`custom`) or the exact call. A rule that cannot be made is said, and the call is allowed
-    /// once. An Always rule also holds for the session, so an unusable file loses nothing now.
+    /// Records what "Allow for session" / "Always allow" keeps for `pending`, judged afresh by
+    /// [`crate::always_allow::decide`] whatever the card offered. False (said in a notice) when
+    /// nothing is kept: the call is allowed once. An Always rule holds for the session at once
+    /// and is saved off the main thread.
     fn remember(
-        &self,
+        self: &Rc<Self>,
         pending: &Pending,
         decision: Decision,
         custom: Option<crate::always_allow::Rule>,
-    ) {
+    ) -> bool {
+        use crate::always_allow::Scope;
         let Some(ctx) = self.context(pending.cwd.as_deref()) else {
-            return;
+            return false;
         };
-        let rule = match (custom, &pending.action) {
-            (Some(rule), _) => rule.complete(&ctx),
-            (None, Some(action)) => crate::always_allow::Rule::from_action(action, &ctx),
-            (None, None) => Err("nothing in this request can be remembered".to_owned()),
+        let scope = if decision == Decision::AllowAlways {
+            Scope::Always
+        } else {
+            Scope::Session
         };
-        let rule = match rule {
+        let rule = match crate::always_allow::decide(pending.action.as_ref(), custom, scope, &ctx) {
             Ok(rule) => rule,
             Err(why) => {
                 self.emit(Envelope::new(Event::Notice {
                     text: format!("Allowed once; no rule was kept: {why}."),
                 }));
-                return;
+                return false;
             }
         };
-        if decision == Decision::AllowAlways {
-            let path = self.always.borrow().clone();
-            if let Some(path) = path {
-                match crate::always_allow::AlwaysRules::remember(&path, rule.clone()) {
-                    Ok(_) => info!(rule = %rule.summary(), "remembered an always-allow rule"),
-                    Err(e) => {
+        let path = self
+            .always
+            .borrow()
+            .as_ref()
+            .map(|cache| cache.path().to_owned());
+        if let (Scope::Always, Some(path)) = (scope, path) {
+            let weak = Rc::downgrade(self);
+            let saved = rule.clone();
+            glib::spawn_future_local(async move {
+                let target = path.clone();
+                let result = gio::spawn_blocking(move || {
+                    crate::always_allow::AlwaysRules::remember(&target, saved)
+                })
+                .await;
+                let Some(inner) = weak.upgrade() else { return };
+                match result {
+                    Ok(Ok(_)) => info!("remembered an always-allow rule"),
+                    Ok(Err(e)) => {
                         warn!(error = %e, "always-allow rule not saved");
-                        self.emit(Envelope::new(Event::Notice {
+                        inner.emit(Envelope::new(Event::Notice {
                             text: crate::always_allow::blocked_notice(&path, &e),
                         }));
                     }
+                    Err(_) => warn!("the always-allow save worker panicked"),
                 }
-            }
+            });
         }
-        self.session_rules.borrow().borrow_mut().add(rule);
+        let session = self.session_rules.borrow().clone();
+        session.borrow_mut().add(rule);
+        true
     }
 
     fn emit(&self, env: Envelope) {
@@ -1134,17 +1091,11 @@ pub(crate) fn canonical_target(path: &Path) -> PathBuf {
     resolve(path)
 }
 
-/// Whether "Always allow" applies to this kind of call: a shell command only. A permanent allow
-/// on a path (`~/.bashrc`, a git hook, the rules file) would be a standing write grant, and an
-/// MCP rule ignores the tool's arguments; those stay "for this session" at most.
-pub(crate) fn always_offerable(action: &crate::always_allow::Action) -> bool {
-    action.kind() == crate::always_allow::ActionKind::Shell
-}
-
 /// The buttons agy's card offers, and what "Always allow" would keep: Allow; "Allow for
 /// session" when a rule could match the call ([`crate::always_allow::offerable`]: no secret, a
-/// simple command, a contained path); "Always allow" when that call is a shell command and a
-/// rules file is configured; Deny.
+/// simple command, a contained path); "Always allow" when a rules file is configured and the
+/// call is one [`crate::always_allow::always_offerable`] keeps (the predicate the rule is then
+/// checked by, so the button never promises what is refused); Deny.
 fn rule_options(
     action: Option<&crate::always_allow::Action>,
     ctx: Option<&crate::always_allow::Context>,
@@ -1155,7 +1106,7 @@ fn rule_options(
     if let (Some(action), Some(ctx)) = (action, ctx) {
         if crate::always_allow::offerable(action, ctx) {
             options.push(Decision::AllowForSession);
-            if always && always_offerable(action) {
+            if always && crate::always_allow::always_offerable(action) {
                 options.push(Decision::AllowAlways);
                 remembers = Some(remembers_text(action, ctx));
             }
@@ -1668,6 +1619,7 @@ mod tests {
 
     #[test]
     fn plain_rules_refuse_wrappers_runners_and_shell_syntax() {
+        use crate::always_allow::rememberable_command;
         assert!(rememberable_command("git status --short"));
         assert!(rememberable_command("/usr/bin/zsh -lc 'git status'"));
         for refused in [
@@ -1859,6 +1811,10 @@ mod tests {
             );
             assert!(handle.respond("q1", Decision::AllowAlways));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
+            // Saved off the main thread.
+            assert!(pump_until(ctx, 10, || {
+                crate::always_allow::AlwaysRules::open(&rules).is_ok_and(|r| r.rules.len() == 1)
+            }));
             // A command that cannot be remembered exactly is never offered "Always".
             let rx = client(
                 handle.socket_path().to_owned(),
@@ -2220,79 +2176,91 @@ mod tests {
 
             let rx = client(
                 handle.socket_path().to_owned(),
-                with_id(cmd("cargo test --bin foo"), "q_custom"),
+                with_id(cmd("ls -la"), "q_custom"),
             );
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
-
-            // User modifies pattern to "cargo test*" with global workspace ("*")
-            let custom_rule = crate::always_allow::Rule::new(
-                "*".to_string(),
-                "run_command".to_string(),
-                "cargo test*".to_string(),
-            );
+            // The user loosens the pattern to "ls *" for every workspace.
+            let custom_rule = crate::always_allow::Rule::new("*", "run_command", "ls *");
             assert!(handle.respond_with_rule("q_custom", Decision::AllowAlways, Some(custom_rule)));
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
+            assert!(pump_until(ctx, 10, || {
+                crate::always_allow::AlwaysRules::open(&rules).is_ok_and(|r| r.rules.len() == 1)
+            }));
 
-            // Next request for "cargo test --bin bar" in a brand new session/handle should auto-approve without asking!
+            // A new session allows a matching call without a card.
             drop(handle);
             let (again, seen2) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
             again.use_always_rules(rules.clone());
             let rx2 = client(
                 again.socket_path().to_owned(),
-                with_id(cmd("cargo test --bin bar"), "q_auto"),
+                with_id(cmd("ls -l"), "q_auto"),
             );
-            let r2 = wait_reply(ctx, &rx2);
-            assert_eq!(r2.decision, Decision::Allow);
-            // No new card was shown to user!
+            assert_eq!(wait_reply(ctx, &rx2).decision, Decision::Allow);
             assert_eq!(seen2.borrow().len(), 0);
         });
     }
 
+    /// R1 and S2: a runner is never kept by "Always allow", even through the dialog's pattern or
+    /// a direct answer the card never offered; for the session it is kept as the exact command
+    /// only, never as a pattern.
     #[test]
-    fn respond_with_rule_session_allows_runners_and_loosened_patterns_in_same_session() {
+    fn runners_are_never_kept_always_and_only_exactly_for_the_session() {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
+            let rules = tmp.path().join("always.json");
             let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            handle.use_always_rules(rules.clone());
+            let ask = |id: &str, line: &str| {
+                let rx = client(handle.socket_path().to_owned(), with_id(cmd(line), id));
+                let n = seen.borrow().len();
+                assert!(pump_until(ctx, 10, || seen.borrow().len() > n));
+                rx
+            };
+            let card_options = |id: &str| {
+                seen.borrow()
+                    .iter()
+                    .find_map(|e| match &e.event {
+                        Event::ApprovalRequested { options, .. }
+                            if e.request.as_deref() == Some(id) =>
+                        {
+                            Some(options.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("card")
+            };
 
+            let rx = ask("a1", "cargo test --bin foo");
+            assert!(!card_options("a1").contains(&Decision::AllowAlways));
+            let typed = crate::always_allow::Rule::new("*", "run_command", "cargo test*");
+            assert!(handle.respond_with_rule("a1", Decision::AllowAlways, Some(typed)));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow, "downgraded");
+            assert!(!rules.exists(), "nothing saved");
+
+            let rx = ask("a2", "cargo test --bin foo");
+            let loose = crate::always_allow::Rule::new("*", "run_command", "cargo *");
+            assert!(handle.respond_with_rule("a2", Decision::AllowForSession, Some(loose)));
+            assert_eq!(
+                wait_reply(ctx, &rx).decision,
+                Decision::Allow,
+                "no pattern kept"
+            );
+
+            let rx = ask("a3", "cargo test --bin foo");
+            assert!(handle.respond("a3", Decision::AllowForSession));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowForSession);
             let rx = client(
                 handle.socket_path().to_owned(),
-                with_id(cmd("cargo test --bin foo"), "q_session"),
+                with_id(cmd("cargo test --bin foo"), "a4"),
             );
-            assert!(pump_until(ctx, 10, || seen.borrow().len() == 1));
-
-            // Operator loosens pattern to "cargo *" for this session only.
-            let session_rule = crate::always_allow::Rule::new(
-                "*".to_string(),
-                "run_command".to_string(),
-                "cargo *".to_string(),
+            assert_eq!(
+                wait_reply(ctx, &rx).decision,
+                Decision::Allow,
+                "exact repeat"
             );
-            assert!(handle.respond_with_rule(
-                "q_session",
-                Decision::AllowForSession,
-                Some(session_rule)
-            ));
-            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowForSession);
-
-            // Subsequent runner command "cargo clippy" in the SAME session auto-approves immediately!
-            let rx2 = client(
-                handle.socket_path().to_owned(),
-                with_id(cmd("cargo clippy"), "q_session2"),
-            );
-            let r2 = wait_reply(ctx, &rx2);
-            assert_eq!(r2.decision, Decision::Allow);
-            // No new card was shown!
-            assert_eq!(seen.borrow().len(), 1);
-
-            // But in a fresh session / handle, it is not remembered on disk:
-            drop(handle);
-            let (fresh_handle, fresh_seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
-            let rx3 = client(
-                fresh_handle.socket_path().to_owned(),
-                with_id(cmd("cargo clippy"), "q_fresh"),
-            );
-            assert!(pump_until(ctx, 10, || fresh_seen.borrow().len() == 1));
-            assert!(fresh_handle.respond("q_fresh", Decision::Deny));
-            assert_eq!(wait_reply(ctx, &rx3).decision, Decision::Deny);
+            let rx = ask("a5", "cargo clippy");
+            assert!(handle.respond("a5", Decision::Deny));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
         });
     }
 }

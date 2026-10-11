@@ -188,6 +188,29 @@ impl AgentTerminalWindow {
         self.config.borrow().permission_source_paths()
     }
 
+    /// Imports the agent configurations into the rules file; an unusable rules file is named
+    /// and left untouched, never treated as empty.
+    fn import_rules(&self, path: &std::path::Path) {
+        match crate::always_allow::AlwaysRules::import_into(path, &self.permission_sources()) {
+            Ok(0) => self.show_toast("Permission rules are already up to date"),
+            Ok(n) => self.show_toast(&format!(
+                "Imported {n} permission rules from agent configurations"
+            )),
+            Err(e) => self.show_toast(&crate::always_allow::blocked_notice(path, &e)),
+        }
+    }
+
+    /// Exports the global rules (the caller has shown [`crate::always_allow::EXPORT_WARNING`]).
+    fn export_rules(&self, path: &std::path::Path) {
+        match crate::always_allow::AlwaysRules::export_from(path, &self.permission_sources()) {
+            Ok(0) => self.show_toast("Agent configurations are already up to date"),
+            Ok(n) => self.show_toast(&format!(
+                "Exported {n} global rules to agent configurations"
+            )),
+            Err(e) => self.show_toast(&crate::always_allow::blocked_notice(path, &e)),
+        }
+    }
+
     /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
     fn edit_agent_profile(&self, driver: Driver, edit: impl FnOnce(&mut Profile)) {
         {
@@ -606,17 +629,7 @@ impl AgentTerminalWindow {
                     };
                     let imp = obj.imp();
                     if let Some(path) = crate::always_allow::path() {
-                        let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                        let added_count =
-                            rules.import_agent_permissions(None, &imp.permission_sources());
-                        if added_count > 0 {
-                            let _ = rules.save(&path);
-                            imp.show_toast(&format!(
-                                "Imported {added_count} permission rules from agent configurations"
-                            ));
-                        } else {
-                            imp.show_toast("Permission rules are already up to date");
-                        }
+                        imp.import_rules(&path);
                     }
                     if let Some(btn) = btn_weak.upgrade() {
                         btn.set_label("✓ Synced");
@@ -646,10 +659,13 @@ impl AgentTerminalWindow {
         export_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
-            move |_| {
+            move |clicked| {
                 let Some(btn) = export_btn_weak.upgrade() else {
                     return;
                 };
+                if !confirm_export_first(clicked) {
+                    return;
+                }
                 btn.set_sensitive(false);
                 btn.set_label("Syncing…");
                 let obj_weak = obj.downgrade();
@@ -661,16 +677,7 @@ impl AgentTerminalWindow {
                     };
                     let imp = obj.imp();
                     if let Some(path) = crate::always_allow::path() {
-                        let rules = crate::always_allow::AlwaysRules::load(&path);
-                        let exported_count =
-                            rules.export_agent_permissions(None, &imp.permission_sources());
-                        if exported_count > 0 {
-                            imp.show_toast(&format!(
-                                "Exported {exported_count} permission rules to agent configurations"
-                            ));
-                        } else {
-                            imp.show_toast("Agent configurations are already up to date");
-                        }
+                        imp.export_rules(&path);
                     }
                     if let Some(btn) = btn_weak.upgrade() {
                         btn.set_label("✓ Synced");
@@ -881,10 +888,17 @@ impl AgentTerminalWindow {
         let Some(path) = crate::always_allow::path() else {
             return;
         };
-        let rules = crate::always_allow::AlwaysRules::load(&path);
+        let opened = crate::always_allow::AlwaysRules::open(&path);
+        let blocked = opened
+            .as_ref()
+            .err()
+            .map(|e| crate::always_allow::blocked_notice(&path, e));
+        let rules = opened.unwrap_or_default();
         let status = rules.check_sync_status(None, &self.permission_sources());
 
-        let subtitle = if status.is_out_of_sync() {
+        let subtitle = if let Some(blocked) = blocked {
+            blocked
+        } else if status.is_out_of_sync() {
             format!(
                 "Warning: {}. Rules that automatically approve matching commands and tools.",
                 status.summary()
@@ -917,7 +931,7 @@ impl AgentTerminalWindow {
                 .build();
             list.append(&empty_row);
         } else {
-            for (i, r) in rules.rules.iter().enumerate() {
+            for r in &rules.rules {
                 let ws_label = if r.workspace == "*" {
                     "All workspaces"
                 } else {
@@ -941,7 +955,7 @@ impl AgentTerminalWindow {
                     .build();
                 let obj = self.obj();
                 let p = path.clone();
-                let idx = i;
+                let rule = r.clone();
                 let cb = on_changed.clone();
                 del_btn.connect_clicked(glib::clone!(
                     #[weak]
@@ -950,15 +964,18 @@ impl AgentTerminalWindow {
                     row,
                     move |_| {
                         let imp = obj.imp();
-                        let mut current_rules = crate::always_allow::AlwaysRules::load(&p);
-                        if idx < current_rules.rules.len() {
-                            current_rules.rules.remove(idx);
-                            let _ = current_rules.save(&p);
-                            row.set_visible(false);
-                            imp.show_toast("Rule removed");
-                            if let Some(ref f) = cb {
-                                f();
+                        // By the rule itself, not its position: the file may have changed since
+                        // this list was built. Hidden only once the removal is saved.
+                        match crate::always_allow::AlwaysRules::forget(&p, &rule) {
+                            Ok(true) => {
+                                row.set_visible(false);
+                                imp.show_toast("Rule removed");
+                                if let Some(ref f) = cb {
+                                    f();
+                                }
                             }
+                            Ok(false) => imp.show_toast("That rule was already gone"),
+                            Err(e) => imp.show_toast(&crate::always_allow::blocked_notice(&p, &e)),
                         }
                     }
                 ));
@@ -987,29 +1004,25 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 match response.as_str() {
                     "import" => {
-                        let mut rules = crate::always_allow::AlwaysRules::load(&p);
-                        let count = rules.import_agent_permissions(None, &imp.permission_sources());
-                        if count > 0 {
-                            let _ = rules.save(&p);
-                            imp.show_toast(&format!(
-                                "Imported {count} permission rules from agent configurations"
-                            ));
-                        } else {
-                            imp.show_toast("Permission rules are already up to date");
-                        }
+                        imp.import_rules(&p);
                         if let Some(ref f) = on_changed {
                             f();
                         }
                     }
                     "export" => {
-                        let rules = crate::always_allow::AlwaysRules::load(&p);
-                        let count = rules.export_agent_permissions(None, &imp.permission_sources());
-                        if count > 0 {
-                            imp.show_toast(&format!(
-                                "Exported {count} permission rules to agent configurations"
-                            ));
-                        } else {
-                            imp.show_toast("Agent configurations are already up to date");
+                        let confirm = adw::AlertDialog::new(
+                            Some("Export rules outside agent-terminal?"),
+                            Some(crate::always_allow::EXPORT_WARNING),
+                        );
+                        confirm.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
+                        confirm.set_response_appearance(
+                            "export",
+                            adw::ResponseAppearance::Destructive,
+                        );
+                        confirm.set_default_response(Some("cancel"));
+                        confirm.set_close_response("cancel");
+                        if confirm.choose_future(root.as_ref()).await == "export" {
+                            imp.export_rules(&p);
                         }
                         if let Some(ref f) = on_changed {
                             f();
@@ -1558,19 +1571,54 @@ impl AgentTerminalWindow {
 
 /// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
 /// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
+/// The widget name a confirmed export click carries (see [`confirm_export_first`]).
+const EXPORT_CONFIRMED: &str = "export-confirmed";
+
+/// Export writes standing grants outside agent-terminal, so it is confirmed first: the first
+/// click shows [`crate::always_allow::EXPORT_WARNING`] and returns false; choosing Export there
+/// clicks `button` again, marked confirmed, and that click returns true.
+fn confirm_export_first(button: &Button) -> bool {
+    if button.widget_name() == EXPORT_CONFIRMED {
+        button.set_widget_name("");
+        return true;
+    }
+    let dialog = adw::AlertDialog::new(
+        Some("Export rules outside agent-terminal?"),
+        Some(crate::always_allow::EXPORT_WARNING),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("export", "Export")]);
+    dialog.set_response_appearance("export", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let weak = button.downgrade();
+    dialog.connect_response(None, move |_, response| {
+        if response == "export" {
+            if let Some(button) = weak.upgrade() {
+                button.set_widget_name(EXPORT_CONFIRMED);
+                button.emit_clicked();
+            }
+        }
+    });
+    dialog.present(Some(button));
+    false
+}
+
 fn always_allowed_rows() -> adw::ExpanderRow {
     use crate::always_allow::{self, AlwaysRules};
-    let rules = always_allow::path()
-        .map(|p| AlwaysRules::load(&p))
-        .unwrap_or_default();
+    let path = always_allow::path();
+    let opened = path.as_deref().map(AlwaysRules::open);
+    let subtitle = match (&opened, &path) {
+        (Some(Err(e)), Some(p)) => always_allow::blocked_notice(p, e),
+        (Some(Ok(rules)), _) if !rules.rules.is_empty() => format!(
+            "{} remembered. Removing one applies at once",
+            rules.rules.len()
+        ),
+        _ => "None yet. “Always allow” on an approval adds one, for that folder only".to_owned(),
+    };
+    let rules = opened.and_then(Result::ok).unwrap_or_default();
     let expander = adw::ExpanderRow::builder()
         .title("Always-Allowed Actions")
-        .subtitle(match rules.rules.len() {
-            0 => {
-                "None yet. “Always allow” on an approval adds one, for that folder only".to_owned()
-            }
-            n => format!("{n} remembered. Removing one applies to new Antigravity sessions"),
-        })
+        .subtitle(subtitle)
         .build();
     for rule in rules.rules {
         let row = adw::ActionRow::builder()
@@ -1594,10 +1642,8 @@ fn always_allowed_rows() -> adw::ExpanderRow {
                 let Some(path) = always_allow::path() else {
                     return;
                 };
-                let mut rules = AlwaysRules::load(&path);
-                rules.rules.retain(|r| *r != rule);
-                match rules.save(&path) {
-                    Ok(()) => expander.remove(&row),
+                match AlwaysRules::forget(&path, &rule) {
+                    Ok(_) => expander.remove(&row),
                     Err(e) => warn!(error = %e, "could not save the always-allow rules"),
                 }
             }
