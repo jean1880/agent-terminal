@@ -823,3 +823,175 @@ fn native_queue_stays_pinned_and_contained() {
         window.destroy();
     }
 }
+
+/// A backend that remembers every prompt sent to it.
+struct PromptLog {
+    status: SessionStatus,
+    sent: RefCell<Vec<String>>,
+}
+
+impl ChatBackend for PromptLog {
+    fn send_prompt(&self, text: &str) {
+        self.sent.borrow_mut().push(text.to_owned());
+    }
+    fn queue_prompt(&self, text: &str) {
+        self.sent.borrow_mut().push(text.to_owned());
+    }
+    fn interrupt(&self) {}
+    fn respond_approval(&self, _: &str, _: Decision) {}
+    fn answer_questions(&self, _: &str, _: serde_json::Value) {
+        panic!("a reply question is answered by a prompt, never over the protocol");
+    }
+    fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
+    fn reload_session(&self) {}
+    fn set_mode(&self, _: Mode) {}
+    fn control(&self, _: Control) -> String {
+        String::new()
+    }
+    fn status(&self) -> SessionStatus {
+        self.status.clone()
+    }
+}
+
+/// Quick-reply chips under a finished reply: a click puts the exact option in the composer, with
+/// the cursor after it and the focus there, and sends nothing; the chips are no interruption;
+/// Dismiss and "Don't suggest these" both take them away, the latter telling the window.
+#[test]
+#[ignore = "native GTK layout; run alone in an isolated display"]
+fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
+    gtk4::init().expect("GTK must be available for the native gate");
+    adw::init().expect("libadwaita init");
+    crate::icons::register();
+    crate::load_css();
+    let ctx = glib::MainContext::default();
+    let backend = Rc::new(PromptLog {
+        status: status_of(Driver::Codex),
+        sent: RefCell::default(),
+    });
+    let view = ChatView::new(backend.clone());
+    let actions: Rc<RefCell<Vec<String>>> = Rc::default();
+    let log = actions.clone();
+    view.connect_action(move |a| log.borrow_mut().push(format!("{a:?}")));
+    let window = gtk4::Window::new();
+    window.set_default_size(620, 560);
+    window.set_child(Some(&view));
+    window.present();
+    crate::testutil::settle(&ctx);
+    let inner = view.inner().expect("built view");
+
+    let offer = |request: &str| {
+        for event in [
+            Event::TurnStarted { model: None },
+            Event::ItemStarted {
+                kind: ItemKind::AssistantMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            },
+        ] {
+            view.apply(&Envelope::new(event).item("a1"));
+        }
+        view.apply(
+            &Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text:
+                    "Two layouts fit.\n\nWhich do you prefer?\n\n- Tabs on top\n- Tabs on the side"
+                        .into(),
+            })
+            .item("a1"),
+        );
+        view.apply(&Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        }));
+        view.apply(
+            &Envelope::new(Event::QuestionRequested {
+                source: agent_core::event::QuestionSource::Reply,
+                questions: vec![Question {
+                    id: "reply".into(),
+                    header: "Quick replies".into(),
+                    question: "Which do you prefer?".into(),
+                    options: ["Tabs on top", "Tabs on the side"]
+                        .iter()
+                        .map(|o| QuestionOption {
+                            label: (*o).into(),
+                            description: None,
+                        })
+                        .collect(),
+                    multi_select: false,
+                }],
+            })
+            .request(request),
+        );
+        crate::testutil::settle(&ctx);
+    };
+    let chips = || -> Vec<gtk4::Button> {
+        crate::testutil::descendants(view.upcast_ref())
+            .into_iter()
+            .filter(|w| w.has_css_class("quick-reply") && w.is_mapped())
+            .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+            .collect()
+    };
+    let action = |title: &str| -> gtk4::Button {
+        crate::testutil::descendants(view.upcast_ref())
+            .into_iter()
+            .filter(|w| w.has_css_class("quick-reply-action") && w.is_mapped())
+            .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+            .find(|b| b.label().as_deref() == Some(title))
+            .unwrap_or_else(|| panic!("no {title} button"))
+    };
+
+    offer("reply:a1");
+    assert_eq!(chips().len(), 2, "one chip per option");
+    assert!(
+        !inner.interruption.revealer.reveals_child(),
+        "a reply question never takes the shelf"
+    );
+    assert!(
+        !matches!(
+            inner.model.borrow().activity(false),
+            model::Activity::NeedsAnswer
+        ),
+        "a reply question is not a needed answer"
+    );
+    crate::testutil::capture_window(&window, "quick-replies");
+
+    chips()
+        .into_iter()
+        .find(|c| c.tooltip_text().as_deref() == Some("Tabs on the side"))
+        .expect("the second option's chip")
+        .emit_clicked();
+    crate::testutil::settle(&ctx);
+    assert_eq!(inner.composer.text(), "Tabs on the side");
+    assert!(
+        inner.composer.cursor_at_end(),
+        "the cursor follows the text"
+    );
+    assert!(backend.sent.borrow().is_empty(), "a click sends nothing");
+    assert_eq!(
+        chips().len(),
+        2,
+        "the chips stay until a prompt, a turn or Dismiss"
+    );
+
+    action("Dismiss").emit_clicked();
+    crate::testutil::settle(&ctx);
+    assert!(chips().is_empty());
+    assert!(backend.sent.borrow().is_empty());
+    assert!(actions.borrow().is_empty(), "Dismiss changes no setting");
+
+    offer("reply:a2");
+    action("Don\u{2019}t suggest these").emit_clicked();
+    crate::testutil::settle(&ctx);
+    assert!(chips().is_empty());
+    assert_eq!(&*actions.borrow(), &["StopQuickReplies".to_owned()]);
+
+    // A new turn takes chips away without a click.
+    offer("reply:a3");
+    view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+    crate::testutil::settle(&ctx);
+    assert!(chips().is_empty());
+    window.destroy();
+}

@@ -860,7 +860,9 @@ thread_local! {
 /// ~/.config of whoever runs them.
 #[cfg(not(test))]
 fn initial_config() -> crate::config::TerminalConfig {
-    crate::config::TerminalConfig::load()
+    let config = crate::config::TerminalConfig::load();
+    crate::config::mirror_quick_replies(config.suggest_quick_replies);
+    config
 }
 
 #[cfg(test)]
@@ -1198,6 +1200,7 @@ impl AgentTerminalWindow {
             old.default_profile != new.default_profile || old.profiles != new.profiles
         };
         *self.config.borrow_mut() = *new;
+        crate::config::mirror_quick_replies(self.config.borrow().suggest_quick_replies);
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
@@ -3251,6 +3254,15 @@ impl AgentTerminalWindow {
         self.pending_save.replace(Some(source));
     }
 
+    /// Turns quick replies on or off: the setting, the copy chat sessions read, and the file.
+    fn set_quick_replies(&self, on: bool) {
+        if self.config.borrow().suggest_quick_replies != on {
+            self.config.borrow_mut().suggest_quick_replies = on;
+            self.schedule_config_save();
+        }
+        crate::config::mirror_quick_replies(on);
+    }
+
     /// Cancels a queued save and writes immediately, if one was pending.
     fn flush_pending_save(&self) {
         if let Some(pending) = self.pending_save.borrow_mut().take() {
@@ -3652,6 +3664,16 @@ impl AgentTerminalWindow {
             .active(config.reopen_last_thread)
             .build();
 
+        let quick_replies_row = adw::SwitchRow::builder()
+            .title("Suggest quick replies when a reply ends with a question")
+            .subtitle(
+                "Codex and Antigravity: when a reply ends with a question and a short list of \
+                 choices, offer the choices under the reply. Choosing one fills the message box; \
+                 nothing is sent until you press Enter",
+            )
+            .active(config.suggest_quick_replies)
+            .build();
+
         let skip_animation_row = adw::SwitchRow::builder()
             .title("Skip Load Animation")
             .subtitle("Show the window as soon as it is ready, without the logo intro")
@@ -3728,6 +3750,9 @@ impl AgentTerminalWindow {
         notifications.add(&notify_row);
         notifications.add(&notify_quota_row);
         general.add(&notifications);
+        let replies = adw::PreferencesGroup::builder().title("Replies").build();
+        replies.add(&quick_replies_row);
+        general.add(&replies);
         dialog.add(&general);
 
         self.add_agents_page(&dialog);
@@ -3902,6 +3927,12 @@ impl AgentTerminalWindow {
                 imp.config.borrow_mut().reopen_last_thread = row.is_active();
                 imp.schedule_config_save();
             }
+        ));
+
+        quick_replies_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| obj.imp().set_quick_replies(row.is_active())
         ));
 
         skip_animation_row.connect_active_notify(glib::clone!(

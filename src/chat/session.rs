@@ -35,6 +35,7 @@ use gtk4::glib;
 use tracing::{debug, info, warn};
 
 mod agy_transcript;
+mod reply_questions;
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
@@ -231,6 +232,8 @@ struct Inner {
     /// What Codex was allowed for its session (`scope: "session"`), said plainly; held by the
     /// app-server process, so forgotten when it ends.
     codex_grants: RefCell<Vec<String>>,
+    /// What the current turn said, for the quick replies offered when it completes.
+    reply_turn: RefCell<reply_questions::ReplyTurn>,
 }
 
 /// What the session decided about one Codex permission request.
@@ -442,6 +445,7 @@ impl ChatSession {
             thinking: ThinkingFlag::default(),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
+            reply_turn: RefCell::default(),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -586,10 +590,15 @@ impl Inner {
             warn!(error = %e, "could not persist an event");
         }
         self.apply(&env);
+        self.reply_turn.borrow_mut().observe(&env);
         // Every event is masked on the way to the view (not only approvals: tool input and
         // output, errors, notices and questions carry secrets too); the rules judged the real
         // call. A secret split across two streaming deltas is only caught at persistence.
+        let turn_ended = matches!(env.event, Event::TurnCompleted { .. }).then(|| env.clone());
         (self.sink)(&crate::approval_server::masked_for_view(env));
+        if let Some(ended) = turn_ended {
+            self.offer_reply_question(&ended);
+        }
     }
 
     /// Delivers without persisting (the store already has it).
