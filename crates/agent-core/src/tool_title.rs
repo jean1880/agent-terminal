@@ -324,10 +324,11 @@ pub fn display_command(command: &str) -> String {
     wrapper_body_for_display(command).unwrap_or_else(|| command.trim().to_owned())
 }
 
-/// The one shell-wrapper shape that is ever unwrapped: `sh|bash|zsh` (bare, `/bin/` or
-/// `/usr/bin/`) then `-c` or `-lc` (Codex runs every command as `/usr/bin/zsh -lc '…'`). The
-/// single definition: the app's fail-closed `always_allow::unwrap_shell_wrapper` (rules) and
-/// [`wrapper_body_for_display`] (titles) both judge the shape by it.
+/// The system shell-wrapper shape: `sh|bash|zsh` (bare, `/bin/` or `/usr/bin/`) then `-c` or
+/// `-lc` (Codex runs every command as `/usr/bin/zsh -lc '…'`). [`wrapper_body_for_display`]
+/// (titles) judges by it alone; the app's fail-closed `always_allow::unwrap_shell_wrapper`
+/// (rules) also accepts the account's own login shell by its exact path, which this crate,
+/// doing no I/O, cannot know.
 pub fn is_strict_wrapper(shell: &str, flag: &str) -> bool {
     let known = ["", "/bin/", "/usr/bin/"].iter().any(|dir| {
         shell

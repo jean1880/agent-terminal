@@ -138,13 +138,56 @@ fn is_wrapped(tokens: &[String]) -> bool {
 }
 
 /// The quoted body of the one wrapper shape that is unwrapped
-/// ([`agent_core::tool_title::is_strict_wrapper`], shared with the card titles), then exactly
-/// one argument.
-fn strict_wrapper_body(tokens: &[String]) -> Option<&str> {
+/// ([`agent_core::tool_title::is_strict_wrapper`], shared with the card titles, or the account's
+/// own login shell, [`login_shells`]), then exactly one argument.
+fn strict_wrapper_body_with<'a>(tokens: &'a [String], login: &[PathBuf]) -> Option<&'a str> {
     let [shell, flag, body] = tokens else {
         return None;
     };
-    agent_core::tool_title::is_strict_wrapper(shell, flag).then_some(body.as_str())
+    let login_wrapper =
+        (flag == "-c" || flag == "-lc") && login.iter().any(|s| s.as_os_str() == shell.as_str());
+    (agent_core::tool_title::is_strict_wrapper(shell, flag) || login_wrapper)
+        .then_some(body.as_str())
+}
+
+/// The account's login shell from passwd, and the file it leads to: the shells outside `/bin`
+/// and `/usr/bin` whose `-c`/`-lc` wrapper is unwrapped, because Codex wraps every command in
+/// the user's own shell (`/home/linuxbrew/.linuxbrew/bin/zsh -lc '…'`, Nix's
+/// `/run/current-system/sw/bin/bash -lc '…'`). Matched by exact absolute path only: a command
+/// naming some other `…/bash` is not the user's shell. Read once; empty under test.
+fn login_shells() -> &'static [PathBuf] {
+    static SHELLS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    SHELLS.get_or_init(|| {
+        if cfg!(test) {
+            return Vec::new();
+        }
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        login_shell(uid)
+            .map(|shell| trusted_login_shells(Path::new(&shell)))
+            .unwrap_or_default()
+    })
+}
+
+/// [`login_shells`] for a passwd shell: it and its canonical file, each kept only when absolute
+/// and named `sh`, `bash` or `zsh` (the shells Codex wraps with `-c`/`-lc`).
+fn trusted_login_shells(shell: &Path) -> Vec<PathBuf> {
+    let posix = |p: &Path| {
+        p.is_absolute()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| ["sh", "bash", "zsh"].contains(&n))
+    };
+    let mut out = Vec::new();
+    for candidate in [Some(shell.to_owned()), std::fs::canonicalize(shell).ok()]
+        .into_iter()
+        .flatten()
+    {
+        if posix(&candidate) && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 /// The command line a strict shell wrapper runs (`/usr/bin/zsh -lc 'ls -la'` gives `ls -la`), or
@@ -156,8 +199,13 @@ fn strict_wrapper_body(tokens: &[String]) -> Option<&str> {
 /// non-ASCII whitespace, apply inside the quotes too) and may not be a wrapper; otherwise `None`,
 /// and the dialog never prefills a command no rule could hold.
 pub fn unwrap_shell_wrapper(command: &str) -> Option<String> {
+    unwrap_shell_wrapper_with(command, login_shells())
+}
+
+/// [`unwrap_shell_wrapper`] with `login` as the account's login shells ([`login_shells`]).
+fn unwrap_shell_wrapper_with(command: &str, login: &[PathBuf]) -> Option<String> {
     let tokens = simple_command_tokens(command)?;
-    let body = strict_wrapper_body(&tokens)?;
+    let body = strict_wrapper_body_with(&tokens, login)?;
     let inner = simple_command_tokens(body)?;
     (!is_wrapped(&inner)).then(|| body.to_owned())
 }
@@ -167,11 +215,16 @@ pub fn unwrap_shell_wrapper(command: &str) -> Option<String> {
 /// a wrapper itself). Any other wrapped command (`bash -c "…"` with options, `sh -ec`, a wrapper
 /// inside a wrapper) is `None`: it never auto-matches.
 pub fn command_tokens(command: &str) -> Option<Vec<String>> {
+    command_tokens_with(command, login_shells())
+}
+
+/// [`command_tokens`] with `login` as the account's login shells ([`login_shells`]).
+fn command_tokens_with(command: &str, login: &[PathBuf]) -> Option<Vec<String>> {
     let tokens = simple_command_tokens(command)?;
     if !is_wrapped(&tokens) {
         return Some(tokens);
     }
-    simple_command_tokens(&unwrap_shell_wrapper(command)?)
+    simple_command_tokens(&unwrap_shell_wrapper_with(command, login)?)
 }
 
 /// Whether `text` carries something [`agent_core::redact`] would mask.
@@ -2241,8 +2294,9 @@ fn group_members(gid: u32) -> Option<Vec<String>> {
     }
 }
 
-/// The user name of `uid` (`None`: the lookup failed).
-fn user_name(uid: u32) -> Option<String> {
+/// One string field of `uid`'s passwd entry, picked by `field` (`None`: the lookup failed or
+/// the field is empty).
+fn passwd_field(uid: u32, field: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
     let mut size = 16 * 1024;
     loop {
         let mut buf = vec![0 as libc::c_char; size];
@@ -2256,16 +2310,26 @@ fn user_name(uid: u32) -> Option<String> {
             size *= 4;
             continue;
         }
-        if rc != 0 || result.is_null() || pw.pw_name.is_null() {
+        let ptr = field(&pw);
+        if rc != 0 || result.is_null() || ptr.is_null() {
             return None;
         }
-        // SAFETY: pw_name points into `buf`, NUL-terminated.
-        return Some(
-            unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }
-                .to_string_lossy()
-                .into_owned(),
-        );
+        // SAFETY: the field points into `buf`, NUL-terminated.
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        return (!text.is_empty()).then_some(text);
     }
+}
+
+/// The user name of `uid` (`None`: the lookup failed).
+fn user_name(uid: u32) -> Option<String> {
+    passwd_field(uid, |pw| pw.pw_name)
+}
+
+/// The login shell of `uid` as passwd records it (`None`: the lookup failed).
+fn login_shell(uid: u32) -> Option<String> {
+    passwd_field(uid, |pw| pw.pw_shell)
 }
 
 /// Where a `.rules` entry (or the rules folder, `dir`) leads: the entry itself when it is not a
@@ -3901,6 +3965,70 @@ mod tests {
         ] {
             assert!(!rule.matches(&shell(refused), &c), "{refused}");
         }
+    }
+
+    /// Codex wraps commands in the user's own login shell, wherever it lives (Linuxbrew, Nix,
+    /// `/usr/local`). That exact shell, from passwd, and the file it leads to unwrap like a
+    /// system shell; any other path ending in `bash` or `zsh` still does not, so it never matches.
+    #[test]
+    fn the_accounts_own_login_shell_unwraps_wherever_it_lives() {
+        let brew = vec![PathBuf::from("/home/linuxbrew/.linuxbrew/bin/zsh")];
+        let wrapped = "/home/linuxbrew/.linuxbrew/bin/zsh -lc 'git status --short'";
+        assert_eq!(
+            command_tokens_with(wrapped, &[]),
+            None,
+            "unknown without it"
+        );
+        assert_eq!(
+            command_tokens_with(wrapped, &brew).expect("login shell"),
+            ["git", "status", "--short"]
+        );
+        assert_eq!(
+            unwrap_shell_wrapper_with("/home/linuxbrew/.linuxbrew/bin/zsh -c 'ls -la'", &brew)
+                .as_deref(),
+            Some("ls -la"),
+            "-c too, as Codex sends without a login shell"
+        );
+        for refused in [
+            "/tmp/x/zsh -lc 'git status'",
+            "/home/linuxbrew/.linuxbrew/bin/zsh -ic 'git status'",
+            "/home/linuxbrew/.linuxbrew/bin/zsh -lc 'ls; id'",
+            "/home/linuxbrew/.linuxbrew/bin/zsh -lc \"bash -c 'ls'\"",
+            "/home/linuxbrew/.linuxbrew/bin/zsh -l -c 'ls'",
+        ] {
+            assert_eq!(command_tokens_with(refused, &brew), None, "{refused}");
+        }
+
+        // A Nix-style link: the passwd path and the file it leads to are both the user's shell.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = tmp.path().join("store-bash-5.2").join("bin");
+        std::fs::create_dir_all(&store).expect("store");
+        std::fs::write(store.join("bash"), "").expect("bash");
+        let profile = tmp.path().join("sw").join("bin");
+        std::fs::create_dir_all(&profile).expect("profile");
+        std::os::unix::fs::symlink(store.join("bash"), profile.join("bash")).expect("link");
+        let trusted = trusted_login_shells(&profile.join("bash"));
+        assert_eq!(trusted.len(), 2, "{trusted:?}");
+        for shell in &trusted {
+            let line = format!("{} -lc 'cat README.md'", shell.display());
+            assert_eq!(
+                command_tokens_with(&line, &trusted).expect("unwraps"),
+                ["cat", "README.md"]
+            );
+        }
+        // Only the shells Codex wraps with -c, and only absolute paths.
+        for odd in ["/usr/bin/fish", "/bin/tcsh", "zsh", "/usr/sbin/nologin"] {
+            assert!(trusted_login_shells(Path::new(odd)).is_empty(), "{odd}");
+        }
+    }
+
+    /// The real lookup reads this account's passwd entry (read-only).
+    #[test]
+    fn the_login_shell_comes_from_passwd() {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        assert!(login_shell(uid).is_some_and(|s| !s.is_empty()));
+        assert_eq!(login_shell(u32::MAX - 7), None, "no such user");
     }
 
     /// The one unwrap (W2's `unwrap_shell_wrapper`, which `dialog_prefill` and `command_tokens`
