@@ -182,23 +182,25 @@ fn env_file_ok(text: &str) -> bool {
     text.is_empty() || std::path::Path::new(&crate::utils::expand_tilde(text)).is_file()
 }
 
-/// Where Codex's rules are, resolved as the Codex threads would ([`crate::codex_home`]: the
-/// Codex profile's env file, then `clear_env`, then the app's own variable), with the binary
-/// that checks an export. Off the main thread (the env file is sourced by a shell). `Err`: why
-/// it cannot be known (always under test: no test reads the real `~/.codex`).
+/// Where Codex's rules are, in the environment a Codex thread gets ([`crate::codex_home`]: the
+/// app's environment minus `clear_env`, the shell `PATH`, then the Codex profile's env file),
+/// with the binary that checks the rules. Off the main thread (the env file is sourced by a
+/// shell). `Err`: why it cannot be known.
 async fn codex_target(
     (profile, clear): (Profile, Vec<String>),
 ) -> Result<crate::always_allow::CodexTarget, String> {
-    let Some((inherited, home)) = crate::codex_home::process_inputs() else {
-        return Err("Codex's folder is not resolved under test".to_owned());
-    };
     let resolved = super::threads::resolve_agent(profile).await;
-    let home =
-        crate::codex_home::resolve(&resolved.env, &clear, inherited.as_deref(), home.as_deref())?;
+    let env = crate::codex_home::child_env(&crate::codex_home::Inputs {
+        inherited: crate::codex_home::process_env(),
+        shell_path: crate::utils::known_shell_path().map(str::to_owned),
+        env_file: resolved.env,
+        clear,
+    });
+    let home = crate::codex_home::resolve(&env)?;
     Ok(crate::always_allow::CodexTarget {
         home,
         program: resolved.program.map(std::path::PathBuf::from),
-        env: resolved.env,
+        env,
     })
 }
 
@@ -693,14 +695,16 @@ impl AgentTerminalWindow {
                             let target = codex.as_ref().ok();
                             let status = rules.check_sync_status(None, &sources, target);
                             let available = target.is_some_and(|t| t.available());
-                            let plan = rules.codex_plan();
-                            let warning = crate::always_allow::export_warning(
-                                target.filter(|_| available).map(|t| (t, &plan)),
-                            );
-                            let described = match &codex {
+                            let warning = rules.export_warning_for(target);
+                            let mut described = match &codex {
                                 Ok(t) => t.describe(),
                                 Err(reason) => format!("Codex's rules folder is unknown: {reason}"),
                             };
+                            if let Some(reason) = &status.codex_refused {
+                                described.push_str(&format!(
+                                    ". Codex's own rules are not imported: {reason}"
+                                ));
+                            }
                             (
                                 rules.rules.len(),
                                 blocked,
@@ -1132,10 +1136,7 @@ impl AgentTerminalWindow {
                     .map(|e| crate::always_allow::blocked_notice(&target, e));
                 let rules = opened.unwrap_or_default();
                 let status = rules.check_sync_status(None, &sources, codex.as_ref());
-                let plan = rules.codex_plan();
-                let warning = crate::always_allow::export_warning(
-                    codex.as_ref().filter(|t| t.available()).map(|t| (t, &plan)),
-                );
+                let warning = rules.export_warning_for(codex.as_ref());
                 (rules, blocked, status, warning)
             })
             .await;

@@ -5,13 +5,23 @@
 //! pattern position may be a list of alternatives and a match is always a prefix match. The
 //! reader understands exactly that: string literals (either quote, standard escapes), lists of
 //! strings, keyword arguments in any order (the pattern may also come first, positionally), and
-//! comments. Anything more (a variable, concatenation, another call, a raw or triple-quoted
-//! string as a value) skips that rule. A file Codex itself could not parse (a bad escape, an
-//! unterminated string, unbalanced brackets), or one that could rebind `prefix_rule`, is broken
-//! as a whole: nothing in it is used. The reader parses text; it never evaluates anything.
+//! comments, plus `host_executable(name=..., paths=[...])`. A rule's inline `match` and
+//! `not_match` examples are checked under prefix semantics, as Codex checks them when it loads
+//! the file. Anything more (a variable, concatenation, another call, a raw or triple-quoted
+//! string as a value, an unknown keyword) makes that call unreadable. A file the reader cannot
+//! vouch for as a whole (an unterminated string, unbalanced brackets, an escape outside the
+//! standard set, a character outside strings that is not Starlark, or one that could rebind
+//! `prefix_rule`) is broken: nothing in it is used. This is conservative: Codex keeps an unknown
+//! escape such as `\q` literally, the reader does not take the file. The reader parses text; it
+//! never evaluates anything.
+//!
+//! Codex discards its whole rules policy when any file fails to load, so the caller treats an
+//! unreadable call, an unread statement or a broken file as a reason to import nothing.
 //!
 //! The writer emits only printable-ASCII tokens through a dedicated escaper: an escape Starlark
 //! rejects (`{:?}` writes `\u{…}`) would make Codex refuse every rule, the user's own included.
+//! Every exported program is pinned with `host_executable`, so a program of the same name
+//! elsewhere (a model-written `./cat`) never matches when Codex resolves host executables.
 
 /// The one file export writes, beside the user's own rules.
 pub const EXPORT_FILE: &str = "agent-terminal.rules";
@@ -37,11 +47,20 @@ pub struct PrefixRule {
     pub decision: Decision,
 }
 
+/// One `host_executable` call: the absolute paths a bare program name may resolve to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostExecutable {
+    pub name: String,
+    pub paths: Vec<String>,
+}
+
 /// What a rules file holds, as far as the reader understands it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parsed {
     /// The rules read in full.
     pub rules: Vec<PrefixRule>,
+    /// The `host_executable` calls read in full.
+    pub hosts: Vec<HostExecutable>,
     /// `prefix_rule` calls that use more than the subset (or expand past
     /// [`MAX_COMBINATIONS`]), skipped.
     pub unreadable: usize,
@@ -52,9 +71,16 @@ pub struct Parsed {
     pub broken: bool,
 }
 
-/// Whether `token` may appear in an exported (or imported) rule: non-empty, printable ASCII.
+/// Whether `token` may appear in an exported (or imported) rule: non-empty, printable ASCII
+/// with no space (a word holding a space reads as two words to anyone checking the rule by
+/// eye, and agent-terminal never relies on one).
 pub fn plain_token(token: &str) -> bool {
-    !token.is_empty() && token.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    !token.is_empty() && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// Printable ASCII, spaces included (an example's words, which are never exported).
+fn printable(text: &str) -> bool {
+    text.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
 /// `token` as a double-quoted Starlark string literal, or `None` when it is not a
@@ -75,12 +101,39 @@ pub fn escape(token: &str) -> Option<String> {
     Some(out)
 }
 
-/// The whole of [`EXPORT_FILE`] for these argv prefixes: [`HEADER`], then one
+/// Whether `host` is one Codex accepts: a bare name, and absolute paths whose basename is that
+/// name, all plain tokens.
+fn valid_host(host: &HostExecutable) -> bool {
+    plain_token(&host.name)
+        && !host.name.contains('/')
+        && !host.paths.is_empty()
+        && host.paths.iter().all(|p| {
+            plain_token(p) && p.starts_with('/') && p.rsplit('/').next() == Some(host.name.as_str())
+        })
+}
+
+/// The whole of [`EXPORT_FILE`] for these argv prefixes: [`HEADER`], one
+/// `host_executable(name=..., paths=[...])` per pinned program, then one
 /// `prefix_rule(pattern=[...], decision="allow", justification="agent-terminal")` per rule. No
-/// rules gives the header alone (so removed rules stop applying). `None` when a rule is empty
-/// or holds a token [`escape`] refuses.
-pub fn render(rules: &[Vec<String>]) -> Option<String> {
+/// rules gives the header alone (so removed rules stop applying). `None` when a rule is empty,
+/// holds a token [`escape`] refuses, or a host is not one Codex accepts.
+pub fn render(rules: &[Vec<String>], hosts: &[HostExecutable]) -> Option<String> {
     let mut out = format!("{HEADER}\n");
+    for host in hosts {
+        if !valid_host(host) {
+            return None;
+        }
+        let paths = host
+            .paths
+            .iter()
+            .map(|p| escape(p))
+            .collect::<Option<Vec<_>>>()?;
+        out.push_str(&format!(
+            "host_executable(name={}, paths=[{}])\n",
+            escape(&host.name)?,
+            paths.join(", ")
+        ));
+    }
     for rule in rules {
         if rule.is_empty() {
             return None;
@@ -321,7 +374,7 @@ enum Value {
 pub fn parse(text: &str) -> Parsed {
     let broken = |text: &str| Parsed {
         broken: true,
-        unreadable: text.matches("prefix_rule").count().max(1),
+        unreadable: text.matches(PREFIX_RULE).count().max(1),
         ..Parsed::default()
     };
     let Some(statements) = statements(text) else {
@@ -329,35 +382,47 @@ pub fn parse(text: &str) -> Parsed {
     };
     let mut parsed = Parsed::default();
     for (toks, col0) in statements {
-        let is_call = col0
-            && matches!(toks.first(), Some(Tok::Ident(n)) if n == "prefix_rule")
-            && toks.get(1) == Some(&Tok::Open('('));
-        if is_call {
-            match call(&toks) {
+        let callee = match (toks.first(), toks.get(1)) {
+            (Some(Tok::Ident(n)), Some(Tok::Open('('))) if col0 => Some(n.as_str()),
+            _ => None,
+        };
+        match callee {
+            Some(PREFIX_RULE) => match prefix_rule(&toks) {
                 Some(rule) => parsed.rules.push(rule),
                 None => parsed.unreadable += 1,
+            },
+            Some(HOST_EXECUTABLE) => match host_executable(&toks) {
+                Some(host) => parsed.hosts.push(host),
+                None => parsed.unreadable += 1,
+            },
+            _ => {
+                // Anything else that names either call could rebind it, or call it where the
+                // reader cannot see whether it runs (an indented block, a condition).
+                let mentions = toks.iter().any(|t| {
+                    matches!(t, Tok::Ident(n) | Tok::Str(n)
+                        if n == PREFIX_RULE || n == HOST_EXECUTABLE)
+                });
+                if mentions {
+                    return broken(text);
+                }
+                parsed.other += 1;
             }
-            continue;
         }
-        // Anything else that names prefix_rule could rebind it, or call it where the reader
-        // cannot see whether it runs (an indented block, a condition): nothing is trusted.
-        let mentions = toks
-            .iter()
-            .any(|t| matches!(t, Tok::Ident(n) | Tok::Str(n) if n == "prefix_rule"));
-        if mentions {
-            return broken(text);
-        }
-        parsed.other += 1;
     }
     parsed
 }
 
-/// A `prefix_rule(...)` statement (its tokens from the name on), or `None` when it uses more
-/// than the subset.
-fn call(toks: &[Tok]) -> Option<PrefixRule> {
+const PREFIX_RULE: &str = "prefix_rule";
+const HOST_EXECUTABLE: &str = "host_executable";
+
+/// A call's arguments (its tokens from the name on): keyword arguments named in `keywords`,
+/// each at most once, after positional ones that take the names in `positional` in order.
+/// `None` for anything else, an unknown keyword included (so a call has at most
+/// `keywords.len()` arguments), or for anything after the closing parenthesis.
+fn arguments(toks: &[Tok], keywords: &[&str], positional: &[&str]) -> Option<Vec<(String, Value)>> {
     let mut i = 2;
     let mut args: Vec<(String, Value)> = Vec::new();
-    let mut positional = true;
+    let mut by_position = true;
     loop {
         if toks.get(i)? == &Tok::Close(')') {
             i += 1;
@@ -366,14 +431,10 @@ fn call(toks: &[Tok]) -> Option<PrefixRule> {
         let name = match (toks.get(i)?, toks.get(i + 1)) {
             (Tok::Ident(name), Some(Tok::Eq)) => {
                 i += 2;
-                positional = false;
-                name.clone()
+                by_position = false;
+                keywords.iter().find(|k| **k == name)?.to_string()
             }
-            // Only the pattern may be positional, and only first.
-            _ if positional && args.is_empty() => {
-                positional = false;
-                "pattern".to_owned()
-            }
+            _ if by_position => positional.get(args.len())?.to_string(),
             _ => return None,
         };
         if args.iter().any(|(n, _)| *n == name) {
@@ -389,11 +450,21 @@ fn call(toks: &[Tok]) -> Option<PrefixRule> {
         }
     }
     // Nothing may follow the call (`prefix_rule(...) if x else y`, a chained call).
-    if i != toks.len() {
-        return None;
-    }
+    (i == toks.len()).then_some(args)
+}
+
+/// A `prefix_rule(...)` statement, or `None` when it uses more than the subset or one of its
+/// examples does not hold.
+fn prefix_rule(toks: &[Tok]) -> Option<PrefixRule> {
+    let args = arguments(
+        toks,
+        &["pattern", "decision", "justification", "match", "not_match"],
+        &["pattern"],
+    )?;
     let mut pattern = None;
     let mut decision = Decision::Allow;
+    let mut matches = Vec::new();
+    let mut not_matches = Vec::new();
     for (name, value) in args {
         match name.as_str() {
             "pattern" => pattern = Some(positions(&value)?),
@@ -410,26 +481,77 @@ fn call(toks: &[Tok]) -> Option<PrefixRule> {
                     return None;
                 }
             }
-            // Examples Codex checks when it loads the file; they change nothing it matches.
-            "match" | "not_match" => {
-                let Value::List(examples) = value else {
-                    return None;
-                };
-                for example in examples {
-                    match example {
-                        Value::Str(_) => {}
-                        Value::List(words) if words.iter().all(|w| matches!(w, Value::Str(_))) => {}
-                        Value::List(_) => return None,
-                    }
-                }
+            "match" => matches = examples(value)?,
+            "not_match" => not_matches = examples(value)?,
+            _ => return None,
+        }
+    }
+    let patterns = expand(&pattern?)?;
+    // Codex refuses the file when an example does not hold; the reader refuses the call.
+    let matched = |example: &Vec<String>| patterns.iter().any(|p| example.starts_with(p));
+    if !matches.iter().all(matched) || not_matches.iter().any(matched) {
+        return None;
+    }
+    Some(PrefixRule { patterns, decision })
+}
+
+/// A rule's examples: lists of words, or strings of plain words split at spaces (a string
+/// that needs shell quoting to split is not one the reader can vouch for).
+fn examples(value: Value) -> Option<Vec<Vec<String>>> {
+    let Value::List(items) = value else {
+        return None;
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::Str(s) => {
+                let plain = printable(&s) && !s.contains(['"', '\'', '\\']);
+                let words: Vec<String> = s
+                    .split(' ')
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                (plain && !words.is_empty()).then_some(words)
+            }
+            Value::List(words) => words
+                .into_iter()
+                .map(|w| match w {
+                    Value::Str(s) if !s.is_empty() && printable(&s) => Some(s),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|w| !w.is_empty()),
+        })
+        .collect()
+}
+
+/// A `host_executable(name, paths)` statement, or `None` unless Codex would accept it.
+fn host_executable(toks: &[Tok]) -> Option<HostExecutable> {
+    let args = arguments(toks, &["name", "paths"], &["name", "paths"])?;
+    let mut name = None;
+    let mut paths = None;
+    for (key, value) in args {
+        match (key.as_str(), value) {
+            ("name", Value::Str(s)) => name = Some(s),
+            ("paths", Value::List(items)) => {
+                paths = Some(
+                    items
+                        .into_iter()
+                        .map(|p| match p {
+                            Value::Str(s) => Some(s),
+                            Value::List(_) => None,
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                )
             }
             _ => return None,
         }
     }
-    Some(PrefixRule {
-        patterns: expand(&pattern?)?,
-        decision,
-    })
+    let host = HostExecutable {
+        name: name?,
+        paths: paths?,
+    };
+    valid_host(&host).then_some(host)
 }
 
 /// The value starting at `toks[i]`: a string, or a list of values (lists nest at most twice).
@@ -620,6 +742,21 @@ prefix_rule(pattern=["head"], decision="prompt")
             "prefix_rule(pattern=[\"\u{202e}\"])",
             "prefix_rule(pattern=[\"\\U0000202E\"])",
             r#"prefix_rule(pattern=[1])"#,
+            // Examples Codex checks at load time, under prefix semantics.
+            r#"prefix_rule(["cat"], not_match=["cat /etc/shadow"])"#,
+            r#"prefix_rule(["cat"], match=["ls x"])"#,
+            r#"prefix_rule(["cat"], match=[["cat"], ["ls"]])"#,
+            r#"prefix_rule(["echo"], match=["echo \"a b\""])"#,
+            r#"prefix_rule(["echo"], match=[""])"#,
+            // Unknown keywords end the call at once.
+            r#"prefix_rule(["ls"], x1=[], x2=[])"#,
+            // host_executable as Codex would refuse it.
+            r#"host_executable(name="cat", paths=["/usr/bin/ls"])"#,
+            r#"host_executable(name="/usr/bin/cat", paths=["/usr/bin/cat"])"#,
+            r#"host_executable(name="cat", paths=["cat"])"#,
+            r#"host_executable(name="cat", paths=[])"#,
+            r#"host_executable(name="cat")"#,
+            r#"host_executable(name="cat", paths=["/bin/cat"], extra=1)"#,
         ];
         for rule in skipped {
             let text = format!("{rule}\nprefix_rule(pattern=[\"ok\"])\n");
@@ -640,18 +777,105 @@ prefix_rule(pattern=["head"], decision="prompt")
 """A docstring."""
 X = ["ls"]
 load("other.star", "helper")
-host_executable(name="git", paths=["/usr/bin/git"])
-prefix_rule(pattern=["ls"])
+host_executable(name="git", paths=["/usr/bin/git", "/usr/local/bin/git"])
+host_executable("ls", ["/bin/ls"])
+prefix_rule(pattern=["ls"], match=["ls -la", ["ls", "a b"]], not_match=["lsof"])
 "#;
         let parsed = parse(text);
         assert!(!parsed.broken);
-        assert_eq!(parsed.other, 4);
+        assert_eq!(parsed.other, 3);
         assert_eq!(parsed.rules, vec![allow(&[&["ls"]])]);
+        assert_eq!(
+            parsed.hosts,
+            vec![
+                HostExecutable {
+                    name: "git".into(),
+                    paths: words(&["/usr/bin/git", "/usr/local/bin/git"])
+                },
+                HostExecutable {
+                    name: "ls".into(),
+                    paths: words(&["/bin/ls"])
+                }
+            ]
+        );
         assert_eq!(parsed.unreadable, 0);
     }
 
+    /// Hostile shapes: no panic, no quadratic blow-up, nothing read.
     #[test]
-    fn a_file_codex_cannot_parse_or_that_rebinds_the_call_is_broken() {
+    fn hostile_shapes_never_panic() {
+        let many_args = format!(
+            "prefix_rule([\"ls\"], {})",
+            (0..50_000)
+                .map(|i| format!("x{i}=[]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let started = std::time::Instant::now();
+        let parsed = parse(&many_args);
+        assert_eq!((parsed.rules.len(), parsed.unreadable), (0, 1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        for text in [
+            format!(
+                "prefix_rule(pattern={}\"a\"{})",
+                "[".repeat(100_000),
+                "]".repeat(100_000)
+            ),
+            format!("{}prefix_rule([\"ls\"])", "(".repeat(10_000)),
+            "prefix_rule([\"ls\"]) # ünïcödé comment is fine\n".to_owned(),
+            "ünïcödé\nprefix_rule([\"ls\"])".to_owned(),
+            "prefix_rule([\"ls\"], ✓=1)".to_owned(),
+            "\0\0\0".to_owned(),
+            "]]]]".to_owned(),
+            "prefix_rule(".repeat(1000),
+            "host_executable(name=\"a\", paths=[\"/a\"] * 100000)".to_owned(),
+        ] {
+            let parsed = parse(&text);
+            assert!(parsed.rules.len() <= 1, "{parsed:?}");
+        }
+        assert_eq!(
+            parse("prefix_rule([\"ls\"]) # ünïcödé comment is fine\n").rules,
+            vec![allow(&[&["ls"]])]
+        );
+    }
+
+    #[test]
+    fn exported_hosts_render_and_read_back() {
+        let hosts = vec![HostExecutable {
+            name: "cat".into(),
+            paths: words(&["/usr/bin/cat", "/usr/lib/cargo/bin/coreutils/cat"]),
+        }];
+        let text = render(&[words(&["cat"])], &hosts).expect("renders");
+        assert!(text.contains(
+            "host_executable(name=\"cat\", paths=[\"/usr/bin/cat\", \"/usr/lib/cargo/bin/coreutils/cat\"])"
+        ));
+        let parsed = parse(&text);
+        assert_eq!(parsed.hosts, hosts);
+        assert_eq!(parsed.rules, vec![allow(&[&["cat"]])]);
+        for bad in [
+            HostExecutable {
+                name: "cat".into(),
+                paths: words(&["/usr/bin/ls"]),
+            },
+            HostExecutable {
+                name: "cat".into(),
+                paths: words(&["relative/cat"]),
+            },
+            HostExecutable {
+                name: "c/at".into(),
+                paths: words(&["/c/at"]),
+            },
+            HostExecutable {
+                name: "cat".into(),
+                paths: vec![],
+            },
+        ] {
+            assert_eq!(render(&[], std::slice::from_ref(&bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_the_reader_cannot_vouch_for_or_that_rebinds_the_call_is_broken() {
         for text in [
             "prefix_rule(pattern=[\"a\\u{202e}\"])\nprefix_rule([\"ls\"])",
             "prefix_rule(pattern=[\"a\\q\"])\nprefix_rule([\"ls\"])",
@@ -665,6 +889,8 @@ prefix_rule(pattern=["ls"])
             "if True:\n    prefix_rule([\"bash\"])\nprefix_rule([\"ls\"])",
             "  prefix_rule([\"bash\"])\nprefix_rule([\"ls\"])",
             "f = prefix_rule\nf([\"bash\"])",
+            "h = host_executable\nprefix_rule([\"ls\"])",
+            "  host_executable(name=\"ls\", paths=[\"/bin/ls\"])\nprefix_rule([\"ls\"])",
             // After `;` a call may sit in a one-line block (`if x: a(); prefix_rule(…)`).
             "prefix_rule([\"ls\"]); prefix_rule([\"cat\"])",
             "if False: pass; prefix_rule([\"bash\"])",
@@ -710,16 +936,16 @@ y"])"#,
     fn the_escaper_round_trips_and_refuses_what_starlark_cannot_hold() {
         let tokens = words(&[
             "plain",
-            "a \"q\" b",
+            "a\"q\"b",
             "back\\slash",
             "'single'",
             "-x=1",
             "~/$HOME",
         ]);
         let quoted: Vec<String> = tokens.iter().map(|t| escape(t).expect(t)).collect();
-        assert_eq!(quoted[1], r#""a \"q\" b""#);
+        assert_eq!(quoted[1], r#""a\"q\"b""#);
         assert_eq!(quoted[2], r#""back\\slash""#);
-        let text = render(std::slice::from_ref(&tokens)).expect("renders");
+        let text = render(std::slice::from_ref(&tokens), &[]).expect("renders");
         assert_eq!(
             parse(&text).rules,
             vec![allow(&[&tokens
@@ -727,8 +953,16 @@ y"])"#,
                 .map(String::as_str)
                 .collect::<Vec<_>>()])]
         );
+        // SEC-09: a space never goes into a word, imported or exported.
+        assert!(!plain_token("a b"));
+        assert!(!plain_token(" "));
+        assert!(parse(r#"prefix_rule(pattern=["echo", "a b"])"#)
+            .rules
+            .is_empty());
         for refused in [
             "",
+            "a b",
+            " lead",
             "new\nline",
             "tab\t",
             "bidi\u{202e}",
@@ -737,18 +971,22 @@ y"])"#,
             "del\u{7f}",
         ] {
             assert_eq!(escape(refused), None, "{refused:?}");
-            assert_eq!(render(&[words(&["echo", refused])]), None, "{refused:?}");
+            assert_eq!(
+                render(&[words(&["echo", refused])], &[]),
+                None,
+                "{refused:?}"
+            );
         }
-        assert_eq!(render(&[vec![]]), None);
+        assert_eq!(render(&[vec![]], &[]), None);
     }
 
     #[test]
     fn an_empty_export_is_the_header_alone() {
-        let text = render(&[]).expect("renders");
+        let text = render(&[], &[]).expect("renders");
         assert_eq!(text, format!("{HEADER}\n"));
         let parsed = parse(&text);
         assert_eq!(parsed, Parsed::default());
-        let two = render(&[words(&["ls"]), words(&["git", "status"])]).expect("renders");
+        let two = render(&[words(&["ls"]), words(&["git", "status"])], &[]).expect("renders");
         assert_eq!(
             two,
             format!(
