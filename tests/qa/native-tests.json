@@ -9,5 +9,6 @@
   "chat::view::ux_tests::native_click_matrix",
   "chat::view::ux_tests::native_toasts_clear_the_composer",
   "chat::view::ux_tests::native_queue_stays_pinned_and_contained",
-  "window::imp::setup::tests::native_welcome_button_is_inside_the_dialog"
+  "window::imp::setup::tests::native_welcome_button_is_inside_the_dialog",
+  "window::imp::agents_prefs::tests::native_dropdown_rows_show_their_whole_value"
 ]

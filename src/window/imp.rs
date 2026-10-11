@@ -3585,6 +3585,8 @@ impl AgentTerminalWindow {
             .model(&theme_model)
             .selected(theme_index)
             .build();
+        Self::keep_value_whole(&theme_row);
+        Self::keep_value_whole(&cli_client_row);
 
         let setup_row = adw::ActionRow::builder()
             .title("Setup")
@@ -3633,6 +3635,7 @@ impl AgentTerminalWindow {
                     .unwrap_or(0) as u32,
             )
             .build();
+        Self::keep_value_whole(&cursor_row);
 
         let blink_row = adw::SwitchRow::builder()
             .title("Blinking Cursor")

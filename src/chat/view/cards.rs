@@ -2195,45 +2195,55 @@ pub(super) fn suggestion_flow(
         flow.insert(&b, -1);
     }
 
-    let buttons_rc = Rc::new(toggle_buttons);
-    for (b, pat) in buttons_rc.iter() {
-        let entry_clone = entry.clone();
-        let buttons_clone = buttons_rc.clone();
-        let in_sync_clone = in_sync.clone();
+    // Handlers hold the widgets weakly: the buttons and the entry each own the other's
+    // handler, so strong references would keep them all alive for good.
+    let weak_buttons: Rc<Vec<(glib::WeakRef<gtk4::ToggleButton>, String)>> = Rc::new(
+        toggle_buttons
+            .iter()
+            .map(|(b, pat)| (b.downgrade(), pat.clone()))
+            .collect(),
+    );
+    for (b, pat) in &toggle_buttons {
+        let entry = entry.downgrade();
+        let others = weak_buttons.clone();
+        let in_sync = in_sync.clone();
         let pattern = pat.clone();
 
         b.connect_toggled(move |btn| {
-            if in_sync_clone.get() {
+            let Some(entry) = entry.upgrade() else { return };
+            if in_sync.get() {
                 return;
             }
-            in_sync_clone.set(true);
+            in_sync.set(true);
             if btn.is_active() {
-                entry_clone.set_text(&pattern);
-                for (other_btn, other_pat) in buttons_clone.iter() {
-                    if other_pat != &pattern {
-                        other_btn.set_active(false);
+                entry.set_text(&pattern);
+                for (other, other_pat) in others.iter() {
+                    if let (Some(other), true) = (other.upgrade(), other_pat != &pattern) {
+                        other.set_active(false);
                     }
                 }
-            } else if entry_clone.text().trim() == pattern {
+            } else if entry.text().trim() == pattern {
                 btn.set_active(true);
             }
-            in_sync_clone.set(false);
+            in_sync.set(false);
         });
     }
 
     {
-        let buttons_clone = buttons_rc.clone();
-        let in_sync_clone = in_sync.clone();
+        let buttons = weak_buttons.clone();
+        let in_sync = in_sync.clone();
         entry.connect_changed(move |ent| {
-            if in_sync_clone.get() {
+            if in_sync.get() {
                 return;
             }
-            in_sync_clone.set(true);
+            in_sync.set(true);
             let current = ent.text().trim().to_string();
-            for (btn, pat) in buttons_clone.iter() {
-                btn.set_active(pat == &current);
+            for (btn, pat) in buttons.iter() {
+                if let Some(btn) = btn.upgrade() {
+                    btn.set_active(pat == &current);
+                }
             }
-            in_sync_clone.set(false);
+            in_sync.set(false);
         });
     }
 
