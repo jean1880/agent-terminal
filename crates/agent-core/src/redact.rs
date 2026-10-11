@@ -73,8 +73,150 @@ pub fn redact(text: &str) -> String {
         let line = redact_auth_schemes(&line);
         let line = redact_url_credentials(&line);
         let line = redact_flag_values(&line);
+        let line = redact_credential_options(&line);
         out.push_str(&redact_assignments(&line));
     }
+    out
+}
+
+/// `mask`, but never revealing a short value whole: four characters or fewer become `****`.
+fn mask_any(secret: &str) -> String {
+    if secret.chars().count() <= 4 {
+        "****".to_owned()
+    } else {
+        mask(secret)
+    }
+}
+
+/// Header names whose value is a credential (compared lowercased).
+const CREDENTIAL_HEADERS: &[&str] = &["cookie:", "x-api-key:", "proxy-authorization:"];
+
+/// Masks the value of a credential header (`Cookie: …`, `X-Api-Key: …`,
+/// `Proxy-Authorization: …`) up to its closing quote or the end of the line.
+fn redact_header_values(line: &str) -> String {
+    let mut out = line.to_owned();
+    for header in CREDENTIAL_HEADERS {
+        let mut from = 0;
+        // ASCII lower-casing keeps byte positions, so offsets found there are char boundaries.
+        while let Some(pos) = out.to_ascii_lowercase()[from..].find(header) {
+            let start = from + pos + header.len();
+            let value_start = start + out[start..].len() - out[start..].trim_start().len();
+            let value_end = out[value_start..]
+                .find(['\'', '"'])
+                .map_or(out.len(), |q| value_start + q);
+            let value = out[value_start..value_end].to_owned();
+            if value.is_empty() || value.starts_with("****") {
+                from = value_end.max(start);
+                continue;
+            }
+            let masked = mask_any(&value);
+            out.replace_range(value_start..value_end, &masked);
+            from = value_start + masked.len();
+        }
+    }
+    out
+}
+
+/// Masks credentials that command-line options carry: curl's `-u`/`--user`/`--proxy-user`
+/// `name:password` (the password part) and `--oauth2-bearer TOKEN`; `mysql`/`mariadb
+/// -pPASSWORD`; `sshpass -p PASSWORD`; and credential headers ([`redact_header_values`]).
+fn redact_credential_options(line: &str) -> String {
+    let line = redact_header_values(line);
+    let spans: Vec<(usize, usize)> = {
+        let mut spans = Vec::new();
+        let mut start = None;
+        for (i, b) in line.bytes().enumerate() {
+            match (b == b' ' || b == b'\t', start) {
+                (true, Some(s)) => {
+                    spans.push((s, i));
+                    start = None;
+                }
+                (false, None) => start = Some(i),
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            spans.push((s, line.len()));
+        }
+        spans
+    };
+    let word = |i: usize| spans.get(i).map(|&(s, e)| &line[s..e]);
+    let unquoted = |w: &str| w.trim_matches(|c| c == '\'' || c == '"').to_owned();
+    let names = |n: &[&str]| {
+        (0..spans.len())
+            .any(|i| word(i).is_some_and(|w| n.contains(&w.rsplit('/').next().unwrap_or(w))))
+    };
+    let db = names(&["mysql", "mariadb", "mysqldump"]);
+    let sshpass = names(&["sshpass"]);
+    // (byte range in `line`, replacement)
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    // Masks what follows the first ':' of the word at `i` (`user:password`).
+    let after_colon = |i: usize, skip: usize, edits: &mut Vec<(usize, usize, String)>| {
+        let Some(&(s, e)) = spans.get(i) else { return };
+        let w = &line[s + skip..e];
+        let core = unquoted(w);
+        if let Some(colon) = core.find(':') {
+            let secret = &core[colon + 1..];
+            if !secret.is_empty() && !secret.starts_with("****") {
+                let at = s + skip + w.find(secret).unwrap_or(0);
+                edits.push((at, at + secret.len(), mask_any(secret)));
+            }
+        }
+    };
+    let whole = |i: usize, skip: usize, edits: &mut Vec<(usize, usize, String)>| {
+        let Some(&(s, e)) = spans.get(i) else { return };
+        let w = &line[s + skip..e];
+        let core = unquoted(w);
+        if !core.is_empty() && !core.starts_with("****") {
+            let at = s + skip + w.find(core.as_str()).unwrap_or(0);
+            edits.push((at, at + core.len(), mask_any(&core)));
+        }
+    };
+    for i in 0..spans.len() {
+        let w = word(i).unwrap_or_default();
+        match w {
+            "-u" | "--user" | "--proxy-user" => after_colon(i + 1, 0, &mut edits),
+            "--oauth2-bearer" => whole(i + 1, 0, &mut edits),
+            "-p" if sshpass => whole(i + 1, 0, &mut edits),
+            _ => {
+                if let Some(eq) = ["--user=", "--proxy-user="]
+                    .iter()
+                    .find(|o| w.starts_with(**o))
+                {
+                    after_colon(i, eq.len(), &mut edits);
+                } else if w.starts_with("--oauth2-bearer=") {
+                    whole(i, "--oauth2-bearer=".len(), &mut edits);
+                } else if w.starts_with("-u")
+                    && !w.starts_with("--")
+                    && w.len() > 2
+                    && w.contains(':')
+                {
+                    after_colon(i, 2, &mut edits);
+                } else if (db || sshpass)
+                    && w.starts_with("-p")
+                    && w.len() > 2
+                    && !w.starts_with("--")
+                {
+                    whole(i, 2, &mut edits);
+                }
+            }
+        }
+    }
+    if edits.is_empty() {
+        return line;
+    }
+    edits.sort_by_key(|(s, _, _)| *s);
+    let mut out = String::with_capacity(line.len());
+    let mut copied = 0;
+    for (s, e, replacement) in edits {
+        if s < copied {
+            continue;
+        }
+        out.push_str(&line[copied..s]);
+        out.push_str(&replacement);
+        copied = e;
+    }
+    out.push_str(&line[copied..]);
     out
 }
 
@@ -380,6 +522,56 @@ mod tests {
         assert!(out.contains("****0123"), "{out}");
         assert!(!out.contains("AIzaSyA123"), "{out}");
         assert!(out.contains("****efgh"), "{out}");
+    }
+
+    /// C4: credentials carried by command-line options and headers are masked in live text.
+    #[test]
+    fn credential_options_and_headers_are_masked() {
+        for (text, leaked) in [
+            ("curl -u alice:s3cr3tpass https://x", "s3cr3tpass"),
+            ("curl --user alice:s3cr3tpass https://x", "s3cr3tpass"),
+            ("curl --user=alice:s3cr3tpass https://x", "s3cr3tpass"),
+            ("curl -ualice:s3cr3tpass https://x", "s3cr3tpass"),
+            ("curl --proxy-user bob:pr0xypass1 https://x", "pr0xypass1"),
+            (
+                "curl --oauth2-bearer tok123456789abc https://x",
+                "tok123456789abc",
+            ),
+            (
+                "curl -H 'Cookie: session=abcdef123456' https://x",
+                "abcdef123456",
+            ),
+            (
+                "curl -H \"X-Api-Key: k1234567890\" https://x",
+                "k1234567890",
+            ),
+            (
+                "curl --header 'Proxy-Authorization: Basic Zm9vOmJhcg==' https://x",
+                "Zm9vOmJhcg",
+            ),
+            ("mysql -u root -pHunter2pass db", "Hunter2pass"),
+            ("mariadb -pHunter2pass", "Hunter2pass"),
+            ("sshpass -p hunter22secret ssh host", "hunter22secret"),
+            ("wget --http-password=topsecret1 https://x", "topsecret1"),
+            ("wget --password topsecret1 https://x", "topsecret1"),
+            ("psql postgres://app:dbpass99@db/app", "dbpass99"),
+        ] {
+            let out = redact(text);
+            assert!(!out.contains(leaked), "{text} leaked: {out}");
+            assert!(out.contains("****"), "{out}");
+        }
+        // Short passwords are never shown whole.
+        assert!(!redact("curl -u a:pw1 https://x").contains("pw1"));
+        // Look-alikes stay readable.
+        for text in [
+            "sort -u names.txt",
+            "mkdir -p build/out",
+            "git log -p",
+            "grep -u: x",
+            "curl -H 'Accept: text/html' https://x",
+        ] {
+            assert_eq!(redact(text), text);
+        }
     }
 
     #[test]
