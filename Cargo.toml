@@ -13,6 +13,8 @@ homepage = "https://github.com/jean1880/agent-terminal"
 readme = "README.md"
 keywords = ["gtk4", "libadwaita", "ai", "claude", "terminal"]
 categories = ["gui", "development-tools"]
+# Shipped as distribution packages, never to crates.io (its path crates are unpublished too).
+publish = false
 
 [workspace]
 # The root package is the GTK app; the pure and git logic live in crates/.

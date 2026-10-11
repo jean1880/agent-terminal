@@ -1,0 +1,40 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/), checked in CI by
+# .github/workflows/cargo-deny.yml. Locally: `cargo deny check`.
+
+[graph]
+# The shipped binary only targets Linux; Windows- or macOS-only crates never reach it.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+# Every RustSec vulnerability fails; unmaintained and yanked crates fail too, but only for the
+# crates we depend on directly or transitively.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences compatible with shipping an MIT binary. A new licence in the tree fails the
+# check until it is reviewed and added here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# The gtk-rs stack and its transitive tree carry a few duplicate versions; report them without
+# failing. Wildcard version requirements are refused outright, except our own path crates.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

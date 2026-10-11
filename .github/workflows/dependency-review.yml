@@ -1,0 +1,23 @@
+name: Dependency review
+
+# Fails a pull request that adds a dependency with a known vulnerability (moderate or worse),
+# and summarises the dependency changes on the PR.
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure

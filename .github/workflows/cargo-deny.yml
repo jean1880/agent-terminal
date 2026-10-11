@@ -1,0 +1,34 @@
+name: cargo-deny
+
+# Supply-chain policy from deny.toml. Licences, bans and sources only change when Cargo.lock
+# does, so that job gates PRs. Advisories change underneath us as RustSec publishes, so that job
+# runs daily too and never blocks a PR on an advisory the PR did not introduce.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
