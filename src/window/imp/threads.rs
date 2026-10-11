@@ -3569,13 +3569,17 @@ impl AgentTerminalWindow {
         glib::MainContext::default().spawn_local(async move {
             let loaded = store_job({
                 let thread = thread.clone();
-                move |store| store.transcript_messages(&thread)
+                move |store| {
+                    store
+                        .transcript_messages(&thread)
+                        .map(|messages| build_handoff(&messages, &format!("thread {thread}")))
+                }
             })
             .await;
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
-            let messages = match loaded {
-                Some(Ok(messages)) => messages,
+            let handoff = match loaded {
+                Some(Ok(handoff)) => handoff,
                 Some(Err(e)) => {
                     present_message(&obj, "Cannot Fork the Thread", &e.to_string());
                     return;
@@ -3585,7 +3589,6 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let handoff = build_handoff(&messages, &format!("thread {thread}"));
             imp.create_chat_thread(NewThread {
                 dir,
                 model,

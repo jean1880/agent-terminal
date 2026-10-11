@@ -864,6 +864,7 @@ impl Inner {
         let spec = self.launch_spec();
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        self.clear_agy_read();
         self.canary_cancelled.borrow_mut().clear();
         let (w_out, w_err, w_exit) = (
             Rc::downgrade(self),
@@ -1478,9 +1479,18 @@ impl Inner {
         }
     }
 
+    /// Forgets an in-flight agy transcript read, its held lines and a deferred exit: they belong
+    /// to a process that is gone, and its read's continuation then finds nothing to do.
+    fn clear_agy_read(&self) {
+        self.agy_reading.set(None);
+        self.agy_hold.borrow_mut().clear();
+        self.agy_deferred_exit.set(None);
+    }
+
     /// Stops the process on purpose; its own exit callback is then ignored.
     fn stop_current(&self) {
         self.generation.set(self.generation.get() + 1);
+        self.clear_agy_read();
         self.adapter.borrow_mut().discard_queued_prompts();
         self.finish_process(None, true);
     }
@@ -5397,6 +5407,7 @@ mod tests {
 
     #[test]
     fn enrich_agy_step_reads_thinking_from_native_transcript() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tmp");
         let conv_id = "test-conv-12345678";
         let logs_dir = tmp
@@ -5557,6 +5568,134 @@ mod tests {
             assert_eq!(reasoning_count, 1, "thinking item should not be duplicated");
         });
 
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
+    /// An agy session on a transcript with thinking for step 2, and a first `step_update` for
+    /// that step already sent (so a read is in flight).
+    fn agy_mid_read(tmp: &Path) -> (Rc<ChatSession>, Seen) {
+        let logs = tmp.join(".gemini/antigravity-cli/brain/cv/.system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            "{\"step_index\":2,\"thinking\":\"pondering\"}\n",
+        )
+        .expect("write");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, "/w");
+        let (sink, seen) = make_sink();
+        let session = ChatSession::new(
+            Box::new(agent_core::agy::AgyAdapter::new("agy")),
+            OpenSession {
+                program: "unused".into(),
+                extra_args: Vec::new(),
+                cwd: "/".into(),
+                model: None,
+                effort: None,
+                mode: Mode::Plan,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+            },
+            store,
+            thread,
+            sink,
+            None,
+        );
+        let frame = r#"{"event":"step_update","step_update":{"conversation_id":"cv","state":"ACTIVE","step_index":2,"step_type":"tool","tool_name":"view_file"}}"#;
+        session
+            .inner
+            .on_line(session.inner.generation.get(), frame, false);
+        assert!(
+            session.inner.agy_reading.get().is_some(),
+            "a read is in flight"
+        );
+        (session, seen)
+    }
+
+    fn reasoning_started(seen: &Seen) -> bool {
+        has(seen, |e| {
+            matches!(
+                e,
+                Event::ItemStarted {
+                    kind: ItemKind::Reasoning,
+                    ..
+                }
+            )
+        })
+    }
+
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_exit_during_a_transcript_read_fires_once_after_the_held_lines() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tmp");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        in_loop(|ctx| {
+            let (session, seen) = agy_mid_read(tmp.path());
+            let generation = session.inner.generation.get();
+            session
+                .inner
+                .on_line(generation, r#"{"event":"held_marker"}"#, false);
+            session.inner.on_exit(generation, Some(0));
+            // Deferred: nothing exited yet, the line and the exit wait behind the read.
+            assert_eq!(exited_count(&seen), 0);
+            assert!(session.inner.agy_deferred_exit.get().is_some());
+
+            assert!(pump_until(ctx, 5, || exited_count(&seen) == 1), "no exit");
+            for _ in 0..50 {
+                ctx.iteration(false);
+            }
+            assert_eq!(exited_count(&seen), 1, "the exit fires exactly once");
+            let events = seen.borrow();
+            let unknown = events
+                .iter()
+                .position(|e| matches!(e.event, Event::Unknown))
+                .expect("the held line reached the adapter");
+            let exit = events
+                .iter()
+                .position(|e| matches!(e.event, Event::SessionExited { .. }))
+                .expect("exit");
+            assert!(unknown < exit, "the held line comes before the exit");
+            assert!(session.inner.agy_deferred_exit.get().is_none());
+        });
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
+    #[test]
+    fn a_restart_during_a_transcript_read_drops_the_stale_read() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tmp");
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        in_loop(|ctx| {
+            let (session, seen) = agy_mid_read(tmp.path());
+            let generation = session.inner.generation.get();
+            session
+                .inner
+                .on_line(generation, r#"{"event":"held_marker"}"#, false);
+            session.inner.on_exit(generation, Some(0));
+            session.inner.stop_current();
+            assert!(session.inner.agy_reading.get().is_none());
+            assert!(session.inner.agy_hold.borrow().is_empty());
+            assert!(session.inner.agy_deferred_exit.get().is_none());
+            let before = seen.borrow().len();
+            for _ in 0..200 {
+                ctx.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The old read's result was dropped: no thinking, no held line, no second exit.
+            assert!(!reasoning_started(&seen));
+            assert!(!has(&seen, |e| matches!(e, Event::Unknown)));
+            assert_eq!(exited_count(&seen), 1, "only the stop's own exit");
+            assert_eq!(seen.borrow().len(), before);
+        });
         if let Some(h) = prev_home {
             std::env::set_var("HOME", h);
         }

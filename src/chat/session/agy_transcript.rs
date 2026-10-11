@@ -62,6 +62,14 @@ fn decode_value(value: &Value) -> Value {
 
 /// The transcript file for `conv_id` under `home`, newest layout first.
 fn transcript_path(home: &Path, conv_id: &str) -> Option<std::path::PathBuf> {
+    // The id comes from agy's output and is joined into a path: it must be one plain component.
+    if conv_id.is_empty()
+        || conv_id.contains(['/', '\\'])
+        || conv_id.contains("..")
+        || conv_id.contains('\0')
+    {
+        return None;
+    }
     [".gemini/antigravity-cli/brain", ".gemini/brain"]
         .iter()
         .map(|base| {
@@ -192,6 +200,24 @@ mod tests {
         assert_eq!(find_step(text, 5).thinking.as_deref(), Some("hmm"));
         assert_eq!(find_step(text, 4).thinking.as_deref(), Some("hmm"));
         assert!(find_step(text, 7).is_empty());
+    }
+
+    #[test]
+    fn a_conversation_id_that_is_not_one_path_component_reads_nothing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp
+            .path()
+            .join(".gemini/antigravity-cli/brain/c1/.system_generated/logs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("transcript.jsonl"),
+            "{\"step_index\":1,\"thinking\":\"t\"}\n",
+        )
+        .expect("write");
+        assert!(read_step(tmp.path(), "c1", 1).thinking.is_some());
+        for bad in ["", "..", "../c1", "c1/..", "a/b", "c1\\x", "c1/", "x..y"] {
+            assert!(read_step(tmp.path(), bad, 1).is_empty(), "{bad:?}");
+        }
     }
 
     #[test]
