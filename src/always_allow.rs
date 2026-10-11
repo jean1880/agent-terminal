@@ -1936,9 +1936,85 @@ impl CodexRead {
 /// neither group- nor world-writable.
 fn owned_safely(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    (meta.uid() == 0 || meta.uid() == me) && meta.mode() & 0o022 == 0
+    // SAFETY: geteuid and getgid have no preconditions and cannot fail.
+    let (me, my_gid) = unsafe { (libc::geteuid(), libc::getgid()) };
+    let mode = meta.mode();
+    if !(meta.uid() == 0 || meta.uid() == me) || mode & 0o002 != 0 {
+        return false;
+    }
+    mode & 0o020 == 0
+        || group_write_ok(
+            meta.gid(),
+            my_gid,
+            group_members(meta.gid()).as_deref(),
+            user_name(me).as_deref(),
+        )
+}
+
+/// Whether group write on a file of group `gid` is still the user's alone: the group is the
+/// user's own primary group (`my_gid`, a user-private group as Ubuntu makes them, so `0664` is
+/// normal) and lists no member but the user. `members` is `None` when the group could not be
+/// looked up, and `me` when the user's name could not: both refuse.
+fn group_write_ok(gid: u32, my_gid: u32, members: Option<&[String]>, me: Option<&str>) -> bool {
+    let (Some(members), Some(me)) = (members, me) else {
+        return false;
+    };
+    gid == my_gid && members.iter().all(|m| m == me)
+}
+
+/// The names `getgrgid_r` lists as members of group `gid` (`None`: no such group, or the
+/// lookup failed).
+fn group_members(gid: u32) -> Option<Vec<String>> {
+    let mut size = 16 * 1024;
+    loop {
+        let mut buf = vec![0 as libc::c_char; size];
+        // SAFETY: zeroed is a valid bit pattern for this plain C struct.
+        let mut group: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the call; buf outlives the reads below.
+        let rc =
+            unsafe { libc::getgrgid_r(gid, &mut group, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && size < 1 << 20 {
+            size *= 4;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let mut members = Vec::new();
+        let mut cursor = group.gr_mem;
+        // SAFETY: gr_mem is a NULL-terminated array of C strings inside `buf`.
+        unsafe {
+            while !cursor.is_null() && !(*cursor).is_null() {
+                members.push(
+                    std::ffi::CStr::from_ptr(*cursor)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                cursor = cursor.add(1);
+            }
+        }
+        return Some(members);
+    }
+}
+
+/// The user name of `uid` (`None`: the lookup failed).
+fn user_name(uid: u32) -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: zeroed is a valid bit pattern for this plain C struct.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call; buf outlives the read below.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pw.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: pw_name points into `buf`, NUL-terminated.
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Where a `.rules` entry (or the rules folder, `dir`) leads: the entry itself when it is not a
@@ -4131,6 +4207,79 @@ host_executable(name="ls", paths=["/bin/ls"])
         );
     }
 
+    /// Group write on a linked rules file is safe only for the user's own private group
+    /// (Ubuntu's `0664` default); another group, other members, or a failed lookup refuse.
+    #[test]
+    fn group_write_is_safe_only_in_a_private_group() {
+        use std::os::unix::fs::MetadataExt;
+        let me = Some("u");
+        assert!(group_write_ok(1000, 1000, Some(&[]), me));
+        assert!(group_write_ok(1000, 1000, Some(&["u".to_owned()]), me));
+        assert!(!group_write_ok(
+            1000,
+            1000,
+            Some(&["u".to_owned(), "eve".to_owned()]),
+            me
+        ));
+        assert!(
+            !group_write_ok(27, 1000, Some(&[]), me),
+            "not the primary group"
+        );
+        assert!(!group_write_ok(1000, 1000, None, me), "group lookup failed");
+        assert!(
+            !group_write_ok(1000, 1000, Some(&[]), None),
+            "user lookup failed"
+        );
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let target = codex_home(dir.path());
+        std::fs::create_dir_all(target.rules_dir()).expect("dir");
+        let real = dir.path().join("dotfiles.rules");
+        std::fs::write(&real, "prefix_rule([\"wc\"])\n").expect("real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o664)).expect("chmod");
+        std::os::unix::fs::symlink(&real, target.rules_dir().join("wc.rules")).expect("link");
+        let meta = std::fs::metadata(&real).expect("meta");
+        // SAFETY: getgid/geteuid have no preconditions.
+        let (my_gid, uid) = unsafe { (libc::getgid(), libc::geteuid()) };
+        let private = group_write_ok(
+            meta.gid(),
+            my_gid,
+            group_members(meta.gid()).as_deref(),
+            user_name(uid).as_deref(),
+        );
+        if private {
+            assert!(owned_safely(&meta));
+            let imported = AlwaysRules::default().import_codex_rules(&target);
+            assert_eq!((imported.added, imported.codex_refused), (1, None));
+        } else {
+            eprintln!(
+                "skipped the private-group case: the test file's group is not a private group"
+            );
+        }
+
+        // A supplementary group the user belongs to: group write there is refused.
+        // SAFETY: a zero-length query writes nothing; the second call gets a buffer that size.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0 as libc::gid_t; usize::try_from(count).unwrap_or(0)];
+        let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(filled).unwrap_or(0));
+        let other = groups.into_iter().find(|g| *g != my_gid && *g != 0);
+        match other.filter(|g| std::os::unix::fs::chown(&real, None, Some(*g)).is_ok()) {
+            Some(_) => {
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o664))
+                    .expect("chmod");
+                let meta = std::fs::metadata(&real).expect("meta");
+                assert!(!owned_safely(&meta));
+                let imported = AlwaysRules::default().import_codex_rules(&target);
+                assert_eq!(imported.added, 0);
+                assert!(imported
+                    .codex_refused
+                    .is_some_and(|r| r.contains("another user or group")));
+            }
+            None => eprintln!("skipped the other-group case: no supplementary group to use"),
+        }
+    }
+
     /// SEC-05: Codex takes the strictest decision, so an allow beside a forbid of the same
     /// prefix (or a broader or narrower one) imports nothing for that program.
     #[test]
@@ -4239,9 +4388,9 @@ host_executable(name="ls", paths=["/bin/ls"])
             (2, None),
             "a stow-style link is read: {imported:?}"
         );
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o664))
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o646))
             .expect("chmod");
-        assert!(refused("a link to a group-writable file").contains("another user or group"));
+        assert!(refused("a link to a world-writable file").contains("another user or group"));
         std::fs::remove_file(&other).expect("rm");
         std::os::unix::fs::symlink(dir.path().join("missing.rules"), &other).expect("dangling");
         assert!(refused("a dangling link").contains("does not resolve"));
