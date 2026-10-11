@@ -188,24 +188,72 @@ impl AgentTerminalWindow {
         self.config.borrow().permission_source_paths()
     }
 
-    /// Imports the agent configurations into the rules file; an unusable rules file is named
-    /// and left untouched, never treated as empty.
+    /// Imports the agent configurations into the rules file, off the main thread (it takes the
+    /// store lock and reads files); an unusable rules file is named and left untouched.
     fn import_rules(&self, path: &std::path::Path) {
-        match crate::always_allow::AlwaysRules::import_into(path, &self.permission_sources()) {
-            Ok(imported) => self.show_toast(&imported.summary()),
-            Err(e) => self.show_toast(&crate::always_allow::blocked_notice(path, &e)),
-        }
+        let path = path.to_owned();
+        let sources = self.permission_sources();
+        let obj = self.obj().downgrade();
+        glib::spawn_future_local(async move {
+            let target = path.clone();
+            let result = gtk4::gio::spawn_blocking(move || {
+                crate::always_allow::AlwaysRules::import_into(&target, &sources)
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            match result {
+                Ok(Ok(imported)) => imp.show_toast(&imported.summary()),
+                Ok(Err(e)) => imp.show_toast(&crate::always_allow::blocked_notice(&path, &e)),
+                Err(_) => imp.show_toast("The import did not finish"),
+            }
+        });
     }
 
-    /// Exports the global rules (the caller has shown [`crate::always_allow::EXPORT_WARNING`]).
+    /// Exports the global rules off the main thread (the caller has shown
+    /// [`crate::always_allow::EXPORT_WARNING`]).
     fn export_rules(&self, path: &std::path::Path) {
-        match crate::always_allow::AlwaysRules::export_from(path, &self.permission_sources()) {
-            Ok(0) => self.show_toast("Agent configurations are already up to date"),
-            Ok(n) => self.show_toast(&format!(
-                "Exported {n} global rules to agent configurations"
-            )),
-            Err(e) => self.show_toast(&crate::always_allow::blocked_notice(path, &e)),
-        }
+        let path = path.to_owned();
+        let sources = self.permission_sources();
+        let obj = self.obj().downgrade();
+        glib::spawn_future_local(async move {
+            let target = path.clone();
+            let result = gtk4::gio::spawn_blocking(move || {
+                crate::always_allow::AlwaysRules::export_from(&target, &sources)
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            match result {
+                Ok(Ok(0)) => imp.show_toast("Agent configurations are already up to date"),
+                Ok(Ok(n)) => imp.show_toast(&format!(
+                    "Exported {n} global rules to agent configurations"
+                )),
+                Ok(Err(e)) => imp.show_toast(&crate::always_allow::blocked_notice(&path, &e)),
+                Err(_) => imp.show_toast("The export did not finish"),
+            }
+        });
+    }
+
+    /// Removes `rule` from the rules file off the main thread (it takes the store lock), then
+    /// calls `done` on the main thread with the outcome.
+    fn forget_rule(
+        path: std::path::PathBuf,
+        rule: crate::always_allow::Rule,
+        done: impl FnOnce(Result<bool, crate::always_allow::StoreError>) + 'static,
+    ) {
+        glib::spawn_future_local(async move {
+            let result = gtk4::gio::spawn_blocking(move || {
+                crate::always_allow::AlwaysRules::forget(&path, &rule)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::always_allow::StoreError::Write(
+                    "the removal did not finish".to_owned(),
+                ))
+            });
+            done(result);
+        });
     }
 
     /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
@@ -998,20 +1046,32 @@ impl AgentTerminalWindow {
                     #[weak]
                     row,
                     move |_| {
-                        let imp = obj.imp();
                         // By the rule itself, not its position: the file may have changed since
-                        // this list was built. Hidden only once the removal is saved.
-                        match crate::always_allow::AlwaysRules::forget(&p, &rule) {
-                            Ok(true) => {
-                                row.set_visible(false);
-                                imp.show_toast("Rule removed");
-                                if let Some(ref f) = cb {
-                                    f();
+                        // this list was built. Off the main thread (the store lock); the row is
+                        // hidden only once the removal is saved.
+                        let obj = obj.downgrade();
+                        let row = row.downgrade();
+                        let cb = cb.clone();
+                        let shown = p.clone();
+                        Self::forget_rule(p.clone(), rule.clone(), move |result| {
+                            let Some(obj) = obj.upgrade() else { return };
+                            let imp = obj.imp();
+                            match result {
+                                Ok(true) => {
+                                    if let Some(row) = row.upgrade() {
+                                        row.set_visible(false);
+                                    }
+                                    imp.show_toast("Rule removed");
+                                    if let Some(ref f) = cb {
+                                        f();
+                                    }
+                                }
+                                Ok(false) => imp.show_toast("That rule was already gone"),
+                                Err(e) => {
+                                    imp.show_toast(&crate::always_allow::blocked_notice(&shown, &e))
                                 }
                             }
-                            Ok(false) => imp.show_toast("That rule was already gone"),
-                            Err(e) => imp.show_toast(&crate::always_allow::blocked_notice(&p, &e)),
-                        }
+                        });
                     }
                 ));
                 row.add_suffix(&del_btn);
@@ -1677,21 +1737,30 @@ fn always_allowed_rows() -> adw::ExpanderRow {
                 let Some(path) = always_allow::path() else {
                     return;
                 };
-                match AlwaysRules::forget(&path, &rule) {
-                    Ok(_) => expander.remove(&row),
-                    Err(e) => {
-                        warn!(error = %e, "could not save the always-allow rules");
-                        // The rule stays, and its row says why it could not be removed.
-                        let notice = always_allow::blocked_notice(&path, &e);
-                        row.set_subtitle(&notice);
-                        if let Some(window) = row
-                            .root()
-                            .and_downcast::<crate::window::AgentTerminalWindow>()
-                        {
-                            window.imp().show_toast(&notice);
+                // Off the main thread (the store lock); the row goes once the removal is saved.
+                let shown = path.clone();
+                let row = row.downgrade();
+                let expander = expander.downgrade();
+                AgentTerminalWindow::forget_rule(path, rule.clone(), move |result| {
+                    let (Some(row), Some(expander)) = (row.upgrade(), expander.upgrade()) else {
+                        return;
+                    };
+                    match result {
+                        Ok(_) => expander.remove(&row),
+                        Err(e) => {
+                            warn!(error = %e, "could not save the always-allow rules");
+                            // The rule stays, and its row says why it could not be removed.
+                            let notice = always_allow::blocked_notice(&shown, &e);
+                            row.set_subtitle(&notice);
+                            if let Some(window) = row
+                                .root()
+                                .and_downcast::<crate::window::AgentTerminalWindow>()
+                            {
+                                window.imp().show_toast(&notice);
+                            }
                         }
                     }
-                }
+                });
             }
         ));
         row.add_suffix(&remove);
@@ -1915,6 +1984,58 @@ pub(super) mod tests {
         let setup = adw::Dialog::new();
         let page = imp.setup_agents_page(&setup);
         assert_titles_render(&page, "setup walkthrough");
+    }
+
+    /// D6: a Settings removal never takes the store lock on the GTK thread. While another holder
+    /// keeps the lock, the call returns at once and the loop stays free; the removal finishes
+    /// once the lock is released.
+    #[test]
+    fn a_settings_removal_never_blocks_the_main_thread_on_the_store_lock() {
+        use crate::always_allow::{AlwaysRules, Context, Rule, FILE_NAME};
+        crate::testutil::in_loop(|ctx| {
+            let dir = tempfile::tempdir().expect("tmp");
+            let path = dir.path().join(FILE_NAME);
+            let c = Context {
+                driver: "agy",
+                workspace: std::path::Path::new("/w"),
+                cwd: Some("/w"),
+                home: None,
+            };
+            let rule = Rule::new("*", "Bash", "ls -la")
+                .and_then(|r| r.complete(&c))
+                .expect("rule");
+            AlwaysRules::remember(&path, rule.clone()).expect("saved");
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join(format!("{FILE_NAME}.lock")))
+                .expect("lock file");
+            lock.lock().expect("hold the lock");
+
+            let done: Rc<std::cell::Cell<Option<bool>>> = Rc::default();
+            let seen = done.clone();
+            let started = std::time::Instant::now();
+            AgentTerminalWindow::forget_rule(path.clone(), rule, move |result| {
+                seen.set(Some(result.unwrap_or(false)));
+            });
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(200),
+                "the call returned at once"
+            );
+            for _ in 0..20 {
+                ctx.iteration(false);
+            }
+            assert_eq!(
+                done.get(),
+                None,
+                "still waiting for the lock, off the main thread"
+            );
+            lock.unlock().expect("release");
+            assert!(crate::testutil::pump_until(ctx, 10, || done
+                .get()
+                .is_some()));
+            assert_eq!(done.get(), Some(true));
+            assert!(AlwaysRules::open(&path).expect("open").rules.is_empty());
+        });
     }
 
     #[test]

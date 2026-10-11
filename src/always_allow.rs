@@ -180,14 +180,6 @@ pub fn argv_has_secret(argv: &[String]) -> bool {
         || credential_option(argv).is_some()
 }
 
-/// Header names whose value is a credential.
-const CREDENTIAL_HEADERS: &[&str] = &[
-    "authorization:",
-    "proxy-authorization:",
-    "cookie:",
-    "x-api-key:",
-];
-
 /// A URL with `user:password@` in it.
 fn url_with_password(word: &str) -> bool {
     word.find("://").is_some_and(|at| {
@@ -199,53 +191,20 @@ fn url_with_password(word: &str) -> bool {
     })
 }
 
-/// The first argument that carries a credential, whatever its shape: curl's `-u`/`--user`,
-/// `--proxy-user`, `--oauth2-bearer`, or a `-H`/`--header` naming Authorization, Cookie or an API
-/// key; wget's password options; `mysql`/`mariadb -p<password>` and `--password=`; `sshpass -p`;
-/// and any URL with `user:password@`. A rule never holds such a command and never matches it.
+/// The first argument that carries a credential: one the shared parser
+/// ([`agent_core::redact::credential_args`], the same one the live masking uses) finds for this
+/// program (curl's user/password, bearer and credential headers, short-option clusters
+/// included; wget's passwords; `mysql`/`mariadb -p…`; `sshpass -p`), or any URL with
+/// `user:password@`. A rule never holds such a command and never matches it.
 pub fn credential_option(argv: &[String]) -> Option<&str> {
-    let program = basename(argv.first()?);
-    let words = &argv[1..];
-    let header = |value: &str| {
-        let value = value.trim_start().to_ascii_lowercase();
-        CREDENTIAL_HEADERS.iter().any(|h| value.starts_with(h))
-    };
-    for (i, word) in words.iter().enumerate() {
-        let w = word.as_str();
-        let next = words.get(i + 1).map(String::as_str).unwrap_or_default();
-        if url_with_password(w) {
-            return Some(w);
-        }
-        let hit = match program {
-            "curl" => {
-                w == "-u"
-                    || (w.starts_with("-u") && !w.starts_with("--"))
-                    || ["--user", "--proxy-user", "--oauth2-bearer"]
-                        .iter()
-                        .any(|o| w == *o || w.starts_with(&format!("{o}=")))
-                    || ((w == "-H" || w == "--header") && header(next))
-                    || w.strip_prefix("--header=").is_some_and(header)
-                    || (w.starts_with("-H") && w.len() > 2 && header(&w[2..]))
-            }
-            "wget" => [
-                "--password",
-                "--http-password",
-                "--ftp-password",
-                "--proxy-password",
-            ]
-            .iter()
-            .any(|o| w == *o || w.starts_with(&format!("{o}="))),
-            "mysql" | "mariadb" | "mysqldump" => {
-                (w.starts_with("-p") && w.len() > 2) || w.starts_with("--password=")
-            }
-            "sshpass" => w.starts_with("-p"),
-            _ => false,
-        };
-        if hit {
-            return Some(w);
-        }
+    let program = argv.first()?;
+    let words: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    if let Some(url) = words.iter().find(|w| url_with_password(w)) {
+        return Some(url);
     }
-    None
+    agent_core::redact::credential_args(program, &words)
+        .first()
+        .map(|&(i, _, _)| argv[1 + i].as_str())
 }
 
 // ---- what a command runs (a denylist, with its ceiling) ----
@@ -328,22 +287,24 @@ const GIT_SAFE: &[&str] = &[
 
 /// Read-only programs a `*` pattern may widen (C1: an allowlist; the option denylist below stays
 /// as defence in depth). Every other program's pattern matches its exact argv only.
+/// D1: only programs whose options can neither write nor execute (with the exec options of rg,
+/// find and jq denied below). Not fd (`-x`/`--exec`), tree (`-o`), file (`-C`/`-m`), date
+/// (`--set`).
 const PREFIX_PROGRAMS: &[&str] = &[
-    "ls", "cat", "head", "tail", "wc", "grep", "rg", "fd", "find", "tree", "stat", "file", "du",
-    "df", "jq", "echo", "pwd", "which", "date", "uname",
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "stat", "du", "df", "jq", "echo",
+    "pwd", "which", "uname",
 ];
 
-/// The git subcommands a `git …*` pattern may widen into.
+/// The git subcommands a `git …*` pattern may widen into (D1: not branch, which deletes and
+/// renames, nor remote, which adds and rewrites).
 const PREFIX_GIT: &[&str] = &[
     "status",
     "log",
     "diff",
     "show",
-    "branch",
     "blame",
     "ls-files",
     "rev-parse",
-    "remote",
 ];
 
 /// A program that runs its own arguments as code: a shell, a wrapper, an interpreter, or a
@@ -413,12 +374,18 @@ const EXEC_LONG: &[(&str, &str)] = &[
     ("rsync", "--rsh*"),
     ("rsync", "--rsync-path*"),
     ("zip", "--unzip-command*"),
+    // jq runs a program file and loads modules from a search path; --rawfile/--slurpfile only
+    // read data, so they stay allowed.
+    ("jq", "--from-file*"),
 ];
 
 /// Short option letters that do the same, refused in any single-dash cluster and with any
-/// attached value (`-ccore.pager=x`, `-C/tmp`, `-tI/usr/bin/id`, `-xzfI…`).
+/// attached value (`-ccore.pager=x`, `-C/tmp`, `-tI/usr/bin/id`, `-xzfI…`). git's letters are
+/// its global options, so they count only before the subcommand (D2: `git log -p` is a patch,
+/// not the pager).
 const EXEC_SHORT: &[(&str, &str)] = &[
     ("git", "cCOp"),
+    ("jq", "fL"),
     ("cargo", "Z"),
     ("rg", "z"),
     ("sed", "f"),
@@ -440,6 +407,20 @@ pub fn exec_option(argv: &[String]) -> Option<&str> {
         .iter()
         .find(|(p, _)| *p == program)
         .map(|(_, l)| *l);
+    // git: where the subcommand is (the first word that is neither an option nor the value of
+    // a separate `-c`/`-C`); its short letters count only before it.
+    let git_sub = (program == "git").then(|| {
+        let words = &argv[1..];
+        let mut i = 0;
+        while i < words.len() {
+            match words[i].as_str() {
+                "-c" | "-C" => i += 2,
+                w if w.starts_with('-') => i += 1,
+                _ => break,
+            }
+        }
+        i
+    });
     argv[1..]
         .iter()
         .enumerate()
@@ -468,9 +449,10 @@ pub fn exec_option(argv: &[String]) -> Option<&str> {
             } else {
                 None
             };
-            let short = letters
-                .zip(cluster)
-                .is_some_and(|(letters, cluster)| cluster.chars().any(|c| letters.contains(c)));
+            let short = git_sub.is_none_or(|sub| i < sub)
+                && letters
+                    .zip(cluster)
+                    .is_some_and(|(letters, cluster)| cluster.chars().any(|c| letters.contains(c)));
             (long || short).then_some(word)
         })
 }
@@ -491,8 +473,8 @@ pub fn rememberable_argv(argv: &[String]) -> bool {
             .is_some_and(|sub| GIT_SAFE.contains(&sub.as_str()))
 }
 
-/// [`rememberable_argv`] of a command line.
-#[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
+/// [`rememberable_argv`] of a command line (tests).
+#[cfg(test)]
 pub fn rememberable_command(command: &str) -> bool {
     command_tokens(command).is_some_and(|argv| rememberable_argv(&argv))
 }
@@ -2159,6 +2141,73 @@ mod tests {
         assert!(!git.matches(&shell("git -C /tmp log"), &c));
     }
 
+    /// D1: programs whose options write or execute no longer widen; D2: git's short global
+    /// letters count only before the subcommand; jq's program file and module path are denied.
+    #[test]
+    fn round_four_allowlist_git_letters_and_jq() {
+        let c = ctx("claude", Path::new("/w"), Some("/w"));
+        for gone in [
+            "fd *",
+            "tree *",
+            "file *",
+            "date *",
+            "git branch *",
+            "git remote *",
+        ] {
+            let r = Rule::new("*", "Bash", gone).complete(&c).expect(gone);
+            assert!(r.check(Scope::Session).is_err(), "{gone}");
+        }
+        let git = Rule::new("*", "Bash", "git *").complete(&c).expect("git");
+        assert!(!git.matches(&shell("git branch -D main"), &c));
+        assert!(!git.matches(&shell("git remote set-url origin x"), &c));
+        // D2: after the subcommand these letters are read-only options again.
+        for ok in [
+            "git log -p",
+            "git diff -p",
+            "git log -C",
+            "git show -c HEAD",
+        ] {
+            assert!(git.matches(&shell(ok), &c), "{ok}");
+        }
+        for refused in [
+            "git -p log",
+            "git -c x=y log",
+            "git -C /tmp log",
+            "git log --output=x",
+        ] {
+            assert!(!git.matches(&shell(refused), &c), "{refused}");
+        }
+        assert!(exec_option(&argv(&["git", "-c", "x=y", "log", "-p"])).is_some());
+        assert!(exec_option(&argv(&["git", "log", "-p"])).is_none());
+        // jq: data files are fine, a program file or a module path is not.
+        let jq = Rule::new("*", "Bash", "jq *").complete(&c).expect("jq");
+        assert!(jq.matches(&shell("jq .a data.json"), &c));
+        assert!(jq.matches(&shell("jq --rawfile t a.txt .a data.json"), &c));
+        assert!(jq.matches(&shell("jq --slurpfile s a.json .a data.json"), &c));
+        for refused in [
+            "jq -f prog.jq data.json",
+            "jq --from-file prog.jq data.json",
+            "jq -L ./mods .a data.json",
+            "jq -Lmods .a data.json",
+            "jq -rf prog.jq data.json",
+        ] {
+            assert!(!jq.matches(&shell(refused), &c), "{refused}");
+        }
+        // D4/D5 on the rule side: curl clusters are credentials; docker's -u is not.
+        for cred in [
+            "curl -su alice:pw https://x",
+            "curl -vualice:pw https://x",
+            "curl -sHCookie:sid=1 https://x",
+        ] {
+            assert!(
+                credential_option(&argv(&cred.split(' ').collect::<Vec<_>>())).is_some(),
+                "{cred}"
+            );
+        }
+        assert!(credential_option(&argv(&["docker", "run", "-u", "1000:1000", "img"])).is_none());
+        assert!(credential_option(&argv(&["curl", "-u", "alice", "https://x"])).is_none());
+    }
+
     /// C2 (and A3): these never get "Always allow"; their exact command can still be allowed
     /// for the session.
     #[test]
@@ -2928,7 +2977,7 @@ mcp = [
         std::fs::write(&claude_path, r#"{"permissions":{"allow":["Bash(rg:*)"]}}"#)
             .expect("write claude");
         let agy_path = dir.path().join("agy_settings.json");
-        std::fs::write(&agy_path, r#"{"permissions":{"allow":["command(date)"]}}"#)
+        std::fs::write(&agy_path, r#"{"permissions":{"allow":["command(uname)"]}}"#)
             .expect("write agy");
 
         let mut rules = AlwaysRules::default();
@@ -2991,7 +3040,7 @@ mcp = [
         );
         write(
             ".claude/settings.json",
-            r#"{"permissions":{"allow":["Bash(date:*)"]}}"#,
+            r#"{"permissions":{"allow":["Bash(uname:*)"]}}"#,
         );
         write(
             ".gemini/antigravity-cli/settings.json",

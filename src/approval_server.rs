@@ -1634,7 +1634,7 @@ mod tests {
             "git difftool",
             "git commit -m x",
             "git -c core.pager=x status",
-            "git status -c x",
+            "git -c x=y status",
             "git status; rm -rf x",
             "a && b",
             "a | b",
