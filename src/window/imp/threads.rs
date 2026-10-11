@@ -1129,13 +1129,16 @@ impl AgentTerminalWindow {
             let split = split.downgrade();
             let obj = obj.downgrade();
             move || {
-                if let (Some(split), Some(obj)) = (split.upgrade(), obj.upgrade()) {
+                // Not allocated yet: leave the breakpoint's state alone rather than force 0 px.
+                if let (Some(split), Some(obj)) =
+                    (split.upgrade(), obj.upgrade().filter(|o| o.width() > 0))
+                {
                     split.set_collapsed(obj.width() as f64 <= SIDEBAR_COLLAPSE_SP);
                 }
             }
         };
         update_collapsed();
-        obj.connect_notify_local(Some("width"), move |_, _| update_collapsed());
+        on_window_resized(obj.upcast_ref(), update_collapsed);
 
         if let Some(header) = self.header.borrow().as_ref() {
             let toggle = gtk4::ToggleButton::builder()

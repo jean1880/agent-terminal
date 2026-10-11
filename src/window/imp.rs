@@ -50,6 +50,33 @@ const NARROW_SP: f64 = 480.0;
 /// space. It is temporarily hidden by a breakpoint and returns when the window grows again.
 const DIFF_HIDE_SP: f64 = 880.0;
 
+/// Runs `update` once the window has been allocated at a new surface size: a resize, maximize,
+/// restore or fullscreen. A widget has no `width` property, so `notify::width` never fires; the
+/// surface's `layout` signal does, and the idle runs after the frame has allocated the window, so
+/// `update` reads the new `width()`.
+fn on_window_resized(window: &gtk4::Window, update: impl Fn() + 'static) {
+    let update = std::rc::Rc::new(update);
+    let connect = move |window: &gtk4::Window| {
+        let Some(surface) = window.surface() else {
+            return;
+        };
+        let update = update.clone();
+        let last = std::cell::Cell::new((0, 0));
+        surface.connect_layout(move |_, width, height| {
+            if last.replace((width, height)) != (width, height) {
+                let update = update.clone();
+                glib::idle_add_local_once(move || update());
+            }
+        });
+    };
+    // A re-realized window has a new surface, which needs its own handler.
+    let connect = std::rc::Rc::new(connect);
+    if window.is_realized() {
+        connect(window);
+    }
+    window.connect_realize(move |w| connect(w));
+}
+
 /// Embedded XML definition for GtkShortcutsWindow.
 const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <interface>
@@ -2401,7 +2428,8 @@ impl AgentTerminalWindow {
         let update_visibility = {
             let obj = obj.downgrade();
             move || {
-                if let Some(obj) = obj.upgrade() {
+                // Not allocated yet: leave the breakpoint's state alone rather than force 0 px.
+                if let Some(obj) = obj.upgrade().filter(|o| o.width() > 0) {
                     let visible = obj.width() as f64 > NARROW_SP;
                     for button in &buttons {
                         button.set_visible(visible);
@@ -2410,7 +2438,7 @@ impl AgentTerminalWindow {
             }
         };
         update_visibility();
-        obj.connect_notify_local(Some("width"), move |_, _| update_visibility());
+        on_window_resized(obj.upcast_ref(), update_visibility);
     }
 
     /// (Re)fills "New Thread With" with the agents that are installed and enabled. Detection is
@@ -6526,6 +6554,12 @@ mod tests {
                             "beside"
                         },
                         if diff_shown { "shown" } else { "hidden" }
+                    );
+                    // Follows the real allocation after a resize, not the size at construction.
+                    assert_eq!(
+                        split.is_collapsed(),
+                        width <= COLLAPSE_BELOW,
+                        "sidebar placement at {state}"
                     );
                     if width == MIN_WINDOW.0 || width == 950 {
                         crate::testutil::capture_window(
