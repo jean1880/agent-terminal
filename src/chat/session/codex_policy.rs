@@ -123,6 +123,37 @@ fn glob_literals(pattern: &str) -> PathBuf {
 struct Findings {
     danger: Vec<String>,
     scope: Vec<String>,
+    /// A granted folder holds the project's settings or history (or is the project root).
+    settings: bool,
+}
+
+/// Said when a grant takes in the project's own settings and history.
+const SETTINGS_WARNING: &str =
+    "This includes the project's own settings and history (.git, agent instructions).";
+
+/// Most entries listed when looking for settings in a folder; a larger one is not vouched for.
+const MAX_LISTED: usize = 10_000;
+
+/// Whether `dir`'s own entries include a name the sensitive list holds (`.git`, `.github`,
+/// agent instruction files, tool configs) or an `.env` file. `None` when it cannot be listed in
+/// full.
+fn holds_settings(dir: &Path) -> Option<bool> {
+    let mut listed = 0;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        listed += 1;
+        if listed > MAX_LISTED {
+            return None;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with(".env")
+            || name == ".github"
+            || crate::approval_server::sensitive_anywhere(&Path::new("/").join(&name), None)
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 impl Findings {
@@ -277,9 +308,25 @@ pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verd
                 lexical.display()
             ));
         }
+        // A folder holding the project's settings or history: the project root itself, or one
+        // whose own entries include .git, agent instructions or tool configs.
+        if std::fs::metadata(&actual).is_ok_and(|m| m.is_dir()) {
+            let root = workspace_real.as_ref().is_some_and(|w| *w == actual);
+            match holds_settings(&actual) {
+                Some(false) if !root => {}
+                Some(_) => f.settings = true,
+                None => f.scope(format!("{} could not be listed", lexical.display())),
+            }
+        }
     }
     let mut warning = String::new();
+    if f.settings {
+        warning.push_str(SETTINGS_WARNING);
+    }
     if !f.danger.is_empty() {
+        if !warning.is_empty() {
+            warning.push(' ');
+        }
         warning.push_str(&format!(
             "This reaches {}. Allow it for this turn only if you trust it.",
             agent_core::codex::sentence(&f.danger)
@@ -293,11 +340,11 @@ pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verd
             "Allow for session is not offered: {}.",
             agent_core::codex::sentence(&f.scope)
         ));
-    } else if !f.danger.is_empty() {
+    } else if !f.danger.is_empty() || f.settings {
         warning.push_str(" Allow for session is not offered.");
     }
     Verdict {
-        session_allowed: f.danger.is_empty() && f.scope.is_empty(),
+        session_allowed: f.danger.is_empty() && f.scope.is_empty() && !f.settings,
         warning: (!warning.is_empty()).then(|| agent_core::codex::clip(&warning, MAX_WARNING)),
         resolved,
     }
@@ -479,6 +526,44 @@ mod tests {
         }
         // Deny entries restrict: never a reason.
         assert!(judge(&one("deny", path(Path::new("/"))), &project, &h).session_allowed);
+    }
+
+    /// A folder grant takes in everything below it: the project root, or any folder whose own
+    /// entries hold its settings or history, is for this turn only.
+    #[test]
+    fn folders_holding_the_projects_settings_are_turn_only() {
+        let (_dir, home, project) = tree();
+        let h = homes(&home);
+        let settings = |target: &Path| {
+            let v = judge(&one("write", path(target)), &project, &h);
+            (v.session_allowed, v.warning.unwrap_or_default())
+        };
+        let (allowed, warning) = settings(&project);
+        assert!(!allowed);
+        assert!(warning.starts_with(SETTINGS_WARNING), "{warning}");
+        assert!(
+            warning.contains("Allow for session is not offered"),
+            "{warning}"
+        );
+        for name in [".git", "AGENTS.md", ".env.local", ".github", ".vscode"] {
+            let sub = project.join(format!("sub-{}", name.trim_start_matches('.')));
+            std::fs::create_dir_all(&sub).expect("sub");
+            let marker = sub.join(name);
+            if name.contains('.') && !name.starts_with('.') || name.starts_with(".env") {
+                std::fs::write(&marker, "x").expect("file");
+            } else {
+                std::fs::create_dir_all(&marker).expect("dir");
+            }
+            let (allowed, warning) = settings(&sub);
+            assert!(!allowed, "{name}");
+            assert!(
+                warning.contains(".git, agent instructions"),
+                "{name}: {warning}"
+            );
+        }
+        // A plain sub-folder of the project is session-grantable.
+        let (allowed, warning) = settings(&project.join("src"));
+        assert!(allowed, "{warning}");
     }
 
     #[test]
