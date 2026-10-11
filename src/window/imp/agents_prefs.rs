@@ -1376,17 +1376,37 @@ impl AgentTerminalWindow {
             hook,
             async move {
                 // Off the main thread, and it refreshes the verdict new Antigravity sessions use.
-                match super::threads::check_hook().await {
-                    Ok(()) => {
-                        hook.set_subtitle("Installed: Antigravity asks agent-terminal before it acts");
-                        hook.remove_css_class("error");
-                    }
-                    Err(_) => {
-                        hook.set_subtitle(
-                            "Not installed: Antigravity cannot ask before acting until the entry below is added",
-                        );
-                        hook.add_css_class("error");
-                    }
+                let _ = super::threads::check_hook().await;
+                let home = std::env::var("HOME").ok();
+                let probe = gtk4::gio::spawn_blocking(move || {
+                    crate::hook_config::probe(home.as_deref())
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    crate::hook_config::HookProbe::Unreadable("the hooks check panicked".into())
+                });
+                let bound = crate::approval_server::socket_bindable();
+                let badge = crate::hook_config::badge(&probe, bound);
+                crate::hook_config::log_verdict(badge, &probe, bound);
+                let (text, bad) = match badge {
+                    crate::hook_config::HookBadge::Verified => (
+                        "Verified: the hook is installed and the approval socket is available, so Antigravity asks agent-terminal before it acts",
+                        false,
+                    ),
+                    crate::hook_config::HookBadge::Missing => (
+                        "Not installed: Antigravity cannot ask before acting until the entry below is added",
+                        true,
+                    ),
+                    crate::hook_config::HookBadge::Unreadable => (
+                        "Could not verify: hooks.json is unreadable or the approval socket is unavailable. Treat Antigravity as ungated",
+                        true,
+                    ),
+                };
+                hook.set_subtitle(text);
+                if bad {
+                    hook.add_css_class("error");
+                } else {
+                    hook.remove_css_class("error");
                 }
             }
         ));
