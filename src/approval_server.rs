@@ -724,13 +724,12 @@ impl ApprovalHandle {
         {
             decision = Decision::Allow;
         }
-        reply(
-            pending.conn,
-            ApprovalReply {
-                decision,
-                reason: None,
-            },
-        );
+        // Stop turn denies the call; the session then interrupts the turn (D4).
+        let (decision, reason) = match decision {
+            Decision::Cancel => (Decision::Deny, Some("The user stopped the turn".to_owned())),
+            d => (d, None),
+        };
+        reply(pending.conn, ApprovalReply { decision, reason });
         true
     }
 
@@ -1090,7 +1089,7 @@ pub(crate) fn canonical_target(path: &Path) -> PathBuf {
 /// session" when a rule could match the call ([`crate::always_allow::offerable`]: no secret, a
 /// simple command, a contained path); "Always allow" when a rules file is configured and the
 /// call is one [`crate::always_allow::always_offerable`] keeps (the predicate the rule is then
-/// checked by, so the button never promises what is refused); Deny.
+/// checked by, so the button never promises what is refused); Deny; Stop turn (D4).
 fn rule_options(
     action: Option<&crate::always_allow::Action>,
     ctx: Option<&crate::always_allow::Context>,
@@ -1108,6 +1107,7 @@ fn rule_options(
         }
     }
     options.push(Decision::Deny);
+    options.push(Decision::Cancel);
     (options, remembers)
 }
 
@@ -1949,7 +1949,12 @@ mod tests {
                 assert_eq!(input["CommandLine"], "git status --short");
                 assert_eq!(
                     options,
-                    &[Decision::Allow, Decision::AllowForSession, Decision::Deny]
+                    &[
+                        Decision::Allow,
+                        Decision::AllowForSession,
+                        Decision::Deny,
+                        Decision::Cancel
+                    ]
                 );
                 assert_eq!(*response, ResponseCapability::Live);
                 assert_eq!(seen[0].request.as_deref(), Some("q1"));
@@ -1971,8 +1976,13 @@ mod tests {
             // A different command still asks.
             let rx = client(path.clone(), with_id(cmd("git push"), "q3"));
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 3));
-            assert!(handle.respond("q3", Decision::Deny));
-            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
+            // Stop turn reaches agy as a deny (the session then interrupts the turn).
+            assert!(handle.respond("q3", Decision::Cancel));
+            let stopped = wait_reply(ctx, &rx);
+            assert_eq!(stopped.decision, Decision::Deny);
+            assert!(stopped
+                .reason
+                .is_some_and(|r| r.contains("stopped the turn")));
 
             drop(handle);
             assert!(!path.exists(), "socket removed on drop");

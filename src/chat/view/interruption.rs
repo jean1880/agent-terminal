@@ -206,25 +206,7 @@ impl InterruptionShelf {
                 let heading = title.unwrap_or_else(|| format!("Approval required: {tool}"));
                 self.title.set_text(&heading);
 
-                let kind = if tool.eq_ignore_ascii_case("bash") || tool == "run_command" {
-                    ItemKind::Command
-                } else {
-                    ItemKind::Tool
-                };
-                let prev = if let Some(summary) = payload::tool_summary(kind, Some(&input), "") {
-                    if kind == ItemKind::Command {
-                        format!("$ {summary}")
-                    } else {
-                        summary
-                    }
-                } else {
-                    let edits = agent_kit::editdiff::preview_from_input(&input);
-                    if !edits.is_empty() {
-                        format!("Edit {}", edits[0].path)
-                    } else {
-                        String::new()
-                    }
-                };
+                let prev = approval_preview(&tool, &input);
                 self.preview.set_text(&prev);
                 self.preview.set_visible(!prev.is_empty());
 
@@ -342,12 +324,55 @@ impl InterruptionShelf {
     }
 }
 
+/// The shelf's one line for a pending approval: the call's card title (W3.4, `Run <command>`,
+/// `Edit <path>`, …), else the first file an edit names, else nothing.
+fn approval_preview(tool: &str, input: &serde_json::Value) -> String {
+    let called = payload::tool_title(ItemKind::Tool, tool, Some(input), "");
+    if !called.target.is_empty() || called.kind == agent_core::tool_title::ToolKind::Mcp {
+        return called.text();
+    }
+    agent_kit::editdiff::preview_from_input(input)
+        .first()
+        .map(|edit| format!("Edit {}", edit.path))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use agent_core::adapter::Driver;
     use agent_core::event::{Envelope, Event, ResponseCapability};
     use std::cell::Cell;
+
+    /// The approval line says what the call's card will: one title grammar for every agent.
+    #[test]
+    fn approval_preview_is_the_cards_title() {
+        let cases = [
+            ("Bash", serde_json::json!({"command": "touch x.tmp"})),
+            (
+                "run_command",
+                serde_json::json!({"CommandLine": "cargo test"}),
+            ),
+            (
+                "command_execution",
+                serde_json::json!({"command": "/usr/bin/zsh -lc 'ls -la'"}),
+            ),
+            ("Edit", serde_json::json!({"file_path": "/w/a.rs"})),
+            ("mcp__unraid__unraid_containers", serde_json::json!({})),
+        ];
+        let want = [
+            "Run touch x.tmp",
+            "Run cargo test",
+            "Run ls -la",
+            "Edit /w/a.rs",
+            "unraid/unraid_containers",
+        ];
+        for ((tool, input), want) in cases.iter().zip(want) {
+            assert_eq!(approval_preview(tool, input), want, "{tool}");
+            let title = payload::tool_title(ItemKind::Tool, tool, Some(input), "");
+            assert_eq!(want, title.text(), "{tool}: same as the card");
+        }
+    }
 
     /// Regression: answering from the shelf resolves the approval at once, which updates the
     /// shelf again from inside its own button handler. That panicked (RefCell already borrowed)

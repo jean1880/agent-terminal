@@ -237,6 +237,9 @@ struct ThinkingFlag {
     refused: Cell<bool>,
     /// The one retry without the flag was spent: this thread never passes it again.
     retried: Cell<bool>,
+    /// The running process sent its `init`: it started, so a later exit is not the CLI refusing
+    /// the flag at start.
+    init_seen: Cell<bool>,
 }
 
 struct QueuedPrompt {
@@ -865,6 +868,7 @@ impl Inner {
         }
         self.thinking.passed.set(thinking);
         self.thinking.refused.set(false);
+        self.thinking.init_seen.set(false);
         let launch = self.launch_env.borrow();
         // The profile's environment first, so it can never override the approval socket.
         let mut env = launch.env.clone();
@@ -1118,6 +1122,7 @@ impl Inner {
             // What a Claude `init` says it is: the next launch's thinking-flag gate.
             if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(version) = agent_core::claude::session_version(&frame) {
+                    self.thinking.init_seen.set(true);
                     crate::claude_probe::note_version(&self.open.borrow().program, version);
                 }
             }
@@ -1580,7 +1585,9 @@ impl Inner {
     /// False when this exit is anything else.
     fn retry_without_thinking(self: &Rc<Self>, code: Option<i32>) -> bool {
         let flag = &self.thinking;
-        if !(flag.passed.get() && flag.refused.get()) || flag.retried.get() {
+        // Only a failed exit before the CLI ever started (no `init`) is the start-up refusal.
+        let failed_at_start = code.is_some_and(|c| c != 0) && !flag.init_seen.get();
+        if !(flag.passed.get() && flag.refused.get() && failed_at_start) || flag.retried.get() {
             return false;
         }
         flag.retried.set(true);
@@ -2029,6 +2036,10 @@ impl Inner {
         if let Some(handle) = self.approval() {
             if handle.respond_with_rule(request, decision, custom_rule.clone()) {
                 self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+                // Stop turn: the hook was denied; end the turn as the stop button does (D4).
+                if decision == Decision::Cancel {
+                    self.command(Command::Interrupt);
+                }
                 return;
             }
         }
@@ -4373,6 +4384,60 @@ mod tests {
         });
     }
 
+    /// W3.2: the retry is for a failed exit before the CLI started. A Claude that sent its
+    /// `init` and then exits, or one that exits 0, takes the normal path: no restart.
+    #[test]
+    fn the_thinking_retry_needs_a_failed_exit_before_init() {
+        for (case, body) in [
+            (
+                "after init",
+                "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 echo \"error: unknown option '--thinking-display'\" >&2\nsleep 0.2\nexit 1",
+            ),
+            (
+                "exit 0",
+                "echo \"error: unknown option '--thinking-display'\" >&2\nexit 0",
+            ),
+        ] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, &tmp.path().to_string_lossy());
+                let (sink, seen) = make_sink();
+                let open = scripted(tmp.path(), body);
+                crate::claude_probe::note_version(&open.program, "2.1.293");
+                let session = ChatSession::new(
+                    Box::new(agent_core::claude::ClaudeAdapter::new()),
+                    open,
+                    store,
+                    thread,
+                    sink,
+                    None,
+                );
+                assert!(
+                    pump_until(ctx, 10, || seen
+                        .borrow()
+                        .iter()
+                        .any(|e| matches!(e.event, Event::SessionExited { .. }))),
+                    "{case}: exit seen"
+                );
+                // Give a (wrong) restart the chance to happen.
+                pump_until(ctx, 1, || false);
+                let launches = std::fs::read_to_string(tmp.path().join("args.log")).expect("args");
+                assert_eq!(launches.lines().count(), 1, "{case}: no retry");
+                assert!(launches.contains("--thinking-display"), "{case}");
+                assert!(
+                    !seen
+                        .borrow()
+                        .iter()
+                        .any(|e| matches!(e.event, Event::Reasoning { .. })),
+                    "{case}: no not-shared block"
+                );
+                assert!(!session.status().alive, "{case}");
+            });
+        }
+    }
+
     fn bound_handle(dir: &Path) -> ApprovalHandle {
         ApprovalHandle::bind(
             &dir.join("rt"),
@@ -4500,6 +4565,60 @@ mod tests {
             assert_eq!(session.status().mode, Mode::Plan);
             assert!(session.status().alive);
             assert!(!socket.exists(), "the approval socket is closed");
+        });
+    }
+
+    #[test]
+    fn agy_stop_turn_denies_the_hook_and_interrupts_the_turn() {
+        in_loop(|ctx| {
+            use std::io::{BufRead as _, Write as _};
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            let mut hook = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+            let query = agent_core::approval::ApprovalQuery {
+                id: "h1".into(),
+                conversation_id: "c1".into(),
+                tool: "run_command".into(),
+                args: serde_json::json!({"CommandLine": "git push"}),
+                cwd: None,
+            };
+            writeln!(
+                hook,
+                "{}",
+                agent_core::approval::encode_query(&query).expect("enc")
+            )
+            .expect("send");
+            assert!(pump_until(ctx, 10, || has(&seen, |e| {
+                matches!(e, Event::ApprovalRequested { options, .. } if options.contains(&Decision::Cancel))
+            })));
+            session.respond_approval("h1", Decision::Cancel);
+            assert_eq!(resolution(&seen, "h1"), Some(Decision::Cancel));
+            assert!(
+                log.borrow().iter().any(|c| matches!(c, Command::Interrupt)),
+                "the turn is interrupted like the stop button"
+            );
+            hook.set_nonblocking(true).expect("nonblocking");
+            let mut reader = std::io::BufReader::new(&hook);
+            let mut reply = String::new();
+            assert!(pump_until(ctx, 10, || {
+                let _ = reader.read_line(&mut reply);
+                reply.ends_with('\n')
+            }));
+            let reply = agent_core::approval::parse_reply(&reply).expect("reply");
+            assert_eq!(reply.decision, Decision::Deny, "agy hears a deny");
         });
     }
 
