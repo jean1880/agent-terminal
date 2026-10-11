@@ -19,8 +19,8 @@ pub struct InterruptionShelf {
     icon: gtk4::Image,
     title: gtk4::Label,
     preview: gtk4::Label,
-    allow_btn: gtk4::Button,
-    deny_btn: gtk4::Button,
+    pub(crate) allow_btn: gtk4::Button,
+    pub(crate) deny_btn: gtk4::Button,
     pub(crate) more_btn: gtk4::MenuButton,
     pub(crate) more_box: gtk4::Box,
     pub(crate) more_popover: gtk4::Popover,
@@ -80,11 +80,15 @@ impl InterruptionShelf {
         more_btn.set_popover(Some(&more_popover));
         more_btn.add_css_class("flat");
         more_btn.set_tooltip_text(Some("More permission options"));
+        more_btn.update_property(&[gtk4::accessible::Property::Label("More permission options")]);
         more_btn.set_visible(false);
 
         let jump_btn = gtk4::Button::from_icon_name("at-go-bottom-symbolic");
         jump_btn.add_css_class("flat");
         jump_btn.set_tooltip_text(Some("Jump to card in transcript"));
+        jump_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Jump to card in transcript",
+        )]);
 
         actions.append(&deny_btn);
         actions.append(&allow_btn);
@@ -282,6 +286,10 @@ impl InterruptionShelf {
                 self.jump_btn.add_css_class("flat");
                 self.jump_btn
                     .set_tooltip_text(Some("Jump to card in transcript"));
+                self.jump_btn
+                    .update_property(&[gtk4::accessible::Property::Label(
+                        "Jump to card in transcript",
+                    )]);
                 self.jump_btn.set_visible(true);
 
                 self.revealer.set_reveal_child(true);
@@ -311,11 +319,17 @@ impl InterruptionShelf {
                 // icon after it replaced the text with nothing, a blank pill.
                 self.jump_btn.set_icon_name("");
                 self.jump_btn.set_label("Answer in transcript ↓");
+                // Ellipsizes rather than widening the shelf at a large text scale.
+                if let Some(text) = self.jump_btn.child().and_downcast::<gtk4::Label>() {
+                    text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                }
                 self.jump_btn.remove_css_class("flat");
                 self.jump_btn.add_css_class("pill");
                 self.jump_btn.add_css_class("suggested-action");
                 self.jump_btn
                     .set_tooltip_text(Some("Jump to question in transcript"));
+                self.jump_btn
+                    .update_property(&[gtk4::accessible::Property::Label("Answer in transcript")]);
                 self.jump_btn.set_visible(true);
 
                 self.revealer.set_reveal_child(true);

@@ -64,13 +64,23 @@ pub fn brand_image(driver: Driver) -> gtk4::Image {
     image
 }
 
+/// A plain label. NOT selectable: a selectable label claims the press (it places a caret), so a
+/// label inside a button or any click target would swallow the click. Content that a person
+/// may want to copy opts in with [`content_label`] or an explicit `set_selectable(true)`.
 pub fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     let l = gtk4::Label::new(Some(text));
     l.set_xalign(0.0);
-    l.set_selectable(true);
+    l.set_selectable(false);
     for c in classes {
         l.add_css_class(c);
     }
+    l
+}
+
+/// A label for content (never inside a button or click target): selectable, so it can be copied.
+pub fn content_label(text: &str, classes: &[&str]) -> gtk4::Label {
+    let l = label(text, classes);
+    l.set_selectable(true);
     l
 }
 
@@ -125,6 +135,10 @@ pub fn collapsible(
             if open { "Hide" } else { "Show" }
         )));
         toggle.update_state(&[gtk4::accessible::State::Expanded(Some(open))]);
+        toggle.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "{} {what}",
+            if open { "Hide" } else { "Show" }
+        ))]);
     };
     show(&toggle, &chevron, open);
     toggle.connect_clicked({
@@ -244,6 +258,34 @@ pub(super) fn apply_scheme(buffer: &sourceview5::Buffer) {
     });
 }
 
+/// A flat "Copy" icon button, named for what it copies (`what`: "Copy output"). Give it its text
+/// with [`wire_copy`].
+pub(super) fn copy_button(what: &str) -> gtk4::Button {
+    let copy = gtk4::Button::from_icon_name("at-edit-copy-symbolic");
+    copy.add_css_class("flat");
+    copy.add_css_class("code-copy");
+    copy.set_valign(gtk4::Align::Center);
+    copy.set_tooltip_text(Some(what));
+    copy.update_property(&[gtk4::accessible::Property::Label(what)]);
+    copy
+}
+
+/// Makes `copy` put `text()` on the clipboard, and shows a tick for a moment.
+pub(super) fn wire_copy(copy: &gtk4::Button, text: impl Fn() -> String + 'static) {
+    copy.connect_clicked(move |copy| {
+        copy.clipboard().set_text(&text());
+        copy.set_icon_name("at-object-select-symbolic");
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(1200),
+            glib::clone!(
+                #[weak]
+                copy,
+                move || copy.set_icon_name("at-edit-copy-symbolic")
+            ),
+        );
+    });
+}
+
 /// A code block: language label + copy button over a read-only, highlighted source view.
 fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -254,10 +296,7 @@ fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
     let lang_label = label(lang.unwrap_or("text"), &["code-lang"]);
     lang_label.set_hexpand(true);
     header.append(&lang_label);
-    let copy = gtk4::Button::from_icon_name("at-edit-copy-symbolic");
-    copy.add_css_class("flat");
-    copy.add_css_class("code-copy");
-    copy.set_tooltip_text(Some("Copy"));
+    let copy = copy_button("Copy code");
     header.append(&copy);
     root.append(&header);
 
@@ -288,25 +327,15 @@ fn code_block(lang: Option<&str>, text: &str) -> BlockWidget {
     scroller.set_child(Some(&view));
     root.append(&scroller);
 
-    copy.connect_clicked(glib::clone!(
-        #[weak]
-        buffer,
-        #[weak]
-        copy,
-        move |_| {
-            let (start, end) = buffer.bounds();
-            copy.clipboard().set_text(&buffer.text(&start, &end, false));
-            copy.set_icon_name("at-object-select-symbolic");
-            glib::timeout_add_local_once(
-                std::time::Duration::from_millis(1200),
-                glib::clone!(
-                    #[weak]
-                    copy,
-                    move || copy.set_icon_name("at-edit-copy-symbolic")
-                ),
-            );
+    wire_copy(&copy, {
+        let buffer = buffer.downgrade();
+        move || {
+            buffer.upgrade().map_or_else(String::new, |buffer| {
+                let (start, end) = buffer.bounds();
+                buffer.text(&start, &end, false).to_string()
+            })
         }
-    ));
+    });
 
     BlockWidget::Code {
         root,
@@ -696,12 +725,18 @@ fn error_row(message: &str) -> gtk4::Box {
     icon.set_valign(gtk4::Align::Start);
     root.append(&icon);
     let col = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    col.append(&label("Turn failed", &["error-title"]));
+    col.set_hexpand(true);
+    col.append(&content_label("Turn failed", &["error-title"]));
     let l = label(message, &["error-text"]);
     wrapping(&l);
     l.set_selectable(true);
     col.append(&l);
     root.append(&col);
+    let copy = copy_button("Copy error");
+    copy.set_valign(gtk4::Align::Start);
+    let message = message.to_owned();
+    wire_copy(&copy, move || message.clone());
+    root.append(&copy);
     root
 }
 
@@ -724,7 +759,13 @@ fn divider(text: &str, class: &str, driver: Option<Driver>) -> gtk4::Widget {
     if let Some(d) = driver {
         pill.append(&brand_image(d));
     }
-    pill.append(&label(text, &["divider-text"]));
+    // Wraps: a long model name must not set the transcript's minimum width.
+    let words = content_label(text, &["divider-text"]);
+    words.set_wrap(true);
+    words.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    words.set_justify(gtk4::Justification::Center);
+    words.set_xalign(0.5);
+    pill.append(&words);
     root.append(&left);
     root.append(&pill);
     root.append(&right);
@@ -893,11 +934,12 @@ pub struct ToolCard {
     badge: gtk4::Label,
     chevron: gtk4::Image,
     revealer: gtk4::Revealer,
-    input_box: gtk4::Box,
-    input: gtk4::Label,
-    output_box: gtk4::Box,
-    output: gtk4::Label,
+    input_box: Section,
+    output_box: Section,
+    /// Kept for the tests that read its selection.
+    #[cfg_attr(not(test), allow(dead_code))]
     error: gtk4::Label,
+    error_box: Section,
     children: gtk4::Box,
     last_status: Cell<Option<ToolStatus>>,
     /// File-change cards only: "View diff" and "Open in ‹tool›", and the diff they reveal.
@@ -966,18 +1008,92 @@ fn status_class(s: ToolStatus) -> &'static str {
 /// Lines of tool input/output shown in a card.
 const MAX_CARD_LINES: usize = 40;
 
-fn section(title: &str, body: &gtk4::Label) -> gtk4::Box {
-    let b = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    b.add_css_class("card-section");
-    b.append(&label(title, &["section-title"]));
-    // No nested scroller: its minimum height padded one-line outputs to three lines, and a
-    // scroller inside the transcript steals wheel events. Long text is cut by lines instead
-    // (`payload::cap_lines`).
-    let frame = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    frame.add_css_class("mono-scroller");
-    frame.append(body);
-    b.append(&frame);
-    b
+/// A titled block of tool text (input, output, error) with a Copy button that copies all of it,
+/// and "Show full" when the card shows only the last [`MAX_CARD_LINES`] lines.
+struct Section {
+    root: gtk4::Box,
+    body: gtk4::Label,
+    full: Rc<RefCell<String>>,
+    expanded: Rc<Cell<bool>>,
+    more: gtk4::Button,
+}
+
+impl Section {
+    fn new(title: &str, body: &gtk4::Label) -> Self {
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        root.add_css_class("card-section");
+        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let name = label(title, &["section-title"]);
+        name.set_hexpand(true);
+        head.append(&name);
+        let more = gtk4::Button::with_label("Show full");
+        more.add_css_class("flat");
+        more.add_css_class("section-more");
+        more.set_visible(false);
+        head.append(&more);
+        let copy = copy_button(&format!("Copy {}", title.to_lowercase()));
+        head.append(&copy);
+        root.append(&head);
+        // No nested scroller: its minimum height padded one-line outputs to three lines, and a
+        // scroller inside the transcript steals wheel events. Long text is cut by lines instead
+        // (`payload::cap_lines`).
+        let frame = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        frame.add_css_class("mono-scroller");
+        frame.append(body);
+        root.append(&frame);
+
+        let full = Rc::new(RefCell::new(String::new()));
+        let expanded = Rc::new(Cell::new(false));
+        wire_copy(&copy, {
+            let full = full.clone();
+            move || full.borrow().clone()
+        });
+        let section = Self {
+            root,
+            body: body.clone(),
+            full,
+            expanded,
+            more,
+        };
+        section.more.connect_clicked({
+            let (body, full, expanded) = (
+                section.body.downgrade(),
+                section.full.clone(),
+                section.expanded.clone(),
+            );
+            move |more| {
+                let Some(body) = body.upgrade() else { return };
+                expanded.set(!expanded.get());
+                Self::show(&body, more, &full.borrow(), expanded.get());
+            }
+        });
+        section
+    }
+
+    /// Shows `text` (all of it to Copy), cut to the last lines unless the person asked for it all.
+    fn set_text(&self, text: &str) {
+        text.clone_into(&mut self.full.borrow_mut());
+        Self::show(&self.body, &self.more, text, self.expanded.get());
+    }
+
+    fn show(body: &gtk4::Label, more: &gtk4::Button, text: &str, expanded: bool) {
+        let capped = text.lines().count() > MAX_CARD_LINES;
+        more.set_visible(capped);
+        more.set_label(if expanded { "Show less" } else { "Show full" });
+        body.set_text(&if expanded {
+            text.to_owned()
+        } else {
+            payload::cap_lines(text, MAX_CARD_LINES)
+        });
+    }
+
+    fn set_visible(&self, visible: bool) {
+        self.root.set_visible(visible);
+    }
+
+    fn widget(&self) -> &gtk4::Box {
+        &self.root
+    }
 }
 
 impl ToolCard {
@@ -1031,19 +1147,18 @@ impl ToolCard {
 
         let body = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
         body.add_css_class("card-body");
-        let input = mono("");
-        let input_box = section("Input", &input);
-        let output = mono("");
-        let output_box = section("Output", &output);
+        let input_box = Section::new("Input", &mono(""));
+        let output_box = Section::new("Output", &mono(""));
         let error = label("", &["card-error"]);
         wrapping(&error);
         error.set_selectable(true);
+        let error_box = Section::new("Error", &error);
         let children = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         children.add_css_class("card-children");
-        body.append(&input_box);
+        body.append(input_box.widget());
         body.append(&children);
-        body.append(&output_box);
-        body.append(&error);
+        body.append(output_box.widget());
+        body.append(error_box.widget());
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
         revealer.set_child(Some(&body));
@@ -1108,10 +1223,9 @@ impl ToolCard {
             chevron,
             revealer,
             input_box,
-            input,
             output_box,
-            output,
             error,
+            error_box,
             children,
             last_status: Cell::new(None),
             diff,
@@ -1132,6 +1246,9 @@ impl ToolCard {
         open.add_css_class("diff-open");
         let open_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         open_row.append(&gtk4::Image::from_icon_name(crate::icons::EXTERNAL_ICON));
+        open.update_property(&[gtk4::accessible::Property::Label(
+            "Open the changes in the external diff tool",
+        )]);
         let open_label = label("", &[]);
         open_row.append(&open_label);
         open.set_child(Some(&open_row));
@@ -1351,17 +1468,15 @@ impl ToolCard {
             })]);
         let input = payload::tool_input_text(tool.kind, tool.input.as_ref(), &tool.input_text);
         self.input_box.set_visible(!input.trim().is_empty());
-        self.input
-            .set_text(&payload::cap_lines(input.trim_end(), MAX_CARD_LINES));
+        self.input_box.set_text(input.trim_end());
         self.output_box.set_visible(!tool.output.trim().is_empty());
-        self.output
-            .set_text(&payload::cap_lines(tool.output.trim_end(), MAX_CARD_LINES));
+        self.output_box.set_text(tool.output.trim_end());
         match &tool.error {
             Some(e) if !e.trim().is_empty() => {
-                self.error.set_text(e.trim());
-                self.error.set_visible(true);
+                self.error_box.set_text(e.trim());
+                self.error_box.set_visible(true);
             }
-            _ => self.error.set_visible(false),
+            _ => self.error_box.set_visible(false),
         }
         self.children.set_visible(!item.children.is_empty());
         let useful_details = !input.trim().is_empty()
@@ -1418,14 +1533,15 @@ pub struct ApprovalCard {
     root: gtk4::Box,
     title: gtk4::Label,
     reason: gtk4::Label,
-    input: gtk4::Label,
+    /// What is asked, as text, which the section also copies and can show whole.
+    input_section: Section,
     /// A file-edit request's proposed change, as a diff (instead of the tool-input JSON).
     diff: DiffText,
     /// A plan to approve (Claude's ExitPlanMode), rendered as markdown.
     plan: MarkdownView,
     /// The request's JSON, capped, one click away.
     raw: gtk4::Expander,
-    raw_text: gtk4::Label,
+    raw_section: Section,
     /// What "Always allow" would save, when it is offered.
     remembers: gtk4::Label,
     buttons: gtk4::Box,
@@ -1521,17 +1637,17 @@ impl ApprovalCard {
         icon.set_valign(gtk4::Align::Start);
         head.append(&icon);
         let col = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-        let title = label("", &["approval-title"]);
+        let title = content_label("", &["approval-title"]);
         wrapping(&title);
-        let reason = label("", &["approval-reason"]);
+        let reason = content_label("", &["approval-reason"]);
         wrapping(&reason);
         col.append(&title);
         col.append(&reason);
         head.append(&col);
         root.append(&head);
         let input = mono("");
-        input.add_css_class("approval-input");
-        root.append(&input);
+        let input_section = Section::new("Request", &input);
+        root.append(input_section.widget());
         let diff = DiffText::new();
         diff.widget().set_visible(false);
         root.append(diff.widget());
@@ -1540,9 +1656,10 @@ impl ApprovalCard {
         plan.widget().set_visible(false);
         root.append(plan.widget());
         let raw_text = mono("");
+        let raw_section = Section::new("Raw request", &raw_text);
         let raw = gtk4::Expander::new(Some("Show raw"));
         raw.add_css_class("approval-raw");
-        raw.set_child(Some(&raw_text));
+        raw.set_child(Some(raw_section.widget()));
         raw.set_visible(false);
         root.append(&raw);
         let remembers = label("", &["approval-remembers", "dim-label"]);
@@ -1551,7 +1668,7 @@ impl ApprovalCard {
         remembers.set_visible(false);
         root.append(&remembers);
         let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let outcome = label("", &["approval-outcome"]);
+        let outcome = content_label("", &["approval-outcome"]);
         outcome.set_hexpand(true);
         let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         buttons.set_halign(gtk4::Align::End);
@@ -1562,11 +1679,11 @@ impl ApprovalCard {
             root,
             title,
             reason,
-            input,
+            input_section,
             diff,
             plan,
             raw,
-            raw_text,
+            raw_section,
             remembers,
             buttons,
             outcome,
@@ -1581,7 +1698,7 @@ impl ApprovalCard {
     #[cfg(test)]
     pub(super) fn diff_view(&self) -> (String, bool, bool, String) {
         (
-            self.input.text().to_string(),
+            self.input_section.full.borrow().clone(),
             self.diff.widget().is_visible(),
             self.raw.is_visible(),
             self.diff.text(),
@@ -1621,8 +1738,8 @@ impl ApprovalCard {
                 .join("\n")
         };
         self.plan.widget().set_visible(plan.is_some());
-        self.input.set_visible(!input.is_empty());
-        self.input.set_text(&input);
+        self.input_section.set_visible(!input.is_empty());
+        self.input_section.set_text(&input);
         // No "Show raw" when the card already shows all of it (a bare command and its folder).
         let shown_whole = a.input.as_object().is_some_and(|o| {
             o.keys().all(|k| {
@@ -1641,8 +1758,8 @@ impl ApprovalCard {
             _ if shown_whole => String::new(),
             v => serde_json::to_string_pretty(v).unwrap_or_default(),
         };
-        self.raw_text
-            .set_text(&payload::cap_lines(&raw, MAX_CARD_LINES));
+        // The Raw section caps what it shows (Show full, Copy takes all of it).
+        self.raw_section.set_text(&raw);
         self.raw.set_visible(!raw.is_empty());
         if preview.is_empty() || plan.is_some() {
             self.diff.widget().set_visible(false);
@@ -1834,7 +1951,9 @@ impl QuestionCardWidget {
         root.add_css_class("card");
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
         head.append(&gtk4::Image::from_icon_name("at-dialog-question-symbolic"));
-        head.append(&label("The agent has a question", &["question-heading"]));
+        let heading = label("The agent has a question", &["question-heading"]);
+        wrapping(&heading);
+        head.append(&heading);
         root.append(&head);
 
         let selected: Rc<RefCell<Vec<Vec<usize>>>> =
@@ -1850,9 +1969,12 @@ impl QuestionCardWidget {
             if !q.header.is_empty() {
                 let chip = label(&q.header, &["question-chip"]);
                 chip.set_halign(gtk4::Align::Start);
+                chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                chip.set_max_width_chars(40);
+                chip.set_tooltip_text(Some(&q.header));
                 qbox.append(&chip);
             }
-            let text = label(&q.question, &["question-text"]);
+            let text = content_label(&q.question, &["question-text"]);
             wrapping(&text);
             qbox.append(&text);
             if q.multi_select {
@@ -1869,7 +1991,12 @@ impl QuestionCardWidget {
                 let b = gtk4::ToggleButton::new();
                 b.add_css_class("option-button");
                 let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-                inner.append(&label(&opt.label, &["option-label"]));
+                // Wraps: a long option must not set the transcript's minimum width.
+                let ol = label(&opt.label, &["option-label"]);
+                wrapping(&ol);
+                ol.set_hexpand(false);
+                ol.set_max_width_chars(36);
+                inner.append(&ol);
                 if let Some(d) = &opt.description {
                     let dl = label(d, &["option-desc"]);
                     wrapping(&dl);
@@ -2074,6 +2201,111 @@ pub(crate) fn build_approval_suggestions(
     suggestions
 }
 
+/// The always-allow dialog's pattern suggestions: toggle buttons that keep `entry` in step.
+/// None when there is nothing to choose between.
+pub(super) fn suggestion_flow(
+    entry: &gtk4::Entry,
+    tool: &str,
+    initial_pattern: &str,
+) -> Option<gtk4::FlowBox> {
+    let suggestions = build_approval_suggestions(tool, initial_pattern);
+    if suggestions.len() <= 1 {
+        return None;
+    }
+    let flow = gtk4::FlowBox::new();
+    flow.set_selection_mode(gtk4::SelectionMode::None);
+    flow.set_max_children_per_line(3);
+    flow.set_column_spacing(8);
+    flow.set_row_spacing(8);
+    flow.set_homogeneous(false);
+
+    let in_sync = Rc::new(Cell::new(false));
+    let mut toggle_buttons: Vec<(gtk4::ToggleButton, String)> = Vec::new();
+
+    for opt in &suggestions {
+        let b = gtk4::ToggleButton::new();
+        b.add_css_class("option-button");
+
+        let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        let ol = label(&opt.label, &["option-label"]);
+        wrapping(&ol);
+        ol.set_max_width_chars(32);
+        ol.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        inner.append(&ol);
+
+        if let Some(desc) = &opt.description {
+            let dl = label(desc, &["option-desc"]);
+            wrapping(&dl);
+            dl.set_max_width_chars(36);
+            inner.append(&dl);
+        }
+
+        b.set_child(Some(&inner));
+        b.set_tooltip_text(Some(&opt.pattern));
+
+        if opt.pattern == initial_pattern {
+            b.set_active(true);
+        }
+
+        toggle_buttons.push((b.clone(), opt.pattern.clone()));
+        flow.insert(&b, -1);
+    }
+
+    // Handlers hold the widgets weakly: the buttons and the entry each own the other's
+    // handler, so strong references would keep them all alive for good.
+    let weak_buttons: Rc<Vec<(glib::WeakRef<gtk4::ToggleButton>, String)>> = Rc::new(
+        toggle_buttons
+            .iter()
+            .map(|(b, pat)| (b.downgrade(), pat.clone()))
+            .collect(),
+    );
+    for (b, pat) in &toggle_buttons {
+        let entry = entry.downgrade();
+        let others = weak_buttons.clone();
+        let in_sync = in_sync.clone();
+        let pattern = pat.clone();
+
+        b.connect_toggled(move |btn| {
+            let Some(entry) = entry.upgrade() else { return };
+            if in_sync.get() {
+                return;
+            }
+            in_sync.set(true);
+            if btn.is_active() {
+                entry.set_text(&pattern);
+                for (other, other_pat) in others.iter() {
+                    if let (Some(other), true) = (other.upgrade(), other_pat != &pattern) {
+                        other.set_active(false);
+                    }
+                }
+            } else if entry.text().trim() == pattern {
+                btn.set_active(true);
+            }
+            in_sync.set(false);
+        });
+    }
+
+    {
+        let buttons = weak_buttons.clone();
+        let in_sync = in_sync.clone();
+        entry.connect_changed(move |ent| {
+            if in_sync.get() {
+                return;
+            }
+            in_sync.set(true);
+            let current = ent.text().trim().to_string();
+            for (btn, pat) in buttons.iter() {
+                if let Some(btn) = btn.upgrade() {
+                    btn.set_active(pat == &current);
+                }
+            }
+            in_sync.set(false);
+        });
+    }
+
+    Some(flow)
+}
+
 fn confirm_approval_rule(
     parent: &impl IsA<gtk4::Widget>,
     request: String,
@@ -2183,89 +2415,7 @@ fn rule_dialog(
         .build();
     content_box.append(&entry);
 
-    let suggestions = build_approval_suggestions(tool, initial_pattern);
-    if suggestions.len() > 1 {
-        let flow = gtk4::FlowBox::new();
-        flow.set_selection_mode(gtk4::SelectionMode::None);
-        flow.set_max_children_per_line(3);
-        flow.set_column_spacing(8);
-        flow.set_row_spacing(8);
-        flow.set_homogeneous(false);
-
-        let in_sync = Rc::new(Cell::new(false));
-        let mut toggle_buttons: Vec<(gtk4::ToggleButton, String)> = Vec::new();
-
-        for opt in &suggestions {
-            let b = gtk4::ToggleButton::new();
-            b.add_css_class("option-button");
-
-            let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-            let ol = label(&opt.label, &["option-label"]);
-            wrapping(&ol);
-            ol.set_max_width_chars(32);
-            ol.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-            inner.append(&ol);
-
-            if let Some(desc) = &opt.description {
-                let dl = label(desc, &["option-desc"]);
-                wrapping(&dl);
-                dl.set_max_width_chars(36);
-                inner.append(&dl);
-            }
-
-            b.set_child(Some(&inner));
-            b.set_tooltip_text(Some(&opt.pattern));
-
-            if opt.pattern == initial_pattern {
-                b.set_active(true);
-            }
-
-            toggle_buttons.push((b.clone(), opt.pattern.clone()));
-            flow.insert(&b, -1);
-        }
-
-        let buttons_rc = Rc::new(toggle_buttons);
-        for (b, pat) in buttons_rc.iter() {
-            let entry_clone = entry.clone();
-            let buttons_clone = buttons_rc.clone();
-            let in_sync_clone = in_sync.clone();
-            let pattern = pat.clone();
-
-            b.connect_toggled(move |btn| {
-                if in_sync_clone.get() {
-                    return;
-                }
-                in_sync_clone.set(true);
-                if btn.is_active() {
-                    entry_clone.set_text(&pattern);
-                    for (other_btn, other_pat) in buttons_clone.iter() {
-                        if other_pat != &pattern {
-                            other_btn.set_active(false);
-                        }
-                    }
-                } else if entry_clone.text().trim() == pattern {
-                    btn.set_active(true);
-                }
-                in_sync_clone.set(false);
-            });
-        }
-
-        {
-            let buttons_clone = buttons_rc.clone();
-            let in_sync_clone = in_sync.clone();
-            entry.connect_changed(move |ent| {
-                if in_sync_clone.get() {
-                    return;
-                }
-                in_sync_clone.set(true);
-                let current = ent.text().trim().to_string();
-                for (btn, pat) in buttons_clone.iter() {
-                    btn.set_active(pat == &current);
-                }
-                in_sync_clone.set(false);
-            });
-        }
-
+    if let Some(flow) = suggestion_flow(&entry, tool, initial_pattern) {
         content_box.append(&flow);
     }
 
@@ -2308,6 +2458,59 @@ fn rule_dialog(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Every `.card-section` and `.code-block` has a Copy button, and output cut to the last
+    /// 40 lines can be shown whole (and copied whole).
+    pub(crate) fn blocks_copy_and_long_output_shows_full() {
+        let sink: RowSink = Rc::new(|_| {});
+        let output: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let item = Item {
+            id: "long".into(),
+            body: Body::Tool(super::super::model::Tool {
+                kind: ItemKind::Command,
+                title: "Bash".into(),
+                input: Some(serde_json::json!({"command": "seq 100"})),
+                input_text: String::new(),
+                output: output.clone(),
+                error: Some("exit status 1".into()),
+                status: ToolStatus::Failed,
+            }),
+            expanded: true,
+            parent: None,
+            children: Vec::new(),
+        };
+        let card = ToolCard::new(&item.id, &sink);
+        card.update(&item);
+        let missing = crate::testutil::blocks_without_copy(&card.root.clone().upcast());
+        assert!(missing.is_empty(), "{missing:?}");
+
+        let shown = |card: &ToolCard| card.output_box.body.text().lines().count();
+        assert_eq!(
+            shown(&card),
+            MAX_CARD_LINES + 1,
+            "the last lines and a note"
+        );
+        assert!(card.output_box.more.is_visible(), "offers the rest");
+        assert_eq!(card.output_box.full.borrow().lines().count(), 100);
+        card.output_box.more.emit_clicked();
+        assert_eq!(shown(&card), 100, "Show full shows everything");
+        assert_eq!(card.output_box.more.label().as_deref(), Some("Show less"));
+        card.output_box.more.emit_clicked();
+        assert_eq!(shown(&card), MAX_CARD_LINES + 1);
+        // Short text offers nothing more.
+        assert!(!card.input_box.more.is_visible());
+
+        // The approval card's details, raw request and diff, and the error row.
+        let approval = ApprovalCard::new(&sink);
+        let missing = crate::testutil::blocks_without_copy(&approval.root.clone().upcast());
+        assert!(missing.is_empty(), "{missing:?}");
+        let failed = error_row("boom");
+        let copies = crate::testutil::descendants(failed.upcast_ref())
+            .iter()
+            .filter(|w| w.tooltip_text().is_some_and(|t| t == "Copy error"))
+            .count();
+        assert_eq!(copies, 1, "an error can be copied whole");
+    }
 
     pub(crate) fn file_changes_and_permission_details_have_distinct_actions() {
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -2538,24 +2741,28 @@ pub(crate) mod tests {
         let options = vec![Decision::Allow, Decision::Deny, Decision::Cancel];
         let (card, _) = codex_card("command_execution", w0, options.clone(), None);
         assert_eq!(
-            card.input.text(),
+            card.input_section.body.text(),
             "$ ls -la\nWorking directory: /tmp/w0-sandbox"
         );
         assert!(
             card.raw.is_visible(),
             "the request's JSON is one click away"
         );
-        assert!(card.raw_text.text().contains("availableDecisions"));
+        assert!(card.raw_section.body.text().contains("availableDecisions"));
         assert!(!card.plan.widget().is_visible());
 
         let big: serde_json::Map<String, Value> = (0..200)
             .map(|i| (format!("key{i:03}"), Value::from(format!("value {i}"))))
             .collect();
         let (card, _) = codex_card("WebFetch", Value::Object(big), options.clone(), None);
-        let visible = card.input.text().lines().count();
+        let visible = card.input_section.body.text().lines().count();
         assert!(visible <= APPROVAL_VISIBLE_LINES, "{visible} lines shown");
-        assert!(card.input.text().ends_with("more lines in Show raw"));
-        assert!(card.raw_text.text().lines().count() <= MAX_CARD_LINES + 1);
+        assert!(card
+            .input_section
+            .body
+            .text()
+            .ends_with("more lines in Show raw"));
+        assert!(card.raw_section.body.text().lines().count() <= MAX_CARD_LINES + 1);
 
         let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n";
         let (card, _) = codex_card(
@@ -2565,7 +2772,10 @@ pub(crate) mod tests {
             None,
         );
         assert!(card.plan.widget().is_visible());
-        assert!(!card.input.is_visible(), "no JSON dump of the plan");
+        assert!(
+            !card.input_section.root.is_visible(),
+            "no JSON dump of the plan"
+        );
         let blocks = card.plan.blocks.borrow();
         assert!(
             matches!(blocks.first(), Some((Block::Text { kind: TextKind::Heading(_), markup }, _))
@@ -2683,11 +2893,18 @@ pub(crate) mod tests {
     }
 
     fn chat_labels_are_selectable() {
+        // A plain label is inert; content opts in.
         let l = label("sample text", &["custom-class"]);
-        assert!(l.is_selectable());
+        assert!(!l.is_selectable());
+        assert!(content_label("sample text", &[]).is_selectable());
 
         let err = error_row("something went wrong");
-        let col = err.last_child().unwrap().downcast::<gtk4::Box>().unwrap();
+        let col = err
+            .first_child()
+            .and_then(|icon| icon.next_sibling())
+            .unwrap()
+            .downcast::<gtk4::Box>()
+            .unwrap();
         let title_lbl = col
             .first_child()
             .unwrap()
@@ -2725,10 +2942,72 @@ pub(crate) mod tests {
         assert!(app.remembers.is_selectable());
         assert!(app.outcome.is_selectable());
 
+        // The card header is a button: its labels must not eat the click.
         let tc = ToolCard::new("t1", &sink);
-        assert!(tc.title.is_selectable());
-        assert!(tc.summary.is_selectable());
-        assert!(tc.badge.is_selectable());
+        assert!(!tc.title.is_selectable());
+        assert!(!tc.summary.is_selectable());
+        assert!(!tc.badge.is_selectable());
         assert!(tc.error.is_selectable());
+    }
+
+    /// Widget-tree walk: no selectable label has a button, list row or click gesture above it.
+    /// Builds every card kind that carries a click target, plus the always-allow dialog's
+    /// suggestion buttons.
+    pub(crate) fn click_targets_hold_no_selectable_labels() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let sink: RowSink = Rc::new(move |event| received.borrow_mut().push(event));
+        let mut transcript = super::super::model::Transcript::new();
+        for env in super::super::demo::DemoBackend::script_envelopes() {
+            transcript.apply(&env, Driver::Claude);
+        }
+        let items: Vec<&Item> = transcript
+            .order()
+            .iter()
+            .filter_map(|id| transcript.get(id))
+            .collect();
+        let mut rows = 0;
+        for item in items.iter().copied() {
+            let row = Row::build(item, &sink);
+            row.update(item);
+            let problems = crate::testutil::selectable_labels_in_click_targets(&row.widget());
+            assert!(problems.is_empty(), "{}: {problems:?}", item.id);
+            rows += 1;
+        }
+        assert!(
+            rows > 10,
+            "the demo script builds a full transcript: {rows}"
+        );
+
+        // Content labels stay selectable (the widgets this walk must not strip).
+        let mut selectable = 0;
+        for item in items.iter().copied() {
+            let row = Row::build(item, &sink);
+            row.update(item);
+            selectable += crate::testutil::descendants(&row.widget())
+                .iter()
+                .filter(|w| {
+                    w.downcast_ref::<gtk4::Label>()
+                        .is_some_and(|l| l.is_selectable())
+                })
+                .count();
+        }
+        assert!(
+            selectable > 10,
+            "content labels remain selectable: {selectable}"
+        );
+
+        // The always-allow dialog's suggestions are toggle buttons around option labels.
+        let entry = gtk4::Entry::new();
+        let flow = suggestion_flow(&entry, "Bash", "cargo test --workspace").expect("suggestions");
+        let toggles = crate::testutil::descendants(flow.upcast_ref())
+            .iter()
+            .filter(|w| w.is::<gtk4::ToggleButton>())
+            .count();
+        assert!(toggles >= 3, "one toggle per suggestion: {toggles}");
+        assert_eq!(
+            crate::testutil::selectable_labels_in_click_targets(flow.upcast_ref()),
+            Vec::<String>::new()
+        );
     }
 }

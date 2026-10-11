@@ -802,21 +802,23 @@ impl AlwaysRules {
             .any(|r| r.origin == ctx.driver && r.matches(action, ctx))
     }
 
-    // ---- one-way import and export (permission sources; paths move to config in W1.10) ----
+    // ---- one-way import and export (permission sources come from the user's config) ----
 
     /// Imports permission rules from available agent configuration files:
-    /// 1. `~/git/agent-config/sync/permissions.toml`
+    /// 1. each of `sources` (the user's permission sources, `permissions.toml` form)
     /// 2. `~/.claude/settings.json`
     /// 3. `~/.gemini/antigravity-cli/settings.json`
     ///
     /// Returns the number of newly added rules.
-    pub fn import_agent_permissions(&mut self, home: Option<&Path>) -> usize {
+    pub fn import_agent_permissions(&mut self, home: Option<&Path>, sources: &[PathBuf]) -> usize {
         let Some(home) = home_dir(home) else {
             return 0;
         };
         let mut added = 0;
-        if let Ok(content) = std::fs::read_to_string(perm_toml(&home)) {
-            added += self.import_permissions_toml(&content);
+        for source in sources {
+            if let Ok(content) = std::fs::read_to_string(source) {
+                added += self.import_permissions_toml(&content);
+            }
         }
         if let Ok(content) = std::fs::read_to_string(claude_settings(&home)) {
             added += self.import_claude_settings(&content);
@@ -829,12 +831,12 @@ impl AlwaysRules {
 
     /// Exports shell and MCP rules to the same files, one way: never alters the rules file.
     /// Returns the number of newly added entries across all targets.
-    pub fn export_agent_permissions(&self, home: Option<&Path>) -> usize {
+    pub fn export_agent_permissions(&self, home: Option<&Path>, sources: &[PathBuf]) -> usize {
         let Some(home) = home_dir(home) else {
             return 0;
         };
         let mut added = 0;
-        for (path, sync) in self.targets(&home) {
+        for (path, sync) in self.targets(&home, sources) {
             if path.exists() {
                 added += sync(self, &path, true).unwrap_or(0);
             }
@@ -843,11 +845,11 @@ impl AlwaysRules {
     }
 
     /// Counts the entries missing from the available agent configurations.
-    pub fn count_unexported(&self, home: Option<&Path>) -> usize {
+    pub fn count_unexported(&self, home: Option<&Path>, sources: &[PathBuf]) -> usize {
         let Some(home) = home_dir(home) else {
             return 0;
         };
-        self.targets(&home)
+        self.targets(&home, sources)
             .into_iter()
             .filter(|(path, _)| path.exists())
             .map(|(path, sync)| sync(self, &path, false).unwrap_or(0))
@@ -858,29 +860,39 @@ impl AlwaysRules {
     fn targets(
         &self,
         home: &Path,
+        sources: &[PathBuf],
     ) -> Vec<(PathBuf, fn(&Self, &Path, bool) -> std::io::Result<usize>)> {
-        vec![
-            (perm_toml(home), Self::sync_permissions_toml),
-            (claude_settings(home), Self::sync_claude_settings),
-            (agy_settings(home), Self::sync_agy_settings),
-        ]
+        let mut targets: Vec<(PathBuf, fn(&Self, &Path, bool) -> std::io::Result<usize>)> = sources
+            .iter()
+            .map(|s| (s.clone(), Self::sync_permissions_toml as _))
+            .collect();
+        targets.push((claude_settings(home), Self::sync_claude_settings));
+        targets.push((agy_settings(home), Self::sync_agy_settings));
+        targets
     }
 
     /// Rules here not yet exported to some available agent configuration, described.
-    pub fn collect_unexported_rules(&self, home: Option<&Path>) -> Vec<String> {
+    pub fn collect_unexported_rules(
+        &self,
+        home: Option<&Path>,
+        sources: &[PathBuf],
+    ) -> Vec<String> {
         let Some(home) = home_dir(home) else {
             return Vec::new();
         };
         let mut out = Vec::new();
         for r in self.exportable() {
-            let missing = self.targets(&home).into_iter().any(|(path, sync)| {
-                path.exists() && {
-                    let single = Self {
-                        rules: vec![r.clone()],
-                    };
-                    sync(&single, &path, false).unwrap_or(0) > 0
-                }
-            });
+            let missing = self
+                .targets(&home, sources)
+                .into_iter()
+                .any(|(path, sync)| {
+                    path.exists() && {
+                        let single = Self {
+                            rules: vec![r.clone()],
+                        };
+                        sync(&single, &path, false).unwrap_or(0) > 0
+                    }
+                });
             let desc = r.summary();
             if missing && !out.contains(&desc) {
                 out.push(desc);
@@ -890,17 +902,23 @@ impl AlwaysRules {
     }
 
     /// Compares the rules here with the external agent configuration files.
-    pub fn check_sync_status(&self, home: Option<&Path>) -> PermissionSyncStatus {
+    pub fn check_sync_status(
+        &self,
+        home: Option<&Path>,
+        sources: &[PathBuf],
+    ) -> PermissionSyncStatus {
         let mut scratch = self.clone();
-        let unimported_count = scratch.import_agent_permissions(home);
+        let unimported_count = scratch.import_agent_permissions(home, sources);
         let unimported_rules: Vec<String> = scratch
             .rules
             .iter()
             .filter(|r| !self.rules.iter().any(|mine| mine.same_as(r)))
             .map(Rule::summary)
             .collect();
-        let unexported_rules = self.collect_unexported_rules(home);
-        let unexported_count = unexported_rules.len().max(self.count_unexported(home));
+        let unexported_rules = self.collect_unexported_rules(home, sources);
+        let unexported_count = unexported_rules
+            .len()
+            .max(self.count_unexported(home, sources));
         PermissionSyncStatus {
             unimported_count,
             unexported_count,
@@ -1115,10 +1133,6 @@ fn home_dir(home: Option<&Path>) -> Option<PathBuf> {
         home.map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
     }
-}
-
-fn perm_toml(home: &Path) -> PathBuf {
-    home.join("git/agent-config/sync/permissions.toml")
 }
 
 fn claude_settings(home: &Path) -> PathBuf {
@@ -1678,7 +1692,7 @@ mcp = [
             std::fs::write(p, body).expect("write");
         };
         write(
-            "git/agent-config/sync/permissions.toml",
+            "sources/permissions.toml",
             "[allow]\nshell = [\n    \"fdfind\",\n]\n",
         );
         write(
@@ -1690,21 +1704,24 @@ mcp = [
             r#"{"permissions":{"allow":["command(uptime)"]}}"#,
         );
 
+        let sources = vec![home.join("sources/permissions.toml")];
+        // With no source configured, only the two agents' own files count.
         let mut rules = AlwaysRules::default();
-        let status = rules.check_sync_status(Some(home));
+        assert_eq!(rules.check_sync_status(Some(home), &[]).unimported_count, 2);
+        let status = rules.check_sync_status(Some(home), &sources);
         assert_eq!(status.unimported_count, 3);
         assert_eq!(status.unexported_count, 0);
         assert!(status
             .summary()
             .contains("3 external rules are not imported"));
 
-        assert_eq!(rules.import_agent_permissions(Some(home)), 3);
-        let status = rules.check_sync_status(Some(home));
+        assert_eq!(rules.import_agent_permissions(Some(home), &sources), 3);
+        let status = rules.check_sync_status(Some(home), &sources);
         assert_eq!(status.unimported_count, 0);
         assert!(status.unexported_count > 0);
 
-        assert!(rules.export_agent_permissions(Some(home)) > 0);
-        let status = rules.check_sync_status(Some(home));
+        assert!(rules.export_agent_permissions(Some(home), &sources) > 0);
+        let status = rules.check_sync_status(Some(home), &sources);
         assert_eq!(status.unexported_count, 0, "{status:?}");
         assert_eq!(status.unimported_count, 0, "{status:?}");
         assert!(!status.is_out_of_sync());

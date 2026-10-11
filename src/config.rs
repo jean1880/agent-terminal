@@ -649,6 +649,11 @@ pub struct TerminalConfig {
     /// When adding an approval rule, prompt to confirm or loosen the pattern.
     #[serde(default = "default_true")]
     pub confirm_rule_modification: bool,
+    /// Extra files in `permissions.toml` form that "Import Agent Permissions" reads and "Export"
+    /// writes, beside the agents' own settings files. Empty by default: the app names no
+    /// project's layout. Paths are absolute or start with `~/`; see
+    /// [`parse_permission_sources`].
+    pub permission_sources: Vec<String>,
     /// Set when this process found no settings file at all (none from a pre-rename release
     /// either): a first start, which offers the setup walkthrough. Not persisted.
     #[serde(skip)]
@@ -663,6 +668,36 @@ pub struct TerminalConfig {
     /// file. Not persisted.
     #[serde(skip)]
     save_blocked: std::cell::Cell<bool>,
+}
+
+/// The permission sources typed in Settings, `:`-separated like `PATH`: each an absolute path or
+/// one starting `~/`, naming a file that exists. Blank is no sources. The error names the first
+/// entry that cannot be used, so the previous setting stays in force until it is fixed.
+pub fn parse_permission_sources(text: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in text.split(':').map(str::trim).filter(|e| !e.is_empty()) {
+        if !(entry.starts_with('/') || entry.starts_with("~/")) {
+            return Err(format!("{entry} is not an absolute path (or ~/…)"));
+        }
+        let path = PathBuf::from(crate::utils::expand_tilde(entry));
+        if !path.is_file() {
+            return Err(format!("{entry} is not an existing file"));
+        }
+        if !out.iter().any(|e| e == entry) {
+            out.push(entry.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+impl TerminalConfig {
+    /// [`Self::permission_sources`] as paths (`~/` expanded), for the import and export code.
+    pub fn permission_source_paths(&self) -> Vec<PathBuf> {
+        self.permission_sources
+            .iter()
+            .map(|s| PathBuf::from(crate::utils::expand_tilde(s)))
+            .collect()
+    }
 }
 
 /// Identifies one version of a file on disk. The inode catches an editor
@@ -884,6 +919,7 @@ impl Default for TerminalConfig {
             reopen_last_thread: false,
             pattern_auto_approval: true,
             confirm_rule_modification: true,
+            permission_sources: Vec::new(),
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
@@ -1355,6 +1391,90 @@ mod tests {
         assert_eq!(loaded.cli_client, cfg.cli_client);
         assert_eq!(loaded.starting_directory, cfg.starting_directory);
         assert_eq!(loaded.theme, cfg.theme);
+    }
+
+    #[test]
+    fn permission_sources_default_empty_and_round_trip() {
+        assert!(TerminalConfig::default().permission_sources.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A file written before the field existed reads as no sources.
+        std::fs::write(&path, br#"{"theme":"dracula"}"#).unwrap();
+        assert!(TerminalConfig::load_from(&path)
+            .permission_sources
+            .is_empty());
+
+        let cfg = TerminalConfig {
+            permission_sources: vec!["/srv/a/permissions.toml".to_owned(), "~/b.toml".to_owned()],
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.permission_sources, cfg.permission_sources);
+        let paths = loaded.permission_source_paths();
+        assert_eq!(paths[0], PathBuf::from("/srv/a/permissions.toml"));
+        assert!(
+            paths[1].is_absolute() && paths[1].ends_with("b.toml"),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn permission_sources_are_validated_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("permissions.toml");
+        std::fs::write(&file, "").unwrap();
+        let f = file.to_string_lossy().into_owned();
+        assert_eq!(parse_permission_sources("").unwrap(), Vec::<String>::new());
+        assert_eq!(parse_permission_sources(&f).unwrap(), vec![f.clone()]);
+        assert_eq!(
+            parse_permission_sources(&format!(" {f} : {f} ")).unwrap(),
+            vec![f.clone()],
+            "blanks and duplicates fold"
+        );
+        assert!(parse_permission_sources("relative/permissions.toml")
+            .unwrap_err()
+            .contains("absolute"));
+        let missing = dir.path().join("nope.toml");
+        assert!(
+            parse_permission_sources(&format!("{f}:{}", missing.display()))
+                .unwrap_err()
+                .contains("nope.toml")
+        );
+        assert!(parse_permission_sources(&dir.path().to_string_lossy())
+            .unwrap_err()
+            .contains("existing file"));
+    }
+
+    /// W1b 1.10: no project's config path is baked into the binary (the plan's U1).
+    #[test]
+    fn no_agent_config_path_is_hard_coded() {
+        fn scan(dir: &Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path
+                        .file_name()
+                        .is_some_and(|n| n == "tests" || n == "fixtures")
+                    {
+                        continue;
+                    }
+                    scan(&path, hits);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    // Everything from the test module on is test code.
+                    let code = text.split("#[cfg(test)]\nmod ").next().unwrap_or("");
+                    if code.contains(concat!("agent", "-config")) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut hits = Vec::new();
+        scan(&root.join("src"), &mut hits);
+        scan(&root.join("crates"), &mut hits);
+        assert!(hits.is_empty(), "hard-coded agent-config path in {hits:?}");
     }
 
     #[test]

@@ -107,6 +107,7 @@ mod imp {
     #[derive(Default)]
     pub struct ChatView {
         pub(super) inner: RefCell<Option<Rc<Inner>>>,
+        pub(super) toasts: RefCell<Option<adw::ToastOverlay>>,
         pub(super) text_style: RefCell<Option<(gdk::Display, gtk4::CssProvider, String)>>,
     }
 
@@ -241,7 +242,13 @@ impl ChatView {
 
         inner.header.set_subagents(inner.subagent_button.widget());
         view.append(&inner.header.bin);
-        view.append(inner.transcript.widget());
+        // Toasts cover the transcript only, never the shelves or the composer where the next
+        // action is (see `ChatView::toast_overlay`).
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_vexpand(true);
+        toasts.set_child(Some(inner.transcript.widget()));
+        view.append(&toasts);
+        *view.imp().toasts.borrow_mut() = Some(toasts);
         let bottom = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         bottom.add_css_class("chat-bottom");
         let clamp = adw::Clamp::new();
@@ -271,6 +278,12 @@ impl ChatView {
 
     fn inner(&self) -> Option<Rc<Inner>> {
         self.imp().inner.borrow().clone()
+    }
+
+    /// Where this thread's toasts go: over the transcript, so one never covers the shelves or
+    /// the composer.
+    pub fn toast_overlay(&self) -> Option<adw::ToastOverlay> {
+        self.imp().toasts.borrow().clone()
     }
 
     /// Applies one envelope from the backend.
@@ -1099,9 +1112,9 @@ impl PlanPanel {
             let (glyph, class) = step_glyph(step.status);
             row.add_css_class(class);
             row.append(&cards::label(glyph, &["step-glyph"]));
-            let text = cards::label(&step.text, &["step-text"]);
-            text.set_wrap(true);
-            text.set_hexpand(true);
+            let text = cards::content_label(&step.text, &["step-text"]);
+            // WordChar: one unbreakable word of a step must not set the thread's width.
+            cards::wrapping(&text);
             row.append(&text);
             self.steps.append(&row);
         }
@@ -1125,6 +1138,30 @@ pub(crate) mod tests {
             alive: true,
             capabilities: agent_core::caps::Capabilities::of(driver),
             commands: Vec::new(),
+        }
+    }
+
+    /// Every custom-drawn button class has a keyboard focus ring in the stylesheet.
+    #[test]
+    fn custom_buttons_have_a_focus_ring() {
+        for class in [
+            ".card-header",
+            ".reasoning-toggle",
+            ".plan-toggle",
+            ".option-button",
+            ".agent-chip",
+            ".subagent-button",
+            ".usage-indicator",
+            ".gauge",
+            ".code-copy",
+            ".section-more",
+            ".jump-button",
+            ".send-button",
+        ] {
+            assert!(
+                STYLE.contains(&format!("{class}:focus-visible")),
+                "{class} has no :focus-visible rule"
+            );
         }
     }
 
@@ -1571,6 +1608,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// The whole view, header (usage meter, sub-agent counter), shelves and the demo
+    /// transcript: no selectable label sits in a button or other click target.
+    fn whole_view_has_no_dead_click_targets() {
+        let backend = demo::demo_backend();
+        let view = ChatView::new(backend.clone());
+        backend.connect(view.sink());
+        view.set_account_status(demo::demo_account_status());
+        view.replay(&demo::DemoBackend::script_envelopes());
+        let problems = crate::testutil::selectable_labels_in_click_targets(view.upcast_ref());
+        assert!(problems.is_empty(), "dead click targets: {problems:#?}");
+        let missing = crate::testutil::blocks_without_copy(view.upcast_ref());
+        assert!(missing.is_empty(), "blocks with no Copy: {missing:#?}");
+        // 4.5: every button is named for assistive tech and is a usable target.
+        let problems = crate::testutil::button_problems(view.upcast_ref(), 24);
+        assert!(problems.is_empty(), "button problems: {problems:#?}");
+        // The walk saw the targets it guards.
+        let all = crate::testutil::descendants(view.upcast_ref());
+        let text = |t: &str| {
+            all.iter()
+                .filter_map(|w| w.downcast_ref::<gtk4::Label>())
+                .any(|l| l.text().contains(t))
+        };
+        assert!(
+            text("Thought") || text("Thinking"),
+            "reasoning toggle built"
+        );
+    }
+
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
     pub(crate) fn ui_checks() {
         model_chip_follows_pending_acceptance_and_rejection();
@@ -1581,6 +1646,9 @@ pub(crate) mod tests {
         panels::tests::changing_effort_does_not_switch_until_row_activation();
         usage::tests::compact_scope_does_not_filter_provider_comparison();
         cards::tests::file_changes_and_permission_details_have_distinct_actions();
+        cards::tests::click_targets_hold_no_selectable_labels();
+        cards::tests::blocks_copy_and_long_output_shows_full();
+        whole_view_has_no_dead_click_targets();
         approval_row_precedes_its_step();
         subagent_shelf::tests::shelf_follows_running_subagents();
         subagents::tests::worker_group_updates_without_rebuilding_its_row();

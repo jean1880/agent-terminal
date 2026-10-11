@@ -911,9 +911,44 @@ impl ServerInner {
     fn emit(&self, env: Envelope) {
         let sink = self.sink.borrow().clone();
         if let Some(sink) = sink {
-            sink(env);
+            sink(masked_for_view(env));
         }
     }
+}
+
+/// An envelope with every secret masked, for the view: the same scrub the store applies before
+/// it persists (`scrub_envelope`: every string, `raw` included). The answer path keeps the
+/// unmasked call; only what is shown is scrubbed. Masking is idempotent.
+///
+/// Ceiling: it works on one envelope, so a secret split across two `ContentDelta` chunks is
+/// shown as typed here and is only caught when the store heals the item at completion.
+pub(crate) fn masked_for_view(env: Envelope) -> Envelope {
+    agent_kit::store::scrub_envelope(env.clone()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not mask an event");
+        // Fail closed: keep the shape and the buttons, drop everything free-form.
+        let mut env = env;
+        env.raw = None;
+        match &mut env.event {
+            Event::ApprovalRequested {
+                title,
+                input,
+                reason,
+                remembers,
+                ..
+            } => {
+                *title = None;
+                *input = Value::Null;
+                *reason = None;
+                *remembers = None;
+            }
+            event => {
+                *event = Event::Notice {
+                    text: "(output withheld: it could not be masked)".to_owned(),
+                }
+            }
+        }
+        env
+    })
 }
 
 fn spawn_accept_loop(weak: Weak<ServerInner>, listener: gio::SocketListener) {

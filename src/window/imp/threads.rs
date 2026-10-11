@@ -380,6 +380,9 @@ pub(super) struct NewThread {
     pub(super) title: Option<String>,
     /// A budgeted, fenced and redacted handoff, with where it came from, seeded into the session.
     pub(super) handoff: Option<(crate::chat::session::Handoff, String)>,
+    /// The mode to start in, when the thread carries one over from another (a continued thread
+    /// keeps its mode rather than adopting the profile default). `None`: the profile default.
+    pub(super) mode: Option<Mode>,
 }
 
 impl NewThread {
@@ -393,6 +396,7 @@ impl NewThread {
             effort: None,
             title: None,
             handoff: None,
+            mode: None,
         }
     }
 }
@@ -864,6 +868,13 @@ fn agent_launch_with(
         },
         approval,
     })
+}
+
+/// The mode a thread's session starts in: the user's own choice in the thread first (a carried
+/// mode is recorded as one, see `create_chat_thread`), else the mode its history last ran in,
+/// else the profile's default, else Ask.
+fn start_mode(chosen: Option<Mode>, replayed: Option<Mode>, profile_default: Option<Mode>) -> Mode {
+    chosen.or(replayed).or(profile_default).unwrap_or_default()
 }
 
 /// Why `driver` cannot be started in `state`, as the thread says it.
@@ -2741,10 +2752,7 @@ impl AgentTerminalWindow {
             .find(|t| &t.page == page)
             .and_then(|t| t.chat.as_ref())
             .and_then(|c| c.chosen_mode);
-        let mode = chosen
-            .or_else(|| view.replayed_mode())
-            .or(profile.default_mode)
-            .unwrap_or_default();
+        let mode = start_mode(chosen, view.replayed_mode(), profile.default_mode);
         let program = resolved
             .program
             .clone()
@@ -3185,11 +3193,31 @@ impl AgentTerminalWindow {
         app.send_notification(Some(id), &notification);
     }
 
+    /// Shows `toast` over the selected thread's transcript, so it never covers that thread's
+    /// shelves or composer; over the whole window when no thread is selected (empty state,
+    /// terminal page).
+    pub(super) fn add_toast(&self, toast: adw::Toast) {
+        let selected = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|view| view.selected_page());
+        let local = selected.and_then(|page| {
+            self.tabs
+                .borrow()
+                .iter()
+                .find(|t| t.page == page)
+                .and_then(|t| t.chat.as_ref())
+                .and_then(|chat| chat.view.as_ref())
+                .and_then(|view| view.toast_overlay())
+        });
+        if let Some(overlay) = local.or_else(|| self.toast_overlay.borrow().clone()) {
+            overlay.add_toast(toast);
+        }
+    }
+
     /// Bumps an interactive in-app toast when a thread needs attention and the user is away from it.
     fn bump_thread_attention_toast(&self, page: &adw::TabPage, thread: &str, question: bool) {
-        let Some(overlay) = self.toast_overlay.borrow().clone() else {
-            return;
-        };
         let title = page.title();
         let name = if title.is_empty() { "Thread" } else { &title };
         let msg = if question {
@@ -3211,7 +3239,7 @@ impl AgentTerminalWindow {
                 window.imp().open_thread(&thread_id, true);
             }
         });
-        overlay.add_toast(toast);
+        self.add_toast(toast);
     }
 
     /// Withdraws a thread's approval and turn-done notifications.
@@ -3506,7 +3534,14 @@ impl AgentTerminalWindow {
             format!("“{title}”")
         };
         let handoff = build_handoff(&messages, &format!("thread {thread}"));
-        self.new_chat_thread(Some(driver), dir, None);
+        // The fork keeps the source's mode and model rather than the profile's defaults.
+        let session = self.slot_of(thread).and_then(|s| s.get());
+        self.create_chat_thread(NewThread {
+            dir,
+            model: session.as_ref().and_then(|s| s.selected_model()),
+            mode: session.as_ref().map(|s| s.wanted_mode()),
+            ..NewThread::new(driver)
+        });
         // The new thread is the one just selected; it is built later, so the handoff waits.
         let page = self
             .tab_view
@@ -3646,6 +3681,7 @@ impl AgentTerminalWindow {
             effort,
             title,
             handoff,
+            mode,
             require_exact_dir,
         } = new;
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
@@ -3687,7 +3723,19 @@ impl AgentTerminalWindow {
                 driver_key(driver),
                 model.as_deref().unwrap_or("default"),
             )
-            .and_then(|pt| store.set_active_provider_thread(&thread, &pt))
+            .and_then(|pt| {
+                store.set_active_provider_thread(&thread, &pt)?;
+                // A carried-over mode is the user's choice for the new thread, so its session
+                // starts in it (as far as the agent can honour it) and not in the profile's.
+                if let Some(mode) = mode {
+                    store.append_event(
+                        &thread,
+                        Some(pt.as_str()),
+                        &Envelope::new(Event::ModeChosen { mode }),
+                    )?;
+                }
+                Ok(())
+            })
         {
             warn!("Cannot record the thread's agent: {e}");
         }
@@ -4568,6 +4616,20 @@ pub(super) mod tests {
         };
         assert_eq!(codex.status().driver, Driver::Codex);
         assert!(codex.status().capabilities.live_approvals);
+    }
+
+    #[test]
+    fn a_thread_starts_in_the_chosen_mode_before_any_default() {
+        use Mode::{AcceptEdits, Ask, Plan};
+        assert_eq!(start_mode(Some(Ask), Some(Plan), Some(AcceptEdits)), Ask);
+        assert_eq!(start_mode(None, Some(Plan), Some(AcceptEdits)), Plan);
+        assert_eq!(start_mode(None, None, Some(AcceptEdits)), AcceptEdits);
+        assert_eq!(start_mode(None, None, None), Ask);
+        // A mode carried to a new thread (fork, continue) is stored as the user's choice, so it
+        // beats the profile's default on the new thread's first start.
+        let carried = [Envelope::new(Event::ModeChosen { mode: Ask })];
+        let chosen = crate::chat::session::chosen_mode(carried.iter());
+        assert_eq!(start_mode(chosen, None, Some(Plan)), Ask);
     }
 
     #[test]

@@ -209,6 +209,9 @@ struct Inner {
     /// A new Codex thread id and its provider thread, not stored until a turn completes: Codex
     /// writes no rollout before that, so a stored id could not be resumed (plan 2.5).
     provisional_native: RefCell<Option<(ProviderThreadId, String)>>,
+    /// How long a Claude permission request may wait for the user before it is denied (agy's
+    /// socket has the same bound). Injectable for tests.
+    approval_deadline: Cell<Duration>,
 }
 
 struct QueuedPrompt {
@@ -431,6 +434,7 @@ impl ChatSession {
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
             provisional_native: RefCell::new(None),
+            approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -575,13 +579,16 @@ impl Inner {
             warn!(error = %e, "could not persist an event");
         }
         self.apply(&env);
-        (self.sink)(&env);
+        // Every event is masked on the way to the view (not only approvals: tool input and
+        // output, errors, notices and questions carry secrets too); the rules judged the real
+        // call. A secret split across two streaming deltas is only caught at persistence.
+        (self.sink)(&crate::approval_server::masked_for_view(env));
     }
 
     /// Delivers without persisting (the store already has it).
     fn deliver(&self, env: &Envelope) {
         self.apply(env);
-        (self.sink)(env);
+        (self.sink)(&crate::approval_server::masked_for_view(env.clone()));
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -1045,6 +1052,7 @@ impl Inner {
                 self.hand_off_to_fresh_codex_thread();
             }
             self.watch_tool_step(&env);
+            self.arm_approval_deadline(&env);
             if auto {
                 self.auto_approve(&env);
             }
@@ -1228,6 +1236,60 @@ impl Inner {
                 .insert(request, (action, cwd));
         }
         (env, auto)
+    }
+
+    /// Claude blocks on a `can_use_tool` request for as long as the app stays silent. A request
+    /// still unanswered at the deadline is denied with a notice (fail closed), as agy's socket
+    /// does. A request answered, cancelled or expired by then is no longer pending: nothing is
+    /// sent.
+    fn arm_approval_deadline(self: &Rc<Self>, env: &Envelope) {
+        // AskUserQuestion arrives as `QuestionRequested`, which is intentionally not timed.
+        if self.adapter.borrow().driver() != Driver::Claude
+            || !matches!(env.event, Event::ApprovalRequested { .. })
+        {
+            return;
+        }
+        let Some(request) = env.request.clone() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let deadline = self.approval_deadline.get();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(deadline).await;
+            if let Some(inner) = weak.upgrade() {
+                inner.expire_approval(&request);
+            }
+        });
+    }
+
+    fn expire_approval(self: &Rc<Self>, request: &str) {
+        if !self
+            .adapter
+            .borrow()
+            .pending_request_ids()
+            .iter()
+            .any(|id| id == request)
+        {
+            return;
+        }
+        self.pending_rules.borrow_mut().remove(request);
+        let denied = self.command(Command::Approve {
+            request: request.to_owned(),
+            decision: Decision::Deny,
+            updated_input: None,
+            message: Some("No answer in agent-terminal before the deadline; denied.".to_owned()),
+        });
+        if denied {
+            self.emit(
+                Envelope::new(Event::ApprovalResolved {
+                    decision: Decision::Deny,
+                })
+                .request(request),
+            );
+            self.emit(Envelope::new(Event::Notice {
+                text: "A permission request got no answer in time and was denied.".to_owned(),
+            }));
+        }
     }
 
     /// Answers `env`'s request Allow once its card is out (the card then shows it resolved).
@@ -1633,7 +1695,7 @@ impl Inner {
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
-                text: text.to_owned(),
+                text: agent_core::redact::redact(text),
             })
             .item(item.clone()),
         );
@@ -1678,7 +1740,7 @@ impl Inner {
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
-                text: text.to_owned(),
+                text: agent_core::redact::redact(text),
             })
             .item(item),
         );
@@ -4038,6 +4100,74 @@ mod tests {
         .expect("bind")
     }
 
+    /// W1b 1.11 (F22): an agy thread in Ask keeps Ask through a model switch and through a
+    /// compact-style same-agent restart onto a launch whose profile default is another mode.
+    /// No mode change is announced, and the restart never passes `--mode plan`.
+    #[test]
+    fn agy_model_switch_and_compact_keep_the_threads_mode() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            let dir = tmp.path().to_owned();
+            session.set_adapter_factory(Rc::new(move |_| {
+                // The profile's default mode (Plan) is what a fresh launch binds the hook to.
+                let profile_default = ApprovalHandle::bind(
+                    &dir.join("rt2"),
+                    "t2",
+                    &dir,
+                    Mode::Plan,
+                    Duration::from_secs(30),
+                )
+                .expect("bind");
+                Ok(AgentLaunch {
+                    adapter: Box::new(AgyAdapter::new("agy")),
+                    program: "/bin/sh".into(),
+                    extra_args: vec![dir.join("agent.sh").to_string_lossy().into_owned()],
+                    default_model: None,
+                    default_effort: None,
+                    env: LaunchEnv::default(),
+                    approval: Ok(profile_default),
+                })
+            }));
+            assert!(pump_until(ctx, 10, || session.status().alive));
+            assert_eq!(session.status().mode, Mode::Ask);
+            let modes = |seen: &Seen| {
+                seen.borrow()
+                    .iter()
+                    .filter(|e| matches!(e.event, Event::ModeChanged { .. }))
+                    .count()
+            };
+            let before = modes(&seen);
+
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
+            assert_eq!(session.status().mode, Mode::Ask, "model switch");
+            let argv = session.launch_spec().argv;
+            assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
+            assert!(
+                argv.iter().any(|a| a == "--dangerously-skip-permissions"),
+                "Ask with the hook is skip-permissions behind the hook: {argv:?}"
+            );
+
+            // Compact by handoff restarts the same agent on a fresh launch.
+            session.inner.create_with_handoff(Driver::Agy, None, None);
+            assert_eq!(session.status().mode, Mode::Ask, "compact");
+            let argv = session.launch_spec().argv;
+            assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
+            assert_eq!(modes(&seen), before, "no silent or announced mode change");
+        });
+    }
+
     fn hook_missing_error(seen: &Seen) -> bool {
         has(
             seen,
@@ -4642,6 +4772,141 @@ mod tests {
             assert!(!log.contains("acceptEdits"), "{log}");
             assert_eq!(session.inner.state.borrow().mode, Mode::Ask);
             assert!(!has(&seen, |e| matches!(e, Event::ModeChanged { .. })));
+        });
+    }
+
+    /// W1b 1.5, canary: a command carrying an `sk-` token reaches the view masked, in the title,
+    /// input and reason; it is offered neither "Allow for session" nor "Always allow"; the
+    /// user's prompt snapshot is masked too. The call the app answers is still the real one.
+    #[test]
+    fn a_secret_in_an_approval_or_prompt_reaches_the_view_masked() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"; // gitleaks:allow
+            feed(
+                &session,
+                &can_use_tool(
+                    "c1",
+                    &format!("curl -H 'x-key: {secret}' https://example.test"),
+                ),
+            );
+            let card = seen
+                .borrow()
+                .iter()
+                .find(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+                .cloned()
+                .expect("approval card");
+            let shown = serde_json::to_string(&card).expect("json");
+            assert!(!shown.contains(secret), "the view saw the secret: {shown}");
+            assert!(shown.contains("****6789"), "{shown}");
+            let options = offered(&seen, "c1");
+            assert!(options.contains(&Decision::Allow) && options.contains(&Decision::Deny));
+            assert!(
+                !options.contains(&Decision::AllowForSession)
+                    && !options.contains(&Decision::AllowAlways),
+                "a secret-bearing command offers no rule: {options:?}"
+            );
+
+            session.send_prompt(&format!("use {secret} please"));
+            // Every other event kind is masked too, not only approvals.
+            let leak = format!("key {secret} here");
+            for event in [
+                Event::ItemStarted {
+                    kind: ItemKind::Command,
+                    title: leak.clone(),
+                    input: Some(serde_json::json!({"command": leak})),
+                    parent: None,
+                },
+                Event::ItemCompleted {
+                    status: ItemStatus::Failed,
+                    output: Some(leak.clone()),
+                    error: Some(leak.clone()),
+                },
+                Event::ContentDelta {
+                    stream: StreamKind::Assistant,
+                    text: leak.clone(),
+                },
+                Event::QuestionRequested {
+                    questions: vec![agent_core::event::Question {
+                        id: "q".into(),
+                        header: leak.clone(),
+                        question: leak.clone(),
+                        options: vec![agent_core::event::QuestionOption {
+                            label: leak.clone(),
+                            description: Some(leak.clone()),
+                        }],
+                        multi_select: false,
+                    }],
+                },
+                Event::Notice { text: leak.clone() },
+                Event::Error {
+                    message: leak.clone(),
+                },
+                Event::TurnCompleted {
+                    state: TurnState::Failed,
+                    usage: None,
+                    cost_usd: None,
+                    error: Some(leak.clone()),
+                },
+            ] {
+                session.inner.emit(Envelope::new(event).item("i1"));
+            }
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("****6789"))
+            ));
+            let all = serde_json::to_string(&*seen.borrow()).expect("json");
+            assert!(!all.contains(secret), "a secret reached the sink: {all}");
+        });
+    }
+
+    /// W1b 1.6: a Claude request nobody answers is denied at the deadline, with a deny frame to
+    /// the agent and a notice; one answered in time sends nothing more.
+    #[test]
+    fn an_unanswered_claude_request_is_denied_at_the_deadline() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            session
+                .inner
+                .approval_deadline
+                .set(Duration::from_millis(60));
+            feed(&session, &can_use_tool("late", "touch b.tmp"));
+            feed(&session, &can_use_tool("prompt", "touch c.tmp"));
+            session.respond_approval("prompt", Decision::Allow);
+            assert!(pump_until(ctx, 10, || resolution(&seen, "late").is_some()));
+            assert_eq!(resolution(&seen, "late"), Some(Decision::Deny));
+            assert!(pump_until(ctx, 10, || stdin_log(tmp.path()).contains("\"late\"")));
+            let log = stdin_log(tmp.path());
+            let frame = log
+                .lines()
+                .find(|l| l.contains("\"late\""))
+                .expect("a frame for the late request");
+            assert!(frame.contains("\"behavior\":\"deny\""), "{frame}");
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("denied"))
+            ));
+            assert_eq!(
+                log.matches("\"request_id\":\"prompt\"").count(),
+                1,
+                "the answered request is not answered twice: {log}"
+            );
+            assert!(session
+                .inner
+                .adapter
+                .borrow()
+                .pending_request_ids()
+                .is_empty());
         });
     }
 

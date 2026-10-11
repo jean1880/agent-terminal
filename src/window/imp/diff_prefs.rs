@@ -50,6 +50,12 @@ pub(super) fn parse_argv(text: &str) -> Result<Vec<String>, String> {
         .map_err(|e| e.message().to_owned())
 }
 
+/// The Command field's title while its text is wrong. Row titles are Pango markup, and `why`
+/// can quote what was typed (`&`, `<`, an unbalanced quote), so it is escaped.
+fn command_error_title(why: &str) -> String {
+    format!("Command — {}", gtk4::glib::markup_escape_text(why))
+}
+
 /// The tool a field's text describes: a preset when the argv is exactly one, else a custom tool
 /// named after its program. `Err` is the reason to show; `Ok(None)` is an empty field.
 pub(super) fn tool_from_text(text: &str) -> Result<Option<DiffTool>, String> {
@@ -200,7 +206,7 @@ impl AgentTerminalWindow {
                     Err(why) => {
                         // Inline, and not saved: the field says what is wrong.
                         entry.add_css_class("error");
-                        entry.set_title(&format!("Command — {why}"));
+                        entry.set_title(&command_error_title(&why));
                     }
                     Ok(tool) => {
                         entry.remove_css_class("error");
@@ -276,6 +282,17 @@ mod tests {
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_error_title_is_valid_markup_whatever_the_reason_quotes() {
+        for why in ["unbalanced quote 'a & b", "<{old}> & </x>", "plain"] {
+            let title = command_error_title(why);
+            assert!(
+                gtk4::pango::parse_markup(&title, '\0').is_ok(),
+                "{title:?} would render blank"
+            );
+        }
     }
 
     #[test]

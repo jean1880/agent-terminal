@@ -52,6 +52,10 @@ const ENV_FILE_HELP: &str =
     "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
 
+const PERMISSION_SOURCES_HELP: &str =
+    "Extra permissions.toml files to import from and export to, separated by ':' (absolute or \
+     ~/ paths to existing files). Blank: none";
+
 fn validation_row() -> adw::ActionRow {
     adw::ActionRow::builder()
         .title("Not Saved")
@@ -179,6 +183,11 @@ fn env_file_ok(text: &str) -> bool {
 }
 
 impl AgentTerminalWindow {
+    /// The permission files the user named in Settings, `~/` expanded.
+    fn permission_sources(&self) -> Vec<std::path::PathBuf> {
+        self.config.borrow().permission_source_paths()
+    }
+
     /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
     fn edit_agent_profile(&self, driver: Driver, edit: impl FnOnce(&mut Profile)) {
         {
@@ -211,9 +220,6 @@ impl AgentTerminalWindow {
         {
             return;
         }
-        let Some(overlay) = self.toast_overlay.borrow().clone() else {
-            return;
-        };
         let name = MODES
             .iter()
             .find(|(m, _)| *m == mode)
@@ -240,7 +246,7 @@ impl AgentTerminalWindow {
                 ));
             }
         ));
-        overlay.add_toast(toast);
+        self.add_toast(toast);
     }
 
     fn agent_profile_now(&self, driver: Driver) -> Profile {
@@ -274,6 +280,35 @@ impl AgentTerminalWindow {
         dialog.add(&page);
     }
 
+    /// A dropdown row's selected value is never cut short: the value label stops ellipsizing,
+    /// so a long subtitle wraps instead of squeezing it ("Agent T…" for a theme name). The
+    /// label is made when the row is first shown, so this runs again then and on every change.
+    pub(super) fn keep_value_whole(row: &adw::ComboRow) {
+        Self::whole_value_now(row);
+        row.connect_map(Self::whole_value_now);
+        row.connect_selected_notify(Self::whole_value_now);
+    }
+
+    fn whole_value_now(row: &adw::ComboRow) {
+        let selected = row
+            .selected_item()
+            .and_downcast::<gtk4::StringObject>()
+            .map(|s| s.string());
+        let mut stack = vec![row.clone().upcast::<gtk4::Widget>()];
+        while let Some(widget) = stack.pop() {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                if selected.as_deref() == Some(label.text().as_str()) {
+                    label.set_ellipsize(gtk4::pango::EllipsizeMode::None);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+    }
+
     /// The "Default Agent for New Threads" dropdown. Applies on change.
     pub(super) fn default_agent_row(&self) -> adw::ComboRow {
         let obj = self.obj();
@@ -286,6 +321,7 @@ impl AgentTerminalWindow {
             .model(&gtk4::StringList::new(&names))
             .selected(choices.iter().position(|(d, _)| *d == current).unwrap_or(0) as u32)
             .build();
+        Self::keep_value_whole(&default_row);
         default_row.connect_selected_notify(glib::clone!(
             #[weak]
             obj,
@@ -304,7 +340,7 @@ impl AgentTerminalWindow {
     /// The "In-App Approvals & Pattern Matching" preferences group.
     pub(super) fn permissions_group(&self) -> adw::PreferencesGroup {
         let group = adw::PreferencesGroup::builder()
-            .title("In-App Approvals & Pattern Matching")
+            .title("In-App Approvals &amp; Pattern Matching")
             .description(
                 "Agent Terminal manages approvals directly within the app, automatically permitting \
                  commands and tools matching wildcard rules (e.g. 'cargo test*') without interrupting your work.",
@@ -332,7 +368,7 @@ impl AgentTerminalWindow {
         group.add(&auto_approve_row);
 
         let confirm_row = adw::SwitchRow::builder()
-            .title("Confirm & Customise Patterns on Save")
+            .title("Confirm &amp; Customise Patterns on Save")
             .subtitle(
                 "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
             )
@@ -351,6 +387,17 @@ impl AgentTerminalWindow {
             }
         ));
         group.add(&confirm_row);
+
+        // Extra permission files to import from and export to; none unless the user names them.
+        let sources_row = adw::EntryRow::builder()
+            .title("Permission Sources")
+            .tooltip_text(PERMISSION_SOURCES_HELP)
+            .text(self.config.borrow().permission_sources.join(":"))
+            .build();
+        let sources_error = validation_row();
+        show_validation(&sources_row, &sources_error, PERMISSION_SOURCES_HELP, None);
+        group.add(&sources_row);
+        group.add(&sources_error);
 
         // Warning row: shown prominently when rules differ between Agent Terminal and agent configs
         let warning_row = adw::ActionRow::builder()
@@ -411,6 +458,9 @@ impl AgentTerminalWindow {
             .css_classes(["pill"])
             .build();
 
+        // The rules file and the permission files are read off the main thread; only the newest
+        // result is shown.
+        let sync_generation = Rc::new(std::cell::Cell::new(0u64));
         let sync_cb = Rc::new(glib::clone!(
             #[weak]
             warning_row,
@@ -424,24 +474,137 @@ impl AgentTerminalWindow {
             export_btn,
             #[weak]
             manage_row,
+            #[weak]
+            obj,
+            #[strong]
+            sync_generation,
             move || {
-                if let Some(path) = crate::always_allow::path() {
-                    let rules = crate::always_allow::AlwaysRules::load(&path);
-                    Self::update_sync_indicator(
-                        &rules,
-                        &warning_row,
-                        &import_row,
-                        &import_btn,
-                        &export_row,
-                        &export_btn,
-                        &manage_row,
-                    );
-                }
+                let Some(path) = crate::always_allow::path() else {
+                    return;
+                };
+                let sources = obj.imp().permission_sources();
+                let current = sync_generation.get().wrapping_add(1);
+                sync_generation.set(current);
+                let sync_generation = sync_generation.clone();
+                glib::spawn_future_local(glib::clone!(
+                    #[weak]
+                    warning_row,
+                    #[weak]
+                    import_row,
+                    #[weak]
+                    import_btn,
+                    #[weak]
+                    export_row,
+                    #[weak]
+                    export_btn,
+                    #[weak]
+                    manage_row,
+                    async move {
+                        let computed = gtk4::gio::spawn_blocking(move || {
+                            let rules = crate::always_allow::AlwaysRules::load(&path);
+                            let status = rules.check_sync_status(None, &sources);
+                            (rules.rules.len(), status)
+                        })
+                        .await;
+                        let Ok((count, status)) = computed else {
+                            return;
+                        };
+                        if sync_generation.get() != current {
+                            return;
+                        }
+                        manage_row.set_subtitle(&format!(
+                            "{count} active rules stored in {}",
+                            crate::always_allow::FILE_NAME
+                        ));
+                        Self::update_sync_indicator(
+                            &status,
+                            &warning_row,
+                            &import_row,
+                            &import_btn,
+                            &export_row,
+                            &export_btn,
+                        );
+                    }
+                ));
             }
         ));
 
         // Initial sync state check
         sync_cb();
+
+        // Applied once valid, ~400 ms after typing stops (the file checks run off the main
+        // thread) or at once when focus leaves. An invalid draft stays in the entry with its
+        // error shown inline, and the previously saved list stays in use; nothing reverts.
+        let on_sources = sync_cb.clone();
+        let typing = Rc::new(std::cell::Cell::new(0u64));
+        let validate = Rc::new(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            sources_row,
+            #[weak]
+            sources_error,
+            #[strong]
+            typing,
+            move |wait: bool| {
+                let current = typing.get().wrapping_add(1);
+                typing.set(current);
+                let text = sources_row.text().to_string();
+                let typing = typing.clone();
+                let on_sources = on_sources.clone();
+                glib::spawn_future_local(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[weak]
+                    sources_row,
+                    #[weak]
+                    sources_error,
+                    async move {
+                        if wait {
+                            glib::timeout_future(std::time::Duration::from_millis(400)).await;
+                            if typing.get() != current {
+                                return;
+                            }
+                        }
+                        let checked = gtk4::gio::spawn_blocking(move || {
+                            crate::config::parse_permission_sources(&text)
+                        })
+                        .await;
+                        let Ok(checked) = checked else { return };
+                        if typing.get() != current {
+                            return; // typed on meanwhile; that edit has its own check
+                        }
+                        match checked {
+                            Ok(parsed) => {
+                                show_validation(
+                                    &sources_row,
+                                    &sources_error,
+                                    PERMISSION_SOURCES_HELP,
+                                    None,
+                                );
+                                let imp = obj.imp();
+                                if imp.config.borrow().permission_sources != parsed {
+                                    imp.config.borrow_mut().permission_sources = parsed;
+                                    imp.schedule_config_save();
+                                    on_sources();
+                                }
+                            }
+                            Err(reason) => show_validation(
+                                &sources_row,
+                                &sources_error,
+                                PERMISSION_SOURCES_HELP,
+                                Some(&reason),
+                            ),
+                        }
+                    }
+                ));
+            }
+        ));
+        let on_change = validate.clone();
+        sources_row.connect_changed(move |_| on_change(true));
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| validate(false));
+        sources_row.add_controller(focus);
 
         let on_sync_for_diff = sync_cb.clone();
         view_diff_btn.connect_clicked(glib::clone!(
@@ -474,7 +637,8 @@ impl AgentTerminalWindow {
                     let imp = obj.imp();
                     if let Some(path) = crate::always_allow::path() {
                         let mut rules = crate::always_allow::AlwaysRules::load(&path);
-                        let added_count = rules.import_agent_permissions(None);
+                        let added_count =
+                            rules.import_agent_permissions(None, &imp.permission_sources());
                         if added_count > 0 {
                             let _ = rules.save(&path);
                             imp.show_toast(&format!(
@@ -528,7 +692,8 @@ impl AgentTerminalWindow {
                     let imp = obj.imp();
                     if let Some(path) = crate::always_allow::path() {
                         let rules = crate::always_allow::AlwaysRules::load(&path);
-                        let exported_count = rules.export_agent_permissions(None);
+                        let exported_count =
+                            rules.export_agent_permissions(None, &imp.permission_sources());
                         if exported_count > 0 {
                             imp.show_toast(&format!(
                                 "Exported {exported_count} permission rules to agent configurations"
@@ -576,21 +741,13 @@ impl AgentTerminalWindow {
     }
 
     fn update_sync_indicator(
-        rules: &crate::always_allow::AlwaysRules,
+        status: &crate::always_allow::PermissionSyncStatus,
         warning_row: &adw::ActionRow,
         import_row: &adw::ActionRow,
         import_btn: &gtk4::Button,
         export_row: &adw::ActionRow,
         export_btn: &gtk4::Button,
-        manage_row: &adw::ActionRow,
     ) {
-        manage_row.set_subtitle(&format!(
-            "{} active rules stored in {}",
-            rules.rules.len(),
-            crate::always_allow::FILE_NAME
-        ));
-
-        let status = rules.check_sync_status(None);
         if status.is_out_of_sync() {
             warning_row.set_subtitle(&status.summary());
             warning_row.set_visible(true);
@@ -661,7 +818,7 @@ impl AgentTerminalWindow {
             return;
         };
         let rules = crate::always_allow::AlwaysRules::load(&path);
-        let status = rules.check_sync_status(None);
+        let status = rules.check_sync_status(None, &self.permission_sources());
 
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
         content.set_margin_top(12);
@@ -755,7 +912,7 @@ impl AgentTerminalWindow {
             return;
         };
         let rules = crate::always_allow::AlwaysRules::load(&path);
-        let status = rules.check_sync_status(None);
+        let status = rules.check_sync_status(None, &self.permission_sources());
 
         let subtitle = if status.is_out_of_sync() {
             format!(
@@ -861,7 +1018,7 @@ impl AgentTerminalWindow {
                 match response.as_str() {
                     "import" => {
                         let mut rules = crate::always_allow::AlwaysRules::load(&p);
-                        let count = rules.import_agent_permissions(None);
+                        let count = rules.import_agent_permissions(None, &imp.permission_sources());
                         if count > 0 {
                             let _ = rules.save(&p);
                             imp.show_toast(&format!(
@@ -876,7 +1033,7 @@ impl AgentTerminalWindow {
                     }
                     "export" => {
                         let rules = crate::always_allow::AlwaysRules::load(&p);
-                        let count = rules.export_agent_permissions(None);
+                        let count = rules.export_agent_permissions(None, &imp.permission_sources());
                         if count > 0 {
                             imp.show_toast(&format!(
                                 "Exported {count} permission rules to agent configurations"
@@ -1607,6 +1764,95 @@ pub(super) mod tests {
             ));
             assert!(feedback.iter().all(|row| !row.is_visible()));
         }
+    }
+
+    /// Every row and group title under `root` is non-empty and, when Pango reads it as markup,
+    /// valid markup: a bare `&` makes the parse fail and the title renders blank (F20).
+    pub(crate) fn assert_titles_render(root: &impl IsA<gtk4::Widget>, what: &str) {
+        let mut checked = 0;
+        for widget in crate::testutil::descendants(root.upcast_ref()) {
+            let titled = if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
+                Some((row.title().to_string(), row.uses_markup()))
+            } else {
+                widget
+                    .downcast_ref::<adw::PreferencesGroup>()
+                    .map(|g| (g.title().to_string(), true))
+            };
+            if let Some((title, markup)) = titled {
+                // EntryRows and some container rows are titled by their own child widgets.
+                if !title.is_empty() || widget.is::<adw::ActionRow>() {
+                    assert!(!title.is_empty(), "{what}: an untitled row");
+                    if markup {
+                        assert!(
+                            gtk4::pango::parse_markup(&title, '\0').is_ok(),
+                            "{what}: {title:?} is invalid Pango markup and would render blank"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "{what}: no titled rows found");
+    }
+
+    /// A dropdown row shows its whole selected value, even in a narrow window beside a long
+    /// subtitle (ui-audit #9: "Agent T…", "Auto…").
+    #[test]
+    #[ignore = "native GTK layout; run alone in an isolated display"]
+    fn native_dropdown_rows_show_their_whole_value() {
+        gtk4::init().expect("GTK must be available for the native gate");
+        adw::init().expect("libadwaita init");
+        crate::load_css();
+        let ctx = glib::MainContext::default();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.Dropdowns")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>)
+            .expect("registering a non-unique application");
+        let win = super::super::super::AgentTerminalWindow::new(&app);
+        let rows: Vec<adw::ComboRow> = vec![win.imp().default_agent_row()];
+        for width in [360, 1400] {
+            for row in &rows {
+                let window = gtk4::Window::new();
+                window.set_default_size(width, 300);
+                let list = gtk4::ListBox::new();
+                list.append(row);
+                window.set_child(Some(&list));
+                window.present();
+                crate::testutil::settle(&ctx);
+                let selected = row
+                    .selected_item()
+                    .and_downcast::<gtk4::StringObject>()
+                    .expect("a selected item")
+                    .string();
+                let value = crate::testutil::descendants(row.upcast_ref())
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk4::Label>().ok())
+                    .find(|l| l.text() == selected && l.is_mapped())
+                    .expect("the value label");
+                assert!(
+                    !value.layout().is_ellipsized(),
+                    "{selected:?} is truncated at {width}px in {:?}",
+                    row.title()
+                );
+                list.remove(row);
+                window.destroy();
+            }
+        }
+    }
+
+    /// Called by the window smoke test on GTK's thread.
+    pub(crate) fn pages_have_renderable_titles(imp: &AgentTerminalWindow) {
+        let prefs = adw::PreferencesDialog::new();
+        imp.add_agents_page(&prefs);
+        let page = prefs.visible_page().expect("the Agents page");
+        assert_titles_render(&page, "Settings -> Agents");
+        let setup = adw::Dialog::new();
+        let page = imp.setup_agents_page(&setup);
+        assert_titles_render(&page, "setup walkthrough");
     }
 
     #[test]
