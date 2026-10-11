@@ -3,6 +3,8 @@ name = "agent-terminal"
 version = "3.3.0"
 
 edition = "2021"
+# std::fs::File::lock (the approval rules store lock) is stable from 1.89.
+rust-version = "1.89"
 authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
 description = "A native GTK4 chat front end for Claude, Antigravity and Codex"
 license = "MIT"
