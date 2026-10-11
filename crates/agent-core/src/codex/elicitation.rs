@@ -11,6 +11,7 @@ use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use super::permissions::{clip, visible};
 use crate::form::{self, ChoiceOption, FieldInput, Form, FormField, TextFormat};
 
 /// A form with more fields than this is declined.
@@ -19,6 +20,37 @@ pub(super) const MAX_FIELDS: usize = 20;
 pub(super) const MAX_OPTIONS: usize = 50;
 /// A message longer than this (in characters) is declined.
 pub(super) const MAX_MESSAGE: usize = 4_000;
+/// A field name or choice value longer than this is declined (the answer carries it whole).
+const MAX_KEY: usize = 200;
+/// Titles and option labels are cut to this many characters for display.
+const MAX_LABEL: usize = 200;
+/// Descriptions are cut to this many characters for display.
+const MAX_DESCRIPTION: usize = 1_000;
+/// Server names are cut to this many characters.
+const MAX_SERVER: usize = 64;
+
+/// Why a form that asks for a secret is declined.
+const SECRET: &str =
+    "asks for a password or other secret; agent-terminal never passes secrets to tool servers";
+
+/// A string `format` that names a secret: `password` (JSON Schema's own) or any unknown format
+/// whose name reads as one.
+fn secret_format(format: &str) -> bool {
+    let f = format.to_ascii_lowercase();
+    [
+        "pass",
+        "secret",
+        "token",
+        "key",
+        "credential",
+        "pin",
+        "otp",
+        "totp",
+        "mfa",
+    ]
+    .iter()
+    .any(|w| f.contains(w))
+}
 
 /// What a request is read into.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,15 +65,18 @@ pub(super) enum Elicitation {
     },
 }
 
-/// The server's name, as the notice and card say it.
+/// The server's name, as the notice and card say it: hidden characters removed, at most
+/// [`MAX_SERVER`] characters.
 pub(super) fn server_name(params: &Value) -> String {
-    params
+    let name = params
         .get("serverName")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unnamed")
-        .to_owned()
+        .map(visible)
+        .unwrap_or_default();
+    match name.trim() {
+        "" => "unnamed".to_owned(),
+        name => clip(name, MAX_SERVER),
+    }
 }
 
 /// Reads a request's params. `order` is the server's own order of the schema's properties
@@ -94,6 +129,18 @@ pub(super) fn parse(params: &Value, order: Option<&[String]>) -> Elicitation {
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return decline("sent a form agent-terminal could not read");
     }
+    // Before any per-field work: a hostile frame may carry any number of properties.
+    if properties.len() > MAX_FIELDS {
+        return decline("sent a form with more fields than agent-terminal shows (20)");
+    }
+    // A text format that is itself a secret (`"format": "password"`), whatever the field's name.
+    if properties.values().any(|p| {
+        p.get("format")
+            .and_then(Value::as_str)
+            .is_some_and(secret_format)
+    }) {
+        return decline(SECRET);
+    }
     let required: Vec<&str> = schema
         .get("required")
         .and_then(Value::as_array)
@@ -112,9 +159,6 @@ pub(super) fn parse(params: &Value, order: Option<&[String]>) -> Elicitation {
             names.push(name);
         }
     }
-    if names.len() > MAX_FIELDS {
-        return decline("sent a form with more fields than agent-terminal shows (20)");
-    }
     let fields: Vec<FormField> = names
         .into_iter()
         .map(|name| {
@@ -132,14 +176,21 @@ pub(super) fn parse(params: &Value, order: Option<&[String]>) -> Elicitation {
         };
     }
     if fields.iter().any(form::asks_for_secret) {
-        return decline(
-            "asks for a password or other secret; agent-terminal never passes secrets to tool servers",
-        );
+        return decline(SECRET);
     }
     if fields.iter().any(
         |f| matches!(&f.input, FieldInput::Choice { options, .. } if options.len() > MAX_OPTIONS),
     ) {
         return decline("offers more choices in one field than agent-terminal shows (50)");
+    }
+    // Names and choice values are what the answer carries, so they cannot be shortened.
+    let too_long = |s: &String| s.chars().count() > MAX_KEY;
+    if fields.iter().any(|f| {
+        too_long(&f.name)
+            || matches!(&f.input, FieldInput::Choice { options, .. }
+                if options.iter().any(|o| too_long(&o.value)))
+    }) {
+        return decline("sent a form with field names or choices too long to show");
     }
     Elicitation::Show {
         message,
@@ -147,8 +198,12 @@ pub(super) fn parse(params: &Value, order: Option<&[String]>) -> Elicitation {
     }
 }
 
-fn text(schema: &Map<String, Value>, key: &str) -> Option<String> {
-    schema.get(key).and_then(Value::as_str).map(str::to_owned)
+/// A display string, cut to `max` characters with an ellipsis.
+fn text(schema: &Map<String, Value>, key: &str, max: usize) -> Option<String> {
+    schema
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|s| clip(s, max))
 }
 
 fn field(name: &str, schema: &Value, required: bool) -> FormField {
@@ -156,8 +211,8 @@ fn field(name: &str, schema: &Value, required: bool) -> FormField {
     let obj = schema.as_object().unwrap_or(&empty);
     FormField {
         name: name.to_owned(),
-        title: text(obj, "title"),
-        description: text(obj, "description"),
+        title: text(obj, "title", MAX_LABEL),
+        description: text(obj, "description", MAX_DESCRIPTION),
         required,
         input: input(obj).unwrap_or(FieldInput::Unknown),
     }
@@ -192,7 +247,10 @@ fn input(schema: &Map<String, Value>) -> Option<FieldInput> {
                 let options = values
                     .into_iter()
                     .zip(labels)
-                    .map(|(value, label)| ChoiceOption { value, label })
+                    .map(|(value, label)| ChoiceOption {
+                        value,
+                        label: clip(&label, MAX_LABEL),
+                    })
                     .collect();
                 return choice(options, false, None, None, single_default(schema));
             }
@@ -309,7 +367,7 @@ fn titled(value: &Value) -> Option<Vec<ChoiceOption>> {
         .map(|o| {
             Some(ChoiceOption {
                 value: o.get("const")?.as_str()?.to_owned(),
-                label: o.get("title")?.as_str()?.to_owned(),
+                label: clip(o.get("title")?.as_str()?, MAX_LABEL),
             })
         })
         .collect()
@@ -555,6 +613,22 @@ mod tests {
         assert!(declined(&form(json!({"type": "object", "properties": {
             "apiToken": {"type": "string"}}})))
         .contains("never passes secrets"));
+        for format in ["password", "x-api-key", "otp-code"] {
+            assert!(
+                declined(&form(json!({"type": "object", "properties": {
+                    "value": {"type": "string", "format": format}}})))
+                .contains("never passes secrets"),
+                "{format}"
+            );
+        }
+        assert!(matches!(
+            parse(
+                &form(json!({"type": "object", "properties": {
+                    "when": {"type": "string", "format": "date"}}})),
+                None
+            ),
+            Elicitation::Show { .. }
+        ));
         assert!(declined(&form(json!({"type": "object", "properties": {
             "c": {"type": "string", "enum": ["x", "x"]}}})))
         .contains("cannot use"));
@@ -615,5 +689,57 @@ mod tests {
             fields(&form(json!({"type": "object", "properties": {}}))),
             vec![]
         );
+    }
+
+    /// 50 000 properties are refused at once, before any per-field work (it used to order them
+    /// with a quadratic scan on the UI thread).
+    #[test]
+    fn a_huge_form_is_declined_before_it_is_read() {
+        let mut props = Map::new();
+        for i in 0..50_000 {
+            props.insert(format!("f{i}"), json!({"type": "string"}));
+        }
+        let order: Vec<String> = props.keys().cloned().collect();
+        let started = std::time::Instant::now();
+        let out = parse(
+            &form(json!({"type": "object", "properties": props})),
+            Some(&order),
+        );
+        assert!(
+            matches!(out, Elicitation::Decline { ref reason, .. } if reason.contains("more fields"))
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn long_display_text_is_cut_and_long_keys_are_declined() {
+        let long = "x".repeat(5_000);
+        let f = fields(&form(json!({"type": "object", "properties": {
+            "a": {"type": "string", "title": long, "description": long},
+            "b": {"type": "string", "oneOf": [{"const": "v", "title": long}]},
+        }})));
+        assert_eq!(
+            f[0].title.as_deref().map(|t| t.chars().count()),
+            Some(MAX_LABEL + 1)
+        );
+        assert!(f[0].title.as_deref().is_some_and(|t| t.ends_with('…')));
+        assert_eq!(
+            f[0].description.as_deref().map(|t| t.chars().count()),
+            Some(MAX_DESCRIPTION + 1)
+        );
+        assert!(
+            matches!(&f[1].input, FieldInput::Choice { options, .. } if options[0].label.chars().count() == MAX_LABEL + 1)
+        );
+        let mut props = Map::new();
+        props.insert(long.clone(), json!({"type": "string"}));
+        assert!(
+            declined(&form(json!({"type": "object", "properties": props}))).contains("too long")
+        );
+        assert!(declined(&form(json!({"type": "object", "properties": {
+            "c": {"type": "string", "enum": [long]}}})))
+        .contains("too long"));
+        let name = server_name(&json!({"serverName": format!("evil\u{202e}{}", "s".repeat(100))}));
+        assert!(!name.contains('\u{202e}'));
+        assert_eq!(name.chars().count(), MAX_SERVER + 1);
     }
 }

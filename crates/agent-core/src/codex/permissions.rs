@@ -128,8 +128,10 @@ struct Typed {
     glob_depth: Option<u64>,
 }
 
-/// Reads a permission request's params.
-pub(super) fn parse(params: &Value) -> Parsed {
+/// Reads a permission request's params. `workspace` is the thread's folder (the session's
+/// `cwd`): the only project root this app can name, so a `project_roots` entry is typeable
+/// only when the request's `cwd` is that folder.
+pub(super) fn parse(params: &Value, workspace: Option<&str>) -> Parsed {
     let requested = params.get("permissions").cloned().unwrap_or(Value::Null);
     let reason = params
         .get("reason")
@@ -142,20 +144,30 @@ pub(super) fn parse(params: &Value) -> Parsed {
         .map(Path::new)
         .filter(|c| c.is_absolute())
         .map(normal);
-    let typed = typed(&requested, cwd.as_deref());
+    let workspace = workspace
+        .filter(|w| displayable(w))
+        .map(Path::new)
+        .filter(|w| w.is_absolute())
+        .map(normal);
+    // Codex applies `project_roots` to its own project root. The app knows only the thread's
+    // folder, so it vouches for that root only when the request was made from it.
+    let project = cwd.clone().filter(|c| Some(c) == workspace.as_ref());
+    let typed = typed(&requested, cwd.as_deref(), project.as_deref()).filter(consistent);
     let cwd_text = cwd
         .as_ref()
         .map(|c| Value::String(c.to_string_lossy().into_owned()))
         .unwrap_or(Value::Null);
     match typed {
         Some(typed) => Parsed {
-            title: title(&typed),
+            title: clip(&title(&typed), MAX_TITLE),
             input: json!({
                 "cwd": cwd_text,
                 "reason": reason,
                 "renderable": true,
+                "summary": summary(&typed),
                 "entries": typed.entries.iter().map(entry_view).collect::<Vec<_>>(),
                 "network": typed.network,
+                "glob_depth": typed.glob_depth,
                 "session_allowed": true,
                 "warning": Value::Null,
                 "requested": requested,
@@ -169,8 +181,10 @@ pub(super) fn parse(params: &Value) -> Parsed {
                 "cwd": cwd_text,
                 "reason": reason,
                 "renderable": false,
+                "summary": "nothing (it was not granted)",
                 "entries": [],
                 "network": Value::Null,
+                "glob_depth": Value::Null,
                 "session_allowed": false,
                 "warning": "agent-terminal cannot read every part of this request, so it can only be denied.",
                 "requested": requested,
@@ -181,22 +195,30 @@ pub(super) fn parse(params: &Value) -> Parsed {
     }
 }
 
-/// Text that reads as what it is: not empty, and no control, bidi, zero-width or tag
-/// characters (which could make a path look like another).
-fn displayable(text: &str) -> bool {
-    !text.is_empty() && !text.chars().any(hidden_char)
+/// More entries than this make a request unrenderable: no card lists them all usefully.
+pub(super) const MAX_ENTRIES: usize = 64;
+/// The longest title shown; longer ones end in an ellipsis.
+const MAX_TITLE: usize = 300;
+/// The longest summary said in a notice.
+const MAX_SUMMARY: usize = 600;
+
+/// Text that reads as what it is: not empty, and nothing [`crate::text::is_hidden`] (which could
+/// make a path look like another).
+pub(super) fn displayable(text: &str) -> bool {
+    !text.is_empty() && !crate::text::has_hidden(text)
 }
 
-fn hidden_char(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{00AD}' | '\u{061C}' | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2069}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}')
+/// `text` without hidden characters (see [`displayable`]), for a name shown as is.
+pub(super) fn visible(text: &str) -> String {
+    crate::text::without_hidden(text)
+}
+
+/// `text` cut to `max` characters, ending in an ellipsis when cut.
+pub fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        None => text.to_owned(),
+        Some((at, _)) => format!("{}…", &text[..at]),
+    }
 }
 
 /// `path` with `.` dropped and `..` applied lexically (`/a/b/../c` is `/a/c`; `..` at the root
@@ -215,12 +237,35 @@ fn normal(path: &Path) -> PathBuf {
     out
 }
 
+/// No target is both denied and asked for: which one Codex would honour is not something the
+/// card can show, so such a request is unrenderable.
+fn consistent(typed: &Typed) -> bool {
+    // Where a target lands: a path and a special place resolving to it are the same place.
+    let place = |t: &Target| match t {
+        Target::Path(p) => p.clone(),
+        Target::Special { path: Some(p), .. } => p.clone(),
+        Target::Special { kind, .. } => format!("special:{}", kind.wire()),
+        Target::Glob(g) => format!("glob:{g}"),
+    };
+    let denied: Vec<String> = typed
+        .entries
+        .iter()
+        .filter(|e| e.access == Access::Deny)
+        .map(|e| place(&e.target))
+        .collect();
+    typed
+        .entries
+        .iter()
+        .filter(|e| e.access != Access::Deny)
+        .all(|e| !denied.contains(&place(&e.target)))
+}
+
 /// Keys outside `known`, or a value of the wrong kind, make the object untypeable.
 fn only_keys(obj: &Map<String, Value>, known: &[&str]) -> bool {
     obj.keys().all(|k| known.contains(&k.as_str()))
 }
 
-fn typed(requested: &Value, cwd: Option<&Path>) -> Option<Typed> {
+fn typed(requested: &Value, cwd: Option<&Path>, project: Option<&Path>) -> Option<Typed> {
     let mut out = Typed::default();
     let profile = requested.as_object()?;
     if !only_keys(profile, &["fileSystem", "network"]) {
@@ -246,6 +291,13 @@ fn typed(requested: &Value, cwd: Option<&Path>) -> Option<Typed> {
             if !only_keys(fs, &["read", "write", "entries", "globScanMaxDepth"]) {
                 return None;
             }
+            let count: usize = ["read", "write", "entries"]
+                .iter()
+                .map(|k| array(fs.get(*k)).map_or(0, <[Value]>::len))
+                .sum();
+            if count > MAX_ENTRIES {
+                return None;
+            }
             for (key, access) in [("read", Access::Read), ("write", Access::Write)] {
                 for path in array(fs.get(key))? {
                     let path = resolve(path.as_str()?, cwd)?;
@@ -257,7 +309,7 @@ fn typed(requested: &Value, cwd: Option<&Path>) -> Option<Typed> {
                 }
             }
             for entry in array(fs.get("entries"))? {
-                out.entries.push(sandbox_entry(entry, cwd)?);
+                out.entries.push(sandbox_entry(entry, cwd, project)?);
             }
             out.glob_depth = match fs.get("globScanMaxDepth") {
                 None | Some(Value::Null) => None,
@@ -292,7 +344,7 @@ fn resolve(path: &str, cwd: Option<&Path>) -> Option<String> {
     Some(full.to_string_lossy().into_owned())
 }
 
-fn sandbox_entry(entry: &Value, cwd: Option<&Path>) -> Option<Entry> {
+fn sandbox_entry(entry: &Value, cwd: Option<&Path>, project: Option<&Path>) -> Option<Entry> {
     let obj = entry.as_object()?;
     if !only_keys(obj, &["access", "path"]) {
         return None;
@@ -316,7 +368,12 @@ fn sandbox_entry(entry: &Value, cwd: Option<&Path>) -> Option<Entry> {
                 return None;
             }
             let pattern = path.get("pattern")?.as_str()?;
-            if !displayable(pattern) {
+            // Only an absolute pattern with no `..` says by itself where it reaches: `~` is
+            // the shell's, a relative one depends on what Codex anchors it to.
+            if !displayable(pattern)
+                || !pattern.starts_with('/')
+                || pattern.split('/').any(|segment| segment == "..")
+            {
                 return None;
             }
             Target::Glob(pattern.to_owned())
@@ -325,7 +382,7 @@ fn sandbox_entry(entry: &Value, cwd: Option<&Path>) -> Option<Entry> {
             if !only_keys(path, &["type", "value"]) {
                 return None;
             }
-            special(path.get("value")?.as_object()?, cwd)?
+            special(path.get("value")?.as_object()?, project)?
         }
         _ => return None,
     };
@@ -336,7 +393,7 @@ fn sandbox_entry(entry: &Value, cwd: Option<&Path>) -> Option<Entry> {
     })
 }
 
-fn special(value: &Map<String, Value>, cwd: Option<&Path>) -> Option<Target> {
+fn special(value: &Map<String, Value>, project: Option<&Path>) -> Option<Target> {
     let kind = match value.get("kind")?.as_str()? {
         "project_roots" => Special::Project,
         "tmpdir" => Special::Temp,
@@ -374,13 +431,15 @@ fn special(value: &Map<String, Value>, cwd: Option<&Path>) -> Option<Target> {
         None
     };
     let path = match kind {
-        Special::Project => cwd.map(|c| {
+        // No project root the app can vouch for: not typeable (see `parse`).
+        Special::Project => {
+            let root = project?;
             let full = match &subpath {
-                Some(sub) => c.join(sub),
-                None => c.to_owned(),
+                Some(sub) => root.join(sub),
+                None => root.to_owned(),
             };
-            normal(&full).to_string_lossy().into_owned()
-        }),
+            Some(normal(&full).to_string_lossy().into_owned())
+        }
         Special::SlashTmp => Some("/tmp".to_owned()),
         Special::Root => Some("/".to_owned()),
         Special::Temp | Special::Minimal => None,
@@ -480,12 +539,40 @@ fn places(entries: &[&Entry]) -> String {
 }
 
 /// "a", "a and b", "a, b and c".
-fn sentence(parts: &[String]) -> String {
+pub fn sentence<S: AsRef<str>>(parts: &[S]) -> String {
     match parts {
         [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [one] => one.as_ref().to_owned(),
+        [rest @ .., last] => format!(
+            "{} and {}",
+            rest.iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+            last.as_ref()
+        ),
     }
+}
+
+/// What a grant gives, entry by entry, for the session-grant notice: "write to /w/out, read
+/// files matching /data/*.csv and use the network". Deny entries grant nothing.
+fn summary(typed: &Typed) -> String {
+    let mut parts: Vec<String> = typed
+        .entries
+        .iter()
+        .filter_map(|e| match e.access {
+            Access::Write => Some(format!("write to {}", words(&e.target))),
+            Access::Read => Some(format!("read {}", words(&e.target))),
+            Access::Deny => None,
+        })
+        .collect();
+    if typed.network == Some(true) {
+        parts.push("use the network".to_owned());
+    }
+    if parts.is_empty() {
+        return "nothing more than before".to_owned();
+    }
+    clip(&sentence(&parts), MAX_SUMMARY)
 }
 
 /// "Codex asks to write to 2 locations, read /etc/hosts and use the network". A read-only or
@@ -521,6 +608,11 @@ fn title(typed: &Typed) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parsed in a thread whose folder is the requests' `cwd`.
+    fn parse(params: &Value) -> Parsed {
+        super::parse(params, Some("/work/repo"))
+    }
 
     fn req(permissions: Value) -> Value {
         json!({"threadId": "th", "turnId": "tu", "itemId": "it", "startedAtMs": 1,
@@ -675,6 +767,14 @@ mod tests {
                 json!({"network": {"enabled": true, "hosts": ["*"]}}),
             ),
             ("home shorthand", json!({"fileSystem": {"read": ["~/x"]}})),
+            (
+                "home shorthand in a glob",
+                json!({"fileSystem": {"entries": [entry("read", json!({"type": "glob_pattern", "pattern": "~/**"}))]}}),
+            ),
+            (
+                "more entries than a card lists",
+                json!({"fileSystem": {"read": (0..=MAX_ENTRIES).map(|i| format!("/f{i}")).collect::<Vec<_>>()}}),
+            ),
             ("empty path", json!({"fileSystem": {"read": [""]}})),
             ("non-string path", json!({"fileSystem": {"read": [3]}})),
             (
@@ -711,15 +811,104 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_says_what_is_granted_in_the_titles_words() {
+        let p = parse(&req(json!({
+            "fileSystem": {"entries": [
+                entry("write", json!({"type": "path", "path": "/w/out"})),
+                entry("read", json!({"type": "glob_pattern", "pattern": "/data/*.csv"})),
+                entry("write", json!({"type": "special", "value": {"kind": "project_roots", "subpath": "build"}})),
+                entry("deny", json!({"type": "path", "path": "/w/.env"})),
+            ]},
+            "network": {"enabled": true},
+        })));
+        assert_eq!(
+            p.input["summary"],
+            "write to /w/out, read files matching /data/*.csv, write to build in the project and use the network"
+        );
+        let full = parse(&req(
+            json!({"fileSystem": {"read": (0..MAX_ENTRIES).map(|i| format!("/{}{i}", "x".repeat(40))).collect::<Vec<_>>()}}),
+        ));
+        assert!(full.renderable);
+        assert!(full.input["summary"].as_str().unwrap().ends_with('…'));
+        assert!(full.input["summary"].as_str().unwrap().chars().count() <= MAX_SUMMARY + 1);
+        assert_eq!(clip("abcdef", 3), "abc…");
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(sentence(&["a", "b", "c"]), "a, b and c");
+    }
+
+    #[test]
     fn deny_only_and_empty_requests_render() {
         let p = parse(&req(json!({"fileSystem": {"entries": [
-            entry("deny", json!({"type": "glob_pattern", "pattern": "**/.env"}))
+            entry("deny", json!({"type": "glob_pattern", "pattern": "/work/**/.env"}))
         ]}})));
         assert!(p.renderable);
-        assert_eq!(p.title, "Codex asks to keep files matching **/.env blocked");
+        assert_eq!(
+            p.title,
+            "Codex asks to keep files matching /work/**/.env blocked"
+        );
         let p = parse(&req(json!({})));
         assert!(p.renderable);
         assert_eq!(p.grant, json!({}));
         assert_eq!(p.input["network"], Value::Null);
+        assert_eq!(p.input["glob_depth"], Value::Null);
+        let p = parse(&req(json!({"fileSystem": {"globScanMaxDepth": 4}})));
+        assert_eq!(p.input["glob_depth"], 4);
+    }
+
+    /// SEC-02: `project_roots` is Codex's project root, which the app vouches for only as the
+    /// thread's folder, and only when the request came from there.
+    #[test]
+    fn the_project_is_the_threads_folder_or_the_request_is_unrenderable() {
+        let project = |sub: Value| {
+            req(json!({"fileSystem": {"entries": [entry("write",
+                json!({"type": "special", "value": {"kind": "project_roots", "subpath": sub}}))]}}))
+        };
+        let p = super::parse(&project(json!("out")), Some("/work/repo"));
+        assert!(p.renderable);
+        assert_eq!(p.input["entries"][0]["target"]["path"], "/work/repo/out");
+        let mut elsewhere = project(Value::Null);
+        elsewhere["cwd"] = json!("/work/repo/sub");
+        assert!(!super::parse(&elsewhere, Some("/work/repo")).renderable);
+        assert!(!super::parse(&project(Value::Null), None).renderable);
+        let mut no_cwd = project(Value::Null);
+        no_cwd["cwd"] = json!("relative");
+        assert!(!super::parse(&no_cwd, Some("/work/repo")).renderable);
+        // A plain path needs no project root.
+        assert!(
+            super::parse(&req(json!({"fileSystem": {"read": ["/etc/hosts"]}})), None).renderable
+        );
+    }
+
+    /// SEC-04 and SEC-07: a place both denied and asked for, and a glob that does not say by
+    /// itself where it reaches, cannot be shown exactly.
+    #[test]
+    fn contradictions_and_unanchored_globs_are_unrenderable() {
+        let glob = |pattern: &str| json!({"fileSystem": {"entries": [entry("read", json!({"type": "glob_pattern", "pattern": pattern}))]}});
+        for pattern in [
+            "**/*.rs",
+            "src/*",
+            "/work/../etc/*",
+            "/a/../../b/**",
+            "~/**",
+        ] {
+            assert!(!parse(&req(glob(pattern))).renderable, "{pattern}");
+        }
+        assert!(
+            parse(&req(glob("/work/..x/*"))).renderable,
+            "only a `..` segment"
+        );
+        for perms in [
+            json!({"fileSystem": {"write": ["/w/a"], "entries": [entry("deny", json!({"type": "path", "path": "/w/./a"}))]}}),
+            json!({"fileSystem": {"entries": [
+                entry("deny", json!({"type": "path", "path": "/work/repo"})),
+                entry("read", json!({"type": "special", "value": {"kind": "project_roots"}})),
+            ]}}),
+            json!({"fileSystem": {"entries": [
+                entry("deny", json!({"type": "special", "value": {"kind": "tmpdir"}})),
+                entry("write", json!({"type": "special", "value": {"kind": "tmpdir"}})),
+            ]}}),
+        ] {
+            assert!(!parse(&req(perms.clone())).renderable, "{perms}");
+        }
     }
 }

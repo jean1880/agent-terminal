@@ -117,6 +117,8 @@
 mod elicitation;
 mod permissions;
 
+pub use permissions::{clip, sentence};
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
@@ -146,6 +148,9 @@ const MODEL_PAGE: u32 = 200;
 // Bound retired-turn history on long-lived connections; settled active-turn requests retire
 // with their scope, so delayed frames do not require keeping the entire conversation here.
 const TURN_TOMBSTONE_LIMIT: usize = 128;
+
+/// How many answered turnless requests are remembered against retransmission.
+const TURNLESS_SETTLED_LIMIT: usize = 256;
 
 /// Notifications that carry nothing the UI renders (bookkeeping, or covered by another frame):
 /// dropped without an [`Event::Unknown`], which would only add noise to every turn.
@@ -276,6 +281,8 @@ pub struct CodexAdapter {
     approvals: HashMap<String, PendingApproval>,
     questions: HashMap<String, PendingQuestion>,
     forms: HashMap<String, PendingForm>,
+    /// Settled turnless request keys, oldest first (see `remember_settled_request`).
+    turnless_settled: VecDeque<String>,
     /// Keep every settled identity until its turn ends, then retire that scope. Retention
     /// grows with active work, not connection lifetime; evicting an active identity would
     /// make an old answer valid again. Child scopes retire only with child terminal evidence.
@@ -345,6 +352,7 @@ impl CodexAdapter {
             approvals: HashMap::new(),
             questions: HashMap::new(),
             forms: HashMap::new(),
+            turnless_settled: VecDeque::new(),
             settled_requests: HashMap::new(),
             ended_turns: HashSet::new(),
             ended_turn_order: VecDeque::new(),
@@ -1291,7 +1299,7 @@ impl CodexAdapter {
         keys.sort();
         for key in keys {
             if let Some(form) = self.forms.remove(&key) {
-                self.settled_requests.insert(key.clone(), form.scope);
+                self.remember_settled_request(key.clone(), form.scope);
                 out.push(
                     Envelope::new(Event::FormResolved {
                         action: crate::form::FormAction::Cancel,
@@ -1343,7 +1351,24 @@ impl CodexAdapter {
 
     // ---- server requests ----
 
+    /// Remembers an answered or expired request so a retransmission cannot revive it. A turn's
+    /// requests are forgotten when the turn retires; a turnless one (a form with no `turnId`)
+    /// never retires, so only the latest [`TURNLESS_SETTLED_LIMIT`] are kept.
     fn remember_settled_request(&mut self, key: String, scope: RequestScope) {
+        if scope.turn.is_none() {
+            self.turnless_settled.push_back(key.clone());
+            while self.turnless_settled.len() > TURNLESS_SETTLED_LIMIT {
+                if let Some(oldest) = self.turnless_settled.pop_front() {
+                    if self
+                        .settled_requests
+                        .get(&oldest)
+                        .is_some_and(|s| s.turn.is_none())
+                    {
+                        self.settled_requests.remove(&oldest);
+                    }
+                }
+            }
+        }
         self.settled_requests.insert(key, scope);
     }
 
@@ -1630,7 +1655,7 @@ impl CodexAdapter {
             return;
         }
         let item = s(params, "itemId").unwrap_or_default().to_owned();
-        let parsed = permissions::parse(params);
+        let parsed = permissions::parse(params, self.cwd.as_deref());
         // No Always allow: the app keeps no rule for a permission grant.
         let options = if parsed.renderable {
             vec![
@@ -1676,18 +1701,19 @@ impl CodexAdapter {
         out: &mut Vec<Envelope>,
     ) {
         let turn = s(params, "turnId").map(str::to_owned);
-        // Only a form that names a turn can be stale by turn; a turnless one is not tied to any.
-        if turn.is_some() && self.stale_explicit_turn(params) {
-            return;
-        }
         let thread = s(params, "threadId")
             .or(self.thread_id.as_deref())
             .map(str::to_owned);
-        if thread.as_deref().is_some_and(|t| {
-            self.workers
-                .get(t)
-                .is_some_and(|w| w.state == WorkerState::Closed)
-        }) {
+        // Only a form that names a turn can be stale by turn; a turnless one is not tied to any.
+        let stale = (turn.is_some() && self.stale_explicit_turn(params))
+            || thread.as_deref().is_some_and(|t| {
+                self.workers
+                    .get(t)
+                    .is_some_and(|w| w.state == WorkerState::Closed)
+            });
+        if stale {
+            // Nobody will see it, but its tool call still waits: decline it so it carries on.
+            self.write(json!({"id": id, "result": {"action": "decline"}}).to_string());
             return;
         }
         let scope = RequestScope { thread, turn };
@@ -1730,7 +1756,7 @@ impl CodexAdapter {
             }
             elicitation::Elicitation::Decline { reason, link } => {
                 self.write(json!({"id": id, "result": {"action": "decline"}}).to_string());
-                self.settled_requests.insert(key, scope);
+                self.remember_settled_request(key, scope);
                 let text = match link {
                     Some(url) => refused_link_notice(&server, &reason, &url),
                     None => format!("The {server} tool server {reason}; it was declined."),
@@ -1806,7 +1832,7 @@ impl CodexAdapter {
                 "no pending Codex form {request}"
             )));
         };
-        self.settled_requests.insert(request, form.scope.clone());
+        self.remember_settled_request(request, form.scope.clone());
         let mut lines = vec![json!({"id": form.rpc_id, "result": result}).to_string()];
         if action == FormAction::Cancel {
             lines.extend(self.interrupt_scope(&form.scope));
@@ -2006,6 +2032,7 @@ impl Adapter for CodexAdapter {
         self.questions.clear();
         self.forms.clear();
         self.settled_requests.clear();
+        self.turnless_settled.clear();
         self.ended_turns.clear();
         self.ended_turn_order.clear();
         self.open_items.clear();
@@ -2321,6 +2348,7 @@ impl Adapter for CodexAdapter {
 
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         self.settled_requests.clear();
+        self.turnless_settled.clear();
         self.worker_turns.clear();
         let expected = self.interrupt_sent;
         let mut out = Vec::new();
@@ -2411,17 +2439,18 @@ pub const PERMISSIONS_TOOL: &str = "codex_permissions";
 /// why, the link as inert text (anything but printable ASCII escaped, at most 300 characters),
 /// and what the user can do.
 pub fn refused_link_notice(server: &str, why: &str, url: &str) -> String {
+    use std::fmt::Write as _;
     let mut shown = String::new();
-    for c in url.chars() {
-        if shown.chars().count() >= 300 {
-            shown.push('…');
-            break;
-        }
+    for c in url.chars().take(300) {
         if c.is_ascii_graphic() {
             shown.push(c);
         } else {
-            shown.push_str(&format!("\\u{{{:x}}}", c as u32));
+            // Writing to a String cannot fail.
+            let _ = write!(shown, "\\u{{{:x}}}", c as u32);
         }
+    }
+    if url.chars().nth(300).is_some() {
+        shown.push('…');
     }
     format!(
         "The {server} tool server {why}, so it was declined. The link: {shown}\nOpen it yourself \
@@ -6059,5 +6088,42 @@ mod tests {
         assert!(
             refused_link_notice("s", "why", "https://x/\u{202e}").contains("https://x/\\u{202e}")
         );
+        let long = refused_link_notice("s", "why", &format!("https://x/{}", "a".repeat(1_000)));
+        assert!(long.contains("a…\n"), "the link is cut at 300 characters");
+    }
+
+    /// A form nobody will see (its turn ended, or its worker closed) is still answered, so the
+    /// tool call that raised it does not wait for its own timeout.
+    #[test]
+    fn a_form_for_an_ended_turn_is_declined_not_dropped() {
+        let mut a = in_turn();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        a.drain_outbox();
+        assert!(a
+            .feed(&form_frame(json!(9), Some("tu-1"), repo_form()))
+            .is_empty());
+        assert_eq!(
+            writes(&a.drain_outbox().actions),
+            [json!({"id": 9, "result": {"action": "decline"}})]
+        );
+    }
+
+    /// Turnless forms never retire with a turn, so their settled keys are bounded.
+    #[test]
+    fn settled_turnless_forms_are_bounded() {
+        use crate::form::FormAction;
+        let mut a = in_turn();
+        for id in 0..(TURNLESS_SETTLED_LIMIT + 50) {
+            let (request, _) = form_request(&a.feed(&form_frame(json!(id), None, repo_form())));
+            a.encode(submit(&request, FormAction::Decline, None))
+                .expect("decline");
+        }
+        assert_eq!(a.turnless_settled.len(), TURNLESS_SETTLED_LIMIT);
+        assert_eq!(a.settled_requests.len(), TURNLESS_SETTLED_LIMIT);
+        // The newest are still protected against retransmission.
+        let last = TURNLESS_SETTLED_LIMIT + 49;
+        assert!(a
+            .feed(&form_frame(json!(last), None, repo_form()))
+            .is_empty());
     }
 }
