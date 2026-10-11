@@ -562,6 +562,17 @@ impl ChatSession {
         }
     }
 
+    /// A watch on the running agent process, if one is alive: taken before [`Self::shutdown`],
+    /// it follows the process out (closing the window waits on it).
+    pub fn exit_watch(&self) -> Option<crate::agent_proc::ExitWatch> {
+        self.inner
+            .proc
+            .borrow()
+            .as_ref()
+            .filter(|p| p.is_alive())
+            .map(AgentProcess::exit_watch)
+    }
+
     #[cfg(test)]
     fn set_canary_grace(&self, grace: Duration) {
         self.inner.canary_grace.set(grace);

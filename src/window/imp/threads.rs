@@ -3302,22 +3302,39 @@ impl AgentTerminalWindow {
     /// Ends every live thread session on purpose (the window is closing), so each thread's
     /// stored history is closed out, and withdraws their notifications. Sessions are collected
     /// first: their envelopes come back through `on_thread_envelope`, which borrows the tabs.
-    pub(super) fn shutdown_thread_sessions(&self) {
+    ///
+    /// Returns the agent processes still on their way out (SIGTERM sent, not yet exited), so the
+    /// window can wait for them instead of the app blocking on them at quit.
+    pub(super) fn shutdown_thread_sessions(&self) -> Vec<super::closing::StopTarget> {
         let (sessions, threads): (Vec<_>, Vec<_>) = self
             .tabs
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .map(|c| ((c.slot.get(), !c.unread), c.thread.clone()))
+            .map(|c| {
+                let label = (driver_label(c.slot.driver()).to_owned(), c.title.clone());
+                ((c.slot.get(), !c.unread, label), c.thread.clone())
+            })
             .unzip();
-        for (session, keep_read) in sessions {
-            if let Some(session) = session {
-                session.shutdown(keep_read);
+        let mut stopping = Vec::new();
+        for (session, keep_read, (agent, title)) in sessions {
+            let Some(session) = session else { continue };
+            // Before the shutdown, which drops the process (the watch outlives it).
+            let watch = session.exit_watch();
+            session.shutdown(keep_read);
+            if let Some(watch) = watch {
+                stopping.push(super::closing::StopTarget {
+                    agent,
+                    title,
+                    watch,
+                });
             }
         }
         for thread in threads {
             self.withdraw_thread_notifications(&thread);
         }
+        stopping.retain(|t| t.watch.phase() != crate::agent_proc::StopPhase::Exited);
+        stopping
     }
 
     /// The window regained focus: the shown thread is looked at, so its unread mark and its

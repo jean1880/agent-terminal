@@ -68,7 +68,10 @@ Architectural mandates, standards, and workflows for this codebase.
     features; the sidebar draws from a thread list loaded off the main thread
     and every store read or write on the UI path goes through `store_job`),
     `window/imp/thread_menu.rs` (the sidebar's context menu and its actions;
-    the menu itself is data in `window/sidebar_model.rs`), `window/imp/agents_prefs.rs` (Settings → Agents),
+    the menu itself is data in `window/sidebar_model.rs`), `window/imp/closing.rs` (closing a
+    window waits for its agents' real exits with the window up, never by blocking at quit; past
+    150 ms it shows the closing screen, drawn by `window/imp/pack_animation.rs`),
+    `window/imp/agents_prefs.rs` (Settings → Agents),
     `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
     diff panel's widgets), `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).

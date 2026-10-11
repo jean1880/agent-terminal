@@ -50,13 +50,19 @@ impl AgentTerminalWindow {
     /// window. `false` if this window does not hold that tab.
     pub fn show_tab(&self, key: u64) -> bool {
         use gtk4::subclass::prelude::ObjectSubclassIsExt;
-        self.imp().show_tab(key)
+        !self.is_closing() && self.imp().show_tab(key)
     }
 
     /// Hands the tab with `key` off to the profile named `target`. `false` if
     /// this window does not hold that tab.
     pub fn continue_tab_in(&self, key: u64, target: &str) -> bool {
         use gtk4::subclass::prelude::ObjectSubclassIsExt;
-        self.imp().continue_tab_in(key, target)
+        !self.is_closing() && self.imp().continue_tab_in(key, target)
+    }
+
+    /// The window is waiting for its agents to exit before it goes: it takes no new work.
+    pub fn is_closing(&self) -> bool {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().is_closing()
     }
 }
