@@ -5510,9 +5510,7 @@ impl AgentTerminalWindow {
                     obj,
                     move |_| obj.imp().remove_worktree(info.clone())
                 ));
-                if let Some(overlay) = obj.imp().toast_overlay.borrow().as_ref() {
-                    overlay.add_toast(toast);
-                }
+                obj.imp().add_toast(toast);
             }
         ));
     }
@@ -5662,9 +5660,7 @@ impl AgentTerminalWindow {
                                 "how they were before the undo"
                             )
                         ));
-                        if let Some(overlay) = imp.toast_overlay.borrow().as_ref() {
-                            overlay.add_toast(toast);
-                        }
+                        imp.add_toast(toast);
                     }
                     Ok(done) => {
                         warn!(
@@ -5701,9 +5697,7 @@ impl AgentTerminalWindow {
 
     /// A short confirmation over the tab view. The text is data, not markup.
     fn show_toast(&self, text: &str) {
-        if let Some(overlay) = self.toast_overlay.borrow().as_ref() {
-            overlay.add_toast(adw::Toast::builder().title(text).use_markup(false).build());
-        }
+        self.add_toast(adw::Toast::builder().title(text).use_markup(false).build());
     }
 
     /// One quota check across all tabs.
@@ -6248,6 +6242,7 @@ mod tests {
         // Here rather than in a test of its own: GTK belongs to the one
         // thread that initialised it, and tests run on several.
         agents_prefs::tests::invalid_agent_drafts_are_not_saved(window.imp());
+        agents_prefs::tests::pages_have_renderable_titles(window.imp());
         diff_panel_shows_each_outcome();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();

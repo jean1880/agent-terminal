@@ -83,11 +83,15 @@ impl AgentTerminalWindow {
             nav,
             move |_| nav.push_by_tag(AGENTS_TAG)
         ));
-        status.set_child(Some(&start));
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&status));
+        // In a bar of its own, like "Done" on the next page: always on screen and clear of the
+        // dialog's edge, not scrolled out of a short dialog with the page.
+        start.set_margin_top(12);
+        start.set_margin_bottom(12);
+        toolbar.add_bottom_bar(&start);
         adw::NavigationPage::builder()
             .title("Welcome")
             .child(&toolbar)
@@ -95,7 +99,7 @@ impl AgentTerminalWindow {
     }
 
     /// Each agent: whether it is installed and used, and who is signed in; then the default.
-    fn setup_agents_page(&self, dialog: &adw::Dialog) -> adw::NavigationPage {
+    pub(super) fn setup_agents_page(&self, dialog: &adw::Dialog) -> adw::NavigationPage {
         let page = adw::PreferencesPage::builder()
             .description(
                 "Agents found on this computer are switched on. Switch off any you do not use, \
@@ -121,7 +125,7 @@ impl AgentTerminalWindow {
         page.add(&threads);
 
         let approvals = adw::PreferencesGroup::builder()
-            .title("In-App Approvals & Pattern Matching")
+            .title("In-App Approvals &amp; Pattern Matching")
             .description(
                 "Agent Terminal can manage approvals directly within the app, automatically \
                  permitting commands and tools that match saved pattern rules (e.g. 'cargo test*') \
@@ -152,7 +156,7 @@ impl AgentTerminalWindow {
         approvals.add(&auto_approve_row);
 
         let confirm_row = adw::SwitchRow::builder()
-            .title("Confirm & Customise Patterns on Save")
+            .title("Confirm &amp; Customise Patterns on Save")
             .subtitle(
                 "Show a confirmation dialogue to loosen or tighten patterns when choosing 'Always allow'.",
             )
@@ -197,5 +201,65 @@ impl AgentTerminalWindow {
             .tag(AGENTS_TAG)
             .child(&toolbar)
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The walkthrough's "Get Started" lies fully inside the dialog, clear of its edge, in a
+    /// narrow window (the dialog becomes a bottom sheet) and a wide one (ui-audit: it sat on
+    /// the dialog's bottom edge).
+    #[test]
+    #[ignore = "native GTK layout; run alone in an isolated display"]
+    fn native_welcome_button_is_inside_the_dialog() {
+        gtk4::init().expect("GTK must be available for the native gate");
+        adw::init().expect("libadwaita init");
+        crate::icons::register();
+        crate::load_css();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.Welcome")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>)
+            .expect("registering a non-unique application");
+        let ctx = glib::MainContext::default();
+        for (width, height) in [(360, 640), (360, 480), (600, 420), (900, 800)] {
+            let window = super::super::super::AgentTerminalWindow::new(&app);
+            window.set_default_size(width, height);
+            window.present();
+            window.imp().show_setup();
+            let settle = || {
+                for _ in 0..50 {
+                    while ctx.iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            };
+            settle();
+            let start = crate::testutil::descendants(window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<Button>().ok())
+                .find(|b| b.label().as_deref() == Some("Get Started") && b.is_mapped())
+                .expect("the Get Started button is on screen");
+            let page = start
+                .ancestor(adw::NavigationView::static_type())
+                .expect("inside the walkthrough");
+            let bounds = start.compute_bounds(&page).expect("button bounds");
+            assert!(
+                bounds.x() >= 0.0 && bounds.x() + bounds.width() <= page.width() as f32,
+                "{width}px: button {bounds:?} sideways out of the dialog ({} wide)",
+                page.width()
+            );
+            assert!(
+                bounds.y() >= 0.0 && bounds.y() + bounds.height() + 8.0 <= page.height() as f32,
+                "{width}px: button {bounds:?} sits on the dialog's bottom edge ({} high)",
+                page.height()
+            );
+            window.destroy();
+            settle();
+        }
     }
 }

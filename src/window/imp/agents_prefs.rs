@@ -211,9 +211,6 @@ impl AgentTerminalWindow {
         {
             return;
         }
-        let Some(overlay) = self.toast_overlay.borrow().clone() else {
-            return;
-        };
         let name = MODES
             .iter()
             .find(|(m, _)| *m == mode)
@@ -240,7 +237,7 @@ impl AgentTerminalWindow {
                 ));
             }
         ));
-        overlay.add_toast(toast);
+        self.add_toast(toast);
     }
 
     fn agent_profile_now(&self, driver: Driver) -> Profile {
@@ -304,7 +301,7 @@ impl AgentTerminalWindow {
     /// The "In-App Approvals & Pattern Matching" preferences group.
     pub(super) fn permissions_group(&self) -> adw::PreferencesGroup {
         let group = adw::PreferencesGroup::builder()
-            .title("In-App Approvals & Pattern Matching")
+            .title("In-App Approvals &amp; Pattern Matching")
             .description(
                 "Agent Terminal manages approvals directly within the app, automatically permitting \
                  commands and tools matching wildcard rules (e.g. 'cargo test*') without interrupting your work.",
@@ -332,7 +329,7 @@ impl AgentTerminalWindow {
         group.add(&auto_approve_row);
 
         let confirm_row = adw::SwitchRow::builder()
-            .title("Confirm & Customise Patterns on Save")
+            .title("Confirm &amp; Customise Patterns on Save")
             .subtitle(
                 "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
             )
@@ -1571,6 +1568,52 @@ pub(super) mod tests {
             ));
             assert!(feedback.iter().all(|row| !row.is_visible()));
         }
+    }
+
+    /// Every row and group title under `root` is non-empty and, when Pango reads it as markup,
+    /// valid markup: a bare `&` makes the parse fail and the title renders blank (F20).
+    pub(crate) fn assert_titles_render(root: &impl IsA<gtk4::Widget>, what: &str) {
+        let mut stack = vec![root.clone().upcast::<gtk4::Widget>()];
+        let mut checked = 0;
+        while let Some(widget) = stack.pop() {
+            let titled = if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
+                Some((row.title().to_string(), row.uses_markup()))
+            } else {
+                widget
+                    .downcast_ref::<adw::PreferencesGroup>()
+                    .map(|g| (g.title().to_string(), true))
+            };
+            if let Some((title, markup)) = titled {
+                // EntryRows and some container rows are titled by their own child widgets.
+                if !title.is_empty() || widget.is::<adw::ActionRow>() {
+                    assert!(!title.is_empty(), "{what}: an untitled row");
+                    if markup {
+                        assert!(
+                            gtk4::pango::parse_markup(&title, '\0').is_ok(),
+                            "{what}: {title:?} is invalid Pango markup and would render blank"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                stack.push(widget);
+            }
+        }
+        assert!(checked > 0, "{what}: no titled rows found");
+    }
+
+    /// Called by the window smoke test on GTK's thread.
+    pub(crate) fn pages_have_renderable_titles(imp: &AgentTerminalWindow) {
+        let prefs = adw::PreferencesDialog::new();
+        imp.add_agents_page(&prefs);
+        let page = prefs.visible_page().expect("the Agents page");
+        assert_titles_render(&page, "Settings -> Agents");
+        let setup = adw::Dialog::new();
+        let page = imp.setup_agents_page(&setup);
+        assert_titles_render(&page, "setup walkthrough");
     }
 
     #[test]
