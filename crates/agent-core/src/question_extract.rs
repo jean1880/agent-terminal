@@ -211,7 +211,7 @@ fn ends_with_question(text: &str) -> bool {
 }
 
 /// The question's last sentence reads as a choice rather than a yes/no about something else.
-/// Returns whether the cue is a strong one ("which", "prefer", "or"): the question names
+/// Returns whether the cue is a strong one ("which", "prefer", "pick", "choose", "rather"; a bare "or" is not): the question names
 /// alternatives, which is what lets short imperative items ("Use A", "Use B") pass as choices.
 fn judge_question(question: &str) -> Result<bool, Skip> {
     let body = question.trim_end_matches(|c: char| !c.is_alphanumeric());
@@ -249,7 +249,7 @@ fn judge_question(question: &str) -> Result<bool, Skip> {
         .collect();
     let strong = words
         .iter()
-        .any(|w| matches!(*w, "which" | "prefer" | "or"));
+        .any(|w| matches!(*w, "which" | "prefer" | "pick" | "choose" | "rather"));
     if strong
         || PHRASES.iter().any(|p| sentence.contains(p))
         || words.iter().any(|w| WORDS.contains(w))
@@ -666,6 +666,10 @@ mod tests {
         (
             "numbered steps with different verbs and an either-or question",
             "Here is the fix.\n\n1. Install the package\n2. Open the settings page\n3. Restart it\n\nShall I do it or will you?",
+        ),
+        (
+            "bullet steps with a bare either-or question",
+            "Here's the fix:\n- Install the package\n- Restart it\n\nShall I do it, or will you?",
         ),
         (
             "braille blank in an item",
