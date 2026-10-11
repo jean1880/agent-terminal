@@ -206,8 +206,9 @@ struct Inner {
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
     last_enriched_step: Cell<Option<u64>>,
-    /// A new Codex thread id and its provider thread, not stored until a turn completes: Codex
-    /// writes no rollout before that, so a stored id could not be resumed (plan 2.5).
+    /// A new Codex thread id and its provider thread, not stored until a turn on it produces an
+    /// item or completes: Codex has no rollout before that, so a stored id could not be resumed
+    /// (plan 2.5).
     provisional_native: RefCell<Option<(ProviderThreadId, String)>>,
     /// How long a Claude permission request may wait for the user before it is denied (agy's
     /// socket has the same bound). Injectable for tests.
@@ -683,6 +684,11 @@ impl Inner {
                     }
                 }
             }
+            // The agent produced an item: Codex has recorded the turn, so the thread can be
+            // resumed even if this turn never completes (2.5).
+            Event::ItemStarted { kind, .. } if *kind != ItemKind::UserMessage => {
+                self.confirm_provisional_native();
+            }
             Event::ModelChanged { model } => {
                 self.set_model(model);
                 let accepted = self.pending_model.borrow().as_ref().is_some_and(|p| {
@@ -767,8 +773,8 @@ impl Inner {
         self.open.borrow_mut().model = Some(model.to_owned());
     }
 
-    /// Stores a provisional Codex thread id once a turn on it completed, if its provider thread
-    /// is still this thread's agent.
+    /// Stores a provisional Codex thread id once a turn on it produced an item or completed, if
+    /// its provider thread is still this thread's agent.
     fn confirm_provisional_native(&self) {
         let Some((pt, native)) = self.provisional_native.borrow_mut().take() else {
             return;
@@ -5091,6 +5097,50 @@ mod tests {
                 "another tool of the server asks"
             );
             assert_eq!(resolution(&seen, "e2"), None);
+        });
+    }
+
+    /// Plan 2.4 (review): Accept edits chosen while an Ask turn runs is deferred to the next turn,
+    /// so an edit that turn asks for is not answered by the app.
+    #[test]
+    fn codex_accept_edits_chosen_mid_turn_does_not_auto_accept_that_turn() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            let frames = w0_frames(
+                W0_CODEX_ACCEPT_EDITS,
+                tmp.path(),
+                &[
+                    "turn/started",
+                    "item/started",
+                    "item/fileChange/requestApproval",
+                ],
+            );
+            let approval_at = frames
+                .iter()
+                .position(|f| f.contains("item/fileChange/requestApproval"))
+                .expect("edit request");
+            feed(&session, &frames[0]); // the Ask turn starts
+            session.set_mode(Mode::AcceptEdits);
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::ModeChangeDeferred {
+                    requested: Mode::AcceptEdits,
+                    effective: Mode::Ask
+                }
+            )));
+            assert_eq!(session.inner.state.borrow().mode, Mode::Ask);
+            for f in &frames[1..=approval_at] {
+                feed(&session, f);
+            }
+            let edit = request_for(&seen, "file_change").expect("edit card");
+            pump_until(ctx, 1, || false);
+            assert_eq!(resolution(&seen, &edit), None, "the Ask turn's edit asks");
+            assert!(!stdin_log(tmp.path()).contains(r#""result":{"decision":"accept"}"#));
         });
     }
 

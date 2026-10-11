@@ -1529,7 +1529,11 @@ impl CodexAdapter {
                     && error.to_ascii_lowercase().contains("no rollout found") =>
             {
                 // The thread never completed a turn, so Codex kept nothing to resume. Start a
-                // new one; the app carries the thread's history into it (plan 2.5).
+                // new one; the app carries the thread's history into it (plan 2.5). The text is
+                // Codex 0.161's, seen live, not in W0: parity report F9
+                // (`docs/feature-parity-report.md`), where fail_startup surfaced it as
+                // "Could not switch to …: no rollout found for thread id …" and "Turn failed: no
+                // rollout found for thread id …". Any other resume error still fails startup.
                 if let Some(params) = self.resume_fallback.take() {
                     let line = self.request(Pending::ThreadStart, "thread/start", params);
                     self.write(line);
