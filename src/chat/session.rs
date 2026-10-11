@@ -3998,6 +3998,74 @@ mod tests {
         .expect("bind")
     }
 
+    /// W1b 1.11 (F22): an agy thread in Ask keeps Ask through a model switch and through a
+    /// compact-style same-agent restart onto a launch whose profile default is another mode.
+    /// No mode change is announced, and the restart never passes `--mode plan`.
+    #[test]
+    fn agy_model_switch_and_compact_keep_the_threads_mode() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            let dir = tmp.path().to_owned();
+            session.set_adapter_factory(Rc::new(move |_| {
+                // The profile's default mode (Plan) is what a fresh launch binds the hook to.
+                let profile_default = ApprovalHandle::bind(
+                    &dir.join("rt2"),
+                    "t2",
+                    &dir,
+                    Mode::Plan,
+                    Duration::from_secs(30),
+                )
+                .expect("bind");
+                Ok(AgentLaunch {
+                    adapter: Box::new(AgyAdapter::new("agy")),
+                    program: "/bin/sh".into(),
+                    extra_args: vec![dir.join("agent.sh").to_string_lossy().into_owned()],
+                    default_model: None,
+                    default_effort: None,
+                    env: LaunchEnv::default(),
+                    approval: Ok(profile_default),
+                })
+            }));
+            assert!(pump_until(ctx, 10, || session.status().alive));
+            assert_eq!(session.status().mode, Mode::Ask);
+            let modes = |seen: &Seen| {
+                seen.borrow()
+                    .iter()
+                    .filter(|e| matches!(e.event, Event::ModeChanged { .. }))
+                    .count()
+            };
+            let before = modes(&seen);
+
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
+            assert_eq!(session.status().mode, Mode::Ask, "model switch");
+            let argv = session.launch_spec().argv;
+            assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
+            assert!(
+                argv.iter().any(|a| a == "--dangerously-skip-permissions"),
+                "Ask with the hook is skip-permissions behind the hook: {argv:?}"
+            );
+
+            // Compact by handoff restarts the same agent on a fresh launch.
+            session.inner.create_with_handoff(Driver::Agy, None, None);
+            assert_eq!(session.status().mode, Mode::Ask, "compact");
+            let argv = session.launch_spec().argv;
+            assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
+            assert_eq!(modes(&seen), before, "no silent or announced mode change");
+        });
+    }
+
     fn hook_missing_error(seen: &Seen) -> bool {
         has(
             seen,

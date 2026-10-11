@@ -380,6 +380,9 @@ pub(super) struct NewThread {
     pub(super) title: Option<String>,
     /// A budgeted, fenced and redacted handoff, with where it came from, seeded into the session.
     pub(super) handoff: Option<(crate::chat::session::Handoff, String)>,
+    /// The mode to start in, when the thread carries one over from another (a continued thread
+    /// keeps its mode rather than adopting the profile default). `None`: the profile default.
+    pub(super) mode: Option<Mode>,
 }
 
 impl NewThread {
@@ -393,6 +396,7 @@ impl NewThread {
             effort: None,
             title: None,
             handoff: None,
+            mode: None,
         }
     }
 }
@@ -3646,6 +3650,7 @@ impl AgentTerminalWindow {
             effort,
             title,
             handoff,
+            mode,
             require_exact_dir,
         } = new;
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
@@ -3687,7 +3692,19 @@ impl AgentTerminalWindow {
                 driver_key(driver),
                 model.as_deref().unwrap_or("default"),
             )
-            .and_then(|pt| store.set_active_provider_thread(&thread, &pt))
+            .and_then(|pt| {
+                store.set_active_provider_thread(&thread, &pt)?;
+                // A carried-over mode is the user's choice for the new thread, so its session
+                // starts in it (as far as the agent can honour it) and not in the profile's.
+                if let Some(mode) = mode {
+                    store.append_event(
+                        &thread,
+                        Some(pt.as_str()),
+                        &Envelope::new(Event::ModeChosen { mode }),
+                    )?;
+                }
+                Ok(())
+            })
         {
             warn!("Cannot record the thread's agent: {e}");
         }
