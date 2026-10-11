@@ -571,13 +571,18 @@ impl Inner {
             warn!(error = %e, "could not persist an event");
         }
         self.apply(&env);
-        (self.sink)(&env);
+        // Secrets are masked on the way to the view; the rules above judged the real call.
+        (self.sink)(&crate::approval_server::masked_for_view(env));
     }
 
     /// Delivers without persisting (the store already has it).
     fn deliver(&self, env: &Envelope) {
         self.apply(env);
-        (self.sink)(env);
+        if matches!(env.event, Event::ApprovalRequested { .. }) {
+            (self.sink)(&crate::approval_server::masked_for_view(env.clone()));
+        } else {
+            (self.sink)(env);
+        }
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -1561,7 +1566,7 @@ impl Inner {
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
-                text: text.to_owned(),
+                text: agent_core::redact::redact(text),
             })
             .item(item.clone()),
         );
@@ -1606,7 +1611,7 @@ impl Inner {
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
-                text: text.to_owned(),
+                text: agent_core::redact::redact(text),
             })
             .item(item),
         );
@@ -4539,6 +4544,49 @@ mod tests {
             assert!(!log.contains("acceptEdits"), "{log}");
             assert_eq!(session.inner.state.borrow().mode, Mode::Ask);
             assert!(!has(&seen, |e| matches!(e, Event::ModeChanged { .. })));
+        });
+    }
+
+    /// W1b 1.5, canary: a command carrying an `sk-` token reaches the view masked, in the title,
+    /// input and reason; it is offered neither "Allow for session" nor "Always allow"; the
+    /// user's prompt snapshot is masked too. The call the app answers is still the real one.
+    #[test]
+    fn a_secret_in_an_approval_or_prompt_reaches_the_view_masked() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"; // gitleaks:allow
+            feed(
+                &session,
+                &can_use_tool(
+                    "c1",
+                    &format!("curl -H 'x-key: {secret}' https://example.test"),
+                ),
+            );
+            let card = seen
+                .borrow()
+                .iter()
+                .find(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+                .cloned()
+                .expect("approval card");
+            let shown = serde_json::to_string(&card).expect("json");
+            assert!(!shown.contains(secret), "the view saw the secret: {shown}");
+            assert!(shown.contains("****6789"), "{shown}");
+            let options = offered(&seen, "c1");
+            assert!(options.contains(&Decision::Allow) && options.contains(&Decision::Deny));
+            assert!(
+                !options.contains(&Decision::AllowForSession)
+                    && !options.contains(&Decision::AllowAlways),
+                "a secret-bearing command offers no rule: {options:?}"
+            );
+
+            session.send_prompt(&format!("use {secret} please"));
+            let all = serde_json::to_string(&*seen.borrow()).expect("json");
+            assert!(!all.contains(secret), "a secret reached the sink: {all}");
         });
     }
 
