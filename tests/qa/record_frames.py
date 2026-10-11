@@ -20,7 +20,11 @@ the run ends after the last turn. Run it ONLY inside a throwaway sandbox repo.
 
 Approval requests are answered from --decision, consumed in order (the last one
 repeats). Codex decisions are sent verbatim ("accept", "decline", "cancel",
-"acceptForSession", or a JSON object). Claude decisions are allow | deny.
+"acceptForSession", or a JSON object). A Codex MCP form (`mcpServer/elicitation/request`,
+which is also how Codex asks to approve an MCP tool call) takes the next decision as its
+action: "accept" (sent with empty content), "decline" or "cancel"; any other decision is
+sent as "decline". Claude decisions are
+allow | deny.
 
 Example (Codex, Ask mode, decline the first approval):
   python3 tests/qa/record_frames.py codex --cwd /tmp/w0-sandbox \
@@ -306,6 +310,14 @@ def run_codex(args, decisions):
             if "id" in frame and method:
                 if method.endswith("requestApproval"):
                     s.send({"id": frame["id"], "result": {"decision": decisions.next("decline")}})
+                elif method == "mcpServer/elicitation/request":
+                    action = decisions.next("decline")
+                    if action not in ("accept", "decline", "cancel"):
+                        action = "decline"  # a form takes no decision object or session scope
+                    result = {"action": action}
+                    if action == "accept":
+                        result["content"] = {}
+                    s.send({"id": frame["id"], "result": result})
                 else:
                     s.send({"id": frame["id"], "error": {
                         "code": -32601, "message": "recorder does not answer " + method}})

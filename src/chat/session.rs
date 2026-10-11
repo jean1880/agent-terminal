@@ -1382,6 +1382,10 @@ impl Inner {
         let (known, kind) = match tool {
             "command_execution" => (COMMAND, "command"),
             "file_change" => (FILE, "fileChange"),
+            // An MCP tool-call approval carries the call's own arguments, which an MCP rule does
+            // not judge (it names the tool, whatever its arguments). The adapter names `mcp__`
+            // tools only for a request it tied to one open call (`on_mcp_tool_approval`).
+            t if t.starts_with("mcp__") => return true,
             _ => return false,
         };
         let Some(fields) = input.as_object() else {
@@ -6317,6 +6321,73 @@ mod tests {
             let (again, _, _) = card(&seen, "item-b");
             assert!(pump_until(ctx, 10, || resolution(&seen, &again).is_some()));
             assert_eq!(resolution(&seen, &again), Some(Decision::Allow));
+        });
+    }
+
+    /// Codex asks to approve an MCP tool call as a fieldless form. It is an approval card like
+    /// Claude's MCP calls: "Allow for session" keeps a rule that answers the next call of that
+    /// tool, and a request the adapter could not tie to one call is never answered by it.
+    #[test]
+    fn a_codex_mcp_session_rule_answers_the_next_call_of_that_tool() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let started = |item: &str| {
+                serde_json::json!({"method": "item/started", "params": {"threadId": "th",
+                    "turnId": "tu", "item": {"type": "mcpToolCall", "id": item,
+                    "server": "ollama", "tool": "ollama_ps", "status": "inProgress",
+                    "arguments": {}}}})
+                .to_string()
+            };
+            let ask = |id: u64| {
+                serde_json::json!({"id": id, "method": "mcpServer/elicitation/request",
+                    "params": {"threadId": "th", "turnId": "tu", "serverName": "ollama",
+                    "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call"},
+                    "message": "Allow the ollama MCP server to run tool \"ollama_ps\"?",
+                    "requestedSchema": {"type": "object", "properties": {}}}})
+                .to_string()
+            };
+            let card = |seen: &Seen, n: usize| {
+                seen.borrow()
+                    .iter()
+                    .filter_map(|e| match &e.event {
+                        Event::ApprovalRequested { tool, .. } => {
+                            Some((e.request.clone().expect("request"), tool.clone()))
+                        }
+                        _ => None,
+                    })
+                    .nth(n)
+                    .expect("card")
+            };
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            feed(&session, &started("c1"));
+            feed(&session, &ask(0));
+            let (first, tool) = card(&seen, 0);
+            assert_eq!(tool, "mcp__ollama__ollama_ps");
+            assert!(!seen
+                .borrow()
+                .iter()
+                .any(|e| matches!(e.event, Event::FormRequested { .. })));
+            assert!(offered(&seen, &first).contains(&Decision::AllowForSession));
+            assert_eq!(resolution(&seen, &first), None, "no rule yet: it asks");
+            session.respond_approval(&first, Decision::AllowForSession);
+            assert_eq!(resolution(&seen, &first), Some(Decision::AllowForSession));
+
+            feed(&session, &started("c2"));
+            feed(&session, &ask(1));
+            let (second, _) = card(&seen, 1);
+            assert!(pump_until(ctx, 10, || resolution(&seen, &second).is_some()));
+            assert_eq!(resolution(&seen, &second), Some(Decision::Allow));
+
+            // A second request for the same call names no tool, so the rule cannot answer it.
+            feed(&session, &ask(2));
+            let (third, tool) = card(&seen, 2);
+            assert_eq!(tool, agent_core::codex::MCP_UNRESOLVED_TOOL);
+            assert!(!pump_until(ctx, 1, || resolution(&seen, &third).is_some()));
+            assert!(!offered(&seen, &third).contains(&Decision::AllowForSession));
         });
     }
 

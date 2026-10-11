@@ -111,8 +111,22 @@
 //! tied to any turn: a turn ending does not expire it, and answering it never interrupts one.
 //! An open form expires (resolved as [`crate::form::FormAction::Cancel`], nothing sent) when the
 //! server resolves it elsewhere, its turn ends, its worker closes or the process exits. The
-//! session emits `FormResolved` for an answer the adapter accepted; the adapter never does.
-//! - stderr (Codex's tracing output) is ignored.
+//! session emits `FormResolved` for an answer the adapter accepted; the adapter never does. An
+//! MCP tool-call approval is the one form that is not shown as a form (next section).
+//!
+//! # MCP tool-call approvals
+//!
+//! Codex asks to approve an MCP tool call as an MCP form of its own: no fields,
+//! `_meta.codex_approval_kind: "mcp_tool_call"` (`tests/fixtures/real/codex/
+//! mcp-tool-approval-accept.jsonl`). It is mapped to an [`Event::ApprovalRequested`] with tool
+//! `mcp__<server>__<tool>`, the name Claude's calls carry, so the app's rules answer it the same
+//! way. The form names no item; the `mcpToolCall` item Codex starts just before it does
+//! ([`CodexAdapter::on_mcp_tool_approval`]). Allow, Allow for session and Always allow send
+//! `{"action": "accept", "content": {}}` (never `_meta.persist`: those scopes are the app's,
+//! plan D1); Deny sends `decline` (Codex tells the model the user rejected the call); Stop turn
+//! sends `cancel` and interrupts the turn. It expires like any approval.
+//!
+//! stderr (Codex's tracing output) is ignored.
 
 mod elicitation;
 mod permissions;
@@ -213,6 +227,19 @@ struct PendingApproval {
     /// A permission request: the grant an Allow sends (rebuilt from the typed entries the card
     /// showed). `None` for command and patch approvals, which answer with a decision.
     grant: Option<Value>,
+    /// An MCP tool-call approval, which Codex asks as a form: answered with an elicitation
+    /// `action`, not a decision.
+    form: bool,
+}
+
+/// An open `mcpToolCall` item: Codex starts it before it asks to approve the call, and the
+/// approval form names no item, so the card and the app's rules take the tool from here.
+#[derive(Debug, Clone)]
+struct McpCall {
+    thread: Option<String>,
+    server: String,
+    tool: String,
+    arguments: Value,
 }
 
 /// An unanswered MCP form (`mcpServer/elicitation/request`).
@@ -298,6 +325,8 @@ pub struct CodexAdapter {
     /// The `changes` of each open `fileChange` item: its approval request carries no path or
     /// diff (W0), so the card and the app's rules take them from here.
     file_changes: HashMap<String, Value>,
+    /// Each open `mcpToolCall` item, by item id.
+    mcp_calls: HashMap<String, McpCall>,
     /// While a `thread/resume` is unanswered: the `thread/start` params to fall back on when it
     /// finds no rollout (a thread that never completed a turn has none).
     resume_fallback: Option<Value>,
@@ -360,6 +389,7 @@ impl CodexAdapter {
             texts: HashMap::new(),
             reasoning: HashMap::new(),
             file_changes: HashMap::new(),
+            mcp_calls: HashMap::new(),
             resume_fallback: None,
             workers: BTreeMap::new(),
             worker_turns: HashMap::new(),
@@ -797,6 +827,7 @@ impl CodexAdapter {
         for id in std::mem::take(&mut self.open_items) {
             // An item cut short never completes: its patch must not outlive it.
             self.file_changes.remove(&id);
+            self.mcp_calls.remove(&id);
             for (stream, text) in [
                 (StreamKind::Assistant, self.texts.remove(&id)),
                 (StreamKind::Reasoning, self.reasoning.remove(&id)),
@@ -835,6 +866,19 @@ impl CodexAdapter {
                 self.file_changes.insert(id.to_owned(), changes);
             }
         }
+        if s(item, "type") == Some("mcpToolCall") {
+            if let (Some(server), Some(tool)) = (s(item, "server"), s(item, "tool")) {
+                self.mcp_calls.insert(
+                    id.to_owned(),
+                    McpCall {
+                        thread: s(params, "threadId").map(str::to_owned),
+                        server: server.to_owned(),
+                        tool: tool.to_owned(),
+                        arguments: item.get("arguments").cloned().unwrap_or(Value::Null),
+                    },
+                );
+            }
+        }
         self.start_item(out, id, kind, title, input);
     }
 
@@ -860,6 +904,7 @@ impl CodexAdapter {
         }
         self.track_collaboration(item, true, out);
         self.file_changes.remove(id);
+        self.mcp_calls.remove(id);
         let (kind, title, input) = item_info(item);
         if matches!(kind, ItemKind::WebSearch | ItemKind::FileChange)
             && self.open_items.iter().any(|open| open == id)
@@ -1625,6 +1670,7 @@ impl CodexAdapter {
                 scope: self.request_scope(params),
                 options: options.clone(),
                 grant: None,
+                form: false,
             },
         );
         out.push(
@@ -1675,6 +1721,7 @@ impl CodexAdapter {
                 scope: self.request_scope(params),
                 options: options.clone(),
                 grant: Some(parsed.grant),
+                form: false,
             },
         );
         out.push(
@@ -1727,8 +1774,15 @@ impl CodexAdapter {
                 id
             ])
         );
-        if self.settled_requests.contains_key(&key) || self.forms.contains_key(&key) {
+        if self.settled_requests.contains_key(&key)
+            || self.forms.contains_key(&key)
+            || self.approvals.contains_key(&key)
+        {
             return; // answered, declined or already shown
+        }
+        if is_mcp_tool_approval(params) {
+            self.on_mcp_tool_approval(id, params, key, scope, out);
+            return;
         }
         let server = elicitation::server_name(params);
         match elicitation::parse(params, order) {
@@ -1764,6 +1818,80 @@ impl CodexAdapter {
                 out.push(Envelope::new(Event::Notice { text }));
             }
         }
+    }
+
+    /// An MCP tool-call approval (see [`is_mcp_tool_approval`]): an approval card, like a
+    /// command's, so the app's rules can answer it. The tool comes from the one open
+    /// `mcpToolCall` item of that thread and server whose tool the message names in Codex's own
+    /// words. With none or several, or a second request for the same item, the card carries
+    /// [`MCP_UNRESOLVED_TOOL`], which no rule matches.
+    ///
+    /// Codex asks once per call, before the server runs it, but a tool server can send a form
+    /// with the same `_meta` while its call runs. A call names the tool of one approval only, so
+    /// a later one is shown unresolved. One a server sends in Codex's exact words during a call
+    /// Codex did not ask about (its approval mode or annotations let it run) is still named, and
+    /// a rule for that tool accepts it: an empty accept, to a server the rule already lets run.
+    fn on_mcp_tool_approval(
+        &mut self,
+        id: &Value,
+        params: &Value,
+        key: String,
+        scope: RequestScope,
+        out: &mut Vec<Envelope>,
+    ) {
+        let server = s(params, "serverName").unwrap_or_default();
+        let message = s(params, "message").unwrap_or_default();
+        let mut calls = self.mcp_calls.iter().filter(|(_, call)| {
+            call.server == server
+                && call.thread.as_deref() == scope.thread.as_deref()
+                && message == mcp_approval_question(&call.server, &call.tool)
+        });
+        let item = match (calls.next(), calls.next()) {
+            (Some((item, _)), None) => Some(item.clone()),
+            _ => None,
+        };
+        let call = item.and_then(|item| self.mcp_calls.remove(&item).map(|call| (item, call)));
+        // A rule names `mcp__<server>__<tool>` and splits at the first `__` after the prefix.
+        let (item, tool, input) = match call {
+            Some((item, call)) if !call.server.is_empty() && !call.server.contains("__") => (
+                item,
+                format!("mcp__{}__{}", call.server, call.tool),
+                call.arguments,
+            ),
+            other => (
+                other.map(|(item, _)| item).unwrap_or_default(),
+                MCP_UNRESOLVED_TOOL.to_owned(),
+                params
+                    .pointer("/_meta/tool_params")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        };
+        let options = ALL_DECISIONS.to_vec();
+        self.approvals.insert(
+            key.clone(),
+            PendingApproval {
+                rpc_id: id.clone(),
+                item: item.clone(),
+                scope,
+                options: options.clone(),
+                grant: None,
+                form: true,
+            },
+        );
+        out.push(
+            Envelope::new(Event::ApprovalRequested {
+                tool,
+                title: s(params, "message").map(|m| clip(&permissions::visible(m), MCP_TITLE_MAX)),
+                input,
+                reason: None,
+                options,
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .item(item)
+            .request(key),
+        );
     }
 
     /// `turn/interrupt` for the active turn, when `scope` is that turn; `None` otherwise (a
@@ -2039,6 +2167,7 @@ impl Adapter for CodexAdapter {
         self.texts.clear();
         self.reasoning.clear();
         self.file_changes.clear();
+        self.mcp_calls.clear();
         self.resume_fallback = None;
         // Reconnecting the same thread forgets live certainty, not its worker history. A newly
         // constructed adapter knows only workers observed on this connection; replaying UI
@@ -2201,6 +2330,22 @@ impl Adapter for CodexAdapter {
                     )));
                 };
                 self.remember_settled_request(request, approval.scope.clone());
+                if approval.form {
+                    // `persist` is never sent: session and always scope are the app's (D1).
+                    let result = match decision {
+                        Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => {
+                            json!({"action": "accept", "content": {}})
+                        }
+                        Decision::Deny => json!({"action": "decline"}),
+                        Decision::Cancel => json!({"action": "cancel"}),
+                    };
+                    let mut lines =
+                        vec![json!({"id": approval.rpc_id, "result": result}).to_string()];
+                    if decision == Decision::Cancel {
+                        lines.extend(self.interrupt_scope(&approval.scope));
+                    }
+                    return Ok(vec![Action::Write(lines)]);
+                }
                 let Some(grant) = rewritten.or(approval.grant) else {
                     let line = json!({
                         "id": approval.rpc_id,
@@ -2455,6 +2600,36 @@ impl Adapter for CodexAdapter {
 /// The approval tool name of a Codex permission request. The session keeps no rule for it and
 /// never answers it on its own.
 pub const PERMISSIONS_TOOL: &str = "codex_permissions";
+
+/// The approval tool name of an MCP tool-call approval whose tool could not be told apart: the
+/// card is shown, and no rule matches it.
+pub const MCP_UNRESOLVED_TOOL: &str = "codex_mcp_tool_call";
+
+/// Codex's question for a tool server's call (codex-rs `build_mcp_tool_approval_fallback_message`).
+/// A connector or a message template words it otherwise; such a request is shown unresolved.
+fn mcp_approval_question(server: &str, tool: &str) -> String {
+    format!("Allow the {server} MCP server to run tool \"{tool}\"?")
+}
+
+/// An MCP tool-call approval's title (Codex's question) is cut to this many characters.
+const MCP_TITLE_MAX: usize = 300;
+
+/// Codex asks to approve an MCP tool call with an `mcpServer/elicitation/request` of its own
+/// (codex-rs `mcp_tool_call.rs`, `build_mcp_tool_approval_elicitation_request`): a form with
+/// no fields whose `_meta.codex_approval_kind` is `mcp_tool_call`. One with fields stays a form.
+/// Codex does not strip that key from a form a tool server sends itself (`codex-mcp`
+/// `elicitation.rs`); see [`CodexAdapter::on_mcp_tool_approval`] for how that is contained.
+fn is_mcp_tool_approval(params: &Value) -> bool {
+    s(params, "mode") == Some("form")
+        && params
+            .pointer("/_meta/codex_approval_kind")
+            .and_then(Value::as_str)
+            == Some("mcp_tool_call")
+        && params
+            .pointer("/requestedSchema/properties")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+}
 
 /// The notice for a link a tool server asked the user to open that is not offered: the server,
 /// why, the link as inert text (anything but printable ASCII escaped, at most 300 characters),
@@ -6208,5 +6383,201 @@ mod tests {
             Some(true),
             "the pending turn was sent workspaceWrite"
         );
+    }
+
+    // ---- MCP tool-call approvals ----
+
+    const MCP_APPROVAL: &str =
+        include_str!("../../../tests/fixtures/real/codex/mcp-tool-approval-accept.jsonl");
+
+    /// A frame of the recorded run, on this test's thread and turn.
+    fn mcp_fixture_frame(method: &str, kind: Option<&str>) -> String {
+        MCP_APPROVAL
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|rec| {
+                rec["frame"]["method"] == method
+                    && kind.is_none_or(|k| rec["frame"]["params"]["item"]["type"] == k)
+            })
+            .expect("recorded frame")["frame"]
+            .to_string()
+            .replace("01a12bc8-a5ec-7133-8050-de4203b15e38", "th-1")
+            .replace("01a12bc8-a7ca-7f82-965c-8f794a2d49a9", "tu-1")
+    }
+
+    fn mcp_call_started(item: &str, server: &str, tool: &str) -> String {
+        json!({"method": "item/started", "params": {"threadId": "th-1", "turnId": "tu-1",
+            "item": {"type": "mcpToolCall", "id": item, "server": server, "tool": tool,
+                     "status": "inProgress", "arguments": {"q": item}}}})
+        .to_string()
+    }
+
+    fn mcp_approval_frame(id: u64, server: &str) -> String {
+        json!({"id": id, "method": "mcpServer/elicitation/request", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "serverName": server, "mode": "form",
+            "_meta": {"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"],
+                      "tool_params": {"from": "meta"}},
+            "message": format!("Allow the {server} MCP server to run tool \"t\"?"),
+            "requestedSchema": {"type": "object", "properties": {}}}})
+        .to_string()
+    }
+
+    fn approval_card(events: &[Envelope]) -> (String, String, String, Value) {
+        let e = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+            .unwrap_or_else(|| panic!("expected an approval card, got {events:?}"));
+        let Event::ApprovalRequested { tool, input, .. } = &e.event else {
+            unreachable!()
+        };
+        (
+            e.request.clone().expect("request"),
+            e.item.clone().unwrap_or_default(),
+            tool.clone(),
+            input.clone(),
+        )
+    }
+
+    /// The recorded run: the item starts, then Codex asks with a fieldless form. It is an
+    /// approval card named like Claude's MCP calls, never a form, and Allow (whatever its
+    /// scope) answers exactly what the recorded run sent.
+    #[test]
+    fn a_recorded_mcp_tool_approval_is_an_approval_card_for_the_call() {
+        for decision in [
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+        ] {
+            let mut a = in_turn();
+            a.feed(&mcp_fixture_frame("item/started", Some("mcpToolCall")));
+            let ev = a.feed(&mcp_fixture_frame("mcpServer/elicitation/request", None));
+            assert!(!ev
+                .iter()
+                .any(|e| matches!(e.event, Event::FormRequested { .. })));
+            let (request, item, tool, input) = approval_card(&ev);
+            assert_eq!(tool, "mcp__ollama__ollama_ps");
+            assert_eq!(item, "exec-5ab2070a-a435-4dd8-8b94-5fa3b20ebd21");
+            assert_eq!(input, json!({}));
+            assert!(
+                matches!(&ev[0].event, Event::ApprovalRequested { options, title, .. }
+                if *options == ALL_DECISIONS.to_vec()
+                    && title.as_deref() == Some("Allow the ollama MCP server to run tool \"ollama_ps\"?"))
+            );
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("allow"));
+            assert_eq!(
+                w,
+                json!({"id": 0, "result": {"action": "accept", "content": {}}})
+            );
+            assert!(
+                a.encode(approve_cmd(&request, Decision::Deny)).is_err(),
+                "answered once"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_declines_and_stop_turn_cancels_and_interrupts() {
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(3, "s")));
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Deny))
+                .expect("deny"),
+        );
+        assert_eq!(w, json!({"id": 3, "result": {"action": "decline"}}));
+
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(4, "s")));
+        let w = writes(
+            &a.encode(approve_cmd(&request, Decision::Cancel))
+                .expect("cancel"),
+        );
+        assert_eq!(w[0], json!({"id": 4, "result": {"action": "cancel"}}));
+        assert_eq!(w[1]["method"], "turn/interrupt");
+    }
+
+    /// The tool is named only from the one open call of that server whose tool the message
+    /// names in Codex's words: none, several, another tool, other words, a server name a rule
+    /// could not split, or a second request for the same call leave it unresolved, shown with
+    /// the form's own parameters and matched by no rule.
+    #[test]
+    fn an_mcp_tool_approval_names_its_tool_only_when_one_call_is_certain() {
+        let unresolved = |a: &mut CodexAdapter, frame: &str| {
+            let (_, _, tool, input) = approval_card(&a.feed(frame));
+            assert_eq!(tool, MCP_UNRESOLVED_TOOL, "{frame}");
+            assert_eq!(input, json!({"from": "meta"}));
+        };
+        let mut a = in_turn();
+        unresolved(&mut a, &mcp_approval_frame(1, "s"));
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        a.feed(&mcp_call_started("c2", "s", "t"));
+        unresolved(&mut a, &mcp_approval_frame(2, "s"));
+        a.feed(&mcp_call_started("c3", "a__b", "t"));
+        unresolved(&mut a, &mcp_approval_frame(3, "a__b"));
+
+        // The one open call is of another tool, or the words are not Codex's.
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "u"));
+        unresolved(&mut a, &mcp_approval_frame(1, "s"));
+        a.feed(&mcp_call_started("c2", "s2", "t"));
+        let reworded = mcp_approval_frame(2, "s2").replace("Allow the", "Let the");
+        unresolved(&mut a, &reworded);
+        // Neither consumed its call: Codex's own request still names it.
+        let (_, item, tool, _) = approval_card(&a.feed(&mcp_approval_frame(3, "s2")));
+        assert_eq!((item.as_str(), tool.as_str()), ("c2", "mcp__s2__t"));
+
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        a.feed(&mcp_call_started("c2", "other", "t"));
+        let (_, item, tool, input) = approval_card(&a.feed(&mcp_approval_frame(1, "s")));
+        assert_eq!((item.as_str(), tool.as_str()), ("c1", "mcp__s__t"));
+        assert_eq!(input, json!({"q": "c1"}));
+        unresolved(&mut a, &mcp_approval_frame(2, "s"));
+
+        // A completed call names nothing.
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        a.feed(r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu-1","item":{"type":"mcpToolCall","id":"c1","server":"s","tool":"t","status":"completed"}}}"#);
+        unresolved(&mut a, &mcp_approval_frame(1, "s"));
+    }
+
+    #[test]
+    fn other_codex_forms_stay_forms() {
+        let mut a = in_turn();
+        let mut frame: Value = serde_json::from_str(&mcp_approval_frame(1, "s")).expect("frame");
+        frame["params"]["requestedSchema"]["properties"] = json!({"why": {"type": "string"}});
+        let ev = a.feed(&frame.to_string());
+        assert!(matches!(ev[0].event, Event::FormRequested { .. }), "{ev:?}");
+        frame["id"] = json!(2);
+        frame["params"]["requestedSchema"]["properties"] = json!({});
+        frame["params"]["_meta"]["codex_approval_kind"] = json!("browser_auth");
+        let ev = a.feed(&frame.to_string());
+        assert!(matches!(ev[0].event, Event::FormRequested { .. }), "{ev:?}");
+    }
+
+    #[test]
+    fn an_mcp_tool_approval_expires_like_any_approval() {
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(7, "s")));
+        assert!(
+            a.feed(&mcp_approval_frame(7, "s")).is_empty(),
+            "a retransmission is not a second card"
+        );
+        let out = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":7}}"#,
+        );
+        assert!(out
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_deref() == Some(&request)));
+        assert!(a.encode(approve_cmd(&request, Decision::Allow)).is_err());
+
+        let mut a = in_turn();
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(8, "s")));
+        let out = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#);
+        assert!(out
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_deref() == Some(&request)));
     }
 }
