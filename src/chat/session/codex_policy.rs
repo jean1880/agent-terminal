@@ -234,6 +234,34 @@ const RENAME_NOTE: &str =
 /// Said when a granted file has hard links.
 const LINKED_NOTE: &str = "This file has other names elsewhere on disk.";
 
+/// Where the card's own write entries would let Codex write, judged before any target (Codex
+/// peer check): a literal path or the project covers itself (as written and as resolved), a
+/// write glob covers the folder it starts from, a special place covers its folder. A special
+/// place with no known folder covers everything (`true`).
+fn card_writes(entries: &[Value]) -> (Vec<PathBuf>, bool) {
+    let mut covered = Vec::new();
+    for entry in entries {
+        if entry.get("access").and_then(Value::as_str) != Some("write") {
+            continue;
+        }
+        let target = &entry["target"];
+        let place = match target.get("kind").and_then(Value::as_str) {
+            Some("glob") => Some(glob_base(target["pattern"].as_str().unwrap_or("/"))),
+            Some("path" | "special") => target
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+            _ => None,
+        };
+        let Some(place) = place else {
+            return (covered, true);
+        };
+        covered.extend(real(&place));
+        covered.push(place);
+    }
+    (covered, false)
+}
+
 /// [`judge_check`] for a thread in Ask mode with no earlier session grants.
 #[cfg(test)]
 pub(super) fn judge(input: &Value, workspace: &Path, homes: &ChildHomes) -> Verdict {
@@ -275,6 +303,7 @@ pub(super) fn judge_check(check: &Check) -> Verdict {
     if workspace_real.is_none() {
         f.scope("the thread's folder could not be checked");
     }
+    let (covered, covers_all) = card_writes(entries);
     let mut v = Verdict::default();
     for entry in entries {
         v.resolved.push(None);
@@ -384,8 +413,11 @@ pub(super) fn judge_check(check: &Check) -> Verdict {
         let parent_in_project = workspace_real
             .as_ref()
             .is_some_and(|w| parent.starts_with(w));
+        // That includes what this same card would let Codex write.
         if (check.project_writable && parent_in_project)
             || check.granted.iter().any(|g| parent.starts_with(g))
+            || covers_all
+            || covered.iter().any(|c| parent.starts_with(c))
         {
             f.renameable = true;
         }
@@ -817,5 +849,68 @@ mod tests {
         std::fs::create_dir_all(build.join("sub")).expect("sub");
         assert_eq!(judge(&card, &project, &homes(&home)), before);
         assert!(matches!(before.marks[0], Some((_, _, 0))));
+    }
+
+    /// Codex peer check: a write on the same card lets Codex replace the names below it, so
+    /// those names are turn-only even in Ask mode with no earlier grant.
+    #[test]
+    fn a_write_on_the_same_card_makes_the_names_below_it_turn_only() {
+        let (_dir, home, project) = tree();
+        let h = homes(&home);
+        let sub = project.join("src");
+        let file = sub.join("main.rs");
+        std::fs::write(&file, "x").expect("file");
+        let entry = |access: &str, target: Value| json!({"access": access, "target": target});
+        // The folder alone is judged as before.
+        assert!(judge(&one("write", path(&sub)), &project, &h).session_allowed);
+        for (entries, why) in [
+            (
+                json!([entry("write", path(&sub)), entry("read", path(&file))]),
+                "a write of the folder holding a read name",
+            ),
+            (
+                json!([entry("write", path(&sub)), entry("write", path(&file))]),
+                "a write of the folder holding a written name",
+            ),
+            (
+                json!([
+                    entry(
+                        "write",
+                        json!({"kind": "glob", "pattern": format!("{}/**", project.display())})
+                    ),
+                    entry("read", path(&file)),
+                ]),
+                "a write glob above the name",
+            ),
+            (
+                json!([
+                    entry(
+                        "write",
+                        json!({"kind": "special", "name": "temp", "path": null})
+                    ),
+                    entry("read", path(&file)),
+                ]),
+                "a write to a place with no known folder",
+            ),
+        ] {
+            let v = judge(&card(entries), &project, &h);
+            assert!(!v.session_allowed, "{why}");
+            assert!(
+                v.warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains(RENAME_NOTE)),
+                "{why}: {v:?}"
+            );
+        }
+        // A read of the folder does not cover the names below it.
+        let v = judge(
+            &card(json!([
+                entry("read", path(&sub)),
+                entry("read", path(&file))
+            ])),
+            &project,
+            &h,
+        );
+        assert!(v.session_allowed, "{v:?}");
     }
 }
