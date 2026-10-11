@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit }}
       - name: Verify producer run
@@ -35,7 +35,7 @@ jobs:
           [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > producer-run.json
           python3 tests/qa/package_smoke.py verify-run producer-run.json "$EXPECTED_COMMIT"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: package-deb
           path: dist
@@ -53,7 +53,7 @@ jobs:
         run: python3 tests/qa/package_smoke.py installed dist "$EXPECTED_COMMIT"
       - name: Preserve package diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: package-smoke-${{ inputs.run_id }}
           path: |

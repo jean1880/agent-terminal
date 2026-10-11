@@ -31,7 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read the version, and check the tag matches it
         id: read
@@ -69,7 +69,7 @@ jobs:
           - kind: arch
             image: archlinux:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build the ${{ matrix.kind }} package
         run: bash packaging/build-${{ matrix.kind }}.sh
@@ -81,7 +81,7 @@ jobs:
         env:
           PACKAGE_SOURCE_COMMIT: ${{ github.sha }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: package-${{ matrix.kind }}
           path: dist/*
@@ -106,9 +106,9 @@ jobs:
           - kind: arch
             image: archlinux:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: package-${{ matrix.kind }}
           path: dist
@@ -125,9 +125,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: package-*
           path: dist
