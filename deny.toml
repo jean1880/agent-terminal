@@ -22,7 +22,11 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "Unicode-3.0",
+    # foldhash 0.2 (via rusqlite 0.40's hashlink).
+    "Zlib",
 ]
+# Allowances not (yet) used by the tree are fine: Zlib is listed ahead of the rusqlite bump.
+unused-allowed-license = "allow"
 confidence-threshold = 0.9
 
 [bans]
