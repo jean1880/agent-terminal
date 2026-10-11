@@ -7,7 +7,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use agent_core::event::ItemKind;
 use gtk4::prelude::*;
 
 use super::cards::label;
@@ -23,7 +22,7 @@ pub fn title_text(running: usize) -> String {
 }
 
 /// What sub-agent `id` is doing now: its running step, else its latest one (`None`: no step
-/// yet). A command reads `$ <command>`; another tool its title and target.
+/// yet), titled as its card is (`Run <command>`, `Read <path>`, …).
 pub fn current_step(model: &Transcript, id: &str) -> Option<String> {
     let agent = model.get(id)?;
     // Newest first: the first running step wins; failing that, the newest step of all.
@@ -40,12 +39,16 @@ pub fn current_step(model: &Transcript, id: &str) -> Option<String> {
         }
     }
     let step = running.or(latest)?;
-    let target = payload::tool_summary(step.kind, step.input.as_ref(), &step.input_text);
-    Some(match (step.kind, target) {
-        (ItemKind::Command, Some(command)) => format!("$ {command}"),
-        (_, Some(target)) => format!("{} {target}", step.title),
-        (_, None) => step.title.clone(),
-    })
+    // The step card's own title (W3.4), so the shelf and the card say the same.
+    Some(
+        payload::tool_title(
+            step.kind,
+            &step.title,
+            step.input.as_ref(),
+            &step.input_text,
+        )
+        .text(),
+    )
 }
 
 /// One running sub-agent's labels, set in place.
@@ -256,7 +259,7 @@ impl SubagentShelf {
 pub(crate) mod tests {
     use super::*;
     use agent_core::adapter::Driver;
-    use agent_core::event::{Envelope, Event};
+    use agent_core::event::{Envelope, Event, ItemKind};
 
     #[test]
     fn titles_count_the_running_ones() {
@@ -337,7 +340,7 @@ pub(crate) mod tests {
             read("r1", "s1", "src/config.rs"),
             done("r1"),
         ]);
-        assert_eq!(current_step(&t, "s1").as_deref(), Some("$ cargo test"));
+        assert_eq!(current_step(&t, "s1").as_deref(), Some("Run cargo test"));
 
         // Everything finished: the newest step, a tool other than a command by title + target.
         let t = transcript(&[
@@ -351,6 +354,19 @@ pub(crate) mod tests {
             current_step(&t, "s1").as_deref(),
             Some("Read src/config.rs")
         );
+
+        // The shelf line is exactly the step card's title (one grammar, W3.4).
+        let step = match &t.get("r1").expect("step").body {
+            Body::Tool(tool) => tool.clone(),
+            other => panic!("{other:?}"),
+        };
+        let (action, target) = payload::card_title_and_summary(
+            step.kind,
+            &step.title,
+            step.input.as_ref(),
+            &step.input_text,
+        );
+        assert_eq!(current_step(&t, "s1"), Some(format!("{action} {target}")));
 
         // No step yet, or no such sub-agent.
         let t = transcript(&[subagent("s1", "Explore")]);
@@ -390,7 +406,7 @@ pub(crate) mod tests {
             (
                 true,
                 false,
-                vec!["Last reported activity: $ rg write_atomic".to_owned()]
+                vec!["Last reported activity: Run rg write_atomic".to_owned()]
             ),
             "shown, collapsed by default, with the running command"
         );
@@ -413,7 +429,7 @@ pub(crate) mod tests {
         assert_eq!(
             shelf.state().2,
             [
-                "Last reported activity: $ rg write_atomic",
+                "Last reported activity: Run rg write_atomic",
                 "Activity unavailable"
             ],
             "a row each, in order"

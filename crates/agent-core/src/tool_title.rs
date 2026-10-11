@@ -334,6 +334,8 @@ pub fn wrapper_body_for_display(command: &str) -> Option<String> {
 /// backtick and newline, `\` outside quotes escaping the next character. `None` for unbalanced
 /// quotes or any unquoted operator, substitution or redirection (then the line is not one
 /// simple command).
+// Not the app's `always_allow::simple_command_tokens`: that one refuses shell syntax even inside
+// quotes (a rule is made from its result), while a title keeps a quoted `ls; id` body as typed.
 fn shell_words(line: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -477,9 +479,9 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s).trim()
 }
 
-/// The first line, at most [`TARGET_MAX`] characters, `…` when anything was cut.
+/// The first non-blank line, at most [`TARGET_MAX`] characters, `…` when anything was cut.
 fn one_line(s: &str) -> String {
-    let line = first_line(s);
+    let line = first_line(s.trim());
     let mut out: String = line.chars().take(TARGET_MAX).collect();
     if line.chars().count() > TARGET_MAX || s.trim().lines().count() > 1 {
         out.push('…');
@@ -819,6 +821,20 @@ mod tests {
         assert!(t.target.ends_with('…'));
         let t = classify(ItemKind::Command, "Bash", Some(&json!({"command": "a\nb"})));
         assert_eq!(t.target, "a…");
+        // A leading blank line is not the command: "\nls\n" titles `Run ls`; with more after it,
+        // the cut is still marked.
+        let t = classify(
+            ItemKind::Command,
+            "Bash",
+            Some(&json!({"command": "\nls\n"})),
+        );
+        assert_eq!(t.text(), "Run ls");
+        let t = classify(
+            ItemKind::Command,
+            "Bash",
+            Some(&json!({"command": "\nls\nx"})),
+        );
+        assert_eq!(t.text(), "Run ls…");
         // No input at all: the verb alone, never a bare tool name as a target.
         assert_eq!(classify(ItemKind::Command, "Bash", None).text(), "Run");
         assert_eq!(classify(ItemKind::FileRead, "Read", None).text(), "Read");
