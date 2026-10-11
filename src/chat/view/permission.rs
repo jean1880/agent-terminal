@@ -10,7 +10,7 @@
 use serde_json::Value;
 
 /// The approval tool name a Codex permission request carries.
-pub const TOOL: &str = "codex_permissions";
+pub const TOOL: &str = agent_core::codex::PERMISSIONS_TOOL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
