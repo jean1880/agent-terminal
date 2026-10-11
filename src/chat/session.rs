@@ -225,6 +225,25 @@ struct Inner {
     approval_deadline: Cell<Duration>,
     /// Claude's `--thinking-display summarized` for the running process (W3.2).
     thinking: ThinkingFlag,
+    /// Open Codex permission requests, by request id: what the answer may be (see
+    /// [`Inner::gate_codex_permissions`]). Never a rule.
+    codex_permissions: RefCell<HashMap<String, PermissionCard>>,
+    /// What Codex was allowed for its session (`scope: "session"`), said plainly; held by the
+    /// app-server process, so forgotten when it ends.
+    codex_grants: RefCell<Vec<String>>,
+}
+
+/// What the session decided about one Codex permission request.
+#[derive(Debug, Clone)]
+struct PermissionCard {
+    /// Allow (this turn) may be sent: the card showed the request exactly.
+    allow: bool,
+    /// Allow for session may be sent: nothing it reaches is too broad or sensitive.
+    session_allowed: bool,
+    /// Why Allow for session is not offered, when it is not.
+    warning: Option<String>,
+    /// What the request grants, for the session-grant notice.
+    summary: String,
 }
 
 /// Whether the running Claude process got `--thinking-display summarized`, and how it took it.
@@ -421,6 +440,8 @@ impl ChatSession {
             agy_hold: RefCell::new(std::collections::VecDeque::new()),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
             thinking: ThinkingFlag::default(),
+            codex_permissions: RefCell::new(HashMap::new()),
+            codex_grants: RefCell::new(Vec::new()),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -747,6 +768,7 @@ impl Inner {
             Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
                 if let Some(req) = &env.request {
                     self.pending_rules.borrow_mut().remove(req);
+                    self.codex_permissions.borrow_mut().remove(req);
                 }
             }
             _ => {}
@@ -1133,6 +1155,9 @@ impl Inner {
             self.adapter.borrow_mut().feed(line)
         };
         for env in envelopes {
+            let Some(env) = self.gate_form(env) else {
+                continue; // declined before it was shown; the notice is out
+            };
             let (env, auto) = self.gate_approval(env);
             let lost_resume = self.is_lost_codex_resume(&env);
             self.emit(env.clone());
@@ -1330,6 +1355,12 @@ impl Inner {
         let driver = self.adapter.borrow().driver();
         if driver == Driver::Agy {
             return (env, false);
+        }
+        // A Codex permission request is never matched, answered or remembered by a rule.
+        if matches!(&env.event, Event::ApprovalRequested { tool, .. }
+            if tool == agent_core::codex::PERMISSIONS_TOOL)
+        {
+            return (self.gate_codex_permissions(env), false);
         }
         let Some(request) = env.request.clone() else {
             return (env, false);
@@ -1642,6 +1673,9 @@ impl Inner {
         // process cannot leave the chip claiming its model change is still in progress.
         self.reject_model_change();
         self.pending_rules.borrow_mut().clear();
+        // The app-server process held Codex's session grants; they ended with it.
+        self.codex_permissions.borrow_mut().clear();
+        self.codex_grants.borrow_mut().clear();
         for env in envelopes {
             self.emit(env);
         }
@@ -2033,6 +2067,11 @@ impl Inner {
         decision: Decision,
         custom_rule: Option<crate::always_allow::Rule>,
     ) {
+        let permission = self.codex_permissions.borrow().get(request).cloned();
+        if let Some(card) = permission {
+            self.respond_codex_permissions(request, decision, &card);
+            return;
+        }
         if let Some(handle) = self.approval() {
             if handle.respond_with_rule(request, decision, custom_rule.clone()) {
                 self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
@@ -2077,7 +2116,10 @@ impl Inner {
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
-        self.wanted_mode.set(mode);
+        let previous = self.wanted_mode.replace(mode);
+        if previous != mode {
+            self.note_grants_outlive_mode();
+        }
         self.record_chosen_mode();
         if self.ask_unavailable() {
             if mode == Mode::Ask {
@@ -2588,6 +2630,391 @@ pub(crate) struct Handoff {
     /// Messages carried, of `total` in the thread.
     pub carried: usize,
     pub total: usize,
+}
+
+// ---- Codex permission requests and MCP forms (plan 2026-10-11, lane L1) ----
+//
+// The adapter types each request; the session adds what only it knows: the home folder, the
+// sensitive-path list, Codex's own folder, what masking would change. Nothing here keeps or
+// matches an app rule.
+
+impl Inner {
+    /// Narrows a Codex permission card before the view sees it, and records what its answer may
+    /// be. Allow for session is withdrawn (with a plain warning) when a read or write reaches the
+    /// filesystem root, the home folder or above, Codex's own folder, a sensitive path, or a
+    /// `**` glob at or above home. A card that masking would change (it shows a secret) can only
+    /// be denied: what is granted must be what is shown.
+    fn gate_codex_permissions(&self, mut env: Envelope) -> Envelope {
+        let Some(request) = env.request.clone() else {
+            return env;
+        };
+        let masked = crate::approval_server::masked_for_view(env.clone());
+        let Event::ApprovalRequested {
+            title,
+            input,
+            options,
+            ..
+        } = &mut env.event
+        else {
+            return env;
+        };
+        let shown_exactly = matches!(&masked.event, Event::ApprovalRequested {
+            title: masked_title, input: masked_input, ..
+        } if masked_title == title && masked_input == input);
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute());
+        let codex_homes = self.codex_homes(home.as_deref());
+        let mut allow = input.get("renderable") == Some(&serde_json::Value::Bool(true))
+            && options.contains(&Decision::Allow);
+        let mut warning = None;
+        let mut session_allowed = allow;
+        if allow && !shown_exactly {
+            allow = false;
+            session_allowed = false;
+            warning = Some(
+                "Part of this request looks like a secret, so agent-terminal cannot show it \
+                 exactly; it can only be denied."
+                    .to_owned(),
+            );
+        } else if allow {
+            let reaches = permission_reaches(input, home.as_deref(), &codex_homes);
+            if !reaches.is_empty() {
+                session_allowed = false;
+                warning = Some(format!(
+                    "This reaches {}. Allow it for this turn only if you trust it; Allow for \
+                     session is not offered.",
+                    and_list(&reaches)
+                ));
+            }
+        }
+        options.retain(|d| match d {
+            Decision::Allow => allow,
+            Decision::AllowForSession => session_allowed,
+            Decision::AllowAlways => false,
+            _ => true,
+        });
+        if let Some(fields) = input.as_object_mut() {
+            fields.insert("session_allowed".to_owned(), session_allowed.into());
+            if let Some(text) = &warning {
+                fields.insert("warning".to_owned(), text.clone().into());
+            }
+            if !allow {
+                fields.insert("renderable".to_owned(), false.into());
+            }
+        }
+        let summary = permission_summary(input);
+        self.codex_permissions.borrow_mut().insert(
+            request,
+            PermissionCard {
+                allow,
+                session_allowed,
+                warning,
+                summary,
+            },
+        );
+        env
+    }
+
+    /// Codex's own folders: `~/.codex`, and `$CODEX_HOME` as the profile sets it or, unless the
+    /// profile clears it, as the app inherited it. Every candidate counts (fail closed).
+    fn codex_homes(&self, home: Option<&Path>) -> Vec<PathBuf> {
+        let env = self.launch_env.borrow();
+        let mut homes: Vec<PathBuf> = home.map(|h| h.join(".codex")).into_iter().collect();
+        let profile = env
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| PathBuf::from(v));
+        let inherited = (!env.unset.iter().any(|k| k == "CODEX_HOME"))
+            .then(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+            .flatten();
+        homes.extend(
+            profile
+                .into_iter()
+                .chain(inherited)
+                .filter(|p| p.is_absolute()),
+        );
+        homes
+    }
+
+    /// Answers a Codex permission card. Refused, with a notice and nothing sent: Always allow
+    /// (never offered), Allow for a card that can only be denied, Allow for session where the
+    /// gate withdrew it. A session grant is said in a notice and remembered until the process
+    /// ends.
+    fn respond_codex_permissions(
+        self: &Rc<Self>,
+        request: &str,
+        decision: Decision,
+        card: &PermissionCard,
+    ) {
+        let refusal = match decision {
+            Decision::AllowAlways => Some(
+                "Codex permission requests cannot be always allowed; choose Allow or Deny."
+                    .to_owned(),
+            ),
+            Decision::Allow | Decision::AllowForSession if !card.allow => Some(
+                "This permission request can only be denied: agent-terminal could not show it \
+                 exactly."
+                    .to_owned(),
+            ),
+            Decision::AllowForSession if !card.session_allowed => Some(format!(
+                "Allow for session is not available for this request. {}",
+                card.warning
+                    .as_deref()
+                    .unwrap_or("Choose Allow to grant it for this turn, or Deny.")
+            )),
+            _ => None,
+        };
+        if let Some(text) = refusal {
+            self.emit(Envelope::new(Event::Notice { text }));
+            return;
+        }
+        let sent = self.command(Command::Approve {
+            request: request.to_owned(),
+            decision,
+            updated_input: None,
+            message: None,
+        });
+        if !sent {
+            return;
+        }
+        self.codex_permissions.borrow_mut().remove(request);
+        if decision == Decision::AllowForSession {
+            self.codex_grants.borrow_mut().push(card.summary.clone());
+            self.emit(Envelope::new(Event::Notice {
+                text: format!(
+                    "Codex has extra access for this session: {}. It lasts until Codex restarts.",
+                    card.summary
+                ),
+            }));
+        }
+        self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+    }
+
+    /// A mode change does not take back what Codex was allowed for its session: say so.
+    fn note_grants_outlive_mode(&self) {
+        if self.adapter.borrow().driver() != Driver::Codex {
+            return;
+        }
+        let grants = self.codex_grants.borrow().clone();
+        if grants.is_empty() {
+            return;
+        }
+        self.emit(Envelope::new(Event::Notice {
+            text: format!(
+                "The extra access Codex was allowed for this session still applies in the new \
+                 mode until the thread restarts: {}.",
+                grants.join("; ")
+            ),
+        }));
+    }
+
+    /// Declines, before it is shown, a Codex form whose link or field names masking would change
+    /// (they carry what looks like a secret: the card could not show what is answered). Returns
+    /// the envelope to deliver, or `None` when it was declined (the notice is out).
+    fn gate_form(self: &Rc<Self>, env: Envelope) -> Option<Envelope> {
+        let Event::FormRequested { server, form, .. } = &env.event else {
+            return Some(env);
+        };
+        let Some(request) = env.request.clone() else {
+            return Some(env);
+        };
+        let masked = crate::approval_server::masked_for_view(env.clone());
+        let Event::FormRequested {
+            form: masked_form, ..
+        } = &masked.event
+        else {
+            return Some(env);
+        };
+        let text = match (form, masked_form) {
+            (agent_core::form::Form::Link { url }, agent_core::form::Form::Link { url: shown })
+                if url != shown =>
+            {
+                agent_core::codex::refused_link_notice(
+                    server,
+                    "asked you to open a link that carries what looks like a secret",
+                    shown,
+                )
+            }
+            (
+                agent_core::form::Form::Fields { fields },
+                agent_core::form::Form::Fields { fields: shown },
+            ) if form_keys(fields) != form_keys(shown) => format!(
+                "The {server} tool server sent a form whose field names or choices look like \
+                 secrets; it was declined."
+            ),
+            _ => return Some(env),
+        };
+        let server = server.clone();
+        info!(server = %server, "declining a form masking would change");
+        self.command(Command::SubmitForm {
+            request,
+            action: agent_core::form::FormAction::Decline,
+            content: None,
+        });
+        self.emit(Envelope::new(Event::Notice { text }));
+        None
+    }
+}
+
+/// The names and choice values a form's answer is keyed on.
+fn form_keys(fields: &[agent_core::form::FormField]) -> Vec<String> {
+    fields
+        .iter()
+        .flat_map(|f| {
+            let values = match &f.input {
+                agent_core::form::FieldInput::Choice { options, .. } => {
+                    options.iter().map(|o| o.value.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+            std::iter::once(f.name.clone()).chain(values)
+        })
+        .collect()
+}
+
+/// "a", "a and b", "a, b and c".
+fn and_list(parts: &[&str]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// `path` with `.` dropped and `..` applied lexically.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// What a Codex permission card's reads and writes reach that Allow for session must not
+/// grant, in words (deny entries restrict, so they never count). Pure: the session supplies
+/// `home` and Codex's folders.
+fn permission_reaches(
+    input: &serde_json::Value,
+    home: Option<&Path>,
+    codex_homes: &[PathBuf],
+) -> Vec<&'static str> {
+    let cwd = input
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new);
+    let mut reaches: Vec<&'static str> = Vec::new();
+    let mut add = |what: &'static str| {
+        if !reaches.contains(&what) {
+            reaches.push(what);
+        }
+    };
+    let entries = input
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for entry in entries {
+        if entry.get("access").and_then(serde_json::Value::as_str) == Some("deny") {
+            continue;
+        }
+        let target = &entry["target"];
+        let (place, glob) = match target.get("kind").and_then(serde_json::Value::as_str) {
+            Some("glob") => {
+                let pattern = target["pattern"].as_str().unwrap_or_default();
+                // The folder the pattern starts from: everything before its first wildcard.
+                let fixed = &pattern[..pattern.find(['*', '?', '[', '{']).unwrap_or(pattern.len())];
+                let dir = fixed.rfind('/').map_or("", |i| &fixed[..=i]);
+                (dir.to_owned(), pattern.contains("**"))
+            }
+            Some(_) => match target.get("path").and_then(serde_json::Value::as_str) {
+                Some(path) => (path.to_owned(), false),
+                // A special place with no known path (the temp folder, system libraries).
+                None => continue,
+            },
+            None => continue,
+        };
+        let path = Path::new(&place);
+        let path = match (path.is_absolute(), cwd) {
+            (true, _) => lexical(path),
+            (false, Some(cwd)) => lexical(&cwd.join(path)),
+            // Nowhere to resolve it from: judge it as the broadest place.
+            (false, None) => PathBuf::from("/"),
+        };
+        if path == Path::new("/") {
+            add("the whole filesystem");
+        }
+        if let Some(home) = home {
+            if home.starts_with(&path) {
+                add(if glob {
+                    "everything under your home folder"
+                } else {
+                    "your home folder"
+                });
+            }
+        }
+        if codex_homes
+            .iter()
+            .any(|c| c.starts_with(&path) || path.starts_with(c))
+        {
+            add("Codex's own settings folder");
+        }
+        if crate::approval_server::sensitive_anywhere(&path, home) {
+            add("files that can run code or hold credentials (such as .git, agent instructions or dotfiles)");
+        }
+    }
+    reaches
+}
+
+/// What a Codex permission card grants, in plain words, for the session-grant notice.
+fn permission_summary(input: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for entry in input
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let access = match entry.get("access").and_then(serde_json::Value::as_str) {
+            Some("write") => "write",
+            Some("read") => "read",
+            _ => continue,
+        };
+        let target = &entry["target"];
+        let place = match target.get("kind").and_then(serde_json::Value::as_str) {
+            Some("path") => target["path"].as_str().unwrap_or_default().to_owned(),
+            Some("glob") => format!(
+                "files matching {}",
+                target["pattern"].as_str().unwrap_or_default()
+            ),
+            Some("special") => match target["name"].as_str() {
+                Some("project") => "the project".to_owned(),
+                Some("temp") => "the temp folder".to_owned(),
+                Some("slash_tmp") => "/tmp".to_owned(),
+                Some("root") => "the whole filesystem".to_owned(),
+                Some("minimal") => "system libraries".to_owned(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        parts.push(format!("{access} {place}"));
+    }
+    if input.get("network") == Some(&serde_json::Value::Bool(true)) {
+        parts.push("use the network".to_owned());
+    }
+    if parts.is_empty() {
+        "nothing more than before".to_owned()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// The handoff a thread still owes its current agent, from its stored history: the latest

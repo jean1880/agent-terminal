@@ -799,3 +799,347 @@ fn scripted_a_turn_with_an_item_confirms_the_new_codex_thread() {
         session.shutdown(false);
     });
 }
+
+// ---- Codex permission requests and forms (plan 2026-10-11, lane L1) ----
+
+/// The latest Codex permission card the view received: request, options and input.
+fn permission_card(seen: &RefCell<Vec<Envelope>>) -> Option<(String, Vec<Decision>, Value)> {
+    seen.borrow().iter().rev().find_map(|e| match &e.event {
+        Event::ApprovalRequested {
+            tool,
+            options,
+            input,
+            ..
+        } if tool == agent_core::codex::PERMISSIONS_TOOL => {
+            Some((e.request.clone()?, options.clone(), input.clone()))
+        }
+        _ => None,
+    })
+}
+
+fn notices(seen: &RefCell<Vec<Envelope>>, needle: &str) -> usize {
+    seen.borrow()
+        .iter()
+        .filter(|e| matches!(&e.event, Event::Notice { text } if text.contains(needle)))
+        .count()
+}
+
+impl Fixture {
+    fn results(&self) -> Vec<Value> {
+        self.incoming()
+            .into_iter()
+            .filter_map(|f| f.get("result").cloned())
+            .collect()
+    }
+
+    fn wait_card(&self, ctx: &glib::MainContext) -> (String, Vec<Decision>, Value) {
+        self.wait(ctx, "permission card", || {
+            permission_card(&self.seen).is_some()
+        });
+        permission_card(&self.seen).expect("card")
+    }
+
+    fn no_rules(&self, session: &ChatSession) {
+        assert!(session.inner.session_rules.borrow().rules.is_empty());
+        assert!(session.inner.pending_rules.borrow().is_empty());
+    }
+}
+
+#[test]
+fn scripted_a_sensitive_permission_request_never_offers_or_sends_a_session_grant() {
+    in_loop(|ctx| {
+        for (permissions, says) in [
+            (
+                json!({"fileSystem": {"entries": [{"access": "write",
+                    "path": {"type": "special", "value": {"kind": "root"}}}]}}),
+                "the whole filesystem",
+            ),
+            (json!({"fileSystem": {"write": [".git/hooks"]}}), ".git"),
+        ] {
+            let fixture = Fixture::new();
+            let session = fixture.session();
+            fixture.prompt(&session, &format!("permissions:{permissions}"));
+            let (request, options, input) = fixture.wait_card(ctx);
+            assert_eq!(options, [Decision::Allow, Decision::Deny, Decision::Cancel]);
+            assert_eq!(input["session_allowed"], false);
+            assert!(
+                input["warning"].as_str().is_some_and(|w| w.contains(says)),
+                "{input}"
+            );
+            // Refused at answer time too, whatever the card offered: nothing is written.
+            for refused in [Decision::AllowForSession, Decision::AllowAlways] {
+                session.respond_approval(&request, refused);
+                assert!(fixture.results().is_empty(), "{refused:?} sent nothing");
+            }
+            assert_eq!(
+                notices(&fixture.seen, "Allow for session is not available"),
+                1
+            );
+            assert_eq!(notices(&fixture.seen, "cannot be always allowed"), 1);
+            session.respond_approval(&request, Decision::Allow);
+            fixture.wait_finished(ctx);
+            let results = fixture.results();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["scope"], "turn");
+            assert!(results[0]["permissions"]["fileSystem"].is_object());
+            assert!(fixture.seen.borrow().iter().any(|e| e.request.as_deref()
+                == Some(request.as_str())
+                && e.event
+                    == Event::ApprovalResolved {
+                        decision: Decision::Allow
+                    }));
+            assert_eq!(notices(&fixture.seen, "extra access"), 0);
+            fixture.no_rules(&session);
+            session.shutdown(false);
+        }
+    });
+}
+
+#[test]
+fn scripted_a_session_grant_is_announced_and_outlives_a_mode_change_until_restart() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]},"network":{"enabled":true}}"#,
+        );
+        let (request, options, input) = fixture.wait_card(ctx);
+        assert_eq!(
+            options,
+            [
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel
+            ]
+        );
+        let build = format!("{}/build", fixture.dir.path().display());
+        assert_eq!(input["entries"][0]["target"]["path"], build.as_str());
+        session.respond_approval(&request, Decision::AllowForSession);
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "session", "permissions": {
+                "fileSystem": {"write": [build]}, "network": {"enabled": true}}})]
+        );
+        assert_eq!(
+            notices(
+                &fixture.seen,
+                &format!("Codex has extra access for this session: write {build}, use the network")
+            ),
+            1
+        );
+        fixture.no_rules(&session);
+        session.set_mode(Mode::AcceptEdits);
+        assert_eq!(notices(&fixture.seen, "still applies in the new mode"), 1);
+        session.set_mode(Mode::AcceptEdits);
+        assert_eq!(
+            notices(&fixture.seen, "still applies"),
+            1,
+            "no change, no notice"
+        );
+        // A new app-server process holds no grant.
+        session.reload_session();
+        session.set_mode(Mode::Ask);
+        assert_eq!(notices(&fixture.seen, "still applies"), 1);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn scripted_stop_turn_on_a_permission_request_grants_nothing_and_interrupts() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, r#"permissions:{"network":{"enabled":true}}"#);
+        let (request, ..) = fixture.wait_card(ctx);
+        session.respond_approval(&request, Decision::Cancel);
+        fixture.wait(ctx, "interrupt", || {
+            fixture
+                .incoming()
+                .iter()
+                .any(|f| f["method"] == "turn/interrupt")
+        });
+        assert_eq!(fixture.results(), [json!({"permissions": {}})]);
+        fixture.wait_finished(ctx);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn scripted_forms_answer_through_the_adapter_and_a_link_with_a_secret_is_declined() {
+    use agent_core::form::{Form, FormAction};
+    in_loop(|ctx| {
+        let form_request = |fixture: &Fixture| {
+            fixture.seen.borrow().iter().find_map(|e| match &e.event {
+                Event::FormRequested { form, .. } => Some((e.request.clone()?, form.clone())),
+                _ => None,
+            })
+        };
+        let resolved = |fixture: &Fixture| {
+            fixture
+                .seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::FormResolved { .. }))
+                .count()
+        };
+
+        // A link whose masking would change it is never shown: declined with a notice.
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            &format!(
+                r#"form:{{"mode":"url","url":"https://example.com/cb?code={token}","elicitationId":"e1"}}"#
+            ),
+        );
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results(), [json!({"action": "decline"})]);
+        assert!(form_request(&fixture).is_none(), "no card");
+        assert_eq!(
+            notices(&fixture.seen, "Open it yourself only if you trust it"),
+            1
+        );
+        assert!(!fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| serde_json::to_string(e)
+                .unwrap_or_default()
+                .contains(&token)));
+        session.shutdown(false);
+
+        // A plain link: Done sends accept, and only the session resolves the card, once.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"form:{"mode":"url","url":"https://example.com/login","elicitationId":"e2"}"#,
+        );
+        fixture.wait(ctx, "link card", || form_request(&fixture).is_some());
+        let (request, form) = form_request(&fixture).expect("card");
+        assert!(matches!(form, Form::Link { .. }));
+        session.respond_form(&request, FormAction::Accept, None);
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results(), [json!({"action": "accept"})]);
+        assert_eq!(resolved(&fixture), 1);
+        session.shutdown(false);
+
+        // A field form: an answer the form refuses is not sent and leaves the card open.
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(
+            &session,
+            r#"form:{"mode":"form","requestedSchema":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}}"#,
+        );
+        fixture.wait(ctx, "form card", || form_request(&fixture).is_some());
+        let (request, _) = form_request(&fixture).expect("card");
+        session.respond_form(&request, FormAction::Accept, Some(json!({})));
+        assert!(fixture.results().is_empty());
+        assert_eq!(resolved(&fixture), 0);
+        session.respond_form(&request, FormAction::Accept, Some(json!({"name": "Ada"})));
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            fixture.results(),
+            [json!({"action": "accept", "content": {"name": "Ada"}})]
+        );
+        assert_eq!(resolved(&fixture), 1);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn permission_reaches_names_home_root_codex_and_sensitive_places() {
+    let home = Path::new("/home/u");
+    let codex = [home.join(".codex"), PathBuf::from("/opt/codex-home")];
+    let reach = |access: &str, target: Value| {
+        super::permission_reaches(
+            &json!({"cwd": "/home/u", "entries": [{"access": access, "target": target}]}),
+            Some(home),
+            &codex,
+        )
+    };
+    let path = |p: &str| json!({"kind": "path", "path": p});
+    let glob = |p: &str| json!({"kind": "glob", "pattern": p});
+    assert!(reach("write", path("/home/u/proj/src")).is_empty());
+    assert!(reach("read", glob("/home/u/proj/**")).is_empty());
+    assert!(reach(
+        "read",
+        json!({"kind": "special", "name": "temp", "path": null})
+    )
+    .is_empty());
+    assert!(reach("deny", path("/")).is_empty(), "deny restricts");
+    assert_eq!(
+        reach("write", path("/")),
+        [
+            "the whole filesystem",
+            "your home folder",
+            "Codex's own settings folder"
+        ]
+    );
+    assert_eq!(
+        reach("read", path("/home/u")),
+        ["your home folder", "Codex's own settings folder"]
+    );
+    assert_eq!(
+        reach("read", path("/home")),
+        ["your home folder", "Codex's own settings folder"]
+    );
+    assert_eq!(
+        reach("read", glob("/home/u/**/*.txt")),
+        [
+            "everything under your home folder",
+            "Codex's own settings folder"
+        ]
+    );
+    assert_eq!(
+        reach("read", glob("**/*.rs"))[0],
+        "everything under your home folder",
+        "relative to cwd"
+    );
+    assert_eq!(
+        reach("write", path("/opt/codex-home/rules")),
+        ["Codex's own settings folder"]
+    );
+    assert_eq!(
+        reach("write", path("/opt")),
+        ["Codex's own settings folder"]
+    );
+    for sensitive in [
+        "/home/u/proj/.git/hooks",
+        "/home/u/.bashrc",
+        "/srv/app/AGENTS.md",
+        "/srv/.github/workflows/ci.yml",
+    ] {
+        assert!(
+            reach("write", path(sensitive))
+                .iter()
+                .any(|r| r.starts_with("files that can run code")),
+            "{sensitive}"
+        );
+    }
+    assert_eq!(
+        reach(
+            "write",
+            json!({"kind": "special", "name": "project", "path": "/home/u"})
+        ),
+        ["your home folder", "Codex's own settings folder"]
+    );
+}
+
+#[test]
+fn a_permission_summary_says_what_is_granted() {
+    let input = json!({"entries": [
+        {"access": "write", "target": {"kind": "path", "path": "/w/out"}},
+        {"access": "read", "target": {"kind": "glob", "pattern": "/data/*.csv"}},
+        {"access": "read", "target": {"kind": "special", "name": "project", "path": "/w"}},
+        {"access": "deny", "target": {"kind": "path", "path": "/w/.env"}},
+    ], "network": true});
+    assert_eq!(
+        super::permission_summary(&input),
+        "write /w/out, read files matching /data/*.csv, read the project, use the network"
+    );
+}
