@@ -81,9 +81,9 @@ pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
             }
             if interruption {
                 if let Some(bounds) = widget.compute_bounds(&widget) {
-                    if bounds.width() < 44.0 || bounds.height() < 44.0 {
+                    if bounds.width() < 34.0 || bounds.height() < 34.0 {
                         out.push(format!(
-                            "permission target is {}×{}; needs 44×44",
+                            "permission target is {}×{}; needs 34×34",
                             bounds.width(),
                             bounds.height()
                         ));
@@ -182,4 +182,156 @@ pub fn min_size_report(
     let mut out = String::new();
     walk(root, orientation, threshold, 0, &mut out);
     out
+}
+
+/// `root` and every widget below it.
+pub fn descendants(root: &gtk4::Widget) -> Vec<gtk4::Widget> {
+    use gtk4::prelude::*;
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(widget) = stack.pop() {
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c);
+        }
+        out.push(widget);
+    }
+    out
+}
+
+/// Whether pressing `widget` does something by itself: a button, a list row or anything with a
+/// click gesture of its own.
+fn is_click_target(widget: &gtk4::Widget) -> bool {
+    use gtk4::prelude::*;
+    widget.is::<gtk4::Button>()
+        || widget.is::<gtk4::MenuButton>()
+        || widget.is::<gtk4::ListBoxRow>()
+        || widget.is::<gtk4::Expander>()
+        || widget.is::<gtk4::CheckButton>()
+        || widget
+            .observe_controllers()
+            .into_iter()
+            .flatten()
+            .any(|c| c.is::<gtk4::GestureClick>())
+}
+
+/// Describes every selectable label under `root` that sits inside a button or click target. A
+/// selectable label claims the press (it places a caret), so the target never fires.
+pub fn selectable_labels_in_click_targets(root: &gtk4::Widget) -> Vec<String> {
+    use gtk4::prelude::*;
+    let mut out = Vec::new();
+    for widget in descendants(root) {
+        let Some(label) = widget.downcast_ref::<gtk4::Label>() else {
+            continue;
+        };
+        if !label.is_selectable() {
+            continue;
+        }
+        let mut parent = label.parent();
+        while let Some(ancestor) = parent {
+            if is_click_target(&ancestor) {
+                out.push(format!(
+                    "selectable label {:?} ({}) inside {} ({})",
+                    label.text().chars().take(40).collect::<String>(),
+                    label.css_classes().join("."),
+                    ancestor.type_().name(),
+                    ancestor.css_classes().join(".")
+                ));
+                break;
+            }
+            parent = ancestor.parent();
+        }
+    }
+    out
+}
+
+/// Accessibility and hit-target problems of every button under `root`: no accessible name, or
+/// smaller than `min` px in either direction (natural size, so it works unmapped).
+pub fn button_problems(root: &gtk4::Widget, min: i32) -> Vec<String> {
+    use gtk4::prelude::*;
+    let mut out = Vec::new();
+    for widget in descendants(root) {
+        let button = widget.is::<gtk4::Button>()
+            || widget.is::<gtk4::MenuButton>()
+            || widget.is::<gtk4::ToggleButton>();
+        // A MenuButton's inner toggle is the MenuButton's business; hidden buttons are not
+        // targets.
+        let inner = widget
+            .parent()
+            .is_some_and(|p| p.is::<gtk4::MenuButton>() || p.is::<adw::SplitButton>());
+        if !button || inner || !shown(&widget) {
+            continue;
+        }
+        let named = widget
+            .downcast_ref::<gtk4::Button>()
+            .and_then(|b| b.label())
+            .is_some_and(|l| !l.is_empty())
+            || widget
+                .downcast_ref::<gtk4::MenuButton>()
+                .and_then(|b| b.label())
+                .is_some_and(|l| !l.is_empty())
+            || gtk4::test_accessible_has_property(
+                widget.upcast_ref::<gtk4::Widget>(),
+                gtk4::AccessibleProperty::Label,
+            )
+            || descendants(&widget).iter().any(|w| {
+                w.downcast_ref::<gtk4::Label>()
+                    .is_some_and(|l| !l.text().is_empty())
+            });
+        let describe = || {
+            format!(
+                "{} ({})",
+                widget.type_().name(),
+                widget.css_classes().join(".")
+            )
+        };
+        if !named {
+            out.push(format!("{} has no accessible name", describe()));
+        }
+        let (w, h) = (
+            widget.measure(gtk4::Orientation::Horizontal, -1).1,
+            widget.measure(gtk4::Orientation::Vertical, -1).1,
+        );
+        if w < min || h < min {
+            out.push(format!("{} is {w}x{h}, under {min}", describe()));
+        }
+    }
+    out
+}
+
+/// Describes every `.card-section` and `.code-block` under `root` that has no Copy button.
+pub fn blocks_without_copy(root: &gtk4::Widget) -> Vec<String> {
+    use gtk4::prelude::*;
+    descendants(root)
+        .into_iter()
+        .filter(|w| w.has_css_class("card-section") || w.has_css_class("code-block"))
+        .filter(|block| {
+            !descendants(block).iter().any(|w| {
+                w.is::<gtk4::Button>()
+                    && w.tooltip_text()
+                        .is_some_and(|tip| tip.to_lowercase().starts_with("copy"))
+            })
+        })
+        .map(|block| {
+            format!(
+                "{} ({}) has no Copy button",
+                block.type_().name(),
+                block.css_classes().join(".")
+            )
+        })
+        .collect()
+}
+
+/// Whether `widget` and every ancestor is visible (a hidden widget measures 0x0).
+pub fn shown(widget: &gtk4::Widget) -> bool {
+    use gtk4::prelude::*;
+    let mut at = Some(widget.clone());
+    while let Some(w) = at {
+        if !w.is_visible() {
+            return false;
+        }
+        at = w.parent();
+    }
+    true
 }

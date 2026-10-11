@@ -5,5 +5,9 @@
   "chat::view::tests::interruption_shelf_reveals_and_collapses",
   "window::imp::tests::small_window_fits",
   "chat::view::tests::completed_plans_retire_to_history_and_new_turns_start_fresh",
-  "chat::view::ux_tests::native_ux_matrix"
+  "chat::view::ux_tests::native_ux_matrix",
+  "chat::view::ux_tests::native_click_matrix",
+  "chat::view::ux_tests::native_toasts_clear_the_composer",
+  "chat::view::ux_tests::native_queue_stays_pinned_and_contained",
+  "window::imp::setup::tests::native_welcome_button_is_inside_the_dialog"
 ]

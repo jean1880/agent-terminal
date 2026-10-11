@@ -920,6 +920,19 @@ impl Transcript {
         id
     }
 
+    /// The newest top-level row, not counting prompts still queued behind it.
+    fn newest_row(&self) -> Option<&Item> {
+        let end = self.order.len().saturating_sub(self.queued_count);
+        self.order[..end]
+            .last()
+            .and_then(|id| self.items.get(id.as_str()))
+    }
+
+    /// Whether the newest row already says `text` as a notice.
+    fn newest_notice_is(&self, text: &str) -> bool {
+        matches!(self.newest_row().map(|i| &i.body), Some(Body::Notice { text: t, .. }) if t == text)
+    }
+
     /// A row the view adds itself (built-in command output such as `/help`).
     pub fn push_notice(&mut self, text: impl Into<String>, tone: Tone) -> Vec<Change> {
         let id = self.next_id("notice");
@@ -1133,7 +1146,10 @@ impl Transcript {
                 match state {
                     TurnState::Completed => {}
                     TurnState::Interrupted => {
-                        out.extend(self.push_notice("Interrupted", Tone::Info));
+                        // Said once: a second "Interrupted" in a row adds nothing.
+                        if !self.newest_notice_is("Interrupted") {
+                            out.extend(self.push_notice("Interrupted", Tone::Info));
+                        }
                     }
                     TurnState::Failed => {
                         let message = error
@@ -1473,7 +1489,16 @@ impl Transcript {
                 ));
             }
             Event::Notice { text } => {
-                out.extend(self.push_notice(text.clone(), Tone::Info));
+                // The agent's own "Set model to X" right under the "Model switched to X" divider
+                // says the same thing twice, and so does any notice repeated in a row.
+                let says_switch = matches!(
+                    self.newest_row().map(|i| &i.body),
+                    Some(Body::Switch { model: Some(m), .. })
+                        if text.starts_with("Set model to") && text.contains(m.as_str())
+                );
+                if !says_switch && !self.newest_notice_is(text) {
+                    out.extend(self.push_notice(text.clone(), Tone::Info));
+                }
             }
             Event::ControlResult { ok, error } => {
                 if let Some(request) = env.request.clone() {
@@ -2675,6 +2700,56 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(t.current_model(), Some("gemini"));
+    }
+
+    #[test]
+    fn a_model_switch_and_an_interrupt_are_each_said_once() {
+        let notices = |t: &Transcript| {
+            t.order()
+                .iter()
+                .filter_map(|id| t.get(id))
+                .filter(|i| matches!(i.body, Body::Notice { .. }))
+                .count()
+        };
+        let mut t = Transcript::new();
+        t.apply(
+            &ev(Event::ModelChanged {
+                model: "opus".into(),
+            }),
+            Driver::Claude,
+        );
+        let c = t.apply(
+            &ev(Event::ModelChanged {
+                model: "claude-sonnet-5-5".into(),
+            }),
+            Driver::Claude,
+        );
+        assert!(matches!(c.first(), Some(Change::Added(_))), "the divider");
+        // The agent's own words for the same switch add nothing under the divider.
+        let said = Event::Notice {
+            text: "Set model to `sonnet (claude-sonnet-5-5)`".into(),
+        };
+        assert!(t.apply(&ev(said), Driver::Claude).is_empty());
+        assert_eq!(notices(&t), 0);
+        // Another notice still shows, once.
+        let other = || Event::Notice {
+            text: "Cleared".into(),
+        };
+        assert_eq!(t.apply(&ev(other()), Driver::Claude).len(), 1);
+        assert!(t.apply(&ev(other()), Driver::Claude).is_empty());
+        assert_eq!(notices(&t), 1);
+        // An interrupt after an interrupt is not a second row.
+        let interrupted = || {
+            ev(Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            })
+        };
+        t.apply(&interrupted(), Driver::Claude);
+        t.apply(&interrupted(), Driver::Claude);
+        assert_eq!(notices(&t), 2, "Cleared and one Interrupted");
     }
 
     #[test]

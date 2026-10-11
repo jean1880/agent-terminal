@@ -161,7 +161,9 @@ separator.md-rule { background-color: @at_border; margin: 4px 0; }
     border-radius: 10px 10px 0 0;
 }
 .code-lang { color: @at_fg_dim; font-family: monospace; font-size: 0.8em; }
-.code-copy { min-height: 24px; min-width: 24px; padding: 2px; color: @at_fg_dim; }
+.code-copy { min-height: 28px; min-width: 28px; padding: 2px; color: @at_fg_dim; }
+.section-more { min-height: 28px; padding: 0 8px; font-size: 0.8em; color: @at_fg_dim; }
+.card-section .card-error { padding: 8px 10px; }
 textview.code-view, textview.code-view text {
     background-color: @at_bg_deep;
     color: mix(@at_fg_strong, @at_fg, 0.4);
@@ -512,3 +514,20 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel .mcp-bad { color: @at_danger; }
 .chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: @at_fg_strong; font-family: monospace; }
 .chat-panel .json-row .subtitle { font-family: monospace; }
+
+/* keyboard focus: one visible ring on every custom-drawn button (ui-audit #8) */
+.tool-card .card-header:focus-visible,
+.reasoning-toggle:focus-visible,
+.plan-toggle:focus-visible,
+.option-button:focus-visible,
+.agent-chip:focus-visible,
+.subagent-button:focus-visible,
+.usage-indicator:focus-visible,
+.gauge:focus-visible,
+.code-copy:focus-visible,
+.section-more:focus-visible,
+.jump-button:focus-visible,
+.send-button:focus-visible {
+    outline: 2px solid @at_accent;
+    outline-offset: -2px;
+}
