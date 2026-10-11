@@ -682,7 +682,12 @@ impl Inner {
         // The header counts background work too; the stop button follows the main turn only.
         let activity = self.model.borrow().activity(running);
         self.header.set_activity(&activity);
-        self.header.set_reload_running(running);
+        let stop_note = status.capabilities.unsupported_note(
+            agent_core::caps::Feature::InterruptKeepsProcess,
+            cards::driver_name(status.driver),
+        );
+        self.header
+            .set_reload_running(running, stop_note.as_deref());
         self.thinking
             .set(&activity, cards::driver_name(status.driver));
         self.composer.set_running(running);
@@ -776,6 +781,17 @@ impl Inner {
             self.handle(changes);
             self.refresh_status();
             return false;
+        }
+        if mode == Mode::Ask {
+            if let Some(note) = caps.unsupported_note(
+                agent_core::caps::Feature::LiveApprovals,
+                cards::driver_name(self.backend.status().driver),
+            ) {
+                let changes = self.model.borrow_mut().push_notice(note, Tone::Warning);
+                self.handle(changes);
+                self.refresh_status();
+                return false;
+            }
         }
         self.backend.set_mode(mode);
         true
@@ -905,8 +921,8 @@ impl Inner {
                 None => {
                     let changes = self.model.borrow_mut().push_notice(
                         format!(
-                            "{} has no compaction command, so the thread continues in a fresh \
-                             session with a budgeted summary.",
+                            "{} has no compaction command, so the conversation continues in a \
+                             new thread with a budgeted summary.",
                             cards::driver_name(status.driver)
                         ),
                         Tone::Info,
@@ -939,22 +955,59 @@ impl Inner {
             BuiltinAction::Rewind => self.emit(ViewAction::Rewind),
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
             BuiltinAction::Help => {
-                let changes = self
-                    .model
-                    .borrow_mut()
-                    .push_notice(help_text(&status.capabilities), Tone::Info);
+                let changes = self.model.borrow_mut().push_notice(
+                    help_text(&status.capabilities, cards::driver_name(status.driver)),
+                    Tone::Info,
+                );
                 self.handle(changes);
             }
         }
     }
 }
 
-/// The `/help` text: the built-ins this agent can back, then the keys.
-fn help_text(caps: &agent_core::caps::Capabilities) -> String {
+/// The notice for a whole prompt that is a built-in this agent cannot back (`/mcp` on Codex):
+/// what it lacks, as the greyed-control tooltip would say. `None` for anything else, including
+/// a command the agent lists itself (that one is the agent's to run).
+fn unavailable_builtin_note(text: &str, status: &SessionStatus) -> Option<String> {
+    let name = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    let (_, feature) = agent_core::commands::unavailable_builtin(name, &status.capabilities)?;
+    let normalized = name.to_lowercase();
+    if status.commands.iter().any(|c| c.name == normalized) {
+        return None;
+    }
+    status
+        .capabilities
+        .unsupported_note(feature, cards::driver_name(status.driver))
+}
+
+/// The `/help` text: the built-ins this agent can back, then the ones it cannot (with why), then
+/// the keys.
+fn help_text(caps: &agent_core::caps::Capabilities, agent: &str) -> String {
     let mut s = String::from("Commands\n");
     for b in builtins().iter().filter(|b| b.available(caps)) {
         let hint = b.hint.map(|h| format!(" {h}")).unwrap_or_default();
         s.push_str(&format!("  /{}{hint} — {}\n", b.name, b.description));
+    }
+    let mut missing: Vec<String> = builtins()
+        .iter()
+        .filter(|b| !b.available(caps))
+        .filter_map(|b| {
+            let note = caps.unsupported_note(b.feature()?, agent)?;
+            Some(format!("  /{} — {note}\n", b.name))
+        })
+        .collect();
+    // Facts no command stands for (stop, @ files, compaction, reasoning, ...) are told too.
+    let command_features: Vec<_> = builtins().iter().filter_map(|b| b.feature()).collect();
+    missing.extend(
+        agent_core::caps::Feature::ALL
+            .iter()
+            .filter(|f| !command_features.contains(*f))
+            .filter_map(|f| caps.unsupported_note(*f, agent))
+            .map(|note| format!("  {note}\n")),
+    );
+    if !missing.is_empty() {
+        s.push_str("\nNot available here\n");
+        missing.iter().for_each(|line| s.push_str(line));
     }
     s.push_str(
         "\nKeys\n  Enter sends · Shift+Enter adds a line · Esc stops the running turn\n  \
@@ -970,6 +1023,14 @@ impl ComposerHost for Inner {
             // Built-ins never reach the agent.
             if let Some(me) = self.view().and_then(|v| v.inner()) {
                 me.run_action(cl.builtin.action, &cl.args);
+            }
+            return;
+        }
+        if let Some(note) = unavailable_builtin_note(text, &status) {
+            // A built-in this agent cannot back: say so rather than send it as a prompt.
+            if let Some(me) = self.view().and_then(|v| v.inner()) {
+                let changes = me.model.borrow_mut().push_notice(note, Tone::Info);
+                me.handle(changes);
             }
             return;
         }
@@ -3112,12 +3173,85 @@ pub(crate) mod tests {
 
     #[test]
     fn help_lists_only_backed_builtins() {
-        let claude = help_text(&agent_core::caps::Capabilities::claude());
+        let claude = help_text(&agent_core::caps::Capabilities::claude(), "claude");
         assert!(claude.contains("/mcp"));
         assert!(claude.contains("/mode plan|default|accept-edits"));
-        let agy = help_text(&agent_core::caps::Capabilities::agy());
-        assert!(!agy.contains("/mcp"));
+        assert!(!claude.contains("Not available here"));
+        assert!(!claude.contains("restarts"));
+        let agy = help_text(&agent_core::caps::Capabilities::agy(), "Antigravity");
+        let (backed, missing) = agy
+            .split_once("Not available here")
+            .expect("a missing section");
+        assert!(!backed.contains("/mcp"));
+        assert!(missing.contains("/mcp — Antigravity has no MCP panel."));
         assert!(agy.contains("Esc stops"));
+    }
+
+    /// The caps contract (D6): every built-in that needs a capability is a working control when
+    /// the agent has it, and a named, explained absence when it does not (`/help` lists it, and
+    /// typing it says why instead of sending it to the agent as a prompt).
+    #[test]
+    fn every_capability_a_command_needs_is_a_control_or_an_explained_absence() {
+        use agent_core::adapter::Driver;
+        use agent_core::caps::Capabilities;
+        for driver in Driver::ALL {
+            let caps = Capabilities::of(driver);
+            let name = cards::driver_name(driver);
+            let help = help_text(&caps, name);
+            let status = SessionStatus {
+                driver,
+                model: None,
+                pending_model: None,
+                effort: None,
+                mode: Mode::Plan,
+                running_turn: false,
+                alive: true,
+                capabilities: caps.clone(),
+                commands: Vec::new(),
+            };
+            for feature in agent_core::caps::Feature::ALL {
+                if let Some(note) = caps.unsupported_note(feature, name) {
+                    assert!(help.contains(&note), "{name} /help omits: {note}");
+                }
+            }
+            for b in builtins() {
+                let typed = format!("/{}", b.name);
+                match b.feature() {
+                    Some(feature) if !caps.supports(feature) => {
+                        let note = caps.unsupported_note(feature, name).expect("a note");
+                        assert!(help.contains(&note), "{name} /help omits: {note}");
+                        assert_eq!(
+                            unavailable_builtin_note(&typed, &status),
+                            Some(note),
+                            "{name} {typed}"
+                        );
+                    }
+                    _ => {
+                        assert!(help.contains(&format!("/{}", b.name)), "{name} {typed}");
+                        assert_eq!(unavailable_builtin_note(&typed, &status), None);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn codex_says_it_has_no_mcp_panel() {
+        let status = SessionStatus {
+            driver: Driver::Codex,
+            model: None,
+            pending_model: None,
+            effort: None,
+            mode: Mode::Plan,
+            running_turn: false,
+            alive: true,
+            capabilities: agent_core::caps::Capabilities::codex(),
+            commands: Vec::new(),
+        };
+        let note = unavailable_builtin_note("/mcp", &status).expect("a note");
+        assert!(note.ends_with("has no MCP panel."), "{note}");
+        assert_eq!(unavailable_builtin_note("/model", &status), None);
+        assert_eq!(unavailable_builtin_note("hello /mcp", &status), None);
     }
 
     #[test]
