@@ -436,7 +436,7 @@ agent-terminal --resume <id> --dir ~/git/some-project
 | `Ctrl+Shift+T` | New thread |
 | `Ctrl+Shift+G` | New thread in a new worktree |
 | `Ctrl+Shift+W` | Close the thread |
-| `Ctrl+Shift+R` | Restart the session |
+| `Ctrl+Shift+R` | Restart the thread's agent on the same conversation (☰ → Restart Agent) |
 | `Ctrl+Shift+O` | New thread in a chosen folder |
 | `Ctrl+Shift+E` | Resume an existing session |
 | `Ctrl+Shift+S` | Take a checkpoint now |
@@ -767,6 +767,11 @@ Agents, then press **Check again**.
 
 **An agent says "Not signed in".** Use **Sign In…** in Settings → Agents (or on the
 thread's banner), finish signing in, then **Check Again**.
+
+**An agent is stuck or misbehaving.** ☰ → **Restart Agent** (`Ctrl+Shift+R`) stops the
+thread's agent process and starts it again on the same conversation. Queued prompts are
+dropped. It also picks up changes to the agent's settings, environment file, MCP servers
+or hooks.
 
 **agy edits files in Plan mode.** It does, without its approval hook. Install the
 [hook](#agys-approval-hook).
