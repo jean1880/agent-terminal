@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/ca.nuvek.AgentTerminal.svg" alt="Agent Terminal icon" width="128" height="128">
+</p>
+
 # Agent Terminal
 
 [![CI](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml)
