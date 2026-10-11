@@ -222,10 +222,9 @@ impl ChatBackend for SessionSlot {
         request: &str,
         action: agent_core::form::FormAction,
         content: Option<serde_json::Value>,
-    ) {
-        if let Some(s) = self.get() {
-            s.respond_form(request, action, content);
-        }
+    ) -> bool {
+        self.get()
+            .is_some_and(|s| s.respond_form(request, action, content))
     }
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         if let Some(s) = self.get() {
@@ -3019,9 +3018,8 @@ impl AgentTerminalWindow {
                     withdraw_ask = true;
                     After::Sidebar
                 }
-                Event::ApprovalRequested { .. }
-                | Event::QuestionRequested { .. }
-                | Event::FormRequested { .. } => {
+                // A reply question is not an interruption: no sidebar ask, no notification.
+                ev if is_interruption(ev) => {
                     chat.approval = true;
                     let r = react(Attention::Asked, in_view, focused, false);
                     chat.unread |= r.unread;
@@ -3554,6 +3552,12 @@ impl AgentTerminalWindow {
                 }
             }
             ViewAction::ModeChosen { driver, mode } => self.offer_default_mode(*driver, *mode),
+            ViewAction::StopQuickReplies => {
+                self.set_quick_replies(false);
+                self.show_toast(
+                    "Quick replies are off. Turn them back on in Settings, General, Replies.",
+                );
+            }
         }
     }
 
@@ -4357,9 +4361,43 @@ fn forget_stale_resolutions() {
     });
 }
 
+/// Whether an event waits on the user: an approval, or a question the agent asked. A question
+/// the app found in a reply ([`agent_core::event::QuestionSource::Reply`]) waits for nothing. A
+/// form waits only if the card can answer it (the same check the transcript makes).
+fn is_interruption(event: &Event) -> bool {
+    use agent_core::event::QuestionSource;
+    match event {
+        Event::ApprovalRequested { .. } => true,
+        Event::QuestionRequested { source, .. } => *source != QuestionSource::Reply,
+        Event::FormRequested { form, .. } => crate::chat::view::model::form_answerable(form),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn only_agent_questions_and_approvals_are_interruptions() {
+        use agent_core::event::QuestionSource;
+        let question = |source| Event::QuestionRequested {
+            questions: Vec::new(),
+            source,
+        };
+        assert!(!is_interruption(&question(QuestionSource::Reply)));
+        assert!(is_interruption(&question(QuestionSource::Agent)));
+        assert!(is_interruption(&Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: None,
+            input: serde_json::Value::Null,
+            reason: None,
+            options: Vec::new(),
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        }));
+        assert!(!is_interruption(&Event::ApprovalExpired));
+    }
 
     pub(crate) fn sidebar_focus_survives_refresh(window: &crate::window::AgentTerminalWindow) {
         let imp = window.imp();

@@ -27,6 +27,9 @@ pub struct InterruptionShelf {
     pub(crate) more_popover: gtk4::Popover,
     pub(crate) jump_btn: gtk4::Button,
     active: Rc<RefCell<Option<PendingInterruption>>>,
+    /// "1 of 3": the shelf shows the newest of several things waiting, and says so.
+    count: gtk4::Label,
+    shown_count: std::cell::Cell<usize>,
     sink: RowSink,
 }
 
@@ -91,6 +94,10 @@ impl InterruptionShelf {
             "Jump to card in transcript",
         )]);
 
+        let count = label("", &["interruption-count", "dim-label"]);
+        count.set_valign(gtk4::Align::Center);
+        count.set_visible(false);
+        actions.append(&count);
         actions.append(&deny_btn);
         actions.append(&allow_btn);
         actions.append(&more_btn);
@@ -189,12 +196,21 @@ impl InterruptionShelf {
             more_popover,
             jump_btn,
             active,
+            count,
+            shown_count: std::cell::Cell::new(0),
             sink,
         }
     }
 
     pub fn update(&self, transcript: &Transcript) {
         let interruption = transcript.pending_interruption();
+        let waiting = transcript.pending_count();
+        if self.shown_count.replace(waiting) != waiting {
+            self.count.set_visible(waiting > 1);
+            self.count.set_text(&format!("1 of {waiting}"));
+            self.count
+                .set_tooltip_text(Some("The newest of several things waiting for you"));
+        }
         if interruption == *self.active.borrow() {
             return;
         }
@@ -716,7 +732,25 @@ pub(crate) mod tests {
             shelf.jump_btn.label().as_deref(),
             Some("Answer in transcript ↓")
         );
+        // Several waiting: the shelf shows the newest and says there are more.
+        assert!(
+            !shelf.count.is_visible(),
+            "one thing waiting needs no count"
+        );
+        transcript.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: String::new(),
+                form: agent_core::form::Form::Fields { fields: vec![] },
+            })
+            .request("g2"),
+            Driver::Codex,
+        );
+        shelf.update(&transcript);
+        assert!(shelf.count.is_visible());
+        assert_eq!(shelf.count.text(), "1 of 2");
         shelf.update(&Transcript::new());
         assert!(!shelf.revealer.reveals_child());
+        assert!(!shelf.count.is_visible());
     }
 }

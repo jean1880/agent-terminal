@@ -411,8 +411,10 @@ pub fn openable_link(url: &str) -> bool {
 /// The host an openable link goes to, lowercased and without its port, for the card's
 /// "Opens <host>" line. `None` when the link may not be offered at all: not http or https, no
 /// host, credentials in it, a `\` anywhere (browsers read it as `/`, so the host a reader sees
-/// is not the one that opens), or anything but printable ASCII (no spaces, controls, bidi
-/// overrides or look-alike letters; an international host arrives in its `xn--` form).
+/// is not the one that opens), a `%` in the host (a browser decodes `%31%32%37.0.0.1` to
+/// `127.0.0.1`, so the host shown would not be the host opened), or anything but printable
+/// ASCII (no spaces, controls, bidi overrides or look-alike letters; an international host
+/// arrives in its `xn--` form). A trailing `.` on the host is dropped, as browsers do.
 pub fn link_host(url: &str) -> Option<String> {
     if !url.bytes().all(|b| b.is_ascii_graphic()) || url.contains('\\') {
         return None;
@@ -422,13 +424,18 @@ pub fn link_host(url: &str) -> Option<String> {
         .strip_prefix("https://")
         .or_else(|| lower.strip_prefix("http://"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
+    if authority.contains(['@', '%']) {
         return None;
     }
     let host = match authority.strip_prefix('[') {
         // An IPv6 literal keeps its brackets; its colons are not a port.
         Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or_default()),
-        None => authority.split(':').next().unwrap_or_default().to_owned(),
+        None => authority
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.')
+            .to_owned(),
     };
     let bare = host.trim_matches(['[', ']', '.']);
     (!bare.is_empty()).then_some(host)
@@ -467,51 +474,101 @@ pub fn link_concern(url: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a field asks for a password or another secret, judged from its key and title. A
-/// tool server must never ask for one in a form (MCP elicitation forbids it), and the answer
-/// would end up in the agent's context and history, so an adapter declines such a form.
+/// Whether a field asks for a password or another secret, judged from its key, title and
+/// description. A tool server must never ask for one in a form (MCP elicitation forbids it), and
+/// the answer would end up in the agent's context and history, so an adapter declines such a
+/// form.
+///
+/// This is a word list, so it is a backstop, not a control: a server can always word a request
+/// so it slips past (another language, look-alike letters). The form card therefore also tells
+/// the user, on every form with a text field, that agent-terminal never needs a secret there.
 pub fn asks_for_secret(field: &FormField) -> bool {
+    /// Single words, compared after a plural `s` is dropped.
     const SECRET: &[&str] = &[
         "password",
         "passwd",
         "passphrase",
+        "passcode",
+        "passwort",
+        "contraseña",
         "secret",
         "token",
         "apikey",
-        "credential",
-        "credentials",
+        "accesskey",
+        "secretkey",
         "privatekey",
+        "credential",
         "otp",
+        "otpcode",
         "totp",
         "mfa",
         "2fa",
+        "pat",
+        "pin",
+    ];
+    /// Two or three words read together.
+    const PHRASES: &[&str] = &[
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "privatekey",
+        "authcode",
+        "authorizationcode",
+        "authorisationcode",
+        "verificationcode",
+        "securitycode",
+        "logincode",
+        "smscode",
+        "onetimecode",
+        "onetimepassword",
+        "motdepasse",
+        "personalaccesstoken",
     ];
     let mut words: Vec<String> = Vec::new();
-    for text in [Some(field.name.as_str()), field.title.as_deref()]
-        .into_iter()
-        .flatten()
+    for text in [
+        Some(field.name.as_str()),
+        field.title.as_deref(),
+        field.description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
+        let chars: Vec<char> = text.chars().collect();
         let mut word = String::new();
-        let mut prev_lower = false;
-        for c in text.chars() {
-            let boundary = !c.is_alphanumeric() || (c.is_uppercase() && prev_lower);
+        for (i, &c) in chars.iter().enumerate() {
+            let prev = i.checked_sub(1).map(|p| chars[p]);
+            let next = chars.get(i + 1).copied();
+            // camelCase, and the end of an acronym: `OTPCode` is OTP + Code.
+            let boundary = !c.is_alphanumeric()
+                || (c.is_uppercase()
+                    && (prev.is_some_and(char::is_lowercase)
+                        || (prev.is_some_and(char::is_uppercase)
+                            && next.is_some_and(char::is_lowercase))));
             if boundary && !word.is_empty() {
                 words.push(std::mem::take(&mut word));
             }
             if c.is_alphanumeric() {
                 word.extend(c.to_lowercase());
             }
-            prev_lower = c.is_lowercase();
         }
         if !word.is_empty() {
             words.push(word);
         }
     }
-    let joined: Vec<String> = words.windows(2).map(|w| w.concat()).collect();
-    words
-        .iter()
-        .chain(&joined)
-        .any(|w| SECRET.contains(&w.as_str()))
+    let singular = |w: &str| -> String {
+        // `passwords` is `password`; `access` and `pass` keep their `ss`.
+        match w.strip_suffix('s') {
+            Some(stem) if stem.chars().count() >= 3 && !stem.ends_with('s') => stem.to_owned(),
+            _ => w.to_owned(),
+        }
+    };
+    let words: Vec<String> = words.iter().map(|w| singular(w)).collect();
+    let pairs = words.windows(2).map(|w| w.concat());
+    let triples = words.windows(3).map(|w| w.concat());
+    words.iter().any(|w| SECRET.contains(&w.as_str()))
+        || pairs
+            .chain(triples)
+            .any(|p| PHRASES.contains(&singular(&p).as_str()))
 }
 
 #[cfg(test)]
@@ -859,6 +916,25 @@ mod tests {
             Some("accounts.example.com")
         );
         assert_eq!(link_host("http://[::1]:8080/cb").as_deref(), Some("[::1]"));
+        assert_eq!(
+            link_host("https://%31%32%37.0.0.1/"),
+            None,
+            "a percent-encoded host would open somewhere other than shown"
+        );
+        assert_eq!(
+            link_host("https://example.com./").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            link_concern("http://localhost./"),
+            Some("This link goes to this computer or your local network."),
+            "a trailing dot does not hide localhost"
+        );
+        assert_eq!(
+            link_concern("https://2130706433/"),
+            Some("This link goes to a bare IP address, not a named site."),
+            "a whole-number IPv4 address"
+        );
         assert_eq!(link_concern("https://github.com/login"), None);
         for local in [
             "http://localhost:3000/callback",
@@ -908,15 +984,34 @@ mod tests {
             ("privateKey", None),
             ("mfa_code", None),
             ("dbPassphrase", None),
+            ("passwords", None),
+            ("api_keys", None),
+            ("access_key", None),
+            ("OTPCode", None),
+            ("pat", None),
+            ("x", Some("Passwort")),
+            ("x", Some("Mot de passe")),
+            ("x", Some("Verification code")),
+            ("x", Some("Personal access token")),
         ] {
             assert!(asks_for_secret(&named(name, title)), "{name} {title:?}");
         }
+        let described = FormField {
+            description: Some("Paste the one-time code shown on the page".into()),
+            ..named("value", Some("Value"))
+        };
+        assert!(asks_for_secret(&described), "the description counts too");
         for (name, title) in [
             ("repo", None),
             ("tokenizer_model", None),
             ("keyboard", None),
             ("x", Some("Primary key column")),
             ("branch", Some("Which branch?")),
+            ("max_items", None),
+            ("country_code", None),
+            ("x", Some("Secretary name")),
+            ("paths", None),
+            ("pattern", None),
         ] {
             assert!(!asks_for_secret(&named(name, title)), "{name} {title:?}");
         }

@@ -35,6 +35,18 @@ pub enum Target {
 pub struct Entry {
     pub access: Access,
     pub target: Target,
+    /// Where the target really is, when it reaches there through a symlink.
+    pub resolved: Option<String>,
+}
+
+impl Entry {
+    /// How the place reads in a list: "<target> → <resolved>" when it resolves elsewhere.
+    pub fn words(&self) -> String {
+        match &self.resolved {
+            Some(real) => format!("{} → {real}", self.target.words()),
+            None => self.target.words(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,12 +59,14 @@ pub struct Request {
     pub session_allowed: bool,
     /// The adapter's own plain warning (a broad grant), if any.
     pub warning: Option<String>,
+    /// The adapter's own one-line summary, preferred for the shelf.
+    pub summary: Option<String>,
     /// The card can say all of it. False: show the raw request and offer only a refusal.
     pub renderable: bool,
 }
 
 /// Whether `s` is safe to print as a line: no control, bidi or zero-width characters.
-fn plain(s: &str) -> bool {
+pub(super) fn plain(s: &str) -> bool {
     !s.chars().any(|c| {
         c.is_control()
             || matches!(c,
@@ -108,6 +122,7 @@ impl Request {
             network: None,
             session_allowed: false,
             warning: None,
+            summary: None,
             renderable: false,
         };
         let Some(object) = input.as_object() else {
@@ -123,6 +138,7 @@ impl Request {
         request.cwd = text("cwd").unwrap_or_default();
         request.reason = text("reason");
         request.warning = text("warning");
+        request.summary = text("summary");
         request.network = object.get("network").and_then(Value::as_bool);
         request.session_allowed = object
             .get("session_allowed")
@@ -139,10 +155,15 @@ impl Request {
         }
         // A request that asks for nothing at all is not one the user can judge.
         exact &= !request.entries.is_empty() || request.network == Some(true);
-        exact &= [Some(&request.cwd), request.reason.as_ref()]
-            .into_iter()
-            .flatten()
-            .all(|s| plain(s));
+        exact &= [
+            Some(&request.cwd),
+            request.reason.as_ref(),
+            request.warning.as_ref(),
+            request.summary.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|s| plain(s));
         request.renderable = exact;
         request
     }
@@ -229,7 +250,7 @@ impl Request {
                 continue;
             }
             lines.push(heading.to_owned());
-            lines.extend(places.map(|e| format!("  {}", e.target.words())));
+            lines.extend(places.map(|e| format!("  {}", e.words())));
         }
         match self.network {
             Some(true) => lines.push("Use the network".to_owned()),
@@ -241,8 +262,11 @@ impl Request {
 
     /// The shelf's single line.
     pub fn one_line(&self) -> String {
+        if let Some(summary) = &self.summary {
+            return summary.clone();
+        }
         let group = |label: &str, access: Access| {
-            let words: Vec<String> = self.of(access).map(|e| e.target.words()).collect();
+            let words: Vec<String> = self.of(access).map(|e| e.words()).collect();
             (!words.is_empty()).then(|| format!("{label} {}", words.join(", ")))
         };
         let mut parts: Vec<String> = [group("Write", Access::Write), group("Read", Access::Read)]
@@ -269,7 +293,7 @@ impl Request {
                 } else {
                     "Read"
                 };
-                format!("{verb}: {}", e.target.words())
+                format!("{verb}: {}", e.words())
             })
             .collect();
         if self.asks_network() {
@@ -309,7 +333,17 @@ fn parse_entry(raw: &Value) -> Option<Entry> {
         }
         _ => return None,
     };
-    Some(Entry { access, target })
+    // A resolved location must be as readable as the target itself, or the entry is not exact.
+    let resolved = match object.get("resolved") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && plain(s) => Some(s.clone()),
+        Some(_) => return None,
+    };
+    Some(Entry {
+        access,
+        target,
+        resolved,
+    })
 }
 
 #[cfg(test)]
@@ -439,6 +473,33 @@ mod tests {
             Request::parse(&Value::Null).one_line(),
             "Review this request"
         );
+    }
+
+    #[test]
+    fn a_symlinked_target_shows_where_it_really_is_and_the_adapters_summary_wins() {
+        let mut data = input(
+            json!([{"access": "write", "resolved": "/real/out",
+                    "target": {"kind": "path", "path": "/w/link"}}]),
+            json!(null),
+        );
+        let request = Request::parse(&data);
+        assert!(request.renderable);
+        assert_eq!(request.lines(), ["Write", "  /w/link → /real/out"]);
+        assert_eq!(request.grant_lines(), ["Write: /w/link → /real/out"]);
+        assert_eq!(request.one_line(), "Write /w/link → /real/out");
+        data["summary"] = json!("Write to /w/link (a symlink)");
+        assert_eq!(
+            Request::parse(&data).one_line(),
+            "Write to /w/link (a symlink)"
+        );
+        // A resolved location or warning that is not plain text is not exact.
+        data["entries"][0]["resolved"] = json!("/real/\u{202E}out");
+        assert!(!Request::parse(&data).renderable);
+        data["entries"][0]["resolved"] = json!(7);
+        assert!(!Request::parse(&data).renderable);
+        data["entries"][0]["resolved"] = json!(null);
+        data["warning"] = json!("careful\u{200B}");
+        assert!(!Request::parse(&data).renderable);
     }
 
     #[test]

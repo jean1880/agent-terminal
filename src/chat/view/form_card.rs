@@ -71,12 +71,8 @@ struct Inner {
     copy: Option<gtk4::Button>,
     opened: gtk4::Label,
     open_failed: gtk4::Label,
-    #[cfg_attr(not(test), allow(dead_code))]
-    host_line: gtk4::Label,
-    #[cfg_attr(not(test), allow(dead_code))]
-    concern: gtk4::Label,
-    #[cfg_attr(not(test), allow(dead_code))]
-    link_text: gtk4::Label,
+    /// The agent did not accept the last answer (shown above the buttons).
+    refusal: gtk4::Label,
     state: Cell<FormState>,
     used_open: Cell<bool>,
     launcher: RefCell<Launcher>,
@@ -171,7 +167,6 @@ impl Inner {
         body.add_css_class("form-body");
         let mut fields = Vec::new();
         let mut draft = Draft::new(&[]);
-        let (mut host_line, mut concern, mut link_text) = (None, None, None);
         match &card.form {
             Form::Fields { fields: specs } => {
                 draft = Draft::new(specs);
@@ -182,10 +177,7 @@ impl Inner {
                     fields.push(ui);
                 }
             }
-            Form::Link { url } => {
-                let (h, c, l) = build_link(url, &body);
-                (host_line, concern, link_text) = (Some(h), Some(c), Some(l));
-            }
+            Form::Link { url } => build_link(url, &body),
             Form::Unknown => {}
         }
         root.append(&body);
@@ -210,6 +202,27 @@ impl Inner {
         // The reason or outcome above the buttons: the buttons wrap, and a wrapping label
         // beside a wrapping row is where GTK's height-for-width measuring disagrees with itself.
         let footer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        // Text typed here goes to a tool server: say, in the app's own words, what never to type.
+        if let Form::Fields { fields: specs } = &card.form {
+            if specs
+                .iter()
+                .any(|f| matches!(f.input, FieldInput::Text { .. }))
+            {
+                let warn = label(
+                    "agent-terminal never needs a password, key or code here. Don't paste one.",
+                    &["form-note", "form-secret-note"],
+                );
+                wrapping(&warn);
+                footer.append(&warn);
+            }
+        }
+        let refusal = label(
+            "Codex did not accept that answer. Try again, or decline.",
+            &["form-error"],
+        );
+        wrapping(&refusal);
+        refusal.set_visible(card.refused);
+        footer.append(&refusal);
         let status = label("", &["approval-outcome"]);
         wrapping(&status);
         status.set_visible(false);
@@ -262,12 +275,7 @@ impl Inner {
             &[],
             "Tell the tool server you will not answer; the agent carries on",
         );
-        let stop = pill(
-            // "Dismiss", not "Stop turn": a form may belong to no turn, and the card cannot tell.
-            "Dismiss",
-            &["destructive-action"],
-            "Dismiss this form; if it belongs to the running turn, the turn stops too.",
-        );
+        // No second way to say no: Decline is the answer, and the composer's Stop ends the turn.
         // Tab order: the fields above, then these, left to right.
         for b in [&open, &submit, &done].into_iter().flatten() {
             add_button(&buttons, b);
@@ -277,7 +285,6 @@ impl Inner {
             show_in_row(copy, false);
         }
         add_button(&buttons, &decline);
-        add_button(&buttons, &stop);
         if let Some(copy) = &copy {
             if let Form::Link { url } = &card.form {
                 let url = url.clone();
@@ -294,7 +301,6 @@ impl Inner {
             });
         };
         wire_action(&decline, FormAction::Decline);
-        wire_action(&stop, FormAction::Cancel);
         if let Some(done) = &done {
             wire_action(done, FormAction::Accept);
         }
@@ -332,9 +338,7 @@ impl Inner {
             copy,
             opened,
             open_failed,
-            host_line: host_line.unwrap_or_else(|| label("", &[])),
-            concern: concern.unwrap_or_else(|| label("", &[])),
-            link_text: link_text.unwrap_or_else(|| label("", &[])),
+            refusal,
             state: Cell::new(card.state),
             used_open: Cell::new(false),
             launcher: RefCell::new(desktop_launcher()),
@@ -344,7 +348,7 @@ impl Inner {
         inner
     }
 
-    /// The user pressed Decline, Dismiss or Done.
+    /// The user pressed Decline or Done.
     fn act(&self, action: FormAction) {
         if self.state.get() != FormState::Pending {
             return;
@@ -490,6 +494,8 @@ impl Inner {
     fn update(&self, card: &FormCard) {
         self.state.set(card.state);
         self.show_state(card.state);
+        self.refusal
+            .set_visible(card.refused && card.state == FormState::Pending);
         self.refresh();
     }
 
@@ -552,7 +558,7 @@ impl Inner {
 }
 
 /// The link block: "Opens <host>", a warning when the link needs one, and the whole link.
-fn build_link(url: &str, body: &gtk4::Box) -> (gtk4::Label, gtk4::Label, gtk4::Label) {
+fn build_link(url: &str, body: &gtk4::Box) {
     let host = form::link_host(url).unwrap_or_default();
     let host_line = label("", &["form-host"]);
     host_line.set_markup(&format!("Opens <b>{}</b>", glib::markup_escape_text(&host)));
@@ -568,7 +574,6 @@ fn build_link(url: &str, body: &gtk4::Box) -> (gtk4::Label, gtk4::Label, gtk4::L
     text.update_property(&[gtk4::accessible::Property::Label("The whole link")]);
     frame.append(&text);
     body.append(&frame);
-    (host_line, concern, text)
 }
 
 /// The label row of a field: its name, and "Required" when it must be answered.
@@ -649,6 +654,54 @@ fn wire(ui_root: &gtk4::Box, index: usize, weak: &Weak<Inner>) {
     ui_root.add_controller(focus);
 }
 
+/// What differs between a text field and a number field, which are otherwise the same entry.
+struct EntryKind {
+    placeholder: &'static str,
+    purpose: gtk4::InputPurpose,
+    /// What it starts with (its default), if anything.
+    start: Option<String>,
+    /// What typed text means: nothing, or the value the draft holds.
+    value: fn(&str) -> Value,
+}
+
+/// A single-line field. It is an `Entry` even for a number (a spin button always holds a number,
+/// so a field nobody touched would send 0). Enter in the last field tries to submit.
+fn entry_field(
+    kind: EntryKind,
+    accessible: &str,
+    required: bool,
+    (index, last): (usize, bool),
+    weak: &Weak<Inner>,
+) -> gtk4::Entry {
+    let entry = gtk4::Entry::new();
+    entry.set_hexpand(true);
+    entry.set_placeholder_text(Some(kind.placeholder));
+    entry.set_input_purpose(kind.purpose);
+    if let Some(start) = &kind.start {
+        entry.set_text(start);
+    }
+    entry.update_property(&[
+        gtk4::accessible::Property::Label(accessible),
+        gtk4::accessible::Property::Required(required),
+    ]);
+    let value = kind.value;
+    entry.connect_changed({
+        let weak = weak.clone();
+        move |entry| record(&weak, index, value(entry.text().as_str()))
+    });
+    if last {
+        entry.connect_activate({
+            let weak = weak.clone();
+            move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.attempt();
+                }
+            }
+        });
+    }
+    entry
+}
+
 fn record(weak: &Weak<Inner>, index: usize, value: Value) {
     if let Some(inner) = weak.upgrade() {
         // Dropped before refresh, which borrows the draft again.
@@ -688,49 +741,34 @@ fn build_field(
     let limits = describe_limits(&spec.input);
     match &spec.input {
         FieldInput::Text { format, .. } => {
-            let entry = gtk4::Entry::new();
-            entry.set_hexpand(true);
-            entry.set_placeholder_text(Some(match format {
-                Some(TextFormat::Email) => "name@example.com",
-                Some(TextFormat::Uri) => "https://example.com",
-                Some(TextFormat::Date) => "YYYY-MM-DD",
-                Some(TextFormat::DateTime) => "YYYY-MM-DDThh:mm",
-                _ => "",
-            }));
-            entry.set_input_purpose(match format {
-                Some(TextFormat::Email) => gtk4::InputPurpose::Email,
-                Some(TextFormat::Uri) => gtk4::InputPurpose::Url,
-                _ => gtk4::InputPurpose::FreeForm,
-            });
-            if let Value::String(text) = initial {
-                entry.set_text(text);
-            }
-            entry.update_property(&[
-                gtk4::accessible::Property::Label(&accessible),
-                gtk4::accessible::Property::Required(spec.required),
-            ]);
-            entry.connect_changed({
-                let weak = weak.clone();
-                move |entry| {
-                    let text = entry.text();
-                    let value = if text.trim().is_empty() {
-                        Value::Null
-                    } else {
-                        Value::String(text.to_string())
-                    };
-                    record(&weak, index, value);
-                }
-            });
-            if last {
-                entry.connect_activate({
-                    let weak = weak.clone();
-                    move |_| {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.attempt();
+            let entry = entry_field(
+                EntryKind {
+                    placeholder: match format {
+                        Some(TextFormat::Email) => "name@example.com",
+                        Some(TextFormat::Uri) => "https://example.com",
+                        Some(TextFormat::Date) => "YYYY-MM-DD",
+                        Some(TextFormat::DateTime) => "YYYY-MM-DDThh:mm",
+                        _ => "",
+                    },
+                    purpose: match format {
+                        Some(TextFormat::Email) => gtk4::InputPurpose::Email,
+                        Some(TextFormat::Uri) => gtk4::InputPurpose::Url,
+                        _ => gtk4::InputPurpose::FreeForm,
+                    },
+                    start: initial.as_str().map(str::to_owned),
+                    value: |text| {
+                        if text.trim().is_empty() {
+                            Value::Null
+                        } else {
+                            Value::String(text.to_owned())
                         }
-                    }
-                });
-            }
+                    },
+                },
+                &accessible,
+                spec.required,
+                (index, last),
+                weak,
+            );
             root.append(&entry);
             focus = entry.clone().upcast();
             marks.push(entry.upcast());
@@ -738,35 +776,22 @@ fn build_field(
         FieldInput::Number { integer, .. } => {
             // An entry, not a spin button: a spin button always holds a number, so a field
             // nobody touched would send 0.
-            let entry = gtk4::Entry::new();
-            entry.set_hexpand(true);
-            entry.set_input_purpose(if *integer {
-                gtk4::InputPurpose::Digits
-            } else {
-                gtk4::InputPurpose::Number
-            });
-            entry.set_placeholder_text(Some(if *integer { "Whole number" } else { "Number" }));
-            if let Value::Number(n) = initial {
-                entry.set_text(&n.to_string());
-            }
-            entry.update_property(&[
-                gtk4::accessible::Property::Label(&accessible),
-                gtk4::accessible::Property::Required(spec.required),
-            ]);
-            entry.connect_changed({
-                let weak = weak.clone();
-                move |entry| record(&weak, index, number_value(entry.text().as_str()))
-            });
-            if last {
-                entry.connect_activate({
-                    let weak = weak.clone();
-                    move |_| {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.attempt();
-                        }
-                    }
-                });
-            }
+            let entry = entry_field(
+                EntryKind {
+                    placeholder: if *integer { "Whole number" } else { "Number" },
+                    purpose: if *integer {
+                        gtk4::InputPurpose::Digits
+                    } else {
+                        gtk4::InputPurpose::Number
+                    },
+                    start: initial.as_number().map(|n| n.to_string()),
+                    value: number_value,
+                },
+                &accessible,
+                spec.required,
+                (index, last),
+                weak,
+            );
             root.append(&entry);
             focus = entry.clone().upcast();
             marks.push(entry.upcast());
@@ -1115,19 +1140,43 @@ impl FormCardWidget {
             .is_some_and(|b| b.has_css_class("suggested-action"))
     }
 
+    /// The first label of the card with CSS class `class` (visible or not).
+    fn label_with(&self, class: &str) -> Option<gtk4::Label> {
+        crate::testutil::descendants(self.inner.root.upcast_ref())
+            .into_iter()
+            .find(|w| w.has_css_class(class))
+            .and_then(|w| w.downcast::<gtk4::Label>().ok())
+    }
+
     pub(super) fn host_line(&self) -> String {
-        self.inner.host_line.text().to_string()
+        self.label_with("form-host")
+            .map(|l| l.text().to_string())
+            .unwrap_or_default()
     }
 
     pub(super) fn concern(&self) -> Option<String> {
-        self.inner
-            .concern
-            .is_visible()
-            .then(|| self.inner.concern.text().to_string())
+        self.label_with("approval-warning")
+            .filter(|l| l.is_visible())
+            .map(|l| l.text().to_string())
     }
 
     pub(super) fn link_text(&self) -> String {
-        self.inner.link_text.text().to_string()
+        self.label_with("mono-text")
+            .map(|l| l.text().to_string())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn refusal(&self) -> Option<String> {
+        self.inner
+            .refusal
+            .is_visible()
+            .then(|| self.inner.refusal.text().to_string())
+    }
+
+    /// The app's own warning about secrets, when the form has a text field.
+    pub(super) fn secret_note(&self) -> Option<String> {
+        self.label_with("form-secret-note")
+            .map(|l| l.text().to_string())
     }
 
     pub(super) fn opened_note(&self) -> Option<String> {
@@ -1187,6 +1236,7 @@ pub(crate) mod tests {
             message: "Which repo should I use?".into(),
             form,
             state: FormState::Pending,
+            refused: false,
         }
     }
 
@@ -1307,7 +1357,7 @@ pub(crate) mod tests {
         assert!(quote.has_css_class("form-message"));
 
         // Nothing is answered, and Submit says why it is off, in one line.
-        assert_eq!(card.buttons(), ["Submit", "Decline", "Dismiss"]);
+        assert_eq!(card.buttons(), ["Submit", "Decline"]);
         assert_eq!(card.submit_enabled(), Some(false));
         assert_eq!(card.status(), "Fill in Repo name");
         assert_eq!(card.sent_to().as_deref(), Some("Sent to github."));
@@ -1362,12 +1412,15 @@ pub(crate) mod tests {
         depth.set_text("4");
         assert!(card.error(1).is_none());
 
-        // Decline and Dismiss send no content.
-        assert!(card.button("Decline").is_some());
+        // Decline sends no content, and there is no second way to say no.
         card.button("Decline").expect("decline").emit_clicked();
         assert_eq!(last_form(&events), (FormAction::Decline, None));
-        card.button("Dismiss").expect("stop").emit_clicked();
-        assert_eq!(last_form(&events), (FormAction::Cancel, None));
+        assert!(card.button("Dismiss").is_none() && card.button("Stop turn").is_none());
+        // Said in the app's own words, because the form has a text field.
+        assert_eq!(
+            card.secret_note().as_deref(),
+            Some("agent-terminal never needs a password, key or code here. Don't paste one.")
+        );
     }
 
     fn only_what_the_user_touched_or_was_given_is_sent() {
@@ -1585,10 +1638,7 @@ pub(crate) mod tests {
             "https://github.com/login/device?code=AB-CD"
         );
         assert!(card.concern().is_none());
-        assert_eq!(
-            card.buttons(),
-            ["Open in Browser", "Done", "Decline", "Dismiss"]
-        );
+        assert_eq!(card.buttons(), ["Open in Browser", "Done", "Decline"]);
         assert!(card.is_suggested("Open in Browser") && !card.is_suggested("Done"));
         assert!(
             labels_in(card.root()).contains(&"A tool server wants you to open a link".to_owned())

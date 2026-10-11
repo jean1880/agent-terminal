@@ -35,6 +35,7 @@ use gtk4::glib;
 use tracing::{debug, info, warn};
 
 mod agy_transcript;
+mod reply_questions;
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
@@ -225,6 +226,8 @@ struct Inner {
     approval_deadline: Cell<Duration>,
     /// Claude's `--thinking-display summarized` for the running process (W3.2).
     thinking: ThinkingFlag,
+    /// What the current turn said, for the quick replies offered when it completes.
+    reply_turn: RefCell<reply_questions::ReplyTurn>,
 }
 
 /// Whether the running Claude process got `--thinking-display summarized`, and how it took it.
@@ -421,6 +424,7 @@ impl ChatSession {
             agy_hold: RefCell::new(std::collections::VecDeque::new()),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
             thinking: ThinkingFlag::default(),
+            reply_turn: RefCell::default(),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -565,10 +569,15 @@ impl Inner {
             warn!(error = %e, "could not persist an event");
         }
         self.apply(&env);
+        self.reply_turn.borrow_mut().observe(&env);
         // Every event is masked on the way to the view (not only approvals: tool input and
         // output, errors, notices and questions carry secrets too); the rules judged the real
         // call. A secret split across two streaming deltas is only caught at persistence.
+        let turn_ended = matches!(env.event, Event::TurnCompleted { .. }).then(|| env.clone());
         (self.sink)(&crate::approval_server::masked_for_view(env));
+        if let Some(ended) = turn_ended {
+            self.offer_reply_question(&ended);
+        }
     }
 
     /// Delivers without persisting (the store already has it).
@@ -2775,17 +2784,20 @@ impl ChatBackend for ChatSession {
         request: &str,
         action: agent_core::form::FormAction,
         content: Option<serde_json::Value>,
-    ) {
+    ) -> bool {
         // Like a question: nothing acknowledges the answer, so the card is resolved once the
-        // adapter has accepted and written it. A refused answer leaves the card open.
-        if self.inner.command(Command::SubmitForm {
+        // adapter has accepted and written it. A refused answer emits nothing and returns
+        // false, and the view reopens the card with a line saying so.
+        let accepted = self.inner.command(Command::SubmitForm {
             request: request.to_owned(),
             action,
             content,
-        }) {
+        });
+        if accepted {
             self.inner
                 .emit(Envelope::new(Event::FormResolved { action }).request(request));
         }
+        accepted
     }
 
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {

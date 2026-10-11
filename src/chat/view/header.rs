@@ -205,7 +205,7 @@ impl Header {
         ));
         access_pop_box.append(&access_list);
         access_pop_box.append(&label(
-            "This lasts until Codex restarts for this thread.",
+            "This lasts until this thread's Codex session restarts.",
             &["dim-label"],
         ));
         let access_pop = gtk4::Popover::new();

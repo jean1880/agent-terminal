@@ -36,13 +36,20 @@ pub enum RowEvent {
         request: String,
         answers: Value,
     },
-    /// A form card was submitted (`content` is what the form's check returned), declined or
-    /// dismissed.
+    /// A form card was submitted (`content` is what the form's check returned) or declined.
     Form {
         request: String,
         action: agent_core::form::FormAction,
         content: Option<Value>,
     },
+    /// A quick-reply chip was chosen: its text goes in the composer, nothing is sent.
+    QuickReply {
+        text: String,
+    },
+    /// "Dismiss" on the quick-reply chips.
+    DismissQuickReplies,
+    /// "Don't suggest these" on the quick-reply chips.
+    StopQuickReplies,
     /// A file-change card was asked to show its diff.
     LoadDiff {
         id: String,
@@ -522,6 +529,9 @@ impl Row {
             Body::Approval(_) => Self::Approval(ApprovalCard::new(sink)),
             Body::Question(q) => Self::Question(QuestionCardWidget::new(q, sink)),
             Body::Form(f) => Self::Form(FormCardWidget::new(f, sink)),
+            Body::QuickReplies(q) => {
+                Self::Static(super::quick_replies::row(&q.options, sink).upcast())
+            }
             Body::Plan { .. } => {
                 let root = gtk4::Expander::new(None);
                 let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -1945,6 +1955,8 @@ impl ApprovalCard {
             .title
             .clone()
             .filter(|t| !t.trim().is_empty())
+            // A permission request's title is shown only if it is plain text.
+            .filter(|t| permission.is_none() || permission::plain(t))
             .or_else(|| permission.as_ref().map(permission::Request::title))
             .unwrap_or_else(|| format!("Allow {}?", a.tool));
         self.title.set_text(&title);
@@ -2227,7 +2239,7 @@ impl ApprovalCard {
         let note = match (request.renderable, session) {
             (false, _) => String::new(),
             (true, true) => "“Allow for this turn” lasts until the turn ends. “Allow for this \
-                             session” lasts until Codex restarts for this thread."
+                             session” lasts until this thread's Codex session restarts."
                 .to_owned(),
             (true, false) => "“Allow for this turn” lasts until the turn ends.".to_owned(),
         };
@@ -2307,6 +2319,25 @@ impl ApprovalCard {
 // Question card
 // ---------------------------------------------------------------------------------------------
 
+/// What an option button holds: its label and, under it, a dim description. Shared by the
+/// question card and the quick-reply chips so both read alike. Wraps: a long option must not set
+/// the transcript's minimum width.
+pub(super) fn option_content(text: &str, description: Option<&str>) -> gtk4::Box {
+    let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    let ol = label(text, &["option-label"]);
+    wrapping(&ol);
+    ol.set_hexpand(false);
+    ol.set_max_width_chars(36);
+    inner.append(&ol);
+    if let Some(d) = description {
+        let dl = label(d, &["option-desc"]);
+        wrapping(&dl);
+        dl.set_max_width_chars(36);
+        inner.append(&dl);
+    }
+    inner
+}
+
 pub struct QuestionCardWidget {
     root: gtk4::Box,
     submit: gtk4::Button,
@@ -2360,20 +2391,10 @@ impl QuestionCardWidget {
             for (oi, opt) in q.options.iter().enumerate() {
                 let b = gtk4::ToggleButton::new();
                 b.add_css_class("option-button");
-                let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-                // Wraps: a long option must not set the transcript's minimum width.
-                let ol = label(&opt.label, &["option-label"]);
-                wrapping(&ol);
-                ol.set_hexpand(false);
-                ol.set_max_width_chars(36);
-                inner.append(&ol);
-                if let Some(d) = &opt.description {
-                    let dl = label(d, &["option-desc"]);
-                    wrapping(&dl);
-                    dl.set_max_width_chars(36);
-                    inner.append(&dl);
-                }
-                b.set_child(Some(&inner));
+                b.set_child(Some(&option_content(
+                    &opt.label,
+                    opt.description.as_deref(),
+                )));
                 if !q.multi_select {
                     if let Some(first) = &group {
                         b.set_group(Some(first));
@@ -3574,7 +3595,7 @@ pub(crate) mod tests {
             "Read\n  /data\n  the project\nWrite\n  /w/out\nStill blocked\n  /w/.git\nUse the network"
         );
         assert_eq!(warning, "");
-        assert!(note.contains("Allow for this turn") && note.contains("until Codex restarts"));
+        assert!(note.contains("Allow for this turn") && note.contains("session restarts"));
         assert!(!raw_open, "a request it can say is not dumped open");
         assert!(!card.input_section.root.is_visible(), "no JSON dump");
 

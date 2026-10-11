@@ -27,6 +27,7 @@ pub mod model;
 mod panels;
 mod payload;
 mod permission;
+mod quick_replies;
 mod subagent_shelf;
 mod subagents;
 mod thinking;
@@ -79,6 +80,9 @@ pub enum ViewAction {
     /// The user picked `mode` in the header for this thread's `driver`: the window offers to make
     /// it that agent's default for new threads.
     ModeChosen { driver: Driver, mode: Mode },
+    /// "Don't suggest these" on the quick-reply chips: the window turns the setting off, which
+    /// applies at once, and says where it turns back on.
+    StopQuickReplies,
 }
 
 type ActionHandler = Rc<dyn Fn(&ViewAction)>;
@@ -846,6 +850,13 @@ impl Inner {
         true
     }
 
+    /// Takes the quick-reply chips away and hands focus back to the composer.
+    fn dismiss_quick_replies(self: &Rc<Self>) {
+        let changes = self.model.borrow_mut().dismiss_quick_replies();
+        self.handle(changes);
+        self.composer.grab_focus();
+    }
+
     fn row_event(self: &Rc<Self>, e: RowEvent) {
         match e {
             RowEvent::Toggle { id, expanded } => {
@@ -885,8 +896,19 @@ impl Inner {
             } => {
                 let changes = self.model.borrow_mut().mark_form_sent(&request);
                 self.handle(changes);
-                self.backend.respond_form(&request, action, content);
-                self.composer.grab_focus();
+                if self.backend.respond_form(&request, action, content) {
+                    self.composer.grab_focus();
+                } else {
+                    // Refused: the card is answerable again, with a line saying so.
+                    let changes = self.model.borrow_mut().mark_form_refused(&request);
+                    self.handle(changes);
+                }
+            }
+            RowEvent::QuickReply { text } => self.composer.fill(&text),
+            RowEvent::DismissQuickReplies => self.dismiss_quick_replies(),
+            RowEvent::StopQuickReplies => {
+                self.dismiss_quick_replies();
+                self.emit(ViewAction::StopQuickReplies);
             }
             RowEvent::LoadDiff { id } => self.load_diff(&id),
             RowEvent::OpenDiff { id } => {
@@ -1822,6 +1844,8 @@ pub(crate) mod tests {
     pub(super) struct AnswerLog {
         pub(super) status: RefCell<SessionStatus>,
         pub(super) approvals: RefCell<Vec<(String, Decision)>>,
+        /// Answer `false` to `respond_form`, as an adapter that refused it does.
+        pub(super) refuse: Cell<bool>,
         pub(super) forms: RefCell<
             Vec<(
                 String,
@@ -1836,6 +1860,7 @@ pub(crate) mod tests {
             Rc::new(Self {
                 status: RefCell::new(status_of(driver)),
                 approvals: RefCell::default(),
+                refuse: Cell::new(false),
                 forms: RefCell::default(),
             })
         }
@@ -1855,10 +1880,11 @@ pub(crate) mod tests {
             request: &str,
             action: agent_core::form::FormAction,
             content: Option<serde_json::Value>,
-        ) {
+        ) -> bool {
             self.forms
                 .borrow_mut()
                 .push((request.to_owned(), action, content));
+            !self.refuse.get()
         }
         fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
         fn reload_session(&self) {}
@@ -1920,19 +1946,43 @@ pub(crate) mod tests {
         assert!(hint().starts_with("Awaiting your answer"), "{}", hint());
         let (entry, status, buttons) = form_row("form:f").flatten().expect("form card");
         assert_eq!(status, "Fill in Repo name");
-        assert_eq!(buttons, ["Submit", "Decline", "Dismiss"]);
+        assert_eq!(buttons, ["Submit", "Decline"]);
         let entry = entry.expect("entry");
         entry.emit_activate();
         assert!(backend.forms.borrow().is_empty(), "invalid: nothing sent");
         entry.set_text("octo");
+        // An answer the adapter refuses must not strand the card at "Sending…".
+        backend.refuse.set(true);
+        entry.emit_activate();
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+        assert_eq!(backend.forms.borrow().len(), 1, "it was tried");
+        let refusal = inner
+            .transcript
+            .with_row("form:f", |row| match row {
+                cards::Row::Form(card) => Some((card.refusal(), card.buttons())),
+                _ => None,
+            })
+            .flatten()
+            .expect("form card");
+        assert_eq!(
+            refusal.0.as_deref(),
+            Some("Codex did not accept that answer. Try again, or decline.")
+        );
+        assert_eq!(refusal.1, ["Submit", "Decline"], "answerable again");
+        assert!(
+            inner.interruption.revealer.reveals_child(),
+            "still waiting on the user"
+        );
+        backend.refuse.set(false);
         entry.emit_activate();
         assert_eq!(
-            *backend.forms.borrow(),
-            [(
+            backend.forms.borrow()[1],
+            (
                 "f".to_owned(),
                 FormAction::Accept,
                 Some(json!({"repo_name": "octo"}))
-            )]
+            )
         );
         assert!(
             !inner.interruption.revealer.reveals_child(),

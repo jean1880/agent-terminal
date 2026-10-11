@@ -548,13 +548,14 @@ impl ChatBackend for DemoBackend {
         request: &str,
         action: agent_core::form::FormAction,
         content: Option<Value>,
-    ) {
+    ) -> bool {
         // The demo never keeps what was typed: only the outcome comes back.
         let _ = content;
         self.push([
             Step::Wait(300),
             Step::Emit(Envelope::new(Event::FormResolved { action }).request(request)),
         ]);
+        true
     }
 
     fn answer_questions(&self, request: &str, answers: Value) {
