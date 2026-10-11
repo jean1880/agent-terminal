@@ -1,6 +1,6 @@
 # Seamless cross-agent experience: closing the parity and UI gaps
 
-Status: APPROVED (plan-reviewer round 2; user CHALLENGE answered); W0 running · 2026-10-10 · HEAD `8502282` (3.3.0)
+Status: DONE (W0–W4 on master, pushed for beta; CI green) · combined 3.4.0 release drafted, not tagged · 2026-10-11 · HEAD `d71cd74f`
 Hive: topic #29 `agent-terminal-seamless-parity`. Round 1 is #301–#318, Round 2 is #319–#321, and the confirmed matcher bypass is #310.
 Evidence:
 - `docs/feature-parity-report.md`;
@@ -183,6 +183,11 @@ Each wave is a release. `git revert` the wave's commits and ship the previous ve
 - **U3. W0 runs now** (about 6 real turns). W1 work that does not depend on Codex starts in parallel.
 
 ## Log
+- 2026-10-11: Closed out. Pushed master (beta suite). CI had been red since before this work. Two causes, both libadwaita 1.5 only and reproduced in an Ubuntu 24.04 container:
+  - Escaped `&` in markup titles: the titles now say "and" (`6fdcac8a`).
+  - The environment-review test answered its dialog before the sheet opened. It now settles first and presses the buttons (`d71cd74f`).
+
+  CI is green. Hive #29 is resolved with its findings set. Worktrees are removed; branches are kept. Open: tagging the combined 3.4.0 release, a full live parity re-run (optional, about 45 turns), and the Codex question polyfill (separate plan).
 - 2026-10-11: Resumed. All waves are on master: W1a/W1b, W2 (plus Stop turn on every card, `0c28918f`), W3 core and app, W4, and F17 (reasoning as markdown). The W1 security gate took 5 rounds:
   - Round 1: the four checkers rejected the first cut.
   - Round 2: the native red-team said SHIP, rust-review approved, Codex and agy did not.
