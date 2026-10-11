@@ -183,6 +183,7 @@ Each wave is a release. `git revert` the wave's commits and ship the previous ve
 - **U3. W0 runs now** (about 6 real turns). W1 work that does not depend on Codex starts in parallel.
 
 ## Log
+- 2026-10-10: Execution. User: live_smoke runs approved for every wave; no per-wave releases: waves merge to `master` (the beta suite builds it) and ship as ONE combined release at the end. Round 1 lanes in worktrees: W1a (`w1a-rules`), 1.4/1.12 (`lane-agy-policy`), 1.8/1.9 + W4 (`lane-view-parity`), live_smoke (`lane-live-smoke`).
 - 2026-10-10: W0 done (Codex 4 turns, one over the ~3 approved; Claude 2; agy 1, whose cwd slipped to $HOME on a read-only prompt). Results:
   - D5 GO; thinking flag GO.
   - Codex accepts an unoffered `decline`, so D4 is simplified to the same five buttons everywhere.
