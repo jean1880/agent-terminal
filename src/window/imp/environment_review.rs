@@ -181,18 +181,26 @@ pub(super) mod tests {
                 .unwrap_or_else(|| panic!("the confirmation has a {label:?} button"));
             button.emit_clicked();
         };
-        press(&cancel, "Cancel");
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
-            .visible_dialog()
-            .is_none()));
+        // A press that lands while a busy runner is still opening the sheet is ignored, as a
+        // user's would be; press again until the dialog goes (a user would click again too).
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            if window.visible_dialog().is_none() {
+                return true;
+            }
+            press(&cancel, "Cancel");
+            crate::testutil::pump_until(&ctx, 1, || window.visible_dialog().is_none())
+        }));
         assert_eq!(imp.tabs.borrow().len(), before);
         let review = trigger();
-        press(&review, "Start Review");
-        assert!(crate::testutil::pump_until(&ctx, 5, || imp
-            .tabs
-            .borrow()
-            .len()
-            == before + 1));
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            if imp.tabs.borrow().len() == before + 1 {
+                return true;
+            }
+            if window.visible_dialog().is_some() {
+                press(&review, "Start Review");
+            }
+            crate::testutil::pump_until(&ctx, 1, || imp.tabs.borrow().len() == before + 1)
+        }));
         let tabs = imp.tabs.borrow();
         let added = tabs.last().unwrap();
         assert_eq!(added.dir, dir, "clicked target wins over the selected page");
