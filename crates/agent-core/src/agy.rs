@@ -18,7 +18,10 @@ use crate::adapter::{
     Outbox,
 };
 use crate::caps::Capabilities;
-use crate::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState, Usage};
+use crate::event::{
+    Envelope, Event, ItemKind, ItemStatus, ReasoningLabel, ReasoningState, StreamKind, TurnState,
+    Usage,
+};
 
 /// Read-only slash commands the CLI answers itself. Inside a stream-json session they fail and
 /// the process exits, so they are never forwarded: each runs as its own `agy -p /cmd` process.
@@ -184,6 +187,20 @@ impl AgyAdapter {
         );
     }
 
+    /// Opens a thinking item. agy hands over each thinking block whole (its transcript has it,
+    /// stdout does not stream it), so the block is Complete from the start: never streamed for
+    /// show.
+    fn start_thinking(&mut self, out: &mut Vec<Envelope>, id: &str) {
+        self.start_item(out, id, ItemKind::Reasoning, "Thinking".to_owned());
+        out.push(
+            Envelope::new(Event::Reasoning {
+                state: ReasoningState::Complete,
+                label: ReasoningLabel::Thinking,
+            })
+            .item(id),
+        );
+    }
+
     fn complete_item(
         &mut self,
         out: &mut Vec<Envelope>,
@@ -280,15 +297,9 @@ impl AgyAdapter {
             let think_id = self.item_id("think", index);
             if !self.completed_thinks.contains(&think_id) {
                 if !self.open_items.contains(&think_id) {
-                    self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
+                    self.start_thinking(out, &think_id);
                 }
-                out.push(
-                    Envelope::new(Event::ContentDelta {
-                        stream: StreamKind::Reasoning,
-                        text: think_text.to_owned(),
-                    })
-                    .item(&think_id),
-                );
+                out.push(thinking_text(&think_id, think_text));
                 if step.state == "DONE" {
                     self.completed_thinks.insert(think_id.clone());
                     self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
@@ -336,14 +347,8 @@ impl AgyAdapter {
             if !self.completed_thinks.contains(&think_id) {
                 self.completed_thinks.insert(think_id.clone());
                 if !self.open_items.contains(&think_id) {
-                    self.start_item(out, &think_id, ItemKind::Reasoning, "Thinking".to_owned());
-                    out.push(
-                        Envelope::new(Event::ContentDelta {
-                            stream: StreamKind::Reasoning,
-                            text: think_text.to_owned(),
-                        })
-                        .item(&think_id),
-                    );
+                    self.start_thinking(out, &think_id);
+                    out.push(thinking_text(&think_id, think_text));
                     self.complete_item(out, &think_id, ItemStatus::Completed, None, None);
                 }
             }
@@ -753,6 +758,16 @@ impl Adapter for AgyAdapter {
 
 fn env(event: Event) -> Envelope {
     Envelope::new(event)
+}
+
+/// A thinking block's whole text: a snapshot, so a repeated step update replaces it rather than
+/// appending it again.
+fn thinking_text(id: &str, text: &str) -> Envelope {
+    Envelope::new(Event::ContentSnapshot {
+        stream: StreamKind::Reasoning,
+        text: text.to_owned(),
+    })
+    .item(id)
 }
 
 fn unknown(raw: Value) -> Envelope {
@@ -1680,7 +1695,7 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "Let me inspect the file")));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "Let me inspect the file")));
         assert!(events.iter().any(|e| matches!(
             &e.event,
             Event::ItemStarted {
@@ -1698,7 +1713,55 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "Now explain what was found")));
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "Now explain what was found")));
         assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Assistant, text } if text == "The file looks good.")));
+    }
+
+    /// W3.1 contract, from the W0 agy frames (`read-outside-project.jsonl`) with the thinking the
+    /// session reads from agy's transcript put on the step, as `enrich_agy_step` does: one
+    /// reasoning block, Complete at once (never Streaming), its text whole, delivered once even
+    /// though the step is reported twice (ACTIVE, then DONE).
+    #[test]
+    fn w0_agy_thinking_is_one_whole_block_never_streamed() {
+        let fixture = include_str!("../../../tests/fixtures/real/agy/read-outside-project.jsonl");
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        let mut out = Vec::new();
+        for line in fixture.lines() {
+            let mut frame: Value = serde_json::from_str(line).expect("fixture line");
+            if let Some(step) = frame.get_mut("step_update").and_then(Value::as_object_mut) {
+                step.insert("thinking".into(), json!("Reading the hostname file."));
+            }
+            out.extend(a.feed(&frame.to_string()));
+        }
+        let states: Vec<ReasoningState> = out
+            .iter()
+            .filter_map(|e| match e.event {
+                Event::Reasoning { state, label } => {
+                    assert_eq!(label, ReasoningLabel::Thinking);
+                    Some(state)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, [ReasoningState::Complete]);
+        assert!(!out.iter().any(|e| matches!(
+            e.event,
+            Event::ContentDelta {
+                stream: StreamKind::Reasoning,
+                ..
+            }
+        )));
+        let texts: Vec<&str> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ContentSnapshot {
+                    stream: StreamKind::Reasoning,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Reading the hostname file."]);
     }
 }

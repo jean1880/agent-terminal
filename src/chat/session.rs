@@ -5051,8 +5051,9 @@ mod tests {
             });
             assert!(has_reasoning, "expected ItemKind::Reasoning to be emitted");
 
+            // Whole, as a snapshot: agy's thinking is never streamed for show (W3.1).
             let reasoning_delta = seen.borrow().iter().find_map(|env| {
-                if let Event::ContentDelta {
+                if let Event::ContentSnapshot {
                     stream: StreamKind::Reasoning,
                     text,
                 } = &env.event

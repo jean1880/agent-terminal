@@ -176,6 +176,8 @@ textview.code-view, textview.code-view text {
 .reasoning-toggle { padding: 2px 8px; border-radius: 8px; color: @at_fg_dim; }
 .reasoning-toggle:hover { color: @at_fg_dim; }
 .reasoning-title { color: @at_fg_dim; font-style: italic; }
+/* Not shared by the model: a closed line, quieter than a block with text to open. */
+.reasoning-unavailable .reasoning-toggle:disabled { opacity: 0.75; }
 .reasoning-text {
     color: @at_fg_dim;
     font-style: italic;

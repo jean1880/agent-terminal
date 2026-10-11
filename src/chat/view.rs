@@ -331,6 +331,8 @@ impl ChatView {
             if !status.alive && model.settle_stale() {
                 tracing::info!("chat view: settled a stored turn left open");
             }
+            // Reasoning loaded from the store says so (W3.1: the Replayed state).
+            model.mark_replayed();
         }
         inner.dirty.borrow_mut().clear();
         inner.transcript.reset(&inner.model.borrow());
