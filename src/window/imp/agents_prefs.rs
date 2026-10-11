@@ -1665,8 +1665,6 @@ impl AgentTerminalWindow {
     }
 }
 
-/// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
-/// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
 /// Shows a sync button as done ("✓ Synced", then "Synced" a second later) and then runs
 /// `refresh` (the sync indicator). Called from the background job's completion (E4).
 fn mark_synced(button: &glib::WeakRef<Button>, refresh: impl Fn() + 'static) {
@@ -1719,6 +1717,8 @@ fn confirm_export_first(button: &Button) -> bool {
     false
 }
 
+/// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
+/// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
 fn always_allowed_rows() -> adw::ExpanderRow {
     use crate::always_allow::{self, AlwaysRules};
     let path = always_allow::path();

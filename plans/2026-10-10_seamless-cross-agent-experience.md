@@ -183,6 +183,14 @@ Each wave is a release. `git revert` the wave's commits and ship the previous ve
 - **U3. W0 runs now** (about 6 real turns). W1 work that does not depend on Codex starts in parallel.
 
 ## Log
+- 2026-10-11: Resumed. All waves are on master: W1a/W1b, W2 (plus Stop turn on every card, `0c28918f`), W3 core and app, W4, and F17 (reasoning as markdown). The W1 security gate took 5 rounds:
+  - Round 1: the four checkers rejected the first cut.
+  - Round 2: the native red-team said SHIP, rust-review approved, Codex and agy did not.
+  - Round 3: the matcher moved to a read-only prefix allowlist with option clusters, a credential parser and a store lock.
+  - Round 4: the allowlist was trimmed (fd/tree/file/date/git branch/git remote removed); masking became quote-aware.
+  - Round 5: jq `--module-path`, rg `--hostname-bin`, and git signature options. Decision: keep `git log`/`show` widening; config-driven git execution is gated by `.git/config` and home dotfiles being sensitive edit targets.
+
+  live_smoke passed on 2026-10-11: Claude 9/9, Codex 16/16, agy 5/5. Parity report regenerated (`0709b648`) from code, tests and smoke runs; the 15-turn scenario was NOT re-run. Release notes are drafted in `docs/releases/v3.4.0.md`.
 - 2026-10-10 (checkpoint, session paused on usage limit). ON MASTER, reviewed and approved: live_smoke (agy run live, 5/5 PASS); 1.4 + 1.12; W1a first cut; UI lane 1.8, 1.9, W4 4.1–4.9 (4.6: notices dedup, dropdown truncation; diff-panel-after-undo not reproduced); session lane 1.5 (all events masked), 1.6, 1.10, 1.11 + fork mode; W2 2.1–2.7 + U2 Always for Edit/Mcp (kept per U2); W3-app 3.3, 3.5, 3.6, 3.7 (`@` files + gauge), agy interrupt/usage. Gate green at b2701e56 (14 native cases).
   OPEN, on branches, not merged:
   - `w1a-rules` holds the W1 security-gate fixes. Codex, agy, the native red-team and rust-review all returned CHANGES-REQUIRED; Hive #342 lists the decisions. Fixes are in 982b3f92 plus a merge. Still running: integration with W2 (R1 through `always_offerable`, R5 on Codex accept-edits, the shared `codex_change_targets`, and Rule::new returning Result). Next: merge it, then re-review the delta with the same four checkers.
