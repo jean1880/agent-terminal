@@ -40,10 +40,13 @@ pub fn hooks_path(home: Option<&str>) -> Option<PathBuf> {
 
 /// True when some `PreToolUse` entry runs `--approval-hook` and matches every tool: a matcher
 /// of `.*`, or none. A narrower matcher leaves tools ungated, so it does not count.
+#[cfg(test)]
 pub fn approval_hook_installed(json: &str) -> bool {
-    let Ok(root) = serde_json::from_str::<Value>(json) else {
-        return false;
-    };
+    serde_json::from_str::<Value>(json).is_ok_and(|root| value_installed(&root))
+}
+
+/// [`approval_hook_installed`] on an already parsed file.
+fn value_installed(root: &Value) -> bool {
     let Some(groups) = root.as_object() else {
         return false;
     };
@@ -100,10 +103,10 @@ pub fn probe(home: Option<&str>) -> HookProbe {
             return HookProbe::Unreadable(format!("cannot read {}: {e}", path.display()));
         }
     };
-    if serde_json::from_str::<Value>(&text).is_err() {
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
         return HookProbe::Unreadable(format!("{} is not valid JSON", path.display()));
-    }
-    if approval_hook_installed(&text) {
+    };
+    if value_installed(&root) {
         HookProbe::Installed
     } else {
         HookProbe::Missing(missing_message(&path))
@@ -129,8 +132,9 @@ pub fn check_installed(home: Option<&str>) -> Result<(), String> {
 /// What the Settings row shows for agy's hook: three states, per the repo's indicator rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookBadge {
-    /// Installed and an approval socket can be bound: agy asks before it acts.
-    Verified,
+    /// Hook entry present and the runtime directory available. (Not a live-gate proof: that is
+    /// the per-thread socket bind and the session canary.)
+    Ready,
     /// No gating entry in `hooks.json`.
     Missing,
     /// Could not tell: unreadable file, bad JSON, or no socket to bind.
@@ -138,19 +142,21 @@ pub enum HookBadge {
 }
 
 /// `socket_bound`: whether the approval socket is (or can be) bound. An installed hook with no
-/// socket is not proof of a gate, so it is `Unreadable`, never `Verified`.
+/// socket is not ready, so it is `Unreadable`, never `Ready`.
 pub fn badge(probe: &HookProbe, socket_bound: bool) -> HookBadge {
     match probe {
-        HookProbe::Installed if socket_bound => HookBadge::Verified,
+        HookProbe::Installed if socket_bound => HookBadge::Ready,
         HookProbe::Installed | HookProbe::Unreadable(_) => HookBadge::Unreadable,
         HookProbe::Missing(_) => HookBadge::Missing,
     }
 }
 
-/// Writes the verdict to the journal (`info` when verified, `warn` otherwise).
+/// Writes the verdict to the journal (`info` when ready, `warn` otherwise).
 pub fn log_verdict(badge: HookBadge, probe: &HookProbe, socket_bound: bool) {
     match badge {
-        HookBadge::Verified => tracing::info!("agy approval hook verified (installed, socket ok)"),
+        HookBadge::Ready => {
+            tracing::info!("agy approval hook ready (entry present, runtime dir ok)")
+        }
         HookBadge::Missing => {
             tracing::warn!("agy approval hook missing: agy cannot ask before acting")
         }
@@ -271,7 +277,7 @@ mod tests {
         let installed = HookProbe::Installed;
         let missing = HookProbe::Missing("m".into());
         let unreadable = HookProbe::Unreadable("u".into());
-        assert_eq!(badge(&installed, true), HookBadge::Verified);
+        assert_eq!(badge(&installed, true), HookBadge::Ready);
         assert_eq!(badge(&installed, false), HookBadge::Unreadable);
         assert_eq!(badge(&missing, true), HookBadge::Missing);
         assert_eq!(badge(&missing, false), HookBadge::Missing);

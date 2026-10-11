@@ -1375,38 +1375,46 @@ impl AgentTerminalWindow {
             #[weak]
             hook,
             async move {
-                // Off the main thread, and it refreshes the verdict new Antigravity sessions use.
-                let _ = super::threads::check_hook().await;
+                // One read off the main thread serves the row and the verdict new Antigravity
+                // sessions use.
                 let home = std::env::var("HOME").ok();
-                let probe = gtk4::gio::spawn_blocking(move || {
-                    crate::hook_config::probe(home.as_deref())
+                let (probe, bound) = gtk4::gio::spawn_blocking(move || {
+                    (
+                        crate::hook_config::probe(home.as_deref()),
+                        crate::approval_server::socket_bindable(),
+                    )
                 })
                 .await
                 .unwrap_or_else(|_| {
-                    crate::hook_config::HookProbe::Unreadable("the hooks check panicked".into())
+                    (
+                        crate::hook_config::HookProbe::Unreadable(
+                            "the hooks check panicked".into(),
+                        ),
+                        false,
+                    )
                 });
-                let bound = crate::approval_server::socket_bindable();
+                super::threads::remember_hook_probe(&probe);
                 let badge = crate::hook_config::badge(&probe, bound);
                 crate::hook_config::log_verdict(badge, &probe, bound);
-                let (text, bad) = match badge {
-                    crate::hook_config::HookBadge::Verified => (
-                        "Verified: the hook is installed and the approval socket is available, so Antigravity asks agent-terminal before it acts",
-                        false,
+                let (text, class) = match badge {
+                    crate::hook_config::HookBadge::Ready => (
+                        "Ready: Hook entry present and runtime directory available",
+                        None,
                     ),
                     crate::hook_config::HookBadge::Missing => (
                         "Not installed: Antigravity cannot ask before acting until the entry below is added",
-                        true,
+                        Some("error"),
                     ),
                     crate::hook_config::HookBadge::Unreadable => (
-                        "Could not verify: hooks.json is unreadable or the approval socket is unavailable. Treat Antigravity as ungated",
-                        true,
+                        "Could not verify: hooks.json is unreadable or the runtime directory is unavailable. Treat Antigravity as ungated",
+                        Some("warning"),
                     ),
                 };
                 hook.set_subtitle(text);
-                if bad {
-                    hook.add_css_class("error");
-                } else {
-                    hook.remove_css_class("error");
+                hook.remove_css_class("error");
+                hook.remove_css_class("warning");
+                if let Some(class) = class {
+                    hook.add_css_class(class);
                 }
             }
         ));
