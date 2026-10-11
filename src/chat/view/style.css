@@ -271,6 +271,16 @@ textview.code-view, textview.code-view text {
 .approval-card.resolved .approval-outcome { color: @at_success; font-style: normal; font-weight: 700; }
 .approval-card.resolved.denied .approval-icon,
 .approval-card.resolved.denied .approval-outcome { color: @at_danger; }
+/* a warning is shown in words and in a tinted box, never by colour alone */
+.approval-warning {
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-weight: 600;
+    color: mix(@at_warning, @at_fg_strong, 0.4);
+    background-color: alpha(@at_warning, 0.14);
+    border-left: 3px solid @at_warning;
+}
+.approval-note { font-size: 0.88em; }
 
 button.pill { padding: 6px 16px; border-radius: 999px; }
 .chat-view button.suggested-action {
@@ -338,6 +348,32 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
 .quick-reply:focus-visible, .quick-reply-action:focus-visible { outline: 2px solid @at_accent; outline-offset: -2px; }
 .option-label { color: @at_fg_strong; font-weight: 600; }
 .option-desc { color: @at_fg_dim; font-size: 0.85em; }
+
+/* button rows wrap; their wrappers add no padding of their own */
+.approval-card flowboxchild, .form-card flowboxchild { padding: 0; }
+
+/* a tool server's form or link: the server's words are quoted, the fields sit below */
+.form-card .form-message { font-style: normal; color: @at_fg_soft; }
+.form-field-label { color: @at_fg_strong; font-weight: 600; }
+.form-required {
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background-color: alpha(@at_fg_dim, 0.18);
+    color: @at_fg_soft;
+}
+.form-error { color: @at_danger_soft; font-size: 0.9em; font-weight: 600; }
+.form-note { color: @at_fg_dim; font-size: 0.88em; }
+.form-host { color: @at_fg_strong; }
+.form-card.resolved, .form-card.expired { border-color: @at_border; background-image: none; }
+.form-card.resolved .approval-outcome { color: @at_success; font-style: normal; font-weight: 700; }
+.form-card.resolved.declined .approval-outcome,
+.form-card.expired .approval-outcome { color: @at_fg_dim; font-weight: 600; }
+
+/* header: the user's session-long grants to Codex */
+.extra-access { color: @at_warning; font-size: 0.9em; }
+.extra-access-title { color: @at_fg_strong; font-weight: 700; }
 
 /* notices, errors, dividers */
 .notice-row {

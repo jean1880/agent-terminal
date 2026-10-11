@@ -3117,17 +3117,20 @@ impl ChatBackend for ChatSession {
         request: &str,
         action: agent_core::form::FormAction,
         content: Option<serde_json::Value>,
-    ) {
+    ) -> bool {
         // Like a question: nothing acknowledges the answer, so the card is resolved once the
-        // adapter has accepted and written it. A refused answer leaves the card open.
-        if self.inner.command(Command::SubmitForm {
+        // adapter has accepted and written it. A refused answer emits nothing and returns
+        // false, and the view reopens the card with a line saying so.
+        let accepted = self.inner.command(Command::SubmitForm {
             request: request.to_owned(),
             action,
             content,
-        }) {
+        });
+        if accepted {
             self.inner
                 .emit(Envelope::new(Event::FormResolved { action }).request(request));
         }
+        accepted
     }
 
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {

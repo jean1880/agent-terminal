@@ -176,3 +176,193 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
         }
     }
 }
+
+/// The three request cards (a permission grant, a form, a link) in a real narrow window at a
+/// normal and a large text size: they wrap rather than widen the thread, none takes keyboard
+/// focus from the composer when it appears, and Enter in the last field sends a valid answer.
+#[test]
+#[ignore = "native GTK; run alone in an isolated display"]
+fn native_request_cards_wrap_and_never_take_focus() {
+    use agent_core::form::{FieldInput, Form, FormAction, FormField};
+    use serde_json::json;
+
+    let ctx = init();
+    for (width, scale) in [(360, 1.0), (560, 2.0), (560, 1.0)] {
+        let backend = super::tests::AnswerLog::new(Driver::Codex);
+        let view = ChatView::new(backend.clone());
+        view.set_text_scale(scale);
+        // As the layout matrix hosts a view: in a pane that may shrink it, so the assertions are
+        // about the rows not being clipped, not about the header's own minimum.
+        let side = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        side.set_visible(false);
+        let pane = gtk4::Paned::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .start_child(&view)
+            .end_child(&side)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        pane.set_position(width);
+        let window = gtk4::Window::new();
+        window.set_default_size(width, 700);
+        window.set_child(Some(&pane));
+        window.present();
+        assert!(pump_until(&ctx, || view.width() > 0), "{width}: shown");
+        view.focus_composer();
+        let inner = view.inner().expect("built view");
+        let focused_before = GtkWindowExt::focus(&window);
+
+        view.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "codex_permissions".into(),
+                title: Some("Codex asks to write to 2 places and use the network".into()),
+                input: json!({
+                    "cwd": "/w", "reason": "The build keeps its cache outside the project",
+                    "renderable": true,
+                    "entries": [
+                        {"access": "write", "target": {"kind": "path",
+                            "path": format!("/home/someone/{}", "long-folder-name/".repeat(8))}},
+                        {"access": "write", "target": {"kind": "special", "name": "slash_tmp", "path": null}},
+                        {"access": "deny", "target": {"kind": "path", "path": "/w/.git"}}
+                    ],
+                    "network": true, "session_allowed": true, "warning": null, "requested": {}
+                }),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::Deny,
+                    Decision::Cancel,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("p"),
+        );
+        let field = |name: &str, input: FieldInput| FormField {
+            name: name.into(),
+            title: None,
+            description: Some("A long description that has to wrap at a narrow width.".into()),
+            required: true,
+            input,
+        };
+        view.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "a-server-with-a-long-name".into(),
+                message: "Please tell me which repository to use for this work.".into(),
+                form: Form::Fields {
+                    fields: vec![
+                        field(
+                            "flavour",
+                            FieldInput::Choice {
+                                options: (0..4)
+                                    .map(|i| agent_core::form::ChoiceOption {
+                                        value: format!("v{i}"),
+                                        label: format!("A fairly long option label {i}"),
+                                    })
+                                    .collect(),
+                                multi: false,
+                                min_items: None,
+                                max_items: None,
+                                default: Vec::new(),
+                            },
+                        ),
+                        field(
+                            "repo_name",
+                            FieldInput::Text {
+                                format: None,
+                                min_length: None,
+                                max_length: None,
+                                default: None,
+                            },
+                        ),
+                    ],
+                },
+            })
+            .request("f"),
+        );
+        view.apply(
+            &Envelope::new(Event::FormRequested {
+                server: "github".into(),
+                message: "Sign in to continue.".into(),
+                form: Form::Link {
+                    url: format!("https://github.com/login/device?code={}", "A".repeat(300)),
+                },
+            })
+            .request("l"),
+        );
+        assert!(
+            pump_until(&ctx, || inner.transcript.frames() >= 3),
+            "{width}: drawn"
+        );
+        crate::testutil::capture_window(
+            &window,
+            &format!("requests-{width}-scale-{}", (scale * 100.0) as u32),
+        );
+        assert!(
+            window.width() <= width,
+            "{width}px scale {scale}: the window grew to {}px: {}",
+            window.width(),
+            crate::testutil::min_size_report(
+                view.upcast_ref(),
+                gtk4::Orientation::Horizontal,
+                width - 100
+            )
+        );
+        for id in ["approval:p", "form:f", "form:l"] {
+            inner.transcript.scroll_to_card(id);
+            assert!(
+                pump_until(&ctx, || inner
+                    .transcript
+                    .row_bounds_in_viewport(id)
+                    .is_some()),
+                "{width}: {id} is on screen"
+            );
+            let (bounds, viewport) = inner
+                .transcript
+                .row_bounds_in_viewport(id)
+                .expect("mapped row");
+            assert!(
+                bounds.x() >= 0.0 && bounds.x() + bounds.width() <= viewport as f32 + 1.0,
+                "{width}px scale {scale}: {id} is clipped: {bounds:?} in {viewport}px"
+            );
+        }
+        // Appearing took no focus from where the user was typing.
+        assert_eq!(GtkWindowExt::focus(&window), focused_before);
+
+        // Enter in the last field of a valid form answers it.
+        let entry = inner
+            .transcript
+            .with_row("form:f", |row| match row {
+                super::cards::Row::Form(card) => card.entry(1),
+                _ => None,
+            })
+            .flatten()
+            .expect("the form's last field");
+        entry.emit_activate();
+        assert!(
+            backend.forms.borrow().is_empty(),
+            "an empty answer is not sent"
+        );
+        let kind = inner
+            .transcript
+            .with_row("form:f", |row| match row {
+                super::cards::Row::Form(card) => card.marks(0).into_iter().next(),
+                _ => None,
+            })
+            .flatten()
+            .and_then(|w| w.downcast::<gtk4::ToggleButton>().ok())
+            .expect("first option");
+        kind.set_active(true);
+        entry.set_text("octo");
+        entry.emit_activate();
+        assert_eq!(
+            *backend.forms.borrow(),
+            [(
+                "f".to_owned(),
+                FormAction::Accept,
+                Some(json!({"flavour": "v0", "repo_name": "octo"}))
+            )]
+        );
+    }
+}
