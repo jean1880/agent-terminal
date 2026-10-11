@@ -104,6 +104,14 @@ pub(super) mod tests {
     ) {
         let ctx = glib::MainContext::default();
         let imp = window.imp();
+        // Libadwaita 1.5 (the minimum, and CI's) animates a dialog open and closed; closing it
+        // while that animation runs can leave it registered, so this check was flaky there
+        // and never locally on newer libadwaita. With animations off both happen at once.
+        let settings = gtk4::Settings::default();
+        let animated = settings.as_ref().map(|s| s.is_gtk_enable_animations());
+        if let Some(s) = &settings {
+            s.set_gtk_enable_animations(false);
+        }
         let availability = crate::availability::AgentAvailability::shared();
         assert!(crate::testutil::pump_until(&ctx, 10, || !availability.any_detecting()));
         availability.set(
@@ -182,5 +190,8 @@ pub(super) mod tests {
             added.chat.as_ref().unwrap().title,
             "Multi-agent environment review"
         );
+        if let (Some(s), Some(on)) = (&settings, animated) {
+            s.set_gtk_enable_animations(on);
+        }
     }
 }
