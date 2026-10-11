@@ -102,7 +102,7 @@ impl DiffSource for DemoDiffs {
 }
 
 /// Supplies in-memory diffs and optional deterministic review disclosures. A scene is part
-/// of the fixture, not interaction with a real session: `diff`, `workers`, or `usage`.
+/// of the fixture, not interaction with a real session: `diff`, `workers`, `usage`, or `queue`.
 pub fn configure_demo_view(view: &ChatView) {
     view.set_diff_source(Rc::new(DemoDiffs));
     let Ok(scene) = std::env::var("AGENT_TERMINAL_DEMO_SCENE") else {
@@ -358,6 +358,8 @@ impl DemoBackend {
         let scene = std::env::var("AGENT_TERMINAL_DEMO_SCENE").unwrap_or_default();
         self.push(if scene == "diff" {
             diff_review_script()
+        } else if scene == "queue" {
+            queue_script()
         } else if matches!(scene.as_str(), "workers" | "usage")
             || std::env::var("AGENT_TERMINAL_DEMO_CODEX_WORKERS").as_deref() == Ok("1")
         {
@@ -1129,6 +1131,65 @@ fn diff_review_script() -> Vec<Step> {
         Step::Emit(completed("demo-edit", ItemStatus::Completed, None, None)),
         Step::Emit(Envelope::new(Event::TurnCompleted { state: TurnState::Completed, error: None, usage: None, cost_usd: None })),
     ]
+}
+
+/// `AGENT_TERMINAL_DEMO_SCENE=queue`: a turn still running, two prompts waiting behind it
+/// (one long), and the reply growing above them. The queue stays pinned under the reply.
+fn queue_script() -> Vec<Step> {
+    let queued = |id: &str, text: &str| {
+        [
+            Step::Emit(started(
+                id,
+                ItemKind::UserMessage,
+                "queued",
+                Some(json!({"queued": true})),
+                None,
+            )),
+            Step::Emit(snapshot(id, StreamKind::Assistant, text)),
+        ]
+    };
+    let mut s = vec![
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        Step::Emit(started(
+            "queue-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        )),
+        Step::Emit(snapshot(
+            "queue-reply",
+            StreamKind::Assistant,
+            "Working through the first request. Your next prompts are queued below.",
+        )),
+        Step::SetRunning(true),
+    ];
+    s.extend(queued("queue-1", "Then run the full test suite."));
+    s.extend(queued(
+        "queue-2",
+        &format!(
+            "After that, summarise every change {}.",
+            "in detail ".repeat(30)
+        ),
+    ));
+    s.push(Step::Emit(snapshot(
+        "queue-reply",
+        StreamKind::Assistant,
+        "Working through the first request. Your next prompts are queued below.\n\nStill going: the reply keeps growing while the queue stays pinned under it.",
+    )));
+    s
+}
+
+/// The queue scene's envelopes at once (tests).
+#[cfg(test)]
+pub fn queue_envelopes() -> Vec<Envelope> {
+    queue_script()
+        .into_iter()
+        .filter_map(|step| match step {
+            Step::Emit(env) => Some(env),
+            _ => None,
+        })
+        .collect()
 }
 
 fn codex_worker_script() -> Vec<Step> {

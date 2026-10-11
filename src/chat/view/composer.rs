@@ -219,6 +219,7 @@ impl Composer {
         send.add_css_class("send-button");
         send.set_valign(gtk4::Align::End);
         send.set_tooltip_text(Some("Send (Enter)"));
+        send.update_property(&[gtk4::accessible::Property::Label("Send message")]);
         root.append(&send);
 
         let list = gtk4::ListBox::new();
@@ -323,10 +324,14 @@ impl Composer {
             self.send.set_icon_name("at-media-playback-stop-symbolic");
             self.send.add_css_class("stop");
             self.send.set_tooltip_text(Some("Stop (Esc)"));
+            self.send
+                .update_property(&[gtk4::accessible::Property::Label("Stop turn")]);
         } else {
             self.send.set_icon_name("at-go-up-symbolic");
             self.send.remove_css_class("stop");
             self.send.set_tooltip_text(Some("Send (Enter)"));
+            self.send
+                .update_property(&[gtk4::accessible::Property::Label("Send message")]);
         }
     }
 

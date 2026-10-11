@@ -154,6 +154,9 @@ impl TranscriptView {
         jump.set_margin_end(24);
         jump.set_margin_bottom(16);
         jump.set_tooltip_text(Some("Jump to the latest message"));
+        jump.update_property(&[gtk4::accessible::Property::Label(
+            "Jump to the latest message",
+        )]);
         jump.set_visible(false);
 
         let root = gtk4::Overlay::new();

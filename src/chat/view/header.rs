@@ -172,6 +172,7 @@ impl Header {
         reload.add_css_class("session-reload");
         reload.set_valign(gtk4::Align::Center);
         reload.set_tooltip_text(Some("Reload session"));
+        reload.update_property(&[gtk4::accessible::Property::Label("Reload session")]);
         root.append(&reload);
 
         let activity = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -256,6 +257,8 @@ impl Header {
             subagent_slot.upcast_ref(),
             model.upcast_ref(),
             agent.upcast_ref(),
+            // The spinner stays; the words are in the activity's tooltip and the shelf.
+            activity_text.upcast_ref(),
         ] {
             compact.add_setter(slot, "visible", Some(&hidden));
         }
@@ -410,6 +413,8 @@ impl Header {
         };
         self.reload.set_icon_name(icon);
         self.reload.set_tooltip_text(Some(tooltip));
+        self.reload
+            .update_property(&[gtk4::accessible::Property::Label(tooltip)]);
     }
 
     /// Shows what the thread is doing: the main agent working, only background work left (its
@@ -453,6 +458,29 @@ impl Header {
     #[cfg(test)]
     pub fn running_shown(&self) -> bool {
         matches!(*self.shown.borrow(), Activity::Working { .. }) && self.activity.is_visible()
+    }
+
+    /// Whether the activity's words (not just its spinner) are showing (tests).
+    #[cfg(test)]
+    pub fn activity_words_shown(&self) -> bool {
+        self.activity.is_visible() && self.activity_text.is_visible()
+    }
+
+    /// The right edge of the last visible item of the strip, and the width the strip has, in px
+    /// (tests): the item is clipped by the window when the first exceeds the second.
+    #[cfg(test)]
+    pub fn right_edge(&self) -> (f32, f32) {
+        let mut edge = 0f32;
+        let mut child = self.root.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            if c.is_visible() && c.width() > 0 {
+                if let Some(b) = c.compute_bounds(&self.root) {
+                    edge = edge.max(b.x() + b.width());
+                }
+            }
+        }
+        (edge, self.bin.width() as f32)
     }
 
     /// The status text the header shows, if any (tests).

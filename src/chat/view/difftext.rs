@@ -47,11 +47,31 @@ impl DiffText {
         scroller.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
         scroller.set_propagate_natural_height(true);
         scroller.set_max_content_height(MAX_HEIGHT);
-        scroller.add_css_class("code-block");
         scroller.set_child(Some(&view));
-        root.append(&scroller);
+        // The same frame as a code block: a header with the name and Copy, over the text.
+        let frame = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        frame.add_css_class("code-block");
+        let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        header.add_css_class("code-header");
+        let name = super::cards::label("diff", &["code-lang"]);
+        name.set_hexpand(true);
+        header.append(&name);
+        let copy = super::cards::copy_button("Copy diff");
+        header.append(&copy);
+        super::cards::wire_copy(&copy, {
+            let buffer = buffer.downgrade();
+            move || {
+                buffer.upgrade().map_or_else(String::new, |buffer| {
+                    let (start, end) = buffer.bounds();
+                    buffer.text(&start, &end, false).to_string()
+                })
+            }
+        });
+        frame.append(&header);
+        frame.append(&scroller);
+        root.append(&frame);
 
-        let notes = super::cards::label("", &["diff-notes", "dim-label"]);
+        let notes = super::cards::content_label("", &["diff-notes", "dim-label"]);
         notes.set_visible(false);
         root.append(&notes);
 

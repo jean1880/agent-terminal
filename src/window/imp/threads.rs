@@ -3185,11 +3185,31 @@ impl AgentTerminalWindow {
         app.send_notification(Some(id), &notification);
     }
 
+    /// Shows `toast` over the selected thread's transcript, so it never covers that thread's
+    /// shelves or composer; over the whole window when no thread is selected (empty state,
+    /// terminal page).
+    pub(super) fn add_toast(&self, toast: adw::Toast) {
+        let selected = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|view| view.selected_page());
+        let local = selected.and_then(|page| {
+            self.tabs
+                .borrow()
+                .iter()
+                .find(|t| t.page == page)
+                .and_then(|t| t.chat.as_ref())
+                .and_then(|chat| chat.view.as_ref())
+                .and_then(|view| view.toast_overlay())
+        });
+        if let Some(overlay) = local.or_else(|| self.toast_overlay.borrow().clone()) {
+            overlay.add_toast(toast);
+        }
+    }
+
     /// Bumps an interactive in-app toast when a thread needs attention and the user is away from it.
     fn bump_thread_attention_toast(&self, page: &adw::TabPage, thread: &str, question: bool) {
-        let Some(overlay) = self.toast_overlay.borrow().clone() else {
-            return;
-        };
         let title = page.title();
         let name = if title.is_empty() { "Thread" } else { &title };
         let msg = if question {
@@ -3211,7 +3231,7 @@ impl AgentTerminalWindow {
                 window.imp().open_thread(&thread_id, true);
             }
         });
-        overlay.add_toast(toast);
+        self.add_toast(toast);
     }
 
     /// Withdraws a thread's approval and turn-done notifications.
