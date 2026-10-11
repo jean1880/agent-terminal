@@ -1,6 +1,6 @@
 # Seamless cross-agent experience: closing the parity and UI gaps
 
-Status: DONE (W0–W4 on master, pushed for beta; CI green) · combined 3.4.0 release drafted, not tagged · 2026-10-11 · HEAD `d71cd74f`
+Status: DONE (W0–W4 on master, pushed for beta; CI green) · combined 3.3.0 release drafted, not tagged · 2026-10-11 · HEAD `d71cd74f`
 Hive: topic #29 `agent-terminal-seamless-parity`. Round 1 is #301–#318, Round 2 is #319–#321, and the confirmed matcher bypass is #310.
 Evidence:
 - `docs/feature-parity-report.md`;
@@ -183,6 +183,7 @@ Each wave is a release. `git revert` the wave's commits and ship the previous ve
 - **U3. W0 runs now** (about 6 real turns). W1 work that does not depend on Codex starts in parallel.
 
 ## Log
+- 2026-10-11: Release version corrected. 3.3.0 was never tagged (last tag `v3.2.2`), so the combined release is 3.3.0, not 3.4.0: the W0–W4 notes are merged into `docs/releases/v3.3.0.md`, `v3.4.0.md` is removed, and the parity report says "3.3.0" for the after state and "beta audit" for the before. The plan's earlier "3.4.0" wording below is history.
 - 2026-10-11: Closed out. Pushed master (beta suite). CI had been red since before this work. Two causes, both libadwaita 1.5 only and reproduced in an Ubuntu 24.04 container:
   - Escaped `&` in markup titles: the titles now say "and" (`6fdcac8a`).
   - The environment-review test answered its dialog before the sheet opened. It now settles first and presses the buttons (`d71cd74f`).
