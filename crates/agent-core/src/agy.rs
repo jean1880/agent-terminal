@@ -651,6 +651,11 @@ impl Adapter for AgyAdapter {
     fn feed_stderr(&mut self, line: &str) -> Vec<Envelope> {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("error:") {
+            // An interrupt is the user's own stop, not a failure: the turn ends `Interrupted`
+            // (result frame or exit), like the other agents', and no error card is raised.
+            if rest.trim().eq_ignore_ascii_case("interrupted") {
+                return Vec::new();
+            }
             let mut res = Vec::new();
             if crate::quota::is_rate_limit_or_quota(rest) {
                 res.push(env(Event::RateLimited {
@@ -1192,9 +1197,8 @@ mod tests {
             .collect();
         assert!(text.starts_with("Rivers are the vascular system"));
         let text_all = text.clone();
-        assert!(ev
-            .iter()
-            .any(|e| matches!(&e.event, Event::Error { message } if message == "interrupted")));
+        // agy's own "error: interrupted" is the user's stop, never an error card ("Turn failed").
+        assert!(!ev.iter().any(|e| matches!(&e.event, Event::Error { .. })));
         // The open response is cut short (its whole text snapshotted first), then the turn is
         // Interrupted.
         let n = ev.len();

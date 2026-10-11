@@ -85,7 +85,7 @@ pub fn split_windows(windows: &[QuotaWindow]) -> (Option<&QuotaWindow>, Option<&
     (most(false), most(true))
 }
 
-fn now_epoch() -> i64 {
+pub(super) fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))

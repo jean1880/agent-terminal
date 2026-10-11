@@ -405,16 +405,22 @@ impl Header {
 
     /// The session control stops an active turn, or reloads an idle session so its next agent
     /// process picks up current launch configuration.
-    pub fn set_reload_running(&self, running: bool) {
+    /// The stop/reload button. `stop_note` is what stopping does to this agent when it is more
+    /// than ending the turn (agy exits, and restarts on the next message).
+    pub fn set_reload_running(&self, running: bool, stop_note: Option<&str>) {
         let (icon, tooltip) = if running {
             ("at-media-playback-stop-symbolic", "Stop current turn")
         } else {
             ("at-view-refresh-symbolic", "Reload session")
         };
+        let full = match stop_note.filter(|_| running) {
+            Some(note) => format!("{tooltip}. {note}"),
+            None => tooltip.to_owned(),
+        };
         self.reload.set_icon_name(icon);
-        self.reload.set_tooltip_text(Some(tooltip));
+        self.reload.set_tooltip_text(Some(&full));
         self.reload
-            .update_property(&[gtk4::accessible::Property::Label(tooltip)]);
+            .update_property(&[gtk4::accessible::Property::Label(&full)]);
     }
 
     /// Shows what the thread is doing: the main agent working, only background work left (its

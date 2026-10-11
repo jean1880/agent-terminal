@@ -1560,7 +1560,9 @@ pub struct ApprovalCard {
     input_section: Section,
     /// A file-edit request's proposed change, as a diff (instead of the tool-input JSON).
     diff: DiffText,
-    /// The JSON behind that diff, one click away.
+    /// A plan to approve (Claude's ExitPlanMode), rendered as markdown.
+    plan: MarkdownView,
+    /// The request's JSON, capped, one click away.
     raw: gtk4::Expander,
     raw_section: Section,
     /// What "Always allow" would save, when it is offered.
@@ -1578,7 +1580,8 @@ pub fn decision_label(d: Decision) -> &'static str {
         Decision::AllowForSession => "Allow for session",
         Decision::AllowAlways => "Always allow",
         Decision::Deny => "Deny",
-        Decision::Cancel => "Cancel",
+        // Ends the whole turn (Codex `cancel`); Deny lets the agent see the refusal and go on.
+        Decision::Cancel => "Stop turn",
     }
 }
 
@@ -1588,8 +1591,82 @@ fn decision_outcome(d: Decision) -> &'static str {
         Decision::AllowForSession => "Allowed for this session",
         Decision::AllowAlways => "Always allowed here",
         Decision::Deny => "Denied",
-        Decision::Cancel => "Cancelled",
+        Decision::Cancel => "Turn stopped",
     }
+}
+
+/// Lines of an approval's input shown on the card itself; the rest is behind "Show raw".
+const APPROVAL_VISIBLE_LINES: usize = 12;
+/// Characters of one line shown on the card itself; a longer line is cut, the rest in "Show raw".
+const APPROVAL_LINE_CHARS: usize = 400;
+
+/// What an approval card shows of a request that is not a file edit or a plan, and whether that
+/// was cut. For a shell command: the command line (a strict `zsh -lc '…'` wrapper unwrapped, as
+/// rules see it) and its working directory; otherwise the readable input. Either is cut to
+/// [`APPROVAL_VISIBLE_LINES`] lines of at most [`APPROVAL_LINE_CHARS`] characters.
+fn approval_input_text(tool: &str, input: &Value) -> (String, bool) {
+    if input.is_null() {
+        return (String::new(), false);
+    }
+    if let Some(crate::always_allow::Action::Shell { command }) =
+        crate::always_allow::Action::of(tool, input)
+    {
+        let command = crate::always_allow::unwrap_shell_wrapper(&command).unwrap_or(command);
+        let mut shown = serde_json::json!({ "command": command });
+        for (from, to) in [
+            ("cwd", "cwd"),
+            ("Cwd", "cwd"),
+            ("description", "description"),
+        ] {
+            if let Some(v) = input.get(from).filter(|v| v.is_string()) {
+                shown[to] = v.clone();
+            }
+        }
+        return head_lines(
+            &payload::tool_input_text(ItemKind::Command, Some(&shown), ""),
+            APPROVAL_VISIBLE_LINES,
+            APPROVAL_LINE_CHARS,
+        );
+    }
+    let kind = if tool.starts_with("mcp__") || tool == "call_mcp_tool" {
+        ItemKind::McpTool
+    } else {
+        ItemKind::Tool
+    };
+    head_lines(
+        &payload::tool_input_text(kind, Some(input), ""),
+        APPROVAL_VISIBLE_LINES,
+        APPROVAL_LINE_CHARS,
+    )
+}
+
+/// The first `max` lines of `text`, each cut to `width` characters, with a note of what "Show
+/// raw" holds; true when anything was cut.
+fn head_lines(text: &str, max: usize, width: usize) -> (String, bool) {
+    let total = text.lines().count();
+    let keep = if total <= max {
+        total
+    } else {
+        max.saturating_sub(1)
+    };
+    let mut cut = total > keep;
+    let mut lines: Vec<String> = text
+        .lines()
+        .take(keep)
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars <= width {
+                return line.to_owned();
+            }
+            cut = true;
+            let head: String = line.chars().take(width).collect();
+            format!("{head}… ({} more characters in Show raw)", chars - width)
+        })
+        .collect();
+    if total > keep {
+        lines.push(format!("… {} more lines in Show raw", total - keep));
+    }
+    (lines.join("\n"), cut)
 }
 
 impl ApprovalCard {
@@ -1617,6 +1694,10 @@ impl ApprovalCard {
         let diff = DiffText::new();
         diff.widget().set_visible(false);
         root.append(diff.widget());
+        let plan = MarkdownView::new();
+        plan.widget().add_css_class("approval-plan");
+        plan.widget().set_visible(false);
+        root.append(plan.widget());
         let raw_text = mono("");
         let raw_section = Section::new("Raw request", &raw_text);
         let raw = gtk4::Expander::new(Some("Show raw"));
@@ -1643,6 +1724,7 @@ impl ApprovalCard {
             reason,
             input_section,
             diff,
+            plan,
             raw,
             raw_section,
             remembers,
@@ -1678,33 +1760,56 @@ impl ApprovalCard {
         self.title.set_text(&title);
         self.reason.set_text(a.reason.as_deref().unwrap_or(""));
         self.reason.set_visible(a.reason.is_some());
-        // A file edit is shown as the diff it proposes (computed from the request alone), with
-        // the JSON behind it one click away. Commands and everything else keep their input text.
+        // A file edit is shown as the diff it proposes (computed from the request alone), a plan
+        // (Claude's ExitPlanMode) as markdown, a command as its bare command line and working
+        // directory, anything else as a few lines of its input. The JSON is one click away.
         let preview = agent_kit::editdiff::preview_from_input(&a.input);
-        let input = if preview.is_empty() {
-            match &a.input {
-                Value::Null => String::new(),
-                v => {
-                    let kind = if a.tool.eq_ignore_ascii_case("bash") || a.tool == "run_command" {
-                        ItemKind::Command
-                    } else {
-                        ItemKind::Tool
-                    };
-                    payload::tool_input_text(kind, Some(v), "")
-                }
-            }
+        let plan = (a.tool == "ExitPlanMode")
+            .then(|| a.input.get("plan").and_then(Value::as_str))
+            .flatten()
+            .filter(|p| !p.trim().is_empty());
+        let (input, cut) = if let Some(plan) = plan {
+            self.plan.set_markdown(plan);
+            (String::new(), false)
+        } else if preview.is_empty() {
+            approval_input_text(&a.tool, &a.input)
         } else {
-            preview
+            let files = preview
                 .iter()
                 .map(|e| format!("{}  +{} −{}", e.path, e.added, e.removed))
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            (files, false)
         };
+        self.plan.widget().set_visible(plan.is_some());
         self.input_section.set_visible(!input.is_empty());
         self.input_section.set_text(&input);
-        if preview.is_empty() {
+        // No "Show raw" only when the card already shows all of it, uncut (a bare command and its
+        // folder): whatever is cut is never approved unseen.
+        let shown_whole =
+            !cut && a.input.as_object().is_some_and(|o| {
+                o.keys().all(|k| {
+                    ["command", "CommandLine", "cmd", "cwd", "Cwd", "description"]
+                        .contains(&k.as_str())
+                })
+            }) && preview.is_empty()
+                && plan.is_none()
+                && ["command", "CommandLine", "cmd"].iter().all(|k| {
+                    a.input
+                        .get(*k)
+                        .and_then(Value::as_str)
+                        .is_none_or(|c| crate::always_allow::unwrap_shell_wrapper(c).is_none())
+                });
+        let raw = match &a.input {
+            Value::Null => String::new(),
+            _ if shown_whole => String::new(),
+            v => serde_json::to_string_pretty(v).unwrap_or_default(),
+        };
+        // The Raw section caps what it shows (Show full, Copy takes all of it).
+        self.raw_section.set_text(&raw);
+        self.raw.set_visible(!raw.is_empty());
+        if preview.is_empty() || plan.is_some() {
             self.diff.widget().set_visible(false);
-            self.raw.set_visible(false);
         } else {
             let text: String = preview.iter().map(|e| e.diff.as_str()).collect();
             let (kept, omitted) = agent_kit::diff::truncate(
@@ -1720,9 +1825,6 @@ impl ApprovalCard {
                     .collect::<Vec<_>>(),
             );
             self.diff.widget().set_visible(true);
-            let raw = serde_json::to_string_pretty(&a.input).unwrap_or_default();
-            self.raw_section.set_text(&raw);
-            self.raw.set_visible(true);
         }
 
         if !self.built_buttons.get() {
@@ -1764,40 +1866,11 @@ impl ApprovalCard {
                 if matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
-                    let initial_cmd = match tool.as_str() {
-                        "run_command" | "Bash" | "bash" | "command_execution" => input_val
-                            .get("CommandLine")
-                            .or_else(|| input_val.get("command"))
-                            .or_else(|| input_val.get("cmd"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        "call_mcp_tool" => {
-                            let s = input_val
-                                .get("ServerName")
-                                .or_else(|| input_val.get("server_name"))
-                                .and_then(Value::as_str);
-                            let t = input_val
-                                .get("ToolName")
-                                .or_else(|| input_val.get("tool_name"))
-                                .and_then(Value::as_str);
-                            match (s, t) {
-                                (Some(s), Some(t)) => format!("{s}/{t}"),
-                                _ => String::new(),
-                            }
-                        }
-                        tool_name
-                            if crate::approval_server::classify(tool_name)
-                                == crate::approval_server::ToolClass::Edit =>
-                        {
-                            crate::approval_server::edit_targets(&input_val)
-                                .first()
-                                .copied()
-                                .unwrap_or("")
-                                .to_string()
-                        }
-                        _ => a.remembers.clone().unwrap_or_default(),
-                    };
+                    let initial_cmd = crate::always_allow::dialog_prefill(
+                        &tool,
+                        &input_val,
+                        a.remembers.as_deref(),
+                    );
                     let cwd_str = input_val
                         .get("Cwd")
                         .or_else(|| input_val.get("cwd"))
@@ -1848,8 +1921,15 @@ impl ApprovalCard {
             }
         }
 
-        for class in ["pending", "resolved", "expired"] {
+        for class in ["pending", "resolved", "expired", "denied"] {
             self.root.remove_css_class(class);
+        }
+        // A refusal is never shown in the "allowed" green (F12).
+        if matches!(
+            a.state,
+            ApprovalState::Resolved(Decision::Deny | Decision::Cancel)
+        ) {
+            self.root.add_css_class("denied");
         }
         let (class, outcome, sensitive, show_buttons) = match a.state {
             ApprovalState::Pending => ("pending", String::new(), true, true),
@@ -2072,7 +2152,7 @@ pub(crate) fn build_approval_suggestions(
     }
 
     let mut suggestions: Vec<ApprovalSuggestion> = Vec::new();
-    let is_shell_cmd = matches!(tool, "run_command" | "Bash" | "bash");
+    let is_shell_cmd = matches!(tool, "run_command" | "Bash" | "bash" | "command_execution");
 
     let exact_desc = if is_shell_cmd {
         "Exact command"
@@ -2282,76 +2362,7 @@ fn confirm_approval_rule(
     sink: Rc<dyn Fn(RowEvent)>,
     decision: Decision,
 ) {
-    let (title, subtitle, save_label) = if decision == Decision::AllowForSession {
-        (
-            "Confirm Session Approval Rule",
-            "Modify the pattern below to loosen or tighten what will be approved for the \
-             remainder of this session. Wildcards (* and ?) are supported.",
-            "Save for Session & Allow",
-        )
-    } else {
-        (
-            "Confirm Auto-Approval Rule",
-            "Modify the pattern below to loosen or tighten what will be automatically approved \
-             in future sessions. Wildcards (* and ?) are supported.",
-            "Save Always & Allow",
-        )
-    };
-
-    let dialog = adw::AlertDialog::new(Some(title), Some(subtitle));
-
-    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
-    content_box.set_margin_top(8);
-    content_box.set_margin_bottom(8);
-    content_box.set_margin_start(12);
-    content_box.set_margin_end(12);
-
-    let entry = gtk4::Entry::builder()
-        .text(&initial_pattern)
-        .placeholder_text("e.g. cargo test* or git diff*")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    content_box.append(&entry);
-
-    if let Some(flow) = suggestion_flow(&entry, &tool, &initial_pattern) {
-        content_box.append(&flow);
-    }
-
-    let global_check = gtk4::CheckButton::builder()
-        .label("Apply across all workspaces")
-        .active(false)
-        .build();
-    content_box.append(&global_check);
-
-    let caption = gtk4::Label::builder()
-        .label(
-            "Caution: Overly broad patterns will permit arbitrary agent commands without review.",
-        )
-        .wrap(true)
-        .css_classes(["dim-label", "caption"])
-        .build();
-    content_box.append(&caption);
-
-    dialog.set_extra_child(Some(&content_box));
-    if decision == Decision::AllowAlways {
-        dialog.add_responses(&[
-            ("cancel", "Cancel"),
-            ("allow_once", "Allow Once"),
-            ("save_session", "Save for Session"),
-            ("save", save_label),
-        ]);
-    } else {
-        dialog.add_responses(&[
-            ("cancel", "Cancel"),
-            ("allow_once", "Allow Once"),
-            ("save", save_label),
-        ]);
-    }
-    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("save"));
-    dialog.set_close_response("cancel");
-
+    let (dialog, entry, global_check) = rule_dialog(&tool, &initial_pattern, decision);
     let root = parent.root();
     let req = request;
     let t = tool;
@@ -2410,6 +2421,85 @@ fn confirm_approval_rule(
             }
         }
     });
+}
+
+/// The rule dialog for `decision`, its pattern entry prefilled with `initial_pattern`, and the
+/// "all workspaces" check.
+fn rule_dialog(
+    tool: &str,
+    initial_pattern: &str,
+    decision: Decision,
+) -> (adw::AlertDialog, gtk4::Entry, gtk4::CheckButton) {
+    let (title, subtitle, save_label) = if decision == Decision::AllowForSession {
+        (
+            "Confirm Session Approval Rule",
+            "Modify the pattern below to loosen or tighten what will be approved for the \
+             remainder of this session. Wildcards (* and ?) are supported.",
+            "Save for Session & Allow",
+        )
+    } else {
+        (
+            "Confirm Auto-Approval Rule",
+            "Modify the pattern below to loosen or tighten what will be automatically approved \
+             in future sessions. Wildcards (* and ?) are supported.",
+            "Save Always & Allow",
+        )
+    };
+
+    let dialog = adw::AlertDialog::new(Some(title), Some(subtitle));
+
+    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    content_box.set_margin_top(8);
+    content_box.set_margin_bottom(8);
+    content_box.set_margin_start(12);
+    content_box.set_margin_end(12);
+
+    let entry = gtk4::Entry::builder()
+        .text(initial_pattern)
+        .placeholder_text("e.g. cargo test* or git diff*")
+        .activates_default(true)
+        .hexpand(true)
+        .build();
+    content_box.append(&entry);
+
+    if let Some(flow) = suggestion_flow(&entry, tool, initial_pattern) {
+        content_box.append(&flow);
+    }
+
+    let global_check = gtk4::CheckButton::builder()
+        .label("Apply across all workspaces")
+        .active(false)
+        .build();
+    content_box.append(&global_check);
+
+    let caption = gtk4::Label::builder()
+        .label(
+            "Caution: Overly broad patterns will permit arbitrary agent commands without review.",
+        )
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    content_box.append(&caption);
+
+    dialog.set_extra_child(Some(&content_box));
+    if decision == Decision::AllowAlways {
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("allow_once", "Allow Once"),
+            ("save_session", "Save for Session"),
+            ("save", save_label),
+        ]);
+    } else {
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("allow_once", "Allow Once"),
+            ("save", save_label),
+        ]);
+    }
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+    (dialog, entry, global_check)
 }
 
 #[cfg(test)]
@@ -2580,6 +2670,226 @@ pub(crate) mod tests {
             "scope explanation is retained"
         );
         chat_labels_are_selectable();
+        codex_approval_card_checks();
+    }
+
+    /// A Codex-shaped approval: one card, `transcript` resolved by `resolution` (or pending).
+    fn codex_card(
+        tool: &str,
+        input: Value,
+        options: Vec<Decision>,
+        resolution: Option<Decision>,
+    ) -> (ApprovalCard, Rc<RefCell<Vec<RowEvent>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let sink: RowSink = Rc::new(move |event| received.borrow_mut().push(event));
+        let mut transcript = super::super::model::Transcript::new();
+        transcript.apply(
+            &agent_core::event::Envelope::new(agent_core::event::Event::ApprovalRequested {
+                tool: tool.into(),
+                title: None,
+                input,
+                reason: None,
+                options,
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("c"),
+            Driver::Codex,
+        );
+        if let Some(decision) = resolution {
+            transcript.apply(
+                &agent_core::event::Envelope::new(agent_core::event::Event::ApprovalResolved {
+                    decision,
+                })
+                .request("c"),
+                Driver::Codex,
+            );
+        }
+        let card = ApprovalCard::new(&sink);
+        card.update(transcript.get("approval:c").expect("approval card"));
+        (card, events)
+    }
+
+    fn direct_labels(card: &ApprovalCard) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut child = card.buttons.first_child();
+        while let Some(w) = child {
+            if let Some(b) = w.downcast_ref::<gtk4::Button>() {
+                labels.push(b.label().map(|l| l.to_string()).unwrap_or_default());
+            }
+            child = w.next_sibling();
+        }
+        labels
+    }
+
+    /// Plan W2: Codex cards carry Deny and a separate Stop turn; a refusal is styled as one.
+    fn codex_approval_card_checks() {
+        let all = vec![
+            Decision::Allow,
+            Decision::AllowAlways,
+            Decision::AllowForSession,
+            Decision::Deny,
+            Decision::Cancel,
+        ];
+        let shell = serde_json::json!({"command": "/usr/bin/zsh -lc 'ls -la'", "cwd": "/w"});
+        let (card, events) = codex_card("command_execution", shell.clone(), all.clone(), None);
+        assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
+        let stop = card
+            .buttons
+            .first_child()
+            .and_downcast::<gtk4::Button>()
+            .expect("stop turn");
+        stop.emit_clicked();
+        assert!(matches!(
+            events.borrow().last(),
+            Some(RowEvent::Approve {
+                decision: Decision::Cancel,
+                ..
+            })
+        ));
+        for (decision, denied, outcome) in [
+            (Decision::Deny, true, "Denied"),
+            (Decision::Cancel, true, "Turn stopped"),
+            (Decision::Allow, false, "Allowed once"),
+        ] {
+            let (card, _) = codex_card(
+                "command_execution",
+                shell.clone(),
+                all.clone(),
+                Some(decision),
+            );
+            assert_eq!(card.root.has_css_class("denied"), denied, "{outcome}");
+            assert_eq!(card.outcome.text(), outcome);
+        }
+        // A patch approval carries the change its item started with: shown as a diff.
+        let edit = serde_json::json!({"itemId": "e", "changes": [
+            {"path": "/w/fixture.txt", "kind": {"type": "update"},
+             "diff": "@@ -1 +1 @@\n-hello world\n+hello there\n"}]});
+        let (card, _) = codex_card("file_change", edit, all, None);
+        let (files, diff_shown, _, diff) = card.diff_view();
+        assert!(files.contains("/w/fixture.txt"), "{files}");
+        assert!(diff_shown && diff.contains("hello there"), "{diff}");
+        assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
+        rule_dialog_prefills_the_bare_w0_command();
+        approval_cards_show_the_command_and_cap_the_rest();
+    }
+
+    /// Plan 2.6 (ui-audit #5, F15): a Codex command card shows the bare command and its folder,
+    /// with the request's JSON behind a capped "Show raw"; a large input shows at most the cap;
+    /// Claude's ExitPlanMode shows its plan as markdown, not JSON.
+    fn approval_cards_show_the_command_and_cap_the_rest() {
+        let w0 = include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["frame"]["method"] == "item/commandExecution/requestApproval")
+            .expect("W0 frame")["frame"]["params"]
+            .clone();
+        let options = vec![Decision::Allow, Decision::Deny, Decision::Cancel];
+        let (card, _) = codex_card("command_execution", w0, options.clone(), None);
+        assert_eq!(
+            card.input_section.body.text(),
+            "$ ls -la\nWorking directory: /tmp/w0-sandbox"
+        );
+        assert!(
+            card.raw.is_visible(),
+            "the request's JSON is one click away"
+        );
+        assert!(card.raw_section.body.text().contains("availableDecisions"));
+        assert!(!card.plan.widget().is_visible());
+
+        let big: serde_json::Map<String, Value> = (0..200)
+            .map(|i| (format!("key{i:03}"), Value::from(format!("value {i}"))))
+            .collect();
+        let (card, _) = codex_card("WebFetch", Value::Object(big), options.clone(), None);
+        let visible = card.input_section.body.text().lines().count();
+        assert!(visible <= APPROVAL_VISIBLE_LINES, "{visible} lines shown");
+        assert!(card
+            .input_section
+            .body
+            .text()
+            .ends_with("more lines in Show raw"));
+        assert!(card.raw_section.body.text().lines().count() <= MAX_CARD_LINES + 1);
+
+        // A command the card cuts (a 30-line heredoc, one 5000-character line) always keeps its
+        // whole text one click away, though it has only the keys a plain command has.
+        let heredoc = format!(
+            "cat > notes.txt <<'EOF'\n{}EOF",
+            (1..=30).map(|i| format!("line {i}\n")).collect::<String>()
+        );
+        let long = format!("echo {}", "x".repeat(5000));
+        for command in [heredoc, long] {
+            let (card, _) = codex_card(
+                "Bash",
+                serde_json::json!({ "command": command }),
+                options.clone(),
+                None,
+            );
+            let shown = card.input_section.body.text().to_string();
+            assert!(shown.lines().count() <= APPROVAL_VISIBLE_LINES, "{shown}");
+            assert!(
+                shown
+                    .lines()
+                    .all(|l| l.chars().count() <= APPROVAL_LINE_CHARS + 60),
+                "a single enormous line is cut"
+            );
+            assert!(shown.contains("in Show raw"), "{shown}");
+            assert!(card.raw.is_visible(), "cut text is never approved unseen");
+            let raw: Value = serde_json::from_str(&card.raw_section.full.borrow()).expect("raw");
+            assert_eq!(raw["command"], command, "Show raw holds the whole command");
+        }
+        // A short plain command is shown whole: no raw needed.
+        let (card, _) = codex_card(
+            "Bash",
+            serde_json::json!({ "command": "ls -la" }),
+            options.clone(),
+            None,
+        );
+        assert!(!card.raw.is_visible());
+
+        let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n";
+        let (card, _) = codex_card(
+            "ExitPlanMode",
+            serde_json::json!({ "plan": plan }),
+            options,
+            None,
+        );
+        assert!(card.plan.widget().is_visible());
+        assert!(
+            !card.input_section.root.is_visible(),
+            "no JSON dump of the plan"
+        );
+        let blocks = card.plan.blocks.borrow();
+        assert!(
+            matches!(blocks.first(), Some((Block::Text { kind: TextKind::Heading(_), markup }, _))
+                if markup.contains("Ship the parity wave")),
+            "the plan renders as markdown"
+        );
+        assert!(blocks.len() >= 2);
+    }
+
+    /// Plan 2.3 (F7), from the W0 Codex frame: the rule dialog's entry holds the bare command,
+    /// not the wrapper and not the card's footer sentence.
+    fn rule_dialog_prefills_the_bare_w0_command() {
+        let params = include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["frame"]["method"] == "item/commandExecution/requestApproval")
+            .expect("W0 frame")["frame"]["params"]
+            .clone();
+        assert_eq!(params["command"], "/usr/bin/zsh -lc 'ls -la'");
+        let footer = "`/usr/bin/zsh -lc 'ls -la'` in /tmp/w0-sandbox";
+        let prefill =
+            crate::always_allow::dialog_prefill("command_execution", &params, Some(footer));
+        assert_eq!(prefill, "ls -la");
+        for decision in [Decision::AllowAlways, Decision::AllowForSession] {
+            let (_, entry, global) = rule_dialog("command_execution", &prefill, decision);
+            assert_eq!(entry.text(), "ls -la");
+            assert!(!global.is_active());
+        }
+        let s = build_approval_suggestions("command_execution", &prefill);
+        assert_eq!(s[0].pattern, "ls -la");
+        assert_eq!(s[0].description.as_deref(), Some("Exact command"));
     }
 
     #[test]

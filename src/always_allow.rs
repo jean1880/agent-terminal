@@ -142,16 +142,25 @@ fn strict_wrapper_body(tokens: &[String]) -> Option<&str> {
     (known_shell && STRICT_FLAGS.contains(&flag.as_str())).then_some(body.as_str())
 }
 
+/// The command line a strict shell wrapper runs (`/usr/bin/zsh -lc 'ls -la'` gives `ls -la`), or
+/// `None` when `command` is not exactly that shape. The one unwrap: rules are created from it
+/// (the approval dialog's prefill) and matched through it ([`command_tokens`]), so a saved rule
+/// matches the request it was made from.
+pub fn unwrap_shell_wrapper(command: &str) -> Option<String> {
+    let tokens = simple_command_tokens(command)?;
+    strict_wrapper_body(&tokens).map(str::to_owned)
+}
+
 /// The argv a command line is matched by: [`simple_command_tokens`], with the one strict wrapper
-/// shape unwrapped (its body must pass the same check, and may not be a wrapper itself). Any
-/// other wrapped command (`bash -c "…"` with options, `sh -ec`, a wrapper inside a wrapper) is
-/// `None`: it never auto-matches.
+/// shape unwrapped ([`unwrap_shell_wrapper`]; its body must pass the same check, and may not be
+/// a wrapper itself). Any other wrapped command (`bash -c "…"` with options, `sh -ec`, a wrapper
+/// inside a wrapper) is `None`: it never auto-matches.
 pub fn command_tokens(command: &str) -> Option<Vec<String>> {
     let tokens = simple_command_tokens(command)?;
     if !is_wrapped(&tokens) {
         return Some(tokens);
     }
-    let body = simple_command_tokens(strict_wrapper_body(&tokens)?)?;
+    let body = simple_command_tokens(&unwrap_shell_wrapper(command)?)?;
     (!is_wrapped(&body)).then_some(body)
 }
 
@@ -232,6 +241,21 @@ pub enum Action {
     Mcp { server: String, tool: String },
 }
 
+/// The one file a Codex patch approval changes (its `changes`, which the adapter takes from the
+/// item that started it): exactly one change, not a rename (a rename writes two paths).
+fn codex_change_path(input: &Value) -> Option<String> {
+    let [change] = input.get("changes")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let renamed = change
+        .get("kind")
+        .and_then(|k| k.get("move_path"))
+        .is_some_and(|m| !m.is_null());
+    first_str(change, &["path"])
+        .filter(|_| !renamed)
+        .map(str::to_owned)
+}
+
 fn first_str<'a>(input: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|k| input.get(*k).and_then(Value::as_str))
@@ -258,6 +282,7 @@ impl Action {
             match (targets.as_slice(), notebook) {
                 ([one], None) => Some((*one).to_owned()),
                 ([], Some(nb)) => Some(nb.to_owned()),
+                ([], None) => codex_change_path(input),
                 _ => None,
             }
         };
@@ -611,7 +636,33 @@ impl Rule {
     }
 }
 
-/// Whether "Allow for session" (and, for shell, "Always allow") may be offered for `action`: it
+/// What the approval rule dialog starts from for a request (`tool` and `input` as the agent sent
+/// them): the bare command (a strict `zsh -lc '…'` wrapper unwrapped by
+/// [`unwrap_shell_wrapper`], the same function matching uses, so the saved rule matches this
+/// request again), the one edited path, or `server/tool`. Anything else falls back to
+/// `remembers`, what the card says Always keeps.
+pub fn dialog_prefill(tool: &str, input: &Value, remembers: Option<&str>) -> String {
+    match Action::of(tool, input) {
+        Some(Action::Shell { command }) => unwrap_shell_wrapper(&command).unwrap_or(command),
+        Some(Action::Edit { path }) => path,
+        Some(Action::Mcp { server, tool }) => format!("{server}/{tool}"),
+        Some(Action::Read { .. }) | None => remembers.unwrap_or_default().to_owned(),
+    }
+}
+
+/// Whether "Always allow" applies to this kind of call, once [`offerable`] holds (U2, D4): a shell
+/// command, an edit of one contained, non-sensitive path (`..`, a symlink on the way, `.git`,
+/// `.env`, workflows and home dotfiles never qualify, and the path is checked again at every
+/// match), or one named MCP tool (whatever its arguments). A read stays "for this session".
+pub fn always_offerable(action: &Action) -> bool {
+    matches!(
+        action.kind(),
+        ActionKind::Shell | ActionKind::Edit | ActionKind::Mcp
+    )
+}
+
+/// Whether "Allow for session" (and, with [`always_offerable`], "Always allow") may be offered
+/// for `action`: it
 /// has no secret and a rule could match it at all (a simple command; a contained, non-sensitive
 /// path; a named MCP tool).
 pub fn offerable(action: &Action, ctx: &Context) -> bool {
@@ -1239,6 +1290,19 @@ mod tests {
             command_tokens("bash run.sh").expect("script"),
             ["bash", "run.sh"]
         );
+        // The one unwrap the dialog prefills from: a rule made from its result matches the
+        // wrapped request again (plan 2.3).
+        assert_eq!(
+            unwrap_shell_wrapper("/usr/bin/zsh -lc 'ls -la'").as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(unwrap_shell_wrapper("ls -la"), None);
+        assert_eq!(unwrap_shell_wrapper("bash -ec 'ls'"), None);
+        assert_eq!(
+            unwrap_shell_wrapper("zsh -lc 'ls; id'"),
+            None,
+            "shell syntax anywhere: not unwrapped, never a rule"
+        );
     }
 
     /// The exact #310 payloads: every one asks against rules that would have matched before.
@@ -1366,9 +1430,42 @@ mod tests {
                 path: "/w/a".into()
             })
         );
-        // A Codex file change names no path: no rule can describe it.
+        // A Codex patch request names no path itself: the one change the adapter adds from its
+        // item is the target; several changes or a rename cannot be one rule.
         assert_eq!(Action::of("file_change", &serde_json::json!({})), None);
+        let change = |path: &str, move_path: Value| serde_json::json!({"path": path, "kind": {"type": "update", "move_path": move_path}});
+        assert_eq!(
+            Action::of(
+                "file_change",
+                &serde_json::json!({"changes": [change("/w/a", Value::Null)]})
+            ),
+            Some(Action::Edit {
+                path: "/w/a".into()
+            })
+        );
+        for changes in [
+            serde_json::json!([change("/w/a", Value::Null), change("/w/b", Value::Null)]),
+            serde_json::json!([change("/w/a", serde_json::json!("/w/c"))]),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(
+                Action::of("file_change", &serde_json::json!({ "changes": changes })),
+                None
+            );
+        }
         assert_eq!(Action::of("WebFetch", &serde_json::json!({})), None);
+        // Always applies to shell, edits and MCP tools (U2), never to reads.
+        assert!(always_offerable(&shell("ls")));
+        assert!(always_offerable(&Action::Edit {
+            path: "/w/a".into()
+        }));
+        assert!(always_offerable(&Action::Mcp {
+            server: "fs".into(),
+            tool: "write".into()
+        }));
+        assert!(!always_offerable(&Action::Read {
+            path: "/w/a".into()
+        }));
     }
 
     #[test]

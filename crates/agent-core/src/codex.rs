@@ -6,8 +6,8 @@
 //!
 //! # Provenance
 //!
-//! Nothing here is replayed from a real recording yet (`tests/fixtures/codex-synthetic-turn.ndjson`
-//! is SYNTHETIC). The mapping targets **codex-cli 0.160.1**: the method registry, the enums
+//! Real frames are recorded under `tests/fixtures/real/codex/` (codex-cli 0.161.0); the older
+//! `tests/fixtures/codex-synthetic-turn.ndjson` is SYNTHETIC. The mapping targets **codex-cli 0.160.1**: the method registry, the enums
 //! (`AskForApproval`, `ApprovalsReviewer`, `SandboxPolicy`, `ReasoningSummary`, the approval
 //! decisions) and `Model` were cross-checked against the JSON Schema that binary generates
 //! (`codex app-server generate-json-schema`, stable surface; it writes files only). The struct
@@ -62,10 +62,14 @@
 //! | [`Mode`]      | approvalPolicy | sandboxPolicy       | Effect                                  |
 //! |---------------|----------------|---------------------|-----------------------------------------|
 //! | `Ask`         | `untrusted`    | `readOnly`          | only known-safe reads run unasked; every edit and other command asks |
-//! | `AcceptEdits` | `on-request`   | `workspaceWrite`    | edits inside the workspace are automatic; the model asks to escalate |
+//! | `AcceptEdits` | `untrusted`    | `workspaceWrite`    | every edit and other command asks; the app answers in-workspace edits itself, so shell still asks |
 //! | `Plan`        | `never`        | `readOnly`          | cannot write and never asks (T3 Code has no read-only row; this is the strictest the enums allow without the experimental `collaborationMode`) |
 //!
-//! `Ask` is T3's `approval-required` row, `AcceptEdits` its `auto-accept-edits` row.
+//! `Ask` is T3's `approval-required` row. `AcceptEdits` is not T3's `auto-accept-edits`
+//! (`on-request`, under which Codex runs shell commands unasked): W0
+//! (`untrusted-workspacewrite.jsonl`) showed that on `untrusted` + `workspaceWrite` both edits and
+//! shell ask, and an `accept` applies the edit (plan D5). The app's session accepts edits whose
+//! every path is inside the workspace and not sensitive.
 //!
 //! # Known limits (each with its upgrade path)
 //!
@@ -228,6 +232,12 @@ pub struct CodexAdapter {
     texts: HashMap<String, String>,
     /// Accumulated reasoning summary per open reasoning item.
     reasoning: HashMap<String, String>,
+    /// The `changes` of each open `fileChange` item: its approval request carries no path or
+    /// diff (W0), so the card and the app's rules take them from here.
+    file_changes: HashMap<String, Value>,
+    /// While a `thread/resume` is unanswered: the `thread/start` params to fall back on when it
+    /// finds no rollout (a thread that never completed a turn has none).
+    resume_fallback: Option<Value>,
     /// Worker identity is a thread id, independent of collaboration operation/item ids.
     workers: BTreeMap<String, WorkerSnapshot>,
     /// Current child turn ids: unscoped child requests must never borrow the parent's id.
@@ -284,6 +294,8 @@ impl CodexAdapter {
             open_items: Vec::new(),
             texts: HashMap::new(),
             reasoning: HashMap::new(),
+            file_changes: HashMap::new(),
+            resume_fallback: None,
             workers: BTreeMap::new(),
             worker_turns: HashMap::new(),
             worker_waits: BTreeMap::new(),
@@ -388,6 +400,20 @@ impl CodexAdapter {
             && (submitted.revision > self.confirmed_revision
                 || submitted.model != self.confirmed_model
                 || submitted.effort != self.confirmed_effort)
+    }
+
+    /// A patch approval's card title, from the paths of the item that started it.
+    fn file_change_title(&self, params: &Value) -> String {
+        let paths: Vec<&str> = s(params, "itemId")
+            .and_then(|id| self.file_changes.get(id))
+            .and_then(Value::as_array)
+            .map(|c| c.iter().filter_map(|ch| s(ch, "path")).collect())
+            .unwrap_or_default();
+        match paths.as_slice() {
+            [] => "Apply file changes".to_owned(),
+            [one] => format!("Edit {one}"),
+            [first, rest @ ..] => format!("Edit {first} (+{} more)", rest.len()),
+        }
     }
 
     fn fail_startup(&mut self, message: String, out: &mut Vec<Envelope>) {
@@ -704,6 +730,8 @@ impl CodexAdapter {
 
     fn close_all(&mut self, out: &mut Vec<Envelope>) {
         for id in std::mem::take(&mut self.open_items) {
+            // An item cut short never completes: its patch must not outlive it.
+            self.file_changes.remove(&id);
             for (stream, text) in [
                 (StreamKind::Assistant, self.texts.remove(&id)),
                 (StreamKind::Reasoning, self.reasoning.remove(&id)),
@@ -737,6 +765,11 @@ impl CodexAdapter {
         }
         self.track_collaboration(item, false, out);
         let (kind, title, input) = item_info(item);
+        if kind == ItemKind::FileChange {
+            if let Some(changes) = input.clone().filter(Value::is_array) {
+                self.file_changes.insert(id.to_owned(), changes);
+            }
+        }
         self.start_item(out, id, kind, title, input);
     }
 
@@ -761,6 +794,7 @@ impl CodexAdapter {
             return;
         }
         self.track_collaboration(item, true, out);
+        self.file_changes.remove(id);
         let (kind, title, input) = item_info(item);
         if matches!(kind, ItemKind::WebSearch | ItemKind::FileChange)
             && self.open_items.iter().any(|open| open == id)
@@ -918,6 +952,11 @@ impl CodexAdapter {
             }
             "item/fileChange/patchUpdated" => {
                 if let Some(id) = s(params, "itemId") {
+                    if let Some(changes) = params.get("changes").filter(|c| c.is_array()) {
+                        if let Some(known) = self.file_changes.get_mut(id) {
+                            known.clone_from(changes);
+                        }
+                    }
                     let diff = params
                         .get("changes")
                         .and_then(Value::as_array)
@@ -1347,8 +1386,8 @@ impl CodexAdapter {
                 "file_change",
                 Some(
                     s(params, "reason")
-                        .unwrap_or("Apply file changes")
-                        .to_owned(),
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| self.file_change_title(params)),
                 ),
                 true,
             ),
@@ -1418,6 +1457,24 @@ impl CodexAdapter {
                 }
             }
         }
+        // Deny is always `decline`, offered or not: W0 showed Codex accepts it (the item ends
+        // `declined` and the turn continues). Stop turn (`cancel`) stays a separate choice.
+        if !options.contains(&Decision::Deny) {
+            let at = options
+                .iter()
+                .position(|d| *d == Decision::Cancel)
+                .unwrap_or(options.len());
+            options.insert(at, Decision::Deny);
+        }
+        // A patch approval names no file (W0): its changes come from the item that started it.
+        let mut input = params.clone();
+        if method == "item/fileChange/requestApproval" {
+            if let (Some(obj), Some(changes)) =
+                (input.as_object_mut(), self.file_changes.get(&item))
+            {
+                obj.entry("changes").or_insert_with(|| changes.clone());
+            }
+        }
         self.approvals.insert(
             key.clone(),
             PendingApproval {
@@ -1431,7 +1488,7 @@ impl CodexAdapter {
             Envelope::new(Event::ApprovalRequested {
                 tool: tool.to_owned(),
                 title,
-                input: params.clone(),
+                input,
                 reason: s(params, "reason").map(str::to_owned),
                 options,
                 response: ResponseCapability::Live,
@@ -1463,7 +1520,31 @@ impl CodexAdapter {
             .map(|e| s(e, "message").map_or_else(|| e.to_string(), str::to_owned));
         match (pending, result, error) {
             (Pending::Initialize, Some(_), _) => {}
-            (Pending::ThreadStart, Some(result), _) => self.on_thread_ready(result, out),
+            (Pending::ThreadStart, Some(result), _) => {
+                self.resume_fallback = None;
+                self.on_thread_ready(result, out);
+            }
+            (Pending::ThreadStart, None, Some(error))
+                if self.resume_fallback.is_some()
+                    && error.to_ascii_lowercase().contains("no rollout found") =>
+            {
+                // The thread never completed a turn, so Codex kept nothing to resume. Start a
+                // new one; the app carries the thread's history into it (plan 2.5). The text is
+                // Codex 0.161's, seen live, not in W0: parity report F9
+                // (`docs/feature-parity-report.md`), where fail_startup surfaced it as
+                // "Could not switch to …: no rollout found for thread id …" and "Turn failed: no
+                // rollout found for thread id …". Any other resume error still fails startup.
+                if let Some(params) = self.resume_fallback.take() {
+                    let line = self.request(Pending::ThreadStart, "thread/start", params);
+                    self.write(line);
+                }
+                out.push(Envelope::new(Event::Notice {
+                    text: "Codex kept no saved session for this thread (it ended before a turn \
+                           completed), so a new Codex session started. The thread's history \
+                           goes with your next message."
+                        .to_owned(),
+                }));
+            }
             (Pending::TurnStart(submitted), Some(result), _) => {
                 self.confirm_submitted_model(&submitted, out);
                 if self.turn_id.is_none() {
@@ -1614,6 +1695,8 @@ impl Adapter for CodexAdapter {
         self.open_items.clear();
         self.texts.clear();
         self.reasoning.clear();
+        self.file_changes.clear();
+        self.resume_fallback = None;
         // Reconnecting the same thread forgets live certainty, not its worker history. A newly
         // constructed adapter knows only workers observed on this connection; replaying UI
         // consumers preserve previously stored identities absent from these snapshots.
@@ -1664,6 +1747,7 @@ impl Adapter for CodexAdapter {
         let resume = session.and_then(|s| s.resume);
         let thread = match resume {
             Some(id) => {
+                self.resume_fallback = Some(Value::Object(params.clone()));
                 params.insert("threadId".into(), json!(id));
                 // The app keeps its own transcript; do not have the server send the history.
                 params.insert("excludeTurns".into(), json!(true));
@@ -1737,13 +1821,16 @@ impl Adapter for CodexAdapter {
                 request, decision, ..
             } => {
                 // Checked before it is removed: a refused decision leaves the request answerable.
+                // `decline` is never refused: Codex accepts it unoffered (W0, plan D4).
                 match self.approvals.get(&request) {
                     None => {
                         return Err(AdapterError::Invalid(format!(
                             "no pending approval {request}"
                         )));
                     }
-                    Some(pending) if !pending.options.contains(&decision) => {
+                    Some(pending)
+                        if decision != Decision::Deny && !pending.options.contains(&decision) =>
+                    {
                         return Err(AdapterError::Invalid(format!(
                             "Codex did not offer {} for approval {request}",
                             decision_wire(decision)
@@ -2002,7 +2089,7 @@ fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
 fn mode_policy(mode: Mode) -> (&'static str, Value) {
     match mode {
         Mode::Ask => ("untrusted", json!({"type": "readOnly"})),
-        Mode::AcceptEdits => ("on-request", json!({"type": "workspaceWrite"})),
+        Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
         Mode::Plan => ("never", json!({"type": "readOnly"})),
     }
 }
@@ -2670,7 +2757,7 @@ mod tests {
             .expect("prompt"),
         );
         assert_eq!(next["params"]["sandboxPolicy"]["type"], "workspaceWrite");
-        assert_eq!(next["params"]["approvalPolicy"], "on-request");
+        assert_eq!(next["params"]["approvalPolicy"], "untrusted");
     }
 
     #[test]
@@ -3015,6 +3102,57 @@ mod tests {
         );
     }
 
+    /// Plan 2.5: a resume of a thread that never completed a turn finds no rollout. The adapter
+    /// starts a new thread with the same settings (and says so) instead of failing, and a prompt
+    /// queued meanwhile goes to the new thread. Any other resume error still fails startup.
+    #[test]
+    fn a_resume_with_no_rollout_starts_a_new_thread() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-gone")));
+        a.handshake();
+        assert!(a
+            .encode(Command::Prompt { text: "hi".into() })
+            .expect("queued")
+            .is_empty());
+        let ev = a.feed(
+            r#"{"id":2,"error":{"code":-32600,"message":"no rollout found for thread id th-gone"}}"#,
+        );
+        assert!(
+            ev.iter().any(
+                |e| matches!(&e.event, Event::Notice { text } if text.contains("new Codex session"))
+            ),
+            "{ev:?}"
+        );
+        assert!(!ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        let start = writes(&a.drain_outbox().actions);
+        assert_eq!(start.len(), 1, "{start:?}");
+        assert_eq!(start[0]["method"], "thread/start");
+        assert_eq!(start[0]["params"]["cwd"], "/work/repo");
+        assert!(start[0]["params"].get("threadId").is_none());
+        assert!(start[0]["params"].get("excludeTurns").is_none());
+        let id = start[0]["id"].clone();
+        let ev = a.feed(&json!({"id": id, "result": {"thread": {"id": "th-new"}}}).to_string());
+        assert!(
+            matches!(&ev[0].event, Event::SessionStarted { native_id, .. } if native_id == "th-new")
+        );
+        let turn = writes(&a.drain_outbox().actions);
+        assert_eq!(turn[0]["method"], "turn/start");
+        assert_eq!(turn[0]["params"]["threadId"], "th-new");
+
+        // Not a missing rollout: startup fails as before, and a fresh start never falls back.
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        let ev = a.feed(r#"{"id":2,"error":{"code":-32600,"message":"permission denied"}}"#);
+        assert!(ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        assert!(writes(&a.drain_outbox().actions).is_empty());
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        let ev = a.feed(r#"{"id":2,"error":{"message":"no rollout found for thread id x"}}"#);
+        assert!(ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+    }
+
     #[test]
     fn a_stopped_queued_prompt_is_replaced_by_one_continuation_on_the_resumed_model() {
         let mut a = CodexAdapter::new();
@@ -3316,7 +3454,7 @@ mod tests {
             (Mode::Ask, "untrusted", json!({"type": "readOnly"})),
             (
                 Mode::AcceptEdits,
-                "on-request",
+                "untrusted",
                 json!({"type": "workspaceWrite"}),
             ),
             (Mode::Plan, "never", json!({"type": "readOnly"})),
@@ -3372,7 +3510,7 @@ mod tests {
         );
         let w = one_write(a.encode(Command::Prompt { text: "x".into() }).expect("ok"));
         assert_eq!(w["params"]["model"], "gpt-5.5");
-        assert_eq!(w["params"]["approvalPolicy"], "on-request");
+        assert_eq!(w["params"]["approvalPolicy"], "untrusted");
         assert_eq!(
             w["params"]["sandboxPolicy"],
             json!({"type": "workspaceWrite"})
@@ -3904,7 +4042,7 @@ mod tests {
         );
         assert!(
             matches!(&ev[0].event, Event::ApprovalRequested { options, .. }
-            if options == &vec![Decision::Allow, Decision::AllowAlways, Decision::AllowForSession, Decision::Cancel])
+            if options == &vec![Decision::Allow, Decision::AllowAlways, Decision::AllowForSession, Decision::Deny, Decision::Cancel])
         );
     }
 
@@ -3939,6 +4077,7 @@ mod tests {
                             Decision::Allow,
                             Decision::AllowAlways,
                             Decision::AllowForSession,
+                            Decision::Deny,
                             Decision::Cancel
                         ]
                     );
@@ -3998,7 +4137,7 @@ mod tests {
     fn a_decision_the_server_did_not_offer_is_refused_and_the_request_stays_open() {
         let mut a = started(Mode::Ask);
         let ev = a.feed(
-            r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["accept","cancel"]}}"#,
+            r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["decline","cancel"]}}"#,
         );
         let request = ev[0].request.clone().expect("canonical request");
         let approve = |decision| Command::Approve {
@@ -4008,12 +4147,172 @@ mod tests {
             message: None,
         };
         assert!(matches!(
-            a.encode(approve(Decision::Deny)),
-            Err(AdapterError::Invalid(m)) if m.contains("decline")
+            a.encode(approve(Decision::Allow)),
+            Err(AdapterError::Invalid(m)) if m.contains("accept")
         ));
         // Still pending: an offered decision goes through.
-        let w = one_write(a.encode(approve(Decision::Allow)).expect("offered"));
-        assert_eq!(w, json!({"id": 5, "result": {"decision": "accept"}}));
+        let w = one_write(a.encode(approve(Decision::Deny)).expect("offered"));
+        assert_eq!(w, json!({"id": 5, "result": {"decision": "decline"}}));
+    }
+
+    /// A patch whose item never completes (the turn was interrupted or failed, or the process
+    /// exited) leaves no stored change behind for a later approval to borrow.
+    #[test]
+    fn file_changes_of_items_cut_short_are_dropped() {
+        let begin = |a: &mut CodexAdapter, id: &str| {
+            a.feed(
+                &json!({"method": "item/started", "params": {"threadId": "th-1", "turnId": "tu",
+                "item": {"type": "fileChange", "id": id, "status": "inProgress",
+                    "changes": [{"path": "/w/a", "kind": {"type": "update"}, "diff": "@@"}]}}})
+                .to_string(),
+            );
+        };
+        for end in ["interrupted", "failed"] {
+            let mut a = started(Mode::Ask);
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+            begin(&mut a, "p1");
+            assert!(a.file_changes.contains_key("p1"));
+            a.feed(
+                &json!({"method": "turn/completed", "params": {"threadId": "th-1",
+                "turn": {"id": "tu", "status": end}}})
+                .to_string(),
+            );
+            assert!(a.file_changes.is_empty(), "{end}");
+        }
+        let mut a = started(Mode::Ask);
+        begin(&mut a, "p2");
+        a.on_exit(Some(1));
+        assert!(a.file_changes.is_empty(), "exit");
+    }
+
+    /// The W0 frames from a fixture, replayed: server frames are fed (collecting the events),
+    /// the recorded prompt is encoded so the turn/start reply matches, and the replay stops
+    /// after the first frame with method `until`. Returns the adapter, the events up to there
+    /// and the server frames after it.
+    fn w0_replay(fixture: &str, until: &str) -> (CodexAdapter, Vec<Envelope>, Vec<String>) {
+        let mut a = CodexAdapter::new().client_version("0.1.0");
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        let mut events = Vec::new();
+        let mut rest = Vec::new();
+        let mut reached = false;
+        for rec in fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        {
+            let frame = &rec["frame"];
+            if reached {
+                if rec["dir"] == "out" {
+                    rest.push(frame.to_string());
+                }
+                continue;
+            }
+            match (rec["dir"].as_str(), frame["method"].as_str()) {
+                (Some("in"), Some("turn/start")) => {
+                    let text = frame["params"]["input"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    a.encode(Command::Prompt { text }).expect("prompt");
+                    a.drain_outbox();
+                }
+                (Some("out"), method) => {
+                    events.extend(a.feed(&frame.to_string()));
+                    a.drain_outbox();
+                    reached = method == Some(until);
+                }
+                _ => {}
+            }
+        }
+        assert!(reached, "the fixture has no {until} frame");
+        (a, events, rest)
+    }
+
+    fn feed_all(a: &mut CodexAdapter, frames: &[String]) -> Vec<Envelope> {
+        frames.iter().flat_map(|f| a.feed(f)).collect()
+    }
+
+    /// Plan 2.1, W0 `ask-shell-decline.jsonl` and `ask-edit-decline.jsonl`: Deny sends
+    /// `decline` though neither request offers it, the item ends `declined` and the turn goes
+    /// on to complete; Stop turn sends `cancel`. The patch approval, which names no file,
+    /// shows the change its `item/started` frame carried.
+    #[test]
+    fn w0_deny_sends_decline_and_stop_sends_cancel() {
+        for (fixture, method) in [
+            (W0_SHELL, "item/commandExecution/requestApproval"),
+            (W0_EDIT, "item/fileChange/requestApproval"),
+        ] {
+            let (mut a, events, rest) = w0_replay(fixture, method);
+            let card = events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+                .expect("card");
+            let Event::ApprovalRequested { options, .. } = &card.event else {
+                unreachable!()
+            };
+            assert!(options.contains(&Decision::Deny) && options.contains(&Decision::Cancel));
+            let request = card.request.clone().expect("request");
+            let w = one_write(
+                a.encode(approve_cmd(&request, Decision::Deny))
+                    .expect("deny"),
+            );
+            assert_eq!(w["result"], json!({"decision": "decline"}), "{method}");
+            let after = feed_all(&mut a, &rest);
+            assert!(
+                after.iter().any(|e| matches!(
+                    e.event,
+                    Event::ItemCompleted {
+                        status: ItemStatus::Declined,
+                        ..
+                    }
+                )),
+                "{method}: the item ends declined"
+            );
+            assert!(
+                after.iter().any(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Completed,
+                        ..
+                    }
+                )),
+                "{method}: the turn continues to completion"
+            );
+
+            let (mut a, events, _) = w0_replay(fixture, method);
+            let request = events
+                .iter()
+                .rev()
+                .find_map(|e| match e.event {
+                    Event::ApprovalRequested { .. } => e.request.clone(),
+                    _ => None,
+                })
+                .expect("request");
+            let w = one_write(
+                a.encode(approve_cmd(&request, Decision::Cancel))
+                    .expect("stop"),
+            );
+            assert_eq!(w["result"], json!({"decision": "cancel"}), "{method}");
+        }
+
+        let (_, events, _) = w0_replay(W0_EDIT, "item/fileChange/requestApproval");
+        let Some(Event::ApprovalRequested { title, input, .. }) = events
+            .iter()
+            .rev()
+            .map(|e| &e.event)
+            .find(|e| matches!(e, Event::ApprovalRequested { .. }))
+        else {
+            panic!("no edit card");
+        };
+        let path = input["changes"][0]["path"]
+            .as_str()
+            .expect("the change's path");
+        assert!(path.ends_with(".txt"), "{path}");
+        assert!(input["changes"][0]["diff"]
+            .as_str()
+            .is_some_and(|d| d.contains("@@")));
+        assert_eq!(title.as_deref(), Some(format!("Edit {path}").as_str()));
     }
 
     #[test]

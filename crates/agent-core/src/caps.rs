@@ -5,13 +5,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
-    /// `SetModel` applies to the next turn without a restart (Claude `set_model`).
+    /// `SetModel` applies to the next turn without a restart (Claude `set_model`, Codex
+    /// `turn/start`). False (agy) means the session restarts and resumes with the new model.
     pub model_switch_in_session: bool,
     /// Approvals can be answered live (Claude control protocol; agy via the approval hook).
     pub live_approvals: bool,
     /// Interrupt keeps the process (Claude); false means the process exits (agy SIGINT).
     pub interrupt_keeps_process: bool,
-    /// `Control::FileSuggestions` is answered by the agent.
+    /// `Control::FileSuggestions` is answered by the agent. False means the app's own workspace
+    /// index serves the `@` popover instead.
     pub file_suggestions: bool,
     /// Native-panel controls the agent answers (`/mcp`, `/config`, `/model`, usage, context).
     pub mcp_panel: bool,
@@ -72,16 +74,19 @@ impl Capabilities {
             model_list: true,
             context_usage: true,
             usage: true,
+            // No compact command: `/compact` continues in a new thread with a budgeted summary.
             compact_command: None,
             streams_text: true,
-            streams_reasoning: false,
+            // One whole thought block per step, read from agy's on-disk transcript (live-verified
+            // 2026-10-10); never token by token.
+            streams_reasoning: true,
             questions: false,
             plan_mode: true,
         }
     }
 
-    /// Verified against the upstream `app-server-protocol` source (see `codex.rs`), not a
-    /// recording: Codex is not installed on the development machine yet.
+    /// Verified against the upstream `app-server-protocol` source (see `codex.rs`) and live
+    /// against codex-cli 0.161.0 (2026-10-10).
     pub fn codex() -> Self {
         Self {
             // `turn/start` takes `model` and applies it to that turn and later ones.
@@ -97,6 +102,8 @@ impl Capabilities {
             model_list: true,
             // `thread/tokenUsage/updated` carries the window size and occupancy.
             context_usage: true,
+            // No `Control::Usage` (the /usage panel). Its quota still shows in the header meter,
+            // fed by `account/rateLimits/updated`, which no flag gates.
             usage: false,
             // `thread/compact/start`: the adapter encodes a `/compact` prompt as that request.
             compact_command: Some("/compact".to_owned()),
@@ -108,5 +115,191 @@ impl Capabilities {
             // Plan = read-only sandbox and never escalate (`codex.rs`, "Modes").
             plan_mode: true,
         }
+    }
+}
+
+/// One capability fact, named so the UI can render it: a control when the agent has it, a greyed
+/// control or a notice (with [`Capabilities::unsupported_note`]) when it does not. There is one
+/// variant per [`Capabilities`] field; `supports` and the exhaustive-destructure test keep the
+/// two in step, so a field nothing reads cannot be added unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Feature {
+    ModelSwitch,
+    LiveApprovals,
+    InterruptKeepsProcess,
+    FileSuggestions,
+    McpPanel,
+    SettingsPanel,
+    ModelList,
+    ContextUsage,
+    Usage,
+    Compact,
+    StreamsText,
+    StreamsReasoning,
+    Questions,
+    PlanMode,
+}
+
+impl Feature {
+    pub const ALL: [Feature; 14] = [
+        Feature::ModelSwitch,
+        Feature::LiveApprovals,
+        Feature::InterruptKeepsProcess,
+        Feature::FileSuggestions,
+        Feature::McpPanel,
+        Feature::SettingsPanel,
+        Feature::ModelList,
+        Feature::ContextUsage,
+        Feature::Usage,
+        Feature::Compact,
+        Feature::StreamsText,
+        Feature::StreamsReasoning,
+        Feature::Questions,
+        Feature::PlanMode,
+    ];
+
+    /// Where the app renders this fact (for people reading the contract test; the test checks
+    /// only that it is named).
+    pub fn surface(self) -> &'static str {
+        match self {
+            Feature::ModelSwitch => "model picker: applies at once, or restarts and resumes",
+            Feature::LiveApprovals => "approval cards (Ask mode)",
+            Feature::InterruptKeepsProcess => "stop button tooltip",
+            Feature::FileSuggestions => {
+                "@ popover (the agent's list, else the app's workspace index)"
+            }
+            Feature::McpPanel => "/mcp panel",
+            Feature::SettingsPanel => "/config panel",
+            Feature::ModelList => "/model picker",
+            Feature::ContextUsage => "header gauge and /context",
+            Feature::Usage => "/usage panel",
+            Feature::Compact => "/compact",
+            Feature::StreamsText => "assistant message rows",
+            Feature::StreamsReasoning => "thought-process rows",
+            Feature::Questions => "question cards",
+            Feature::PlanMode => "mode picker: Plan",
+        }
+    }
+}
+
+impl Capabilities {
+    /// Whether this agent has `feature`.
+    pub fn supports(&self, feature: Feature) -> bool {
+        match feature {
+            Feature::ModelSwitch => self.model_switch_in_session,
+            Feature::LiveApprovals => self.live_approvals,
+            Feature::InterruptKeepsProcess => self.interrupt_keeps_process,
+            Feature::FileSuggestions => self.file_suggestions,
+            Feature::McpPanel => self.mcp_panel,
+            Feature::SettingsPanel => self.settings_panel,
+            Feature::ModelList => self.model_list,
+            Feature::ContextUsage => self.context_usage,
+            Feature::Usage => self.usage,
+            Feature::Compact => self.compact_command.is_some(),
+            Feature::StreamsText => self.streams_text,
+            Feature::StreamsReasoning => self.streams_reasoning,
+            Feature::Questions => self.questions,
+            Feature::PlanMode => self.plan_mode,
+        }
+    }
+
+    /// The tooltip or notice for a greyed control: what `agent` (a display name) lacks and what
+    /// happens instead. `None` when the agent has the feature.
+    pub fn unsupported_note(&self, feature: Feature, agent: &str) -> Option<String> {
+        if self.supports(feature) {
+            return None;
+        }
+        Some(match feature {
+            Feature::ModelSwitch => {
+                format!("{agent} restarts to switch models; the conversation resumes.")
+            }
+            Feature::LiveApprovals => format!("{agent} cannot ask before acting."),
+            Feature::InterruptKeepsProcess => {
+                format!("Stopping ends {agent}'s process; the next message restarts it.")
+            }
+            Feature::FileSuggestions => {
+                format!("{agent} does not list files; the app searches the workspace instead.")
+            }
+            Feature::McpPanel => format!("{agent} has no MCP panel."),
+            Feature::SettingsPanel => format!("{agent} has no settings panel."),
+            Feature::ModelList => format!("{agent} has no model list."),
+            Feature::ContextUsage => format!("{agent} reports no context window."),
+            Feature::Usage => format!("{agent} has no usage panel; its quota shows in the header."),
+            Feature::Compact => format!(
+                "{agent} has no compact command; /compact continues in a new thread with a summary."
+            ),
+            Feature::StreamsText => format!("{agent} does not stream its replies."),
+            Feature::StreamsReasoning => format!("{agent} shows no reasoning."),
+            Feature::Questions => format!("{agent} asks no structured questions."),
+            Feature::PlanMode => format!("{agent} has no read-only planning mode."),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::Driver;
+
+    /// Adding a field to `Capabilities` stops this compiling until it is named here, and the
+    /// `Feature` count below then fails until the field has a variant and a `supports` arm.
+    #[test]
+    fn every_field_has_a_feature() {
+        let Capabilities {
+            model_switch_in_session: _,
+            live_approvals: _,
+            interrupt_keeps_process: _,
+            file_suggestions: _,
+            mcp_panel: _,
+            settings_panel: _,
+            model_list: _,
+            context_usage: _,
+            usage: _,
+            compact_command: _,
+            streams_text: _,
+            streams_reasoning: _,
+            questions: _,
+            plan_mode: _,
+        } = Capabilities::claude();
+        assert_eq!(Feature::ALL.len(), 14);
+        let mut seen = std::collections::HashSet::new();
+        assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
+    }
+
+    #[test]
+    fn every_missing_feature_explains_itself_and_every_feature_names_its_control() {
+        for driver in Driver::ALL {
+            let caps = Capabilities::of(driver);
+            let agent = driver.info().long_label;
+            for feature in Feature::ALL {
+                assert!(!feature.surface().is_empty());
+                match caps.unsupported_note(feature, agent) {
+                    None => assert!(caps.supports(feature)),
+                    Some(note) => {
+                        assert!(!caps.supports(feature));
+                        assert!(note.contains(agent), "{note}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_matrix_matches_what_each_agent_does() {
+        let agy = Capabilities::agy();
+        // Reasoning arrives as one whole block per step (from its transcript), not token by token.
+        assert!(agy.supports(Feature::StreamsReasoning));
+        // Model switches restart and resume; compact continues in a new thread.
+        assert!(!agy.supports(Feature::ModelSwitch));
+        assert!(!agy.supports(Feature::Compact));
+        let codex = Capabilities::codex();
+        assert_eq!(
+            codex
+                .unsupported_note(Feature::McpPanel, "Codex")
+                .as_deref(),
+            Some("Codex has no MCP panel.")
+        );
+        // `usage` is the /usage panel; Codex's quota meter does not depend on it.
+        assert!(!codex.supports(Feature::Usage));
     }
 }

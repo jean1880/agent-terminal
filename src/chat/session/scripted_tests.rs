@@ -415,7 +415,7 @@ fn scripted_reload_rejects_previous_process_frames_and_adopts_deferred_mode_next
             .collect();
         assert_eq!(starts[0]["params"]["approvalPolicy"], "untrusted");
         assert_eq!(starts[0]["params"]["sandboxPolicy"]["type"], "readOnly");
-        assert_eq!(starts[1]["params"]["approvalPolicy"], "on-request");
+        assert_eq!(starts[1]["params"]["approvalPolicy"], "untrusted");
         assert_eq!(
             starts[1]["params"]["sandboxPolicy"]["type"],
             "workspaceWrite"
@@ -634,6 +634,168 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
         assert!(fixture.frames().iter().any(|f| f["connection"] == 4
             && f["dir"] == "in"
             && f["frame"]["result"] == json!({"decision": "accept"})));
+        session.shutdown(false);
+    });
+}
+
+/// Plan 2.5: a stored Codex thread id whose thread never completed a turn has no rollout. The
+/// reopened thread still works: the next prompt runs in a new Codex thread, carrying the
+/// thread's history as a handoff, with a notice, and only that completed turn stores the new id.
+#[test]
+fn scripted_resume_with_no_rollout_continues_in_a_new_codex_thread() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let pt = fixture
+            .store
+            .add_provider_thread(&fixture.thread, "codex", "synthetic-model")
+            .expect("provider thread");
+        fixture
+            .store
+            .set_active_provider_thread(&fixture.thread, &pt)
+            .expect("active");
+        fixture
+            .store
+            .set_native_id(&pt, "stale-thread")
+            .expect("stale id");
+        fixture
+            .store
+            .append_user_message(&fixture.thread, Some(&pt), "remember the blue door")
+            .expect("history");
+        let native = || {
+            fixture
+                .store
+                .provider_threads(&fixture.thread)
+                .expect("providers")
+                .into_iter()
+                .find(|p| p.id == pt)
+                .and_then(|p| p.native_id)
+        };
+
+        let session = fixture.session();
+        fixture.wait(ctx, "the new Codex thread", || {
+            session.inner.state.borrow().native_id.as_deref() == Some("fixture-thread")
+        });
+        assert!(fixture.seen.borrow().iter().any(|e| matches!(&e.event,
+            Event::Notice { text } if text.contains("new Codex session"))));
+        assert!(!fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| matches!(e.event, Event::Error { .. })));
+        assert_eq!(
+            native().as_deref(),
+            Some("stale-thread"),
+            "provisional until a turn completes"
+        );
+
+        fixture.prompt(&session, "success");
+        fixture.wait_finished(ctx);
+        let incoming = fixture.incoming();
+        let methods: Vec<&str> = incoming
+            .iter()
+            .filter_map(|f| f["method"].as_str())
+            .filter(|m| m.starts_with("thread/") || *m == "turn/start")
+            .collect();
+        assert_eq!(methods, ["thread/resume", "thread/start", "turn/start"]);
+        let turn = incoming
+            .iter()
+            .find(|f| f["method"] == "turn/start")
+            .expect("turn");
+        assert_eq!(turn["params"]["threadId"], "fixture-thread");
+        let text = turn["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.starts_with("Context handoff (HANDOFF-"), "{text}");
+        assert!(text.contains("remember the blue door"), "{text}");
+        assert!(text.ends_with("\nsuccess"), "{text}");
+        assert_eq!(native().as_deref(), Some("fixture-thread"));
+        session.shutdown(false);
+    });
+}
+
+/// Plan 2.7 (F19): an answered question card leaves "Sending…" for "Answered" once the adapter
+/// has accepted the answer; the agent never acknowledges it. A refused answer stays sent.
+#[test]
+fn scripted_an_accepted_answer_moves_the_question_card_to_answered() {
+    use crate::chat::view::model::QuestionState;
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        let state = |request: &str| {
+            let model = fixture.model.borrow();
+            model
+                .order()
+                .iter()
+                .find_map(|id| match model.get(id).map(|i| &i.body) {
+                    Some(Body::Question(q)) if q.request == request => Some(q.state),
+                    _ => None,
+                })
+        };
+        fixture.prompt(&session, "question");
+        let question = fixture.wait_pending(ctx);
+        fixture.model.borrow_mut().mark_questions_sent(&question);
+        assert_eq!(state(&question), Some(QuestionState::Sent));
+        // An answer the adapter refuses (no such question) resolves nothing.
+        session.answer_questions("no-such-question", json!({"Continue?": "Yes"}));
+        assert_eq!(state(&question), Some(QuestionState::Sent));
+        session.answer_questions(&question, json!({"Continue?": "Yes"}));
+        assert_eq!(state(&question), Some(QuestionState::Answered));
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(question.as_str())
+                && e.event == Event::QuestionResolved { answered: true }));
+        fixture.wait_finished(ctx);
+        assert_eq!(state(&question), Some(QuestionState::Answered));
+        session.shutdown(false);
+    });
+}
+
+/// Plan 2.5 (review): a turn that produced an item but never completed (the process died
+/// mid-command) still confirms the new Codex thread, so the next reopen resumes it.
+#[test]
+fn scripted_a_turn_with_an_item_confirms_the_new_codex_thread() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let pt = fixture
+            .store
+            .add_provider_thread(&fixture.thread, "codex", "synthetic-model")
+            .expect("provider thread");
+        fixture
+            .store
+            .set_active_provider_thread(&fixture.thread, &pt)
+            .expect("active");
+        fixture
+            .store
+            .set_native_id(&pt, "stale-thread")
+            .expect("stale id");
+        let native = || {
+            fixture
+                .store
+                .provider_threads(&fixture.thread)
+                .expect("providers")
+                .into_iter()
+                .find(|p| p.id == pt)
+                .and_then(|p| p.native_id)
+        };
+        let session = fixture.session();
+        fixture.wait(ctx, "the new Codex thread", || {
+            session.inner.state.borrow().native_id.as_deref() == Some("fixture-thread")
+        });
+        assert_eq!(native().as_deref(), Some("stale-thread"));
+        session.send_prompt("disconnect-command");
+        fixture.wait(ctx, "the process dies mid-command", || {
+            !session.status().alive
+        });
+        assert!(!fixture.seen.borrow().iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                ..
+            }
+        )));
+        assert_eq!(native().as_deref(), Some("fixture-thread"));
         session.shutdown(false);
     });
 }
