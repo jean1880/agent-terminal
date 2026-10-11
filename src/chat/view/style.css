@@ -313,6 +313,20 @@ togglebutton.option-button, button.option-button {
     background-color: alpha(@at_info, 0.18);
     border-color: @at_info;
 }
+/* quick replies: suggestions under a reply, muted so they never read as a question to answer */
+.quick-replies { margin: 0 4px 4px 4px; }
+.quick-replies-label { color: @at_fg_dim; font-size: 0.85em; }
+button.quick-reply {
+    padding: 4px 12px;
+    border-radius: 999px;
+    background-color: transparent;
+    border-color: @at_border;
+}
+button.quick-reply:hover { background-color: alpha(@at_accent, 0.08); border-color: @at_border_strong; }
+.quick-reply .option-label { color: @at_fg_soft; font-weight: 400; }
+button.quick-reply-action { color: @at_fg_dim; font-size: 0.85em; min-height: 0; padding: 2px 8px; }
+button.quick-reply-action:hover { color: @at_fg_strong; }
+.quick-reply:focus-visible, .quick-reply-action:focus-visible { outline: 2px solid @at_accent; outline-offset: -2px; }
 .option-label { color: @at_fg_strong; font-weight: 600; }
 .option-desc { color: @at_fg_dim; font-size: 0.85em; }
 

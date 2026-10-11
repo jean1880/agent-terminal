@@ -3546,6 +3546,12 @@ impl AgentTerminalWindow {
                 }
             }
             ViewAction::ModeChosen { driver, mode } => self.offer_default_mode(*driver, *mode),
+            ViewAction::StopQuickReplies => {
+                self.set_quick_replies(false);
+                self.show_toast(
+                    "Quick replies are off. Turn them back on in Settings, General, Replies.",
+                );
+            }
         }
     }
 

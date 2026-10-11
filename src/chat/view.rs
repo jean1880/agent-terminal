@@ -24,6 +24,7 @@ mod markdown;
 pub mod model;
 mod panels;
 mod payload;
+mod quick_replies;
 mod subagent_shelf;
 mod subagents;
 mod thinking;
@@ -76,6 +77,9 @@ pub enum ViewAction {
     /// The user picked `mode` in the header for this thread's `driver`: the window offers to make
     /// it that agent's default for new threads.
     ModeChosen { driver: Driver, mode: Mode },
+    /// "Don't suggest these" on the quick-reply chips: the window turns the setting off, which
+    /// applies at once, and says where it turns back on.
+    StopQuickReplies,
 }
 
 type ActionHandler = Rc<dyn Fn(&ViewAction)>;
@@ -869,6 +873,18 @@ impl Inner {
                 self.handle(changes);
                 self.backend.answer_questions(&request, answers);
                 self.composer.grab_focus();
+            }
+            RowEvent::QuickReply { text } => self.composer.fill(&text),
+            RowEvent::DismissQuickReplies => {
+                let changes = self.model.borrow_mut().dismiss_quick_replies();
+                self.handle(changes);
+                self.composer.grab_focus();
+            }
+            RowEvent::StopQuickReplies => {
+                let changes = self.model.borrow_mut().dismiss_quick_replies();
+                self.handle(changes);
+                self.composer.grab_focus();
+                self.emit(ViewAction::StopQuickReplies);
             }
             RowEvent::LoadDiff { id } => self.load_diff(&id),
             RowEvent::OpenDiff { id } => {

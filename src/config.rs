@@ -649,6 +649,11 @@ pub struct TerminalConfig {
     /// When adding an approval rule, prompt to confirm or loosen the pattern.
     #[serde(default = "default_true")]
     pub confirm_rule_modification: bool,
+    /// Offer quick replies under a Codex or agy reply that ends with a question and a short
+    /// list of choices (`agent_core::question_extract`). On by default; "Don't suggest these"
+    /// on the chips turns it off.
+    #[serde(default = "default_true")]
+    pub suggest_quick_replies: bool,
     /// Extra files in `permissions.toml` form that "Import Agent Permissions" reads and "Export"
     /// writes, beside the agents' own settings files. Empty by default: the app names no
     /// project's layout. Paths are absolute or start with `~/`; see
@@ -803,6 +808,23 @@ fn keep_copy(path: &Path, tag: &str) -> Option<PathBuf> {
     }
 }
 
+thread_local! {
+    /// [`TerminalConfig::suggest_quick_replies`] as the running app has it, for the chat session
+    /// that decides whether to offer chips (it has no window to ask). The window keeps it in
+    /// step with its settings; on until told otherwise, so a test sees the default.
+    static QUICK_REPLIES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether quick replies are on right now (see [`TerminalConfig::suggest_quick_replies`]).
+pub fn quick_replies_on() -> bool {
+    QUICK_REPLIES.with(std::cell::Cell::get)
+}
+
+/// Records the setting where [`quick_replies_on`] reads it.
+pub fn mirror_quick_replies(on: bool) {
+    QUICK_REPLIES.with(|c| c.set(on));
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -919,6 +941,7 @@ impl Default for TerminalConfig {
             reopen_last_thread: false,
             pattern_auto_approval: true,
             confirm_rule_modification: true,
+            suggest_quick_replies: true,
             permission_sources: Vec::new(),
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
@@ -2465,6 +2488,22 @@ mod tests {
         assert_eq!(back.profiles[0].default_mode, Some(Mode::AcceptEdits));
         assert_eq!(back.profiles[0].default_effort.as_deref(), Some("high"));
         assert!(back.profiles[1].disabled);
+    }
+
+    #[test]
+    fn quick_replies_default_on_and_round_trip_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert!(TerminalConfig::default().suggest_quick_replies);
+        // An older file, with no such key, keeps the default.
+        std::fs::write(&path, br#"{"scrollback_lines": 5000}"#).unwrap();
+        let mut config = TerminalConfig::load_from(&path);
+        assert!(config.suggest_quick_replies, "an older file suggests them");
+        config.suggest_quick_replies = false;
+        config.save_to(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"suggest_quick_replies\": false"), "{text}");
+        assert!(!TerminalConfig::load_from(&path).suggest_quick_replies);
     }
 
     #[test]
