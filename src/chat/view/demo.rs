@@ -1103,9 +1103,15 @@ fn script() -> Vec<Step> {
             title: Some("Run cargo clean".into()),
             input: json!({"CommandLine": "cargo clean", "Cwd": "~/git/agent-terminal"}),
             reason: None,
-            options: vec![Decision::Allow, Decision::Deny],
+            options: vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::AllowAlways,
+                Decision::Deny,
+                Decision::Cancel,
+            ],
             response: ResponseCapability::Live,
-            remembers: None,
+            remembers: Some("`cargo clean` in ~/git/agent-terminal".into()),
         })
         .request("ap2"),
     ));
