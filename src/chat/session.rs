@@ -206,6 +206,9 @@ struct Inner {
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
     last_enriched_step: Cell<Option<u64>>,
+    /// A new Codex thread id and its provider thread, not stored until a turn completes: Codex
+    /// writes no rollout before that, so a stored id could not be resumed (plan 2.5).
+    provisional_native: RefCell<Option<(ProviderThreadId, String)>>,
     /// How long a Claude permission request may wait for the user before it is denied (agy's
     /// socket has the same bound). Injectable for tests.
     approval_deadline: Cell<Duration>,
@@ -430,6 +433,7 @@ impl ChatSession {
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
+            provisional_native: RefCell::new(None),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
@@ -609,13 +613,17 @@ impl Inner {
                     // A resume that started a new native session leaves the old one behind:
                     // it is this thread's history now, never a separate session to list.
                     let previous = self.state.borrow().native_id.clone();
+                    let resumed = previous.as_deref() == Some(native_id.as_str());
                     if let Some(old) = previous.filter(|old| old != native_id) {
                         let driver = driver_name(self.adapter.borrow().driver());
                         if let Err(e) = self.store.dismiss_native(driver, &old) {
                             warn!(error = %e, "could not record the replaced native session");
                         }
                     }
-                    if let Err(e) = self.store.set_native_id(&pt, native_id) {
+                    // A new Codex thread stays provisional until a turn completes (2.5).
+                    if self.adapter.borrow().driver() == Driver::Codex && !resumed {
+                        *self.provisional_native.borrow_mut() = Some((pt, native_id.clone()));
+                    } else if let Err(e) = self.store.set_native_id(&pt, native_id) {
                         warn!(error = %e, "could not record the native session id");
                     }
                     self.state.borrow_mut().native_id = Some(native_id.clone());
@@ -648,6 +656,9 @@ impl Inner {
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
                     *self.pending_handoff.borrow_mut() = None;
+                }
+                if *state == TurnState::Completed {
+                    self.confirm_provisional_native();
                 }
                 if let Some(queued) = self.queued_prompts.borrow_mut().pop_front() {
                     self.deliver(
@@ -754,6 +765,55 @@ impl Inner {
     fn set_model(&self, model: &str) {
         self.state.borrow_mut().model = Some(model.to_owned());
         self.open.borrow_mut().model = Some(model.to_owned());
+    }
+
+    /// Stores a provisional Codex thread id once a turn on it completed, if its provider thread
+    /// is still this thread's agent.
+    fn confirm_provisional_native(&self) {
+        let Some((pt, native)) = self.provisional_native.borrow_mut().take() else {
+            return;
+        };
+        if *self.provider_thread.borrow() != pt {
+            return;
+        }
+        if let Err(e) = self.store.set_native_id(&pt, &native) {
+            warn!(error = %e, "could not record the native session id");
+        }
+    }
+
+    /// Whether `env` starts a Codex thread other than the one this session asked to resume: the
+    /// adapter fell back to a new thread because the old one had no rollout (plan 2.5).
+    fn is_lost_codex_resume(&self, env: &Envelope) -> bool {
+        let Event::SessionStarted { native_id, .. } = &env.event else {
+            return false;
+        };
+        self.adapter.borrow().driver() == Driver::Codex
+            && !native_id.is_empty()
+            && self
+                .state
+                .borrow()
+                .native_id
+                .as_ref()
+                .is_some_and(|old| old != native_id)
+    }
+
+    /// The new Codex thread knows nothing of this one: its history rides on the next prompt,
+    /// like a switch's handoff, unless a handoff is already waiting.
+    fn hand_off_to_fresh_codex_thread(&self) {
+        if self.pending_handoff.borrow().is_some() {
+            return;
+        }
+        let messages = match self.store.transcript_messages(&self.thread) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "could not read the thread to carry it into a new Codex thread");
+                return;
+            }
+        };
+        let handoff = build_handoff(&messages, &format!("Codex thread {}", self.thread));
+        if handoff.carried > 0 {
+            self.arm_handoff(handoff);
+        }
     }
 
     fn prepare_model_change(&self, model: String, effort: Option<String>, restarting: bool) {
@@ -986,7 +1046,11 @@ impl Inner {
         };
         for env in envelopes {
             let (env, auto) = self.gate_approval(env);
+            let lost_resume = self.is_lost_codex_resume(&env);
             self.emit(env.clone());
+            if lost_resume {
+                self.hand_off_to_fresh_codex_thread();
+            }
             self.watch_tool_step(&env);
             self.arm_approval_deadline(&env);
             if auto {
@@ -1104,8 +1168,9 @@ impl Inner {
 
     /// The app's own approval gate for Claude and Codex (agy's is its socket, D1). For an
     /// `ApprovalRequested` envelope it sets the buttons that mean the same everywhere ("Allow for
-    /// session" only where a rule could match the call; "Always allow" only for a shell command
-    /// with a rules file), says what Always keeps, records the call for the answer, and returns
+    /// session" only where a rule could match the call; "Always allow" also needs a rules file and
+    /// a kind it applies to: shell, a contained edit, an MCP tool), says what Always keeps,
+    /// records the call for the answer, and returns
     /// whether a session rule of this agent or an Always rule already allows it.
     fn gate_approval(&self, mut env: Envelope) -> (Envelope, bool) {
         let driver = self.adapter.borrow().driver();
@@ -1141,7 +1206,7 @@ impl Inner {
             && self.rules_path.borrow().is_some()
             && action
                 .as_ref()
-                .is_some_and(crate::approval_server::always_offerable);
+                .is_some_and(crate::always_allow::always_offerable);
         options.retain(|d| match d {
             Decision::AllowForSession => offer,
             Decision::AllowAlways => always,
@@ -1151,13 +1216,20 @@ impl Inner {
             .as_ref()
             .filter(|_| options.contains(&Decision::AllowAlways))
             .map(|a| crate::approval_server::remembers_text(a, &ctx));
+        // Codex Accept edits runs on `untrusted` (D5): the app accepts edits whose every path is
+        // in the workspace and not sensitive; anything else, and every shell command, asks.
+        let accept_edit = driver == Driver::Codex
+            && tool == "file_change"
+            && self.state.borrow().mode == Mode::AcceptEdits
+            && codex_edits_contained(input, &workspace, home.as_deref());
         let auto = options.contains(&Decision::Allow)
-            && action.as_ref().is_some_and(|a| {
-                self.session_rules.borrow().matches_session(a, &ctx)
-                    || self
-                        .saved_rules()
-                        .is_some_and(|rules| rules.matches_any(a, &ctx))
-            });
+            && (accept_edit
+                || action.as_ref().is_some_and(|a| {
+                    self.session_rules.borrow().matches_session(a, &ctx)
+                        || self
+                            .saved_rules()
+                            .is_some_and(|rules| rules.matches_any(a, &ctx))
+                }));
         if let Some(action) = action {
             self.pending_rules
                 .borrow_mut()
@@ -2334,6 +2406,32 @@ pub(crate) fn chosen_mode<'a>(events: impl IntoIterator<Item = &'a Envelope>) ->
 /// the first request and the most recent work), and what never travels. `place` reads after
 /// "Continuing": "in Codex", "from “title”".
 /// What the switch notice adds when session approvals end (D3).
+/// Whether a Codex patch approval only touches files Accept edits may write unasked: it names at
+/// least one change, and every path (and rename target) is inside `workspace`, with no `..` or
+/// symlink on the way, and not sensitive (agy's containment check).
+fn codex_edits_contained(input: &serde_json::Value, workspace: &Path, home: Option<&Path>) -> bool {
+    let Some(changes) = input
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .filter(|c| !c.is_empty())
+    else {
+        return false;
+    };
+    changes.iter().all(|change| {
+        let move_to = change
+            .get("kind")
+            .and_then(|k| k.get("move_path"))
+            .filter(|m| !m.is_null());
+        let targets = [change.get("path"), move_to];
+        change.get("path").is_some()
+            && targets.into_iter().flatten().all(|t| {
+                t.as_str().is_some_and(|p| {
+                    crate::approval_server::path_auto_matchable(Path::new(p), workspace, home)
+                })
+            })
+    })
+}
+
 fn session_rules_ended(n: usize) -> String {
     format!("Session approvals ({n}) ended.")
 }
@@ -2439,10 +2537,15 @@ impl ChatBackend for ChatSession {
     }
 
     fn answer_questions(&self, request: &str, answers: serde_json::Value) {
-        self.inner.command(Command::Answer {
+        // No agent acknowledges an answer (F19): once the adapter has accepted and written it,
+        // the card is resolved here, or it would sit at "Sending…" for good.
+        if self.inner.command(Command::Answer {
             request: request.to_owned(),
             answers,
-        });
+        }) {
+            self.inner
+                .emit(Envelope::new(Event::QuestionResolved { answered: true }).request(request));
+        }
     }
 
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
@@ -4869,6 +4972,248 @@ mod tests {
             assert!(pump_until(ctx, 10, || resolution(&seen, &same).is_some()));
             assert_eq!(resolution(&seen, &same), Some(Decision::Allow));
             assert_eq!(resolution(&seen, &compound), None, "ls -la; id asks");
+        });
+    }
+
+    const W0_CODEX_ACCEPT_EDITS: &str =
+        include_str!("../../tests/fixtures/real/codex/untrusted-workspacewrite.jsonl");
+
+    /// The W0 frames of `fixture` whose method is one of `methods`, the recording's sandbox
+    /// replaced by `dir`.
+    fn w0_frames(fixture: &str, dir: &Path, methods: &[&str]) -> Vec<String> {
+        let dir = dir.to_string_lossy();
+        fixture
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["dir"] == "out")
+            .map(|r| r["frame"].clone())
+            .filter(|f| f["method"].as_str().is_some_and(|m| methods.contains(&m)))
+            .map(|f| f.to_string().replace("/tmp/w0-sandbox", &dir))
+            .collect()
+    }
+
+    fn request_for(seen: &Seen, method_tool: &str) -> Option<String> {
+        seen.borrow().iter().find_map(|e| match &e.event {
+            Event::ApprovalRequested { tool, .. } if tool == method_tool => e.request.clone(),
+            _ => None,
+        })
+    }
+
+    const W0_CODEX_EDIT: &str =
+        include_str!("../../tests/fixtures/real/codex/ask-edit-decline.jsonl");
+
+    fn claude_tool(id: &str, tool: &str, input: serde_json::Value) -> String {
+        serde_json::json!({"type": "control_request", "request_id": id, "request": {
+            "subtype": "can_use_tool", "tool_name": tool, "tool_use_id": format!("tu-{id}"),
+            "input": input}})
+        .to_string()
+    }
+
+    /// U2 and D4: Session and Always are offered for a contained edit (a Codex patch's path
+    /// comes from its `item/started` frame, W0 `ask-edit-decline.jsonl`) and for one MCP tool.
+    /// The Always rule is matched by kind: a new Codex session and a Claude session both have
+    /// the same edit answered by the app. An edit outside the workspace is offered neither.
+    #[test]
+    fn always_rules_cover_contained_edits_and_mcp_tools_across_agents() {
+        let methods = ["item/started", "item/fileChange/requestApproval"];
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let codex = || Box::new(agent_core::codex::CodexAdapter::new());
+            let claude = || Box::new(agent_core::claude::ClaudeAdapter::new());
+            let target = tmp.path().join("fixture.txt");
+
+            let (session, seen) = recording(ctx, tmp.path(), codex());
+            for f in w0_frames(W0_CODEX_EDIT, tmp.path(), &methods) {
+                feed(&session, &f);
+            }
+            let edit = request_for(&seen, "file_change").expect("edit card");
+            let options = offered(&seen, &edit);
+            assert!(options.contains(&Decision::AllowForSession), "{options:?}");
+            assert!(options.contains(&Decision::AllowAlways), "{options:?}");
+            session.respond_approval(&edit, Decision::AllowAlways);
+            assert_eq!(resolution(&seen, &edit), Some(Decision::AllowAlways));
+            let saved = crate::always_allow::AlwaysRules::open(
+                &tmp.path().join(crate::always_allow::FILE_NAME),
+            )
+            .expect("saved");
+            assert_eq!(saved.rules.len(), 1);
+            assert_eq!(saved.rules[0].kind, crate::always_allow::ActionKind::Edit);
+            assert_eq!(saved.rules[0].origin, "codex");
+            drop(session);
+
+            // A new Codex session: the same patch is accepted by the app.
+            let (session, seen) = recording(ctx, tmp.path(), codex());
+            for f in w0_frames(W0_CODEX_EDIT, tmp.path(), &methods) {
+                feed(&session, &f);
+            }
+            let again = request_for(&seen, "file_change").expect("edit card");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &again).is_some()));
+            assert_eq!(resolution(&seen, &again), Some(Decision::Allow));
+            drop(session);
+
+            // Claude editing the same file is matched by kind; an MCP tool can be Always too.
+            let (session, seen) = recording(ctx, tmp.path(), claude());
+            let input =
+                serde_json::json!({"file_path": target, "old_string": "a", "new_string": "b"});
+            feed(&session, &claude_tool("e1", "Edit", input));
+            assert!(pump_until(ctx, 10, || resolution(&seen, "e1").is_some()));
+            assert_eq!(resolution(&seen, "e1"), Some(Decision::Allow));
+            feed(
+                &session,
+                &claude_tool("m1", "mcp__fs__write", serde_json::json!({"p": 1})),
+            );
+            assert!(offered(&seen, "m1").contains(&Decision::AllowAlways));
+            session.respond_approval("m1", Decision::AllowAlways);
+            drop(session);
+            let (session, seen) = recording(ctx, tmp.path(), claude());
+            feed(
+                &session,
+                &claude_tool("m2", "mcp__fs__write", serde_json::json!({"p": 2})),
+            );
+            assert!(pump_until(ctx, 10, || resolution(&seen, "m2").is_some()));
+            assert_eq!(resolution(&seen, "m2"), Some(Decision::Allow));
+            feed(
+                &session,
+                &claude_tool("m3", "mcp__fs__delete", serde_json::json!({})),
+            );
+            // Outside the workspace: neither Session nor Always.
+            let outside = serde_json::json!({"file_path": "/etc/hosts", "old_string": "a", "new_string": "b"});
+            feed(&session, &claude_tool("e2", "Edit", outside));
+            let e2 = offered(&seen, "e2");
+            assert!(
+                !e2.contains(&Decision::AllowAlways) && !e2.contains(&Decision::AllowForSession),
+                "{e2:?}"
+            );
+            pump_until(ctx, 1, || false);
+            assert_eq!(
+                resolution(&seen, "m3"),
+                None,
+                "another tool of the server asks"
+            );
+            assert_eq!(resolution(&seen, "e2"), None);
+        });
+    }
+
+    /// Plan 2.4 (D5), replaying `codex/untrusted-workspacewrite.jsonl`: in Accept edits the
+    /// in-workspace edit is answered `accept` by the app and the shell `ls -la` shows a card. In
+    /// Ask, or for an edit outside the workspace, the edit asks too.
+    #[test]
+    fn codex_accept_edits_auto_accepts_workspace_edits_and_shell_still_asks() {
+        let methods = [
+            "turn/started",
+            "item/started",
+            "item/fileChange/requestApproval",
+            "item/commandExecution/requestApproval",
+        ];
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.inner.state.borrow().mode, Mode::AcceptEdits);
+            for f in w0_frames(W0_CODEX_ACCEPT_EDITS, tmp.path(), &methods) {
+                feed(&session, &f);
+            }
+            let edit = request_for(&seen, "file_change").expect("edit card");
+            let shell = request_for(&seen, "command_execution").expect("shell card");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &edit).is_some()));
+            assert_eq!(resolution(&seen, &edit), Some(Decision::Allow));
+            assert!(pump_until(ctx, 10, || {
+                stdin_log(tmp.path()).contains(r#"{"id":0,"result":{"decision":"accept"}}"#)
+            }));
+            assert_eq!(resolution(&seen, &shell), None, "shell asks");
+            assert!(!stdin_log(tmp.path()).contains(r#""id":1,"result""#));
+        });
+        for (mode, sandbox) in [(Mode::Ask, None), (Mode::AcceptEdits, Some("/etc"))] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (session, seen) = recording(
+                    ctx,
+                    tmp.path(),
+                    Box::new(agent_core::codex::CodexAdapter::new()),
+                );
+                session.set_mode(mode);
+                let target = sandbox.map_or_else(|| tmp.path().to_owned(), PathBuf::from);
+                for f in w0_frames(W0_CODEX_ACCEPT_EDITS, &target, &methods[..3]) {
+                    feed(&session, &f);
+                }
+                let edit = request_for(&seen, "file_change").expect("edit card");
+                pump_until(ctx, 1, || false);
+                assert_eq!(resolution(&seen, &edit), None, "{mode:?} {sandbox:?} asks");
+            });
+        }
+    }
+
+    /// Plan 2.3, from the W0 Codex frame: "Always allow" saved with the dialog's prefill (the
+    /// bare `ls -la`) is a rule a new session matches the same wrapped request with.
+    #[test]
+    fn codex_always_rule_from_the_prefill_matches_the_w0_request_next_time() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let frame = |id: u64, item: &str| {
+                let mut f = W0_CODEX_SHELL
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .find(|r| r["frame"]["method"] == "item/commandExecution/requestApproval")
+                    .expect("W0 frame")["frame"]
+                    .clone();
+                f["id"] = serde_json::json!(id);
+                f["params"]["itemId"] = serde_json::json!(item);
+                f["params"]["cwd"] = serde_json::json!(cwd);
+                f
+            };
+            let card = |seen: &Seen, item: &str| {
+                seen.borrow()
+                    .iter()
+                    .find_map(|e| match &e.event {
+                        Event::ApprovalRequested { tool, input, .. }
+                            if e.item.as_deref() == Some(item) =>
+                        {
+                            Some((
+                                e.request.clone().expect("request"),
+                                tool.clone(),
+                                input.clone(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .expect("card")
+            };
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            feed(&session, &frame(0, "item-a").to_string());
+            let (request, tool, input) = card(&seen, "item-a");
+            assert!(offered(&seen, &request).contains(&Decision::AllowAlways));
+            let prefill = crate::always_allow::dialog_prefill(&tool, &input, None);
+            assert_eq!(prefill, "ls -la");
+            let rule = crate::always_allow::Rule::new("", tool, prefill);
+            session.respond_approval_with_rule(&request, Decision::AllowAlways, Some(rule));
+            assert_eq!(resolution(&seen, &request), Some(Decision::AllowAlways));
+            let saved = crate::always_allow::AlwaysRules::open(
+                &tmp.path().join(crate::always_allow::FILE_NAME),
+            )
+            .expect("saved");
+            assert_eq!(saved.rules.len(), 1);
+            assert_eq!(saved.rules[0].detail(), "ls -la");
+            drop(session);
+
+            // Next time: a new session, no session rules, only the saved one.
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            feed(&session, &frame(0, "item-b").to_string());
+            let (again, _, _) = card(&seen, "item-b");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &again).is_some()));
+            assert_eq!(resolution(&seen, &again), Some(Decision::Allow));
         });
     }
 

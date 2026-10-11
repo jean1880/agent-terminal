@@ -267,6 +267,8 @@ textview.code-view, textview.code-view text {
 .approval-card.expired .approval-icon { color: @at_fg_faint; }
 .approval-outcome { color: @at_fg_dim; font-style: italic; }
 .approval-card.resolved .approval-outcome { color: @at_success; font-style: normal; font-weight: 700; }
+.approval-card.resolved.denied .approval-icon,
+.approval-card.resolved.denied .approval-outcome { color: @at_danger; }
 
 button.pill { padding: 6px 16px; border-radius: 999px; }
 .chat-view button.suggested-action {
