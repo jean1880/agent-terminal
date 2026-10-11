@@ -1421,7 +1421,9 @@ pub struct ApprovalCard {
     input: gtk4::Label,
     /// A file-edit request's proposed change, as a diff (instead of the tool-input JSON).
     diff: DiffText,
-    /// The JSON behind that diff, one click away.
+    /// A plan to approve (Claude's ExitPlanMode), rendered as markdown.
+    plan: MarkdownView,
+    /// The request's JSON, capped, one click away.
     raw: gtk4::Expander,
     raw_text: gtk4::Label,
     /// What "Always allow" would save, when it is offered.
@@ -1454,6 +1456,60 @@ fn decision_outcome(d: Decision) -> &'static str {
     }
 }
 
+/// Lines of an approval's input shown on the card itself; the rest is behind "Show raw".
+const APPROVAL_VISIBLE_LINES: usize = 12;
+
+/// What an approval card shows of a request that is not a file edit or a plan: for a shell
+/// command, the command line (a strict `zsh -lc '…'` wrapper unwrapped, as rules see it) and its
+/// working directory; otherwise the readable input, cut to [`APPROVAL_VISIBLE_LINES`].
+fn approval_input_text(tool: &str, input: &Value) -> String {
+    if input.is_null() {
+        return String::new();
+    }
+    if let Some(crate::always_allow::Action::Shell { command }) =
+        crate::always_allow::Action::of(tool, input)
+    {
+        let command = crate::always_allow::unwrap_shell_wrapper(&command).unwrap_or(command);
+        let mut shown = serde_json::json!({ "command": command });
+        for (from, to) in [
+            ("cwd", "cwd"),
+            ("Cwd", "cwd"),
+            ("description", "description"),
+        ] {
+            if let Some(v) = input.get(from).filter(|v| v.is_string()) {
+                shown[to] = v.clone();
+            }
+        }
+        return head_lines(
+            &payload::tool_input_text(ItemKind::Command, Some(&shown), ""),
+            APPROVAL_VISIBLE_LINES,
+        );
+    }
+    let kind = if tool.starts_with("mcp__") || tool == "call_mcp_tool" {
+        ItemKind::McpTool
+    } else {
+        ItemKind::Tool
+    };
+    head_lines(
+        &payload::tool_input_text(kind, Some(input), ""),
+        APPROVAL_VISIBLE_LINES,
+    )
+}
+
+/// The first `max` lines of `text`, with a note of how many more "Show raw" holds.
+fn head_lines(text: &str, max: usize) -> String {
+    let total = text.lines().count();
+    if total <= max {
+        return text.to_owned();
+    }
+    let kept: Vec<&str> = text.lines().take(max.saturating_sub(1)).collect();
+    format!(
+        "{}\n… {} more lines in Show raw",
+        kept.join("\n"),
+        total - kept.len()
+    )
+}
+
 impl ApprovalCard {
     fn new(sink: &RowSink) -> Self {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
@@ -1479,6 +1535,10 @@ impl ApprovalCard {
         let diff = DiffText::new();
         diff.widget().set_visible(false);
         root.append(diff.widget());
+        let plan = MarkdownView::new();
+        plan.widget().add_css_class("approval-plan");
+        plan.widget().set_visible(false);
+        root.append(plan.widget());
         let raw_text = mono("");
         let raw = gtk4::Expander::new(Some("Show raw"));
         raw.add_css_class("approval-raw");
@@ -1504,6 +1564,7 @@ impl ApprovalCard {
             reason,
             input,
             diff,
+            plan,
             raw,
             raw_text,
             remembers,
@@ -1539,21 +1600,19 @@ impl ApprovalCard {
         self.title.set_text(&title);
         self.reason.set_text(a.reason.as_deref().unwrap_or(""));
         self.reason.set_visible(a.reason.is_some());
-        // A file edit is shown as the diff it proposes (computed from the request alone), with
-        // the JSON behind it one click away. Commands and everything else keep their input text.
+        // A file edit is shown as the diff it proposes (computed from the request alone), a plan
+        // (Claude's ExitPlanMode) as markdown, a command as its bare command line and working
+        // directory, anything else as a few lines of its input. The JSON is one click away.
         let preview = agent_kit::editdiff::preview_from_input(&a.input);
-        let input = if preview.is_empty() {
-            match &a.input {
-                Value::Null => String::new(),
-                v => {
-                    let kind = if a.tool.eq_ignore_ascii_case("bash") || a.tool == "run_command" {
-                        ItemKind::Command
-                    } else {
-                        ItemKind::Tool
-                    };
-                    payload::tool_input_text(kind, Some(v), "")
-                }
-            }
+        let plan = (a.tool == "ExitPlanMode")
+            .then(|| a.input.get("plan").and_then(Value::as_str))
+            .flatten()
+            .filter(|p| !p.trim().is_empty());
+        let input = if let Some(plan) = plan {
+            self.plan.set_markdown(plan);
+            String::new()
+        } else if preview.is_empty() {
+            approval_input_text(&a.tool, &a.input)
         } else {
             preview
                 .iter()
@@ -1561,11 +1620,32 @@ impl ApprovalCard {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        self.plan.widget().set_visible(plan.is_some());
         self.input.set_visible(!input.is_empty());
         self.input.set_text(&input);
-        if preview.is_empty() {
+        // No "Show raw" when the card already shows all of it (a bare command and its folder).
+        let shown_whole = a.input.as_object().is_some_and(|o| {
+            o.keys().all(|k| {
+                ["command", "CommandLine", "cmd", "cwd", "Cwd", "description"].contains(&k.as_str())
+            })
+        }) && preview.is_empty()
+            && plan.is_none()
+            && ["command", "CommandLine", "cmd"].iter().all(|k| {
+                a.input
+                    .get(*k)
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| crate::always_allow::unwrap_shell_wrapper(c).is_none())
+            });
+        let raw = match &a.input {
+            Value::Null => String::new(),
+            _ if shown_whole => String::new(),
+            v => serde_json::to_string_pretty(v).unwrap_or_default(),
+        };
+        self.raw_text
+            .set_text(&payload::cap_lines(&raw, MAX_CARD_LINES));
+        self.raw.set_visible(!raw.is_empty());
+        if preview.is_empty() || plan.is_some() {
             self.diff.widget().set_visible(false);
-            self.raw.set_visible(false);
         } else {
             let text: String = preview.iter().map(|e| e.diff.as_str()).collect();
             let (kept, omitted) = agent_kit::diff::truncate(
@@ -1581,10 +1661,6 @@ impl ApprovalCard {
                     .collect::<Vec<_>>(),
             );
             self.diff.widget().set_visible(true);
-            let raw = serde_json::to_string_pretty(&a.input).unwrap_or_default();
-            self.raw_text
-                .set_text(&payload::cap_lines(&raw, MAX_CARD_LINES));
-            self.raw.set_visible(true);
         }
 
         if !self.built_buttons.get() {
@@ -2446,6 +2522,57 @@ pub(crate) mod tests {
         assert!(diff_shown && diff.contains("hello there"), "{diff}");
         assert_eq!(direct_labels(&card), ["Stop turn", "Deny", "Allow"]);
         rule_dialog_prefills_the_bare_w0_command();
+        approval_cards_show_the_command_and_cap_the_rest();
+    }
+
+    /// Plan 2.6 (ui-audit #5, F15): a Codex command card shows the bare command and its folder,
+    /// with the request's JSON behind a capped "Show raw"; a large input shows at most the cap;
+    /// Claude's ExitPlanMode shows its plan as markdown, not JSON.
+    fn approval_cards_show_the_command_and_cap_the_rest() {
+        let w0 = include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["frame"]["method"] == "item/commandExecution/requestApproval")
+            .expect("W0 frame")["frame"]["params"]
+            .clone();
+        let options = vec![Decision::Allow, Decision::Deny, Decision::Cancel];
+        let (card, _) = codex_card("command_execution", w0, options.clone(), None);
+        assert_eq!(
+            card.input.text(),
+            "$ ls -la\nWorking directory: /tmp/w0-sandbox"
+        );
+        assert!(
+            card.raw.is_visible(),
+            "the request's JSON is one click away"
+        );
+        assert!(card.raw_text.text().contains("availableDecisions"));
+        assert!(!card.plan.widget().is_visible());
+
+        let big: serde_json::Map<String, Value> = (0..200)
+            .map(|i| (format!("key{i:03}"), Value::from(format!("value {i}"))))
+            .collect();
+        let (card, _) = codex_card("WebFetch", Value::Object(big), options.clone(), None);
+        let visible = card.input.text().lines().count();
+        assert!(visible <= APPROVAL_VISIBLE_LINES, "{visible} lines shown");
+        assert!(card.input.text().ends_with("more lines in Show raw"));
+        assert!(card.raw_text.text().lines().count() <= MAX_CARD_LINES + 1);
+
+        let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n";
+        let (card, _) = codex_card(
+            "ExitPlanMode",
+            serde_json::json!({ "plan": plan }),
+            options,
+            None,
+        );
+        assert!(card.plan.widget().is_visible());
+        assert!(!card.input.is_visible(), "no JSON dump of the plan");
+        let blocks = card.plan.blocks.borrow();
+        assert!(
+            matches!(blocks.first(), Some((Block::Text { kind: TextKind::Heading(_), markup }, _))
+                if markup.contains("Ship the parity wave")),
+            "the plan renders as markdown"
+        );
+        assert!(blocks.len() >= 2);
     }
 
     /// Plan 2.3 (F7), from the W0 Codex frame: the rule dialog's entry holds the bare command,
