@@ -1574,13 +1574,16 @@ fn decision_outcome(d: Decision) -> &'static str {
 
 /// Lines of an approval's input shown on the card itself; the rest is behind "Show raw".
 const APPROVAL_VISIBLE_LINES: usize = 12;
+/// Characters of one line shown on the card itself; a longer line is cut, the rest in "Show raw".
+const APPROVAL_LINE_CHARS: usize = 400;
 
-/// What an approval card shows of a request that is not a file edit or a plan: for a shell
-/// command, the command line (a strict `zsh -lc '…'` wrapper unwrapped, as rules see it) and its
-/// working directory; otherwise the readable input, cut to [`APPROVAL_VISIBLE_LINES`].
-fn approval_input_text(tool: &str, input: &Value) -> String {
+/// What an approval card shows of a request that is not a file edit or a plan, and whether that
+/// was cut. For a shell command: the command line (a strict `zsh -lc '…'` wrapper unwrapped, as
+/// rules see it) and its working directory; otherwise the readable input. Either is cut to
+/// [`APPROVAL_VISIBLE_LINES`] lines of at most [`APPROVAL_LINE_CHARS`] characters.
+fn approval_input_text(tool: &str, input: &Value) -> (String, bool) {
     if input.is_null() {
-        return String::new();
+        return (String::new(), false);
     }
     if let Some(crate::always_allow::Action::Shell { command }) =
         crate::always_allow::Action::of(tool, input)
@@ -1599,6 +1602,7 @@ fn approval_input_text(tool: &str, input: &Value) -> String {
         return head_lines(
             &payload::tool_input_text(ItemKind::Command, Some(&shown), ""),
             APPROVAL_VISIBLE_LINES,
+            APPROVAL_LINE_CHARS,
         );
     }
     let kind = if tool.starts_with("mcp__") || tool == "call_mcp_tool" {
@@ -1609,21 +1613,37 @@ fn approval_input_text(tool: &str, input: &Value) -> String {
     head_lines(
         &payload::tool_input_text(kind, Some(input), ""),
         APPROVAL_VISIBLE_LINES,
+        APPROVAL_LINE_CHARS,
     )
 }
 
-/// The first `max` lines of `text`, with a note of how many more "Show raw" holds.
-fn head_lines(text: &str, max: usize) -> String {
+/// The first `max` lines of `text`, each cut to `width` characters, with a note of what "Show
+/// raw" holds; true when anything was cut.
+fn head_lines(text: &str, max: usize, width: usize) -> (String, bool) {
     let total = text.lines().count();
-    if total <= max {
-        return text.to_owned();
+    let keep = if total <= max {
+        total
+    } else {
+        max.saturating_sub(1)
+    };
+    let mut cut = total > keep;
+    let mut lines: Vec<String> = text
+        .lines()
+        .take(keep)
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars <= width {
+                return line.to_owned();
+            }
+            cut = true;
+            let head: String = line.chars().take(width).collect();
+            format!("{head}… ({} more characters in Show raw)", chars - width)
+        })
+        .collect();
+    if total > keep {
+        lines.push(format!("… {} more lines in Show raw", total - keep));
     }
-    let kept: Vec<&str> = text.lines().take(max.saturating_sub(1)).collect();
-    format!(
-        "{}\n… {} more lines in Show raw",
-        kept.join("\n"),
-        total - kept.len()
-    )
+    (lines.join("\n"), cut)
 }
 
 impl ApprovalCard {
@@ -1725,34 +1745,38 @@ impl ApprovalCard {
             .then(|| a.input.get("plan").and_then(Value::as_str))
             .flatten()
             .filter(|p| !p.trim().is_empty());
-        let input = if let Some(plan) = plan {
+        let (input, cut) = if let Some(plan) = plan {
             self.plan.set_markdown(plan);
-            String::new()
+            (String::new(), false)
         } else if preview.is_empty() {
             approval_input_text(&a.tool, &a.input)
         } else {
-            preview
+            let files = preview
                 .iter()
                 .map(|e| format!("{}  +{} −{}", e.path, e.added, e.removed))
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            (files, false)
         };
         self.plan.widget().set_visible(plan.is_some());
         self.input_section.set_visible(!input.is_empty());
         self.input_section.set_text(&input);
-        // No "Show raw" when the card already shows all of it (a bare command and its folder).
-        let shown_whole = a.input.as_object().is_some_and(|o| {
-            o.keys().all(|k| {
-                ["command", "CommandLine", "cmd", "cwd", "Cwd", "description"].contains(&k.as_str())
-            })
-        }) && preview.is_empty()
-            && plan.is_none()
-            && ["command", "CommandLine", "cmd"].iter().all(|k| {
-                a.input
-                    .get(*k)
-                    .and_then(Value::as_str)
-                    .is_none_or(|c| crate::always_allow::unwrap_shell_wrapper(c).is_none())
-            });
+        // No "Show raw" only when the card already shows all of it, uncut (a bare command and its
+        // folder): whatever is cut is never approved unseen.
+        let shown_whole =
+            !cut && a.input.as_object().is_some_and(|o| {
+                o.keys().all(|k| {
+                    ["command", "CommandLine", "cmd", "cwd", "Cwd", "description"]
+                        .contains(&k.as_str())
+                })
+            }) && preview.is_empty()
+                && plan.is_none()
+                && ["command", "CommandLine", "cmd"].iter().all(|k| {
+                    a.input
+                        .get(*k)
+                        .and_then(Value::as_str)
+                        .is_none_or(|c| crate::always_allow::unwrap_shell_wrapper(c).is_none())
+                });
         let raw = match &a.input {
             Value::Null => String::new(),
             _ if shown_whole => String::new(),
@@ -2835,6 +2859,42 @@ pub(crate) mod tests {
             .text()
             .ends_with("more lines in Show raw"));
         assert!(card.raw_section.body.text().lines().count() <= MAX_CARD_LINES + 1);
+
+        // A command the card cuts (a 30-line heredoc, one 5000-character line) always keeps its
+        // whole text one click away, though it has only the keys a plain command has.
+        let heredoc = format!(
+            "cat > notes.txt <<'EOF'\n{}EOF",
+            (1..=30).map(|i| format!("line {i}\n")).collect::<String>()
+        );
+        let long = format!("echo {}", "x".repeat(5000));
+        for command in [heredoc, long] {
+            let (card, _) = codex_card(
+                "Bash",
+                serde_json::json!({ "command": command }),
+                options.clone(),
+                None,
+            );
+            let shown = card.input_section.body.text().to_string();
+            assert!(shown.lines().count() <= APPROVAL_VISIBLE_LINES, "{shown}");
+            assert!(
+                shown
+                    .lines()
+                    .all(|l| l.chars().count() <= APPROVAL_LINE_CHARS + 60),
+                "a single enormous line is cut"
+            );
+            assert!(shown.contains("in Show raw"), "{shown}");
+            assert!(card.raw.is_visible(), "cut text is never approved unseen");
+            let raw: Value = serde_json::from_str(&card.raw_section.full.borrow()).expect("raw");
+            assert_eq!(raw["command"], command, "Show raw holds the whole command");
+        }
+        // A short plain command is shown whole: no raw needed.
+        let (card, _) = codex_card(
+            "Bash",
+            serde_json::json!({ "command": "ls -la" }),
+            options.clone(),
+            None,
+        );
+        assert!(!card.raw.is_visible());
 
         let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n";
         let (card, _) = codex_card(

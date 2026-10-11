@@ -751,3 +751,51 @@ fn scripted_an_accepted_answer_moves_the_question_card_to_answered() {
         session.shutdown(false);
     });
 }
+
+/// Plan 2.5 (review): a turn that produced an item but never completed (the process died
+/// mid-command) still confirms the new Codex thread, so the next reopen resumes it.
+#[test]
+fn scripted_a_turn_with_an_item_confirms_the_new_codex_thread() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let pt = fixture
+            .store
+            .add_provider_thread(&fixture.thread, "codex", "synthetic-model")
+            .expect("provider thread");
+        fixture
+            .store
+            .set_active_provider_thread(&fixture.thread, &pt)
+            .expect("active");
+        fixture
+            .store
+            .set_native_id(&pt, "stale-thread")
+            .expect("stale id");
+        let native = || {
+            fixture
+                .store
+                .provider_threads(&fixture.thread)
+                .expect("providers")
+                .into_iter()
+                .find(|p| p.id == pt)
+                .and_then(|p| p.native_id)
+        };
+        let session = fixture.session();
+        fixture.wait(ctx, "the new Codex thread", || {
+            session.inner.state.borrow().native_id.as_deref() == Some("fixture-thread")
+        });
+        assert_eq!(native().as_deref(), Some("stale-thread"));
+        session.send_prompt("disconnect-command");
+        fixture.wait(ctx, "the process dies mid-command", || {
+            !session.status().alive
+        });
+        assert!(!fixture.seen.borrow().iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                ..
+            }
+        )));
+        assert_eq!(native().as_deref(), Some("fixture-thread"));
+        session.shutdown(false);
+    });
+}

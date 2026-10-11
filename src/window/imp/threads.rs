@@ -366,6 +366,38 @@ pub(super) async fn store_job<T: Send + 'static>(
     })
 }
 
+/// Stores a NEW thread in `cwd` on `driver`/`model`, with its provider thread active and `mode`
+/// recorded as the user's choice when one is carried over (a continued or forked thread keeps
+/// its source's mode rather than the profile's). Only the new thread is written: the source of
+/// a fork is never touched. The agent record failing is logged, not fatal: the thread exists.
+fn record_new_thread(
+    store: &Store,
+    cwd: &str,
+    title: Option<&str>,
+    driver: Driver,
+    model: Option<&str>,
+    mode: Option<Mode>,
+) -> agent_kit::store::Result<String> {
+    let thread = store.create_thread(cwd, title)?;
+    if let Err(e) = store
+        .add_provider_thread(&thread, driver_key(driver), model.unwrap_or("default"))
+        .and_then(|pt| {
+            store.set_active_provider_thread(&thread, &pt)?;
+            if let Some(mode) = mode {
+                store.append_event(
+                    &thread,
+                    Some(pt.as_str()),
+                    &Envelope::new(Event::ModeChosen { mode }),
+                )?;
+            }
+            Ok(())
+        })
+    {
+        warn!("Cannot record the thread's agent: {e}");
+    }
+    Ok(thread)
+}
+
 /// A thread to create (see [`AgentTerminalWindow::create_chat_thread`]).
 pub(super) struct NewThread {
     pub(super) driver: Driver,
@@ -2592,6 +2624,7 @@ impl AgentTerminalWindow {
         view.set_model_source(ModelCatalog::shared());
         view.set_account_status(AccountStatus::shared());
         view.set_diff_source(diffs);
+        view.set_workspace(std::path::Path::new(&dir));
         if demo.is_some() {
             crate::chat::view::demo::configure_demo_view(&view);
         }
@@ -3507,16 +3540,10 @@ impl AgentTerminalWindow {
     }
 
     /// A new thread on the same agent and folder, carrying a budgeted, redacted handoff of
-    /// this one.
+    /// this one, its mode and its model. The source thread is only read: its transcript comes
+    /// off the main thread, and the handoff travels with the NEW thread's own record
+    /// (`NewThread::handoff`), never through whichever page happens to be selected.
     fn fork_thread(&self, thread: &str, driver: Driver, dir: Option<String>) {
-        let store = app_store();
-        let messages = match store.transcript_messages(thread) {
-            Ok(m) => m,
-            Err(e) => {
-                present_message(&self.obj(), "Cannot Fork the Thread", &e.to_string());
-                return;
-            }
-        };
         let title = self
             .tabs
             .borrow()
@@ -3533,43 +3560,40 @@ impl AgentTerminalWindow {
         } else {
             format!("“{title}”")
         };
-        let handoff = build_handoff(&messages, &format!("thread {thread}"));
-        // The fork keeps the source's mode and model rather than the profile's defaults.
         let session = self.slot_of(thread).and_then(|s| s.get());
-        self.create_chat_thread(NewThread {
-            dir,
-            model: session.as_ref().and_then(|s| s.selected_model()),
-            mode: session.as_ref().map(|s| s.wanted_mode()),
-            ..NewThread::new(driver)
-        });
-        // The new thread is the one just selected; it is built later, so the handoff waits.
-        let page = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page());
-        if let Some(page) = page {
-            let built = {
-                let mut tabs = self.tabs.borrow_mut();
-                let chat = tabs
-                    .iter_mut()
-                    .find(|t| t.page == page)
-                    .and_then(|t| t.chat.as_mut());
-                match chat {
-                    Some(chat) if chat.view.is_none() => {
-                        chat.pending_handoff = Some((handoff.clone(), source.clone()));
-                        false
-                    }
-                    Some(_) => true,
-                    None => false,
+        let (model, mode) = (
+            session.as_ref().and_then(|s| s.selected_model()),
+            session.as_ref().map(|s| s.wanted_mode()),
+        );
+        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
+        glib::MainContext::default().spawn_local(async move {
+            let loaded = store_job({
+                let thread = thread.clone();
+                move |store| store.transcript_messages(&thread)
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let messages = match loaded {
+                Some(Ok(messages)) => messages,
+                Some(Err(e)) => {
+                    present_message(&obj, "Cannot Fork the Thread", &e.to_string());
+                    return;
+                }
+                None => {
+                    imp.show_toast("Cannot read the thread");
+                    return;
                 }
             };
-            if built {
-                if let Some(session) = self.current_slot().and_then(|s| s.get()) {
-                    session.seed_handoff(handoff, &source);
-                }
-            }
-        }
+            let handoff = build_handoff(&messages, &format!("thread {thread}"));
+            imp.create_chat_thread(NewThread {
+                dir,
+                model,
+                mode,
+                handoff: Some((handoff, source)),
+                ..NewThread::new(driver)
+            });
+        });
     }
 
     /// `/rewind`: undo the last turn's changes in the thread's folder, through the 2.x
@@ -3700,13 +3724,6 @@ impl AgentTerminalWindow {
             resolve_working_directory(&requested, &home)
         };
         let store = app_store();
-        let thread = match store.create_thread(&cwd, title.as_deref()) {
-            Ok(id) => id,
-            Err(e) => {
-                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
-                return None;
-            }
-        };
         // The agent is recorded now, so the sidebar and a later reopen know it before the
         // session starts. The session adopts this provider thread.
         let model = model.or_else(|| {
@@ -3717,28 +3734,20 @@ impl AgentTerminalWindow {
         });
         // A profile default the agent has retired is never started: the suggestion is used.
         let (model, effort, _) = live_model(driver, model, effort);
-        if let Err(e) = store
-            .add_provider_thread(
-                &thread,
-                driver_key(driver),
-                model.as_deref().unwrap_or("default"),
-            )
-            .and_then(|pt| {
-                store.set_active_provider_thread(&thread, &pt)?;
-                // A carried-over mode is the user's choice for the new thread, so its session
-                // starts in it (as far as the agent can honour it) and not in the profile's.
-                if let Some(mode) = mode {
-                    store.append_event(
-                        &thread,
-                        Some(pt.as_str()),
-                        &Envelope::new(Event::ModeChosen { mode }),
-                    )?;
-                }
-                Ok(())
-            })
-        {
-            warn!("Cannot record the thread's agent: {e}");
-        }
+        let thread = match record_new_thread(
+            &store,
+            &cwd,
+            title.as_deref(),
+            driver,
+            model.as_deref(),
+            mode,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
+                return None;
+            }
+        };
         info!("New {} thread in {cwd}", driver_label(driver));
         self.reload_summaries();
         let page = self.open_thread(&thread, false)?;
@@ -4695,6 +4704,58 @@ pub(super) mod tests {
         HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Ok(())));
         assert_eq!(cached_hook_verdict(), Ok(()));
         HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_fork_makes_a_second_thread_and_leaves_the_original_exactly_as_it_was() {
+        for driver in [Driver::Claude, Driver::Agy, Driver::Codex] {
+            let store = Store::open_in_memory().expect("store");
+            let source = store.create_thread("/w", Some("source")).expect("thread");
+            let pt = store
+                .add_provider_thread(&source, driver_key(driver), "m1")
+                .expect("pt");
+            store.set_active_provider_thread(&source, &pt).expect("set");
+            let say = |text: &str| Envelope::new(Event::Notice { text: text.into() });
+            store
+                .append_event(&source, Some(pt.as_str()), &say("hello"))
+                .expect("event");
+            let before = (
+                store.events(&source, None, 100).expect("events").len(),
+                store.active_provider_thread(&source).expect("active"),
+                store.thread_summary(&source).expect("summary"),
+            );
+
+            // What `fork_thread` hands to `create_chat_thread`: the same agent, the source's
+            // model and mode, in the source's folder.
+            let fork = record_new_thread(&store, "/w", None, driver, Some("m1"), Some(Mode::Plan))
+                .expect("fork");
+
+            assert_ne!(fork, source, "{driver:?}: a second thread");
+            let ids: Vec<_> = store
+                .list_threads(true)
+                .expect("list")
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&source) && ids.contains(&fork));
+            // The fork is on the same agent and starts in the carried mode.
+            assert!(store
+                .active_provider_thread(&fork)
+                .expect("active")
+                .is_some());
+            let fork_events = store.events(&fork, None, 100).expect("events");
+            assert!(fork_events
+                .iter()
+                .any(|(_, e)| matches!(e.event, Event::ModeChosen { mode: Mode::Plan })));
+            // The original: same events, same active provider thread, same summary.
+            let after = (
+                store.events(&source, None, 100).expect("events").len(),
+                store.active_provider_thread(&source).expect("active"),
+                store.thread_summary(&source).expect("summary"),
+            );
+            assert_eq!(before, after, "{driver:?}: the source is untouched");
+        }
     }
 
     #[test]

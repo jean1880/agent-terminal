@@ -32,6 +32,8 @@ mod typeahead;
 pub mod usage;
 
 #[cfg(test)]
+mod gap_tests;
+#[cfg(test)]
 mod ux_tests;
 
 use std::cell::{Cell, RefCell};
@@ -46,6 +48,7 @@ use agent_core::event::{Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
+use super::workspace_files;
 use super::{ChatBackend, DiffAsk, DiffSource, EnvelopeSink, ModelSource, SessionStatus};
 use crate::account_status::AccountStatus;
 use cards::{RowEvent, RowSink};
@@ -177,6 +180,10 @@ pub(crate) struct Inner {
     subagent_panel: RefCell<Option<Rc<subagents::SubagentPanel>>>,
     /// Sub-agent items (and their steps) changed since the last flush.
     subagent_changes: RefCell<Vec<String>>,
+    /// The thread's folder: what the app's own `@` file index lists for agents that do not
+    /// answer `Control::FileSuggestions` themselves.
+    workspace: RefCell<Option<std::path::PathBuf>>,
+    file_seq: Cell<u64>,
 }
 
 impl ChatView {
@@ -237,6 +244,8 @@ impl ChatView {
                 subagent_shelf,
                 subagent_panel: RefCell::new(None),
                 subagent_changes: RefCell::new(Vec::new()),
+                workspace: RefCell::new(None),
+                file_seq: Cell::new(0),
             }
         });
 
@@ -367,6 +376,14 @@ impl ChatView {
     pub fn connect_action(&self, f: impl Fn(&ViewAction) + 'static) {
         if let Some(inner) = self.inner() {
             inner.actions.borrow_mut().push(Rc::new(f));
+        }
+    }
+
+    /// Tells the view the thread's folder, so `@` lists its files for agents that do not list
+    /// them themselves (agy, Codex).
+    pub fn set_workspace(&self, dir: &std::path::Path) {
+        if let Some(inner) = self.inner() {
+            *inner.workspace.borrow_mut() = Some(dir.to_path_buf());
         }
     }
 
@@ -518,6 +535,9 @@ impl Inner {
         }
         let changes = self.model.borrow_mut().apply(env, driver);
         self.handle(changes);
+        if matches!(env.event, Event::TurnCompleted { .. }) && polls_context(driver) {
+            self.poll_context_soon();
+        }
         // Phase changes are discrete events: never walk the transcript for each text delta.
         if matches!(
             env.event,
@@ -676,13 +696,34 @@ impl Inner {
         self.requests.resolve(request, result);
     }
 
+    /// Asks the agent for its context occupancy once this turn has unwound, so the gauge fills
+    /// without the user opening `/context`. The reply is a `UsageUpdated` from the adapter; the
+    /// request itself needs no answer here.
+    fn poll_context_soon(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(inner) = weak.upgrade() else { return };
+            if !inner.backend.status().capabilities.context_usage {
+                return;
+            }
+            inner
+                .requests
+                .ask(inner.backend.as_ref(), Control::ContextUsage, |_| {});
+        });
+    }
+
     fn refresh_status(&self) {
         let status = self.backend.status();
         let running = status.running_turn || self.model.borrow().running;
         // The header counts background work too; the stop button follows the main turn only.
         let activity = self.model.borrow().activity(running);
         self.header.set_activity(&activity);
-        self.header.set_reload_running(running);
+        let stop_note = status.capabilities.unsupported_note(
+            agent_core::caps::Feature::InterruptKeepsProcess,
+            cards::driver_name(status.driver),
+        );
+        self.header
+            .set_reload_running(running, stop_note.as_deref());
         self.thinking
             .set(&activity, cards::driver_name(status.driver));
         self.composer.set_running(running);
@@ -776,6 +817,17 @@ impl Inner {
             self.handle(changes);
             self.refresh_status();
             return false;
+        }
+        if mode == Mode::Ask {
+            if let Some(note) = caps.unsupported_note(
+                agent_core::caps::Feature::LiveApprovals,
+                cards::driver_name(self.backend.status().driver),
+            ) {
+                let changes = self.model.borrow_mut().push_notice(note, Tone::Warning);
+                self.handle(changes);
+                self.refresh_status();
+                return false;
+            }
         }
         self.backend.set_mode(mode);
         true
@@ -905,8 +957,8 @@ impl Inner {
                 None => {
                     let changes = self.model.borrow_mut().push_notice(
                         format!(
-                            "{} has no compaction command, so the thread continues in a fresh \
-                             session with a budgeted summary.",
+                            "{} has no compaction command, so the conversation continues in a \
+                             new thread with a budgeted summary.",
                             cards::driver_name(status.driver)
                         ),
                         Tone::Info,
@@ -939,22 +991,66 @@ impl Inner {
             BuiltinAction::Rewind => self.emit(ViewAction::Rewind),
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
             BuiltinAction::Help => {
-                let changes = self
-                    .model
-                    .borrow_mut()
-                    .push_notice(help_text(&status.capabilities), Tone::Info);
+                let changes = self.model.borrow_mut().push_notice(
+                    help_text(&status.capabilities, cards::driver_name(status.driver)),
+                    Tone::Info,
+                );
                 self.handle(changes);
             }
         }
     }
 }
 
-/// The `/help` text: the built-ins this agent can back, then the keys.
-fn help_text(caps: &agent_core::caps::Capabilities) -> String {
+/// Whether the host must ask for the context gauge itself after each turn. Codex pushes its
+/// occupancy (`thread/tokenUsage/updated`); Claude and agy report it only when asked
+/// (`get_context_usage`, agy's running token count), which left Claude's gauge empty (F11).
+fn polls_context(driver: Driver) -> bool {
+    !matches!(driver, Driver::Codex)
+}
+
+/// The notice for a whole prompt that is a built-in this agent cannot back (`/mcp` on Codex):
+/// what it lacks, as the greyed-control tooltip would say. `None` for anything else, including
+/// a command the agent lists itself (that one is the agent's to run).
+fn unavailable_builtin_note(text: &str, status: &SessionStatus) -> Option<String> {
+    let name = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    let (_, feature) = agent_core::commands::unavailable_builtin(name, &status.capabilities)?;
+    let normalized = name.to_lowercase();
+    if status.commands.iter().any(|c| c.name == normalized) {
+        return None;
+    }
+    status
+        .capabilities
+        .unsupported_note(feature, cards::driver_name(status.driver))
+}
+
+/// The `/help` text: the built-ins this agent can back, then the ones it cannot (with why), then
+/// the keys.
+fn help_text(caps: &agent_core::caps::Capabilities, agent: &str) -> String {
     let mut s = String::from("Commands\n");
     for b in builtins().iter().filter(|b| b.available(caps)) {
         let hint = b.hint.map(|h| format!(" {h}")).unwrap_or_default();
         s.push_str(&format!("  /{}{hint} — {}\n", b.name, b.description));
+    }
+    let mut missing: Vec<String> = builtins()
+        .iter()
+        .filter(|b| !b.available(caps))
+        .filter_map(|b| {
+            let note = caps.unsupported_note(b.feature()?, agent)?;
+            Some(format!("  /{} — {note}\n", b.name))
+        })
+        .collect();
+    // Facts no command stands for (stop, @ files, compaction, reasoning, ...) are told too.
+    let command_features: Vec<_> = builtins().iter().filter_map(|b| b.feature()).collect();
+    missing.extend(
+        agent_core::caps::Feature::ALL
+            .iter()
+            .filter(|f| !command_features.contains(*f))
+            .filter_map(|f| caps.unsupported_note(*f, agent))
+            .map(|note| format!("  {note}\n")),
+    );
+    if !missing.is_empty() {
+        s.push_str("\nNot available here\n");
+        missing.iter().for_each(|line| s.push_str(line));
     }
     s.push_str(
         "\nKeys\n  Enter sends · Shift+Enter adds a line · Esc stops the running turn\n  \
@@ -970,6 +1066,14 @@ impl ComposerHost for Inner {
             // Built-ins never reach the agent.
             if let Some(me) = self.view().and_then(|v| v.inner()) {
                 me.run_action(cl.builtin.action, &cl.args);
+            }
+            return;
+        }
+        if let Some(note) = unavailable_builtin_note(text, &status) {
+            // A built-in this agent cannot back: say so rather than send it as a prompt.
+            if let Some(me) = self.view().and_then(|v| v.inner()) {
+                let changes = me.model.borrow_mut().push_notice(note, Tone::Info);
+                me.handle(changes);
             }
             return;
         }
@@ -1014,12 +1118,32 @@ impl ComposerHost for Inner {
     }
 
     fn request_files(&self, query: &str) -> Option<String> {
-        if !self.backend.status().capabilities.file_suggestions {
-            return None;
+        if self.backend.status().capabilities.file_suggestions {
+            return Some(self.backend.control(Control::FileSuggestions {
+                query: query.to_owned(),
+            }));
         }
-        Some(self.backend.control(Control::FileSuggestions {
-            query: query.to_owned(),
-        }))
+        // The agent lists no files: the app's own index of the thread's folder answers, off the
+        // main thread. The reply goes through the same request id path as the agent's.
+        let root = self.workspace.borrow().clone()?;
+        let id = {
+            self.file_seq.set(self.file_seq.get() + 1);
+            format!("app-files-{}", self.file_seq.get())
+        };
+        let weak = self
+            .view()
+            .and_then(|v| v.inner())
+            .map(|i| Rc::downgrade(&i))?;
+        let (reply_id, query) = (id.clone(), query.to_owned());
+        glib::spawn_future_local(async move {
+            let files = gtk4::gio::spawn_blocking(move || workspace_files::suggest(&root, &query))
+                .await
+                .unwrap_or_default();
+            if let Some(inner) = weak.upgrade() {
+                inner.composer.file_reply(&reply_id, files);
+            }
+        });
+        Some(id)
     }
 
     fn placeholder(&self) -> String {
@@ -1033,10 +1157,8 @@ impl ComposerHost for Inner {
 
 /// The composer's hint for the thread's CURRENT agent: its name and the triggers it backs.
 fn placeholder_text(status: &SessionStatus) -> String {
-    let mut tips = vec!["/ commands"];
-    if status.capabilities.file_suggestions {
-        tips.push("@ files");
-    }
+    // `@` works for every agent: the agent's own list (Claude) or the app's index of the folder.
+    let mut tips = vec!["/ commands", "@ files"];
     if status
         .commands
         .iter()
@@ -3112,12 +3234,102 @@ pub(crate) mod tests {
 
     #[test]
     fn help_lists_only_backed_builtins() {
-        let claude = help_text(&agent_core::caps::Capabilities::claude());
+        let claude = help_text(&agent_core::caps::Capabilities::claude(), "claude");
         assert!(claude.contains("/mcp"));
         assert!(claude.contains("/mode plan|default|accept-edits"));
-        let agy = help_text(&agent_core::caps::Capabilities::agy());
-        assert!(!agy.contains("/mcp"));
+        assert!(!claude.contains("Not available here"));
+        assert!(!claude.contains("restarts"));
+        let agy = help_text(&agent_core::caps::Capabilities::agy(), "Antigravity");
+        let (backed, missing) = agy
+            .split_once("Not available here")
+            .expect("a missing section");
+        assert!(!backed.contains("/mcp"));
+        assert!(missing.contains("/mcp — Antigravity has no MCP panel."));
         assert!(agy.contains("Esc stops"));
+    }
+
+    /// The caps contract (D6): every built-in that needs a capability is a working control when
+    /// the agent has it, and a named, explained absence when it does not (`/help` lists it, and
+    /// typing it says why instead of sending it to the agent as a prompt).
+    #[test]
+    fn every_capability_a_command_needs_is_a_control_or_an_explained_absence() {
+        use agent_core::adapter::Driver;
+        use agent_core::caps::Capabilities;
+        for driver in Driver::ALL {
+            let caps = Capabilities::of(driver);
+            let name = cards::driver_name(driver);
+            let help = help_text(&caps, name);
+            let status = SessionStatus {
+                driver,
+                model: None,
+                pending_model: None,
+                effort: None,
+                mode: Mode::Plan,
+                running_turn: false,
+                alive: true,
+                capabilities: caps.clone(),
+                commands: Vec::new(),
+            };
+            for feature in agent_core::caps::Feature::ALL {
+                if let Some(note) = caps.unsupported_note(feature, name) {
+                    assert!(help.contains(&note), "{name} /help omits: {note}");
+                }
+            }
+            for b in builtins() {
+                let typed = format!("/{}", b.name);
+                match b.feature() {
+                    Some(feature) if !caps.supports(feature) => {
+                        let note = caps.unsupported_note(feature, name).expect("a note");
+                        assert!(help.contains(&note), "{name} /help omits: {note}");
+                        assert_eq!(
+                            unavailable_builtin_note(&typed, &status),
+                            Some(note),
+                            "{name} {typed}"
+                        );
+                    }
+                    _ => {
+                        assert!(help.contains(&format!("/{}", b.name)), "{name} {typed}");
+                        assert_eq!(unavailable_builtin_note(&typed, &status), None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// F8: `/fork` is a built-in for every agent, run locally, never sent to the agent as text.
+    #[test]
+    fn slash_fork_is_a_local_builtin_for_every_agent() {
+        use agent_core::adapter::Driver;
+        for driver in Driver::ALL {
+            let caps = agent_core::caps::Capabilities::of(driver);
+            for typed in ["/fork", "  /fork  ", "/FORK"] {
+                let line = typeahead::parse_command_line(typed, &caps).expect("a built-in");
+                assert_eq!(
+                    line.builtin.action,
+                    BuiltinAction::Fork,
+                    "{driver:?} {typed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_says_it_has_no_mcp_panel() {
+        let status = SessionStatus {
+            driver: Driver::Codex,
+            model: None,
+            pending_model: None,
+            effort: None,
+            mode: Mode::Plan,
+            running_turn: false,
+            alive: true,
+            capabilities: agent_core::caps::Capabilities::codex(),
+            commands: Vec::new(),
+        };
+        let note = unavailable_builtin_note("/mcp", &status).expect("a note");
+        assert!(note.ends_with("has no MCP panel."), "{note}");
+        assert_eq!(unavailable_builtin_note("/model", &status), None);
+        assert_eq!(unavailable_builtin_note("hello /mcp", &status), None);
     }
 
     #[test]
