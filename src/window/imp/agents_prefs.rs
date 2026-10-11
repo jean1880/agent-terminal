@@ -428,10 +428,10 @@ impl AgentTerminalWindow {
         default_row
     }
 
-    /// The "In-App Approvals & Pattern Matching" preferences group.
+    /// The "In-App Approvals and Pattern Matching" preferences group.
     pub(super) fn permissions_group(&self) -> adw::PreferencesGroup {
         let group = adw::PreferencesGroup::builder()
-            .title("In-App Approvals &amp; Pattern Matching")
+            .title("In-App Approvals and Pattern Matching")
             .description(
                 "Agent Terminal manages approvals directly within the app, automatically permitting \
                  commands and tools matching wildcard rules (e.g. 'cargo test*') without interrupting your work.",
@@ -459,7 +459,7 @@ impl AgentTerminalWindow {
         group.add(&auto_approve_row);
 
         let confirm_row = adw::SwitchRow::builder()
-            .title("Confirm &amp; Customise Patterns on Save")
+            .title("Confirm and Customise Patterns on Save")
             .subtitle(
                 "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
             )

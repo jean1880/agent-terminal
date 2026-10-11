@@ -125,7 +125,7 @@ impl AgentTerminalWindow {
         page.add(&threads);
 
         let approvals = adw::PreferencesGroup::builder()
-            .title("In-App Approvals &amp; Pattern Matching")
+            .title("In-App Approvals and Pattern Matching")
             .description(
                 "Agent Terminal can manage approvals directly within the app, automatically \
                  permitting commands and tools that match saved pattern rules (e.g. 'cargo test*') \
@@ -156,7 +156,7 @@ impl AgentTerminalWindow {
         approvals.add(&auto_approve_row);
 
         let confirm_row = adw::SwitchRow::builder()
-            .title("Confirm &amp; Customise Patterns on Save")
+            .title("Confirm and Customise Patterns on Save")
             .subtitle(
                 "Show a confirmation dialogue to loosen or tighten patterns when choosing 'Always allow'.",
             )
