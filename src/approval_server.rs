@@ -464,6 +464,9 @@ struct Pending {
     /// The call in canonical terms, when a rule can describe it.
     action: Option<crate::always_allow::Action>,
     cwd: Option<String>,
+    /// The folder the card offered for "Allow for session" ([`crate::always_allow::session_folder`]
+    /// when it was built): the answer keeps a folder only if it is still this one.
+    shown_folder: Option<PathBuf>,
 }
 
 /// One thread's session rules, shared by its chat session (which clears them on a cross-agent
@@ -836,7 +839,13 @@ impl ServerInner {
         } else {
             Scope::Session
         };
-        let rule = match crate::always_allow::decide(pending.action.as_ref(), custom, scope, &ctx) {
+        let rule = match crate::always_allow::decide_as_shown(
+            pending.action.as_ref(),
+            custom,
+            scope,
+            &ctx,
+            pending.shown_folder.as_deref(),
+        ) {
             Ok(rule) => {
                 let warnings = rule.warnings(scope, Some(&ctx));
                 if let Some(text) = crate::always_allow::kept_with_warnings(&rule, &warnings) {
@@ -1049,11 +1058,19 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     }
 
     let id = query.id.clone();
+    let ctx = inner.context(query.cwd.as_deref());
     let (options, remembers) = rule_options(
         action.as_ref(),
-        inner.context(query.cwd.as_deref()).as_ref(),
+        ctx.as_ref(),
         inner.always.borrow().is_some(),
     );
+    // The folder the card offered, pinned: the answer keeps it only if it is still the same.
+    let shown_folder = match (&action, &ctx) {
+        (Some(a), Some(c)) if options.contains(&Decision::AllowForSession) => {
+            crate::always_allow::session_folder(a, c)
+        }
+        _ => None,
+    };
     // Registered before the envelope goes out: the sink may answer synchronously.
     inner.pending.borrow_mut().insert(
         id.clone(),
@@ -1061,6 +1078,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
             conn: conn.clone(),
             action,
             cwd: query.cwd.clone(),
+            shown_folder,
         },
     );
     let title = query
@@ -1102,6 +1120,17 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
 /// The rule engine's path check; the same one agy's Accept-edits policy uses.
 pub(crate) fn path_auto_matchable(target: &Path, workspace: &Path, home: Option<&Path>) -> bool {
     contained(target, workspace) && !sensitive_target(target, workspace, home)
+}
+
+/// Whether an edit of `target` may be matched by a session folder rule for `folder`:
+/// [`contained`] in the folder (absolute, no `..`, no symlink or extra hard link below it), not a
+/// [`sensitive_target`] relative to it, and not [`sensitive_anywhere`] (the folder may sit outside
+/// the workspace, so the workspace-relative view alone would miss a `.git` or `~/.config` above
+/// it). The folder grants ordinary files; git, hooks, agent config and instructions still ask.
+pub(crate) fn folder_auto_matchable(target: &Path, folder: &Path, home: Option<&Path>) -> bool {
+    contained(target, folder)
+        && !sensitive_target(target, folder, home)
+        && !sensitive_anywhere(target, home)
 }
 
 /// Whether a session read pattern may read `target` unasked: inside `workspace` ([`contained`]:
@@ -1166,6 +1195,18 @@ pub(crate) fn card_note(
         lines.push(format!(
             "“Allow for session” allows `{} …` in this workspace",
             head.join(" ")
+        ));
+    }
+    if let Some(folder) = crate::always_allow::session_folder(action, ctx).filter(|_| session) {
+        let outside = if crate::always_allow::folder_in_workspace(&folder, ctx) {
+            ""
+        } else {
+            ", outside this thread's workspace"
+        };
+        lines.push(format!(
+            "“Allow for session” allows edits in {}/ and its subfolders{outside} (git, hooks and \
+             agent config there still ask)",
+            folder.display()
         ));
     }
     if always {

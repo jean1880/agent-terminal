@@ -456,6 +456,64 @@ pub fn session_widening(action: &Action, ctx: &Context) -> Option<Vec<String>> {
     ctx.args_contained(&argv).then_some(head)
 }
 
+/// The folder a plain "Allow for session" keeps for an edit: the edited file's own folder and
+/// everything below it, so the next edit there does not ask again. `None` (the exact file is kept,
+/// as before) when:
+/// - the path carries a secret or `..`, or the home folder is not known (fail closed: the
+///   home-dotfile protections need it);
+/// - the folder is too broad: `/`, the home folder or above it ([`folder_too_broad`]);
+/// - the folder is outside the thread's workspace and not at least two levels inside home: a
+///   project folder elsewhere in home (`~/scripts/crates/x/src`) widens, while `~/git` (every
+///   repository), `~/bin` (on PATH), `/tmp`, `/etc` and `/run` never do;
+/// - this call itself is not one a folder rule may match (a sensitive file or a link out:
+///   [`crate::approval_server::folder_auto_matchable`]), so the call that makes the rule is
+///   always one it covers.
+///
+/// What [`decide`] keeps and the card says, from one place.
+pub fn session_folder(action: &Action, ctx: &Context) -> Option<PathBuf> {
+    let Action::Edit { path } = action else {
+        return None;
+    };
+    let home = ctx.home?;
+    if has_secret(path) {
+        return None;
+    }
+    let full = ctx.absolute(path)?;
+    if full
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let file = crate::approval_server::canonical_target(&full);
+    let folder = file.parent()?.to_owned();
+    if folder_too_broad(&folder, home) {
+        return None;
+    }
+    if !folder_in_workspace(&folder, ctx) {
+        let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+        let depth = folder
+            .strip_prefix(&real_home)
+            .or_else(|_| folder.strip_prefix(home))
+            .map_or(0, |rel| rel.components().count());
+        if depth < 2 {
+            return None;
+        }
+    }
+    crate::approval_server::folder_auto_matchable(&file, &folder, Some(home)).then_some(folder)
+}
+
+/// `/`, the home folder, or a folder above it: never a folder grant, typed or not.
+fn folder_too_broad(folder: &Path, home: &Path) -> bool {
+    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+    folder.parent().is_none() || home.starts_with(folder) || real_home.starts_with(folder)
+}
+
+/// Whether `folder` (canonical) is the thread's workspace or inside it.
+pub(crate) fn folder_in_workspace(folder: &Path, ctx: &Context) -> bool {
+    folder.starts_with(ctx.workspace) || folder.starts_with(ctx.workspace_key())
+}
+
 /// Whether a `*` pattern made of `argv` can widen at all: an allowlisted program, `git` alone, or
 /// git with an allowlisted subcommand.
 fn prefix_pattern_allowed(argv: &[String]) -> bool {
@@ -848,6 +906,8 @@ struct Probe {
     cwd_key: Option<String>,
     argv: Option<Vec<String>>,
     path: Option<PathBuf>,
+    /// The user's home, for the folder rule's sensitivity check.
+    home: Option<PathBuf>,
     /// The command carries no secret and no exec-capable option, and its working directory and
     /// every argument pass the containment check ([`Context::args_contained`]); what a session
     /// read pattern needs to match.
@@ -953,6 +1013,7 @@ impl Context<'_> {
             cwd_key: self.cwd.map(canonical_or_raw),
             argv,
             path,
+            home: self.home.map(Path::to_owned),
             args_contained,
         }
     }
@@ -970,6 +1031,11 @@ pub enum Target {
     },
     /// A canonical absolute path.
     Path { path: String },
+    /// A canonical absolute folder: an edit of any file below it. "Allow for session" on an edit
+    /// keeps the file's folder ([`session_folder`]); a typed edit pattern ending in `/` is one.
+    /// Session only ([`Rule::check`]); matched through
+    /// [`crate::approval_server::folder_auto_matchable`] (no `..`, no link out, not sensitive).
+    Dir { dir: String },
     /// One MCP server's tool (`*`: any tool of that server).
     Mcp { server: String, tool: String },
 }
@@ -1031,6 +1097,24 @@ impl Rule {
                 })?;
                 Target::Argv { argv, prefix }
             }
+            ActionKind::Edit if pattern.len() > 1 && pattern.ends_with('/') => {
+                let dir = pattern.trim_end_matches('/');
+                let p = Path::new(dir);
+                if dir.is_empty()
+                    || !p.is_absolute()
+                    || dir.contains(GLOB)
+                    || p.components().any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err(
+                        "a folder rule needs one absolute folder ending in `/`, without `..` or \
+                         wildcards, and not `/`"
+                            .to_owned(),
+                    );
+                }
+                Target::Dir {
+                    dir: dir.to_owned(),
+                }
+            }
             ActionKind::Edit | ActionKind::Read => {
                 let p = Path::new(pattern);
                 if !p.is_absolute()
@@ -1038,7 +1122,9 @@ impl Rule {
                     || p.components().any(|c| c == std::path::Component::ParentDir)
                 {
                     return Err(
-                        "a path rule needs one absolute path, without `..` or wildcards".to_owned(),
+                        "a path rule needs one absolute path, without `..` or wildcards (for an \
+                         edit, end it in `/` to allow a whole folder)"
+                            .to_owned(),
                     );
                 }
                 Target::Path {
@@ -1148,6 +1234,14 @@ impl Rule {
         self
     }
 
+    /// An exact edit rule made the session folder rule for `folder` ([`session_folder`]).
+    fn into_folder(mut self, folder: &Path) -> Self {
+        self.target = Target::Dir {
+            dir: folder.to_string_lossy().into_owned(),
+        };
+        self
+    }
+
     /// A user's rule ([`Self::new`]) made concrete for the request it answers: the thread's
     /// canonical workspace (unless global), the request's canonical working directory for a shell
     /// rule, a canonical path (wherever it is), and the agent it is created on.
@@ -1159,10 +1253,22 @@ impl Rule {
                 self.cwd = ctx.cwd.map(canonical_or_raw);
             }
         }
-        if let Target::Path { path } = &mut self.target {
+        if let Target::Path { path: p } | Target::Dir { dir: p } = &mut self.target {
             // Outside the workspace or sensitive is the user's call ([`Self::warnings`]).
-            let canonical = crate::approval_server::canonical_target(Path::new(path));
-            *path = canonical.to_string_lossy().into_owned();
+            let canonical = crate::approval_server::canonical_target(Path::new(p));
+            *p = canonical.to_string_lossy().into_owned();
+        }
+        // A typed folder is the user's choice, but never `/`, home or above it, and never without
+        // the home folder known (the dotfile protections need it).
+        if let Target::Dir { dir } = &self.target {
+            let home = ctx
+                .home
+                .ok_or("a folder rule needs the home folder known; keep the one file instead")?;
+            if folder_too_broad(Path::new(dir), home) {
+                return Err(format!(
+                    "{dir}/ is `/`, your home folder or above it: too wide for a folder rule"
+                ));
+            }
         }
         Ok(self)
     }
@@ -1173,6 +1279,17 @@ impl Rule {
     /// for session" on a runner, wrapper or interpreter only as the exact command, never a
     /// pattern.
     pub fn check(&self, scope: Scope) -> Result<(), String> {
+        if let Target::Dir { .. } = &self.target {
+            // A standing write grant over a whole folder is too much to keep for good: a later
+            // session's files there are not ones the user has seen.
+            return match scope {
+                Scope::Session => Ok(()),
+                Scope::Always => Err(
+                    "a folder is kept for this session only; \"Always allow\" keeps one file"
+                        .to_owned(),
+                ),
+            };
+        }
         let Target::Argv { argv, prefix } = &self.target else {
             return Ok(());
         };
@@ -1226,6 +1343,14 @@ impl Rule {
                      instructions that change what runs next)"
                 ));
             }
+            Target::Dir { dir }
+                if ctx.is_some_and(|ctx| !folder_in_workspace(Path::new(dir), ctx)) =>
+            {
+                out.push(format!(
+                    "{dir}/ is outside the workspace: any file in it may be edited this session \
+                     (git, hooks and agent config there still ask)"
+                ));
+            }
             _ => {}
         }
         out
@@ -1272,6 +1397,13 @@ impl Rule {
             (Target::Path { path }, Action::Edit { .. } | Action::Read { .. }) => {
                 probe.path.as_deref() == Some(Path::new(path))
             }
+            // No home known: the home-dotfile protections cannot apply, so nothing matches.
+            (Target::Dir { dir }, Action::Edit { .. }) => match (&probe.path, &probe.home) {
+                (Some(p), Some(home)) => {
+                    crate::approval_server::folder_auto_matchable(p, Path::new(dir), Some(home))
+                }
+                _ => false,
+            },
             (Target::Mcp { server, tool }, Action::Mcp { server: s, tool: t }) => {
                 server == s && (tool == "*" || tool == t)
             }
@@ -1299,6 +1431,7 @@ impl Rule {
                 }
             }
             Target::Path { path } => path.clone(),
+            Target::Dir { dir } => format!("{dir}/"),
             Target::Mcp { server, tool } => format!("{server}/{tool}"),
         }
     }
@@ -1322,6 +1455,9 @@ impl Rule {
 pub fn dialog_prefill(tool: &str, input: &Value, remembers: Option<&str>) -> String {
     match Action::of(tool, input) {
         Some(Action::Shell { command }) => unwrap_shell_wrapper(&command).unwrap_or(command),
+        // Without a trailing `/`: the agent's path must never prefill a folder rule (`/home/u/`
+        // would be a grant over the whole home); a folder is only ever the user's own typing.
+        Some(Action::Edit { path }) if path.len() > 1 => path.trim_end_matches('/').to_owned(),
         Some(Action::Edit { path }) => path,
         Some(Action::Mcp { server, tool }) => format!("{server}/{tool}"),
         Some(Action::Read { .. }) | None => remembers.unwrap_or_default().to_owned(),
@@ -1372,11 +1508,29 @@ pub fn always_offerable(action: &Action) -> bool {
 /// in the workspace becomes its [`session_pattern`]), and [`Rule::check`] decides what `scope`
 /// may keep. `Err` says why
 /// nothing is kept (the call is then allowed once).
+///
+/// Trusts the folder as resolved now; the app answers cards through [`decide_as_shown`].
+#[cfg(test)]
 pub fn decide(
     action: Option<&Action>,
     custom: Option<Rule>,
     scope: Scope,
     ctx: &Context,
+) -> Result<Rule, String> {
+    let shown = action.and_then(|a| session_folder(a, ctx));
+    decide_as_shown(action, custom, scope, ctx, shown.as_deref())
+}
+
+/// [`decide`] for an answer to a card: a folder is kept only when it is the one the card showed
+/// (`shown`, [`session_folder`] when the card was built). Paths are resolved again at the click,
+/// and a link swapped in meanwhile could name a different folder; the grant is then the exact
+/// file, never wider than what the user was told.
+pub fn decide_as_shown(
+    action: Option<&Action>,
+    custom: Option<Rule>,
+    scope: Scope,
+    ctx: &Context,
+    shown: Option<&Path>,
 ) -> Result<Rule, String> {
     let action = action.ok_or("nothing in this request can be remembered")?;
     if !offerable(action, ctx) {
@@ -1387,10 +1541,17 @@ pub fn decide(
     }
     let rule = match custom {
         Some(rule) => rule.complete(ctx)?,
-        // A read widens only when this call itself stays in the workspace; one run from outside
-        // it keeps its exact command, tied to its folder.
-        None if scope == Scope::Session && session_widening(action, ctx).is_some() => {
-            Rule::from_action(action, ctx)?.widen_read()
+        None if scope == Scope::Session => {
+            match session_folder(action, ctx).filter(|now| shown == Some(now.as_path())) {
+                // An edit keeps its folder, when that folder is one a grant may name.
+                Some(folder) => Rule::from_action(action, ctx)?.into_folder(&folder),
+                // A read widens only when this call itself stays in the workspace; one run from
+                // outside it keeps its exact command, tied to its folder.
+                None if session_widening(action, ctx).is_some() => {
+                    Rule::from_action(action, ctx)?.widen_read()
+                }
+                None => Rule::from_action(action, ctx)?,
+            }
         }
         None => Rule::from_action(action, ctx)?,
     };
@@ -1557,7 +1718,12 @@ impl AlwaysRules {
     /// request is prepared once, not per rule.
     pub fn matches_any(&self, action: &Action, ctx: &Context) -> bool {
         let probe = ctx.probe(action);
-        self.rules.iter().any(|r| r.matches_probe(action, &probe))
+        // A folder rule is session-only ([`Rule::check`]); one hand-written into the rules file
+        // never grants anything.
+        self.rules
+            .iter()
+            .filter(|r| !matches!(r.target, Target::Dir { .. }))
+            .any(|r| r.matches_probe(action, &probe))
     }
 
     /// A rule created on this agent allows `action` (session rules are per agent, D3).
@@ -1774,7 +1940,7 @@ impl AlwaysRules {
                     argv_text(argv),
                 ),
                 Target::Mcp { server, tool } => ("mcp", format!("{server}/{tool}")),
-                Target::Path { .. } => continue,
+                Target::Path { .. } | Target::Dir { .. } => continue,
             };
             let quoted = toml_string(&entry);
             if entry.is_empty() || new_content.contains(&quoted) {
@@ -1849,7 +2015,7 @@ impl AlwaysRules {
             }
             Target::Argv { argv, .. } => Some(format!("Bash({})", argv_text(argv))),
             Target::Mcp { server, tool } => Some(format!("mcp__{server}__{tool}")),
-            Target::Path { .. } => None,
+            Target::Path { .. } | Target::Dir { .. } => None,
         })
     }
 
@@ -1858,7 +2024,7 @@ impl AlwaysRules {
             // agy's `command(…)` is a prefix: an exact rule is not exported there.
             Target::Argv { argv, prefix: true } => Some(format!("command({})", argv_text(argv))),
             Target::Mcp { server, tool } => Some(format!("mcp({server}/{tool})")),
-            Target::Argv { .. } | Target::Path { .. } => None,
+            Target::Argv { .. } | Target::Path { .. } | Target::Dir { .. } => None,
         })
     }
 
@@ -4139,6 +4305,155 @@ mod tests {
             None,
             "shell syntax anywhere: not unwrapped, never a rule"
         );
+    }
+
+    /// "Allow for session" on an edit keeps the file's folder: the next edit there (or below it)
+    /// does not ask, while a sibling folder, a link out, git and agent config still do. Never for
+    /// good, never wider than a folder a grant may name, and the card says it before the click.
+    #[test]
+    fn session_edit_keeps_its_folder_and_nothing_more() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = std::fs::canonicalize(tmp.path()).expect("canon");
+        let ws = root.join("ws");
+        let src = ws.join("crate/src");
+        let home = root.join("home");
+        let outside = root.join("outside");
+        for d in [&src, &home, &outside] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        std::os::unix::fs::symlink(&outside, src.join("link")).expect("link");
+        let ws_s = ws.to_string_lossy().into_owned();
+        let c = Context {
+            driver: "claude",
+            workspace: &ws,
+            cwd: Some(&ws_s),
+            home: Some(&home),
+        };
+        let edit = |p: &Path| Action::Edit {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let a = edit(&src.join("a.rs"));
+
+        let rule = decide(Some(&a), None, Scope::Session, &c).expect("session rule");
+        assert_eq!(
+            rule.target,
+            Target::Dir {
+                dir: src.to_string_lossy().into_owned()
+            }
+        );
+        assert_eq!(rule.detail(), format!("{}/", src.display()));
+        assert!(rule.matches(&a, &c), "the call that made it");
+        assert!(rule.matches(&edit(&src.join("b.rs")), &c), "a sibling file");
+        assert!(
+            rule.matches(&edit(&src.join("deep/new/c.rs")), &c),
+            "below, not yet created"
+        );
+        for refused in [
+            ws.join("crate/other.rs"),
+            ws.join("crate/src2/a.rs"),
+            src.join("link/x.rs"),
+            src.join(".git/config"),
+            src.join("AGENTS.md"),
+            src.join(".claude/settings.json"),
+        ] {
+            assert!(!rule.matches(&edit(&refused), &c), "{refused:?}");
+        }
+        assert!(!rule.matches(&shell("cat a.rs"), &c));
+        let note = crate::approval_server::card_note(&a, &c, true, false).expect("note");
+        assert!(
+            note.contains(&format!("allows edits in {}/", src.display())),
+            "{note}"
+        );
+
+        // "Always allow" keeps the one file; a folder is refused for good, typed or not, and one
+        // hand-written into the rules file grants nothing.
+        let always = decide(Some(&a), None, Scope::Always, &c).expect("always");
+        assert!(matches!(always.target, Target::Path { .. }));
+        let typed = Rule::new("", "Edit", format!("{}/", src.display())).expect("folder");
+        assert!(matches!(typed.target, Target::Dir { .. }));
+        assert!(decide(Some(&a), Some(typed.clone()), Scope::Always, &c).is_err());
+        let kept = decide(Some(&a), Some(typed), Scope::Session, &c).expect("typed session");
+        assert!(kept.matches(&edit(&src.join("z.rs")), &c));
+        let file = AlwaysRules {
+            rules: vec![kept.clone()],
+        };
+        assert!(!file.matches_any(&edit(&src.join("z.rs")), &c));
+        let session = AlwaysRules { rules: vec![kept] };
+        assert!(session.matches_session(&edit(&src.join("z.rs")), &c));
+        for bad in ["//", "src/", "/tmp/*/"] {
+            assert!(Rule::new("", "Edit", bad).is_err(), "{bad}");
+        }
+
+        // Kept as the exact file: a sensitive file, one directly in home, one through `..`.
+        for exact in [
+            ws.join("AGENTS.md"),
+            home.join("notes.txt"),
+            PathBuf::from(format!("{ws_s}/crate/../crate/src/a.rs")),
+        ] {
+            assert_eq!(session_folder(&edit(&exact), &c), None, "{exact:?}");
+        }
+        let at_home = decide(
+            Some(&edit(&home.join("notes.txt"))),
+            None,
+            Scope::Session,
+            &c,
+        )
+        .expect("exact");
+        assert!(matches!(at_home.target, Target::Path { .. }));
+
+        // Outside the workspace: a project folder well inside home widens (said so on the card
+        // and in the warnings); a folder directly in home (`~/bin`, `~/git`) or outside home
+        // (`/tmp`, `/run`, `/etc`) keeps the exact file.
+        let project = home.join("scripts/crates/tool/src");
+        std::fs::create_dir_all(&project).expect("project");
+        let there = edit(&project.join("gh.rs"));
+        let elsewhere = decide(Some(&there), None, Scope::Session, &c).expect("outside");
+        assert!(matches!(elsewhere.target, Target::Dir { .. }));
+        assert!(!elsewhere.warnings(Scope::Session, Some(&c)).is_empty());
+        assert!(rule.warnings(Scope::Session, Some(&c)).is_empty());
+        let note = crate::approval_server::card_note(&there, &c, true, false).expect("note");
+        assert!(note.contains("outside this thread's workspace"), "{note}");
+        for exact in [
+            home.join("bin/git"),
+            home.join("git/notes.md"),
+            outside.join("x.rs"),
+        ] {
+            assert_eq!(session_folder(&edit(&exact), &c), None, "{exact:?}");
+        }
+
+        // Pinned to the card: a folder other than the one shown (a link swapped in before the
+        // click) keeps the exact file; no folder shown, no folder kept.
+        let other = home.join("elsewhere");
+        let swapped = decide_as_shown(Some(&a), None, Scope::Session, &c, Some(&other))
+            .expect("exact instead");
+        assert!(matches!(swapped.target, Target::Path { .. }));
+        let unshown = decide_as_shown(Some(&a), None, Scope::Session, &c, None).expect("exact");
+        assert!(matches!(unshown.target, Target::Path { .. }));
+
+        // A typed (or prefilled) folder is never `/`, home or above it; the agent's path never
+        // prefills a folder.
+        for wide in [
+            format!("{}/", home.display()),
+            format!("{}/", root.display()),
+        ] {
+            let typed = Rule::new("", "Edit", &wide).expect("parses");
+            assert!(typed.complete(&c).is_err(), "{wide}");
+        }
+        let prefill = dialog_prefill(
+            "Edit",
+            &serde_json::json!({"file_path": format!("{}/", home.display())}),
+            None,
+        );
+        assert_eq!(prefill, home.to_string_lossy(), "the path, without its `/`");
+
+        // No home known: no folder offered, and a folder rule matches nothing (fail closed).
+        let no_home = Context { home: None, ..c };
+        assert_eq!(session_folder(&a, &no_home), None);
+        assert!(!rule.matches(&edit(&src.join("b.rs")), &no_home));
+        assert!(Rule::new("", "Edit", format!("{}/", src.display()))
+            .expect("parses")
+            .complete(&no_home)
+            .is_err());
     }
 
     /// The exact #310 payloads: a compound or expanding command is not the command a rule names,
