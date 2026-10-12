@@ -4362,7 +4362,7 @@ mod tests {
         let note = crate::approval_server::card_note(&a, &c, true, false).expect("note");
         assert!(
             note.contains(&format!("allows edits in {}/", src.display())),
-            "{note}"
+            "the card names the folder"
         );
 
         // "Always allow" keeps the one file; a folder is refused for good, typed or not, and one
@@ -4412,7 +4412,10 @@ mod tests {
         assert!(!elsewhere.warnings(Scope::Session, Some(&c)).is_empty());
         assert!(rule.warnings(Scope::Session, Some(&c)).is_empty());
         let note = crate::approval_server::card_note(&there, &c, true, false).expect("note");
-        assert!(note.contains("outside this thread's workspace"), "{note}");
+        assert!(
+            note.contains("outside this thread's workspace"),
+            "the card says the folder is outside the workspace"
+        );
         for exact in [
             home.join("bin/git"),
             home.join("git/notes.md"),
