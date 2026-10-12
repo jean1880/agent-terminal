@@ -24,6 +24,11 @@ pub trait ChatBackend {
     fn queue_prompt(&self, text: &str) {
         self.send_prompt(text);
     }
+    /// A message written while a turn runs, for an agent that takes it at once
+    /// (`Capabilities::live_input`). A backend that cannot queues it as before.
+    fn steer_prompt(&self, text: &str) {
+        self.queue_prompt(text);
+    }
     fn interrupt(&self);
     fn respond_approval(&self, request: &str, decision: Decision);
     fn respond_approval_with_rule(

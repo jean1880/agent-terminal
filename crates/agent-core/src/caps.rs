@@ -34,6 +34,11 @@ pub struct Capabilities {
     /// Passes forms from its tool servers (MCP elicitation) to the UI to fill in or decline.
     #[serde(default)]
     pub forms: bool,
+    /// Takes a message while a turn runs ([`crate::adapter::Command::Steer`]): Claude folds it
+    /// into the running turn, Codex through `turn/steer`. False (agy) keeps the app's queue: agy
+    /// runs a message written mid-turn as the next turn anyway (verified 2026-10-11).
+    #[serde(default)]
+    pub live_input: bool,
 }
 
 impl Capabilities {
@@ -65,6 +70,9 @@ impl Capabilities {
             plan_mode: true,
             // The stream-json control protocol raises no MCP elicitation the adapter maps.
             forms: false,
+            // A user line written mid-turn is folded into that turn: one `result`, no new
+            // `init` (probe, 2026-10-11).
+            live_input: true,
         }
     }
 
@@ -89,6 +97,8 @@ impl Capabilities {
             plan_mode: true,
             // Headless agy has no channel for a tool server's form.
             forms: false,
+            // A message written mid-turn waits and runs as the next turn (probe, 2026-10-11).
+            live_input: false,
         }
     }
 
@@ -123,6 +133,8 @@ impl Capabilities {
             plan_mode: true,
             // `mcpServer/elicitation/request` is a live server request answered by the form card.
             forms: true,
+            // `turn/steer` (codex-cli 0.161.0's own schema).
+            live_input: true,
         }
     }
 }
@@ -148,10 +160,11 @@ pub enum Feature {
     Questions,
     PlanMode,
     Forms,
+    LiveInput,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 15] = [
+    pub const ALL: [Feature; 16] = [
         Feature::ModelSwitch,
         Feature::LiveApprovals,
         Feature::InterruptKeepsProcess,
@@ -167,6 +180,7 @@ impl Feature {
         Feature::Questions,
         Feature::PlanMode,
         Feature::Forms,
+        Feature::LiveInput,
     ];
 
     /// Where the app renders this fact (for people reading the contract test; the test checks
@@ -190,6 +204,7 @@ impl Feature {
             Feature::Questions => "question cards",
             Feature::PlanMode => "mode picker: Plan",
             Feature::Forms => "form cards (a tool server's form or link)",
+            Feature::LiveInput => "composer while a turn runs: sent at once, or queued",
         }
     }
 }
@@ -213,6 +228,7 @@ impl Capabilities {
             Feature::Questions => self.questions,
             Feature::PlanMode => self.plan_mode,
             Feature::Forms => self.forms,
+            Feature::LiveInput => self.live_input,
         }
     }
 
@@ -249,6 +265,10 @@ impl Capabilities {
                 "{agent} does not pass on forms from its tool servers; a tool that needs one \
                  asks in the reply instead."
             ),
+            Feature::LiveInput => format!(
+                "{agent} cannot take a message while it works; it is queued and sent when the \
+                 turn ends."
+            ),
         })
     }
 }
@@ -278,6 +298,7 @@ mod tests {
             questions: _,
             plan_mode: _,
             forms: _,
+            live_input: _,
         } = Capabilities::claude();
         let mut seen = std::collections::HashSet::new();
         assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
@@ -304,7 +325,8 @@ mod tests {
                 StreamsReasoning => Some(Questions),
                 Questions => Some(PlanMode),
                 PlanMode => Some(Forms),
-                Forms => None,
+                Forms => Some(LiveInput),
+                LiveInput => None,
             }
         }
         let mut walked = vec![ModelSwitch];

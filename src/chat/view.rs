@@ -1119,7 +1119,10 @@ impl ComposerHost for Inner {
         }
         // What you just sent, and the reply to it, are where the view goes.
         self.transcript.scroll_to_end();
-        if status.running_turn {
+        if status.running_turn && status.capabilities.live_input {
+            // Straight to the agent, which takes it into the running turn.
+            self.backend.steer_prompt(text);
+        } else if status.running_turn {
             self.backend.queue_prompt(text);
         } else {
             self.backend.send_prompt(text);
