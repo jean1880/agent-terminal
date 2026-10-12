@@ -1261,28 +1261,73 @@ impl Transcript {
                     t.status = ToolStatus::Interrupted;
                     changed = true;
                 }
+                _ => {}
+            }
+        }
+        changed |= !self.expire_requests().is_empty();
+        // No Codex session is alive to remember a grant.
+        changed |= !std::mem::take(&mut self.extra_access).is_empty();
+        changed
+    }
+
+    /// Expires every approval, question and form still waiting on the user (or sent and not yet
+    /// acknowledged): nothing can take the answer any more, because the turn that asked ended
+    /// (stopped or failed) or no agent is alive. Returns the items changed.
+    fn expire_requests(&mut self) -> Vec<ItemId> {
+        let mut changed = Vec::new();
+        for (id, item) in &mut self.items {
+            let expired = match &mut item.body {
                 Body::Approval(a)
                     if matches!(a.state, ApprovalState::Pending | ApprovalState::Sent(_)) =>
                 {
                     a.state = ApprovalState::Expired;
-                    changed = true;
+                    true
                 }
                 Body::Question(q)
                     if matches!(q.state, QuestionState::Pending | QuestionState::Sent) =>
                 {
                     q.state = QuestionState::Expired;
-                    changed = true;
+                    true
                 }
                 Body::Form(f) if matches!(f.state, FormState::Pending | FormState::Sent) => {
                     f.state = FormState::Expired;
-                    changed = true;
+                    true
                 }
-                _ => {}
+                _ => false,
+            };
+            if expired {
+                changed.push(id.clone());
             }
         }
-        // No Codex session is alive to remember a grant.
-        changed |= !std::mem::take(&mut self.extra_access).is_empty();
+        changed.sort();
         changed
+    }
+
+    /// A question the agent withdrew without an answer (its request cancelled or expired, as
+    /// Claude reports any request it drops: `ApprovalResolved { Cancel }`). `expired`: nothing
+    /// can answer it now. Questions already answered keep their state.
+    fn withdraw_question(&mut self, env: &Envelope, expired: bool) -> Vec<Change> {
+        let Some(id) = env
+            .request
+            .as_ref()
+            .and_then(|r| self.requests.get(r))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        match self.items.get_mut(&id).map(|i| &mut i.body) {
+            Some(Body::Question(q))
+                if matches!(q.state, QuestionState::Pending | QuestionState::Sent) =>
+            {
+                q.state = if expired {
+                    QuestionState::Expired
+                } else {
+                    QuestionState::Withdrawn
+                };
+                vec![Change::Updated(id)]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Marks every finished reasoning block loaded from history as Replayed (it did not come
@@ -1426,6 +1471,13 @@ impl Transcript {
                 }
                 if let Some(id) = self.open_text.take() {
                     out.extend(self.finish_text(&id));
+                }
+                // A stopped turn can no longer take an answer: whatever it was still asking (a
+                // question, an approval, a form) expires, so nothing waits forever. Only a stop:
+                // background work (Codex workers, Claude background sub-agents) can outlive a
+                // turn that completed or failed and still ask, and those requests stay live.
+                if *state == TurnState::Interrupted {
+                    out.extend(self.expire_requests().into_iter().map(Change::Updated));
                 }
                 match state {
                     TurnState::Completed => {}
@@ -1686,6 +1738,11 @@ impl Transcript {
                 out.extend(self.update_approval(env, |a| {
                     a.state = ApprovalState::Resolved(*decision);
                 }));
+                // Claude asks its questions through the same permission request and drops one
+                // (a stop, a cancel, the process ending) as a cancelled approval.
+                if matches!(decision, Decision::Cancel | Decision::Deny) {
+                    out.extend(self.withdraw_question(env, false));
+                }
             }
             Event::ApprovalExpired => {
                 out.extend(self.update_approval(env, |a| {
@@ -1693,6 +1750,7 @@ impl Transcript {
                         a.state = ApprovalState::Expired;
                     }
                 }));
+                out.extend(self.withdraw_question(env, true));
             }
             Event::QuestionRequested {
                 questions,
@@ -3911,6 +3969,123 @@ mod tests {
             .request("q1"),
             tasks(&[("t1", BackgroundTaskKind::Agent, Some("Map the crate"))]),
         ]
+    }
+
+    /// The reported bug: stopping the agent while it asked a question left the question
+    /// "unanswered" for good (the shelf kept pointing at it). Claude asks through a permission
+    /// request and drops one as a cancelled approval, which only updated approval cards.
+    #[test]
+    fn a_question_the_agent_drops_or_a_stop_cuts_off_stops_waiting() {
+        let asked = |t: &mut Transcript, request: &str| {
+            t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+            t.apply(
+                &ev(Event::QuestionRequested {
+                    questions: vec![],
+                    source: QuestionSource::Agent,
+                })
+                .request(request),
+                Driver::Claude,
+            );
+            assert!(matches!(
+                t.pending_interruption(),
+                Some(PendingInterruption::Question { .. })
+            ));
+        };
+        let state = |t: &Transcript, request: &str| match t
+            .get(&format!("question:{request}"))
+            .map(|i| &i.body)
+        {
+            Some(Body::Question(q)) => q.state,
+            other => panic!("{other:?}"),
+        };
+
+        // Claude cancels the request (control_cancel_request, or its process ending).
+        let mut t = Transcript::new();
+        asked(&mut t, "q1");
+        t.apply(
+            &ev(Event::ApprovalResolved {
+                decision: Decision::Cancel,
+            })
+            .request("q1"),
+            Driver::Claude,
+        );
+        assert_eq!(state(&t, "q1"), QuestionState::Withdrawn);
+        assert!(t.pending_interruption().is_none());
+        assert_eq!(t.pending_count(), 0);
+
+        // An expiry names it the same way.
+        let mut t = Transcript::new();
+        asked(&mut t, "q2");
+        t.apply(&ev(Event::ApprovalExpired).request("q2"), Driver::Claude);
+        assert_eq!(state(&t, "q2"), QuestionState::Expired);
+
+        // The turn is stopped with no word on the request: it expires with the turn.
+        let mut t = Transcript::new();
+        asked(&mut t, "q3");
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+            Driver::Claude,
+        );
+        assert_eq!(state(&t, "q3"), QuestionState::Expired);
+        assert!(t.pending_interruption().is_none());
+
+        // A turn that completes leaves a live request alone (background work can still ask).
+        let mut t = Transcript::new();
+        asked(&mut t, "q4");
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+            Driver::Claude,
+        );
+        assert_eq!(state(&t, "q4"), QuestionState::Pending);
+        // An answered question keeps its state whatever follows.
+        t.apply(
+            &ev(Event::QuestionResolved { answered: true }).request("q4"),
+            Driver::Claude,
+        );
+        t.apply(
+            &ev(Event::ApprovalResolved {
+                decision: Decision::Cancel,
+            })
+            .request("q4"),
+            Driver::Claude,
+        );
+        assert_eq!(state(&t, "q4"), QuestionState::Answered);
+    }
+
+    /// End to end through the Claude adapter's own frames: AskUserQuestion arrives as a
+    /// `can_use_tool` request; a `control_cancel_request` (what a stop brings) clears it.
+    #[test]
+    fn a_cancelled_claude_question_clears_through_the_adapter() {
+        use agent_core::adapter::Adapter;
+        let mut a = agent_core::claude::ClaudeAdapter::new();
+        let mut t = Transcript::new();
+        let mut feed = |a: &mut agent_core::claude::ClaudeAdapter, line: serde_json::Value| {
+            for env in a.feed(&line.to_string()) {
+                t.apply(&env, Driver::Claude);
+            }
+            t.pending_interruption().is_some()
+        };
+        assert!(feed(
+            &mut a,
+            serde_json::json!({"type": "control_request", "request_id": "r1", "request": {
+                "subtype": "can_use_tool", "tool_name": "AskUserQuestion", "tool_use_id": "tu1",
+                "input": {"questions": [{"question": "Which?", "header": "Pick",
+                    "options": [{"label": "A"}, {"label": "B"}], "multiSelect": false}]}}})
+        ));
+        assert!(!feed(
+            &mut a,
+            serde_json::json!({"type": "control_cancel_request", "request_id": "r1"})
+        ));
     }
 
     #[test]
