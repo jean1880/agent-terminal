@@ -2031,6 +2031,71 @@ impl Inner {
         });
     }
 
+    /// A message written while a turn runs, sent at once to an agent that takes it then
+    /// (`Capabilities::live_input`: Claude folds it into the running turn, Codex steers it). It
+    /// shows as an ordinary message, not a queued one. Everything else goes the way it always
+    /// did: sent as a prompt if the turn ended meanwhile, else queued — an agent without live
+    /// input, a slash command (mid-turn it would stop being one), or a handoff still waiting to
+    /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
+    /// one, so it is never lost.
+    fn steer_prompt(self: &Rc<Self>, text: &str) {
+        if !self.state.borrow().running_turn {
+            return self.send_prompt(text);
+        }
+        let live = self.adapter.borrow().capabilities().live_input;
+        let handoff_waiting =
+            self.pending_handoff.borrow().is_some() && !self.handoff_in_flight.get();
+        if !live || Self::is_slash_command(text) || handoff_waiting {
+            return self.queue_prompt(text);
+        }
+        self.apply_retired();
+        let pt = self.provider_thread.borrow().clone();
+        let provider = (!pt.is_empty()).then_some(pt.as_str());
+        let item = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => item,
+            Err(e) => {
+                warn!(error = %e, "could not persist the user message");
+                self.next_local_id("user")
+            }
+        };
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item(item.clone()),
+        );
+        self.deliver(
+            &Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: agent_core::redact::redact(text),
+            })
+            .item(item.clone()),
+        );
+        if self.command(Command::Steer {
+            text: text.to_owned(),
+        }) {
+            return;
+        }
+        // Refused: it waits for the turn to end, as a message sent mid-turn always did.
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: "queued".to_string(),
+                input: Some(serde_json::json!({"queued": true})),
+                parent: None,
+            })
+            .item(item.clone()),
+        );
+        self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
+            item_id: item,
+            text: text.to_owned(),
+            handoff: None,
+        });
+    }
+
     fn send_prompt(self: &Rc<Self>, text: &str) {
         self.apply_retired();
         let pt = self.provider_thread.borrow().clone();
@@ -3321,6 +3386,10 @@ impl ChatBackend for ChatSession {
 
     fn queue_prompt(&self, text: &str) {
         self.inner.queue_prompt(text);
+    }
+
+    fn steer_prompt(&self, text: &str) {
+        self.inner.steer_prompt(text);
     }
 
     fn interrupt(&self) {

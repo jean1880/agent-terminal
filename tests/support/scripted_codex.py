@@ -133,6 +133,16 @@ for line in sys.stdin:
             complete()
         else:
             request()
+    elif method == "turn/steer":
+        # Accepted only into the active turn it names (codex-cli 0.161.0's precondition).
+        params = frame["params"]
+        if turn is not None and not ended and params["expectedTurnId"] == turn:
+            with (root / "steered").open("a") as log:
+                log.write(params["input"][0]["text"] + "\n")
+            emit({"id": frame["id"], "result": {"turnId": turn}})
+        else:
+            emit({"id": frame["id"], "error": {
+                "code": -32600, "message": "expected turn mismatch"}})
     elif method == "turn/interrupt":
         emit({"id": frame["id"], "result": {}})
         if not ended:

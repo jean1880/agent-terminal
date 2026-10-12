@@ -630,6 +630,11 @@ impl Adapter for AgyAdapter {
                 };
                 Ok(vec![action])
             }
+            // agy runs a message written mid-turn as the next turn (probe, 2026-10-11): the host
+            // keeps its own queue for it (`Capabilities::live_input` is false).
+            Command::Steer { .. } => Err(AdapterError::Unsupported(
+                "agy cannot take a message while a turn runs",
+            )),
         }
     }
 
@@ -1367,6 +1372,18 @@ mod tests {
             assert!(argv.windows(2).any(|w| w == ["--mode", flag]), "{mode:?}");
             assert!(!argv.contains(&"--dangerously-skip-permissions".to_owned()));
         }
+    }
+
+    #[test]
+    fn a_steer_is_refused_so_the_host_keeps_its_queue() {
+        let mut a = AgyAdapter::new("/usr/bin/agy");
+        assert!(matches!(
+            a.encode(Command::Steer {
+                text: "also".into()
+            }),
+            Err(AdapterError::Unsupported(_))
+        ));
+        assert!(!a.capabilities().live_input);
     }
 
     #[test]

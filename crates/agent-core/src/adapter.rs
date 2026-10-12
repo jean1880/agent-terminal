@@ -168,6 +168,12 @@ pub enum Command {
     Prompt {
         text: String,
     },
+    /// A user message for the turn that is running ([`crate::caps::Capabilities::live_input`]):
+    /// Claude folds it into the turn (verified 2026-10-11), Codex takes it through
+    /// `turn/steer`. An adapter that cannot refuses it; the host then queues it as before.
+    Steer {
+        text: String,
+    },
     Interrupt,
     /// Answer an approval the adapter raised itself (Claude `can_use_tool`).
     Approve {

@@ -1208,10 +1208,16 @@ impl ComposerHost for Inner {
         }
         // What you just sent, and the reply to it, are where the view goes.
         self.transcript.scroll_to_end();
-        // A new prompt starts a new round of work: the last one's finished workers leave the dock.
-        self.subagent_shelf.clear_finished();
-        self.refresh_subagents(&[]);
-        if status.running_turn {
+        // A prompt that starts a new round of work: the last one's finished workers leave the
+        // dock. One sent mid-turn joins the running turn, whose finished workers stay.
+        if !status.running_turn {
+            self.subagent_shelf.clear_finished();
+            self.refresh_subagents(&[]);
+        }
+        if status.running_turn && status.capabilities.live_input {
+            // Straight to the agent, which takes it into the running turn.
+            self.backend.steer_prompt(text);
+        } else if status.running_turn {
             self.backend.queue_prompt(text);
         } else {
             self.backend.send_prompt(text);
