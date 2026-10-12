@@ -499,6 +499,11 @@ fn load_css() {
             color: @at_fg_soft;
             margin-left: 6px;
         }
+        .update-dot {
+            color: @at_warning;
+            font-size: 9px;
+            margin: 3px 3px 0 0;
+        }
         .dim-label {
             opacity: 1.0;
             color: @at_fg_dim;

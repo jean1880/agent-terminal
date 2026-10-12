@@ -22,7 +22,7 @@ mod form_card;
 mod form_draft;
 mod header;
 mod interruption;
-mod markdown;
+pub(crate) mod markdown;
 pub mod model;
 mod panels;
 mod payload;
