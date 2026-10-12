@@ -157,6 +157,47 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
         </child>
         <child>
           <object class="GtkShortcutsGroup">
+            <property name="title">Approvals &amp; Agents</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;Return</property>
+                <property name="title">Allow the Pending Approval</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Return</property>
+                <property name="title">Allow for This Session</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Alt&gt;Return</property>
+                <property name="title">Always Allow</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;BackSpace</property>
+                <property name="title">Deny the Pending Approval</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;period</property>
+                <property name="title">Stop the Turn (from an Approval)</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;A</property>
+                <property name="title">Expand or Collapse All Sub-agents</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
             <property name="title">Navigation &amp; Tabs</property>
             <child>
               <object class="GtkShortcutsShortcut">
