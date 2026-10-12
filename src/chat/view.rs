@@ -22,7 +22,7 @@ mod form_card;
 mod form_draft;
 mod header;
 mod interruption;
-mod markdown;
+pub(crate) mod markdown;
 pub mod model;
 mod panels;
 mod payload;
@@ -217,11 +217,19 @@ impl ChatView {
                 }
             });
             let w = weak.clone();
-            let subagent_shelf = subagent_shelf::SubagentShelf::new(move |id| {
-                if let Some(inner) = w.upgrade() {
-                    inner.open_subagent(id);
-                }
-            });
+            let w_cleared = weak.clone();
+            let subagent_shelf = subagent_shelf::SubagentShelf::new(
+                move |id| {
+                    if let Some(inner) = w.upgrade() {
+                        inner.open_subagent(id);
+                    }
+                },
+                move || {
+                    if let Some(inner) = w_cleared.upgrade() {
+                        inner.refresh_subagents(&[]);
+                    }
+                },
+            );
             let w = weak.clone();
             let interruption = interruption::InterruptionShelf::new(sink.clone(), move |id| {
                 if let Some(inner) = w.upgrade() {
@@ -288,6 +296,7 @@ impl ChatView {
         let host: Rc<dyn ComposerHost> = inner.clone();
         inner.composer.set_host(Rc::downgrade(&host));
         inner.connect_header();
+        inner.install_shortcuts(view.upcast_ref());
         inner.refresh_status();
         inner.transcript.reset(&inner.model.borrow());
 
@@ -684,6 +693,86 @@ impl Inner {
             let summary = agents.iter().find(|a| a.id == panel.id());
             panel.refresh(&model, summary, changed);
         }
+    }
+
+    /// Expands every sub-agent card in the thread, or collapses them all when every one is
+    /// already open (Ctrl+Shift+A). False when the thread has none.
+    fn toggle_all_subagents(self: &Rc<Self>) -> bool {
+        let (ids, expand) = {
+            let model = self.model.borrow();
+            let ids: Vec<String> = model.subagents().into_iter().map(|a| a.id).collect();
+            let expand = ids
+                .iter()
+                .any(|id| model.get(id).is_some_and(|item| !item.expanded));
+            (ids, expand)
+        };
+        if ids.is_empty() {
+            return false;
+        }
+        for id in ids {
+            self.row_event(RowEvent::Toggle {
+                id,
+                expanded: expand,
+            });
+        }
+        true
+    }
+
+    /// The thread's keys for its pending approval and its sub-agent cards: active while focus is
+    /// in this thread, in the capture phase so they reach it before the composer, and each lets
+    /// its key through when there is nothing for it to do (Ctrl+Backspace still deletes a word,
+    /// Ctrl+Enter is untouched, when no approval is waiting).
+    fn install_shortcuts(self: &Rc<Self>, view: &gtk4::Widget) {
+        let controller = gtk4::ShortcutController::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.set_scope(gtk4::ShortcutScope::Local);
+        use agent_core::event::Decision;
+        let approvals = [
+            ("<Control>Return|<Control>KP_Enter", Decision::Allow),
+            (
+                "<Control><Shift>Return|<Control><Shift>KP_Enter",
+                Decision::AllowForSession,
+            ),
+            (
+                "<Control><Alt>Return|<Control><Alt>KP_Enter",
+                Decision::AllowAlways,
+            ),
+            ("<Control>BackSpace", Decision::Deny),
+            ("<Control>period", Decision::Cancel),
+        ];
+        for (keys, decision) in approvals {
+            let weak = Rc::downgrade(self);
+            let action = gtk4::CallbackAction::new(move |_, _| {
+                let answered = weak
+                    .upgrade()
+                    .is_some_and(|inner| inner.interruption.answer(decision));
+                if answered {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            controller.add_shortcut(gtk4::Shortcut::new(
+                gtk4::ShortcutTrigger::parse_string(keys),
+                Some(action),
+            ));
+        }
+        let weak = Rc::downgrade(self);
+        let toggle = gtk4::CallbackAction::new(move |_, _| {
+            if weak
+                .upgrade()
+                .is_some_and(|inner| inner.toggle_all_subagents())
+            {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        controller.add_shortcut(gtk4::Shortcut::new(
+            gtk4::ShortcutTrigger::parse_string("<Control><Shift>a"),
+            Some(toggle),
+        ));
+        view.add_controller(controller);
     }
 
     /// Shows one sub-agent on its own, in a dialog that follows it until closed.
@@ -1119,7 +1208,16 @@ impl ComposerHost for Inner {
         }
         // What you just sent, and the reply to it, are where the view goes.
         self.transcript.scroll_to_end();
-        if status.running_turn {
+        // A prompt that starts a new round of work: the last one's finished workers leave the
+        // dock. One sent mid-turn joins the running turn, whose finished workers stay.
+        if !status.running_turn {
+            self.subagent_shelf.clear_finished();
+            self.refresh_subagents(&[]);
+        }
+        if status.running_turn && status.capabilities.live_input {
+            // Straight to the agent, which takes it into the running turn.
+            self.backend.steer_prompt(text);
+        } else if status.running_turn {
             self.backend.queue_prompt(text);
         } else {
             self.backend.send_prompt(text);
@@ -2052,7 +2150,49 @@ pub(crate) mod tests {
     }
 
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
+    /// Ctrl+Shift+A: every sub-agent card opens when any is closed, then all close; a thread
+    /// with none lets the key through.
+    fn all_subagent_cards_toggle_together() {
+        use agent_core::event::{Event, ItemKind};
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        let inner = view.inner().expect("view");
+        assert!(
+            !inner.toggle_all_subagents(),
+            "no sub-agents: the key goes through"
+        );
+        let agent = |id: &str| {
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Subagent,
+                title: "Agent".into(),
+                input: Some(serde_json::json!({"subagent_type": "Explore"})),
+                parent: None,
+            })
+            .item(id)
+        };
+        view.replay(&[agent("a1"), agent("a2")]);
+        let expanded = |inner: &Inner| {
+            let model = inner.model.borrow();
+            ["a1", "a2"].map(|id| model.get(id).is_some_and(|i| i.expanded))
+        };
+        // Sub-agent cards start open: the first press closes them all, the next opens them all.
+        assert_eq!(expanded(&inner), [true, true]);
+        assert!(inner.toggle_all_subagents());
+        assert_eq!(expanded(&inner), [false, false], "all closed");
+        assert!(inner.toggle_all_subagents());
+        assert_eq!(expanded(&inner), [true, true], "all open again");
+        // Mixed: one closed by hand, so the key opens the rest rather than closing the open one.
+        inner.row_event(RowEvent::Toggle {
+            id: "a1".into(),
+            expanded: false,
+        });
+        assert!(inner.toggle_all_subagents());
+        assert_eq!(expanded(&inner), [true, true], "any closed: open all");
+    }
+
     pub(crate) fn ui_checks() {
+        all_subagent_cards_toggle_together();
         model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
         interruption::tests::answering_from_the_shelf_reenters_safely();

@@ -753,6 +753,77 @@ fn scripted_an_accepted_answer_moves_the_question_card_to_answered() {
     });
 }
 
+/// A message written while a Codex turn runs goes into that turn (`turn/steer`, pinned to it)
+/// and shows as an ordinary message, not a queued one; no second turn starts. A slash command
+/// mid-turn still waits in the queue.
+#[test]
+fn scripted_a_message_mid_turn_steers_the_running_codex_turn() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "approval");
+        let request = fixture.wait_pending(ctx);
+        let user_rows = |fixture: &Fixture| -> Vec<(String, bool)> {
+            let model = fixture.model.borrow();
+            model
+                .order()
+                .iter()
+                .filter_map(|id| match model.get(id).map(|i| &i.body) {
+                    Some(Body::User { text, queued }) => Some((text.clone(), *queued)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        session.steer_prompt("also check the tests");
+        fixture.wait(ctx, "the steer reaches the running turn", || {
+            fixture.dir.path().join("steered").exists()
+        });
+        let steers: Vec<Value> = fixture
+            .incoming()
+            .into_iter()
+            .filter(|f| f["method"] == "turn/steer")
+            .collect();
+        assert_eq!(steers.len(), 1, "{steers:?}");
+        assert_eq!(
+            steers[0]["params"]["input"][0]["text"],
+            "also check the tests"
+        );
+        let starts = fixture
+            .incoming()
+            .iter()
+            .filter(|f| f["method"] == "turn/start")
+            .count();
+        assert_eq!(starts, 1, "no second turn");
+        assert_eq!(
+            user_rows(&fixture).last(),
+            Some(&("also check the tests".to_owned(), false)),
+            "shown as sent, not queued"
+        );
+
+        // A slash command mid-turn keeps waiting for the turn to end.
+        session.steer_prompt("/review");
+        assert_eq!(
+            user_rows(&fixture).last(),
+            Some(&("/review".to_owned(), true)),
+            "queued"
+        );
+        assert_eq!(
+            fixture
+                .incoming()
+                .iter()
+                .filter(|f| f["method"] == "turn/steer")
+                .count(),
+            1,
+            "a slash command is never steered"
+        );
+
+        session.respond_approval(&request, Decision::Allow);
+        fixture.wait_finished(ctx);
+        session.shutdown(false);
+    });
+}
+
 /// Plan 2.5 (review): a turn that produced an item but never completed (the process died
 /// mid-command) still confirms the new Codex thread, so the next reopen resumes it.
 #[test]

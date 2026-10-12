@@ -1,10 +1,16 @@
-//! The sticky "sub-agents at work" card above the composer. While any sub-agent runs it shows a
-//! one-line summary ("2 sub-agents running"), collapsed by default; opened, one row per running
-//! sub-agent with what it is running right now (`$ cargo test`, `Read src/config.rs`). A row
-//! opens that sub-agent on its own (the explorer's dialog). It slides away once none runs; the
-//! header's sub-agent button still lists the finished ones.
+//! The sticky "sub-agents at work" card above the composer, so what the workers do never gets lost
+//! in the history. It shows a one-line summary ("2 workers active · 1 finished"), collapsed by
+//! default; opened, one row per docked sub-agent with what it is running now (`Run cargo test`,
+//! `Read src/config.rs`) or how it ended. A row opens that sub-agent on its own (the explorer's
+//! dialog).
+//!
+//! A sub-agent docks when it is seen running and stays docked after it finishes, until the next
+//! prompt is sent or "Clear finished" is pressed; then the card slides away once none runs.
+//! Sub-agents that finished before the thread was opened (replayed history) never dock: the
+//! header's sub-agent button lists those.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
@@ -13,11 +19,20 @@ use super::cards::label;
 use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
 use super::payload;
 
-/// The card's one-line summary.
-pub fn title_text(running: usize) -> String {
-    match running {
+/// The card's one-line summary: the running ones, then the finished ones still docked.
+pub fn title_text(running: usize, finished: usize) -> String {
+    let active = match running {
         1 => "1 worker active".to_owned(),
         n => format!("{n} workers active"),
+    };
+    let done = match finished {
+        1 => "1 worker finished".to_owned(),
+        n => format!("{n} workers finished"),
+    };
+    match (running, finished) {
+        (_, 0) => active,
+        (0, _) => done,
+        (_, n) => format!("{active} · {n} finished"),
     }
 }
 
@@ -51,9 +66,13 @@ pub fn current_step(model: &Transcript, id: &str) -> Option<String> {
     )
 }
 
-/// One running sub-agent's labels, set in place.
+/// One docked sub-agent's labels, set in place.
 struct Row {
     row: gtk4::ListBoxRow,
+    /// Spins while it runs; hidden once it has finished.
+    spinner: gtk4::Spinner,
+    /// How it ended (`completed`, `failed`…); empty while it runs.
+    state: gtk4::Label,
     name: gtk4::Label,
     task: gtk4::Label,
     now: gtk4::Label,
@@ -67,6 +86,9 @@ impl Row {
         let spinner = gtk4::Spinner::builder().spinning(true).build();
         spinner.add_css_class("thread-background");
         top.append(&spinner);
+        let state = label("", &["subagent-state", "dim-label"]);
+        state.set_visible(false);
+        top.append(&state);
         let name = label("", &["subagent-name"]);
         name.set_xalign(0.0);
         name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -89,6 +111,8 @@ impl Row {
             row.clone(),
             Self {
                 row,
+                spinner,
+                state,
                 name,
                 task,
                 now,
@@ -97,6 +121,15 @@ impl Row {
     }
 
     fn set(&self, agent: &SubagentSummary, now: Option<&str>) {
+        let running = agent.active();
+        // The widget's own `visible`, not `is_visible()`: that is false for every row while the
+        // card is collapsed, and a finished row would keep spinning once opened.
+        if self.spinner.property::<bool>("visible") != running {
+            self.spinner.set_visible(running);
+            self.spinner.set_spinning(running);
+        }
+        self.state.set_visible(!running);
+        set_if_changed(&self.state, if running { "" } else { agent.state_label() });
         let activity = agent.activity.as_deref().or(now);
         let now = activity
             .map(|s| format!("Last reported activity: {s}"))
@@ -149,13 +182,19 @@ pub struct SubagentShelf {
     #[cfg_attr(not(test), allow(dead_code))]
     fold: super::cards::Collapsible,
     list: gtk4::ListBox,
-    /// The running sub-agents behind the rows, in order, and their labels.
+    /// The docked sub-agents behind the rows, in order, and their labels.
     rows: RefCell<Vec<(String, Row)>>,
+    /// Every sub-agent seen running since the last prompt or "Clear finished": what stays docked
+    /// after it finishes.
+    docked: RefCell<HashSet<String>>,
+    /// "Clear finished": shown while a finished sub-agent is docked.
+    clear: gtk4::Button,
 }
 
 impl SubagentShelf {
-    /// `open` is called with a sub-agent's item id when its row is chosen.
-    pub fn new(open: impl Fn(&str) + 'static) -> Rc<Self> {
+    /// `open` is called with a sub-agent's item id when its row is chosen; `cleared` after
+    /// "Clear finished" emptied the dock, to redraw it.
+    pub fn new(open: impl Fn(&str) + 'static, cleared: impl Fn() + 'static) -> Rc<Self> {
         let title = label("", &["plan-title"]);
         let list = gtk4::ListBox::new();
         list.add_css_class("subagent-list");
@@ -168,11 +207,21 @@ impl SubagentShelf {
             .max_content_height(220)
             .child(&list)
             .build();
+        let clear = gtk4::Button::builder()
+            .label("Clear finished")
+            .halign(gtk4::Align::End)
+            .css_classes(["flat"])
+            .tooltip_text("Take the finished workers off the dock")
+            .visible(false)
+            .build();
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        body.append(&scroller);
+        body.append(&clear);
         // Collapsed by default: one line until it is asked for.
         let fold = super::cards::collapsible(
             crate::icons::SUBAGENT_ICON,
             &title,
-            &scroller,
+            &body,
             false,
             "what the sub-agents are doing",
         );
@@ -189,6 +238,15 @@ impl SubagentShelf {
             fold,
             list,
             rows: RefCell::new(Vec::new()),
+            docked: RefCell::new(HashSet::new()),
+            clear,
+        });
+        let weak = Rc::downgrade(&this);
+        this.clear.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.clear_finished();
+                cleared();
+            }
         });
         let weak = Rc::downgrade(&this);
         this.list.connect_row_activated(move |_, row| {
@@ -203,34 +261,48 @@ impl SubagentShelf {
         this
     }
 
-    /// Follows the thread's sub-agents: shown while any runs, one row per running one with its
-    /// current step. Rows are rebuilt only when the set of running sub-agents changes.
+    /// Follows the thread's sub-agents: a row per docked one (every one seen running since the
+    /// last prompt or "Clear finished"), with its current step or how it ended; shown while any
+    /// is docked. Rows are rebuilt only when the set of docked sub-agents changes.
     pub fn set(&self, model: &Transcript, agents: &[SubagentSummary]) {
-        let running: Vec<&SubagentSummary> = agents.iter().filter(|a| a.active()).collect();
-        self.revealer.set_reveal_child(!running.is_empty());
-        if running.is_empty() {
+        let shown: Vec<&SubagentSummary> = {
+            let mut docked = self.docked.borrow_mut();
+            docked.extend(agents.iter().filter(|a| a.active()).map(|a| a.id.clone()));
+            agents.iter().filter(|a| docked.contains(&a.id)).collect()
+        };
+        self.revealer.set_reveal_child(!shown.is_empty());
+        if shown.is_empty() {
             return;
         }
-        set_if_changed(&self.title, &title_text(running.len()));
+        let running = shown.iter().filter(|a| a.active()).count();
+        let finished = shown.len() - running;
+        set_if_changed(&self.title, &title_text(running, finished));
+        self.clear.set_visible(finished > 0);
         let same = {
             let rows = self.rows.borrow();
-            rows.len() == running.len() && rows.iter().zip(&running).all(|((id, _), a)| *id == a.id)
+            rows.len() == shown.len() && rows.iter().zip(&shown).all(|((id, _), a)| *id == a.id)
         };
         if !same {
             while let Some(child) = self.list.first_child() {
                 self.list.remove(&child);
             }
-            let mut rows = Vec::with_capacity(running.len());
-            for agent in &running {
+            let mut rows = Vec::with_capacity(shown.len());
+            for agent in &shown {
                 let (row, labels) = Row::new();
                 self.list.append(&row);
                 rows.push((agent.id.clone(), labels));
             }
             *self.rows.borrow_mut() = rows;
         }
-        for ((id, labels), agent) in self.rows.borrow().iter().zip(&running) {
+        for ((id, labels), agent) in self.rows.borrow().iter().zip(&shown) {
             labels.set(agent, current_step(model, id).as_deref());
         }
+    }
+
+    /// Takes the finished sub-agents off the dock (a new prompt, or "Clear finished"). Running
+    /// ones dock again at the next [`Self::set`]; the caller redraws.
+    pub fn clear_finished(&self) {
+        self.docked.borrow_mut().clear();
     }
 
     /// Opens the worker activity disclosure, including deterministic demo scenes.
@@ -263,8 +335,11 @@ pub(crate) mod tests {
 
     #[test]
     fn titles_count_the_running_ones() {
-        assert_eq!(title_text(1), "1 worker active");
-        assert_eq!(title_text(3), "3 workers active");
+        assert_eq!(title_text(1, 0), "1 worker active");
+        assert_eq!(title_text(3, 0), "3 workers active");
+        assert_eq!(title_text(0, 1), "1 worker finished");
+        assert_eq!(title_text(0, 2), "2 workers finished");
+        assert_eq!(title_text(1, 2), "1 worker active · 2 finished");
     }
 
     fn start(
@@ -384,17 +459,24 @@ pub(crate) mod tests {
             subagent("s1", "Explore"),
             command("c1", "s1", "rg write_atomic"),
         ]);
-        let shelf = SubagentShelf::new({
-            let (opened, shelf_slot) = (opened.clone(), shelf_slot.clone());
-            let t = transcript(&[subagent("s1", "Explore")]);
-            move |id| {
-                opened.borrow_mut().push(id.to_owned());
-                // Opening runs the view's refresh, which updates the shelf from in here.
-                if let Some(shelf) = shelf_slot.borrow().as_ref() {
-                    shelf.set(&t, &t.subagents());
+        let cleared = Rc::new(std::cell::Cell::new(0));
+        let shelf = SubagentShelf::new(
+            {
+                let (opened, shelf_slot) = (opened.clone(), shelf_slot.clone());
+                let t = transcript(&[subagent("s1", "Explore")]);
+                move |id| {
+                    opened.borrow_mut().push(id.to_owned());
+                    // Opening runs the view's refresh, which updates the shelf from in here.
+                    if let Some(shelf) = shelf_slot.borrow().as_ref() {
+                        shelf.set(&t, &t.subagents());
+                    }
                 }
-            }
-        });
+            },
+            {
+                let cleared = cleared.clone();
+                move || cleared.set(cleared.get() + 1)
+            },
+        );
         *shelf_slot.borrow_mut() = Some(shelf.clone());
         // In a window, as in the app: activating a row moves focus, which needs a root.
         let window = gtk4::Window::new();
@@ -443,8 +525,44 @@ pub(crate) mod tests {
                 a
             })
             .collect();
+        // Finished, they stay docked (not lost in the history), with how they ended, and the
+        // card offers to clear them.
         shelf.set(&two, &finished);
-        assert!(!shelf.state().0, "hidden once no sub-agent runs");
+        assert!(shelf.state().0, "still docked once they finish");
+        assert_eq!(shelf.title.text(), "2 workers finished");
+        // The `visible` property itself: `is_visible()` also needs every parent shown, and the
+        // card is collapsed here.
+        assert!(shelf.clear.property::<bool>("visible"));
+        let ended: Vec<String> = shelf
+            .rows
+            .borrow()
+            .iter()
+            .map(|(_, r)| r.state.text().to_string())
+            .collect();
+        assert_eq!(ended, ["completed", "completed"]);
+        assert!(shelf
+            .rows
+            .borrow()
+            .iter()
+            .all(|(_, r)| !r.spinner.property::<bool>("visible")
+                && r.state.property::<bool>("visible")));
+
+        // "Clear finished" takes them off and asks the view to redraw; then the card goes.
+        shelf.clear.emit_clicked();
+        assert_eq!(cleared.get(), 1);
+        shelf.set(&two, &finished);
+        assert!(!shelf.state().0, "gone once cleared and none runs");
+
+        // A sub-agent that finished before the thread was shown (replayed history) never docks.
+        let fresh = SubagentShelf::new(|_| {}, || {});
+        fresh.set(&two, &finished);
+        assert!(!fresh.state().0, "replayed finished workers are not docked");
+
+        // Clearing keeps a running one: it docks again at the next update.
+        shelf.set(&two, &two.subagents());
+        shelf.clear_finished();
+        shelf.set(&two, &two.subagents());
+        assert_eq!(shelf.title.text(), "2 workers active");
         shelf_slot.borrow_mut().take();
         window.destroy();
     }

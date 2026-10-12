@@ -157,6 +157,47 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
         </child>
         <child>
           <object class="GtkShortcutsGroup">
+            <property name="title">Approvals &amp; Agents</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;Return</property>
+                <property name="title">Allow the Pending Approval</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Return</property>
+                <property name="title">Allow for This Session</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Alt&gt;Return</property>
+                <property name="title">Always Allow</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;BackSpace</property>
+                <property name="title">Deny the Pending Approval</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;period</property>
+                <property name="title">Stop the Turn (from an Approval)</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;A</property>
+                <property name="title">Expand or Collapse All Sub-agents</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
             <property name="title">Navigation &amp; Tabs</property>
             <child>
               <object class="GtkShortcutsShortcut">
@@ -218,6 +259,41 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </object>
 </interface>
 "#;
+
+/// The startup update check, once per process whatever the number of windows: not started,
+/// running, or done (`Some`: a newer release than this build). GTK runs on one thread.
+#[derive(Clone, Default)]
+enum StartupUpdate {
+    #[default]
+    NotStarted,
+    Running,
+    Done(Option<agent_kit::update::Release>),
+}
+
+thread_local! {
+    static STARTUP_UPDATE: RefCell<StartupUpdate> =
+        const { RefCell::new(StartupUpdate::NotStarted) };
+}
+
+/// The newer release the startup check found, if any.
+fn known_update() -> Option<agent_kit::update::Release> {
+    STARTUP_UPDATE.with(|s| match &*s.borrow() {
+        StartupUpdate::Done(release) => release.clone(),
+        _ => None,
+    })
+}
+
+/// The window menu's update entry: what the startup check found, else the plain check.
+fn update_menu_label() -> String {
+    match known_update() {
+        Some(release) => format!("Download Update {}…", release.tag.trim_start_matches('v')),
+        None => "Check for Updates…".to_owned(),
+    }
+}
+
+/// How long after the shell is shown the startup check waits, so it never competes with
+/// opening the window and its threads.
+const STARTUP_UPDATE_DELAY_SECS: u32 = 5;
 
 /// Per-tab state, tracked explicitly so terminal/directory lookups never depend
 /// on walking the tab's widget hierarchy. `dir` is the directory the tab was
@@ -982,6 +1058,11 @@ pub struct AgentTerminalWindow {
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
     /// The header's "New Thread With" submenu, refilled when agent detection finishes.
     new_with_menu: RefCell<Option<gtk4::gio::Menu>>,
+    /// The yellow dot on the window menu button, shown while a newer release is known.
+    update_dot: RefCell<Option<gtk4::Widget>>,
+    /// The window menu's last section: "Check for Updates…", or "Download Update X…" once a
+    /// newer release is known.
+    update_menu: RefCell<Option<gtk4::gio::Menu>>,
     /// The stored threads as of the last load (archived included): the sidebar draws from this
     /// and never reads the store itself. Reloaded off the main thread when the store changes.
     summaries: RefCell<Option<Vec<agent_kit::store::ThreadSummary>>>,
@@ -1760,6 +1841,24 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&shortcuts_action);
 
+        let updates_action = gtk4::gio::SimpleAction::new("check-updates", None);
+        updates_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |action, _| {
+                debug!("Action: Check for Updates");
+                // Already found at startup: show it, no second request.
+                if let Some(release) = known_update() {
+                    obj.imp().show_update_result(Ok(release));
+                    return;
+                }
+                // One check at a time: enabled again when its answer is shown.
+                action.set_enabled(false);
+                obj.imp().check_for_updates(action.clone());
+            }
+        ));
+        obj.add_action(&updates_action);
+
         // Both targeted by profile name, like the new-tab-as actions.
         for name in ["resume-session-profile", "continue-in"] {
             let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
@@ -2188,6 +2287,7 @@ impl AgentTerminalWindow {
             action.set_enabled(true);
         }
         self.show_boot_page("ready");
+        self.check_updates_on_startup();
     }
 
     /// Switches the window's actions (every shortcut and menu entry) off while the shell is
@@ -2227,7 +2327,20 @@ impl AgentTerminalWindow {
         let mut panel_buttons = Vec::new();
         if let Some(header) = self.header.borrow().as_ref() {
             let menu_btn = animated_menu::build_animated_menu_button(&self.build_new_menu());
-            header.pack_start(&menu_btn);
+            // A yellow dot over the button while a newer release is known (see
+            // `show_known_update`); clicks go through to the button.
+            let dot = gtk4::Label::builder()
+                .label("●")
+                .halign(Align::End)
+                .valign(Align::Start)
+                .can_target(false)
+                .visible(false)
+                .css_classes(["update-dot"])
+                .build();
+            let menu_overlay = gtk4::Overlay::builder().child(&menu_btn).build();
+            menu_overlay.add_overlay(&dot);
+            *self.update_dot.borrow_mut() = Some(dot.upcast());
+            header.pack_start(&menu_overlay);
 
             let new_btn = Button::builder()
                 .icon_name("at-list-add-symbolic")
@@ -2501,7 +2614,195 @@ impl AgentTerminalWindow {
         let recovery = gtk4::gio::Menu::new();
         recovery.append(Some("Restart Agent"), Some("win.restart-tab"));
         menu.append_section(None, &recovery);
+        let app = gtk4::gio::Menu::new();
+        app.append(Some(&update_menu_label()), Some("win.check-updates"));
+        *self.update_menu.borrow_mut() = Some(app.clone());
+        menu.append_section(None, &app);
         menu
+    }
+
+    /// Shows what the startup check found, if it found a newer release: the yellow dot on the
+    /// menu button and "Download Update X…" in place of "Check for Updates…".
+    fn show_known_update(&self) {
+        let found = known_update().is_some();
+        if let Some(dot) = self.update_dot.borrow().as_ref() {
+            dot.set_visible(found);
+            dot.set_tooltip_text(found.then_some("An update is available"));
+        }
+        if let Some(menu) = self.update_menu.borrow().as_ref() {
+            if menu.n_items() > 0 {
+                menu.remove(0);
+            }
+            menu.append(Some(&update_menu_label()), Some("win.check-updates"));
+        }
+    }
+
+    /// The startup update check (Settings → Check for Updates at Startup): once per process, a
+    /// few seconds after the first window's shell shows, off the main thread. A newer release
+    /// marks every window's menu; "up to date" and failures are only logged (nobody asked).
+    fn check_updates_on_startup(&self) {
+        let start = self.config.borrow().check_updates_on_startup
+            && STARTUP_UPDATE.with(|s| {
+                let mut state = s.borrow_mut();
+                let fresh = matches!(*state, StartupUpdate::NotStarted);
+                if fresh {
+                    *state = StartupUpdate::Running;
+                }
+                fresh
+            });
+        // A window opened after the check finished shows what it found.
+        self.show_known_update();
+        // Tests build real windows: they never reach the network.
+        if !start || cfg!(test) {
+            return;
+        }
+        let Some(slug) = agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY")) else {
+            STARTUP_UPDATE.with(|s| *s.borrow_mut() = StartupUpdate::Done(None));
+            return;
+        };
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            glib::timeout_future_seconds(STARTUP_UPDATE_DELAY_SECS).await;
+            let result = gtk4::gio::spawn_blocking(move || {
+                agent_kit::update::fetch_latest(
+                    &slug,
+                    concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err("the update check stopped unexpectedly".to_owned()));
+            let newer = match result {
+                Ok(release)
+                    if agent_kit::update::is_newer(env!("CARGO_PKG_VERSION"), &release.tag) =>
+                {
+                    info!(tag = %release.tag, "startup update check: a newer release is out");
+                    Some(release)
+                }
+                Ok(_) => {
+                    info!("startup update check: up to date");
+                    None
+                }
+                Err(e) => {
+                    info!("startup update check failed: {e}");
+                    None
+                }
+            };
+            STARTUP_UPDATE.with(|s| *s.borrow_mut() = StartupUpdate::Done(newer));
+            if let Some(obj) = obj.upgrade() {
+                obj.imp()
+                    .for_each_window(|window| window.show_known_update());
+            }
+        });
+    }
+
+    /// "Check for Updates…": asks GitHub for the newest release (off the main thread; the one
+    /// network request the app makes, and only when asked), then says what it found. `action`
+    /// is enabled again once the answer is shown.
+    fn check_for_updates(&self, action: gtk4::gio::SimpleAction) {
+        let obj = self.obj().downgrade();
+        let slug = agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY"));
+        glib::MainContext::default().spawn_local(async move {
+            let result = match slug {
+                Some(slug) => gtk4::gio::spawn_blocking(move || {
+                    agent_kit::update::fetch_latest(
+                        &slug,
+                        concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| Err("The update check stopped unexpectedly.".to_owned())),
+                None => Err("This build names no GitHub repository to check.".to_owned()),
+            };
+            action.set_enabled(true);
+            // A newer release found by hand marks the menus too, as one found at startup does.
+            if let Ok(release) = &result {
+                if agent_kit::update::is_newer(env!("CARGO_PKG_VERSION"), &release.tag) {
+                    STARTUP_UPDATE
+                        .with(|s| *s.borrow_mut() = StartupUpdate::Done(Some(release.clone())));
+                }
+            }
+            if let Some(obj) = obj.upgrade() {
+                obj.imp()
+                    .for_each_window(|window| window.show_known_update());
+                obj.imp().show_update_result(result);
+            }
+        });
+    }
+
+    /// The update check's answer: a newer release with its notes and a Download button that
+    /// opens the release page, "up to date", or what went wrong.
+    fn show_update_result(&self, result: Result<agent_kit::update::Release, String>) {
+        let current = env!("CARGO_PKG_VERSION");
+        let dialog = match result {
+            Ok(release) if agent_kit::update::is_newer(current, &release.tag) => {
+                let version = release.tag.trim_start_matches('v');
+                let dialog = adw::AlertDialog::builder()
+                    .heading(format!("Agent Terminal {version} is available"))
+                    .body(format!(
+                        "You have {current}. Installed from a package repository (apt, dnf, \
+                         pacman)? Update it there instead."
+                    ))
+                    .build();
+                if !release.notes.trim().is_empty() {
+                    let notes = Label::builder()
+                        .use_markup(true)
+                        .label(crate::chat::view::markdown::passage_markup(&release.notes))
+                        .wrap(true)
+                        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+                        .xalign(0.0)
+                        .selectable(true)
+                        .build();
+                    let scroll = gtk4::ScrolledWindow::builder()
+                        .hscrollbar_policy(gtk4::PolicyType::Never)
+                        .min_content_height(160)
+                        .max_content_height(360)
+                        .propagate_natural_height(true)
+                        .child(&notes)
+                        .build();
+                    dialog.set_extra_child(Some(&scroll));
+                }
+                dialog.add_responses(&[("close", "Not Now"), ("download", "Download")]);
+                dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("download"));
+                let url = release.url;
+                let window = self.obj().downgrade();
+                dialog.connect_response(None, move |_, response| {
+                    if response != "download" {
+                        return;
+                    }
+                    let parent = window.upgrade();
+                    gtk4::UriLauncher::new(&url).launch(
+                        parent.as_ref(),
+                        None::<&gtk4::gio::Cancellable>,
+                        |result| {
+                            if let Err(e) = result {
+                                warn!("Could not open the release page: {e}");
+                            }
+                        },
+                    );
+                });
+                dialog
+            }
+            Ok(_) => {
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Agent Terminal is up to date")
+                    .body(format!("{current} is the newest release."))
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog
+            }
+            Err(error) => {
+                warn!("Update check failed: {error}");
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Could not check for updates")
+                    .body(error)
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog
+            }
+        };
+        dialog.set_close_response("close");
+        dialog.present(Some(&*self.obj()));
     }
 
     /// Opens a new tab rooted in the current tab's directory (fast path).
@@ -3763,6 +4064,15 @@ impl AgentTerminalWindow {
             .active(config.notify_on_quota)
             .build();
 
+        let update_check_row = adw::SwitchRow::builder()
+            .title("Check for Updates at Startup")
+            .subtitle(
+                "Ask GitHub in the background whether a newer release is out; one found puts a \
+                 yellow dot on the menu. Off, the app only checks when you pick Check for Updates",
+            )
+            .active(config.check_updates_on_startup)
+            .build();
+
         let restore_row = adw::SwitchRow::builder()
             .title("Reopen Terminal Tabs")
             .subtitle(
@@ -3809,6 +4119,7 @@ impl AgentTerminalWindow {
         startup.add(&reopen_thread_row);
         startup.add(&restore_row);
         startup.add(&skip_animation_row);
+        startup.add(&update_check_row);
         startup.add(&setup_row);
         general.add(&startup);
         let notifications = adw::PreferencesGroup::builder()
@@ -3919,6 +4230,17 @@ impl AgentTerminalWindow {
                     });
                     imp.withdraw_bell_if_answered();
                 }
+                imp.schedule_config_save();
+            }
+        ));
+
+        update_check_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                // Applies from the next start: this run's check has already happened or not.
+                imp.config.borrow_mut().check_updates_on_startup = row.is_active();
                 imp.schedule_config_save();
             }
         ));
@@ -6316,6 +6638,14 @@ mod tests {
                 .is_some_and(|a| !a.is_enabled()),
             "the window's actions wait for the shell"
         );
+        assert!(
+            window.lookup_action("check-updates").is_some(),
+            "the menu's Check for Updates… has its action"
+        );
+        assert!(
+            agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY")).is_some(),
+            "this build names the repository its updates come from"
+        );
 
         // The splash plays its minimum however fast loading was, unless the user skips it.
         {
@@ -6354,19 +6684,69 @@ mod tests {
         let menu = window.imp().build_new_menu();
         assert_eq!(
             menu.n_items(),
-            3,
-            "menu has threads, sessions and recovery sections, no terminal section"
+            4,
+            "menu has threads, sessions, recovery and app sections, no terminal section"
         );
-        let recovery = menu
-            .item_link(2, gtk4::gio::MENU_LINK_SECTION)
-            .expect("recovery section");
-        assert_eq!(
-            recovery
+        let action_of = |section: i32| {
+            menu.item_link(section, gtk4::gio::MENU_LINK_SECTION)
+                .expect("section")
                 .item_attribute_value(0, "action", None)
-                .and_then(|v| v.get::<String>()),
+                .and_then(|v| v.get::<String>())
+        };
+        assert_eq!(
+            action_of(2),
             Some("win.restart-tab".into()),
-            "Restart Agent sits last, in the window menu"
+            "Restart Agent in its own recovery section"
         );
+        assert_eq!(
+            action_of(3),
+            Some("win.check-updates".into()),
+            "Check for Updates… sits last, in the window menu"
+        );
+
+        // A newer release known (as the startup check leaves it): the yellow dot shows and the
+        // entry says what to download; no release known: back to the plain check.
+        let imp = window.imp();
+        let label = |imp: &AgentTerminalWindow| {
+            imp.update_menu
+                .borrow()
+                .as_ref()
+                .and_then(|m| m.item_attribute_value(0, "label", None))
+                .and_then(|v| v.get::<String>())
+        };
+        let dot = || {
+            imp.update_dot
+                .borrow()
+                .as_ref()
+                .is_some_and(|d| d.property::<bool>("visible"))
+        };
+        assert_eq!(label(imp).as_deref(), Some("Check for Updates…"));
+        assert!(!dot());
+        STARTUP_UPDATE.with(|s| {
+            *s.borrow_mut() = StartupUpdate::Done(Some(agent_kit::update::Release {
+                tag: "v9.9.9".into(),
+                name: "Agent Terminal 9.9.9".into(),
+                notes: "Notes".into(),
+                url: "https://github.com/jean1880/agent-terminal/releases/tag/v9.9.9".into(),
+            }))
+        });
+        imp.show_known_update();
+        assert!(dot(), "the yellow dot shows");
+        assert_eq!(label(imp).as_deref(), Some("Download Update 9.9.9…"));
+        assert_eq!(
+            imp.update_menu
+                .borrow()
+                .as_ref()
+                .and_then(|m| m.item_attribute_value(0, "action", None))
+                .and_then(|v| v.get::<String>())
+                .as_deref(),
+            Some("win.check-updates"),
+            "the same entry, which now opens the found release"
+        );
+        STARTUP_UPDATE.with(|s| *s.borrow_mut() = StartupUpdate::Done(None));
+        imp.show_known_update();
+        assert!(!dot());
+        assert_eq!(label(imp).as_deref(), Some("Check for Updates…"));
         chat_shell_opens_threads_and_lists_them(&window);
         environment_review::tests::confirmation_preserves_target(&window);
     }
@@ -6785,6 +7165,49 @@ mod tests {
         assert!(shown.starts_with(text));
         assert!(shown.ends_with("3 more lines not shown"), "{shown}");
         assert_eq!(rows, 1);
+
+        // Files sit under a header per folder, collapsed; expanding one builds its own diff, and
+        // a file past where the diff was cut short says so instead of showing another's text.
+        let a = "diff --git a/src/a.rs b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let root = "diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-p\n+q\n";
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                // git's order: chunk i is stats[i]'s; src/b.rs is past the cut.
+                stats: crate::diff::parse_numstat(
+                    b"1\t1\tsrc/a.rs\x001\t1\tREADME.md\x002\t0\tsrc/b.rs\0",
+                ),
+                text: format!("{a}{root}"),
+                omitted_lines: 9,
+                too_large: false,
+                undo_to: None,
+                from: "c0ffee".into(),
+                to_checkpoint: None,
+            })),
+        );
+        assert_eq!(panel.folder_headers(), ["Repository root", "src/"]);
+        let files = panel.file_expanders();
+        assert_eq!(files.len(), 3);
+        assert!(files
+            .iter()
+            .all(|f| !f.is_expanded() && f.child().is_none()));
+        // Order under the headers: README.md, then src/a.rs, src/b.rs.
+        files[1].set_expanded(true);
+        let view = files[1]
+            .child()
+            .and_then(|c| c.downcast::<gtk4::TextView>().ok())
+            .expect("a.rs's diff view");
+        let buffer = view.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        assert_eq!(format!("{text}\n"), a, "only a.rs's own diff");
+        assert!(files[0].child().is_none(), "README.md stays unbuilt");
+        files[2].set_expanded(true);
+        let hidden = files[2]
+            .child()
+            .and_then(|c| c.downcast::<gtk4::Label>().ok())
+            .expect("a note, not a diff");
+        assert!(hidden.text().contains("cut short"), "{}", hidden.text());
 
         // Before the paned has a size, nothing is placed and no position is
         // taken for the user's choice of width.

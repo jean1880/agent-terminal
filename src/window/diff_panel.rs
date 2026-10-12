@@ -1,9 +1,15 @@
 //! The per-tab diff panel: a read-only view of what changed in the tab's
 //! repository — uncommitted, over the last turn, or since the tab opened.
 //!
+//! The changed files are listed under a header per folder, each file a
+//! collapsed row (name and `+3 −1`) that expands to its own diff, so the diffs
+//! are separate and explored one at a time. A file's diff view is built the
+//! first time it is expanded: a large change set lists instantly.
+//!
 //! This module only builds and fills widgets. The diff itself comes from
 //! [`crate::git::tab_diff`], run off the main thread by the window, and the
-//! text logic is in [`crate::diff`].
+//! text logic (classifying, splitting by file, grouping by folder) is in
+//! [`crate::diff`].
 
 use crate::diff::{DiffBase, LineKind};
 use crate::diff_tool::DiffTools;
@@ -56,6 +62,67 @@ fn apply_view_colours(colours: &DiffColours) {
     });
 }
 
+/// Gives `view`'s line tags the diff colours.
+fn colour_tags(view: &gtk4::TextView, colours: &DiffColours) {
+    let table = view.buffer().tag_table();
+    for (name, colour) in [
+        (TAG_ADDED, &colours.added),
+        (TAG_REMOVED, &colours.removed),
+        (TAG_HUNK, &colours.hunk),
+        (TAG_META, &colours.meta),
+        (TAG_FILE, &colours.file),
+    ] {
+        if let Some(tag) = table.lookup(name) {
+            tag.set_foreground_rgba(Some(colour));
+        }
+    }
+}
+
+/// A read-only view of one file's diff, each line coloured by its kind.
+fn file_view(text: &str, colours: &DiffColours) -> gtk4::TextView {
+    let view = gtk4::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk4::WrapMode::None)
+        .left_margin(6)
+        .right_margin(6)
+        .top_margin(4)
+        .bottom_margin(4)
+        .build();
+    // Added, not set through the builder: `css_classes` replaces the list,
+    // and with it the `monospace` class that `.monospace(true)` put there.
+    view.add_css_class(VIEW_CLASS);
+    let buffer = view.buffer();
+    for name in [TAG_ADDED, TAG_REMOVED, TAG_HUNK, TAG_META, TAG_FILE] {
+        buffer.create_tag(Some(name), &[]);
+    }
+    if let Some(tag) = buffer.tag_table().lookup(TAG_FILE) {
+        tag.set_weight(700);
+    }
+    colour_tags(&view, colours);
+    buffer.set_text(text.strip_suffix('\n').unwrap_or(text));
+    for (line, kind) in crate::diff::classify(text).into_iter().enumerate() {
+        let tag = match kind {
+            LineKind::Added => TAG_ADDED,
+            LineKind::Removed => TAG_REMOVED,
+            LineKind::Hunk => TAG_HUNK,
+            LineKind::Meta => TAG_META,
+            LineKind::File => TAG_FILE,
+            LineKind::Context => continue,
+        };
+        let Ok(line) = i32::try_from(line) else {
+            break;
+        };
+        if let Some(start) = buffer.iter_at_line(line) {
+            let mut end = start;
+            end.forward_to_line_end();
+            buffer.apply_tag_by_name(tag, &start, &end);
+        }
+    }
+    view
+}
+
 /// A file the user asked to open in the external diff tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFile {
@@ -86,10 +153,18 @@ pub struct DiffPanel {
     stack: gtk4::Stack,
     status: adw::StatusPage,
     retry: gtk4::Button,
-    files: gtk4::ListBox,
-    view: gtk4::TextView,
-    /// The buffer line on which each listed file's diff starts, by row.
-    file_lines: Rc<RefCell<Vec<i32>>>,
+    /// The folder headers and file rows of the diff on show.
+    files: gtk4::Box,
+    /// Under the files: why some diffs are not shown (too large, cut short).
+    note: gtk4::Label,
+    /// Each listed file's diff text, by `stats` index (empty: not shown).
+    chunks: Rc<RefCell<Vec<String>>>,
+    /// How many file rows are listed.
+    file_rows: Rc<Cell<usize>>,
+    /// Every file view built so far, recoloured with the theme.
+    views: Rc<RefCell<Vec<gtk4::TextView>>>,
+    /// The diff colours, for views built after a theme change.
+    colours: Rc<RefCell<DiffColours>>,
     /// Bumped by every refresh, so a slow one that finishes after a newer one
     /// cannot overwrite it.
     generation: Rc<Cell<u64>>,
@@ -155,49 +230,28 @@ impl DiffPanel {
             .build();
         status.add_css_class("compact");
 
-        let files = gtk4::ListBox::builder()
-            .selection_mode(gtk4::SelectionMode::None)
-            .activate_on_single_click(true)
-            .css_classes(["navigation-sidebar"])
-            .build();
-        let files_scroll = gtk4::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .max_content_height(160)
-            .propagate_natural_height(true)
-            .child(&files)
-            .build();
-
-        let view = gtk4::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .monospace(true)
-            .wrap_mode(gtk4::WrapMode::None)
-            .left_margin(6)
-            .right_margin(6)
-            .top_margin(4)
-            .bottom_margin(4)
-            .build();
-        // Added, not set through the builder: `css_classes` replaces the list,
-        // and with it the `monospace` class that `.monospace(true)` put there.
-        view.add_css_class(VIEW_CLASS);
-        let buffer = view.buffer();
-        for name in [TAG_ADDED, TAG_REMOVED, TAG_HUNK, TAG_META, TAG_FILE] {
-            buffer.create_tag(Some(name), &[]);
-        }
-        if let Some(tag) = buffer.tag_table().lookup(TAG_FILE) {
-            tag.set_weight(700);
-        }
-        let view_scroll = gtk4::ScrolledWindow::builder()
-            .vexpand(true)
-            .child(&view)
-            .build();
-
-        let diff_page = gtk4::Box::builder()
+        let files = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
+            .spacing(2)
+            .margin_start(6)
+            .margin_end(6)
+            .margin_top(4)
+            .margin_bottom(6)
             .build();
-        diff_page.append(&files_scroll);
-        diff_page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        diff_page.append(&view_scroll);
+        let note = gtk4::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .margin_top(6)
+            .css_classes(["dim-label"])
+            .build();
+        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        column.append(&files);
+        column.append(&note);
+        let diff_page = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .child(&column)
+            .build();
 
         let stack = gtk4::Stack::new();
         stack.add_named(&status, Some("status"));
@@ -223,8 +277,11 @@ impl DiffPanel {
             status,
             retry,
             files,
-            view,
-            file_lines: Rc::new(RefCell::new(Vec::new())),
+            note,
+            chunks: Rc::new(RefCell::new(Vec::new())),
+            file_rows: Rc::new(Cell::new(0)),
+            views: Rc::new(RefCell::new(Vec::new())),
+            colours: Rc::new(RefCell::new(colours.clone())),
             generation: Rc::new(Cell::new(0)),
             open_handler: Rc::new(RefCell::new(None)),
             shown_sides: Rc::new(RefCell::new(None)),
@@ -232,7 +289,6 @@ impl DiffPanel {
             placing: Rc::new(Cell::new(false)),
         };
         panel.set_colours(colours);
-        panel.wire_file_jumps();
         panel
     }
 
@@ -286,32 +342,25 @@ impl DiffPanel {
         self.base.connect_selected_notify(move |_| refresh());
     }
 
-    /// Recolours the diff text, as when the terminal theme changes.
+    /// Recolours the diff text, as when the terminal theme changes: every file
+    /// view built so far, and those built from now on.
     pub fn set_colours(&self, colours: &DiffColours) {
         apply_view_colours(colours);
-        let table = self.view.buffer().tag_table();
-        for (name, colour) in [
-            (TAG_ADDED, &colours.added),
-            (TAG_REMOVED, &colours.removed),
-            (TAG_HUNK, &colours.hunk),
-            (TAG_META, &colours.meta),
-            (TAG_FILE, &colours.file),
-        ] {
-            if let Some(tag) = table.lookup(name) {
-                tag.set_foreground_rgba(Some(colour));
-            }
+        *self.colours.borrow_mut() = colours.clone();
+        for view in self.views.borrow().iter() {
+            colour_tags(view, colours);
         }
     }
 
     /// What the panel shows: the stack page, the status title, the summary,
-    /// the diff text and how many files are listed.
+    /// the diff text (every file's, expanded or not, then the note) and how
+    /// many files are listed.
     #[cfg(test)]
     pub fn visible_state(&self) -> (String, String, String, String, usize) {
-        let buffer = self.view.buffer();
-        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-        let mut rows = 0;
-        while self.files.row_at_index(rows).is_some() {
-            rows += 1;
+        let mut text = self.chunks.borrow().concat();
+        if self.note.is_visible() {
+            text.push('\n');
+            text.push_str(&self.note.text());
         }
         (
             self.stack
@@ -320,9 +369,37 @@ impl DiffPanel {
                 .unwrap_or_default(),
             self.status.title().to_string(),
             self.summary.text().to_string(),
-            text.to_string(),
-            usize::try_from(rows).unwrap_or(0),
+            text,
+            self.file_rows.get(),
         )
+    }
+
+    /// The folder headers on show, in order (tests).
+    #[cfg(test)]
+    pub fn folder_headers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut child = self.files.first_child();
+        while let Some(widget) = child {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                out.push(label.text().to_string());
+            }
+            child = widget.next_sibling();
+        }
+        out
+    }
+
+    /// The file rows' expanders, in order (tests).
+    #[cfg(test)]
+    pub fn file_expanders(&self) -> Vec<gtk4::Expander> {
+        let mut out = Vec::new();
+        let mut child = self.files.first_child();
+        while let Some(widget) = child {
+            if let Ok(expander) = widget.clone().downcast::<gtk4::Expander>() {
+                out.push(expander);
+            }
+            child = widget.next_sibling();
+        }
+        out
     }
 
     /// Marks a refresh as started and returns its generation, which
@@ -445,85 +522,131 @@ impl DiffPanel {
     fn show_diff(&self, diff: &TabDiff) {
         self.set_undo(diff.undo_to.clone());
         self.summary.set_text(&crate::diff::summary(&diff.stats));
-
-        while let Some(row) = self.files.row_at_index(0) {
-            self.files.remove(&row);
-        }
         *self.shown_sides.borrow_mut() = Some((diff.from.clone(), diff.to_checkpoint.clone()));
-        for stat in &diff.stats {
-            let label = gtk4::Label::builder()
-                .label(crate::diff::file_row(stat))
-                .xalign(0.0)
-                .hexpand(true)
-                .ellipsize(gtk4::pango::EllipsizeMode::Middle)
-                .tooltip_text(stat.path.as_str())
-                .build();
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-            row.append(&label);
-            // Binary files open fine in a tool that knows them; the button is for every row.
-            row.append(&self.open_button(stat.path.clone()));
-            self.files.append(&row);
-        }
 
-        let buffer = self.view.buffer();
-        let mut file_lines = Vec::new();
-        if diff.too_large {
+        while let Some(child) = self.files.first_child() {
+            self.files.remove(&child);
+        }
+        self.views.borrow_mut().clear();
+
+        // Chunk `i` is `stats[i]`'s: git writes `--numstat` and the patch in the same order. A
+        // diff cut short has fewer chunks than files; a too-large one has none.
+        let chunks: Vec<String> = if diff.too_large {
+            Vec::new()
+        } else {
+            crate::diff::split_by_file(&diff.text)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        };
+        let mut by_stat = vec![String::new(); diff.stats.len()];
+        for (slot, chunk) in by_stat.iter_mut().zip(chunks) {
+            *slot = chunk;
+        }
+        let cut_short = !diff.too_large && diff.omitted_lines > 0;
+
+        let mut rows = 0;
+        for (folder, files) in crate::diff::group_by_folder(&diff.stats) {
+            let heading = if folder.is_empty() {
+                "Repository root".to_owned()
+            } else {
+                format!("{folder}/")
+            };
+            let header = gtk4::Label::builder()
+                .label(heading)
+                .xalign(0.0)
+                .ellipsize(gtk4::pango::EllipsizeMode::Start)
+                .tooltip_text(folder.as_str())
+                .margin_top(if rows == 0 { 0 } else { 8 })
+                .css_classes(["heading", "dim-label"])
+                .build();
+            self.files.append(&header);
+            for index in files {
+                let stat = &diff.stats[index];
+                let text = by_stat[index].clone();
+                let why_hidden = if diff.too_large {
+                    Some("Not shown: the diff is too large. Open it in your diff tool.")
+                } else if text.is_empty() && cut_short {
+                    Some("Not shown: the diff was cut short before this file.")
+                } else if text.is_empty() {
+                    Some("No text diff for this file.")
+                } else {
+                    None
+                };
+                self.files.append(&self.file_row(stat, text, why_hidden));
+                rows += 1;
+            }
+        }
+        self.file_rows.set(rows);
+        *self.chunks.borrow_mut() = by_stat;
+
+        let note = if diff.too_large {
             let (_, added, deleted) = crate::diff::totals(&diff.stats);
-            buffer.set_text(&format!(
+            Some(format!(
                 "This diff is too large to show ({} changed lines). The file list above is complete.",
                 added + deleted
-            ));
+            ))
+        } else if cut_short {
+            Some(format!(
+                "… diff truncated: {} more lines not shown",
+                diff.omitted_lines
+            ))
         } else {
-            buffer.set_text(&diff.text);
-            for (line, kind) in crate::diff::classify(&diff.text).into_iter().enumerate() {
-                let tag = match kind {
-                    LineKind::Added => TAG_ADDED,
-                    LineKind::Removed => TAG_REMOVED,
-                    LineKind::Hunk => TAG_HUNK,
-                    LineKind::Meta => TAG_META,
-                    LineKind::File => TAG_FILE,
-                    LineKind::Context => continue,
-                };
-                let Ok(line) = i32::try_from(line) else {
-                    break;
-                };
-                if kind == LineKind::File {
-                    file_lines.push(line);
-                }
-                if let Some(start) = buffer.iter_at_line(line) {
-                    let mut end = start;
-                    end.forward_to_line_end();
-                    buffer.apply_tag_by_name(tag, &start, &end);
-                }
-            }
-            if diff.omitted_lines > 0 {
-                let mut end = buffer.end_iter();
-                let note = format!(
-                    "\n… diff truncated: {} more lines not shown",
-                    diff.omitted_lines
-                );
-                buffer.insert_with_tags_by_name(&mut end, &note, &[TAG_META]);
-            }
-        }
-        *self.file_lines.borrow_mut() = file_lines;
+            None
+        };
+        self.note.set_visible(note.is_some());
+        self.note.set_text(note.as_deref().unwrap_or_default());
         self.stack.set_visible_child_name("diff");
     }
 
-    /// Clicking a file scrolls the diff to where it starts. Files and
-    /// `diff --git` headers come out of git in the same order.
-    fn wire_file_jumps(&self) {
-        let view = self.view.clone();
-        let file_lines = Rc::clone(&self.file_lines);
-        self.files.connect_row_activated(move |_, row| {
-            let Ok(index) = usize::try_from(row.index()) else {
+    /// One changed file: a collapsed row (name, `+3 −1`, "Open in …") that expands to its own
+    /// diff, built on first expand. `why_hidden`: shown instead of a diff there is no text for.
+    fn file_row(
+        &self,
+        stat: &crate::diff::FileStat,
+        text: String,
+        why_hidden: Option<&'static str>,
+    ) -> gtk4::Expander {
+        let label = gtk4::Label::builder()
+            .label(crate::diff::file_label(stat))
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+            .tooltip_text(stat.path.as_str())
+            .build();
+        let title = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        title.append(&label);
+        // Binary files open fine in a tool that knows them; the button is for every row.
+        title.append(&self.open_button(stat.path.clone()));
+        let expander = gtk4::Expander::builder()
+            .label_widget(&title)
+            .margin_start(8)
+            .build();
+        expander.add_css_class("diff-file");
+
+        let views = Rc::clone(&self.views);
+        let colours = Rc::clone(&self.colours);
+        expander.connect_expanded_notify(move |expander| {
+            if !expander.is_expanded() || expander.child().is_some() {
                 return;
-            };
-            let Some(line) = file_lines.borrow().get(index).copied() else {
-                return;
-            };
-            if let Some(mut iter) = view.buffer().iter_at_line(line) {
-                view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
             }
+            let child: gtk4::Widget = match why_hidden {
+                Some(why) => gtk4::Label::builder()
+                    .label(why)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .margin_start(6)
+                    .css_classes(["dim-label"])
+                    .build()
+                    .upcast(),
+                None => {
+                    let view = file_view(&text, &colours.borrow());
+                    views.borrow_mut().push(view.clone());
+                    view.upcast()
+                }
+            };
+            expander.set_child(Some(&child));
         });
+        expander
     }
 }

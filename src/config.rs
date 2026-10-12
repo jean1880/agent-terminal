@@ -595,6 +595,10 @@ pub struct TerminalConfig {
     /// runs out of quota. On by default, unlike the bell: it is rare, and it
     /// means work has stopped.
     pub notify_on_quota: bool,
+    /// Ask GitHub, in the background a few seconds after startup, whether a newer release is
+    /// out; one found marks the window menu. On by default (an older config opts in); off, the
+    /// app connects to nothing unless "Check for Updates…" is picked.
+    pub check_updates_on_startup: bool,
     /// Reopen the previous window's tabs on launch. Off by default: a restored
     /// tab gets its directory and profile back but starts a fresh conversation,
     /// so by default it only multiplies blank sessions.
@@ -925,6 +929,7 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             notify_on_bell: false,
             notify_on_quota: true,
+            check_updates_on_startup: true,
             restore_session: false,
             checkpoints: true,
             diff_panel_visible: false,
@@ -1930,6 +1935,22 @@ mod tests {
         let loaded = TerminalConfig::load_from(&path);
         assert!(loaded.notify_on_quota);
         assert!(!loaded.notify_on_bell);
+    }
+
+    #[test]
+    fn the_startup_update_check_is_on_unless_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        assert!(TerminalConfig::load_from(&path).check_updates_on_startup);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"check_updates_on_startup":false}"#)
+            .unwrap();
+        assert!(!TerminalConfig::load_from(&path).check_updates_on_startup);
     }
 
     #[test]

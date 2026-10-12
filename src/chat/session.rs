@@ -149,6 +149,10 @@ fn accepted_model_choice(driver: Driver, requested: Option<&str>, reported: &str
     alias.unwrap_or(reported).to_owned()
 }
 
+/// An open approval a rule can describe: the call, the working directory its rule is judged in,
+/// and the folder its card offered for "Allow for session" (pinned against a later re-resolve).
+type PendingRule = (crate::always_allow::Action, Option<String>, Option<PathBuf>);
+
 struct Inner {
     adapter: RefCell<Box<dyn Adapter>>,
     open: RefCell<OpenSession>,
@@ -197,7 +201,7 @@ struct Inner {
     /// Open Claude and Codex approvals a rule can describe: the call and the working directory
     /// its rule is judged in (`None`: relative paths never resolve), by request id, so "Allow for
     /// session" / "Always allow" can record it (D1: app-owned).
-    pending_rules: RefCell<HashMap<String, (crate::always_allow::Action, Option<String>)>>,
+    pending_rules: RefCell<HashMap<String, PendingRule>>,
     /// This thread's session rules, each tagged with its agent; shared with agy's approval
     /// server, kept through a same-agent restart, cleared by a cross-agent switch (D3).
     session_rules: crate::approval_server::SessionRules,
@@ -1477,10 +1481,15 @@ impl Inner {
                     let in_session = self.session_rules.borrow().matches_session(a, &ctx);
                     in_session || self.saved_allow(a, &ctx)
                 }));
+        // The folder the card offered (pinned: the answer keeps it only if it is still the same).
+        let shown = action
+            .as_ref()
+            .filter(|_| options.contains(&Decision::AllowForSession))
+            .and_then(|a| crate::always_allow::session_folder(a, &ctx));
         if let Some(action) = action {
             self.pending_rules
                 .borrow_mut()
-                .insert(request, (action, cwd));
+                .insert(request, (action, cwd, shown));
         }
         (env, auto)
     }
@@ -1559,7 +1568,7 @@ impl Inner {
     /// nothing is kept until the agent has taken the answer ([`Self::keep_rule`]).
     fn plan_rule(
         &self,
-        pending: Option<&(crate::always_allow::Action, Option<String>)>,
+        pending: Option<&PendingRule>,
         decision: Decision,
         custom: Option<crate::always_allow::Rule>,
     ) -> Result<(crate::always_allow::Rule, Vec<String>), String> {
@@ -1569,7 +1578,7 @@ impl Inner {
         let ctx = crate::always_allow::Context {
             driver: driver_name(driver),
             workspace: &workspace,
-            cwd: pending.and_then(|(_, cwd)| cwd.as_deref()),
+            cwd: pending.and_then(|(_, cwd, _)| cwd.as_deref()),
             home: home.as_deref(),
         };
         let scope = if decision == Decision::AllowAlways {
@@ -1577,7 +1586,14 @@ impl Inner {
         } else {
             crate::always_allow::Scope::Session
         };
-        crate::always_allow::decide(pending.map(|(a, _)| a), custom, scope, &ctx).map(|rule| {
+        crate::always_allow::decide_as_shown(
+            pending.map(|(a, _, _)| a),
+            custom,
+            scope,
+            &ctx,
+            pending.and_then(|(_, _, shown)| shown.as_deref()),
+        )
+        .map(|rule| {
             let warnings = rule.warnings(scope, Some(&ctx));
             (rule, warnings)
         })
@@ -2028,6 +2044,71 @@ impl Inner {
             item_id: item,
             text: text.to_owned(),
             handoff,
+        });
+    }
+
+    /// A message written while a turn runs, sent at once to an agent that takes it then
+    /// (`Capabilities::live_input`: Claude folds it into the running turn, Codex steers it). It
+    /// shows as an ordinary message, not a queued one. Everything else goes the way it always
+    /// did: sent as a prompt if the turn ended meanwhile, else queued — an agent without live
+    /// input, a slash command (mid-turn it would stop being one), or a handoff still waiting to
+    /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
+    /// one, so it is never lost.
+    fn steer_prompt(self: &Rc<Self>, text: &str) {
+        if !self.state.borrow().running_turn {
+            return self.send_prompt(text);
+        }
+        let live = self.adapter.borrow().capabilities().live_input;
+        let handoff_waiting =
+            self.pending_handoff.borrow().is_some() && !self.handoff_in_flight.get();
+        if !live || Self::is_slash_command(text) || handoff_waiting {
+            return self.queue_prompt(text);
+        }
+        self.apply_retired();
+        let pt = self.provider_thread.borrow().clone();
+        let provider = (!pt.is_empty()).then_some(pt.as_str());
+        let item = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => item,
+            Err(e) => {
+                warn!(error = %e, "could not persist the user message");
+                self.next_local_id("user")
+            }
+        };
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item(item.clone()),
+        );
+        self.deliver(
+            &Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: agent_core::redact::redact(text),
+            })
+            .item(item.clone()),
+        );
+        if self.command(Command::Steer {
+            text: text.to_owned(),
+        }) {
+            return;
+        }
+        // Refused: it waits for the turn to end, as a message sent mid-turn always did.
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: "queued".to_string(),
+                input: Some(serde_json::json!({"queued": true})),
+                parent: None,
+            })
+            .item(item.clone()),
+        );
+        self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
+            item_id: item,
+            text: text.to_owned(),
+            handoff: None,
         });
     }
 
@@ -3321,6 +3402,10 @@ impl ChatBackend for ChatSession {
 
     fn queue_prompt(&self, text: &str) {
         self.inner.queue_prompt(text);
+    }
+
+    fn steer_prompt(&self, text: &str) {
+        self.inner.steer_prompt(text);
     }
 
     fn interrupt(&self) {

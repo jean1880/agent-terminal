@@ -37,6 +37,7 @@ fn hex(color: u32) -> RGBA {
 
 /// Colours for the diff panel: the terminal's own background and text, and a
 /// foreground for each kind of diff line.
+#[derive(Clone)]
 pub struct DiffColours {
     pub background: RGBA,
     pub text: RGBA,

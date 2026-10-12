@@ -196,6 +196,9 @@ enum Pending {
     TurnStart(SubmittedModel),
     Compact,
     Interrupt,
+    /// `turn/steer` carrying this text: refused (the turn ended first), it starts a turn of its
+    /// own instead.
+    Steer(String),
     /// `model/list`, answering the control with this id.
     Models(String),
 }
@@ -2078,6 +2081,25 @@ impl CodexAdapter {
                     message: error.unwrap_or_else(|| "request failed".to_owned()),
                 }));
             }
+            // Taken into the running turn: Codex reports it like any input of that turn.
+            (Pending::Steer(_), Some(_), _) => {}
+            // Refused: the turn ended (or another began) before it arrived. The message is not
+            // lost: it starts a turn of its own, as it would have from the queue.
+            (Pending::Steer(text), None, error) => {
+                if let Some(thread) = self.thread_id.clone() {
+                    let line = self.turn_start_line(&thread, &text);
+                    self.write(line);
+                    out.push(Envelope::new(Event::Notice {
+                        text: "Codex finished its turn before your message reached it, so it \
+                               went as a new message."
+                            .to_owned(),
+                    }));
+                } else {
+                    out.push(Envelope::new(Event::Error {
+                        message: error.unwrap_or_else(|| "turn/steer failed".to_owned()),
+                    }));
+                }
+            }
             // An interrupt with no turn to stop, or an acknowledged compact: nothing to show.
             (Pending::Interrupt | Pending::Compact, _, _) => {}
         }
@@ -2272,6 +2294,25 @@ impl Adapter for CodexAdapter {
                         Ok(Vec::new())
                     }
                 }
+            }
+            Command::Steer { text } => {
+                // Into the running turn, pinned to it: Codex refuses the steer if that turn is no
+                // longer the active one, and the refusal starts a turn instead (`on_response`).
+                // With no turn running there is nothing to steer: it is a prompt.
+                let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone())
+                else {
+                    return self.encode(Command::Prompt { text });
+                };
+                let line = self.request(
+                    Pending::Steer(text.clone()),
+                    "turn/steer",
+                    json!({
+                        "threadId": thread,
+                        "expectedTurnId": turn,
+                        "input": [{"type": "text", "text": text}],
+                    }),
+                );
+                Ok(vec![Action::Write(vec![line])])
             }
             Command::Interrupt => {
                 let mut updates = Vec::new();
@@ -3314,6 +3355,62 @@ mod tests {
             .any(|e| matches!(e.event, Event::QuestionRequested { .. })));
         assert!(a.questions.is_empty());
         assert_eq!(writes(&a.drain_outbox().actions)[0]["id"], 55);
+    }
+
+    /// A message during a turn goes into it through `turn/steer`, pinned to that turn (frames
+    /// follow codex-cli 0.161.0's schema: threadId, expectedTurnId, input). Refused because the
+    /// turn ended first, it starts a turn of its own with a notice; with no turn running, a steer
+    /// is a prompt.
+    #[test]
+    fn a_message_mid_turn_steers_it_and_a_refused_steer_starts_a_turn() {
+        let mut a = started(Mode::Ask);
+        let idle = one_write(
+            a.encode(Command::Steer {
+                text: "hello".into(),
+            })
+            .expect("no turn: a prompt"),
+        );
+        assert_eq!(idle["method"], "turn/start");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+
+        let steer = one_write(
+            a.encode(Command::Steer {
+                text: "also check the tests".into(),
+            })
+            .expect("steer"),
+        );
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["threadId"], "th-1");
+        assert_eq!(steer["params"]["expectedTurnId"], "tu");
+        assert_eq!(steer["params"]["input"][0]["text"], "also check the tests");
+
+        // Accepted: nothing to show, nothing written.
+        let id = steer["id"].clone();
+        let out = a.feed(&json!({"id": id, "result": {"turnId": "tu"}}).to_string());
+        assert!(out.is_empty(), "{out:?}");
+        assert!(a.drain_outbox().actions.is_empty());
+
+        // Refused: the same text starts a turn, and the user is told.
+        let again = one_write(
+            a.encode(Command::Steer {
+                text: "one more thing".into(),
+            })
+            .expect("steer"),
+        );
+        let out = a.feed(
+            &json!({"id": again["id"], "error": {"code": -32600, "message": "expected turn mismatch"}})
+                .to_string(),
+        );
+        assert!(
+            out.iter().any(
+                |e| matches!(&e.event, Event::Notice { text } if text.contains("new message"))
+            ),
+            "{out:?}"
+        );
+        let started = writes(&a.drain_outbox().actions);
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0]["method"], "turn/start");
+        assert_eq!(started[0]["params"]["input"][0]["text"], "one more thing");
     }
 
     #[test]

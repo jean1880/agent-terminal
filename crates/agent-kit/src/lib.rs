@@ -16,4 +16,5 @@ pub mod paths;
 pub mod restore;
 pub mod sessions;
 pub mod store;
+pub mod update;
 pub mod worktree;

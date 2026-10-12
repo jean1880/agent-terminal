@@ -1142,7 +1142,10 @@ impl Adapter for ClaudeAdapter {
 
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         let line = match command {
-            Command::Prompt { text } => json!({
+            // A steer is the same user line: written while a turn runs, Claude folds it into
+            // that turn (one `result`, no new `init`); written as the turn ends, it starts the
+            // next one, which opens with its own `init` like any prompt.
+            Command::Prompt { text } | Command::Steer { text } => json!({
                 "type": "user",
                 "message": {"role": "user", "content": text},
                 "parent_tool_use_id": null,
@@ -2962,6 +2965,16 @@ mod tests {
                 }
             ),
             json!({"type": "user", "message": {"role": "user", "content": "hello"}, "parent_tool_use_id": null})
+        );
+        // A message mid-turn is the same line: Claude folds it into the running turn.
+        assert_eq!(
+            written(
+                &mut a,
+                Command::Steer {
+                    text: "also".into()
+                }
+            ),
+            json!({"type": "user", "message": {"role": "user", "content": "also"}, "parent_tool_use_id": null})
         );
         assert_eq!(
             written(&mut a, Command::Interrupt),
