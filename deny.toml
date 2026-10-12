@@ -24,6 +24,11 @@ allow = [
     "Unicode-3.0",
     # foldhash 0.2 (via rusqlite 0.40's hashlink).
     "Zlib",
+    # The update check's TLS stack (ureq → rustls): ring, rustls-webpki and untrusted (ISC),
+    # subtle (BSD-3-Clause) and the Mozilla root certificates in webpki-roots (CDLA-Permissive-2.0).
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
 ]
 # Allowances not (yet) used by the tree are fine: Zlib is listed ahead of the rusqlite bump.
 unused-allowed-license = "allow"

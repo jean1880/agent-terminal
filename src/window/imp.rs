@@ -1760,6 +1760,19 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&shortcuts_action);
 
+        let updates_action = gtk4::gio::SimpleAction::new("check-updates", None);
+        updates_action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |action, _| {
+                debug!("Action: Check for Updates");
+                // One check at a time: enabled again when its answer is shown.
+                action.set_enabled(false);
+                obj.imp().check_for_updates(action.clone());
+            }
+        ));
+        obj.add_action(&updates_action);
+
         // Both targeted by profile name, like the new-tab-as actions.
         for name in ["resume-session-profile", "continue-in"] {
             let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
@@ -2501,7 +2514,111 @@ impl AgentTerminalWindow {
         let recovery = gtk4::gio::Menu::new();
         recovery.append(Some("Restart Agent"), Some("win.restart-tab"));
         menu.append_section(None, &recovery);
+        let app = gtk4::gio::Menu::new();
+        app.append(Some("Check for Updates…"), Some("win.check-updates"));
+        menu.append_section(None, &app);
         menu
+    }
+
+    /// "Check for Updates…": asks GitHub for the newest release (off the main thread; the one
+    /// network request the app makes, and only when asked), then says what it found. `action`
+    /// is enabled again once the answer is shown.
+    fn check_for_updates(&self, action: gtk4::gio::SimpleAction) {
+        let obj = self.obj().downgrade();
+        let slug = agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY"));
+        glib::MainContext::default().spawn_local(async move {
+            let result = match slug {
+                Some(slug) => gtk4::gio::spawn_blocking(move || {
+                    agent_kit::update::fetch_latest(
+                        &slug,
+                        concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| Err("The update check stopped unexpectedly.".to_owned())),
+                None => Err("This build names no GitHub repository to check.".to_owned()),
+            };
+            action.set_enabled(true);
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().show_update_result(result);
+            }
+        });
+    }
+
+    /// The update check's answer: a newer release with its notes and a Download button that
+    /// opens the release page, "up to date", or what went wrong.
+    fn show_update_result(&self, result: Result<agent_kit::update::Release, String>) {
+        let current = env!("CARGO_PKG_VERSION");
+        let dialog = match result {
+            Ok(release) if agent_kit::update::is_newer(current, &release.tag) => {
+                let version = release.tag.trim_start_matches('v');
+                let dialog = adw::AlertDialog::builder()
+                    .heading(format!("Agent Terminal {version} is available"))
+                    .body(format!(
+                        "You have {current}. Installed from a package repository (apt, dnf, \
+                         pacman)? Update it there instead."
+                    ))
+                    .build();
+                if !release.notes.trim().is_empty() {
+                    let notes = Label::builder()
+                        .use_markup(true)
+                        .label(crate::chat::view::markdown::passage_markup(&release.notes))
+                        .wrap(true)
+                        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+                        .xalign(0.0)
+                        .selectable(true)
+                        .build();
+                    let scroll = gtk4::ScrolledWindow::builder()
+                        .hscrollbar_policy(gtk4::PolicyType::Never)
+                        .min_content_height(160)
+                        .max_content_height(360)
+                        .propagate_natural_height(true)
+                        .child(&notes)
+                        .build();
+                    dialog.set_extra_child(Some(&scroll));
+                }
+                dialog.add_responses(&[("close", "Not Now"), ("download", "Download")]);
+                dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("download"));
+                let url = release.url;
+                let window = self.obj().downgrade();
+                dialog.connect_response(None, move |_, response| {
+                    if response != "download" {
+                        return;
+                    }
+                    let parent = window.upgrade();
+                    gtk4::UriLauncher::new(&url).launch(
+                        parent.as_ref(),
+                        None::<&gtk4::gio::Cancellable>,
+                        |result| {
+                            if let Err(e) = result {
+                                warn!("Could not open the release page: {e}");
+                            }
+                        },
+                    );
+                });
+                dialog
+            }
+            Ok(_) => {
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Agent Terminal is up to date")
+                    .body(format!("{current} is the newest release."))
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog
+            }
+            Err(error) => {
+                warn!("Update check failed: {error}");
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Could not check for updates")
+                    .body(error)
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog
+            }
+        };
+        dialog.set_close_response("close");
+        dialog.present(Some(&*self.obj()));
     }
 
     /// Opens a new tab rooted in the current tab's directory (fast path).
@@ -6316,6 +6433,14 @@ mod tests {
                 .is_some_and(|a| !a.is_enabled()),
             "the window's actions wait for the shell"
         );
+        assert!(
+            window.lookup_action("check-updates").is_some(),
+            "the menu's Check for Updates… has its action"
+        );
+        assert!(
+            agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY")).is_some(),
+            "this build names the repository its updates come from"
+        );
 
         // The splash plays its minimum however fast loading was, unless the user skips it.
         {
@@ -6354,18 +6479,24 @@ mod tests {
         let menu = window.imp().build_new_menu();
         assert_eq!(
             menu.n_items(),
-            3,
-            "menu has threads, sessions and recovery sections, no terminal section"
+            4,
+            "menu has threads, sessions, recovery and app sections, no terminal section"
         );
-        let recovery = menu
-            .item_link(2, gtk4::gio::MENU_LINK_SECTION)
-            .expect("recovery section");
-        assert_eq!(
-            recovery
+        let action_of = |section: i32| {
+            menu.item_link(section, gtk4::gio::MENU_LINK_SECTION)
+                .expect("section")
                 .item_attribute_value(0, "action", None)
-                .and_then(|v| v.get::<String>()),
+                .and_then(|v| v.get::<String>())
+        };
+        assert_eq!(
+            action_of(2),
             Some("win.restart-tab".into()),
-            "Restart Agent sits last, in the window menu"
+            "Restart Agent in its own recovery section"
+        );
+        assert_eq!(
+            action_of(3),
+            Some("win.check-updates".into()),
+            "Check for Updates… sits last, in the window menu"
         );
         chat_shell_opens_threads_and_lists_them(&window);
         environment_review::tests::confirmation_preserves_target(&window);

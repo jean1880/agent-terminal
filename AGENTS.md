@@ -143,7 +143,10 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
   env file, then the approval socket.
-- **Localhost bound**: interacts only with the local shell; exposes no ports.
+- **Localhost bound**: interacts only with the local shell; exposes no ports. The one outbound
+  connection is "Check for Updates…" (`agent_kit::update`): a single HTTPS GET of the
+  repository's latest GitHub release, only when the user picks it, off the main thread, with a
+  timeout. Never add a request the user did not ask for (no background or startup checks).
 - **Never block the main thread**: anything that shells out — CLI detection above
   all, which may run `$SHELL -ic` and source the user's rc — goes through
   `gio::spawn_blocking`. A frozen window cannot even repaint its own spinner.
