@@ -149,6 +149,10 @@ fn accepted_model_choice(driver: Driver, requested: Option<&str>, reported: &str
     alias.unwrap_or(reported).to_owned()
 }
 
+/// An open approval a rule can describe: the call, the working directory its rule is judged in,
+/// and the folder its card offered for "Allow for session" (pinned against a later re-resolve).
+type PendingRule = (crate::always_allow::Action, Option<String>, Option<PathBuf>);
+
 struct Inner {
     adapter: RefCell<Box<dyn Adapter>>,
     open: RefCell<OpenSession>,
@@ -197,7 +201,7 @@ struct Inner {
     /// Open Claude and Codex approvals a rule can describe: the call and the working directory
     /// its rule is judged in (`None`: relative paths never resolve), by request id, so "Allow for
     /// session" / "Always allow" can record it (D1: app-owned).
-    pending_rules: RefCell<HashMap<String, (crate::always_allow::Action, Option<String>)>>,
+    pending_rules: RefCell<HashMap<String, PendingRule>>,
     /// This thread's session rules, each tagged with its agent; shared with agy's approval
     /// server, kept through a same-agent restart, cleared by a cross-agent switch (D3).
     session_rules: crate::approval_server::SessionRules,
@@ -1477,10 +1481,15 @@ impl Inner {
                     let in_session = self.session_rules.borrow().matches_session(a, &ctx);
                     in_session || self.saved_allow(a, &ctx)
                 }));
+        // The folder the card offered (pinned: the answer keeps it only if it is still the same).
+        let shown = action
+            .as_ref()
+            .filter(|_| options.contains(&Decision::AllowForSession))
+            .and_then(|a| crate::always_allow::session_folder(a, &ctx));
         if let Some(action) = action {
             self.pending_rules
                 .borrow_mut()
-                .insert(request, (action, cwd));
+                .insert(request, (action, cwd, shown));
         }
         (env, auto)
     }
@@ -1559,7 +1568,7 @@ impl Inner {
     /// nothing is kept until the agent has taken the answer ([`Self::keep_rule`]).
     fn plan_rule(
         &self,
-        pending: Option<&(crate::always_allow::Action, Option<String>)>,
+        pending: Option<&PendingRule>,
         decision: Decision,
         custom: Option<crate::always_allow::Rule>,
     ) -> Result<(crate::always_allow::Rule, Vec<String>), String> {
@@ -1569,7 +1578,7 @@ impl Inner {
         let ctx = crate::always_allow::Context {
             driver: driver_name(driver),
             workspace: &workspace,
-            cwd: pending.and_then(|(_, cwd)| cwd.as_deref()),
+            cwd: pending.and_then(|(_, cwd, _)| cwd.as_deref()),
             home: home.as_deref(),
         };
         let scope = if decision == Decision::AllowAlways {
@@ -1577,7 +1586,14 @@ impl Inner {
         } else {
             crate::always_allow::Scope::Session
         };
-        crate::always_allow::decide(pending.map(|(a, _)| a), custom, scope, &ctx).map(|rule| {
+        crate::always_allow::decide_as_shown(
+            pending.map(|(a, _, _)| a),
+            custom,
+            scope,
+            &ctx,
+            pending.and_then(|(_, _, shown)| shown.as_deref()),
+        )
+        .map(|rule| {
             let warnings = rule.warnings(scope, Some(&ctx));
             (rule, warnings)
         })
