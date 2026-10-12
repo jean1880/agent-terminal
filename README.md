@@ -178,15 +178,17 @@ When the agent wants to run a command or edit a file, an approval card shows exa
 what it asks for. **Allow** answers once, **More** offers **Allow for session** and
 **Always allow**, **Deny** lets the agent see the refusal and carry on, and **Stop turn**
 ends the turn. A panel above the composer keeps the pending approval within reach while
-you scroll. See [Approvals and rules](#approvals-and-rules).
+you scroll, and the keyboard answers it too (`Ctrl+Enter` allows, `Ctrl+Backspace` denies).
+See [Approvals and rules](#approvals-and-rules).
 
 ![An approval card for cargo clean with More open on Always allow and Allow for session](docs/screenshots/approval.png)
 
-### 5. Answer questions, queue follow-ups
+### 5. Answer questions, add to a running turn
 
-Questions the agent asks come as cards with answers to pick. A prompt you send while a
-turn is running waits in a queue pinned under the reply and goes out when the turn ends;
-`Up` in an empty composer takes the last one back to edit.
+Questions the agent asks come as cards with answers to pick. A message you send while a
+turn is running reaches Claude and Codex at once, inside that turn. For Antigravity it
+waits in a queue pinned under the reply and goes out when the turn ends; `Up` in an empty
+composer takes the last queued one back to edit.
 
 | | |
 |---|---|
@@ -297,7 +299,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 
 ### Chat threads
 
-- **A sidebar of threads**, grouped by folder and searchable. Each row shows the
+- **A sidebar of threads**, grouped by folder and searchable. Threads that are working,
+  waiting for an approval, rate limited or running background work sit above the rest in
+  an **Active** section, most urgent first, each naming its folder. Each row shows the
   agent, the title, how long ago it was active, and a badge: working, needs approval,
   rate limited or unread. `F9` or `Ctrl+Shift+B` shows or hides it. It overlays the
   thread when the window is narrow. When hidden, its toggle still signals unread
@@ -309,12 +313,16 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **A native transcript**: markdown, code blocks, tool cards, file-change cards with
   their diffs, inline approvals, a plan panel, sub-agent progress, questions with
   answers to pick, and a composer with typeahead.
+- **Sub-agents stay docked.** A card above the composer lists the sub-agents at work, and
+  keeps the finished ones (with how each ended) until your next prompt or **Clear
+  finished**. `Ctrl+Shift+A` opens or closes every sub-agent card in the thread.
 - **Pending approvals stay within reach.** A panel above the composer keeps approval
   controls available while you scroll, with extra choices in a popover when the
   agent supports them. Pending questions offer a jump back to their answer card.
-- **Queued prompts.** A prompt sent while a turn is running waits, pinned at the bottom of
-  the transcript, and goes out when the turn ends. `Up` in an empty composer takes the
-  last one back for editing.
+- **Talk while it works.** A message sent while a turn is running goes straight into that
+  turn for Claude and Codex. For Antigravity (and for slash commands) it is queued instead,
+  pinned at the bottom of the transcript, and goes out when the turn ends. `Up` in an empty
+  composer takes the last queued one back for editing.
 - **Quick replies.** When a Codex or Antigravity reply ends with a question and a short
   list of choices, the choices appear under it; one click puts the answer in the composer,
   ready to send or edit. Turn them off from the replies themselves or in Settings → General.
@@ -343,6 +351,15 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   `cat`, `grep`, `rg`, `git status`/`log`/`diff`, …) the session grant keeps the program
   for the workspace, as long as every path it names stays inside it and away from `.git`,
   secret-looking files and home dotfiles.
+- **Allow for session on an edit covers its folder.** The grant keeps the edited file's
+  folder and everything below it, and the card names the folder before you choose. It stays
+  inside the workspace (or at least two levels inside your home folder), never covers `/` or
+  your home folder, and sensitive files inside it still ask. **Always allow** keeps the one
+  file.
+- **Answer from the keyboard.** While an approval waits in the focused thread:
+  `Ctrl+Enter` allows, `Ctrl+Shift+Enter` allows for the session, `Ctrl+Alt+Enter` always
+  allows, `Ctrl+Backspace` denies and `Ctrl+.` stops the turn. A Codex permission request
+  can only be denied or stopped from the keyboard.
 - **Import and export.** Settings → Agents imports the rules your agents already have
   (Claude, Antigravity, Codex's `~/.codex/rules` and any permission files you list) and
   exports Agent Terminal's global rules back. **View Differences…** shows what is not yet
@@ -361,7 +378,8 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   hidden refs when a turn ends. Your branch, index and stash stay as they were.
   See [Turn checkpoints](#turn-checkpoints).
 - **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, everything since
-  the thread opened, or the target branch. Open any file in your own diff tool. See [Diff panel](#diff-panel).
+  the thread opened, or the target branch, with files grouped under their folder and each
+  file's diff on its own row. Open any file in your own diff tool. See [Diff panel](#diff-panel).
 - **Undo a turn**, which saves the current state first, so the undo can itself be undone.
   See [Undoing a turn](#undoing-a-turn).
 - **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can
@@ -394,6 +412,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   the app runs.
 - **Status indicators**: optional header lights driven by a file or a command. See
   [Status indicators](#status-indicators).
+- **Updates**: ☰ → **Check for Updates…** asks GitHub for the latest release and shows its
+  notes, with a Download button. The same check runs once a few seconds after startup (turn
+  it off in Settings → Startup); a newer release puts a dot on the menu button. It is the
+  app's only connection to the internet.
 
 ## Command-line options
 
@@ -457,8 +479,22 @@ agent-terminal --resume <id> --dir ~/git/some-project
 | `Ctrl+Alt+1`…`Ctrl+Alt+9` | New terminal thread with the Nth profile, in the current folder |
 | `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` | Chat and terminal text zoom in / out / reset (saved); `Ctrl+=` also zooms in |
 | `Ctrl+click` | Open a link in a terminal |
+| `Ctrl+Shift+A` | Open or close every sub-agent card in the thread |
 
 These are caught before a terminal sees them, so a CLI never receives them.
+
+While an approval is waiting in the focused thread:
+
+| Keys | Answer |
+|---|---|
+| `Ctrl+Enter` | Allow |
+| `Ctrl+Shift+Enter` | Allow for session |
+| `Ctrl+Alt+Enter` | Always allow |
+| `Ctrl+Backspace` | Deny (Stop turn where the card has no Deny) |
+| `Ctrl+.` | Stop turn |
+
+A key the card does not offer does its usual job, and a Codex permission request is never
+allowed from the keyboard.
 
 ## Configuration
 
@@ -498,6 +534,7 @@ until it is fixed.
 | `confirm_rule_modification` | `true` | Confirm, or loosen, a rule's pattern when choosing Always allow |
 | `permission_sources` | `[]` | Extra `permissions.toml`-style files that import reads and export writes (absolute or `~/`) |
 | `suggest_quick_replies` | `true` | Offer quick replies under a Codex or Antigravity reply that ends with a question |
+| `check_updates_on_startup` | `true` | Ask GitHub for the latest release once, a few seconds after startup |
 | `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font and zoom |
 | `cursor_shape`, `cursor_blink` | `block`, `true` | Terminal cursor |
 | `scrollback_lines` | `10000` | Terminal scrollback |
@@ -700,8 +737,10 @@ git for-each-ref --format='delete %(refname)' refs/agent-terminal | git update-r
 
 ### Diff panel
 
-`Ctrl+Shift+D` opens a read-only panel with a file list, line counts and a coloured
-unified diff. The dropdown picks what to compare against:
+`Ctrl+Shift+D` opens a read-only panel listing the changed files under a header for each
+folder (the repository root first). Each file is a collapsed row with its line counts and
+**Open in…**; expanding it shows that file's coloured unified diff, built when first opened.
+The dropdown picks what to compare against:
 
 | Base | Shows |
 |---|---|
