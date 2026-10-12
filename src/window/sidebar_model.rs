@@ -230,6 +230,42 @@ pub fn group_rows(
     groups
 }
 
+/// Whether a row is live work: a turn running, background work going, an approval waiting or a
+/// rate limit holding it. These sit in the sidebar's own "Active" section.
+pub fn is_active(row: &SidebarRow) -> bool {
+    matches!(
+        row.badge,
+        Some(Badge::NeedsApproval | Badge::RateLimited | Badge::Running | Badge::Background)
+    )
+}
+
+/// The sidebar's two sections: the active threads ([`is_active`]) on their own, most urgent
+/// first (an approval, a rate limit, then working, then background work) and newest within each;
+/// then every other thread grouped by folder as [`group_rows`] does, ordered by the newest of
+/// what is left. The same search and archive filter applies to both, and an active thread is
+/// listed once, in the active section only.
+pub fn sidebar_sections(
+    rows: Vec<SidebarRow>,
+    query: &str,
+    show_archived: bool,
+) -> (Vec<SidebarRow>, Vec<(String, Vec<SidebarRow>)>) {
+    let mut active = Vec::new();
+    let mut groups: Vec<(String, Vec<SidebarRow>)> = group_rows(rows, query, show_archived)
+        .into_iter()
+        .filter_map(|(folder, list)| {
+            let (live, rest): (Vec<_>, Vec<_>) = list.into_iter().partition(is_active);
+            active.extend(live);
+            (!rest.is_empty()).then_some((folder, rest))
+        })
+        .collect();
+    // An active row that left a group may have been what put it on top.
+    groups.sort_by_key(|(_, list)| {
+        std::cmp::Reverse(list.first().map_or(i64::MIN, |r| r.updated_ms))
+    });
+    active.sort_by(|a, b| a.badge.cmp(&b.badge).then(b.updated_ms.cmp(&a.updated_ms)));
+    (active, groups)
+}
+
 /// A compact age: `now`, `5m`, `3h`, `2d`, `6w`.
 pub fn relative_time(now_ms: i64, then_ms: i64) -> String {
     let secs = (now_ms - then_ms).max(0) / 1000;
@@ -750,6 +786,57 @@ mod tests {
         running.badge = Some(Badge::Running);
         assert!(!needs_attention(&running, Some(&shown("other")), false));
         assert!(!needs_attention(&row("n", "/w", 1), None, false));
+    }
+
+    /// Active threads get their own section, most urgent first, and leave their folder group;
+    /// a folder left empty disappears, and the rest re-order by what is left in them. Search and
+    /// the archive toggle apply to both sections.
+    #[test]
+    fn active_threads_get_their_own_section() {
+        let id = |r: &SidebarRow| match &r.key {
+            RowKey::Thread(id) => id.clone(),
+            RowKey::Terminal(_) => "t".into(),
+        };
+        let with = |mut r: SidebarRow, badge: Badge| {
+            r.badge = Some(badge);
+            r
+        };
+        let rows = vec![
+            with(row("run-old", "/w/one", 10), Badge::Running),
+            with(row("ask", "/w/two", 5), Badge::NeedsApproval),
+            row("idle", "/w/one", 50),
+            with(row("bg", "/w/three", 60), Badge::Background),
+            with(row("unread", "/w/two", 20), Badge::Unread),
+            with(row("run-new", "/w/two", 40), Badge::Running),
+            with(row("limited", "/w/four", 1), Badge::RateLimited),
+        ];
+        let (active, groups) = sidebar_sections(rows.clone(), "", false);
+        assert_eq!(
+            active.iter().map(id).collect::<Vec<_>>(),
+            ["ask", "limited", "run-new", "run-old", "bg"],
+            "approval, rate limit, working (newest first), background"
+        );
+        let shape: Vec<(String, Vec<String>)> = groups
+            .iter()
+            .map(|(f, r)| (f.clone(), r.iter().map(id).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("/w/one".to_owned(), vec!["idle".to_owned()]),
+                ("/w/two".to_owned(), vec!["unread".to_owned()]),
+            ],
+            "unread is not active; emptied folders go; ordered by what is left"
+        );
+        assert!(!is_active(&with(row("u", "/w", 1), Badge::Unread)));
+        assert!(!is_active(&row("n", "/w", 1)));
+
+        // The search filters the active section too; nothing active: no section.
+        let (active, groups) = sidebar_sections(rows, "thread ask", false);
+        assert_eq!(active.iter().map(id).collect::<Vec<_>>(), ["ask"]);
+        assert!(groups.is_empty());
+        let (active, _) = sidebar_sections(vec![row("x", "/w", 1)], "", false);
+        assert!(active.is_empty());
     }
 
     #[test]

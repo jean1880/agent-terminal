@@ -504,6 +504,15 @@ fn load_css() {
             font-size: 9px;
             margin: 3px 3px 0 0;
         }
+        .thread-list row.active-divider {
+            padding: 8px 0 2px 0;
+            min-height: 0;
+        }
+        .thread-list row.active-divider separator {
+            min-height: 2px;
+            background-color: @at_fg_soft;
+            opacity: 0.35;
+        }
         .dim-label {
             opacity: 1.0;
             color: @at_fg_dim;

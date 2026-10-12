@@ -34,9 +34,9 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, group_rows,
-    held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, relative_time,
-    resume_as, row_tooltip, safe_handoff_target, stop_heading, stored_model, thread_title,
+    badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, held_finish_due,
+    is_busy, limit_over, needs_attention, parse_driver, react, relative_time, resume_as,
+    row_tooltip, safe_handoff_target, sidebar_sections, stop_heading, stored_model, thread_title,
     turn_finishes_thread, Attention, Badge, ResumeAs, RowKey, SidebarRow,
 };
 
@@ -1617,7 +1617,8 @@ impl AgentTerminalWindow {
         let rows = self.sidebar_rows();
         let selected = self.selected_row_key();
         let focused = self.obj().is_active();
-        let groups = group_rows(rows, &sidebar.search.text(), self.show_archived.get());
+        let (active, groups) =
+            sidebar_sections(rows, &sidebar.search.text(), self.show_archived.get());
         let home = env::var("HOME").unwrap_or_default();
         let now = now_ms();
 
@@ -1630,6 +1631,60 @@ impl AgentTerminalWindow {
         clear_rows(&sidebar.list);
         let mut keys = Vec::new();
         let mut select = None;
+        // Live work first, in a section of its own: each row names its folder (there is no
+        // folder header above it), and a full divider separates it from the rest.
+        if !active.is_empty() {
+            let header = gtk4::ListBoxRow::builder()
+                .activatable(false)
+                .selectable(false)
+                .css_classes(["folder-row", "active-section"])
+                .build();
+            header.set_child(Some(
+                &Label::builder()
+                    .label("Active")
+                    .xalign(0.0)
+                    .css_classes(["folder-label", "caption-heading"])
+                    .tooltip_text("Threads working, waiting for you, or rate limited")
+                    .build(),
+            ));
+            sidebar.list.append(&header);
+            keys.push(None);
+            for row in active {
+                let widget = self.sidebar_row_widget(&row, now);
+                if let Some(line) = widget.child().and_then(|c| c.downcast::<Box>().ok()) {
+                    let folder = Label::builder()
+                        .label(crate::utils::tildify(&row.folder, &home))
+                        .ellipsize(gtk4::pango::EllipsizeMode::Start)
+                        .max_width_chars(16)
+                        .css_classes(["thread-folder", "dim-label", "caption"])
+                        .tooltip_text(&row.folder)
+                        .build();
+                    // After the title, before the badge and age.
+                    if let Some(title) = line.first_child().and_then(|dot| dot.next_sibling()) {
+                        line.insert_child_after(&folder, Some(&title));
+                    }
+                }
+                if needs_attention(&row, selected.as_ref(), focused) {
+                    widget.add_css_class("needs-attention");
+                }
+                sidebar.list.append(&widget);
+                if Some(&row.key) == selected.as_ref() {
+                    select = Some(widget.clone());
+                }
+                keys.push(Some(row.key));
+            }
+            if !groups.is_empty() {
+                let divider = gtk4::ListBoxRow::builder()
+                    .activatable(false)
+                    .selectable(false)
+                    .focusable(false)
+                    .css_classes(["active-divider"])
+                    .child(&gtk4::Separator::new(Orientation::Horizontal))
+                    .build();
+                sidebar.list.append(&divider);
+                keys.push(None);
+            }
+        }
         for (folder, rows) in groups {
             let header = gtk4::ListBoxRow::builder()
                 .activatable(false)
