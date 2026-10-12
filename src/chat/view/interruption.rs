@@ -202,6 +202,41 @@ impl InterruptionShelf {
         }
     }
 
+    /// Answers the approval on show with `decision`, as its buttons would: a permission request
+    /// (a list of places) is never allowed from here, only denied or stopped, since the shelf
+    /// cuts its list. Deny falls back to Cancel where the approval offers no Deny, as the Deny
+    /// button does. False when no approval is pending or it does not offer `decision`: the
+    /// keyboard shortcut then lets its key through.
+    pub fn answer(&self, decision: Decision) -> bool {
+        // Copied out before the sink runs: answering updates this shelf re-entrantly.
+        let answer = match self.active.borrow().as_ref() {
+            Some(PendingInterruption::Approval {
+                request,
+                tool,
+                options,
+                ..
+            }) => {
+                let decision = match decision {
+                    Decision::Deny if !options.contains(&Decision::Deny) => Decision::Cancel,
+                    d => d,
+                };
+                let refusal = matches!(decision, Decision::Deny | Decision::Cancel);
+                (options.contains(&decision) && (refusal || tool != permission::TOOL))
+                    .then(|| (request.clone(), decision))
+            }
+            _ => None,
+        };
+        let Some((request, decision)) = answer else {
+            return false;
+        };
+        (self.sink)(RowEvent::Approve {
+            request,
+            decision,
+            custom_rule: None,
+        });
+        true
+    }
+
     pub fn update(&self, transcript: &Transcript) {
         let interruption = transcript.pending_interruption();
         let waiting = transcript.pending_count();
@@ -673,6 +708,12 @@ pub(crate) mod tests {
             [Decision::Deny],
             "even a stray click on the hidden Allow grants nothing"
         );
+        // The keyboard follows the same rules: no Allow or session grant for a permission
+        // request (the key goes through), Deny still works.
+        assert!(!shelf.answer(Decision::Allow));
+        assert!(!shelf.answer(Decision::AllowForSession));
+        assert!(shelf.answer(Decision::Deny));
+        assert_eq!(*answered.borrow(), [Decision::Deny, Decision::Deny]);
 
         // An ordinary approval keeps its Allow.
         let mut command = Transcript::new();
@@ -692,6 +733,34 @@ pub(crate) mod tests {
         shelf.update(&command);
         assert!(shelf.allow_btn.is_visible());
         assert!(shelf.jump_btn.icon_name().is_some());
+        // Keys: what the approval does not offer lets the key through; Allow answers it.
+        assert!(!shelf.answer(Decision::AllowAlways), "not offered");
+        assert!(!shelf.answer(Decision::Cancel), "not offered");
+        assert!(shelf.answer(Decision::Allow));
+        assert_eq!(answered.borrow().last(), Some(&Decision::Allow));
+
+        // Deny falls back to Stop turn where the approval offers no Deny, as the button does.
+        let mut no_deny = Transcript::new();
+        no_deny.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: serde_json::json!({"command": "ls"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Cancel],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("c"),
+            Driver::Claude,
+        );
+        shelf.update(&no_deny);
+        assert!(shelf.answer(Decision::Deny));
+        assert_eq!(answered.borrow().last(), Some(&Decision::Cancel));
+        // Nothing pending: every key goes through.
+        shelf.update(&Transcript::new());
+        assert!(!shelf.answer(Decision::Allow));
+        assert!(!shelf.answer(Decision::Deny));
 
         // A form: whose words, and the way to the card.
         let mut form = Transcript::new();
