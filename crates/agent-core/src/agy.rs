@@ -83,6 +83,9 @@ pub struct AgyAdapter {
     resp_text: HashMap<String, String>,
     /// Cumulative token count across turns in this session.
     cumulative_tokens: u64,
+    /// The actions agy denied in its last turn ([`denied_name`]), until the next prompt: an
+    /// unexpected exit right after names them.
+    last_denied: Vec<String>,
     outbox: Outbox,
 }
 
@@ -110,6 +113,7 @@ impl AgyAdapter {
             fallback_prefix: format!("a{}", ADAPTER_SEQ.fetch_add(1, Ordering::Relaxed)),
             resp_text: HashMap::new(),
             cumulative_tokens: 0,
+            last_denied: Vec::new(),
             outbox: Outbox::default(),
         }
     }
@@ -419,10 +423,11 @@ impl AgyAdapter {
         }
         // Anything still open when the turn ends was cut short.
         self.close_all(out);
-        if !result.denied_actions.is_empty() {
-            let names: Vec<String> = result.denied_actions.iter().map(denied_name).collect();
+        // Kept until the next prompt: an exit right after this turn is reported with them.
+        self.last_denied = result.denied_actions.iter().map(denied_name).collect();
+        if !self.last_denied.is_empty() {
             out.push(env(Event::Notice {
-                text: format!("Denied actions: {}", names.join(", ")),
+                text: format!("agy denied these actions: {}", self.last_denied.join(", ")),
             }));
         }
         let error = result.error.clone().filter(|e| !e.is_empty());
@@ -566,6 +571,8 @@ impl Adapter for AgyAdapter {
                     "message": {"role": "user", "content": text},
                 });
                 self.prompt_pending = true;
+                // A new turn: the last one's denials no longer explain an exit.
+                self.last_denied.clear();
                 Ok(vec![Action::Write(vec![line.to_string()])])
             }
             Command::Interrupt => {
@@ -768,6 +775,19 @@ impl Adapter for AgyAdapter {
                 error: (!expected).then(|| format!("agy exited unexpectedly (code {code:?})")),
             }));
         }
+        // An unexpected exit right after a turn in which agy denied actions: say which, and that
+        // the conversation goes on. No cause is claimed: in the stored threads, denials came on
+        // turns that completed and agy kept running; this only puts the two facts together.
+        let denied = std::mem::take(&mut self.last_denied);
+        if !expected && !denied.is_empty() {
+            out.push(env(Event::Notice {
+                text: format!(
+                    "agy exited right after denying {}. Send a message to continue: the \
+                     conversation resumes in a new agy process.",
+                    denied.join(", ")
+                ),
+            }));
+        }
         out.push(env(Event::SessionExited { code, expected }));
         out
     }
@@ -847,13 +867,31 @@ fn error_message(v: &Value) -> Option<String> {
     }
 }
 
+/// One `denied_actions` entry as words. agy writes either a bare name or an object; its policy
+/// writes `{"action":"command","display_name":"RunCommand"}` (seen in stored threads,
+/// 2026-10-10), shown as `RunCommand (command)`. Older or other shapes name the tool under
+/// `name`/`tool_name`/`tool`. Anything unrecognised falls back to its JSON rather than nothing.
 fn denied_name(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        other => ["name", "tool_name", "tool"]
-            .iter()
-            .find_map(|k| other.get(*k).and_then(Value::as_str))
-            .map_or_else(|| other.to_string(), str::to_owned),
+        other => {
+            let field = |k: &str| {
+                other
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+            };
+            let tool = ["name", "tool_name", "tool"].iter().find_map(|k| field(k));
+            match (field("display_name"), field("action"), tool) {
+                (Some(display), Some(action), _) if display != action => {
+                    format!("{display} ({action})")
+                }
+                (Some(display), _, _) => display.to_owned(),
+                (None, _, Some(tool)) => tool.to_owned(),
+                (None, Some(action), None) => action.to_owned(),
+                (None, None, None) => other.to_string(),
+            }
+        }
     }
 }
 
@@ -1284,6 +1322,97 @@ mod tests {
         );
         assert!(matches!(&ev[0].event, Event::Notice { text } if text.contains("run_command")));
         assert!(matches!(ev[1].event, Event::TurnCompleted { .. }));
+    }
+
+    /// agy's policy writes `{"action","display_name"}` objects (the frame below is a real one,
+    /// from a stored thread): the notice names them, never their JSON.
+    #[test]
+    fn policy_denials_are_named_not_dumped_as_json() {
+        let mut a = AgyAdapter::default();
+        let ev = a.feed(
+            r#"{"event":"result","result":{"conversation_id":"54bedcf5-6f77-4cf4-8c29-88d0be861976","status":"SUCCESS","denied_actions":[{"action":"command","display_name":"RunCommand"},{"action":"read_file","display_name":"ViewFile"},{"action":"write_file","display_name":"ReplaceFileContent"}]}}"#,
+        );
+        let Event::Notice { text } = &ev[0].event else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(
+            text,
+            "agy denied these actions: RunCommand (command), ViewFile (read_file), \
+             ReplaceFileContent (write_file)"
+        );
+        assert!(!text.contains('{'), "{text}");
+        assert!(matches!(
+            ev[1].event,
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn every_denied_shape_reads_as_words() {
+        let name = |v: Value| denied_name(&v);
+        assert_eq!(
+            name(json!({"action": "command", "display_name": "RunCommand"})),
+            "RunCommand (command)"
+        );
+        assert_eq!(name(json!({"display_name": "ViewFile"})), "ViewFile");
+        assert_eq!(name(json!({"action": "read_file"})), "read_file");
+        assert_eq!(name(json!({"tool_name": "Bash"})), "Bash");
+        assert_eq!(name(json!({"name": "write_to_file"})), "write_to_file");
+        assert_eq!(name(json!("run_command")), "run_command");
+        // The same word twice is said once; blanks do not count.
+        assert_eq!(name(json!({"action": "x", "display_name": "x"})), "x");
+        assert_eq!(
+            name(json!({"action": "command", "display_name": " "})),
+            "command"
+        );
+        // Unknown: its JSON, rather than nothing.
+        assert_eq!(name(json!({"what": 1})), r#"{"what":1}"#);
+    }
+
+    /// An unexpected exit right after a turn with denials says which, and that a message
+    /// resumes; an expected exit, or one after a new prompt, adds nothing.
+    #[test]
+    fn an_exit_right_after_denials_names_them() {
+        let denial = r#"{"event":"result","result":{"status":"SUCCESS","denied_actions":[{"action":"command","display_name":"RunCommand"}]}}"#;
+        let notice = |ev: &[Envelope]| {
+            ev.iter().find_map(|e| match &e.event {
+                Event::Notice { text } if text.starts_with("agy exited") => Some(text.clone()),
+                _ => None,
+            })
+        };
+
+        let mut a = AgyAdapter::default();
+        a.feed(denial);
+        let ev = a.on_exit(Some(1));
+        let text = notice(&ev).expect("a notice");
+        assert!(text.contains("RunCommand (command)"), "{text}");
+        assert!(text.contains("Send a message to continue"), "{text}");
+        assert!(matches!(
+            ev.last().expect("exit").event,
+            Event::SessionExited {
+                code: Some(1),
+                expected: false
+            }
+        ));
+
+        let mut a = AgyAdapter::default();
+        a.feed(denial);
+        a.encode(Command::Interrupt).expect("interrupt");
+        assert_eq!(notice(&a.on_exit(Some(1))), None, "expected exit");
+
+        let mut a = AgyAdapter::default();
+        a.feed(denial);
+        a.encode(Command::Prompt {
+            text: "go on".into(),
+        })
+        .expect("prompt");
+        assert_eq!(notice(&a.on_exit(Some(1))), None, "a new turn began");
+
+        let mut a = AgyAdapter::default();
+        assert_eq!(notice(&a.on_exit(Some(1))), None, "no denials");
     }
 
     #[test]
