@@ -6786,6 +6786,49 @@ mod tests {
         assert!(shown.ends_with("3 more lines not shown"), "{shown}");
         assert_eq!(rows, 1);
 
+        // Files sit under a header per folder, collapsed; expanding one builds its own diff, and
+        // a file past where the diff was cut short says so instead of showing another's text.
+        let a = "diff --git a/src/a.rs b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let root = "diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-p\n+q\n";
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                // git's order: chunk i is stats[i]'s; src/b.rs is past the cut.
+                stats: crate::diff::parse_numstat(
+                    b"1\t1\tsrc/a.rs\x001\t1\tREADME.md\x002\t0\tsrc/b.rs\0",
+                ),
+                text: format!("{a}{root}"),
+                omitted_lines: 9,
+                too_large: false,
+                undo_to: None,
+                from: "c0ffee".into(),
+                to_checkpoint: None,
+            })),
+        );
+        assert_eq!(panel.folder_headers(), ["Repository root", "src/"]);
+        let files = panel.file_expanders();
+        assert_eq!(files.len(), 3);
+        assert!(files
+            .iter()
+            .all(|f| !f.is_expanded() && f.child().is_none()));
+        // Order under the headers: README.md, then src/a.rs, src/b.rs.
+        files[1].set_expanded(true);
+        let view = files[1]
+            .child()
+            .and_then(|c| c.downcast::<gtk4::TextView>().ok())
+            .expect("a.rs's diff view");
+        let buffer = view.buffer();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        assert_eq!(format!("{text}\n"), a, "only a.rs's own diff");
+        assert!(files[0].child().is_none(), "README.md stays unbuilt");
+        files[2].set_expanded(true);
+        let hidden = files[2]
+            .child()
+            .and_then(|c| c.downcast::<gtk4::Label>().ok())
+            .expect("a note, not a diff");
+        assert!(hidden.text().contains("cut short"), "{}", hidden.text());
+
         // Before the paned has a size, nothing is placed and no position is
         // taken for the user's choice of width.
         let paned = gtk4::Paned::builder()

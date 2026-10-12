@@ -164,6 +164,66 @@ pub fn file_row(stat: &FileStat) -> String {
     }
 }
 
+/// The last component of a repository-relative path (`src/a.rs` → `a.rs`).
+pub fn file_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// The folder part of a repository-relative path (`src/a.rs` → `src`); `""` at the root.
+pub fn folder_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(folder, _)| folder)
+}
+
+/// A file's row under its folder header: its name, then `+3 −1` or `binary`. A rename names the
+/// old path in full (it may have come from another folder): `old/a.rs → b.rs  +0 −0`.
+pub fn file_label(stat: &FileStat) -> String {
+    let name = match &stat.old_path {
+        Some(old) => format!("{old} → {}", file_name(&stat.path)),
+        None => file_name(&stat.path).to_owned(),
+    };
+    match (stat.added, stat.deleted) {
+        (Some(added), Some(deleted)) => format!("{name}  +{added} −{deleted}"),
+        _ => format!("{name}  binary"),
+    }
+}
+
+/// The files of a diff grouped for the panel: `(folder, indices into stats)`. Folders sorted by
+/// path, the repository root (`""`) first; files sorted by name within each folder.
+pub fn group_by_folder(stats: &[FileStat]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: std::collections::BTreeMap<&str, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, stat) in stats.iter().enumerate() {
+        groups.entry(folder_of(&stat.path)).or_default().push(i);
+    }
+    groups
+        .into_iter()
+        .map(|(folder, mut files)| {
+            files.sort_by(|a, b| file_name(&stats[*a].path).cmp(file_name(&stats[*b].path)));
+            (folder.to_owned(), files)
+        })
+        .collect()
+}
+
+/// A unified diff cut at each `diff --git` header: one chunk per file, in git's order, which is
+/// the order `--numstat` lists them in (so chunk `i` is `stats[i]`'s). A diff cut short by
+/// [`truncate`] has fewer chunks than files. Text before the first header (git writes none) is
+/// dropped.
+pub fn split_by_file(diff: &str) -> Vec<&str> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| &diff[start..starts.get(i + 1).copied().unwrap_or(diff.len())])
+        .collect()
+}
+
 /// How a line of a unified diff is coloured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -342,6 +402,80 @@ pub fn discover_enclosing_repo(paths: &[std::path::PathBuf]) -> Option<std::path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stat(path: &str) -> FileStat {
+        FileStat {
+            path: path.to_owned(),
+            old_path: None,
+            added: Some(1),
+            deleted: Some(0),
+        }
+    }
+
+    /// Folders sorted with the root first, files by name inside each, indices back into `stats`.
+    #[test]
+    fn files_group_under_their_folder() {
+        let stats = [
+            stat("src/window/diff_panel.rs"),
+            stat("Cargo.toml"),
+            stat("src/main.rs"),
+            stat("src/window/imp.rs"),
+            stat("README.md"),
+            stat("src/config.rs"),
+        ];
+        let groups = group_by_folder(&stats);
+        let named: Vec<(&str, Vec<&str>)> = groups
+            .iter()
+            .map(|(folder, files)| {
+                (
+                    folder.as_str(),
+                    files.iter().map(|i| file_name(&stats[*i].path)).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("", vec!["Cargo.toml", "README.md"]),
+                ("src", vec!["config.rs", "main.rs"]),
+                ("src/window", vec!["diff_panel.rs", "imp.rs"]),
+            ]
+        );
+        assert!(group_by_folder(&[]).is_empty());
+    }
+
+    #[test]
+    fn file_labels_name_the_file_under_its_folder() {
+        assert_eq!(file_label(&stat("src/a.rs")), "a.rs  +1 −0");
+        let renamed = FileStat {
+            path: "src/b.rs".into(),
+            old_path: Some("old/a.rs".into()),
+            added: Some(0),
+            deleted: Some(0),
+        };
+        assert_eq!(file_label(&renamed), "old/a.rs → b.rs  +0 −0");
+        let binary = FileStat {
+            added: None,
+            deleted: None,
+            ..stat("logo.png")
+        };
+        assert_eq!(file_label(&binary), "logo.png  binary");
+    }
+
+    /// One chunk per `diff --git` header, each starting at its header, nothing lost between; a
+    /// removed line that reads like a header inside a hunk does not split.
+    #[test]
+    fn diffs_split_at_each_file_header() {
+        let a = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n";
+        let b = "diff --git a/b b/b\nnew file mode 100644\n--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+diff --git not a header\n";
+        let text = format!("{a}{b}");
+        let chunks = split_by_file(&text);
+        assert_eq!(chunks, [a, b]);
+        assert_eq!(chunks.concat(), text);
+        assert!(split_by_file("").is_empty());
+        let no_newline = "diff --git a/a b/a\n@@ -1 +1 @@\n-x\n+y";
+        assert_eq!(split_by_file(no_newline), [no_newline]);
+    }
 
     #[test]
     fn all_lists_every_base_in_dropdown_order() {
