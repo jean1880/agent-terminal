@@ -159,6 +159,27 @@ Architectural mandates, standards, and workflows for this codebase.
   `agent-terminal`) and to stderr when attached to a terminal, with a panic hook.
   Keep meaningful coverage on spawn, detection, config and tab lifecycle paths.
 
+## 🧭 Navigating with Graphify
+
+A Graphify knowledge graph of the repo (code symbols from the AST, docs from a pass on the
+NAS Ollama) lives in the git-ignored `graphify-out/`. Reach for it before a broad grep:
+the `graphify` MCP tools, or the CLI from the repo root:
+
+- `graphify explain "crates/agent-core/src/redact.rs::redact()"`: a symbol's callers and
+  callees with file and line. The strongest tool; start here.
+- `graphify path "ChatSession" "crates_agent_kit_src_store_store"`: how two symbols connect.
+- `graphify affected "<symbol>"`: what depends on a symbol, before you change it.
+- `graphify query "<question>"`: keyword-seeded BFS; broad and noisy, so prefer the above.
+- `graphify-out/GRAPH_REPORT.md`: the communities and hub nodes at a glance.
+
+Short names are often ambiguous (`Store` matches four nodes); the CLI exits 3 and lists the
+candidates, so retry with `<path>::<symbol>` or the node id it prints. Edges tagged
+`[INFERRED]` are guesses; `[EXTRACTED]` ones come from the AST.
+
+The graph is a snapshot: confirm what it says in the source before editing. Refresh it with
+`/home/jdesroches/scripts/graphify-build.sh /home/jdesroches/git/agent-terminal` (add
+`--code-only` for an AST-only pass with no LLM).
+
 ## 🧪 Testing Strategy
 
 - **Logic separation**: keep pure logic in `agent-core`, and GTK-free git and

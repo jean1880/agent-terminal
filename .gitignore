@@ -33,3 +33,6 @@ __pycache__/
 
 # Agent overlays and local settings
 .claude/
+
+# Graphify knowledge graph: a local artefact, rebuilt by graphify-build
+graphify-out/
