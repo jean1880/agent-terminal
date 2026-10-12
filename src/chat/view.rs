@@ -217,11 +217,19 @@ impl ChatView {
                 }
             });
             let w = weak.clone();
-            let subagent_shelf = subagent_shelf::SubagentShelf::new(move |id| {
-                if let Some(inner) = w.upgrade() {
-                    inner.open_subagent(id);
-                }
-            });
+            let w_cleared = weak.clone();
+            let subagent_shelf = subagent_shelf::SubagentShelf::new(
+                move |id| {
+                    if let Some(inner) = w.upgrade() {
+                        inner.open_subagent(id);
+                    }
+                },
+                move || {
+                    if let Some(inner) = w_cleared.upgrade() {
+                        inner.refresh_subagents(&[]);
+                    }
+                },
+            );
             let w = weak.clone();
             let interruption = interruption::InterruptionShelf::new(sink.clone(), move |id| {
                 if let Some(inner) = w.upgrade() {
@@ -1119,6 +1127,9 @@ impl ComposerHost for Inner {
         }
         // What you just sent, and the reply to it, are where the view goes.
         self.transcript.scroll_to_end();
+        // A new prompt starts a new round of work: the last one's finished workers leave the dock.
+        self.subagent_shelf.clear_finished();
+        self.refresh_subagents(&[]);
         if status.running_turn {
             self.backend.queue_prompt(text);
         } else {
