@@ -12,7 +12,6 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::adapter::Driver;
 use agent_core::event::{Account, Envelope, Event, QuotaWindow};
@@ -22,7 +21,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent_proc::{run_side_full, AGY_TIMEOUT};
-use crate::freshness::{age_of, freshness, is_due, Freshness, ACCOUNT_TTL};
+use crate::freshness::{
+    age_of, freshness, is_due, latest, now_epoch, Freshness, ReadAt, ACCOUNT_TTL,
+};
 use crate::probe::{join_n, ListenerSet, ProbeTargets};
 use crate::{claude_probe, codex_probe};
 
@@ -87,20 +88,6 @@ pub fn merge(
     changed
 }
 
-fn driver_index(driver: Driver) -> usize {
-    match driver {
-        Driver::Claude => 0,
-        Driver::Agy => 1,
-        Driver::Codex => 2,
-    }
-}
-
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
 /// `~/.gemini/google_accounts.json`, from the value of `HOME`.
 pub fn google_accounts_path(home: Option<&str>) -> Option<PathBuf> {
     let home = home.filter(|h| std::path::Path::new(h).is_absolute())?;
@@ -131,7 +118,7 @@ pub struct AccountStatus {
     refreshing: Cell<bool>,
     /// Each agent's last finished probe in this run (Claude, agy, Codex), successful or not: with
     /// `read_at`, the due clock.
-    tried_at: Cell<[Option<i64>; 3]>,
+    tried_at: Cell<ReadAt>,
     /// Agents the user asked to check again ([`Self::recheck`]): probed by the next refresh even
     /// if signed out (agy is otherwise skipped then).
     forced: RefCell<Vec<Driver>>,
@@ -152,7 +139,7 @@ impl AccountStatus {
             codex: RefCell::default(),
             listeners: ListenerSet::default(),
             refreshing: Cell::new(false),
-            tried_at: Cell::new([None; 3]),
+            tried_at: Cell::new(ReadAt::default()),
             forced: RefCell::default(),
             queued: RefCell::default(),
         }
@@ -226,7 +213,7 @@ impl AccountStatus {
 
     fn mark_tried(&self, driver: Driver, now: i64) {
         let mut tried = self.tried_at.get();
-        tried[driver_index(driver)] = Some(now);
+        tried.set(driver, Some(now));
         self.tried_at.set(tried);
     }
 
@@ -236,12 +223,10 @@ impl AccountStatus {
         if self.is_rechecking(driver) {
             return true;
         }
-        let read = self.slot(driver).borrow().read_at;
-        let tried = self.tried_at.get()[driver_index(driver)];
-        let last = match (read, tried) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+        let last = latest(
+            self.slot(driver).borrow().read_at,
+            self.tried_at.get().get(driver),
+        );
         is_due(last, now, ACCOUNT_TTL)
     }
 

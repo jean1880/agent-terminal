@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 
 use crate::agent_proc::{run_side, AGY_TIMEOUT};
 use crate::chat::ModelSource;
-use crate::freshness::{age_of, is_due, now_epoch, CatalogStatus, MODEL_PICKER_AGE, MODEL_TTL};
+use crate::freshness::{
+    is_due, latest, now_epoch, CatalogStatus, ReadAt, MODEL_PICKER_AGE, MODEL_TTL,
+};
 use crate::probe::{join_n, ListenerSet, ProbeTargets};
 use crate::{claude_probe, codex_probe};
 
@@ -62,36 +64,36 @@ struct CacheFile {
     read_at: ReadAt,
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq)]
-struct ReadAt {
-    #[serde(default)]
-    claude: Option<i64>,
-    #[serde(default)]
-    agy: Option<i64>,
-    #[serde(default)]
-    codex: Option<i64>,
-}
-
-impl ReadAt {
-    fn get(&self, driver: Driver) -> Option<i64> {
-        match driver {
-            Driver::Claude => self.claude,
-            Driver::Agy => self.agy,
-            Driver::Codex => self.codex,
-        }
-    }
-
-    fn set(&mut self, driver: Driver, at: Option<i64>) {
-        match driver {
-            Driver::Claude => self.claude = at,
-            Driver::Agy => self.agy = at,
-            Driver::Codex => self.codex = at,
-        }
-    }
-}
-
 fn decode_cache(text: &str) -> CacheFile {
     serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Writes the cache off the main thread (an fsync can stall). Writes are numbered so a slow,
+/// older one never lands over a newer one; each is the shared private (0600) atomic write.
+fn write_cache(path: PathBuf, bytes: Vec<u8>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static WRITTEN: Mutex<u64> = Mutex::new(0);
+    let generation = NEXT.fetch_add(1, Ordering::Relaxed);
+    let write = move || {
+        let mut written = WRITTEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *written > generation {
+            return; // a newer write already landed
+        }
+        if let Err(e) = agent_kit::fsutil::write_private_atomic(&path, &bytes) {
+            warn!(error = %e, "could not write the model cache");
+        }
+        *written = generation;
+    };
+    // Unit tests read the file straight back and run without a main loop: write in place.
+    if cfg!(test) {
+        write();
+    } else {
+        drop(gtk4::gio::spawn_blocking(write));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -114,6 +116,12 @@ pub struct ModelCatalog {
     refreshing: Cell<bool>,
     /// Each list's last successful fetch (persisted with the lists).
     read_at: Cell<ReadAt>,
+    /// The times last written to (or read from) the cache: an unchanged list is written again
+    /// only when its time moved by [`MODEL_PICKER_AGE`] or more.
+    saved_at: Cell<ReadAt>,
+    /// A forced fetch asked for while another ran: run once that one ends, so a Settings change
+    /// (another command or env file) is never left on the old profile's list.
+    queued: Cell<bool>,
     /// Each agent's last finished fetch in this run, successful or not: the due clock, so a
     /// failing agent is not fetched again on every check.
     tried_at: Cell<ReadAt>,
@@ -157,6 +165,8 @@ impl ModelCatalog {
             cache,
             refreshing: Cell::new(false),
             read_at: Cell::new(loaded.read_at),
+            saved_at: Cell::new(loaded.read_at),
+            queued: Cell::new(false),
             tried_at: Cell::new(ReadAt::default()),
             failed: RefCell::new(Vec::new()),
             forced: RefCell::new(Vec::new()),
@@ -205,16 +215,6 @@ impl ModelCatalog {
         self.is_fresh(driver) || self.attempted.borrow().contains(&driver)
     }
 
-    /// Whether a session start may skip waiting for `driver`'s fetch: it has settled, or the
-    /// cached list was fetched within [`MODEL_TTL`]. A start that skips the wait still never
-    /// ports a model on the cached list ([`Self::is_fresh`] stays false); the fetch landing
-    /// later re-judges the thread.
-    pub fn may_start_without_waiting(&self, driver: Driver, now: i64) -> bool {
-        self.is_settled(driver)
-            || (!self.slot(driver).borrow().is_empty()
-                && age_of(self.read_at.get().get(driver), now).is_some_and(|a| a < MODEL_TTL))
-    }
-
     fn mark_attempted(&self, driver: Driver) {
         self.mark_attempted_at(driver, now_epoch());
     }
@@ -227,6 +227,13 @@ impl ModelCatalog {
         if !attempted.contains(&driver) {
             attempted.push(driver);
         }
+    }
+
+    /// A fetch in this run finishing with `models` (tests elsewhere in the crate).
+    #[cfg(test)]
+    pub(crate) fn land_fetch(&self, driver: Driver, models: Vec<CatalogModel>) {
+        self.set(driver, models);
+        self.mark_attempted(driver);
     }
 
     /// Records a failed fetch: the list stays, and is shown as not refreshed.
@@ -252,13 +259,10 @@ impl ModelCatalog {
         if self.forced.borrow().contains(&driver) || !self.attempted.borrow().contains(&driver) {
             return true;
         }
-        let last = match (
+        let last = latest(
             self.read_at.get().get(driver),
             self.tried_at.get().get(driver),
-        ) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+        );
         let ttl = if self.slot(driver).borrow().is_empty() {
             ttl.min(MODEL_PICKER_AGE)
         } else {
@@ -272,13 +276,15 @@ impl ModelCatalog {
         let read_at = self.read_at.get();
         let shown: Vec<Driver> = Driver::ALL.into_iter().filter(|d| shown(*d)).collect();
         let failed = shown.iter().any(|d| self.failed.borrow().contains(d));
-        // The oldest read among the shown agents that have a list; one without a time is unknown.
+        // The oldest read among the shown agents; one with no list, or a list without a time,
+        // was not read, which makes the whole footer "not read".
         let mut oldest: Option<Option<i64>> = None;
         for d in shown {
-            if self.slot(d).borrow().is_empty() {
-                continue;
-            }
-            let at = read_at.get(d);
+            let at = if self.slot(d).borrow().is_empty() {
+                None
+            } else {
+                read_at.get(d)
+            };
             oldest = Some(match (oldest, at) {
                 (None, at) => at,
                 (Some(Some(o)), Some(a)) => Some(o.min(a)),
@@ -338,9 +344,12 @@ impl ModelCatalog {
         if changed {
             *slot.borrow_mut() = models;
         }
-        // Saved on every success, unchanged list or not: the time is what makes it Fresh after
-        // a restart. At most once per fetch, so about once an hour per agent.
-        self.save();
+        // The time is what keeps an old list from looking Fresh after a restart, so an unchanged
+        // list is still saved, but only once its stored time is MODEL_PICKER_AGE behind.
+        let stored = self.saved_at.get().get(driver);
+        if changed || stored.is_none_or(|s| now.saturating_sub(s) >= MODEL_PICKER_AGE) {
+            self.save();
+        }
         if changed || newly_fresh {
             self.listeners.notify();
         }
@@ -354,24 +363,33 @@ impl ModelCatalog {
             codex: self.codex.borrow().clone(),
             read_at: self.read_at.get(),
         };
-        let result = serde_json::to_vec(&file)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| agent_kit::fsutil::write_private_atomic(path, &bytes));
-        if let Err(e) = result {
-            warn!(error = %e, "could not write the model cache");
+        match serde_json::to_vec(&file) {
+            Ok(bytes) => {
+                self.saved_at.set(self.read_at.get());
+                write_cache(path.clone(), bytes);
+            }
+            Err(e) => warn!(error = %e, "could not encode the model cache"),
         }
     }
 
     /// Re-fetches every ready agent's list in the background, whatever its clock says (Settings
-    /// changed the agent, or the user asked). Returns at once; a refresh already in flight makes
-    /// this a no-op. No program is given a prompt, and each runs in the environment its threads
-    /// get.
+    /// changed the agent, or the user asked). Returns at once; asked while a fetch runs, it runs
+    /// once more when that one ends, with these targets. No program is given a prompt, and each
+    /// runs in the environment its threads get.
     pub fn refresh(self: &Rc<Self>, targets: &ProbeTargets) {
         *self.targets.borrow_mut() = targets.clone();
         let all: Vec<Driver> = Driver::ALL
             .into_iter()
             .filter(|d| targets.get(*d).is_some())
             .collect();
+        if self.refreshing.get() {
+            debug!("model catalog refresh already running; queued another");
+            for d in &all {
+                self.mark_due(*d);
+            }
+            self.queued.set(true);
+            return;
+        }
         self.fetch(targets, &all);
     }
 
@@ -418,6 +436,11 @@ impl ModelCatalog {
             join_n(u8::try_from(drivers.len()).unwrap_or(u8::MAX), move || {
                 me.refreshing.set(false);
                 me.status_listeners.notify();
+                // A forced refresh asked for meanwhile: its drivers were marked due, with the
+                // targets it brought.
+                if me.queued.replace(false) {
+                    me.fetch_due(now_epoch(), MODEL_TTL);
+                }
             })
         };
         for &driver in drivers {
@@ -535,7 +558,7 @@ impl ModelSource for ModelCatalog {
         Some(self.status_of(|d| availability.is_ready(d)))
     }
 
-    fn refresh(self: Rc<Self>, force: bool) {
+    fn refresh_lists(self: Rc<Self>, force: bool) {
         self.refresh_for_picker(force, now_epoch());
     }
 
@@ -712,7 +735,7 @@ mod tests {
         assert_eq!(ids, ["opus", "g", "gpt"]);
     }
 
-    use crate::freshness::{freshness, Freshness, DUE_SLACK};
+    use crate::freshness::{age_of, freshness, Freshness, DUE_SLACK};
 
     const NOW: i64 = 1_800_000_000;
 
@@ -783,7 +806,10 @@ mod tests {
             freshness(age_of(st.read_at, NOW), MODEL_TTL),
             Freshness::Expired
         );
-        assert!(!cat.may_start_without_waiting(Driver::Claude, NOW));
+        assert!(
+            !cat.is_settled(Driver::Claude),
+            "a start waits for this run's fetch"
+        );
         assert!(cat.is_due(Driver::Claude, NOW, MODEL_TTL));
     }
 
@@ -805,30 +831,76 @@ mod tests {
             Some(NOW + 3600)
         );
         assert!(!again.is_fresh(Driver::Claude), "cached is not this run");
-        // The oldest shown list sets the footer's age; one with no list is left out.
+        // The oldest shown list sets the footer's age.
         again.set_at(Driver::Codex, vec![model(Driver::Codex, "gpt")], NOW + 7200);
-        assert_eq!(again.status_of(|_| true).read_at, Some(NOW + 3600));
+        assert_eq!(
+            again.status_of(|d| d != Driver::Agy).read_at,
+            Some(NOW + 3600)
+        );
+        // A shown agent with no list at all was not read: the footer cannot say "Updated".
+        assert_eq!(again.status_of(|_| true).read_at, None);
     }
 
     #[test]
-    fn a_cached_list_within_the_ttl_starts_a_thread_without_waiting() {
+    fn an_unchanged_list_is_rewritten_only_when_its_time_moved_far() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models.json");
-        ModelCatalog::with_cache(Some(path.clone())).set_at(
+        let stored = || ModelCatalog::with_cache(Some(path.clone())).read_at.get();
+        let cat = ModelCatalog::with_cache(Some(path.clone()));
+        let opus = || vec![model(Driver::Claude, "opus")];
+        cat.set_at(Driver::Claude, opus(), NOW);
+        assert_eq!(stored().get(Driver::Claude), Some(NOW));
+        // Refetched a few minutes later, unchanged: not written again.
+        cat.set_at(Driver::Claude, opus(), NOW + 300);
+        assert_eq!(stored().get(Driver::Claude), Some(NOW));
+        assert_eq!(cat.read_at.get().get(Driver::Claude), Some(NOW + 300));
+        // Far enough on, the time is saved.
+        cat.set_at(Driver::Claude, opus(), NOW + MODEL_PICKER_AGE);
+        assert_eq!(stored().get(Driver::Claude), Some(NOW + MODEL_PICKER_AGE));
+        // A changed list is always written.
+        cat.set_at(
             Driver::Claude,
-            vec![model(Driver::Claude, "opus")],
-            NOW,
+            vec![model(Driver::Claude, "sonnet")],
+            NOW + MODEL_PICKER_AGE + 1,
         );
-        let cat = ModelCatalog::with_cache(Some(path));
-        assert!(
-            !cat.is_settled(Driver::Claude),
-            "nothing fetched in this run"
+        assert_eq!(
+            stored().get(Driver::Claude),
+            Some(NOW + MODEL_PICKER_AGE + 1)
         );
-        assert!(cat.may_start_without_waiting(Driver::Claude, NOW + 60));
-        // Beyond the TTL the start waits for this run's fetch, as before.
-        assert!(!cat.may_start_without_waiting(Driver::Claude, NOW + MODEL_TTL));
-        // An agent with no cached list waits too.
-        assert!(!cat.may_start_without_waiting(Driver::Agy, NOW + 60));
+    }
+
+    #[test]
+    fn a_forced_refresh_asked_for_during_a_fetch_runs_after_it() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (targets, mark) = marking_claude(dir.path());
+        let starts = || {
+            std::fs::read_to_string(&mark)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        in_loop(|ctx| {
+            // One fetch alone, to learn how many processes a probe starts.
+            let once = Rc::new(ModelCatalog::with_cache(None));
+            once.refresh(&targets);
+            assert!(pump_until(ctx, 15, || !once.refreshing.get()));
+            let per_fetch = starts();
+            assert!(per_fetch > 0);
+            std::fs::remove_file(&mark).unwrap();
+
+            let cat = Rc::new(ModelCatalog::with_cache(None));
+            cat.refresh(&targets);
+            assert!(cat.refreshing.get());
+            // Settings changed the agent meanwhile: not dropped, queued.
+            cat.refresh(&targets);
+            assert!(
+                pump_until(ctx, 15, || starts() >= 2 * per_fetch),
+                "the queued fetch ran"
+            );
+            assert!(pump_until(ctx, 15, || !cat.refreshing.get()));
+            pump_until(ctx, 1, || false);
+            assert_eq!(starts(), 2 * per_fetch, "once more, not more");
+        });
     }
 
     /// A fake `claude` that leaves a mark each time it is started.

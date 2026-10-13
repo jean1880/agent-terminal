@@ -654,18 +654,12 @@ pub(super) async fn wait_until(
 }
 
 /// Waits (at most [`CATALOG_WAIT`]) for `driver`'s model list to be fresh, or for its fetch to
-/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s. A
-/// cached list fetched within the TTL does not wait at all (it is still not used to port a
-/// model; the fetch landing later re-judges the thread).
+/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s. Only a
+/// fetch in this run settles it, never the cache's age: argv decisions use the same predicate.
+/// The one start-up fetch per ready agent makes the wait rare after the first seconds.
 async fn wait_for_fresh_catalog(driver: Driver) {
     let catalog = ModelCatalog::shared();
-    if catalog.may_start_without_waiting(driver, crate::freshness::now_epoch()) {
-        return;
-    }
-    wait_until(CATALOG_WAIT, std::time::Duration::from_millis(100), || {
-        catalog.is_settled(driver)
-    })
-    .await;
+    wait_for_catalog(&catalog, driver, CATALOG_WAIT).await;
     if !catalog.is_fresh(driver) {
         info!(
             "{} model list not fresh after {:?}; starting on the stored model",
@@ -673,6 +667,18 @@ async fn wait_for_fresh_catalog(driver: Driver) {
             CATALOG_WAIT
         );
     }
+}
+
+/// Waits at most `limit` for `catalog`'s fetch of `driver` in this run to settle; whether it did.
+async fn wait_for_catalog(
+    catalog: &ModelCatalog,
+    driver: Driver,
+    limit: std::time::Duration,
+) -> bool {
+    wait_until(limit, std::time::Duration::from_millis(100), || {
+        catalog.is_settled(driver)
+    })
+    .await
 }
 
 /// Everything [`AgentTerminalWindow::build_thread`] needs once the agent is resolved and the
@@ -4854,40 +4860,90 @@ pub(super) mod tests {
         );
     }
 
-    /// A list read from the cache, however recent, never ports a thread's model in argv: only a
-    /// list fetched in this run does (`is_fresh`), so a thread that skipped the wait starts on
-    /// its stored model and the later fetch re-judges it.
-    #[test]
-    fn a_cached_list_never_swaps_argv_even_inside_its_ttl() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("models.json");
-        let now = crate::freshness::now_epoch();
+    fn sonnet() -> agent_core::catalog::CatalogModel {
+        agent_core::catalog::CatalogModel {
+            driver: Driver::Claude,
+            id: "sonnet".into(),
+            display: "Sonnet".into(),
+            description: None,
+            efforts: vec!["low".into(), "high".into()],
+            default_effort: None,
+            via: None,
+        }
+    }
+
+    /// A catalogue holding only a recent cached Claude list (fetched a minute ago, last run).
+    fn cached_catalog(dir: &std::path::Path) -> Rc<ModelCatalog> {
+        let path = dir.join("models.json");
         let cache = serde_json::json!({
-            "claude": [{"driver": "claude", "id": "sonnet", "display": "Sonnet",
-                        "description": null, "efforts": [], "default_effort": null, "via": null}],
-            "read_at": {"claude": now - 60},
+            "claude": [sonnet()],
+            "read_at": {"claude": crate::freshness::now_epoch() - 60},
         });
         std::fs::write(&path, cache.to_string()).unwrap();
-        let catalog = ModelCatalog::with_cache(Some(path));
+        Rc::new(ModelCatalog::with_cache(Some(path)))
+    }
+
+    /// A start from a list fetched in this run does not wait.
+    #[test]
+    fn a_thread_started_after_this_runs_fetch_does_not_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = cached_catalog(dir.path());
+        catalog.land_fetch(Driver::Claude, vec![sonnet()]);
+        let ctx = glib::MainContext::new();
+        let started = std::time::Instant::now();
+        assert!(ctx.block_on(wait_for_catalog(&catalog, Driver::Claude, CATALOG_WAIT)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    /// A cached list, however recent, is neither a reason to skip the wait nor to port a model
+    /// in argv: the start waits (at most CATALOG_WAIT) for this run's fetch, which then ports a
+    /// retired model before it reaches argv.
+    #[test]
+    fn a_thread_started_from_only_a_cached_list_waits_then_ports_a_retired_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = cached_catalog(dir.path());
         assert_eq!(catalog.models_of(Driver::Claude).len(), 1, "cache read");
         assert!(
-            catalog.may_start_without_waiting(Driver::Claude, now),
-            "no wait"
+            !catalog.is_settled(Driver::Claude),
+            "cache alone does not settle"
         );
-        assert!(!catalog.is_fresh(Driver::Claude));
-        let (model, effort, ported) = decide_live_model(
-            &catalog.models_of(Driver::Claude),
-            catalog.is_fresh(Driver::Claude),
-            Some("claude-sonnet-3-7".into()),
-            Some("high".into()),
-        );
+        // On the cached list alone, nothing is ported.
+        let retired = || {
+            (
+                Some("claude-sonnet-3-7".to_owned()),
+                Some("high".to_owned()),
+            )
+        };
+        let decide = |c: &ModelCatalog| {
+            let (m, e) = retired();
+            decide_live_model(
+                &c.models_of(Driver::Claude),
+                c.is_fresh(Driver::Claude),
+                m,
+                e,
+            )
+        };
+        assert_eq!(decide(&catalog).0.as_deref(), Some("claude-sonnet-3-7"));
+        crate::testutil::in_loop(|ctx| {
+            // This run's fetch lands while the start waits.
+            let landing = catalog.clone();
+            ctx.spawn_local(async move {
+                glib::timeout_future(std::time::Duration::from_millis(150)).await;
+                landing.land_fetch(Driver::Claude, vec![sonnet()]);
+            });
+            let started = std::time::Instant::now();
+            let settled = ctx.block_on(wait_for_catalog(&catalog, Driver::Claude, CATALOG_WAIT));
+            assert!(settled);
+            let waited = started.elapsed();
+            assert!(waited >= std::time::Duration::from_millis(100), "it waited");
+            assert!(waited <= CATALOG_WAIT);
+        });
+        let (model, effort, ported) = decide(&catalog);
         assert_eq!(
-            model.as_deref(),
-            Some("claude-sonnet-3-7"),
-            "argv unchanged"
+            (model.as_deref(), effort.as_deref()),
+            (Some("sonnet"), Some("high"))
         );
-        assert_eq!(effort.as_deref(), Some("high"));
-        assert!(ported.is_none());
+        assert_eq!(ported.expect("recorded").model, "claude-sonnet-3-7");
     }
 
     #[test]

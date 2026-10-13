@@ -17,7 +17,9 @@ use gtk4::prelude::*;
 use super::cards::{accent_class, brand_image, driver_name, label};
 use crate::account_status::{AccountStatus, Snapshot};
 use crate::availability::AgentAvailability;
-use crate::freshness::{age_of, ago, freshness, last_read_text, Freshness, ACCOUNT_TTL};
+use crate::freshness::{
+    age_of, ago, freshness, last_read_text, next_boundary, now_epoch, Freshness, ACCOUNT_TTL,
+};
 
 const WARN_AT: f64 = 0.75;
 const CRITICAL_AT: f64 = 0.90;
@@ -86,12 +88,6 @@ pub fn split_windows(windows: &[QuotaWindow]) -> (Option<&QuotaWindow>, Option<&
     (most(false), most(true))
 }
 
-pub(super) fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
 fn bar(used: f64, width: i32) -> gtk4::ProgressBar {
     let bar = gtk4::ProgressBar::new();
     bar.set_fraction(used.clamp(0.0, 1.0));
@@ -114,10 +110,18 @@ pub struct UsageIndicator {
     availability_listener: Cell<Option<u64>>,
     /// Run after each repaint (its size may have changed): see [`Self::connect_repainted`].
     on_repaint: RefCell<Vec<Box<dyn Fn()>>>,
+    /// The repaint due when a shown reading next changes freshness (Fresh to Aging, Aging to
+    /// Expired), so an unfocused window that probes nothing still stops looking healthy.
+    boundary: RefCell<Option<gtk4::glib::SourceId>>,
+    /// This indicator, for the boundary timer to call back without keeping it alive.
+    me: RefCell<std::rc::Weak<UsageIndicator>>,
 }
 
 impl Drop for UsageIndicator {
     fn drop(&mut self) {
+        if let Some(source) = self.boundary.take() {
+            source.remove();
+        }
         if let Some(id) = self.listener.take() {
             self.status.disconnect(id);
         }
@@ -160,7 +164,10 @@ impl UsageIndicator {
             listener: Cell::new(None),
             availability_listener: Cell::new(None),
             on_repaint: RefCell::new(Vec::new()),
+            boundary: RefCell::new(None),
+            me: RefCell::new(std::rc::Weak::new()),
         });
+        *this.me.borrow_mut() = Rc::downgrade(&this);
         this.repaint();
         let weak = Rc::downgrade(&this);
         let id = AgentAvailability::shared().connect_changed(move || {
@@ -214,7 +221,35 @@ impl UsageIndicator {
     }
 
     fn repaint(&self) {
-        self.render_snapshots(&self.shown());
+        let shown = self.shown();
+        self.render_snapshots(&shown);
+        self.schedule_boundary(&shown, now_epoch());
+    }
+
+    /// Replaces the pending boundary repaint with one at the next moment a shown reading
+    /// changes freshness (none when nothing will).
+    fn schedule_boundary(&self, shown: &[(Driver, Snapshot)], now: i64) {
+        if let Some(old) = self.boundary.take() {
+            old.remove(); // still pending: a fired one clears itself first
+        }
+        let reads = shown
+            .iter()
+            .filter(|(_, s)| !s.signed_out)
+            .filter_map(|(_, s)| s.read_at);
+        let Some(at) = next_boundary(reads, now, ACCOUNT_TTL) else {
+            return;
+        };
+        let secs = u32::try_from(at.saturating_sub(now).max(1)).unwrap_or(u32::MAX);
+        let weak = self.me.borrow().clone();
+        let id = gtk4::glib::timeout_add_seconds_local_once(secs, move || {
+            if let Some(this) = weak.upgrade() {
+                // This source is done: forget it without removing it, then repaint (which
+                // schedules the next boundary).
+                let _fired = this.boundary.take();
+                this.repaint();
+            }
+        });
+        *self.boundary.borrow_mut() = Some(id);
     }
 
     fn render_snapshots(&self, shown: &[(Driver, Snapshot)]) {
@@ -280,6 +315,14 @@ pub fn reading_text(snap: &Snapshot, now: i64) -> Option<String> {
     })
 }
 
+/// The "Unknown" meter's tooltip: always says why there is nothing to show.
+pub fn unknown_tooltip(agent: &str, read: Option<&str>) -> String {
+    match read {
+        Some(read) => format!("{agent} · {read}"),
+        None => format!("{agent} · No usage data could be read"),
+    }
+}
+
 /// The severity class a value is drawn with: an Aging reading never gets the healthy colour.
 fn shown_class(used: f64, aging: bool) -> &'static str {
     match severity(used) {
@@ -309,9 +352,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let (short, weekly) = split_windows(&snap.windows);
     if state == Freshness::Expired || (short.is_none() && weekly.is_none()) {
         b.append(&label("Unknown", &["usage-text"]));
-        if let Some(read) = read {
-            b.set_tooltip_text(Some(&format!("{} · {read}", driver_name(driver))));
-        }
+        b.set_tooltip_text(Some(&unknown_tooltip(driver_name(driver), read.as_deref())));
         return b;
     }
     let aging = state == Freshness::Aging || snap.refresh_failed;
@@ -573,6 +614,15 @@ pub(crate) mod tests {
             Freshness::Expired
         );
         assert_eq!(reading_text(&snap(None, false), now), None);
+        // Never read: the Unknown meter still says why.
+        assert_eq!(
+            unknown_tooltip("Codex", None),
+            "Codex · No usage data could be read"
+        );
+        assert_eq!(
+            unknown_tooltip("Codex", Some("Could not read recently")),
+            "Codex · Could not read recently"
+        );
         assert!(reading_text(&snap(Some(7 * ACCOUNT_TTL), false), now)
             .is_some_and(|t| t.starts_with("Could not read recently")));
     }

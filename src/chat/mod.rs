@@ -91,7 +91,7 @@ pub trait ModelSource {
     }
     /// The picker opened (`force`: its Refresh button): fetch in the background what is old.
     /// Returns at once; the lists show from cache meanwhile.
-    fn refresh(self: std::rc::Rc<Self>, _force: bool) {}
+    fn refresh_lists(self: std::rc::Rc<Self>, _force: bool) {}
     /// Calls `f` when [`Self::status`] may have changed; `None` when it never does.
     fn connect_status_changed(&self, _f: Box<dyn Fn()>) -> Option<u64> {
         None

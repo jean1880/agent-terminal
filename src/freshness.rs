@@ -12,6 +12,8 @@
 //! Neither predicate says whether a model list was fetched in *this run*: argv decisions keep
 //! using [`crate::model_catalog::ModelCatalog::is_fresh`] for that.
 
+use agent_core::adapter::Driver;
+
 /// Account and usage: probed again when the last reading is this old (seconds). A live
 /// `QuotaUpdated` from a thread counts as a reading, so an agent in use is never probed.
 pub const ACCOUNT_TTL: i64 = 10 * 60;
@@ -24,6 +26,54 @@ pub const MODEL_PICKER_AGE: i64 = 15 * 60;
 /// A clock check that lands this close to a TTL already counts as due: the 10-minute timer would
 /// otherwise just miss a reading taken a few seconds after the previous tick, and wait 20.
 pub const DUE_SLACK: i64 = 60;
+
+/// One optional time (epoch seconds) per agent: a last read or a last attempt. Persisted as is
+/// in the model cache, where a missing field reads as never.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReadAt {
+    #[serde(default)]
+    pub claude: Option<i64>,
+    #[serde(default)]
+    pub agy: Option<i64>,
+    #[serde(default)]
+    pub codex: Option<i64>,
+}
+
+impl ReadAt {
+    pub fn get(&self, driver: Driver) -> Option<i64> {
+        match driver {
+            Driver::Claude => self.claude,
+            Driver::Agy => self.agy,
+            Driver::Codex => self.codex,
+        }
+    }
+
+    pub fn set(&mut self, driver: Driver, at: Option<i64>) {
+        match driver {
+            Driver::Claude => self.claude = at,
+            Driver::Agy => self.agy = at,
+            Driver::Codex => self.codex = at,
+        }
+    }
+}
+
+/// The later of two optional times.
+pub fn latest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The next moment at or after `now` when a reading taken at one of `reads` changes how it may
+/// be shown (Fresh to Aging at 2×`ttl`, Aging to Expired past 6×`ttl`): when to repaint.
+pub fn next_boundary(reads: impl IntoIterator<Item = i64>, now: i64, ttl: i64) -> Option<i64> {
+    reads
+        .into_iter()
+        .flat_map(|at| [at.saturating_add(2 * ttl), at.saturating_add(6 * ttl + 1)])
+        .filter(|t| *t > now)
+        .min()
+}
 
 /// The wall clock, in epoch seconds: what callers pass as `now` outside tests.
 pub fn now_epoch() -> i64 {
@@ -154,6 +204,28 @@ mod tests {
         assert!(is_due(Some(now - T), now, T));
         assert!(is_due(Some(now + DUE_SLACK + 1), now, T), "future");
         assert!(!is_due(Some(now + 5), now, T), "skew is not future");
+    }
+
+    #[test]
+    fn the_next_repaint_is_the_nearest_freshness_boundary_ahead() {
+        let now = 100_000;
+        // Read just now: it turns Aging at 2×TTL.
+        assert_eq!(next_boundary([now], now, T), Some(now + 2 * T));
+        // Already Aging: the next change is Expired, just past 6×TTL.
+        assert_eq!(
+            next_boundary([now - 3 * T], now, T),
+            Some(now - 3 * T + 6 * T + 1)
+        );
+        // The nearest of several; long expired readings change no more.
+        assert_eq!(
+            next_boundary([now - 7 * T, now - T, now], now, T),
+            Some(now + T)
+        );
+        assert_eq!(next_boundary([now - 7 * T], now, T), None);
+        assert_eq!(next_boundary([], now, T), None);
+        assert_eq!(latest(Some(1), Some(2)), Some(2));
+        assert_eq!(latest(None, Some(2)), Some(2));
+        assert_eq!(latest(None, None), None);
     }
 
     #[test]

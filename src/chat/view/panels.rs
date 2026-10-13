@@ -347,11 +347,12 @@ fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<g
             else {
                 return;
             };
-            let now = super::usage::now_epoch();
+            let now = crate::freshness::now_epoch();
             text.set_text(&crate::freshness::picker_footer(status, now));
             let fresh = !status.failed
                 && freshness(age_of(status.read_at, now), MODEL_TTL) == Freshness::Fresh;
-            if fresh || status.refreshing {
+            // "Refreshing…" keeps the state's look: an Expired or failed list stays muted.
+            if fresh {
                 text.remove_css_class("stale");
             } else {
                 text.add_css_class("stale");
@@ -362,7 +363,7 @@ fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<g
     update();
     button.connect_clicked({
         let source = source.clone();
-        move |_| source.clone().refresh(true)
+        move |_| source.clone().refresh_lists(true)
     });
     if let Some(id) = source.connect_status_changed(Box::new({
         let update = update.clone();
@@ -487,7 +488,7 @@ pub fn model_picker(ctx: &PanelCtx) {
             }
             // Lists older than the picker's age are fetched in the background; the cached ones
             // are already shown.
-            source.clone().refresh(false);
+            source.clone().refresh_lists(false);
             *ctx.model_listener.borrow_mut() = Some(live);
             let slot = ctx.model_listener.clone();
             d.connect_closed(move |_| {
@@ -779,7 +780,7 @@ pub fn usage_panel(ctx: &PanelCtx) {
             stack,
             move |result| match result {
                 Ok(v) => {
-                    let rows = usage_rows(&v, super::usage::now_epoch());
+                    let rows = usage_rows(&v, crate::freshness::now_epoch());
                     let page = if rows.is_empty() {
                         json_page(&v, None)
                     } else {
