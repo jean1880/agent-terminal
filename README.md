@@ -773,9 +773,10 @@ change (`~`) or be deleted (`−`), and warns if the agent still looks busy.
 
 ### Worktree threads
 
-**New Thread in Isolated Git Worktree…** (`Ctrl+Shift+G`) asks for a new branch and what to start
-it from, checks both as you type, then runs `git worktree add -b <branch>` and opens a
-thread there.
+**New Thread in Isolated Git Worktree…** (`Ctrl+Shift+G`) asks for the repository, a new branch
+and what to start it from, checks them as you type, then runs `git worktree add -b <branch>` and
+opens a thread there. The repository starts as the current thread's, when it is in one; **Choose…**
+picks any other folder in a repository, so no thread needs to be open in it first.
 
 Worktrees go in a hidden folder beside the repository,
 `<parent>/.<repo>.worktrees/<branch>`, so tools that scan every project folder don't
