@@ -43,6 +43,7 @@ impl Drop for StripInner {
 
 pub struct ThinkingStrip {
     pub revealer: gtk4::Revealer,
+    row: gtk4::Box,
     inner: Rc<StripInner>,
 }
 
@@ -84,7 +85,16 @@ impl ThinkingStrip {
             current_agent: RefCell::new(String::new()),
         });
 
-        Self { revealer, inner }
+        Self {
+            revealer,
+            row,
+            inner,
+        }
+    }
+
+    /// Puts `widget` at the end of the strip, after its status (the background task button).
+    pub fn append(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.row.append(widget);
     }
 
     /// Follows the thread: shown while its turn runs or background work it waits on does,

@@ -177,6 +177,109 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
     }
 }
 
+/// The strip lists every background task; a shell task opens its output, read from the agent
+/// once a second (escapes stripped) until it ends, then once more, and never again after that.
+/// A sub-agent task whose item is not in the thread has nothing to open.
+#[test]
+#[ignore = "native GTK; run alone in an isolated display"]
+fn native_background_tasks_are_listed_and_a_shell_task_shows_its_output() {
+    use agent_core::event::{BackgroundTask, BackgroundTaskKind};
+    let ctx = init();
+    let backend = RecordingBackend::new(Driver::Claude);
+    let view = ChatView::new(backend.clone());
+    let window = gtk4::Window::new();
+    window.set_default_size(560, 700);
+    window.set_child(Some(&view));
+    window.present();
+    assert!(pump_until(&ctx, || view.width() > 0), "shown");
+    let inner = view.inner().expect("built view");
+    let button = inner.background_button.widget().clone();
+    assert!(!button.is_visible(), "nothing in the background yet");
+
+    let tasks = |tasks: Vec<BackgroundTask>| {
+        view.apply(&Envelope::new(Event::BackgroundTasks { tasks }));
+    };
+    let shell = BackgroundTask {
+        id: "b1".to_owned(),
+        kind: BackgroundTaskKind::Shell,
+        description: Some("cargo test".to_owned()),
+        tool_use_id: Some("toolu_1".to_owned()),
+    };
+    tasks(vec![
+        shell.clone(),
+        BackgroundTask {
+            id: "a1".to_owned(),
+            kind: BackgroundTaskKind::Agent,
+            description: Some("Review".to_owned()),
+            tool_use_id: Some("toolu_gone".to_owned()),
+        },
+    ]);
+    assert!(button.is_visible());
+    assert_eq!(
+        inner.background_button.listed(),
+        [
+            ("cargo test".to_owned(), true),
+            ("Review".to_owned(), false)
+        ]
+    );
+
+    let reads = || -> Vec<String> {
+        backend
+            .controls
+            .borrow()
+            .iter()
+            .filter(|(_, c)| matches!(c, Control::TaskOutput { task_id } if task_id == "b1"))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let reply = |id: &str, output: &str| {
+        view.apply(
+            &Envelope::new(Event::ControlResult {
+                ok: Some(serde_json::json!({
+                    "output": output, "total_bytes": output.len(), "truncated": false
+                })),
+                error: None,
+            })
+            .request(id),
+        );
+    };
+    inner.open_background(&shell);
+    assert_eq!(reads().len(), 1, "read at once");
+    let panel = inner
+        .task_panel
+        .borrow()
+        .clone()
+        .expect("the output dialog");
+    reply(&reads()[0], "\u{1b}[32mok\u{1b}[0m\n");
+    assert_eq!(
+        panel.shown(),
+        (
+            "ok\n".to_owned(),
+            "Running · updates every second".to_owned()
+        )
+    );
+    assert!(pump_until(&ctx, || reads().len() == 2), "polled again");
+    reply(&reads()[1], "ok\nmore\n");
+    assert_eq!(panel.shown().0, "ok\nmore\n");
+
+    // The task ends: one last read, whose empty answer (the file is gone) keeps what was shown.
+    tasks(Vec::new());
+    assert!(!button.is_visible());
+    assert!(pump_until(&ctx, || reads().len() == 3), "the last read");
+    reply(&reads()[2], "");
+    assert_eq!(
+        panel.shown(),
+        ("ok\nmore\n".to_owned(), "Finished".to_owned())
+    );
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        if !ctx.iteration(false) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(reads().len(), 3, "no read after the last");
+}
+
 /// The three request cards (a permission grant, a form, a link) in a real narrow window at a
 /// normal and a large text size: they wrap rather than widen the thread, none takes keyboard
 /// focus from the composer when it appears, and Enter in the last field sends a valid answer.

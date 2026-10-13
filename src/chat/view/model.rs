@@ -558,7 +558,7 @@ const STATUS_TASKS: usize = 3;
 
 /// A background task as the status names it: its description's first line, else what kind of
 /// task it is.
-fn task_name(task: &BackgroundTask) -> String {
+pub fn task_name(task: &BackgroundTask) -> String {
     let first_line = |d: &str| {
         d.lines()
             .map(str::trim)
@@ -867,18 +867,7 @@ impl Transcript {
                     .collect(),
             };
         }
-        let mut background = self.background.clone();
-        for worker in agents
-            .iter()
-            .filter(|a| a.lifecycle.is_some() && a.active())
-        {
-            background.push(BackgroundTask {
-                id: worker.id.clone(),
-                kind: BackgroundTaskKind::Agent,
-                description: Some(worker.name.clone()),
-                tool_use_id: None,
-            });
-        }
+        let background = self.background_with(&agents);
         if main_running {
             for id in self.order.iter().rev() {
                 match self.items.get(id).map(|item| &item.body) {
@@ -907,6 +896,28 @@ impl Transcript {
             };
         }
         activity
+    }
+
+    /// Everything running in the background: the agent's task list, then the provider's workers
+    /// still at work (a worker's id is its sub-agent item's).
+    pub fn background_tasks(&self) -> Vec<BackgroundTask> {
+        self.background_with(&self.subagents())
+    }
+
+    fn background_with(&self, agents: &[SubagentSummary]) -> Vec<BackgroundTask> {
+        let mut background = self.background.clone();
+        for worker in agents
+            .iter()
+            .filter(|a| a.lifecycle.is_some() && a.active())
+        {
+            background.push(BackgroundTask {
+                id: worker.id.clone(),
+                kind: BackgroundTaskKind::Agent,
+                description: Some(worker.name.clone()),
+                tool_use_id: None,
+            });
+        }
+        background
     }
 
     fn worker_item_id(driver: Driver, id: &str) -> String {

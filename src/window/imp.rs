@@ -431,6 +431,40 @@ impl IndicatorKind {
     }
 }
 
+/// The main checkout of the repository `dir` is in, and the branch `dir` has checked out.
+/// Blocking: run it off the main thread.
+fn worktree_repo(dir: &std::path::Path) -> Result<(std::path::PathBuf, Option<String>), String> {
+    crate::worktree::main_toplevel(dir)
+        .map(|main| (main, crate::worktree::current_branch(dir)))
+        .map_err(|err| worktree_repo_problem(dir, &err))
+}
+
+/// What to say when `dir` cannot be used for a worktree: git's own "not a git repository"
+/// is reworded, and any other reason (a submodule, say) is passed on as it is.
+fn worktree_repo_problem(dir: &std::path::Path, err: &str) -> String {
+    if err.contains("not a git repository") {
+        format!("{} is not in a Git repository", dir.display())
+    } else {
+        err.to_string()
+    }
+}
+
+/// Shows the repository chosen in the worktree dialog, or that none is yet.
+fn show_worktree_repo(label: &Label, main: Option<&std::path::Path>) {
+    match main {
+        Some(main) => {
+            label.set_text(&main.display().to_string());
+            label.set_tooltip_text(Some(&main.display().to_string()));
+            label.remove_css_class("dim-label");
+        }
+        None => {
+            label.set_text("No repository chosen");
+            label.set_tooltip_text(None);
+            label.add_css_class("dim-label");
+        }
+    }
+}
+
 /// Whether an evaluation is logged at info: the first one, and any change of
 /// state. A value-only change within one state is debug noise.
 fn indicator_log_at_info(previous: Option<IndicatorKind>, now: IndicatorKind) -> bool {
@@ -5705,50 +5739,69 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// New Thread in Isolated Git Worktree: checks, off the main thread, that the current
-    /// tab is in a repository, then asks for the branch to create.
+    /// New Thread in Isolated Git Worktree: finds, off the main thread, the repository the
+    /// current tab is in, then asks for the repository, the branch and its base. With no tab in
+    /// a repository the dialog opens with none chosen, so one can be picked first.
     fn new_tab_in_worktree(&self, profile: Option<Profile>) {
         if !agent_kit::git::git_installed() {
             self.show_toast("Git is not installed on this system");
             return;
         }
-        let Some(dir) = self.current_dir() else {
-            self.show_toast("Select or open a folder first");
-            return;
-        };
+        let dir = self.current_dir().map(std::path::PathBuf::from);
         let obj = self.obj();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
-                let found = gtk4::gio::spawn_blocking(move || {
-                    let dir = std::path::Path::new(&dir);
-                    crate::worktree::main_toplevel(dir)
-                        .map(|main| (main, crate::worktree::current_branch(dir)))
-                })
-                .await
-                .unwrap_or_else(|_| Err("the repository check panicked".to_string()));
-                match found {
-                    Ok((main, branch)) => obj.imp().show_worktree_dialog(main, branch, profile),
-                    Err(_) => obj.imp().show_toast(
-                        "Isolated worktrees require a Git repository: this folder is not in one",
-                    ),
-                }
+                let found = match dir.clone() {
+                    Some(dir) => gtk4::gio::spawn_blocking(move || worktree_repo(&dir))
+                        .await
+                        .ok()
+                        .and_then(Result::ok),
+                    None => None,
+                };
+                obj.imp().show_worktree_dialog(found, dir, profile);
             }
         ));
     }
 
-    /// Asks for the new branch and its base, checking both as they are typed.
+    /// Asks for the repository, the new branch and its base, checking them as they change.
+    /// `found` is the repository's main checkout and current branch, when one is known;
+    /// `start` is where the folder picker opens without one.
     fn show_worktree_dialog(
         &self,
-        main: std::path::PathBuf,
-        current: Option<String>,
+        found: Option<(std::path::PathBuf, Option<String>)>,
+        start: Option<std::path::PathBuf>,
         profile: Option<Profile>,
     ) {
         let root = {
             let root = self.config.borrow().worktree_root.trim().to_string();
             (!root.is_empty()).then(|| std::path::PathBuf::from(crate::utils::expand_tilde(&root)))
         };
+        let (main, current) = found.unzip();
+        let current = current.flatten();
+        let has_repo = main.is_some();
+        // The main checkout chosen so far; the picker below replaces it.
+        let repo = std::rc::Rc::new(std::cell::RefCell::new(main));
+
+        let repo_label = Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::Start)
+            .build();
+        show_worktree_repo(&repo_label, repo.borrow().as_deref());
+        let choose = gtk4::Button::with_label("Choose…");
+        let repo_row = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        repo_row.append(&repo_label);
+        repo_row.append(&choose);
+        let repo_problem = Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["error"])
+            .build();
 
         let branch = gtk4::Entry::builder()
             .placeholder_text("feat/my-change")
@@ -5782,6 +5835,9 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .spacing(6)
             .build();
+        form.append(&Label::builder().label("Repository").xalign(0.0).build());
+        form.append(&repo_row);
+        form.append(&repo_problem);
         form.append(&Label::builder().label("Branch").xalign(0.0).build());
         form.append(&branch);
         form.append(&Label::builder().label("Starting from").xalign(0.0).build());
@@ -5819,7 +5875,7 @@ impl AgentTerminalWindow {
             #[weak]
             location,
             #[strong]
-            main,
+            repo,
             #[strong]
             root,
             #[strong]
@@ -5830,16 +5886,15 @@ impl AgentTerminalWindow {
                 dialog.set_response_enabled("create", false);
                 let name = branch.text().trim().to_string();
                 let start = base.text().trim().to_string();
-                if name.is_empty() {
+                let Some(main) = repo.borrow().clone().filter(|_| !name.is_empty()) else {
                     location.set_text("");
                     problem.set_text("");
                     return;
-                }
+                };
                 location.set_text(&format!(
                     "In {}",
                     crate::worktree::default_path(&main, &name, root.as_deref()).display()
                 ));
-                let main = main.clone();
                 let generation = generation.clone();
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(250),
@@ -5880,8 +5935,69 @@ impl AgentTerminalWindow {
             entry.connect_changed(move |_| validate());
         }
 
+        // A folder that is not in a repository keeps the previous choice and says why.
+        choose.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            #[weak]
+            base,
+            #[weak]
+            repo_label,
+            #[weak]
+            repo_problem,
+            #[strong]
+            repo,
+            #[strong]
+            validate,
+            move |_| {
+                let picker = gtk4::FileDialog::builder()
+                    .title("Select the Git Repository")
+                    .accept_label("Select")
+                    .modal(true)
+                    .build();
+                if let Some(folder) = repo.borrow().clone().or_else(|| start.clone()) {
+                    picker.set_initial_folder(Some(&gtk4::gio::File::for_path(folder)));
+                }
+                let parent = dialog.root().and_downcast::<gtk4::Window>();
+                let repo = repo.clone();
+                let validate = validate.clone();
+                glib::MainContext::default().spawn_local(glib::clone!(
+                    #[weak]
+                    base,
+                    #[weak]
+                    repo_label,
+                    #[weak]
+                    repo_problem,
+                    async move {
+                        let picked = picker.select_folder_future(parent.as_ref()).await;
+                        // Dismissing the picker is a normal outcome, not a failure.
+                        let Some(path) = picked.ok().and_then(|f| f.path()) else {
+                            return;
+                        };
+                        let found = gtk4::gio::spawn_blocking(move || worktree_repo(&path))
+                            .await
+                            .unwrap_or_else(|_| Err("the repository check panicked".to_string()));
+                        match found {
+                            Ok((main, current)) => {
+                                repo_problem.set_text("");
+                                show_worktree_repo(&repo_label, Some(&main));
+                                *repo.borrow_mut() = Some(main);
+                                base.set_text(current.as_deref().unwrap_or("HEAD"));
+                            }
+                            Err(err) => repo_problem.set_text(&err),
+                        }
+                        validate();
+                    }
+                ));
+            }
+        ));
+
         let obj = self.obj();
-        branch.grab_focus();
+        if has_repo {
+            branch.grab_focus();
+        } else {
+            choose.grab_focus();
+        }
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
@@ -5892,6 +6008,10 @@ impl AgentTerminalWindow {
                 if response != "create" {
                     return;
                 }
+                // Create is only enabled once a repository is chosen.
+                let Some(main) = repo.borrow().clone() else {
+                    return;
+                };
                 let name = branch.text().trim().to_string();
                 let start = base.text().trim().to_string();
                 let path = crate::worktree::default_path(&main, &name, root.as_deref());
@@ -6658,6 +6778,38 @@ mod tests {
             "Checkpoint 1 · 09:00"
         );
         assert_eq!(tab_tooltip(None, None), "");
+    }
+
+    #[test]
+    fn the_worktree_dialog_finds_a_picked_repository_and_explains_any_other_folder() {
+        if !agent_kit::git::git_installed() {
+            return;
+        }
+        let plain = tempfile::tempdir().unwrap();
+        let err = worktree_repo(plain.path()).unwrap_err();
+        assert_eq!(
+            err,
+            format!("{} is not in a Git repository", plain.path().display())
+        );
+
+        let repo = tempfile::tempdir().unwrap();
+        let inited = std::process::Command::new("git")
+            .args(["-c", "init.defaultBranch=trunk", "init", "-q"])
+            .arg(repo.path())
+            .status()
+            .unwrap();
+        assert!(inited.success());
+        let inner = repo.path().join("src");
+        std::fs::create_dir(&inner).unwrap();
+        let (main, current) = worktree_repo(&inner).unwrap();
+        assert_eq!(main, repo.path().canonicalize().unwrap());
+        assert_eq!(current.as_deref(), Some("trunk"));
+
+        // Any other reason is passed on as git or the kit gave it.
+        assert_eq!(
+            worktree_repo_problem(plain.path(), "submodules are not supported"),
+            "submodules are not supported"
+        );
     }
 
     #[test]

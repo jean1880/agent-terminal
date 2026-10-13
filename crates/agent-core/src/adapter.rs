@@ -219,13 +219,25 @@ pub enum Command {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Control {
     McpStatus,
-    McpToggle { server: String, enabled: bool },
-    McpReconnect { server: String },
+    McpToggle {
+        server: String,
+        enabled: bool,
+    },
+    McpReconnect {
+        server: String,
+    },
     GetSettings,
     ListModels,
-    FileSuggestions { query: String },
+    FileSuggestions {
+        query: String,
+    },
     ContextUsage,
     Usage,
+    /// The end of one background shell task's output (Claude `get_task_output`: at most the
+    /// last 8 KiB, with `total_bytes` and `truncated`).
+    TaskOutput {
+        task_id: String,
+    },
 }
 
 /// How the transport must carry out an encoded command.

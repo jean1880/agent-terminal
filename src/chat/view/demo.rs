@@ -516,6 +516,10 @@ impl DemoBackend {
                 "quota": {"five_hour": {"used_percent": 38, "resets_at": "16:00"},
                           "weekly": {"used_percent": 12, "resets_at": "Mon 09:00"}}
             }),
+            Control::TaskOutput { .. } => json!({
+                "output": "   Compiling agent-core v0.1.0\n   Compiling agent-terminal v3.4.0\n",
+                "total_bytes": 64, "truncated": false
+            }),
         }
     }
 }
