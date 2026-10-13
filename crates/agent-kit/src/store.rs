@@ -263,6 +263,10 @@ pub struct Store {
     tails: RefCell<HealTails>,
     /// Inside [`Store::batch`]: methods that open a transaction take a savepoint instead.
     in_batch: Cell<bool>,
+    /// `PRAGMA data_version` when the tails were last known to match the database. It changes
+    /// only when ANOTHER connection commits (a second process, a worker): rows the tails never
+    /// saw, so every tail is then dropped before a heal trusts one.
+    seen_version: Cell<i64>,
     /// Threads appended to in the current batch: their tails are distrusted if it fails.
     batch_threads: RefCell<HashSet<String>>,
     /// Test hook: the next append fails after its insert and tail update (an injected error).
@@ -476,11 +480,13 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&conn)?;
+        let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
         Ok(Self {
             conn,
             last_ms: Cell::new(0),
             tails: RefCell::new(HealTails::default()),
             in_batch: Cell::new(false),
+            seen_version: Cell::new(version),
             batch_threads: RefCell::new(HashSet::new()),
             #[cfg(test)]
             fail_next_append: Cell::new(false),
@@ -1161,7 +1167,20 @@ impl Store {
     /// rows; the tail only skips the scan (and, for an item longer than [`HEAL_WINDOW`], also
     /// reaches the rows the scan cannot).
     fn heal(&self, thread: &str, item: &str) -> Result<()> {
-        let tail = self.tails.borrow().trusted(thread, item);
+        let mut tail = self.tails.borrow().trusted(thread, item);
+        if tail.is_some() {
+            // Another connection committed since the tails were last known good: they may
+            // miss its rows (a fragment of this very item). Drop them all and scan.
+            let version: i64 = self
+                .conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            if version != self.seen_version.get() {
+                tracing::warn!("another connection wrote to the store; heal tails dropped");
+                self.tails.borrow_mut().reset_all();
+                self.seen_version.set(version);
+                tail = None;
+            }
+        }
         #[cfg(test)]
         {
             let mut paths = self.heal_paths.get();
@@ -3308,6 +3327,37 @@ mod tests {
         assert!(rows
             .iter()
             .any(|(seq, _, _, j)| *seq == first && j.contains("\"other\"")));
+    }
+
+    /// A fragment committed by another connection (a second process on the same store) between
+    /// an item's start and its completion: the tail never saw it, so it must not be trusted.
+    #[test]
+    fn a_row_committed_by_another_connection_is_healed_by_the_scan() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("threads.db");
+        let a = Store::open(&path).expect("a");
+        let b = Store::open(&path).expect("b");
+        let t = a.create_thread("/", None).expect("t");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (one, two) = secret.split_at(12);
+        a.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
+            .expect("start");
+        a.append_event(&t, None, &delta("x", one)).expect("one");
+        b.append_event(&t, None, &delta("x", two))
+            .expect("two, elsewhere");
+        a.append_event(&t, None, &completed("x", ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(a.heal_paths.get(), [0, 1], "healed by the scan");
+        let all = serde_json::to_string(&a.events(&t, None, 10).expect("ev")).expect("json");
+        assert!(!all.contains(one) && !all.contains(two), "{all}");
+        // Its own commits do not count as another connection's: a tail heals again.
+        a.append_event(&t, None, &started("y", ItemKind::AssistantMessage))
+            .expect("start");
+        a.append_event(&t, None, &delta("y", one)).expect("one");
+        a.append_event(&t, None, &delta("y", two)).expect("two");
+        a.append_event(&t, None, &completed("y", ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(a.heal_paths.get(), [1, 1]);
     }
 
     #[test]

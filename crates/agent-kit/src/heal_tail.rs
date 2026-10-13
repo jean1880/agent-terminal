@@ -190,6 +190,15 @@ impl HealTails {
         }
     }
 
+    /// Drops every tail, for good: nothing a rollback could bring back (the database changed
+    /// under them). Open levels stay balanced, with nothing left to take back.
+    pub(crate) fn reset_all(&mut self) {
+        self.items.clear();
+        self.total = 0;
+        self.journal.clear();
+        self.levels.fill(0);
+    }
+
     /// Whether a level is open (changes are journalled).
     #[cfg(test)]
     pub(crate) fn in_level(&self) -> bool {

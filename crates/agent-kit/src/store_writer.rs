@@ -151,6 +151,8 @@ struct Shared {
     config: WriterConfig,
     /// Which items have an event admitted, and which were refused ([`StoreWriter::append_event`]).
     items: Mutex<Admission>,
+    /// The queue went past its bound for in-flight items (said once, until it drains).
+    over_bound: std::sync::atomic::AtomicBool,
 }
 
 /// Per-item admission: `(thread, item)` keys, forgotten when the thread's turn or session ends.
@@ -177,7 +179,13 @@ impl Shared {
     }
 
     fn settle(&self, cost: usize) {
-        self.pending.fetch_sub(1, Ordering::SeqCst);
+        let left = self
+            .pending
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        if left < self.config.max_queued / 2 {
+            self.over_bound.store(false, Ordering::SeqCst);
+        }
         self.queued_bytes.fetch_sub(cost, Ordering::SeqCst);
     }
 
@@ -235,6 +243,7 @@ impl StoreWriter {
             last_failure: Mutex::new(None),
             config,
             items: Mutex::new(Admission::default()),
+            over_bound: std::sync::atomic::AtomicBool::new(false),
         });
         let path = path.to_owned();
         let thread_shared = shared.clone();
@@ -298,6 +307,15 @@ impl StoreWriter {
                 let pending = self.shared.pending.load(Ordering::SeqCst);
                 let bytes = self.shared.queued_bytes.load(Ordering::SeqCst);
                 let full = pending >= config.max_queued || bytes + cost > config.max_queued_bytes;
+                if full && write.force && !self.shared.over_bound.swap(true, Ordering::SeqCst) {
+                    // By design: items already in flight are never cut short, so the queue
+                    // grows past its bound while the writer is stalled. Said once per stall.
+                    tracing::error!(
+                        pending,
+                        mb = bytes >> 20,
+                        "the store writer is stalled; in-flight items go past the queue's bound"
+                    );
+                }
                 if full && !write.force {
                     self.shared.overloaded.fetch_add(1, Ordering::SeqCst);
                     Some((
@@ -410,11 +428,12 @@ impl StoreWriter {
     }
 
     /// Queues one event. Admission is per item, never per delta, so an item is stored whole or
-    /// not at all (a secret split across its deltas is then always healed, or absent): an event
-    /// of an item that already has an event admitted is admitted past the queue's bound; the
-    /// first event of a new item may be refused, and then every later event of that item is
-    /// refused too. Events of no item follow the bound. A thread's turn or session end forgets
-    /// its items (none of them can receive events after it).
+    /// not at all (a secret split across its deltas is then always healed, or absent): only the
+    /// `ItemStarted` of a new item may be refused at the queue's bound, and then every later
+    /// event of that item is refused too. Every other event of an item goes in past the bound,
+    /// including one whose earlier rows an earlier run or another connection stored. A turn's or
+    /// session's end is never refused, and forgets the thread's items (none of them can receive
+    /// events after it); other events of no item follow the bound.
     pub fn append_event(
         &self,
         thread: &str,
@@ -436,9 +455,11 @@ impl StoreWriter {
             return self.write_sized("store an event", Some(thread), cost, false, job);
         };
         let result = match &env.item {
-            None => self.write_sized("store an event", Some(thread), cost, false, job),
+            // A turn's or session's end clears tails and admission: never refused.
+            None => self.write_sized("store an event", Some(thread), cost, ends_items, job),
             Some(item) => {
                 let key = (thread.to_owned(), item.clone());
+                let starts = matches!(env.event, Event::ItemStarted { .. });
                 if items.refused.contains(&key) {
                     self.shared.overloaded.fetch_add(1, Ordering::SeqCst);
                     self.shared.fail(
@@ -447,18 +468,26 @@ impl StoreWriter {
                         "its item was refused when the store was too far behind",
                     );
                     Err(StoreError::Overloaded)
-                } else {
-                    let admitted = items.admitted.contains(&key);
-                    let result =
-                        self.write_sized("store an event", Some(thread), cost, admitted, job);
+                } else if starts && !items.admitted.contains(&key) {
+                    // Only the start of a new item may be refused; then all of it is.
+                    let result = self.write_sized("store an event", Some(thread), cost, false, job);
                     match result {
-                        Ok(()) if !admitted => {
+                        Ok(()) => {
                             items.admitted.insert(key);
                         }
                         Err(StoreError::Overloaded) => {
                             items.refused.insert(key);
                         }
-                        _ => {}
+                        Err(_) => {}
+                    }
+                    result
+                } else {
+                    // Any other event of an item not refused (one admitted here, or whose
+                    // earlier rows a previous run or another connection stored) goes in past
+                    // the bound: refusing part of an item could leave half a secret stored.
+                    let result = self.write_sized("store an event", Some(thread), cost, true, job);
+                    if result.is_ok() {
+                        items.admitted.insert(key);
                     }
                     result
                 }
@@ -980,6 +1009,7 @@ pub(crate) fn run_jobs_as_batch(store: &Store, jobs: Vec<WriteJob>) -> u64 {
         last_failure: Mutex::new(None),
         config: WriterConfig::default(),
         items: Mutex::new(Admission::default()),
+        over_bound: std::sync::atomic::AtomicBool::new(false),
     };
     let writes = jobs
         .into_iter()
@@ -1333,6 +1363,82 @@ mod tests {
             assert!(!all.contains(frag), "a fragment survived: {frag}");
         }
         assert!(all.contains("****0123"), "the stored items were healed");
+    }
+
+    /// A fresh writer, its queue full, gets the completion of an item whose split-secret deltas
+    /// an earlier run stored: never refused (only new items' starts are), so they are healed.
+    /// A turn's end is never refused either.
+    #[test]
+    fn a_full_queue_still_takes_a_completion_of_rows_stored_before() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("threads.db");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (one, two) = secret.split_at(9);
+        let t = {
+            let earlier = Store::open(&path).expect("earlier run");
+            let t = earlier.create_thread("/", None).expect("t");
+            for text in [one, two] {
+                earlier
+                    .append_event(
+                        &t,
+                        None,
+                        &Envelope::new(Event::ContentDelta {
+                            stream: StreamKind::Assistant,
+                            text: text.into(),
+                        })
+                        .item("old"),
+                    )
+                    .expect("delta");
+            }
+            t
+        };
+        crate::store::quiet_injected_panics();
+        let reader = Rc::new(Store::open(&path).expect("reader"));
+        let config = WriterConfig {
+            max_queued: 1,
+            ..WriterConfig::default()
+        };
+        let writer = StoreWriter::spawn_with(&path, config).expect("writer");
+        let handle = StoreHandle::Queued {
+            reader,
+            writer: writer.clone(),
+        };
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })
+            .expect("queued");
+        // Full: a new item's start is refused, but not the old item's completion.
+        let new_start = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::AssistantMessage,
+            title: String::new(),
+            input: None,
+            parent: None,
+        })
+        .item("new");
+        assert!(handle.append_event(&t, None, &new_start).is_err());
+        let done = Envelope::new(Event::ItemCompleted {
+            status: agent_core::event::ItemStatus::Completed,
+            output: None,
+            error: None,
+        })
+        .item("old");
+        handle.append_event(&t, None, &done).expect("admitted");
+        let turn = Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        });
+        handle
+            .append_event(&t, None, &turn)
+            .expect("a turn's end is admitted");
+        assert!(writer.flush(Duration::from_secs(10)));
+        let check = Store::open(&path).expect("open");
+        let all = serde_json::to_string(&check.events(&t, None, 100).expect("ev")).expect("json");
+        assert!(!all.contains(one) && !all.contains(two), "{all}");
+        assert!(all.contains("****0123"));
     }
 
     #[test]
