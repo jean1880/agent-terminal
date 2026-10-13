@@ -7389,6 +7389,7 @@ mod tests {
             "the deleted thread left the list"
         );
         assert!(imp.summary_of(&ids[0]).is_none());
+        thread_menu::tests::actions_carry_out_each_choice(window);
     }
 
     fn diff_panel_shows_each_outcome() {

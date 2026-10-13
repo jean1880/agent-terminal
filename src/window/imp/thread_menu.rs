@@ -611,6 +611,273 @@ pub(super) mod tests {
         ));
     }
 
+    /// Each menu choice, carried out on a real window and store, does what its label says and
+    /// nothing more. Run from the window test with the shell up (GTK belongs to one thread).
+    pub(in crate::window) fn actions_carry_out_each_choice(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        use crate::testutil::pump_until;
+        use crate::window::imp::threads::app_store;
+        let imp = window.imp();
+        let ctx = glib::MainContext::default();
+        let settle = |cond: &dyn Fn() -> bool| assert!(pump_until(&ctx, 5, cond), "timed out");
+        let chat_of = |thread: &str| {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .find(|c| c.thread == thread)
+                .map(|c| (c.title.clone(), c.driver, c.pending_switch.clone()))
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        let folder = dir.path().to_string_lossy().into_owned();
+        let open_thread = || {
+            imp.new_chat_thread(Some(Driver::Claude), Some(folder.clone()), None);
+            let thread = imp
+                .tabs
+                .borrow()
+                .last()
+                .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+                .expect("a thread page");
+            imp.reload_summaries();
+            thread
+        };
+        let thread = open_thread();
+
+        // A thread nobody has named is "New thread" everywhere; an unknown one too.
+        assert_eq!(imp.thread_title_of(&thread), "New thread");
+        assert_eq!(imp.thread_title_of("no-such-thread"), "New thread");
+
+        // Rename: the store, the open page, its tab title and the sidebar row all follow.
+        imp.rename_thread_to(&thread, "Fix the build");
+        settle(&|| {
+            app_store()
+                .thread_summary(&thread)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.title == "Fix the build")
+        });
+        assert_eq!(
+            chat_of(&thread).map(|c| c.0).as_deref(),
+            Some("Fix the build")
+        );
+        assert_eq!(
+            imp.page_of_thread(&thread)
+                .map(|p| p.title().to_string())
+                .as_deref(),
+            Some("Fix the build")
+        );
+        settle(&|| {
+            imp.sidebar_rows()
+                .iter()
+                .any(|r| r.key == RowKey::Thread(thread.clone()) && r.title == "Fix the build")
+        });
+        // While the page is open its own title wins over a stored one changed elsewhere.
+        app_store()
+            .rename_thread(&thread, "Changed elsewhere")
+            .expect("rename");
+        assert_eq!(imp.thread_title_of(&thread), "Fix the build");
+
+        // Copy id: exactly the id reaches the clipboard.
+        imp.run_thread_action(ThreadAction::CopyId(thread.clone()));
+        let copied = Rc::new(std::cell::RefCell::new(None));
+        let sink = copied.clone();
+        let clipboard = window.clipboard();
+        ctx.spawn_local(async move {
+            *sink.borrow_mut() = Some(clipboard.read_text_future().await.ok().flatten());
+        });
+        settle(&|| copied.borrow().is_some());
+        assert_eq!(
+            copied
+                .borrow()
+                .clone()
+                .flatten()
+                .map(|t| t.to_string())
+                .as_deref(),
+            Some(thread.as_str())
+        );
+
+        // Continue in, before anything was said: there is nothing to hand over, so no thread
+        // is made.
+        let pages = imp.tabs.borrow().len();
+        imp.run_thread_action(ThreadAction::ContinueIn {
+            thread: thread.clone(),
+            driver: Driver::Codex,
+            model: None,
+            effort: None,
+        });
+        for _ in 0..50 {
+            ctx.iteration(false);
+        }
+        assert_eq!(imp.tabs.borrow().len(), pages, "no handoff, no new thread");
+
+        // With history it opens a NEW Codex thread in the same folder, titled after its
+        // source, and leaves the source alone.
+        app_store()
+            .append_user_message(&thread, None, "make the build pass")
+            .expect("message");
+        imp.run_thread_action(ThreadAction::ContinueIn {
+            thread: thread.clone(),
+            driver: Driver::Codex,
+            model: None,
+            effort: None,
+        });
+        settle(&|| imp.tabs.borrow().len() == pages + 1);
+        {
+            let tabs = imp.tabs.borrow();
+            let new = tabs.last().expect("the new page");
+            let chat = new.chat.as_ref().expect("a thread page");
+            assert_ne!(chat.thread, thread);
+            assert_eq!(chat.driver, Driver::Codex);
+            assert_eq!(new.dir, folder);
+            assert_eq!(chat.title, "Fix the build (→ Codex)");
+        }
+        assert_eq!(
+            chat_of(&thread).map(|c| c.1),
+            Some(Driver::Claude),
+            "the source is unchanged"
+        );
+
+        // The menu itself reflects the thread: with history, Continue in is offered enabled.
+        // Folders start collapsed: open the thread's by clicking its header, as a user would.
+        let sidebar = imp.sidebar.borrow().clone().expect("sidebar");
+        let row_index = || {
+            sidebar
+                .keys
+                .borrow()
+                .iter()
+                .position(|k| k.as_ref() == Some(&RowKey::Thread(thread.clone())))
+        };
+        imp.refresh_sidebar();
+        if row_index().is_none() {
+            let header = crate::testutil::descendants(sidebar.list.upcast_ref())
+                .into_iter()
+                .find(|w| w.is::<gtk4::ListBoxRow>() && w.widget_name() == folder.as_str())
+                .expect("the folder's header");
+            let toggle = header
+                .first_child()
+                .and_then(|line| line.first_child())
+                .and_then(|w| w.downcast::<gtk4::Button>().ok())
+                .expect("the folder toggle");
+            toggle.emit_clicked();
+        }
+        let index = row_index().expect("the thread's row, once its folder is open");
+        let row = sidebar.list.row_at_index(index as i32).expect("row");
+        // The menu offers only agents detected as ready; here Claude is, the others are not.
+        let availability = crate::availability::AgentAvailability::shared();
+        let before = availability.all();
+        availability.set(
+            Driver::Claude,
+            crate::availability::Availability::Ready("/nonexistent/claude".into()),
+        );
+        imp.open_thread_menu(thread.clone(), &row, Some((4.0, 4.0)));
+        let list = imp
+            .sidebar
+            .borrow()
+            .as_ref()
+            .map(|s| s.list.clone())
+            .expect("list");
+        // The thread menu hangs off the list itself (rows' own popovers sit deeper).
+        let popover = || {
+            let mut child = list.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Ok(menu) = widget.downcast::<gtk4::PopoverMenu>() {
+                    return Some(menu);
+                }
+            }
+            None
+        };
+        settle(&|| popover().is_some());
+        // GIO does not bounds-check item indices: count before indexing.
+        let link = |model: &gio::MenuModel, index: i32, kind: &str| {
+            assert!(
+                index < model.n_items(),
+                "{kind} {index} of {}",
+                model.n_items()
+            );
+            model.item_link(index, kind).expect(kind)
+        };
+        let model = popover().and_then(|p| p.menu_model()).expect("menu model");
+        assert_eq!(model.n_items(), 3, "the thread menu's three sections");
+        let section = link(&model, 0, "section");
+        let continue_in = link(&section, 0, "submenu");
+        assert_eq!(continue_in.n_items(), 1, "only the ready agent is offered");
+        let first_agent = link(&continue_in, 0, "submenu");
+        assert!(first_agent.n_items() > 0);
+        for (driver, state) in before {
+            availability.set(driver, state);
+        }
+        assert_eq!(
+            first_agent
+                .item_attribute_value(0, "action", None)
+                .and_then(|v| v.get::<String>())
+                .as_deref(),
+            Some(ACTION),
+            "a thread with history can be continued"
+        );
+        if let Some(p) = popover() {
+            p.popdown();
+        }
+
+        // Archive: the page closes and the store marks it; Unarchive brings it back.
+        imp.run_thread_action(ThreadAction::Archive(thread.clone()));
+        assert!(chat_of(&thread).is_none(), "archiving closes the page");
+        settle(&|| {
+            app_store()
+                .thread_summary(&thread)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.archived)
+        });
+        imp.run_thread_action(ThreadAction::Unarchive(thread.clone()));
+        settle(&|| {
+            app_store()
+                .thread_summary(&thread)
+                .ok()
+                .flatten()
+                .is_some_and(|s| !s.archived)
+        });
+        // Closed, its title comes from the store.
+        imp.reload_summaries();
+        assert_eq!(imp.thread_title_of(&thread), "Changed elsewhere");
+
+        // Switch, for a thread that is not open: it is opened, and the switch waits for its
+        // session.
+        imp.run_thread_action(ThreadAction::SwitchTo {
+            thread: thread.clone(),
+            driver: Driver::Codex,
+            model: Some("gpt-5".into()),
+            effort: None,
+        });
+        let switched = chat_of(&thread).expect("switching opens the thread");
+        assert!(
+            imp.slot_of(&thread).and_then(|s| s.get()).is_none(),
+            "a reopened thread has no session until it is shown"
+        );
+        assert_eq!(
+            switched.2,
+            Some((Driver::Codex, Some("gpt-5".into()), None)),
+            "the switch waits for the session"
+        );
+
+        // Delete: the page closes and the thread leaves the store, its history with it.
+        imp.delete_thread_now(&thread);
+        assert!(chat_of(&thread).is_none());
+        settle(&|| app_store().thread_summary(&thread).ok().flatten().is_none());
+        assert!(!app_store().has_messages(&thread).expect("read"));
+        // Actions on a thread that is gone do nothing (and do not panic).
+        imp.run_thread_action(ThreadAction::OpenFolder(thread.clone()));
+        imp.run_thread_action(ThreadAction::ReviewEnvironment(thread.clone()));
+        imp.run_thread_action(ThreadAction::ContinueIn {
+            thread: thread.clone(),
+            driver: Driver::Agy,
+            model: None,
+            effort: None,
+        });
+        assert!(chat_of(&thread).is_none());
+    }
+
     fn gio_menu_labels_of(model: &gio::MenuModel) -> Vec<String> {
         (0..model.n_items())
             .filter_map(|i| {
