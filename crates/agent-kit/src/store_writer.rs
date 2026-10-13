@@ -149,6 +149,22 @@ struct Shared {
     overloaded: AtomicU64,
     last_failure: Mutex<Option<String>>,
     config: WriterConfig,
+    /// Which items have an event admitted, and which were refused ([`StoreWriter::append_event`]).
+    items: Mutex<Admission>,
+}
+
+/// Per-item admission: `(thread, item)` keys, forgotten when the thread's turn or session ends.
+#[derive(Default)]
+struct Admission {
+    admitted: std::collections::HashSet<(String, String)>,
+    refused: std::collections::HashSet<(String, String)>,
+}
+
+impl Admission {
+    fn forget(&mut self, thread: &str) {
+        self.admitted.retain(|(t, _)| t != thread);
+        self.refused.retain(|(t, _)| t != thread);
+    }
 }
 
 impl Shared {
@@ -218,6 +234,7 @@ impl StoreWriter {
             overloaded: AtomicU64::new(0),
             last_failure: Mutex::new(None),
             config,
+            items: Mutex::new(Admission::default()),
         });
         let path = path.to_owned();
         let thread_shared = shared.clone();
@@ -390,6 +407,75 @@ impl StoreWriter {
             caller_reports: true,
         });
         rx
+    }
+
+    /// Queues one event. Admission is per item, never per delta, so an item is stored whole or
+    /// not at all (a secret split across its deltas is then always healed, or absent): an event
+    /// of an item that already has an event admitted is admitted past the queue's bound; the
+    /// first event of a new item may be refused, and then every later event of that item is
+    /// refused too. Events of no item follow the bound. A thread's turn or session end forgets
+    /// its items (none of them can receive events after it).
+    pub fn append_event(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        env: &Envelope,
+    ) -> Result<()> {
+        let cost = encoded_len(env);
+        let (t, pt, owned) = (
+            thread.to_owned(),
+            provider_thread.map(str::to_owned),
+            env.clone(),
+        );
+        let job = move |s: &Store| s.append_event(&t, pt.as_deref(), &owned).map(drop);
+        let ends_items = matches!(
+            env.event,
+            Event::TurnCompleted { .. } | Event::SessionExited { .. }
+        );
+        let Ok(mut items) = self.shared.items.lock() else {
+            return self.write_sized("store an event", Some(thread), cost, false, job);
+        };
+        let result = match &env.item {
+            None => self.write_sized("store an event", Some(thread), cost, false, job),
+            Some(item) => {
+                let key = (thread.to_owned(), item.clone());
+                if items.refused.contains(&key) {
+                    self.shared.overloaded.fetch_add(1, Ordering::SeqCst);
+                    self.shared.fail(
+                        "store an event",
+                        Some(thread),
+                        "its item was refused when the store was too far behind",
+                    );
+                    Err(StoreError::Overloaded)
+                } else {
+                    let admitted = items.admitted.contains(&key);
+                    let result =
+                        self.write_sized("store an event", Some(thread), cost, admitted, job);
+                    match result {
+                        Ok(()) if !admitted => {
+                            items.admitted.insert(key);
+                        }
+                        Err(StoreError::Overloaded) => {
+                            items.refused.insert(key);
+                        }
+                        _ => {}
+                    }
+                    result
+                }
+            }
+        };
+        if ends_items {
+            items.forget(thread);
+        }
+        result
+    }
+
+    /// Forgets what is remembered of the thread's items' admission (its page closed: none of
+    /// them receives events any more).
+    pub fn forget_items(&self, thread: &str) {
+        if let Ok(mut items) = self.shared.items.lock() {
+            items.forget(thread);
+        }
     }
 
     /// Answers once everything queued before it is committed (or has failed). Errors at once
@@ -784,39 +870,7 @@ impl StoreHandle {
             }
             Self::Queued { writer, .. } => writer,
         };
-        let cost = encoded_len(env);
-        // What carries a heal (a completion, a snapshot) is never refused, full queue or not.
-        let heals = matches!(
-            env.event,
-            Event::ItemCompleted { .. } | Event::ContentSnapshot { .. }
-        );
-        let item = env.item.clone();
-        let (t, pt, env) = (
-            thread.to_owned(),
-            provider_thread.map(str::to_owned),
-            env.clone(),
-        );
-        let queued = writer.write_sized("store an event", Some(thread), cost, heals, move |s| {
-            s.append_event(&t, pt.as_deref(), &env).map(drop)
-        });
-        if matches!(queued, Err(StoreError::Overloaded)) {
-            if let Some(item) = item {
-                // A delta refused mid-item: its tail must not vouch for the item any more
-                // (queued in order, past the bound, after the rows that were admitted).
-                let t = thread.to_owned();
-                let _ = writer.write_sized(
-                    "forget a part-refused item's tail",
-                    Some(thread),
-                    0,
-                    true,
-                    move |s| {
-                        s.distrust_tail(&t, &item);
-                        Ok(())
-                    },
-                );
-            }
-        }
-        queued
+        writer.append_event(thread, provider_thread, env)
     }
 
     /// Stores a user prompt; returns its item id (made here, so it is known before the write).
@@ -899,8 +953,12 @@ impl StoreHandle {
         Ok(id)
     }
 
-    /// The thread's page closed: its heal tails go (in order after its last writes).
+    /// The thread's page closed: its heal tails go (in order after its last writes), and so
+    /// does what the writer remembers of its items' admission.
     pub fn forget_thread(&self, thread: &str) {
+        if let Self::Queued { writer, .. } = self {
+            writer.forget_items(thread);
+        }
         let t = thread.to_owned();
         let _ = self.write("forget a closed thread", Some(thread), move |s| {
             s.forget_tails(&t);
@@ -921,6 +979,7 @@ pub(crate) fn run_jobs_as_batch(store: &Store, jobs: Vec<WriteJob>) -> u64 {
         overloaded: AtomicU64::new(0),
         last_failure: Mutex::new(None),
         config: WriterConfig::default(),
+        items: Mutex::new(Admission::default()),
     };
     let writes = jobs
         .into_iter()
@@ -1179,10 +1238,13 @@ mod tests {
         assert!(ok.recv().expect("answered").is_ok());
     }
 
+    /// Admission is per item: under a tiny bound, an item with a secret split across its
+    /// deltas is either stored whole (and healed) or wholly absent; no stored row ever holds
+    /// part of the secret.
     #[test]
-    fn a_completion_is_admitted_past_a_full_queue() {
+    fn an_item_is_stored_whole_or_not_at_all_when_the_queue_is_full() {
         let config = WriterConfig {
-            max_queued: 3,
+            max_queued: 2,
             ..WriterConfig::default()
         };
         let (_dir, path, handle) = setup_with(config);
@@ -1195,45 +1257,82 @@ mod tests {
                 Ok(())
             })
             .expect("queued");
-        let delta = |n: usize| {
-            Envelope::new(Event::ContentDelta {
-                stream: StreamKind::Assistant,
-                text: format!("w{n} "),
-            })
-            .item("full")
-        };
-        handle
-            .append_event(
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let frags = [&secret[..7], &secret[7..15], &secret[15..24], &secret[24..]];
+        let event = |item: &str, event: Event| Envelope::new(event).item(item);
+        let items: Vec<String> = (0..6).map(|n| format!("it{n}")).collect();
+        // Interleaved: each item starts, then the items stream their fragments in turns.
+        for item in &items {
+            let _ = handle.append_event(
                 &t,
                 None,
-                &Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::AssistantMessage,
-                    title: String::new(),
-                    input: None,
-                    parent: None,
-                })
-                .item("full"),
-            )
-            .expect("queued");
-        let refused = (0..5)
-            .filter(|n| handle.append_event(&t, None, &delta(*n)).is_err())
-            .count();
-        assert!(refused > 0);
-        let done = Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item("full");
-        handle
-            .append_event(&t, None, &done)
-            .expect("a completion is never refused");
+                &event(
+                    item,
+                    Event::ItemStarted {
+                        kind: ItemKind::AssistantMessage,
+                        title: String::new(),
+                        input: None,
+                        parent: None,
+                    },
+                ),
+            );
+        }
+        for frag in frags {
+            for item in &items {
+                let _ = handle.append_event(
+                    &t,
+                    None,
+                    &event(
+                        item,
+                        Event::ContentDelta {
+                            stream: StreamKind::Assistant,
+                            text: frag.to_owned(),
+                        },
+                    ),
+                );
+            }
+        }
+        for item in &items {
+            let _ = handle.append_event(
+                &t,
+                None,
+                &event(
+                    item,
+                    Event::ItemCompleted {
+                        status: agent_core::event::ItemStatus::Completed,
+                        output: None,
+                        error: None,
+                    },
+                ),
+            );
+        }
         assert!(writer.flush(Duration::from_secs(10)));
+        assert!(
+            writer.overloaded() > 0,
+            "the bound really refused something"
+        );
         let check = Store::open(&path).expect("open");
-        let stored = check.events(&t, None, 100).expect("events");
-        assert!(stored
-            .iter()
-            .any(|(_, e)| matches!(e.event, Event::ItemCompleted { .. })));
+        let stored = check.events(&t, None, 1000).expect("events");
+        let mut whole = 0;
+        for item in &items {
+            let rows: Vec<&Envelope> = stored
+                .iter()
+                .map(|(_, e)| e)
+                .filter(|e| e.item.as_deref() == Some(item.as_str()))
+                .collect();
+            match rows.len() {
+                0 => {}
+                // Start, four deltas, completion.
+                6 => whole += 1,
+                n => panic!("{item}: {n} rows, a partial item"),
+            }
+        }
+        assert!(whole > 0, "the items admitted first were stored whole");
+        let all = serde_json::to_string(&stored).expect("json");
+        for frag in frags {
+            assert!(!all.contains(frag), "a fragment survived: {frag}");
+        }
+        assert!(all.contains("****0123"), "the stored items were healed");
     }
 
     #[test]
