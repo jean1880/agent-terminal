@@ -55,6 +55,12 @@ pub enum StoreError {
     },
     /// The store writer thread has stopped (or never started): the write was not queued.
     WriterGone,
+    /// The store writer's queue is full: the write was refused (counted and shown).
+    Overloaded,
+    /// The store writer did not catch up in time: a read that needs it was not made.
+    Behind,
+    /// SQLite rolled the transaction back on its own (disk full, I/O error, …).
+    TransactionLost,
 }
 
 impl fmt::Display for StoreError {
@@ -69,6 +75,14 @@ impl fmt::Display for StoreError {
                 "database schema v{found} is newer than this build supports (v{supported})"
             ),
             Self::WriterGone => write!(f, "the store writer has stopped"),
+            Self::Overloaded => write!(f, "the store writer is too far behind to take more"),
+            Self::Behind => write!(f, "the store writer has not caught up yet"),
+            Self::TransactionLost => {
+                write!(
+                    f,
+                    "the database rolled the write back (disk full or I/O error?)"
+                )
+            }
         }
     }
 }
@@ -182,6 +196,27 @@ pub fn scrub_envelope(env: Envelope) -> Result<Envelope> {
     Ok(serde_json::from_value(scrub_value(None, value))?)
 }
 
+/// Tests inject panics on purpose; their messages would bury real failures. Silences only those
+/// (by message), leaving every other panic report as it was.
+#[cfg(test)]
+pub(crate) fn quiet_injected_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let text = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("");
+            if !(text.starts_with("injected") || text == "a job that panics") {
+                default(info);
+            }
+        }));
+    });
+}
+
 /// The event's wire name (`content_delta`, `item_completed`, …), for logs. Encodes the event, so
 /// only call it off the hot path (a slow write already being reported).
 pub fn event_kind(event: &Event) -> String {
@@ -227,9 +262,15 @@ pub struct Store {
     in_batch: Cell<bool>,
     /// Threads appended to in the current batch: their tails are distrusted if it fails.
     batch_threads: RefCell<HashSet<String>>,
-    /// Test hook: the next append fails after its insert (an injected write error).
+    /// Test hook: the next append fails after its insert and tail update (an injected error).
     #[cfg(test)]
     fail_next_append: Cell<bool>,
+    /// Test hook: the next append panics after its insert and tail update.
+    #[cfg(test)]
+    panic_next_append: Cell<bool>,
+    /// Test hook: the next batch COMMIT fails.
+    #[cfg(test)]
+    fail_next_commit: Cell<bool>,
     /// Test record of which heal ran: `[tail, sql]`.
     #[cfg(test)]
     heal_paths: Cell<[u32; 2]>,
@@ -268,6 +309,98 @@ impl Drop for Scope<'_> {
         };
         if let Err(e) = self.conn.execute_batch(sql) {
             tracing::warn!(error = %e, "could not roll a store write back");
+        }
+    }
+}
+
+/// An open batch transaction ([`Store::begin_batch`]).
+pub struct Batch<'a> {
+    store: &'a Store,
+    committed: bool,
+}
+
+impl Batch<'_> {
+    /// Whether the transaction is still open. SQLite rolls a whole transaction back on its own
+    /// after some errors (disk full, I/O, out of memory); what ran in it is then gone, and what
+    /// runs next would autocommit. The writer checks this after every job.
+    pub fn alive(&self) -> bool {
+        !self.store.conn.is_autocommit()
+    }
+
+    /// Runs one job under a savepoint of its own: rolled back, leaving no partial rows, when it
+    /// fails or panics (the panic then carries on to the caller).
+    pub fn job<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let conn = &self.store.conn;
+        conn.execute_batch("SAVEPOINT job")?;
+        struct Undo<'a> {
+            conn: &'a Connection,
+            done: bool,
+        }
+        impl Drop for Undo<'_> {
+            fn drop(&mut self) {
+                if !self.done && !self.conn.is_autocommit() {
+                    let _ = self.conn.execute_batch("ROLLBACK TO job; RELEASE job");
+                }
+            }
+        }
+        let mut undo = Undo { conn, done: false };
+        let result = f(self.store);
+        if result.is_ok() && self.alive() {
+            conn.execute_batch("RELEASE job")?;
+            undo.done = true;
+        }
+        result
+    }
+
+    /// Commits the batch. On failure nothing of it is stored (and its threads' tails are
+    /// distrusted, as for any batch that does not commit).
+    pub fn commit(mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.store.fail_next_commit.replace(false) {
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected commit failure",
+            )));
+        }
+        if !self.alive() {
+            return Err(StoreError::TransactionLost);
+        }
+        self.store.conn.execute_batch("COMMIT")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        let store = self.store;
+        store.in_batch.set(false);
+        let threads: Vec<String> = store.batch_threads.borrow_mut().drain().collect();
+        if self.committed {
+            return;
+        }
+        if !store.conn.is_autocommit() {
+            let _ = store.conn.execute_batch("ROLLBACK");
+        }
+        // The tails may hold rows this batch wrote and nothing now does.
+        let mut tails = store.tails.borrow_mut();
+        for t in threads {
+            tails.distrust_thread(&t);
+        }
+    }
+}
+
+/// Distrusts a thread's heal tails unless disarmed: held across an append, so an error or a
+/// panic (unwinding past the append) never leaves a tail vouching for a row not stored.
+struct DistrustUnlessDone<'a> {
+    store: &'a Store,
+    thread: &'a str,
+    done: bool,
+}
+
+impl Drop for DistrustUnlessDone<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.store.tails.borrow_mut().distrust_thread(self.thread);
         }
     }
 }
@@ -323,6 +456,10 @@ impl Store {
             #[cfg(test)]
             fail_next_append: Cell::new(false),
             #[cfg(test)]
+            panic_next_append: Cell::new(false),
+            #[cfg(test)]
+            fail_next_commit: Cell::new(false),
+            #[cfg(test)]
             heal_paths: Cell::new([0, 0]),
         })
     }
@@ -370,14 +507,30 @@ impl Store {
         })
     }
 
-    /// Runs `f` inside one `BEGIN IMMEDIATE` transaction, committed at the end: the store
-    /// writer's batches. Every method `f` calls that opens a transaction of its own takes a
-    /// savepoint instead, so one failing write rolls back alone and the rest still commit. If
-    /// the COMMIT itself fails nothing of the batch is stored, and the heal tails of every
-    /// thread appended to are distrusted. A batch inside a batch just runs `f`.
+    /// Runs `f` inside one batch ([`Store::begin_batch`]), committed at the end. `Err` (and
+    /// nothing of `f` stored) when the batch could not begin, SQLite rolled it back on its own
+    /// meanwhile, or the COMMIT failed. A batch inside a batch just runs `f`.
     pub fn batch<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R> {
         if self.in_batch.get() {
             return Ok(f(self));
+        }
+        let batch = self.begin_batch()?;
+        let out = f(self);
+        if !batch.alive() {
+            return Err(StoreError::TransactionLost);
+        }
+        batch.commit()?;
+        Ok(out)
+    }
+
+    /// Begins one `BEGIN IMMEDIATE` transaction for many writes: the store writer's batches.
+    /// Every method called meanwhile that opens a transaction of its own takes a savepoint
+    /// instead, so one failing write rolls back alone. The batch is committed only by
+    /// [`Batch::commit`]; any other end (an error, a panic, a lost transaction) rolls it back
+    /// and distrusts the heal tails of every thread appended to in it.
+    pub fn begin_batch(&self) -> Result<Batch<'_>> {
+        if self.in_batch.get() {
+            return Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery));
         }
         // Another process holding the write lock past the busy timeout: try again before the
         // batch is given up (and reported).
@@ -399,28 +552,17 @@ impl Store {
         }
         self.in_batch.set(true);
         self.batch_threads.borrow_mut().clear();
-        // Reset however `f` leaves (a panic included), so the connection stays usable.
-        struct Reset<'a>(&'a Store);
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.0.in_batch.set(false);
-                if !self.0.conn.is_autocommit() {
-                    // Not committed: `f` panicked, or the COMMIT failed.
-                    let _ = self.0.conn.execute_batch("ROLLBACK");
-                    let threads: Vec<String> = self.0.batch_threads.borrow_mut().drain().collect();
-                    let mut tails = self.0.tails.borrow_mut();
-                    for t in threads {
-                        tails.distrust_thread(&t);
-                    }
-                }
-            }
-        }
-        let reset = Reset(self);
-        let out = f(self);
-        self.conn.execute_batch("COMMIT")?;
-        self.batch_threads.borrow_mut().clear();
-        drop(reset);
-        Ok(out)
+        Ok(Batch {
+            store: self,
+            committed: false,
+        })
+    }
+
+    /// Test hook: SQLite rolling the open transaction back on its own (as after a disk-full or
+    /// I/O error), behind the store's back.
+    #[cfg(test)]
+    pub(crate) fn lose_transaction(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
     }
 
     /// A transaction, or a savepoint of the open batch (see [`Store::batch`]).
@@ -808,6 +950,13 @@ impl Store {
         env: &Envelope,
     ) -> Result<i64> {
         let started = Instant::now();
+        // Anything but success (an error, a panic unwinding through here): the tail may now
+        // hold a row the database does not, or the reverse.
+        let mut guard = DistrustUnlessDone {
+            store: self,
+            thread,
+            done: false,
+        };
         // The insert and the `updated_at` bump commit together or not at all.
         let result = self
             .scope(rusqlite::TransactionBehavior::Deferred)
@@ -816,10 +965,8 @@ impl Store {
                 tx.commit()?;
                 Ok(seq)
             });
-        if result.is_err() {
-            // The tail may now hold a row the database does not (or the reverse).
-            self.tails.borrow_mut().distrust_thread(thread);
-        }
+        guard.done = result.is_ok();
+        drop(guard);
         let took = started.elapsed();
         if took > SLOW_WRITE {
             tracing::warn!(
@@ -855,14 +1002,20 @@ impl Store {
             )
             .map_err(|e| fk_or(e, thread))?;
         let seq = self.conn.last_insert_rowid();
-        #[cfg(test)]
-        if self.fail_next_append.replace(false) {
-            return Err(StoreError::Io(std::io::Error::other(
-                "injected append failure",
-            )));
-        }
         match (&scrubbed.event, &scrubbed.item) {
-            (Event::ItemStarted { .. }, Some(item)) => self.tails.borrow_mut().arm(thread, item),
+            (Event::ItemStarted { .. }, Some(item)) => {
+                // A reused item id (a second start, a reopened thread, another process) already
+                // has rows the scan would heal with; a tail started now would not hold them.
+                if self.tails.borrow().would_arm(thread, item) {
+                    if self.item_has_rows(thread, item, seq)? {
+                        self.tails.borrow_mut().refuse(thread, item);
+                    } else {
+                        self.tails.borrow_mut().arm(thread, item);
+                    }
+                } else {
+                    self.tails.borrow_mut().arm(thread, item);
+                }
+            }
             (Event::ContentDelta { stream, text }, Some(item)) => self
                 .tails
                 .borrow_mut()
@@ -891,8 +1044,37 @@ impl Store {
         ) {
             self.tails.borrow_mut().clear_thread(thread);
         }
+        // Injected after the tails moved, so a failing append really leaves them ahead of the
+        // database: only the distrust on the way out keeps them honest.
+        #[cfg(test)]
+        if self.fail_next_append.replace(false) {
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected append failure",
+            )));
+        }
+        #[cfg(test)]
+        if self.panic_next_append.replace(false) {
+            panic!("injected append panic");
+        }
         self.touch(thread, now)?;
         Ok(seq)
+    }
+
+    /// Whether `thread` already has a row naming `item`, other than row `seq`, within the rows
+    /// [`Store::heal_split_deltas`] would search. A substring test on the stored JSON: a false
+    /// "yes" (the id quoted in some text) only costs the SQL heal; a false "no" cannot happen,
+    /// since every row of the item carries exactly this `"item":"…"` field.
+    fn item_has_rows(&self, thread: &str, item: &str, seq: i64) -> Result<bool> {
+        let needle = format!("\"item\":{}", serde_json::to_string(item)?);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events
+                 WHERE thread_id = ?1
+                   AND seq > (SELECT COALESCE(MAX(seq), 0) FROM events WHERE thread_id = ?1) - ?3
+                   AND seq <> ?4
+                   AND instr(envelope_json, ?2) > 0)",
+            params![thread, needle, HEAL_WINDOW, seq],
+            |r| r.get(0),
+        )?)
     }
 
     /// Re-scrubs an item's streamed text as a whole: from its trusted in-memory tail when there
@@ -907,16 +1089,32 @@ impl Store {
             paths[usize::from(tail.is_none())] += 1;
             self.heal_paths.set(paths);
         }
-        match tail {
-            Some(streams) => {
-                tracing::debug!(path = "tail", "healing an item's streamed text");
-                self.heal_from_tail(thread, item, streams)
-            }
-            None => {
-                tracing::debug!(path = "sql", "healing an item's streamed text");
-                self.heal_split_deltas(thread, item)
+        if let Some(streams) = tail {
+            tracing::debug!(path = "tail", "healing an item's streamed text");
+            // Its own savepoint: a tail heal that fails is undone whole and the scan runs
+            // instead, so a broken tail can never leave fragments the scan would have healed.
+            self.conn.execute_batch("SAVEPOINT tail_heal")?;
+            match self.heal_from_tail(thread, item, streams) {
+                Ok(()) => {
+                    self.conn.execute_batch("RELEASE tail_heal")?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "a heal tail did not match the store; scanning");
+                    self.conn
+                        .execute_batch("ROLLBACK TO tail_heal; RELEASE tail_heal")?;
+                    self.tails.borrow_mut().distrust_thread(thread);
+                    #[cfg(test)]
+                    {
+                        let mut paths = self.heal_paths.get();
+                        paths[1] += 1;
+                        self.heal_paths.set(paths);
+                    }
+                }
             }
         }
+        tracing::debug!(path = "sql", "healing an item's streamed text");
+        self.heal_split_deltas(thread, item)
     }
 
     /// [`Store::heal_split_deltas`] with the rows already known: only a stream whose joined text
@@ -943,6 +1141,15 @@ impl Store {
                     |r| r.get(0),
                 )?;
                 let mut env: Envelope = serde_json::from_str(&json)?;
+                // The row must still be this item's delta on this stream: never rewrite a row
+                // the tail only thinks it knows.
+                let ours = env.item.as_deref() == Some(item)
+                    && matches!(&env.event, Event::ContentDelta { stream: s, .. } if *s == stream);
+                if !ours {
+                    return Err(StoreError::NotFound(format!(
+                        "delta row {seq} of a heal tail"
+                    )));
+                }
                 if let Event::ContentDelta { text, .. } = &mut env.event {
                     *text = if i == 0 { whole.clone() } else { String::new() };
                 }
@@ -1105,6 +1312,11 @@ impl Store {
             text: text.to_string(),
         })
         .item(item);
+        let mut guard = DistrustUnlessDone {
+            store: self,
+            thread,
+            done: false,
+        };
         let result = self
             .scope(rusqlite::TransactionBehavior::Deferred)
             .and_then(|tx| {
@@ -1112,9 +1324,7 @@ impl Store {
                 self.append_in_txn(thread, provider_thread, &snapshot)?;
                 tx.commit()
             });
-        if result.is_err() {
-            self.tails.borrow_mut().distrust_thread(thread);
-        }
+        guard.done = result.is_ok();
         result
     }
 
@@ -2410,69 +2620,103 @@ mod tests {
     #[allow(clippy::large_enum_variant)] // a test script, built once
     enum Step {
         Append(String, Envelope),
-        /// The next append fails after its insert (an injected write error).
+        /// A user prompt (`append_user_message_with_id`: two rows in one transaction).
+        Prompt(String, String),
+        /// An imported history (`import_events`), into a thread that has none yet.
+        Import(String, Vec<Envelope>),
+        /// The next append fails after its insert and tail update (an injected write error).
         Fail,
+        /// The next append panics after its insert and tail update.
+        Panic,
+        /// SQLite rolls the open transaction back on its own (inside a batch).
+        LoseTxn,
+        /// The next batch's COMMIT fails.
+        FailCommit,
         Forget(String),
-        /// These steps in one batch, as the writer commits them.
+        /// These steps as one batch of the store writer (`store_writer::run_jobs_as_batch`).
         Batch(Vec<Step>),
+    }
+
+    fn split(rng: &mut Rng, secret: &str) -> Vec<String> {
+        let cuts = 1 + rng.below(4);
+        let mut at: Vec<usize> = (0..cuts).map(|_| 1 + rng.below(secret.len() - 1)).collect();
+        at.sort_unstable();
+        at.dedup();
+        let mut frags = Vec::new();
+        let mut last = 0;
+        for c in at {
+            frags.push(secret[last..c].to_owned());
+            last = c;
+        }
+        frags.push(secret[last..].to_owned());
+        frags
     }
 
     fn script(seed: u64) -> Vec<Step> {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        let threads = ["t1", "t2"];
+        let threads = ["t1", "t2", "t3"];
         let streams = [StreamKind::Assistant, StreamKind::Reasoning];
         let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
         // Open items: (thread, item, pending fragments of a split secret).
         let mut open: Vec<(usize, String, Vec<String>)> = Vec::new();
+        // Items completed (or whose turn ended): an id that may come back.
+        let mut closed: Vec<(usize, String)> = Vec::new();
         let mut next_item = 0;
+        let mut imported = false;
         let mut steps = Vec::new();
+        // The next delta of an open item, consuming a fragment of its secret when it has one.
+        let next_delta =
+            |rng: &mut Rng, open: &mut Vec<(usize, String, Vec<String>)>| -> Option<Step> {
+                if open.is_empty() {
+                    return None;
+                }
+                let k = rng.below(open.len());
+                let stream = streams[rng.below(2)];
+                let (t, item, frags) = &mut open[k];
+                let text = if !frags.is_empty() && rng.below(3) != 0 {
+                    let f = frags.remove(0);
+                    if rng.below(2) == 0 {
+                        format!("token {f}")
+                    } else {
+                        f
+                    }
+                } else {
+                    format!("word{} ", rng.below(100))
+                };
+                Some(Step::Append(
+                    threads[*t].into(),
+                    stream_delta(item, stream, &text),
+                ))
+            };
         for _ in 0..400 {
             let t = rng.below(2);
-            let step = match rng.below(20) {
+            let step = match rng.below(26) {
                 0..=2 => {
-                    // Usually a new item, sometimes one started before (started twice).
-                    let item = if rng.below(8) == 0 && !open.is_empty() {
-                        open[rng.below(open.len())].1.clone()
-                    } else {
-                        next_item += 1;
-                        format!("i{next_item}")
-                    };
-                    let mut frags = Vec::new();
-                    if rng.below(2) == 0 {
-                        let cuts = 1 + rng.below(4);
-                        let mut at: Vec<usize> =
-                            (0..cuts).map(|_| 1 + rng.below(secret.len() - 1)).collect();
-                        at.sort_unstable();
-                        at.dedup();
-                        let mut last = 0;
-                        for c in at {
-                            frags.push(secret[last..c].to_owned());
-                            last = c;
+                    // A new item; sometimes one open already (started twice), sometimes one
+                    // completed before (a reused id).
+                    let item = match rng.below(8) {
+                        0 if !open.is_empty() => open[rng.below(open.len())].1.clone(),
+                        1 if !closed.is_empty() => closed.remove(rng.below(closed.len())).1,
+                        _ => {
+                            next_item += 1;
+                            format!("i{next_item}")
                         }
-                        frags.push(secret[last..].to_owned());
-                    }
+                    };
+                    let frags = if rng.below(2) == 0 {
+                        split(&mut rng, &secret)
+                    } else {
+                        Vec::new()
+                    };
                     open.push((t, item.clone(), frags));
                     Step::Append(
                         threads[t].into(),
                         started(&item, ItemKind::AssistantMessage),
                     )
                 }
-                3..=11 if !open.is_empty() => {
-                    let k = rng.below(open.len());
-                    let stream = streams[rng.below(2)];
-                    let (t, item, frags) = &mut open[k];
-                    let text = if !frags.is_empty() && rng.below(2) == 0 {
-                        let f = frags.remove(0);
-                        if rng.below(2) == 0 {
-                            format!("token {f}")
-                        } else {
-                            f
-                        }
-                    } else {
-                        format!("word{} ", rng.below(100))
-                    };
-                    Step::Append(threads[*t].into(), stream_delta(item, stream, &text))
-                }
+                3..=11 => match next_delta(&mut rng, &mut open) {
+                    Some(step) => step,
+                    None => continue,
+                },
                 12 if !open.is_empty() => {
                     let (t, item, _) = &open[rng.below(open.len())];
                     let snap = Envelope::new(Event::ContentSnapshot {
@@ -2489,6 +2733,7 @@ mod tests {
                     } else {
                         ItemStatus::Completed
                     };
+                    closed.push((t, item.clone()));
                     Step::Append(threads[t].into(), completed(&item, status))
                 }
                 15 => {
@@ -2511,22 +2756,93 @@ mod tests {
                     }),
                 ),
                 17 => Step::Fail,
-                18 => Step::Forget(threads[t].into()),
+                18 => Step::Panic,
+                19 => Step::Forget(threads[t].into()),
+                20 => {
+                    next_item += 1;
+                    Step::Prompt(threads[t].into(), format!("u{next_item}"))
+                }
+                22 | 23 => {
+                    // A secret split around a delta that does not survive (its write fails,
+                    // panics, or its batch is rolled back or not committed): only a tail that
+                    // forgets that row heals what the store really holds.
+                    next_item += 1;
+                    let item = format!("x{next_item}");
+                    let at = 1 + rng.below(secret.len() - 1);
+                    let delta = |text: &str| {
+                        Step::Append(
+                            threads[t].into(),
+                            stream_delta(&item, StreamKind::Assistant, text),
+                        )
+                    };
+                    steps.push(Step::Append(
+                        threads[t].into(),
+                        started(&item, ItemKind::AssistantMessage),
+                    ));
+                    steps.push(delta(&secret[..at]));
+                    match rng.below(6) {
+                        0 => steps.push(Step::Batch(vec![delta("lost "), Step::FailCommit])),
+                        1 => {
+                            steps.push(Step::Batch(vec![delta("lost "), Step::LoseTxn, delta("")]))
+                        }
+                        2 => steps.push(Step::Batch(vec![Step::Panic, delta("lost ")])),
+                        3 => steps.push(Step::Batch(vec![Step::Fail, delta("lost ")])),
+                        4 => steps.extend([Step::Panic, delta("lost ")]),
+                        _ => steps.extend([Step::Fail, delta("lost ")]),
+                    }
+                    steps.push(delta(&secret[at..]));
+                    closed.push((t, item.clone()));
+                    Step::Append(threads[t].into(), completed(&item, ItemStatus::Completed))
+                }
+                24 => {
+                    // A reused id: half a secret in its first life, the rest after it starts
+                    // again. The scan joins both lives; a tail started anew would not.
+                    next_item += 1;
+                    let item = format!("r{next_item}");
+                    let at = 1 + rng.below(secret.len() - 1);
+                    let mut life = |text: &str| {
+                        steps.push(Step::Append(
+                            threads[t].into(),
+                            started(&item, ItemKind::AssistantMessage),
+                        ));
+                        steps.push(Step::Append(
+                            threads[t].into(),
+                            stream_delta(&item, StreamKind::Assistant, text),
+                        ));
+                        steps.push(Step::Append(
+                            threads[t].into(),
+                            completed(&item, ItemStatus::Completed),
+                        ));
+                    };
+                    life(&secret[..at]);
+                    life(&secret[at..]);
+                    continue;
+                }
+                21 if !imported => {
+                    // A history with half a secret in an item that never completed there: a
+                    // later start of the same id must not trust a tail without that row.
+                    imported = true;
+                    let mut frags = split(&mut rng, &secret);
+                    let first = frags.remove(0);
+                    open.push((2, "imp".into(), frags));
+                    Step::Import(
+                        "t3".into(),
+                        vec![
+                            started("imp", ItemKind::AssistantMessage),
+                            stream_delta("imp", StreamKind::Assistant, &first),
+                        ],
+                    )
+                }
                 _ => {
-                    // A batch of a few deltas, as the writer commits them.
+                    // A batch of the writer: deltas, with now and then a failure inside it.
                     let mut inner = Vec::new();
-                    for _ in 0..1 + rng.below(4) {
-                        let pick = rng.below(open.len().max(1));
-                        if let Some((t, item, frags)) = open.get_mut(pick) {
-                            let text = if frags.is_empty() {
-                                "x".to_owned()
-                            } else {
-                                frags.remove(0)
-                            };
-                            inner.push(Step::Append(
-                                threads[*t].into(),
-                                stream_delta(item, StreamKind::Assistant, &text),
-                            ));
+                    for _ in 0..1 + rng.below(5) {
+                        match rng.below(12) {
+                            0 => inner.push(Step::Fail),
+                            1 => inner.push(Step::Panic),
+                            2 => inner.push(Step::LoseTxn),
+                            3 => inner.push(Step::FailCommit),
+                            _ => inner.extend(next_delta(&mut rng, &mut open)),
                         }
                     }
                     Step::Batch(inner)
@@ -2544,45 +2860,97 @@ mod tests {
         steps
     }
 
-    fn play(s: &Store, steps: &[Step]) {
-        for step in steps {
-            match step {
-                Step::Append(t, env) => {
-                    let _ = s.append_event(t, None, env);
-                }
-                Step::Fail => s.fail_next_append.set(true),
-                Step::Forget(t) => s.forget_tails(t),
-                Step::Batch(inner) => {
-                    s.batch(|s| play(s, inner)).expect("batch");
-                }
+    /// One step as a job of the store writer.
+    fn job_of(step: &Step) -> crate::store_writer::TestJob {
+        match step {
+            Step::Append(t, env) => {
+                let (t, env) = (t.clone(), env.clone());
+                Box::new(move |s: &Store| s.append_event(&t, None, &env).map(drop))
             }
+            Step::Prompt(t, item) => {
+                let (t, item) = (t.clone(), item.clone());
+                Box::new(move |s: &Store| s.append_user_message_with_id(&t, None, &item, "hi"))
+            }
+            Step::Import(t, envs) => {
+                let (t, envs) = (t.clone(), envs.clone());
+                Box::new(move |s: &Store| s.import_events(&t, None, &envs).map(drop))
+            }
+            Step::Fail => Box::new(|s: &Store| {
+                s.fail_next_append.set(true);
+                Ok(())
+            }),
+            Step::Panic => Box::new(|s: &Store| {
+                s.panic_next_append.set(true);
+                Ok(())
+            }),
+            Step::LoseTxn => Box::new(|s: &Store| {
+                s.lose_transaction();
+                Ok(())
+            }),
+            Step::FailCommit => Box::new(|s: &Store| {
+                s.fail_next_commit.set(true);
+                Ok(())
+            }),
+            Step::Forget(t) => {
+                let t = t.clone();
+                Box::new(move |s: &Store| {
+                    s.forget_tails(&t);
+                    Ok(())
+                })
+            }
+            Step::Batch(_) => Box::new(|_: &Store| Ok(())),
         }
     }
 
-    fn diff_store(tails: bool, small_caps: bool) -> Store {
+    fn play(s: &Store, steps: &[Step]) {
+        quiet_injected_panics();
+        for step in steps {
+            match step {
+                Step::Batch(inner) => {
+                    crate::store_writer::run_jobs_as_batch(s, inner.iter().map(job_of).collect());
+                }
+                step => {
+                    let job = job_of(step);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(s)));
+                }
+            }
+        }
+        // A hook left set by the last steps must not leak into the comparison.
+        s.fail_next_append.set(false);
+        s.panic_next_append.set(false);
+        s.fail_next_commit.set(false);
+    }
+
+    fn diff_store(tails: bool, seed: u64) -> Store {
         let s = store();
         s.set_heal_tails(tails);
-        if small_caps {
-            s.tails.borrow_mut().set_caps(40, 120);
+        if tails && seed.is_multiple_of(3) {
+            s.tails.borrow_mut().set_caps(120, 360);
         }
-        for t in ["t1", "t2"] {
+        if tails && seed.is_multiple_of(5) {
+            // Few tails at once: deltas of items past the limit leave no marker at all.
+            s.tails.borrow_mut().set_max_items(2);
+        }
+        for t in ["t1", "t2", "t3"] {
             s.create_thread_with_id(t, "/", None).expect("thread");
         }
         s
     }
 
     /// §6.4: the same randomised script (split secrets across 2-5 deltas, two interleaved
-    /// streams and threads, snapshots, interrupts, items started twice or never, overflow,
-    /// injected append errors, batches, forgotten tails) into a store healing from its tails and
-    /// one forced to the SQL scan leaves byte-identical events tables.
+    /// streams and threads, snapshots, interrupts, items started twice, never, or again after
+    /// completing (reused ids), prompts, an import, overflow, too many items, injected append
+    /// errors and panics, forgotten tails, and writer batches with failures, panics, a lost
+    /// transaction or a failed COMMIT inside) into a store healing from its tails and one forced
+    /// to the SQL scan leaves byte-identical events tables.
     #[test]
     fn healing_from_tails_writes_exactly_what_the_sql_scan_does() {
         let mut paths = [0u32; 2];
         let mut healed_rows = 0;
-        for seed in 1..=60u64 {
+        for seed in 1..=200u64 {
             let steps = script(seed);
-            let tail = diff_store(true, seed % 3 == 0);
-            let sql = diff_store(false, false);
+            let tail = diff_store(true, seed);
+            let sql = diff_store(false, seed);
             play(&tail, &steps);
             play(&sql, &steps);
             let rows = event_rows(&tail);
@@ -2632,8 +3000,8 @@ mod tests {
             "t1".into(),
             completed("long", ItemStatus::Completed),
         ));
-        let tail = diff_store(true, false);
-        let sql = diff_store(false, false);
+        let tail = diff_store(true, 1);
+        let sql = diff_store(false, 1);
         play(&tail, &steps);
         play(&sql, &steps);
         let leaks = |s: &Store| {
@@ -2664,6 +3032,93 @@ mod tests {
         assert_eq!(s.heal_paths.get(), [0, 1], "healed by the scan");
         let all = serde_json::to_string(&s.events(&t, None, 50).expect("ev")).expect("j");
         assert!(!all.contains(a) && !all.contains("lost"), "{all}");
+    }
+
+    fn leaks(s: &Store, parts: &[&str]) -> bool {
+        event_rows(s)
+            .iter()
+            .any(|(_, _, _, json)| parts.iter().any(|p| json.contains(p)))
+    }
+
+    /// B1: an item id that comes back (after its completion cleared its tail) already has rows;
+    /// a tail started anew would miss them, so it heals by the scan, which joins both lives.
+    #[test]
+    fn a_reused_item_id_heals_by_the_scan() {
+        let s = diff_store(true, 1);
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(13);
+        for env in [
+            started("r", ItemKind::AssistantMessage),
+            delta("r", a),
+            completed("r", ItemStatus::Completed),
+            started("r", ItemKind::AssistantMessage),
+            delta("r", b),
+            completed("r", ItemStatus::Completed),
+        ] {
+            s.append_event("t1", None, &env).expect("append");
+        }
+        assert!(!leaks(&s, &[a, b]));
+        assert_eq!(
+            s.heal_paths.get(),
+            [1, 1],
+            "the second life heals by the scan"
+        );
+    }
+
+    /// A1: a delta that came before its item's start while the tails were full left no marker;
+    /// the start that follows must still not trust a tail that lacks that row.
+    #[test]
+    fn a_delta_unseen_by_full_tails_is_not_vouched_for_later() {
+        let s = diff_store(true, 1);
+        s.tails.borrow_mut().set_max_items(1);
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(9);
+        s.append_event("t1", None, &started("full", ItemKind::AssistantMessage))
+            .expect("start");
+        s.append_event("t1", None, &delta("w", a)).expect("early");
+        s.append_event("t1", None, &completed("full", ItemStatus::Completed))
+            .expect("done");
+        for env in [
+            started("w", ItemKind::AssistantMessage),
+            delta("w", b),
+            completed("w", ItemStatus::Completed),
+        ] {
+            s.append_event("t1", None, &env).expect("append");
+        }
+        assert!(!leaks(&s, &[a, b]));
+    }
+
+    /// A tail that no longer matches the store (here a row rewritten behind its back) is not
+    /// healed from: the tail heal is undone and the scan runs instead.
+    #[test]
+    fn a_tail_that_does_not_match_the_store_falls_back_to_the_scan() {
+        let s = diff_store(true, 1);
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(10);
+        s.append_event("t1", None, &started("m", ItemKind::AssistantMessage))
+            .expect("start");
+        let first = s.append_event("t1", None, &delta("m", a)).expect("a");
+        s.append_event("t1", None, &delta("m", b)).expect("b");
+        // The row the tail knows as the item's first now belongs to another item.
+        let other = serde_json::to_string(&delta("other", a)).expect("json");
+        s.conn
+            .execute(
+                "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
+                params![other, first],
+            )
+            .expect("tamper");
+        s.append_event("t1", None, &completed("m", ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(
+            s.heal_paths.get(),
+            [1, 1],
+            "tried the tail, healed by the scan"
+        );
+        // The scan saw only `b` for this item: nothing to heal, and nothing half-rewritten.
+        let rows = event_rows(&s);
+        assert!(rows
+            .iter()
+            .any(|(seq, _, _, j)| *seq == first && j.contains("\"other\"")));
     }
 
     #[test]
@@ -2731,10 +3186,13 @@ mod tests {
                 .expect("a thread with events");
             let mut deltas = Vec::new();
             let mut done = Vec::new();
+            let mut starts = Vec::new();
             for round in 0..200 {
                 let item = format!("bench-{label}-{round}");
+                let t = Instant::now();
                 s.append_event(&thread, None, &started(&item, ItemKind::AssistantMessage))
                     .expect("start");
+                starts.push(t.elapsed());
                 for n in 0..20 {
                     let t = Instant::now();
                     s.append_event(&thread, None, &delta(&item, &format!("word {n} ")))
@@ -2747,7 +3205,14 @@ mod tests {
                 done.push(t.elapsed());
             }
             done.sort();
+            starts.sort();
             let us = |d: Duration| d.as_secs_f64() * 1e6;
+            // The start checks the item has no rows yet (a reused id heals by the scan).
+            eprintln!(
+                "{label}: item_started p50 {:.1} µs, p99 {:.1} µs",
+                us(starts[starts.len() / 2]),
+                us(starts[starts.len() * 99 / 100]),
+            );
             let mean = deltas.iter().map(|d| us(*d)).sum::<f64>() / deltas.len() as f64;
             eprintln!(
                 "{label}: content_delta mean {mean:.1} µs; item_completed p50 {:.1} µs, p99 {:.1} µs",

@@ -6,12 +6,17 @@
 //! would. Anything less makes it untrusted, and an untrusted or absent tail means "use the SQL
 //! scan", which is always correct. The rules:
 //!
-//! - A tail starts at the item's `ItemStarted` in this process. Deltas of an item with no
-//!   started tail leave an untrusted marker, so a later `ItemStarted` cannot vouch for them.
+//! - A tail starts at the item's `ItemStarted` in this process, and only if the store holds no
+//!   row of that item yet (within the scan's window): a reused id (a second start after the
+//!   first was completed or cleared, a reopened thread, another process) heals by the scan.
+//!   Deltas of an item with no started tail leave an untrusted marker.
 //! - A second `ItemStarted` for an item already tailed makes it untrusted.
-//! - It overflows (per-item or global byte cap): untrusted, and its text is dropped.
-//! - Any append error on the thread, or a batch that failed to commit: every tail of the
-//!   thread becomes untrusted (the DB may not hold what the tail does, or the reverse).
+//! - It overflows (per-item or global cap, row overhead counted): untrusted, text dropped.
+//! - Any append that does not succeed (an error, a panic), a batch that does not commit, or a
+//!   transaction SQLite rolled back on its own: every tail of the thread becomes untrusted
+//!   (the DB may not hold what the tail does, or the reverse).
+//! - A tail heal that does not match the store (a row gone or changed) is undone and the
+//!   scan runs instead.
 //! - `ItemCompleted` consumes it; `ContentSnapshot` keeps it (with the healed text);
 //!   `TurnCompleted`, `SessionExited`, a deleted or closed thread clear the thread's tails.
 //!
@@ -27,6 +32,8 @@ pub(crate) const ITEM_CAP: usize = 1 << 20;
 pub(crate) const TOTAL_CAP: usize = 16 << 20;
 /// Most items tailed at once (trusted or not); past it new items get no tail (SQL heal).
 pub(crate) const MAX_ITEMS: usize = 4096;
+/// What one kept row costs beyond its text: its `seq` and `String` header, and its slot.
+pub(crate) const ROW_OVERHEAD: usize = std::mem::size_of::<(i64, String)>();
 
 /// One stream's rows: `(seq, scrubbed text)` in append order.
 pub(crate) type StreamRows = Vec<(i64, String)>;
@@ -90,6 +97,34 @@ impl HealTails {
         self.total_cap = total_cap;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_max_items(&mut self, max_items: usize) {
+        self.max_items = max_items;
+    }
+
+    /// Whether [`HealTails::arm`] would start a new trusted tail for the item: the store then
+    /// first checks the item has no rows yet ([`HealTails::refuse`] if it has).
+    pub(crate) fn would_arm(&self, thread: &str, item: &str) -> bool {
+        self.enabled
+            && self.items.len() < self.max_items
+            && !self.items.contains_key(&key(thread, item))
+    }
+
+    /// The item started, but already has rows in the store (a reused id): never trusted.
+    pub(crate) fn refuse(&mut self, thread: &str, item: &str) {
+        if !self.enabled {
+            return;
+        }
+        let full = self.items.len() >= self.max_items;
+        match self.items.get_mut(&key(thread, item)) {
+            Some(tail) => self.total -= tail.distrust(),
+            None if !full => {
+                self.items.insert(key(thread, item), ItemTail::default());
+            }
+            None => {}
+        }
+    }
+
     /// The item started (its `ItemStarted` is stored).
     pub(crate) fn arm(&mut self, thread: &str, item: &str) {
         if !self.enabled {
@@ -134,13 +169,15 @@ impl HealTails {
         if !tail.trusted {
             return;
         }
-        if tail.bytes + text.len() > self.item_cap || self.total + text.len() > self.total_cap {
+        // A row costs its text plus what keeping it costs (its seq, the String, the Vec slot).
+        let cost = text.len() + ROW_OVERHEAD;
+        if tail.bytes + cost > self.item_cap || self.total + cost > self.total_cap {
             self.total -= tail.distrust();
             tracing::debug!("a heal tail overflowed; its item will heal by the SQL scan");
             return;
         }
-        tail.bytes += text.len();
-        self.total += text.len();
+        tail.bytes += cost;
+        self.total += cost;
         let row = (seq, text.to_owned());
         match tail.streams.iter_mut().find(|(s, _)| *s == stream) {
             Some((_, rows)) => rows.push(row),
@@ -258,15 +295,23 @@ mod tests {
 
     #[test]
     fn overflow_drops_the_text_and_distrusts() {
+        let o = ROW_OVERHEAD;
         let mut t = HealTails::default();
-        t.set_caps(4, 100);
+        t.set_caps(o + 4, 1000);
         t.arm("t", "i");
         t.record("t", "i", A, 1, "abc");
         t.record("t", "i", A, 2, "de");
         assert!(t.trusted("t", "i").is_none());
         assert_eq!(t.total_bytes(), 0);
+        // Row overhead counts: many empty rows overflow too.
+        t.set_caps(3 * o, 1000);
+        t.arm("t", "e");
+        for seq in 0..4 {
+            t.record("t", "e", A, seq, "");
+        }
+        assert!(t.trusted("t", "e").is_none());
         // The global cap overflows the item being appended.
-        t.set_caps(100, 5);
+        t.set_caps(1000, o + 5);
         t.arm("t", "k");
         t.record("t", "k", A, 3, "abcd");
         t.arm("t", "m");

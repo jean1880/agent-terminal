@@ -3,25 +3,33 @@
 //! Every write the app makes on its main thread (an event as it streams, a prompt, a title, the
 //! read mark, …) is queued here instead of run in place, so the main thread never waits on
 //! SQLite: not on the disk, not on a checkpoint, not on another connection's lock. The writer runs
-//! what is queued in order, many writes to one transaction ([`Store::batch`], each write under a
-//! savepoint of its own so one failure does not take its neighbours with it).
+//! what is queued in order, many writes to one transaction ([`Store::begin_batch`]), each write
+//! under a savepoint of its own ([`Batch::job`]): one that fails or panics leaves no partial rows
+//! and does not take its neighbours with it.
 //!
 //! - **Order.** One queue, one connection: writes land in the order they were queued, whichever
 //!   app thread queued them.
 //! - **Read-after-write.** [`StoreWriter::barrier`] answers once everything queued before it is
-//!   committed; a reader waits on it, then reads on a connection of its own (WAL shows it every
-//!   committed row). [`StoreWriter::call`] runs a job on the writer's own connection, in order.
+//!   committed (or has failed); a reader waits on it, then reads on a connection of its own (WAL
+//!   shows it every committed row). A reader whose barrier does not answer in time does not read
+//!   ([`StoreError::Behind`]). [`StoreWriter::call`] runs a job on the writer, in order, and hands
+//!   its result back once its batch is committed.
 //! - **Errors.** A write that fails is logged with what it was and its thread, and counted
-//!   ([`StoreWriter::failures`]) for the app to show. Nothing is dropped silently.
+//!   ([`StoreWriter::failures`]) for the app to show; so is a batch SQLite rolled back on its own,
+//!   for every write it held. Nothing is dropped silently.
+//! - **Overload.** The queue is bounded ([`WriterConfig`]): past the bound a write is refused at
+//!   once (never blocking its caller), counted as a failure and shown. The writes that are taken
+//!   keep their order.
 //! - **Checkpoints.** SQLite's automatic checkpoint is off on this connection: the writer
-//!   checkpoints (PASSIVE) every [`Timing::checkpoint_every`] while there were writes, and
-//!   whenever the queue has been idle for [`Timing::idle`]. With `synchronous=NORMAL` in WAL mode
-//!   a commit reaches the disk at the next checkpoint (or WAL sync), so a power cut can lose the
-//!   commits since the last checkpoint: at most about `checkpoint_every` of writes. It cannot
-//!   corrupt the database. If the WAL still grows past [`WAL_WARN_BYTES`] (a reader pinning old
-//!   pages), the writer says so and hands checkpoints back to SQLite.
-//! - **Shutdown.** [`StoreWriter::shutdown`] drains the queue and closes the connection; SQLite
-//!   checkpoints on the last close. No TRUNCATE: it would wait for readers.
+//!   checkpoints (PASSIVE) every [`WriterConfig::checkpoint_every`] while there were writes, and
+//!   whenever the queue has been idle for [`WriterConfig::idle`]. With `synchronous=NORMAL` in
+//!   WAL mode a commit is synced at the next checkpoint, so a power cut can lose the commits since
+//!   the last one: at most about `checkpoint_every` of writes. It cannot corrupt the database. If
+//!   the WAL grows past [`WAL_WARN_BYTES`] anyway (a reader pinning old pages) that is an error:
+//!   the writer says so, hands checkpoints back to SQLite, and says so again each time it doubles.
+//! - **Shutdown.** [`StoreWriter::shutdown`] drains the queue, checkpoints (PASSIVE: the app's
+//!   readers are still open, so closing would not) and closes the connection. No TRUNCATE: it
+//!   would wait for readers. It says whether the queue really drained ([`Shutdown`]).
 //!
 //! [`StoreHandle`] is what the app holds: the writer plus a read connection of the calling
 //! thread, or (memory-only store, tests) one store that runs writes in place.
@@ -36,61 +44,97 @@ use std::time::{Duration, Instant};
 
 use agent_core::event::Envelope;
 
-use crate::store::{ProviderThreadId, Result, Store, StoreError, SLOW_WRITE};
+use crate::store::{Batch, ProviderThreadId, Result, Store, StoreError, SLOW_WRITE};
 
-/// Past this many bytes of WAL the writer warns and turns SQLite's own checkpoints back on.
+/// Past this many bytes of WAL the writer reports an error and turns SQLite's own checkpoints
+/// back on.
 pub const WAL_WARN_BYTES: i64 = 64 << 20;
 /// SQLite's default automatic checkpoint threshold, restored by the WAL guard.
 const AUTOCHECKPOINT_PAGES: i64 = 1000;
 /// Most writes committed in one transaction.
 const MAX_BATCH: usize = 512;
-/// How long a read on the calling thread waits for the writer to catch up
-/// ([`StoreHandle::read`]) before it reads what is committed and says so.
+/// How long a read on the calling (main) thread waits for the writer to catch up
+/// ([`StoreHandle::read`]) before it gives up rather than read stale rows.
 pub const READ_FLUSH_WAIT: Duration = Duration::from_secs(5);
+/// The same for a read on a worker thread, which blocks nothing on screen.
+pub const WORKER_FLUSH_WAIT: Duration = Duration::from_secs(30);
+/// What a write is counted as against the byte bound when its size is not worked out.
+const DEFAULT_COST: usize = 256;
 
-/// When the writer checkpoints.
+/// How the writer checkpoints and how much it queues.
 #[derive(Debug, Clone, Copy)]
-pub struct Timing {
+pub struct WriterConfig {
     /// At most this long between checkpoints while there are writes.
     pub checkpoint_every: Duration,
     /// A queue idle this long, with writes since the last checkpoint, checkpoints.
     pub idle: Duration,
+    /// Most writes waiting at once; past it a write is refused.
+    pub max_queued: usize,
+    /// Most bytes (of envelopes, roughly) waiting at once; past it a write is refused.
+    pub max_queued_bytes: usize,
 }
 
-impl Default for Timing {
+impl Default for WriterConfig {
     fn default() -> Self {
         Self {
             checkpoint_every: Duration::from_secs(30),
             idle: Duration::from_secs(5),
+            max_queued: 100_000,
+            max_queued_bytes: 64 << 20,
         }
     }
 }
 
+/// How [`StoreWriter::shutdown`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    /// Everything queued was run and the connection closed.
+    Drained,
+    /// The writer was still busy when the wait ran out: the rest may be lost.
+    TimedOut,
+    /// The writer had already stopped (or died): whatever was still queued is lost.
+    WriterGone,
+}
+
 type WriteJob = Box<dyn FnOnce(&Store) -> Result<()> + Send>;
-type CallJob = Box<dyn FnOnce(&Store) + Send>;
+type Deliver = Box<dyn FnOnce() + Send>;
 
 struct Write {
     what: &'static str,
     thread: Option<String>,
     job: WriteJob,
+    /// Run once the write is committed (a `call`'s answer); dropped if it is not.
+    deliver: Option<Deliver>,
+    cost: usize,
+}
+
+/// A write that ran, waiting for its batch's outcome.
+struct Done {
+    what: &'static str,
+    thread: Option<String>,
+    deliver: Option<Deliver>,
+    cost: usize,
 }
 
 enum Op {
     Write(Write),
-    Call(CallJob),
     Barrier(Sender<()>),
     Shutdown(Sender<()>),
 }
 
-#[derive(Default)]
 struct Shared {
     /// Set (under the lock) once the writer takes its last look at the queue: a write sent
-    /// after that would be lost, so it is refused instead. Writes send while holding it.
+    /// after that would be lost, so it is refused instead. Writes are sent while holding it.
     closed: Mutex<bool>,
     /// Writes queued and not yet committed (or failed).
     pending: AtomicUsize,
+    /// Their rough size.
+    queued_bytes: AtomicUsize,
     failures: AtomicU64,
+    /// Of the failures, writes refused because the queue was full.
+    overloaded: AtomicU64,
     last_failure: Mutex<Option<String>>,
+    config: WriterConfig,
 }
 
 impl Shared {
@@ -100,6 +144,23 @@ impl Shared {
         if let Ok(mut last) = self.last_failure.lock() {
             *last = Some(format!("Could not {what}: {error}"));
         }
+    }
+
+    fn settle(&self, cost: usize) {
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        self.queued_bytes.fetch_sub(cost, Ordering::SeqCst);
+    }
+
+    fn finish_ok(&self, done: Done) {
+        if let Some(deliver) = done.deliver {
+            deliver();
+        }
+        self.settle(done.cost);
+    }
+
+    fn finish_failed(&self, done: Done, error: &str) {
+        self.fail(done.what, done.thread.as_deref(), error);
+        self.settle(done.cost);
     }
 }
 
@@ -111,16 +172,25 @@ pub struct StoreWriter {
 }
 
 impl StoreWriter {
-    /// Opens the store at `path` on a new writer thread (blocking until it is open).
+    /// Opens the store at `path` on a new writer thread, blocking until it is open (the schema
+    /// is migrated by whoever opened the store first, so this is one quick open).
     pub fn spawn(path: &Path) -> Result<Self> {
-        Self::spawn_with(path, Timing::default())
+        Self::spawn_with(path, WriterConfig::default())
     }
 
-    /// [`StoreWriter::spawn`] with its own checkpoint timing.
-    pub fn spawn_with(path: &Path, timing: Timing) -> Result<Self> {
+    /// [`StoreWriter::spawn`] with its own checkpoint timing and queue bounds.
+    pub fn spawn_with(path: &Path, config: WriterConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            closed: Mutex::new(false),
+            pending: AtomicUsize::new(0),
+            queued_bytes: AtomicUsize::new(0),
+            failures: AtomicU64::new(0),
+            overloaded: AtomicU64::new(0),
+            last_failure: Mutex::new(None),
+            config,
+        });
         let path = path.to_owned();
         let thread_shared = shared.clone();
         std::thread::Builder::new()
@@ -130,7 +200,7 @@ impl StoreWriter {
                 match opened {
                     Ok(store) => {
                         let _ = ready_tx.send(Ok(()));
-                        run(store, rx, &thread_shared, timing);
+                        run(store, rx, &thread_shared);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -142,52 +212,108 @@ impl StoreWriter {
     }
 
     /// Queues `job` (`what` names it in logs and the failure message: "store an event").
-    /// `Err` only when the writer is gone; a job that fails later is counted in
-    /// [`StoreWriter::failures`].
+    /// `Err` when it was not queued: the writer is gone, or its queue is full (both counted in
+    /// [`StoreWriter::failures`]). A job that fails later is counted there too.
     pub fn write(
         &self,
         what: &'static str,
         thread: Option<&str>,
         job: impl FnOnce(&Store) -> Result<()> + Send + 'static,
     ) -> Result<()> {
-        let op = Op::Write(Write {
+        self.enqueue(Write {
             what,
             thread: thread.map(str::to_owned),
             job: Box::new(job),
-        });
-        let sent = match self.shared.closed.lock() {
-            Ok(closed) if !*closed => {
-                self.shared.pending.fetch_add(1, Ordering::SeqCst);
-                self.tx.send(op).is_ok()
-            }
-            _ => {
-                // Counted below as one that never went out.
-                self.shared.pending.fetch_add(1, Ordering::SeqCst);
-                false
-            }
-        };
-        if !sent {
-            self.shared.pending.fetch_sub(1, Ordering::SeqCst);
-            self.shared
-                .fail(what, thread, "the store writer has stopped");
-            return Err(StoreError::WriterGone);
-        }
-        Ok(())
+            deliver: None,
+            cost: DEFAULT_COST,
+        })
     }
 
-    /// Runs `job` on the writer's connection after everything queued before it, outside any
-    /// batch (so it may open transactions of its own), and returns its result. The receiver
-    /// errors when the writer is gone or the job panicked.
+    /// [`StoreWriter::write`] with its size counted against the byte bound.
+    pub fn write_sized(
+        &self,
+        what: &'static str,
+        thread: Option<&str>,
+        cost: usize,
+        job: impl FnOnce(&Store) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.enqueue(Write {
+            what,
+            thread: thread.map(str::to_owned),
+            job: Box::new(job),
+            deliver: None,
+            cost,
+        })
+    }
+
+    fn enqueue(&self, write: Write) -> Result<()> {
+        let (what, thread) = (write.what, write.thread.clone());
+        let cost = write.cost;
+        let config = &self.shared.config;
+        let refused = match self.shared.closed.lock() {
+            Ok(closed) if !*closed => {
+                let pending = self.shared.pending.load(Ordering::SeqCst);
+                let bytes = self.shared.queued_bytes.load(Ordering::SeqCst);
+                if pending >= config.max_queued || bytes + cost > config.max_queued_bytes {
+                    self.shared.overloaded.fetch_add(1, Ordering::SeqCst);
+                    Some((
+                        StoreError::Overloaded,
+                        format!(
+                            "the store is too far behind ({pending} writes, {} MB waiting)",
+                            bytes >> 20
+                        ),
+                    ))
+                } else {
+                    self.shared.pending.fetch_add(1, Ordering::SeqCst);
+                    self.shared.queued_bytes.fetch_add(cost, Ordering::SeqCst);
+                    if self.tx.send(Op::Write(write)).is_ok() {
+                        None
+                    } else {
+                        self.shared.settle(cost);
+                        Some((StoreError::WriterGone, StoreError::WriterGone.to_string()))
+                    }
+                }
+            }
+            _ => Some((StoreError::WriterGone, StoreError::WriterGone.to_string())),
+        };
+        match refused {
+            None => Ok(()),
+            Some((error, message)) => {
+                self.shared.fail(what, thread.as_deref(), &message);
+                Err(error)
+            }
+        }
+    }
+
+    /// Runs `job` on the writer after everything queued before it, inside a batch like any
+    /// write (so it may open transactions of its own, which become savepoints), and hands its
+    /// result back once that batch is committed. The receiver errors when the writer is gone,
+    /// the queue is full, the job panicked or its batch did not commit.
     pub fn call<T: Send + 'static>(
         &self,
+        what: &'static str,
         job: impl FnOnce(&Store) -> T + Send + 'static,
     ) -> Receiver<T> {
         let (tx, rx) = mpsc::channel();
-        let op = Op::Call(Box::new(move |store: &Store| {
-            let _ = tx.send(job(store));
-        }));
-        // A writer that is gone drops the job, and with it the sender: the receiver errors.
-        let _ = self.tx.send(op);
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let fill = slot.clone();
+        let _ = self.enqueue(Write {
+            what,
+            thread: None,
+            job: Box::new(move |store: &Store| {
+                let value = job(store);
+                if let Ok(mut slot) = fill.lock() {
+                    *slot = Some(value);
+                }
+                Ok(())
+            }),
+            deliver: Some(Box::new(move || {
+                if let Some(value) = slot.lock().ok().and_then(|mut s| s.take()) {
+                    let _ = tx.send(value);
+                }
+            })),
+            cost: DEFAULT_COST,
+        });
         rx
     }
 
@@ -204,40 +330,50 @@ impl StoreWriter {
         self.barrier().recv_timeout(wait).is_ok()
     }
 
-    /// Writes queued and not yet committed.
+    /// Writes queued and not yet committed (or failed).
     pub fn pending(&self) -> usize {
         self.shared.pending.load(Ordering::SeqCst)
     }
 
-    /// How many writes failed so far, and what the last one said.
+    /// How many writes failed so far (refused ones included), and what the last one said.
     pub fn failures(&self) -> (u64, Option<String>) {
         let last = self.shared.last_failure.lock().ok().and_then(|l| l.clone());
         (self.shared.failures.load(Ordering::SeqCst), last)
     }
 
-    /// Drains the queue and stops the writer (its connection closes, which checkpoints), waiting
-    /// at most `wait`; whether it finished. Writes queued afterwards fail as "stopped".
-    pub fn shutdown(&self, wait: Duration) -> bool {
+    /// Of [`StoreWriter::failures`], the writes refused because the queue was full.
+    pub fn overloaded(&self) -> u64 {
+        self.shared.overloaded.load(Ordering::SeqCst)
+    }
+
+    /// Drains the queue and stops the writer (its connection closes, which checkpoints),
+    /// waiting at most `wait`, and says how it went. Writes queued afterwards are refused.
+    pub fn shutdown(&self, wait: Duration) -> Shutdown {
         let (tx, rx) = mpsc::channel();
         if self.tx.send(Op::Shutdown(tx)).is_err() {
-            return true; // already gone
+            return Shutdown::WriterGone;
         }
-        rx.recv_timeout(wait).is_ok()
+        match rx.recv_timeout(wait) {
+            Ok(()) => Shutdown::Drained,
+            Err(RecvTimeoutError::Timeout) => Shutdown::TimedOut,
+            Err(RecvTimeoutError::Disconnected) => Shutdown::WriterGone,
+        }
     }
 }
 
-fn run(owned: Store, rx: Receiver<Op>, shared: &Shared, timing: Timing) {
+fn run(owned: Store, rx: Receiver<Op>, shared: &Shared) {
     let store = &owned;
+    let config = shared.config;
     let mut dirty = false;
     let mut last_checkpoint = Instant::now();
-    let mut guard_tripped = false;
+    let mut wal_reported = 0i64;
     let mut checkpoint = |dirty: &mut bool, last: &mut Instant| {
-        do_checkpoint(store, &mut guard_tripped);
+        do_checkpoint(store, &mut wal_reported);
         *dirty = false;
         *last = Instant::now();
     };
     loop {
-        let first = match rx.recv_timeout(timing.idle) {
+        let first = match rx.recv_timeout(config.idle) {
             Ok(op) => op,
             Err(RecvTimeoutError::Timeout) => {
                 if dirty {
@@ -271,6 +407,10 @@ fn run(owned: Store, rx: Receiver<Op>, shared: &Shared, timing: Timing) {
                 *closed = true;
             }
             drop(rx);
+            // The app's other connections are still open, so closing this one does not
+            // checkpoint: do it now (PASSIVE, never waiting on a reader), so the last commits
+            // do not sit in the WAL until the next run.
+            do_checkpoint(store, &mut wal_reported);
             drop(owned);
             tracing::debug!("store writer: queue drained, connection closed");
             for done in stop {
@@ -278,36 +418,20 @@ fn run(owned: Store, rx: Receiver<Op>, shared: &Shared, timing: Timing) {
             }
             return;
         }
-        if dirty && last_checkpoint.elapsed() >= timing.checkpoint_every {
+        if dirty && last_checkpoint.elapsed() >= config.checkpoint_every {
             checkpoint(&mut dirty, &mut last_checkpoint);
         }
     }
 }
 
-/// Runs `ops` in order: consecutive writes as one batch, the rest one by one. Whether anything
-/// may have been written.
+/// Runs `ops` in order: consecutive writes as one batch, a barrier or shutdown after the writes
+/// before it. Whether anything may have been written.
 fn process(store: &Store, shared: &Shared, ops: Vec<Op>, stop: &mut Vec<Sender<()>>) -> bool {
     let mut wrote = false;
     let mut writes = Vec::new();
     for op in ops {
         match op {
             Op::Write(w) => writes.push(w),
-            Op::Call(job) => {
-                commit(store, shared, &mut writes);
-                wrote = true;
-                let started = Instant::now();
-                if std::panic::catch_unwind(AssertUnwindSafe(|| job(store))).is_err() {
-                    tracing::error!("a store job panicked on the writer");
-                }
-                let took = started.elapsed();
-                if took > SLOW_WRITE {
-                    tracing::warn!(
-                        kind = "job",
-                        ms = took.as_secs_f64() * 1000.0,
-                        "slow store job"
-                    );
-                }
-            }
             Op::Barrier(done) => {
                 wrote |= commit(store, shared, &mut writes);
                 let _ = done.send(());
@@ -321,51 +445,89 @@ fn process(store: &Store, shared: &Shared, ops: Vec<Op>, stop: &mut Vec<Sender<(
     wrote | commit(store, shared, &mut writes)
 }
 
-/// Commits `writes` as one batch; failures are reported. Whether there was anything to write.
+/// Runs `writes` as one batch (see the module docs); each write's outcome is settled.
+/// Whether there was anything to write.
 fn commit(store: &Store, shared: &Shared, writes: &mut Vec<Write>) -> bool {
+    run_batch(store, shared, std::mem::take(writes))
+}
+
+/// The body of [`commit`], reusable by tests without a thread.
+fn run_batch(store: &Store, shared: &Shared, writes: Vec<Write>) -> bool {
     if writes.is_empty() {
         return false;
     }
-    let batch: Vec<Write> = std::mem::take(writes);
-    let n = batch.len();
-    let whats: Vec<(&'static str, Option<String>)> =
-        batch.iter().map(|w| (w.what, w.thread.clone())).collect();
+    let n = writes.len();
     let started = Instant::now();
-    let mut failed = Vec::new();
-    let outcome = store.batch(|s| {
-        for w in batch {
-            let one = Instant::now();
-            let result = std::panic::catch_unwind(AssertUnwindSafe(|| (w.job)(s)));
-            let took = one.elapsed();
-            if took > SLOW_WRITE {
-                tracing::warn!(
-                    kind = w.what,
-                    ms = took.as_secs_f64() * 1000.0,
-                    "slow store write"
-                );
-            }
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => failed.push((w.what, w.thread, e.to_string())),
-                Err(_) => failed.push((w.what, w.thread, "the write panicked".to_owned())),
+    // Writes that ran, waiting for the COMMIT.
+    let mut held: Vec<Done> = Vec::new();
+    let mut txn: Option<Batch<'_>> = None;
+    for w in writes {
+        let Write {
+            what,
+            thread,
+            job,
+            deliver,
+            cost,
+        } = w;
+        let done = Done {
+            what,
+            thread,
+            deliver,
+            cost,
+        };
+        if txn.is_none() {
+            match store.begin_batch() {
+                Ok(batch) => txn = Some(batch),
+                Err(e) => {
+                    shared.finish_failed(done, &format!("the batch could not begin: {e}"));
+                    continue;
+                }
             }
         }
-    });
-    match outcome {
-        Ok(()) => {
-            for (what, thread, error) in &failed {
-                shared.fail(what, thread.as_deref(), error);
-            }
+        let Some(batch) = txn.as_ref() else {
+            shared.finish_failed(done, "no batch");
+            continue;
+        };
+        let one = Instant::now();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| batch.job(job)));
+        let took = one.elapsed();
+        if took > SLOW_WRITE {
+            tracing::warn!(
+                kind = what,
+                ms = took.as_secs_f64() * 1000.0,
+                "slow store write"
+            );
         }
-        Err(e) => {
-            // Nothing of the batch is stored: every write in it failed.
-            let error = format!("the batch could not be committed: {e}");
-            for (what, thread) in &whats {
-                shared.fail(what, thread.as_deref(), &error);
+        match result {
+            Ok(Ok(())) => held.push(done),
+            Ok(Err(e)) => shared.finish_failed(done, &e.to_string()),
+            Err(_) => shared.finish_failed(done, "the write panicked"),
+        }
+        if !batch.alive() {
+            // SQLite rolled the whole transaction back on its own: what it held is gone. The
+            // batch is dropped (its threads' tails distrusted) and the rest go in a new one.
+            let lost = StoreError::TransactionLost.to_string();
+            for d in held.drain(..) {
+                shared.finish_failed(d, &lost);
+            }
+            txn = None;
+        }
+    }
+    if let Some(batch) = txn {
+        match batch.commit() {
+            Ok(()) => {
+                for d in held.drain(..) {
+                    shared.finish_ok(d);
+                }
+            }
+            Err(e) => {
+                let error = format!("the batch could not be committed: {e}");
+                for d in held.drain(..) {
+                    shared.finish_failed(d, &error);
+                }
             }
         }
     }
-    shared.pending.fetch_sub(n, Ordering::SeqCst);
     let took = started.elapsed();
     if took > SLOW_WRITE {
         tracing::warn!(
@@ -378,7 +540,7 @@ fn commit(store: &Store, shared: &Shared, writes: &mut Vec<Write>) -> bool {
     true
 }
 
-fn do_checkpoint(store: &Store, guard_tripped: &mut bool) {
+fn do_checkpoint(store: &Store, wal_reported: &mut i64) {
     let started = Instant::now();
     match store.checkpoint() {
         Ok(stats) => {
@@ -400,18 +562,42 @@ fn do_checkpoint(store: &Store, guard_tripped: &mut bool) {
                     "store checkpoint"
                 );
             }
-            if stats.wal_bytes > WAL_WARN_BYTES && !*guard_tripped {
-                *guard_tripped = true;
-                tracing::warn!(
+            let first = *wal_reported == 0 && stats.wal_bytes > WAL_WARN_BYTES;
+            let doubled = *wal_reported > 0 && stats.wal_bytes > wal_reported.saturating_mul(2);
+            if first || doubled {
+                *wal_reported = stats.wal_bytes;
+                tracing::error!(
                     wal_mb = stats.wal_bytes / (1 << 20),
-                    "the store's WAL is past 64 MB; handing checkpoints back to SQLite"
+                    "the store's WAL keeps growing (a reader holds old pages?); handing \
+                     checkpoints back to SQLite"
                 );
-                if let Err(e) = store.set_autocheckpoint(AUTOCHECKPOINT_PAGES) {
-                    tracing::warn!(error = %e, "could not turn automatic checkpoints back on");
+                if first {
+                    if let Err(e) = store.set_autocheckpoint(AUTOCHECKPOINT_PAGES) {
+                        tracing::error!(error = %e, "could not turn automatic checkpoints back on");
+                    }
                 }
             }
         }
         Err(e) => tracing::warn!(error = %e, "store checkpoint failed"),
+    }
+}
+
+/// Bytes `env` encodes to, without keeping the encoding: what it is counted as in the queue.
+fn encoded_len(env: &Envelope) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, env) {
+        Ok(()) => count.0,
+        Err(_) => DEFAULT_COST,
     }
 }
 
@@ -451,14 +637,13 @@ impl StoreHandle {
     }
 
     /// Runs `f` on the reader once every write queued so far is committed. Blocks the calling
-    /// thread until then (at most [`READ_FLUSH_WAIT`], after which it reads what is committed
-    /// and warns): keep it to reads that need their own writes and cannot wait asynchronously.
-    pub fn read<T>(&self, f: impl FnOnce(&Store) -> T) -> T {
+    /// thread until then, at most [`READ_FLUSH_WAIT`]; past that it does not read at all
+    /// ([`StoreError::Behind`]): a stale read could hand off a thread without its last turn.
+    /// Keep it to reads that need their own writes and cannot wait asynchronously.
+    pub fn read<T>(&self, f: impl FnOnce(&Store) -> T) -> Result<T> {
         if let Self::Queued { writer, .. } = self {
             let started = Instant::now();
-            if !writer.flush(READ_FLUSH_WAIT) {
-                tracing::warn!("reading the store before its writer caught up");
-            }
+            let caught_up = writer.flush(READ_FLUSH_WAIT);
             let took = started.elapsed();
             if took > SLOW_WRITE {
                 tracing::warn!(
@@ -467,8 +652,12 @@ impl StoreHandle {
                     "slow wait for the store writer"
                 );
             }
+            if !caught_up {
+                tracing::error!("the store writer did not catch up; not reading stale rows");
+                return Err(StoreError::Behind);
+            }
         }
-        f(self.reader())
+        Ok(f(self.reader()))
     }
 
     /// Runs `job` now (inline) or queues it (writer). Queued, `Ok` means accepted: a failure
@@ -496,15 +685,19 @@ impl StoreHandle {
         provider_thread: Option<&str>,
         env: &Envelope,
     ) -> Result<()> {
-        if let Self::Inline(store) = self {
-            return store.append_event(thread, provider_thread, env).map(drop);
-        }
+        let writer = match self {
+            Self::Inline(store) => {
+                return store.append_event(thread, provider_thread, env).map(drop)
+            }
+            Self::Queued { writer, .. } => writer,
+        };
+        let cost = encoded_len(env);
         let (t, pt, env) = (
             thread.to_owned(),
             provider_thread.map(str::to_owned),
             env.clone(),
         );
-        self.write("store an event", Some(thread), move |s| {
+        writer.write_sized("store an event", Some(thread), cost, move |s| {
             s.append_event(&t, pt.as_deref(), &env).map(drop)
         })
     }
@@ -567,7 +760,8 @@ impl StoreHandle {
         })
     }
 
-    /// A new provider thread for `thread` on `driver`/`model`, made the active one.
+    /// A new provider thread for `thread` on `driver`/`model`, made the active one. Queued as
+    /// one write: both rows or neither.
     pub fn create_provider_thread(
         &self,
         thread: &str,
@@ -598,6 +792,36 @@ impl StoreHandle {
     }
 }
 
+/// Test access to the writer's batch logic without its thread: runs `jobs` as the writer would
+/// one batch of them, and returns how many failed.
+#[cfg(test)]
+pub(crate) fn run_jobs_as_batch(store: &Store, jobs: Vec<WriteJob>) -> u64 {
+    let shared = Shared {
+        closed: Mutex::new(false),
+        pending: AtomicUsize::new(jobs.len()),
+        queued_bytes: AtomicUsize::new(0),
+        failures: AtomicU64::new(0),
+        overloaded: AtomicU64::new(0),
+        last_failure: Mutex::new(None),
+        config: WriterConfig::default(),
+    };
+    let writes = jobs
+        .into_iter()
+        .map(|job| Write {
+            what: "test job",
+            thread: None,
+            job,
+            deliver: None,
+            cost: 0,
+        })
+        .collect();
+    run_batch(store, &shared, writes);
+    shared.failures.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) type TestJob = WriteJob;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,19 +845,35 @@ mod tests {
             .collect()
     }
 
-    fn setup() -> (tempfile::TempDir, std::path::PathBuf, StoreHandle) {
+    fn setup_with(config: WriterConfig) -> (tempfile::TempDir, std::path::PathBuf, StoreHandle) {
+        crate::store::quiet_injected_panics();
         let dir = tempfile::tempdir().expect("tmp");
         let path = dir.path().join("threads.db");
         let reader = Rc::new(Store::open(&path).expect("reader"));
-        let writer = StoreWriter::spawn(&path).expect("writer");
+        let writer = StoreWriter::spawn_with(&path, config).expect("writer");
         (dir, path, StoreHandle::Queued { reader, writer })
+    }
+
+    fn setup() -> (tempfile::TempDir, std::path::PathBuf, StoreHandle) {
+        setup_with(WriterConfig::default())
+    }
+
+    fn create(handle: &StoreHandle) -> String {
+        let t = handle.new_id().expect("id");
+        let t2 = t.clone();
+        handle
+            .write("create", None, move |s| {
+                s.create_thread_with_id(&t2, "/", None)
+            })
+            .expect("queued");
+        t
     }
 
     #[test]
     fn the_writer_connection_checkpoints_on_its_own() {
         let (_dir, _path, handle) = setup();
         let writer = handle.writer().expect("writer").clone();
-        let pages = writer.call(|s| s.autocheckpoint().expect("pragma"));
+        let pages = writer.call("read a pragma", |s| s.autocheckpoint().expect("pragma"));
         assert_eq!(
             pages.recv().expect("answer"),
             0,
@@ -647,16 +887,8 @@ mod tests {
     fn events_land_in_the_order_they_were_queued_across_threads() {
         let (_dir, path, handle) = setup();
         let writer = handle.writer().expect("writer").clone();
-        let a = handle.new_id().expect("id");
-        let b = handle.new_id().expect("id");
-        for t in [&a, &b] {
-            let t2 = t.clone();
-            writer
-                .write("create", None, move |s| {
-                    s.create_thread_with_id(&t2, "/", None)
-                })
-                .expect("queued");
-        }
+        let a = create(&handle);
+        let b = create(&handle);
         // Interleaved from this thread: global order follows the queue.
         for n in 0..200 {
             let t = if n % 2 == 0 { &a } else { &b };
@@ -715,13 +947,7 @@ mod tests {
     #[test]
     fn a_read_after_a_barrier_sees_every_queued_write() {
         let (_dir, _path, handle) = setup();
-        let t = handle.new_id().expect("id");
-        let t2 = t.clone();
-        handle
-            .write("create", None, move |s| {
-                s.create_thread_with_id(&t2, "/w", Some("x"))
-            })
-            .expect("queued");
+        let t = create(&handle);
         let pt = handle
             .create_provider_thread(&t, "claude", "opus")
             .expect("queued");
@@ -734,14 +960,16 @@ mod tests {
             .append_user_message(&t, Some(&pt), "hello")
             .expect("queued");
         handle.mark_read(&t).expect("queued");
-        let (events, summary, active, msgs) = handle.read(|s| {
-            (
-                s.events(&t, None, 10_000).expect("events").len(),
-                s.thread_summary(&t).expect("summary").expect("exists"),
-                s.active_provider_thread(&t).expect("active"),
-                s.transcript_messages(&t).expect("msgs"),
-            )
-        });
+        let (events, summary, active, msgs) = handle
+            .read(|s| {
+                (
+                    s.events(&t, None, 10_000).expect("events").len(),
+                    s.thread_summary(&t).expect("summary").expect("exists"),
+                    s.active_provider_thread(&t).expect("active"),
+                    s.transcript_messages(&t).expect("msgs"),
+                )
+            })
+            .expect("caught up");
         assert_eq!(events, 502);
         assert!(!summary.unread, "the read mark came after every event");
         assert_eq!(active, Some(pt));
@@ -749,16 +977,61 @@ mod tests {
     }
 
     #[test]
+    fn a_read_the_writer_cannot_catch_up_with_is_refused_not_stale() {
+        let (_dir, _path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        let t = create(&handle);
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(READ_FLUSH_WAIT + Duration::from_millis(500));
+                Ok(())
+            })
+            .expect("queued");
+        handle.append_event(&t, None, &notice(1)).expect("queued");
+        assert!(matches!(
+            handle.read(|s| s.events(&t, None, 10).map(|e| e.len())),
+            Err(StoreError::Behind)
+        ));
+        assert!(writer.flush(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_call_answers_after_its_batch_commits_and_counts_as_pending() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        let t = create(&handle);
+        assert!(writer.flush(Duration::from_secs(10)));
+        let t2 = t.clone();
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .expect("queued");
+        let answer = writer.call("rename", move |s| s.rename_thread(&t2, "renamed").is_ok());
+        assert_eq!(
+            writer.pending(),
+            2,
+            "a job counts as pending like any write"
+        );
+        assert!(answer.recv().expect("answered"));
+        // Answered only after the commit: another connection sees it at once.
+        let check = Store::open(&path).expect("open");
+        assert_eq!(
+            check.thread_summary(&t).expect("q").expect("exists").title,
+            "renamed"
+        );
+        // A job that panics answers nothing, and is counted.
+        let never = writer.call("panic", |_| -> bool { panic!("a job that panics") });
+        assert!(never.recv().is_err());
+        assert_eq!(writer.failures().0, 1);
+    }
+
+    #[test]
     fn shutdown_drains_the_queue_first() {
         let (_dir, path, handle) = setup();
         let writer = handle.writer().expect("writer").clone();
-        let t = handle.new_id().expect("id");
-        let t2 = t.clone();
-        handle
-            .write("create", None, move |s| {
-                s.create_thread_with_id(&t2, "/", None)
-            })
-            .expect("queued");
+        let t = create(&handle);
         // A slow first write keeps the rest queued when shutdown is asked for.
         writer
             .write("wait", None, |_| {
@@ -769,26 +1042,79 @@ mod tests {
         for n in 0..1000 {
             handle.append_event(&t, None, &notice(n)).expect("queued");
         }
-        assert!(writer.shutdown(Duration::from_secs(20)), "drained in time");
+        assert_eq!(writer.shutdown(Duration::from_secs(20)), Shutdown::Drained);
         assert_eq!(writer.pending(), 0);
         let check = Store::open(&path).expect("open");
         assert_eq!(texts(&check, &t).len(), 1000);
         // Writes after the writer stopped are refused and counted, never lost silently.
         assert!(handle.append_event(&t, None, &notice(1)).is_err());
         assert_eq!(writer.failures().0, 1);
+        // A second shutdown is not reported as a clean drain.
+        assert_eq!(
+            writer.shutdown(Duration::from_secs(1)),
+            Shutdown::WriterGone
+        );
+    }
+
+    #[test]
+    fn a_shutdown_that_runs_out_of_time_says_so() {
+        let (_dir, _path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(())
+            })
+            .expect("queued");
+        assert_eq!(
+            writer.shutdown(Duration::from_millis(50)),
+            Shutdown::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_full_queue_refuses_writes_at_once_and_counts_them() {
+        let config = WriterConfig {
+            max_queued: 10,
+            ..WriterConfig::default()
+        };
+        let (_dir, path, handle) = setup_with(config);
+        let writer = handle.writer().expect("writer").clone();
+        let t = create(&handle);
+        assert!(writer.flush(Duration::from_secs(10)));
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })
+            .expect("queued");
+        let started = Instant::now();
+        let taken: Vec<usize> = (0..30)
+            .filter(|n| handle.append_event(&t, None, &notice(*n)).is_ok())
+            .collect();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "never blocks"
+        );
+        assert_eq!(taken.len(), 9, "the wait job holds one slot");
+        assert_eq!(writer.overloaded(), 21);
+        assert_eq!(writer.failures().0, 21);
+        assert!(writer
+            .failures()
+            .1
+            .is_some_and(|l| l.contains("too far behind")));
+        assert!(writer.flush(Duration::from_secs(10)));
+        // What was taken kept its order.
+        let check = Store::open(&path).expect("open");
+        let want: Vec<String> = taken.iter().map(|n| format!("n{n}")).collect();
+        assert_eq!(texts(&check, &t), want);
     }
 
     #[test]
     fn a_failed_write_is_counted_and_said_and_its_neighbours_still_commit() {
         let (_dir, path, handle) = setup();
         let writer = handle.writer().expect("writer").clone();
-        let t = handle.new_id().expect("id");
-        let t2 = t.clone();
-        handle
-            .write("create", None, move |s| {
-                s.create_thread_with_id(&t2, "/", None)
-            })
-            .expect("queued");
+        let t = create(&handle);
         handle.append_event(&t, None, &notice(1)).expect("queued");
         // A thread that does not exist: the append fails on the writer.
         handle
@@ -797,22 +1123,26 @@ mod tests {
         writer
             .write("panic", None, |_| panic!("a job that panics"))
             .expect("queued");
+        // A job that fails part-way leaves nothing behind.
+        let t3 = t.clone();
+        writer
+            .write("half a job", None, move |s| {
+                s.append_event(&t3, None, &notice(99))?;
+                s.append_event("missing-thread", None, &notice(98))
+                    .map(drop)
+            })
+            .expect("queued");
         handle.append_event(&t, None, &notice(3)).expect("queued");
         assert!(writer.flush(Duration::from_secs(10)));
         let (count, last) = writer.failures();
-        assert_eq!(count, 2, "{last:?}");
-        assert!(
-            last.as_deref().is_some_and(|l| l.contains("panic")),
-            "{last:?}"
-        );
+        assert_eq!(count, 3, "{last:?}");
         let check = Store::open(&path).expect("open");
         assert_eq!(texts(&check, &t), vec!["n1", "n3"]);
-        // The first failure said what failed.
         let failing = handle.append_event("missing-thread", None, &notice(4));
         assert!(failing.is_ok());
         assert!(writer.flush(Duration::from_secs(10)));
         let (count, last) = writer.failures();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         assert!(
             last.as_deref()
                 .is_some_and(|l| l.starts_with("Could not store an event: not found")),
@@ -823,13 +1153,7 @@ mod tests {
     #[test]
     fn a_split_secret_is_healed_on_the_writer() {
         let (_dir, path, handle) = setup();
-        let t = handle.new_id().expect("id");
-        let t2 = t.clone();
-        handle
-            .write("create", None, move |s| {
-                s.create_thread_with_id(&t2, "/", None)
-            })
-            .expect("queued");
+        let t = create(&handle);
         let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
         let (a, b) = secret.split_at(10);
         let delta = |text: &str| {
@@ -882,5 +1206,12 @@ mod tests {
         assert_eq!(store.active_provider_thread(&t).expect("a"), Some(pt));
         assert!(handle.append_event("nope", None, &notice(2)).is_err());
         assert!(handle.writer().is_none());
+        assert_eq!(
+            handle
+                .read(|s| s.events(&t, None, 10).map(|e| e.len()))
+                .expect("read")
+                .expect("events"),
+            1
+        );
     }
 }
