@@ -577,6 +577,73 @@ fn native_click_matrix() {
         window.destroy();
     }
 
+    // Deny and Allow on the shelf stay put from one request to the next, whatever else it
+    // offers: the menu of session grants, a Cancel in place of Deny, a permission request
+    // with no Allow and a wide Review button. A click aimed at one never lands on the other.
+    let slots = |tool: &str, options: Vec<Decision>| {
+        let input = if tool == super::permission::TOOL {
+            serde_json::json!({
+                "cwd": "/w", "reason": null, "renderable": true,
+                "entries": [{"access": "write", "target": {"kind": "path", "path": "/w/out"}}],
+                "network": null, "session_allowed": true, "warning": null, "requested": {}
+            })
+        } else {
+            serde_json::json!({"command": "cargo test"})
+        };
+        let history = vec![Envelope::new(Event::ApprovalRequested {
+            tool: tool.into(),
+            title: None,
+            input,
+            reason: None,
+            options,
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .request("r1")];
+        let (window, view) = shown_view(1100, &history, &ctx);
+        let inner = view.inner().expect("view");
+        let at = |button: &gtk4::Widget| {
+            let slot = button.parent().expect("the button's slot");
+            let b = slot.compute_bounds(&window).expect("the slot is laid out");
+            (b.x(), b.y(), b.width(), b.height())
+        };
+        let placed = (
+            at(inner.interruption.deny_btn.upcast_ref()),
+            at(inner.interruption.allow_btn.upcast_ref()),
+        );
+        window.destroy();
+        placed
+    };
+    let plain = slots("Bash", vec![Decision::Allow, Decision::Deny]);
+    for (case, options, tool) in [
+        (
+            "with the grants menu",
+            vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::AllowAlways,
+                Decision::Deny,
+            ],
+            "Bash",
+        ),
+        (
+            "with Cancel for Deny",
+            vec![Decision::Allow, Decision::Cancel],
+            "Bash",
+        ),
+        (
+            "for a permission request",
+            vec![Decision::Allow, Decision::AllowForSession, Decision::Deny],
+            super::permission::TOOL,
+        ),
+    ] {
+        assert_eq!(
+            slots(tool, options),
+            plain,
+            "the shelf buttons moved {case}"
+        );
+    }
+
     // Send answers sends the chosen answers.
     let (window, view) = shown_view(1100, &asking, &ctx);
     let inner = view.inner().expect("view");

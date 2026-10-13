@@ -51,6 +51,8 @@ impl InterruptionShelf {
         title.set_xalign(0.0);
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
+        // Always shown, even empty: a line that came and went would change the shelf's height
+        // and move its buttons up and down between requests.
         let preview = label("", &["interruption-preview"]);
         preview.set_xalign(0.0);
         preview.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -62,7 +64,14 @@ impl InterruptionShelf {
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         actions.set_valign(gtk4::Align::Center);
 
-        let deny_btn = gtk4::Button::with_label("Deny");
+        // Deny and Cancel share one width, so the label switching never moves Allow.
+        let deny_text = gtk4::Stack::new();
+        deny_text.set_hhomogeneous(true);
+        deny_text.add_named(&gtk4::Label::new(Some("Deny")), Some("Deny"));
+        deny_text.add_named(&gtk4::Label::new(Some("Cancel")), Some("Cancel"));
+        let deny_btn = gtk4::Button::new();
+        deny_btn.set_child(Some(&deny_text));
+        deny_btn.update_property(&[gtk4::accessible::Property::Label("Deny")]);
         deny_btn.add_css_class("pill");
         deny_btn.add_css_class("destructive-action");
 
@@ -85,7 +94,6 @@ impl InterruptionShelf {
         more_btn.add_css_class("flat");
         more_btn.set_tooltip_text(Some("More permission options"));
         more_btn.update_property(&[gtk4::accessible::Property::Label("More permission options")]);
-        more_btn.set_visible(false);
 
         let jump_btn = gtk4::Button::from_icon_name("at-go-bottom-symbolic");
         jump_btn.add_css_class("flat");
@@ -97,12 +105,17 @@ impl InterruptionShelf {
         let count = label("", &["interruption-count", "dim-label"]);
         count.set_valign(gtk4::Align::Center);
         count.set_visible(false);
+        // Deny, Allow and the menu sit last, at the shelf's right edge, each in a slot that
+        // keeps its space when its button is not offered: they never move between requests,
+        // so a click aimed at one never lands on another. Anything that changes width (the
+        // count, the jump button turning into a labelled pill) goes before them.
         actions.append(&count);
-        actions.append(&deny_btn);
-        actions.append(&allow_btn);
-        actions.append(&more_btn);
         actions.append(&jump_btn);
+        actions.append(&slot(&deny_btn));
+        actions.append(&slot(&allow_btn));
+        actions.append(&slot(&more_btn));
         card.append(&actions);
+        place(&more_btn, false);
 
         let revealer = gtk4::Revealer::new();
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
@@ -266,7 +279,6 @@ impl InterruptionShelf {
 
                 let prev = approval_preview(&tool, &input);
                 self.preview.set_text(&prev);
-                self.preview.set_visible(!prev.is_empty());
 
                 // A permission grant is a list of places: the shelf cuts lists, so it never
                 // offers a one-click Allow for one. It points at the card instead.
@@ -274,15 +286,19 @@ impl InterruptionShelf {
                 let has_allow = options.contains(&Decision::Allow) && !permission;
                 let has_deny =
                     options.contains(&Decision::Deny) || options.contains(&Decision::Cancel);
-                self.allow_btn.set_visible(has_allow);
-                self.deny_btn.set_visible(has_deny);
-                self.allow_btn.set_label("Allow");
+                self.show_slots(true);
+                place(&self.allow_btn, has_allow);
+                place(&self.deny_btn, has_deny);
+                let deny = if options.contains(&Decision::Deny) {
+                    "Deny"
+                } else {
+                    "Cancel"
+                };
+                if let Some(text) = self.deny_btn.child().and_downcast::<gtk4::Stack>() {
+                    text.set_visible_child_name(deny);
+                }
                 self.deny_btn
-                    .set_label(if options.contains(&Decision::Deny) {
-                        "Deny"
-                    } else {
-                        "Cancel"
-                    });
+                    .update_property(&[gtk4::accessible::Property::Label(deny)]);
 
                 // Clear previous extra options in the dropdown popover
                 while let Some(child) = self.more_box.first_child() {
@@ -320,7 +336,7 @@ impl InterruptionShelf {
                     });
                     self.more_box.append(&b);
                 }
-                self.more_btn.set_visible(!extra_decisions.is_empty());
+                place(&self.more_btn, !extra_decisions.is_empty());
 
                 if permission {
                     self.jump_as_action(
@@ -340,7 +356,7 @@ impl InterruptionShelf {
                 link,
                 ..
             }) => {
-                self.more_btn.set_visible(false);
+                place(&self.more_btn, false);
                 self.card.add_css_class("is-question");
                 self.icon.set_icon_name(Some("at-dialog-question-symbolic"));
                 self.title.set_text(if link {
@@ -355,9 +371,7 @@ impl InterruptionShelf {
                     None => server,
                 };
                 self.preview.set_text(&preview);
-                self.preview.set_visible(true);
-                self.allow_btn.set_visible(false);
-                self.deny_btn.set_visible(false);
+                self.show_slots(false);
                 self.jump_as_action(
                     if link {
                         "Review in transcript ↓"
@@ -374,7 +388,7 @@ impl InterruptionShelf {
                 self.revealer.set_reveal_child(true);
             }
             Some(PendingInterruption::Question { questions, .. }) => {
-                self.more_btn.set_visible(false);
+                place(&self.more_btn, false);
                 self.card.add_css_class("is-question");
                 self.icon.set_icon_name(Some("at-dialog-question-symbolic"));
                 let count = questions.len();
@@ -390,10 +404,8 @@ impl InterruptionShelf {
                     .map(|q| q.question.trim().replace('\n', " "))
                     .unwrap_or_default();
                 self.preview.set_text(&first_text);
-                self.preview.set_visible(!first_text.is_empty());
 
-                self.allow_btn.set_visible(false);
-                self.deny_btn.set_visible(false);
+                self.show_slots(false);
                 self.jump_as_action(
                     "Answer in transcript ↓",
                     "Jump to question in transcript",
@@ -403,13 +415,28 @@ impl InterruptionShelf {
                 self.revealer.set_reveal_child(true);
             }
             None => {
-                self.more_btn.set_visible(false);
+                place(&self.more_btn, false);
                 self.revealer.set_reveal_child(false);
             }
         }
     }
 
     /// The jump button as a small icon beside the approval's own buttons.
+    /// Whether the approval slots take their space. A question or a form answers nothing from
+    /// the shelf, so it gives the room to its title; an approval always has all three, so
+    /// Deny and Allow land in the same place for every approval.
+    fn show_slots(&self, shown: bool) {
+        for button in [
+            self.deny_btn.upcast_ref::<gtk4::Widget>(),
+            self.allow_btn.upcast_ref(),
+            self.more_btn.upcast_ref(),
+        ] {
+            if let Some(slot) = button.parent() {
+                slot.set_visible(shown);
+            }
+        }
+    }
+
     fn jump_as_icon(&self) {
         self.jump_btn.set_label("");
         self.jump_btn.set_icon_name("at-go-bottom-symbolic");
@@ -443,6 +470,40 @@ impl InterruptionShelf {
             .update_property(&[gtk4::accessible::Property::Label(accessible)]);
         self.jump_btn.set_visible(true);
     }
+}
+
+/// A fixed place on the shelf for `button`: a stack of the button and an empty page, the same
+/// size, so a button that is not offered leaves its space empty rather than letting its
+/// neighbours slide into it. Shown or emptied with [`place`].
+fn slot(button: &impl IsA<gtk4::Widget>) -> gtk4::Stack {
+    let stack = gtk4::Stack::new();
+    stack.set_hhomogeneous(true);
+    stack.set_vhomogeneous(true);
+    stack.set_valign(gtk4::Align::Center);
+    stack.add_named(button, Some("button"));
+    stack.add_named(
+        &gtk4::Box::new(gtk4::Orientation::Horizontal, 0),
+        Some("empty"),
+    );
+    stack
+}
+
+/// Shows `button` in its [`slot`], or leaves the slot empty (same size, nothing to click).
+fn place(button: &impl IsA<gtk4::Widget>, shown: bool) {
+    if let Some(stack) = button.parent().and_downcast::<gtk4::Stack>() {
+        stack.set_visible_child_name(if shown { "button" } else { "empty" });
+    }
+}
+
+/// Whether `button` is the one showing in its [`slot`], and the slot is shown.
+#[cfg(test)]
+pub(crate) fn placed(button: &impl IsA<gtk4::Widget>) -> bool {
+    button
+        .parent()
+        .and_downcast::<gtk4::Stack>()
+        .filter(|stack| stack.is_visible())
+        .and_then(|stack| stack.visible_child())
+        .is_some_and(|child| &child == button.upcast_ref())
 }
 
 /// The shelf's one line for a pending approval: the call's card title (W3.4, `Run <command>`,
@@ -612,10 +673,7 @@ pub(crate) mod tests {
             Driver::Claude,
         );
         shelf2.update(&transcript2);
-        assert!(
-            shelf2.more_btn.is_visible(),
-            "More dropdown button is visible"
-        );
+        assert!(placed(&shelf2.more_btn), "More dropdown button is visible");
         assert_eq!(
             shelf2.jump_btn.icon_name().as_deref(),
             Some("at-go-bottom-symbolic")
@@ -692,9 +750,9 @@ pub(crate) mod tests {
         );
         shelf.update(&transcript);
         assert!(shelf.revealer.reveals_child());
-        assert!(!shelf.allow_btn.is_visible(), "no one-click Allow");
-        assert!(!shelf.more_btn.is_visible(), "no session grant in a menu");
-        assert!(shelf.deny_btn.is_visible());
+        assert!(!placed(&shelf.allow_btn), "no one-click Allow");
+        assert!(!placed(&shelf.more_btn), "no session grant in a menu");
+        assert!(placed(&shelf.deny_btn));
         assert_eq!(shelf.preview.text(), "Write /w/out");
         assert_eq!(
             shelf.jump_btn.label().as_deref(),
@@ -731,7 +789,7 @@ pub(crate) mod tests {
             Driver::Codex,
         );
         shelf.update(&command);
-        assert!(shelf.allow_btn.is_visible());
+        assert!(placed(&shelf.allow_btn));
         assert!(shelf.jump_btn.icon_name().is_some());
         // Keys: what the approval does not offer lets the key through; Allow answers it.
         assert!(!shelf.answer(Decision::AllowAlways), "not offered");
@@ -779,7 +837,7 @@ pub(crate) mod tests {
         assert!(shelf.revealer.reveals_child());
         assert_eq!(shelf.title.text(), "A tool server wants you to open a link");
         assert_eq!(shelf.preview.text(), "github: Which repo?");
-        assert!(!shelf.allow_btn.is_visible() && !shelf.deny_btn.is_visible());
+        assert!(!placed(&shelf.allow_btn) && !placed(&shelf.deny_btn));
         assert_eq!(
             shelf.jump_btn.label().as_deref(),
             Some("Review in transcript ↓")
