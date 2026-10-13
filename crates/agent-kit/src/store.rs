@@ -9,16 +9,22 @@
 //! `rusqlite` is built with `bundled`, so the single shipped binary carries its
 //! own SQLite and needs no runtime library.
 
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
 use agent_core::redact::{redact, redact_keyed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
+
+use crate::heal_tail::HealTails;
+
+/// A store write (an append, a batch, a checkpoint) slower than this is logged as a warning with
+/// its kind and duration: one frame at 60 Hz.
+pub const SLOW_WRITE: Duration = Duration::from_millis(16);
 
 /// Identifier of an app thread (a UUID string).
 pub type ThreadId = String;
@@ -47,6 +53,8 @@ pub enum StoreError {
         found: i64,
         supported: i64,
     },
+    /// The store writer thread has stopped (or never started): the write was not queued.
+    WriterGone,
 }
 
 impl fmt::Display for StoreError {
@@ -60,6 +68,7 @@ impl fmt::Display for StoreError {
                 f,
                 "database schema v{found} is newer than this build supports (v{supported})"
             ),
+            Self::WriterGone => write!(f, "the store writer has stopped"),
         }
     }
 }
@@ -173,6 +182,15 @@ pub fn scrub_envelope(env: Envelope) -> Result<Envelope> {
     Ok(serde_json::from_value(scrub_value(None, value))?)
 }
 
+/// The event's wire name (`content_delta`, `item_completed`, …), for logs. Encodes the event, so
+/// only call it off the hot path (a slow write already being reported).
+pub fn event_kind(event: &Event) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// `key` is the name of the nearest enclosing object field; array elements
 /// inherit it, so `{"tokens": ["..."]}` is judged by "tokens".
 fn scrub_value(key: Option<&str>, v: Value) -> Value {
@@ -203,6 +221,68 @@ pub struct Store {
     /// Last timestamp handed out, so `updated_at` strictly increases even
     /// within one millisecond (list ordering stays deterministic).
     last_ms: Cell<i64>,
+    /// Streamed text of open items, so a heal need not scan the table (see `heal_tail`).
+    tails: RefCell<HealTails>,
+    /// Inside [`Store::batch`]: methods that open a transaction take a savepoint instead.
+    in_batch: Cell<bool>,
+    /// Threads appended to in the current batch: their tails are distrusted if it fails.
+    batch_threads: RefCell<HashSet<String>>,
+    /// Test hook: the next append fails after its insert (an injected write error).
+    #[cfg(test)]
+    fail_next_append: Cell<bool>,
+    /// Test record of which heal ran: `[tail, sql]`.
+    #[cfg(test)]
+    heal_paths: Cell<[u32; 2]>,
+}
+
+/// A unit of work that commits or rolls back as one: a transaction, or inside a
+/// [`Store::batch`] a savepoint of the batch's transaction. Rolled back when dropped uncommitted.
+struct Scope<'a> {
+    conn: &'a Connection,
+    savepoint: bool,
+    done: bool,
+}
+
+impl Scope<'_> {
+    fn commit(mut self) -> Result<()> {
+        let sql = if self.savepoint {
+            "RELEASE op"
+        } else {
+            "COMMIT"
+        };
+        self.conn.execute_batch(sql)?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let sql = if self.savepoint {
+            "ROLLBACK TO op; RELEASE op"
+        } else {
+            "ROLLBACK"
+        };
+        if let Err(e) = self.conn.execute_batch(sql) {
+            tracing::warn!(error = %e, "could not roll a store write back");
+        }
+    }
+}
+
+/// What a `PRAGMA wal_checkpoint` reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointStats {
+    /// The checkpoint could not finish (a reader or writer was in the way).
+    pub busy: bool,
+    /// Frames in the WAL.
+    pub wal_frames: i64,
+    /// Of those, frames copied into the database.
+    pub checkpointed: i64,
+    /// Bytes the WAL's frames hold (`wal_frames` × page size).
+    pub wal_bytes: i64,
 }
 
 impl Store {
@@ -218,7 +298,9 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         enable_wal(&conn)?;
         // NORMAL is durable enough under WAL (a power cut can lose the last commits, never
-        // corrupt) and avoids an fsync per event.
+        // corrupt) and avoids an fsync per event. The WAL is synced at checkpoints, so the
+        // commits at risk are those since the last one: on the store writer's connection that
+        // is its checkpoint interval (`store_writer::Timing`).
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init(conn)
     }
@@ -235,6 +317,125 @@ impl Store {
         Ok(Self {
             conn,
             last_ms: Cell::new(0),
+            tails: RefCell::new(HealTails::default()),
+            in_batch: Cell::new(false),
+            batch_threads: RefCell::new(HashSet::new()),
+            #[cfg(test)]
+            fail_next_append: Cell::new(false),
+            #[cfg(test)]
+            heal_paths: Cell::new([0, 0]),
+        })
+    }
+
+    /// Whether heals may use the in-memory tails (on by default). Off, every heal scans the
+    /// table, as before the tails existed: the reference the differential test compares with.
+    pub fn set_heal_tails(&self, enabled: bool) {
+        self.tails.borrow_mut().set_enabled(enabled);
+    }
+
+    /// Forgets the thread's heal tails (its page closed). Its next heal scans the table.
+    pub fn forget_tails(&self, thread: &str) {
+        self.tails.borrow_mut().clear_thread(thread);
+    }
+
+    /// Sets this connection's automatic checkpoint threshold in pages (0: off; SQLite's default
+    /// is 1000). The store writer turns it off and checkpoints on its own thread instead.
+    pub fn set_autocheckpoint(&self, pages: i64) -> Result<()> {
+        self.conn
+            .pragma_update(None, "wal_autocheckpoint", pages)
+            .map_err(Into::into)
+    }
+
+    /// This connection's automatic checkpoint threshold, in pages.
+    pub fn autocheckpoint(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?)
+    }
+
+    /// A PASSIVE checkpoint: copies what it can from the WAL into the database without waiting
+    /// on anyone. Never TRUNCATE: that waits for readers and could stall its caller.
+    pub fn checkpoint(&self) -> Result<CheckpointStats> {
+        let (busy, frames, done): (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        let page: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok(CheckpointStats {
+            busy: busy != 0,
+            wal_frames: frames.max(0),
+            checkpointed: done.max(0),
+            wal_bytes: frames.max(0).saturating_mul(page),
+        })
+    }
+
+    /// Runs `f` inside one `BEGIN IMMEDIATE` transaction, committed at the end: the store
+    /// writer's batches. Every method `f` calls that opens a transaction of its own takes a
+    /// savepoint instead, so one failing write rolls back alone and the rest still commit. If
+    /// the COMMIT itself fails nothing of the batch is stored, and the heal tails of every
+    /// thread appended to are distrusted. A batch inside a batch just runs `f`.
+    pub fn batch<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R> {
+        if self.in_batch.get() {
+            return Ok(f(self));
+        }
+        // Another process holding the write lock past the busy timeout: try again before the
+        // batch is given up (and reported).
+        let mut attempt = 0;
+        loop {
+            match self.conn.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy && attempt < 2 =>
+                {
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        "the store is locked by another connection; retrying"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.in_batch.set(true);
+        self.batch_threads.borrow_mut().clear();
+        // Reset however `f` leaves (a panic included), so the connection stays usable.
+        struct Reset<'a>(&'a Store);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.in_batch.set(false);
+                if !self.0.conn.is_autocommit() {
+                    // Not committed: `f` panicked, or the COMMIT failed.
+                    let _ = self.0.conn.execute_batch("ROLLBACK");
+                    let threads: Vec<String> = self.0.batch_threads.borrow_mut().drain().collect();
+                    let mut tails = self.0.tails.borrow_mut();
+                    for t in threads {
+                        tails.distrust_thread(&t);
+                    }
+                }
+            }
+        }
+        let reset = Reset(self);
+        let out = f(self);
+        self.conn.execute_batch("COMMIT")?;
+        self.batch_threads.borrow_mut().clear();
+        drop(reset);
+        Ok(out)
+    }
+
+    /// A transaction, or a savepoint of the open batch (see [`Store::batch`]).
+    fn scope(&self, behavior: rusqlite::TransactionBehavior) -> Result<Scope<'_>> {
+        let savepoint = self.in_batch.get();
+        let sql = match (savepoint, behavior) {
+            (true, _) => "SAVEPOINT op",
+            (false, rusqlite::TransactionBehavior::Immediate) => "BEGIN IMMEDIATE",
+            (false, _) => "BEGIN DEFERRED",
+        };
+        self.conn.execute_batch(sql)?;
+        Ok(Scope {
+            conn: &self.conn,
+            savepoint,
+            done: false,
         })
     }
 
@@ -248,7 +449,9 @@ impl Store {
         next
     }
 
-    fn new_id(&self) -> Result<String> {
+    /// A fresh random v4 UUID string. Touches no table, so it takes no lock: callers that queue
+    /// a write (the store writer) make the row's id here first.
+    pub fn new_id(&self) -> Result<String> {
         let hex: String = self
             .conn
             .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
@@ -275,11 +478,8 @@ impl Store {
     /// between (WAL), without waiting on the busy timeout; this one waits instead. Callers use
     /// plain statements only: SQLite has no nested transactions, so never call another
     /// transaction-opening method (`write_txn`, `append_event`, …) while one is open.
-    fn write_txn(&self) -> Result<rusqlite::Transaction<'_>> {
-        Ok(rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?)
+    fn write_txn(&self) -> Result<Scope<'_>> {
+        self.scope(rusqlite::TransactionBehavior::Immediate)
     }
 
     fn touch(&self, thread: &str, at: i64) -> Result<()> {
@@ -301,12 +501,24 @@ impl Store {
     /// `at_ms` (epoch milliseconds) so it sorts where that session does, not as brand new.
     pub fn create_thread_at(&self, cwd: &str, title: Option<&str>, at_ms: i64) -> Result<ThreadId> {
         let id = self.new_id()?;
+        self.insert_thread(&id, cwd, title, at_ms)?;
+        Ok(id)
+    }
+
+    /// [`Store::create_thread`] under an id the caller made ([`Store::new_id`]): a write queued
+    /// to the store writer knows its thread's id before it runs.
+    pub fn create_thread_with_id(&self, id: &str, cwd: &str, title: Option<&str>) -> Result<()> {
+        let now = self.now();
+        self.insert_thread(id, cwd, title, now)
+    }
+
+    fn insert_thread(&self, id: &str, cwd: &str, title: Option<&str>, at_ms: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO threads (id, title, cwd, created_at, updated_at, archived, read_seq)
              VALUES (?1, ?2, ?3, ?4, ?4, 0, 0)",
             params![id, redact(title.unwrap_or("")), cwd, at_ms],
         )?;
-        Ok(id)
+        Ok(())
     }
 
     /// A thread for an agent's existing session (`driver`, `native_id`), dated `at_ms` (epoch
@@ -380,6 +592,7 @@ impl Store {
             .execute("DELETE FROM threads WHERE id = ?1", params![thread])?;
         require_row(n, thread)?;
         tx.commit()?;
+        self.tails.borrow_mut().clear_thread(thread);
         Ok(())
     }
 
@@ -490,6 +703,18 @@ impl Store {
         model: &str,
     ) -> Result<ProviderThreadId> {
         let id = self.new_id()?;
+        self.add_provider_thread_with_id(&id, thread, driver, model)?;
+        Ok(id)
+    }
+
+    /// [`Store::add_provider_thread`] under an id the caller made ([`Store::new_id`]).
+    pub fn add_provider_thread_with_id(
+        &self,
+        id: &str,
+        thread: &str,
+        driver: &str,
+        model: &str,
+    ) -> Result<()> {
         let now = self.now();
         self.conn.execute(
             "INSERT INTO provider_threads (id, thread_id, driver, model, native_id, created_at, updated_at)
@@ -497,7 +722,7 @@ impl Store {
             params![id, thread, driver, model, now],
         )
         .map_err(|e| fk_or(e, thread))?;
-        Ok(id)
+        Ok(())
     }
 
     /// Records the model a provider thread was last set to: what a reopened thread resumes on.
@@ -582,14 +807,34 @@ impl Store {
         provider_thread: Option<&str>,
         env: &Envelope,
     ) -> Result<i64> {
+        let started = Instant::now();
         // The insert and the `updated_at` bump commit together or not at all.
-        let tx = self.conn.unchecked_transaction()?;
-        let seq = self.append_in_txn(thread, provider_thread, env)?;
-        tx.commit()?;
-        Ok(seq)
+        let result = self
+            .scope(rusqlite::TransactionBehavior::Deferred)
+            .and_then(|tx| {
+                let seq = self.append_in_txn(thread, provider_thread, env)?;
+                tx.commit()?;
+                Ok(seq)
+            });
+        if result.is_err() {
+            // The tail may now hold a row the database does not (or the reverse).
+            self.tails.borrow_mut().distrust_thread(thread);
+        }
+        let took = started.elapsed();
+        if took > SLOW_WRITE {
+            tracing::warn!(
+                kind = event_kind(&env.event),
+                ms = took.as_secs_f64() * 1000.0,
+                "slow store append"
+            );
+        }
+        result
     }
 
     /// The body of [`Store::append_event`]; the caller owns the transaction.
+    ///
+    /// The heal tails are updated as each row is written, from the scrubbed envelope; a write
+    /// that fails afterwards (this append's, or the batch's COMMIT) distrusts the thread's tails.
     fn append_in_txn(
         &self,
         thread: &str,
@@ -599,6 +844,9 @@ impl Store {
         let scrubbed = scrub_envelope(env.clone())?;
         let json = serde_json::to_string(&scrubbed)?;
         let now = self.now();
+        if self.in_batch.get() {
+            self.batch_threads.borrow_mut().insert(thread.to_owned());
+        }
         self.conn
             .execute(
                 "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
@@ -607,25 +855,106 @@ impl Store {
             )
             .map_err(|e| fk_or(e, thread))?;
         let seq = self.conn.last_insert_rowid();
-        if matches!(
-            scrubbed.event,
-            Event::ItemCompleted { .. } | Event::ContentSnapshot { .. }
-        ) {
-            if let Some(item) = &scrubbed.item {
+        #[cfg(test)]
+        if self.fail_next_append.replace(false) {
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected append failure",
+            )));
+        }
+        match (&scrubbed.event, &scrubbed.item) {
+            (Event::ItemStarted { .. }, Some(item)) => self.tails.borrow_mut().arm(thread, item),
+            (Event::ContentDelta { stream, text }, Some(item)) => self
+                .tails
+                .borrow_mut()
+                .record(thread, item, *stream, seq, text),
+            (Event::ItemCompleted { .. } | Event::ContentSnapshot { .. }, Some(item)) => {
                 // Under a savepoint: a heal that fails is undone on its own and the event is
                 // still stored (each delta row is already scrubbed alone).
                 self.conn.execute_batch("SAVEPOINT heal")?;
-                match self.heal_split_deltas(thread, item) {
+                match self.heal(thread, item) {
                     Ok(()) => self.conn.execute_batch("RELEASE heal")?,
                     Err(e) => {
                         tracing::warn!(error = %e, "could not re-scrub an item's streamed text");
                         self.conn.execute_batch("ROLLBACK TO heal; RELEASE heal")?;
+                        self.tails.borrow_mut().distrust_thread(thread);
                     }
                 }
+                if matches!(scrubbed.event, Event::ItemCompleted { .. }) {
+                    self.tails.borrow_mut().consume(thread, item);
+                }
             }
+            _ => {}
+        }
+        if matches!(
+            scrubbed.event,
+            Event::TurnCompleted { .. } | Event::SessionExited { .. }
+        ) {
+            self.tails.borrow_mut().clear_thread(thread);
         }
         self.touch(thread, now)?;
         Ok(seq)
+    }
+
+    /// Re-scrubs an item's streamed text as a whole: from its trusted in-memory tail when there
+    /// is one, else by scanning the table ([`Store::heal_split_deltas`]). Both write the same
+    /// rows; the tail only skips the scan (and, for an item longer than [`HEAL_WINDOW`], also
+    /// reaches the rows the scan cannot).
+    fn heal(&self, thread: &str, item: &str) -> Result<()> {
+        let tail = self.tails.borrow().trusted(thread, item);
+        #[cfg(test)]
+        {
+            let mut paths = self.heal_paths.get();
+            paths[usize::from(tail.is_none())] += 1;
+            self.heal_paths.set(paths);
+        }
+        match tail {
+            Some(streams) => {
+                tracing::debug!(path = "tail", "healing an item's streamed text");
+                self.heal_from_tail(thread, item, streams)
+            }
+            None => {
+                tracing::debug!(path = "sql", "healing an item's streamed text");
+                self.heal_split_deltas(thread, item)
+            }
+        }
+    }
+
+    /// [`Store::heal_split_deltas`] with the rows already known: only a stream whose joined text
+    /// redaction changes is read back (by `seq`) and rewritten, exactly as the scan would.
+    fn heal_from_tail(
+        &self,
+        thread: &str,
+        item: &str,
+        streams: Vec<(StreamKind, crate::heal_tail::StreamRows)>,
+    ) -> Result<()> {
+        for (stream, rows) in streams {
+            if rows.len() < 2 {
+                continue;
+            }
+            let joined: String = rows.iter().map(|(_, t)| t.as_str()).collect();
+            let whole = redact(&joined);
+            if whole == joined {
+                continue;
+            }
+            for (i, (seq, _)) in rows.iter().enumerate() {
+                let json: String = self.conn.query_row(
+                    "SELECT envelope_json FROM events WHERE seq = ?1 AND thread_id = ?2",
+                    params![seq, thread],
+                    |r| r.get(0),
+                )?;
+                let mut env: Envelope = serde_json::from_str(&json)?;
+                if let Event::ContentDelta { text, .. } = &mut env.event {
+                    *text = if i == 0 { whole.clone() } else { String::new() };
+                }
+                env.raw = None;
+                self.conn.execute(
+                    "UPDATE events SET envelope_json = ?1 WHERE seq = ?2",
+                    params![serde_json::to_string(&env)?, seq],
+                )?;
+            }
+            self.tails.borrow_mut().healed(thread, item, stream, &whole);
+        }
+        Ok(())
     }
 
     /// Re-scrubs an item's streamed text as a whole. Each delta is scrubbed
@@ -639,8 +968,9 @@ impl Store {
     /// thread's newest are searched (there is no item column to index;
     /// `seq` is global, so other threads' rows interleaved there shrink the
     /// window), and an item that never
-    /// completes or snapshots keeps its fragments. Upgrade path: an indexed
-    /// `item` column, or carrying a per-item tail in memory at append time.
+    /// completes or snapshots keeps its fragments. This scan is the fallback: an item whose
+    /// in-memory tail is trusted heals from it instead ([`Store::heal`], `heal_tail`), and
+    /// writes the same rows.
     fn heal_split_deltas(&self, thread: &str, item: &str) -> Result<()> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, envelope_json FROM events
@@ -751,23 +1081,41 @@ impl Store {
         text: &str,
     ) -> Result<String> {
         let item = self.new_id()?;
+        self.append_user_message_with_id(thread, provider_thread, &item, text)?;
+        Ok(item)
+    }
+
+    /// [`Store::append_user_message`] under an item id the caller made ([`Store::new_id`]).
+    pub fn append_user_message_with_id(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        item: &str,
+        text: &str,
+    ) -> Result<()> {
         let started = Envelope::new(Event::ItemStarted {
             kind: ItemKind::UserMessage,
             title: String::new(),
             input: None,
             parent: None,
         })
-        .item(item.clone());
+        .item(item);
         let snapshot = Envelope::new(Event::ContentSnapshot {
             stream: StreamKind::Assistant,
             text: text.to_string(),
         })
-        .item(item.clone());
-        let tx = self.conn.unchecked_transaction()?;
-        self.append_in_txn(thread, provider_thread, &started)?;
-        self.append_in_txn(thread, provider_thread, &snapshot)?;
-        tx.commit()?;
-        Ok(item)
+        .item(item);
+        let result = self
+            .scope(rusqlite::TransactionBehavior::Deferred)
+            .and_then(|tx| {
+                self.append_in_txn(thread, provider_thread, &started)?;
+                self.append_in_txn(thread, provider_thread, &snapshot)?;
+                tx.commit()
+            });
+        if result.is_err() {
+            self.tails.borrow_mut().distrust_thread(thread);
+        }
+        result
     }
 
     /// The `seq` just before the newest `n` events of `thread`, to pass as `after_seq` to
@@ -2008,5 +2356,437 @@ mod tests {
         assert_eq!(default_path(Some(""), Some("/h")), fallback);
         assert_eq!(default_path(Some("relative"), Some("/h")), fallback);
         assert_eq!(default_path(None, None), None);
+    }
+
+    // ---- heal tails, batches, checkpoints ----
+
+    fn completed(item: &str, status: ItemStatus) -> Envelope {
+        Envelope::new(Event::ItemCompleted {
+            status,
+            output: None,
+            error: None,
+        })
+        .item(item)
+    }
+
+    fn stream_delta(item: &str, stream: StreamKind, text: &str) -> Envelope {
+        Envelope::new(Event::ContentDelta {
+            stream,
+            text: text.into(),
+        })
+        .item(item)
+        .raw(serde_json::json!({"frag": text}))
+    }
+
+    /// Every events row, byte for byte (`at` aside: it is the wall clock).
+    fn event_rows(s: &Store) -> Vec<(i64, String, Option<String>, String)> {
+        let mut stmt = s
+            .conn
+            .prepare(
+                "SELECT seq, thread_id, provider_thread_id, envelope_json FROM events ORDER BY seq",
+            )
+            .expect("prep");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("q");
+        rows.collect::<std::result::Result<_, _>>().expect("rows")
+    }
+
+    /// A small deterministic generator (xorshift), so a failing seed replays.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// One step of a randomised script, applied the same way to both stores.
+    #[allow(clippy::large_enum_variant)] // a test script, built once
+    enum Step {
+        Append(String, Envelope),
+        /// The next append fails after its insert (an injected write error).
+        Fail,
+        Forget(String),
+        /// These steps in one batch, as the writer commits them.
+        Batch(Vec<Step>),
+    }
+
+    fn script(seed: u64) -> Vec<Step> {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let threads = ["t1", "t2"];
+        let streams = [StreamKind::Assistant, StreamKind::Reasoning];
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        // Open items: (thread, item, pending fragments of a split secret).
+        let mut open: Vec<(usize, String, Vec<String>)> = Vec::new();
+        let mut next_item = 0;
+        let mut steps = Vec::new();
+        for _ in 0..400 {
+            let t = rng.below(2);
+            let step = match rng.below(20) {
+                0..=2 => {
+                    // Usually a new item, sometimes one started before (started twice).
+                    let item = if rng.below(8) == 0 && !open.is_empty() {
+                        open[rng.below(open.len())].1.clone()
+                    } else {
+                        next_item += 1;
+                        format!("i{next_item}")
+                    };
+                    let mut frags = Vec::new();
+                    if rng.below(2) == 0 {
+                        let cuts = 1 + rng.below(4);
+                        let mut at: Vec<usize> =
+                            (0..cuts).map(|_| 1 + rng.below(secret.len() - 1)).collect();
+                        at.sort_unstable();
+                        at.dedup();
+                        let mut last = 0;
+                        for c in at {
+                            frags.push(secret[last..c].to_owned());
+                            last = c;
+                        }
+                        frags.push(secret[last..].to_owned());
+                    }
+                    open.push((t, item.clone(), frags));
+                    Step::Append(
+                        threads[t].into(),
+                        started(&item, ItemKind::AssistantMessage),
+                    )
+                }
+                3..=11 if !open.is_empty() => {
+                    let k = rng.below(open.len());
+                    let stream = streams[rng.below(2)];
+                    let (t, item, frags) = &mut open[k];
+                    let text = if !frags.is_empty() && rng.below(2) == 0 {
+                        let f = frags.remove(0);
+                        if rng.below(2) == 0 {
+                            format!("token {f}")
+                        } else {
+                            f
+                        }
+                    } else {
+                        format!("word{} ", rng.below(100))
+                    };
+                    Step::Append(threads[*t].into(), stream_delta(item, stream, &text))
+                }
+                12 if !open.is_empty() => {
+                    let (t, item, _) = &open[rng.below(open.len())];
+                    let snap = Envelope::new(Event::ContentSnapshot {
+                        stream: streams[rng.below(2)],
+                        text: "snapshot".into(),
+                    })
+                    .item(item.as_str());
+                    Step::Append(threads[*t].into(), snap)
+                }
+                13 | 14 if !open.is_empty() => {
+                    let (t, item, _) = open.remove(rng.below(open.len()));
+                    let status = if rng.below(4) == 0 {
+                        ItemStatus::Interrupted
+                    } else {
+                        ItemStatus::Completed
+                    };
+                    Step::Append(threads[t].into(), completed(&item, status))
+                }
+                15 => {
+                    // Deltas of an item that never started here (a restart mid-item).
+                    next_item += 1;
+                    let item = format!("i{next_item}");
+                    open.push((t, item.clone(), Vec::new()));
+                    Step::Append(
+                        threads[t].into(),
+                        stream_delta(&item, StreamKind::Assistant, &secret[..9]),
+                    )
+                }
+                16 => Step::Append(
+                    threads[t].into(),
+                    Envelope::new(Event::TurnCompleted {
+                        state: agent_core::event::TurnState::Completed,
+                        usage: None,
+                        cost_usd: None,
+                        error: None,
+                    }),
+                ),
+                17 => Step::Fail,
+                18 => Step::Forget(threads[t].into()),
+                _ => {
+                    // A batch of a few deltas, as the writer commits them.
+                    let mut inner = Vec::new();
+                    for _ in 0..1 + rng.below(4) {
+                        let pick = rng.below(open.len().max(1));
+                        if let Some((t, item, frags)) = open.get_mut(pick) {
+                            let text = if frags.is_empty() {
+                                "x".to_owned()
+                            } else {
+                                frags.remove(0)
+                            };
+                            inner.push(Step::Append(
+                                threads[*t].into(),
+                                stream_delta(item, StreamKind::Assistant, &text),
+                            ));
+                        }
+                    }
+                    Step::Batch(inner)
+                }
+            };
+            steps.push(step);
+        }
+        // Everything still open completes, so every item gets its final heal.
+        for (t, item, _) in open {
+            steps.push(Step::Append(
+                threads[t].into(),
+                completed(&item, ItemStatus::Completed),
+            ));
+        }
+        steps
+    }
+
+    fn play(s: &Store, steps: &[Step]) {
+        for step in steps {
+            match step {
+                Step::Append(t, env) => {
+                    let _ = s.append_event(t, None, env);
+                }
+                Step::Fail => s.fail_next_append.set(true),
+                Step::Forget(t) => s.forget_tails(t),
+                Step::Batch(inner) => {
+                    s.batch(|s| play(s, inner)).expect("batch");
+                }
+            }
+        }
+    }
+
+    fn diff_store(tails: bool, small_caps: bool) -> Store {
+        let s = store();
+        s.set_heal_tails(tails);
+        if small_caps {
+            s.tails.borrow_mut().set_caps(40, 120);
+        }
+        for t in ["t1", "t2"] {
+            s.create_thread_with_id(t, "/", None).expect("thread");
+        }
+        s
+    }
+
+    /// §6.4: the same randomised script (split secrets across 2-5 deltas, two interleaved
+    /// streams and threads, snapshots, interrupts, items started twice or never, overflow,
+    /// injected append errors, batches, forgotten tails) into a store healing from its tails and
+    /// one forced to the SQL scan leaves byte-identical events tables.
+    #[test]
+    fn healing_from_tails_writes_exactly_what_the_sql_scan_does() {
+        let mut paths = [0u32; 2];
+        let mut healed_rows = 0;
+        for seed in 1..=60u64 {
+            let steps = script(seed);
+            let tail = diff_store(true, seed % 3 == 0);
+            let sql = diff_store(false, false);
+            play(&tail, &steps);
+            play(&sql, &steps);
+            let rows = event_rows(&tail);
+            healed_rows += rows
+                .iter()
+                .filter(|(_, _, _, j)| j.contains("content_delta") && j.contains("****0123"))
+                .count();
+            assert_eq!(rows, event_rows(&sql), "seed {seed}");
+            let p = tail.heal_paths.get();
+            paths = [paths[0] + p[0], paths[1] + p[1]];
+            assert_eq!(
+                sql.heal_paths.get()[0],
+                0,
+                "the forced store never used a tail"
+            );
+        }
+        // Both paths really ran: the comparison was not vacuous.
+        assert!(paths[0] > 100 && paths[1] > 20, "{paths:?}");
+        // And split secrets really were healed (masked whole in a delta row).
+        assert!(healed_rows > 5, "{healed_rows}");
+    }
+
+    /// Past [`HEAL_WINDOW`] the scan no longer sees an item's first rows; the tail still does,
+    /// so the tail store is at least as scrubbed (here: strictly more).
+    #[test]
+    fn an_item_longer_than_the_heal_window_is_at_least_as_scrubbed_from_its_tail() {
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(11);
+        let mut steps = vec![
+            Step::Append("t1".into(), started("long", ItemKind::AssistantMessage)),
+            Step::Append(
+                "t1".into(),
+                stream_delta("long", StreamKind::Assistant, &format!("key {a}")),
+            ),
+            Step::Append(
+                "t1".into(),
+                stream_delta("long", StreamKind::Assistant, &format!("{b} ok")),
+            ),
+        ];
+        for n in 0..HEAL_WINDOW + 10 {
+            steps.push(Step::Append(
+                "t1".into(),
+                stream_delta("long", StreamKind::Assistant, &format!("w{n} ")),
+            ));
+        }
+        steps.push(Step::Append(
+            "t1".into(),
+            completed("long", ItemStatus::Completed),
+        ));
+        let tail = diff_store(true, false);
+        let sql = diff_store(false, false);
+        play(&tail, &steps);
+        play(&sql, &steps);
+        let leaks = |s: &Store| {
+            event_rows(s)
+                .iter()
+                .filter(|(_, _, _, json)| json.contains(a) || json.contains(b))
+                .count()
+        };
+        assert_eq!(leaks(&tail), 0);
+        assert!(leaks(&sql) > 0, "the scan's window really was exceeded");
+        assert_eq!(tail.heal_paths.get(), [1, 0]);
+    }
+
+    #[test]
+    fn a_tail_cut_short_by_an_append_error_falls_back_to_the_scan() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123");
+        let (a, b) = secret.split_at(12);
+        s.append_event(&t, None, &started("a1", ItemKind::AssistantMessage))
+            .expect("start");
+        s.append_event(&t, None, &delta("a1", a)).expect("a");
+        s.fail_next_append.set(true);
+        assert!(s.append_event(&t, None, &delta("a1", "lost")).is_err());
+        s.append_event(&t, None, &delta("a1", b)).expect("b");
+        s.append_event(&t, None, &completed("a1", ItemStatus::Completed))
+            .expect("done");
+        assert_eq!(s.heal_paths.get(), [0, 1], "healed by the scan");
+        let all = serde_json::to_string(&s.events(&t, None, 50).expect("ev")).expect("j");
+        assert!(!all.contains(a) && !all.contains("lost"), "{all}");
+    }
+
+    #[test]
+    fn a_batch_keeps_its_good_writes_when_one_fails() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let results = s
+            .batch(|s| {
+                [
+                    s.append_event(&t, None, &Envelope::new(Event::Unknown))
+                        .is_ok(),
+                    s.append_event("missing", None, &Envelope::new(Event::Unknown))
+                        .is_ok(),
+                    s.append_user_message(&t, None, "hi").is_ok(),
+                    s.delete_thread("missing").is_ok(),
+                ]
+            })
+            .expect("commit");
+        assert_eq!(results, [true, false, true, false]);
+        assert_eq!(s.events(&t, None, 10).expect("events").len(), 3);
+        assert!(s.conn.is_autocommit(), "no transaction left open");
+    }
+
+    #[test]
+    fn checkpoints_report_the_wal_and_can_be_turned_off() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let s = Store::open(&tmp.path().join("threads.db")).expect("open");
+        assert_eq!(s.autocheckpoint().expect("pragma"), 1000);
+        s.set_autocheckpoint(0).expect("off");
+        assert_eq!(s.autocheckpoint().expect("pragma"), 0);
+        let t = s.create_thread("/", None).expect("t");
+        for _ in 0..50 {
+            s.append_event(&t, None, &delta("a", &"x".repeat(2000)))
+                .expect("append");
+        }
+        let before = s.checkpoint().expect("checkpoint");
+        assert!(before.wal_frames > 0 && before.wal_bytes >= before.wal_frames * 512);
+        assert!(!before.busy);
+        assert_eq!(before.checkpointed, before.wal_frames);
+    }
+
+    /// The append benchmark (§1 E5, §2 WP4a): run it on a read-only snapshot of a real store,
+    /// release build:
+    /// `sqlite3 -readonly ~/.local/state/agent-terminal/threads.db ".backup /tmp/x/threads.db"`,
+    /// then `AGENT_TERMINAL_BENCH_DB=/tmp/x/threads.db cargo test --release -p agent-kit
+    /// append_bench -- --ignored --nocapture`. It appends to the copy's busiest thread.
+    #[test]
+    #[ignore = "benchmark: needs AGENT_TERMINAL_BENCH_DB, a scratch copy of a real store"]
+    fn append_bench() {
+        let Some(path) = std::env::var_os("AGENT_TERMINAL_BENCH_DB") else {
+            eprintln!("AGENT_TERMINAL_BENCH_DB is not set");
+            return;
+        };
+        let path = PathBuf::from(path);
+        for (label, tails) in [("sql scan (master's heal)", false), ("heal tails", true)] {
+            let s = Store::open(&path).expect("open the copy");
+            s.set_heal_tails(tails);
+            let thread: String = s
+                .conn
+                .query_row(
+                    "SELECT thread_id FROM events GROUP BY thread_id ORDER BY COUNT(*) DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("a thread with events");
+            let mut deltas = Vec::new();
+            let mut done = Vec::new();
+            for round in 0..200 {
+                let item = format!("bench-{label}-{round}");
+                s.append_event(&thread, None, &started(&item, ItemKind::AssistantMessage))
+                    .expect("start");
+                for n in 0..20 {
+                    let t = Instant::now();
+                    s.append_event(&thread, None, &delta(&item, &format!("word {n} ")))
+                        .expect("delta");
+                    deltas.push(t.elapsed());
+                }
+                let t = Instant::now();
+                s.append_event(&thread, None, &completed(&item, ItemStatus::Completed))
+                    .expect("complete");
+                done.push(t.elapsed());
+            }
+            done.sort();
+            let us = |d: Duration| d.as_secs_f64() * 1e6;
+            let mean = deltas.iter().map(|d| us(*d)).sum::<f64>() / deltas.len() as f64;
+            eprintln!(
+                "{label}: content_delta mean {mean:.1} µs; item_completed p50 {:.1} µs, p99 {:.1} µs",
+                us(done[done.len() / 2]),
+                us(done[done.len() * 99 / 100]),
+            );
+        }
+        // What the main thread pays now: queueing an append for the writer.
+        let reader = std::rc::Rc::new(Store::open(&path).expect("open"));
+        let writer = crate::store_writer::StoreWriter::spawn(&path).expect("writer");
+        let handle = crate::store_writer::StoreHandle::Queued {
+            reader,
+            writer: writer.clone(),
+        };
+        let thread = handle.new_id().expect("id");
+        let t2 = thread.clone();
+        handle
+            .write("create", None, move |s| {
+                s.create_thread_with_id(&t2, "/", None)
+            })
+            .expect("queued");
+        let mut queued = Vec::new();
+        for n in 0..4000 {
+            let env = if n % 21 == 20 {
+                completed("q", ItemStatus::Completed)
+            } else {
+                delta("q", "word ")
+            };
+            let t = Instant::now();
+            handle.append_event(&thread, None, &env).expect("queued");
+            queued.push(t.elapsed());
+        }
+        assert!(writer.flush(Duration::from_secs(60)));
+        queued.sort();
+        eprintln!(
+            "queued append on the calling thread: p50 {:.1} µs, p99 {:.1} µs",
+            queued[queued.len() / 2].as_secs_f64() * 1e6,
+            queued[queued.len() * 99 / 100].as_secs_f64() * 1e6,
+        );
+        assert_eq!(writer.failures().0, 0);
     }
 }
