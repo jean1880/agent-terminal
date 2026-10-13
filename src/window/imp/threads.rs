@@ -35,9 +35,10 @@ use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
     badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, held_finish_due,
-    is_busy, limit_over, needs_attention, parse_driver, react, relative_time, resume_as,
-    row_tooltip, safe_handoff_target, sidebar_sections, stop_heading, stored_model, thread_title,
-    turn_finishes_thread, Attention, Badge, ResumeAs, RowKey, SidebarRow,
+    is_busy, limit_over, needs_attention, parse_driver, react, redraw_for, relative_time,
+    resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading, stored_model,
+    thread_title, turn_finishes_thread, Attention, Badge, Redraw, ResumeAs, RowKey, SidebarModel,
+    SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -1007,6 +1008,51 @@ pub(super) fn refresh_hook_verdict() {
 // The sidebar
 // ---------------------------------------------------------------------------------------------
 
+/// A row's widget and the label holding its age, kept to update them without a rebuild.
+struct DrawnRow {
+    row: gtk4::ListBoxRow,
+    age: Label,
+}
+
+impl DrawnRow {
+    fn new(row: &gtk4::ListBoxRow) -> Self {
+        let mut child = row.child().and_then(|line| line.first_child());
+        let mut age = None;
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.has_css_class("thread-age") {
+                age = widget.downcast::<Label>().ok();
+            }
+        }
+        Self {
+            row: row.clone(),
+            // Every row has one (`sidebar_row_widget`); a detached label keeps this total.
+            age: age.unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Moves the sidebar's clock, so a test can age the rows.
+    static CLOCK_SKEW_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// The time the sidebar draws ages against.
+fn sidebar_now() -> i64 {
+    #[cfg(test)]
+    {
+        now_ms() + CLOCK_SKEW_MS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        now_ms()
+    }
+}
+
+/// How many times the sidebar was asked to refresh (the debug timing log numbers them).
+static SIDEBAR_REFRESHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(super) struct Sidebar {
     pub(super) root: gtk4::Box,
     pub(super) list: gtk4::ListBox,
@@ -1015,6 +1061,10 @@ pub(super) struct Sidebar {
     pub(super) keys: RefCell<Vec<Option<RowKey>>>,
     /// Set while the list is rebuilt, so selecting the current row is not taken as a click.
     rebuilding: std::cell::Cell<bool>,
+    /// What the list on screen shows (`None`: nothing drawn yet), to skip or shrink a redraw.
+    drawn: RefCell<Option<SidebarModel>>,
+    /// The widgets of the rows in `drawn`, in the order [`SidebarModel::rows`] lists them.
+    drawn_rows: RefCell<Vec<DrawnRow>>,
     /// The thread list has not loaded yet, so the list shows skeleton rows (its placeholder).
     loading: std::cell::Cell<bool>,
     /// Those skeleton rows.
@@ -1181,7 +1231,9 @@ impl AgentTerminalWindow {
         self.watch_availability();
         self.watch_account_status();
         self.refresh_sidebar();
-        // Relative times age; a minute is their resolution.
+        // Relative times age; a minute is their resolution. Nobody sees them while the window is
+        // hidden or minimised; a visible window keeps them current even unfocused, and regaining
+        // focus refreshes once (`watch_availability`).
         glib::timeout_add_seconds_local(
             60,
             glib::clone!(
@@ -1190,7 +1242,9 @@ impl AgentTerminalWindow {
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    obj.imp().refresh_sidebar();
+                    if obj.is_mapped() {
+                        obj.imp().refresh_sidebar();
+                    }
                     glib::ControlFlow::Continue
                 }
             ),
@@ -1406,6 +1460,8 @@ impl AgentTerminalWindow {
             search: search.clone(),
             keys: RefCell::new(Vec::new()),
             rebuilding: std::cell::Cell::new(false),
+            drawn: RefCell::new(None),
+            drawn_rows: RefCell::new(Vec::new()),
             loading: std::cell::Cell::new(true),
             placeholder,
             _usage: usage,
@@ -1462,12 +1518,17 @@ impl AgentTerminalWindow {
         // From the last load: the sidebar never reads the store on the main thread.
         let summaries = self.summaries.borrow().clone().unwrap_or_default();
         let tabs = self.tabs.borrow();
+        // Looked up once per summary, not scanned for: the first open tab of a thread wins.
+        let mut open: HashMap<&str, &TabState> = HashMap::new();
+        for tab in tabs.iter() {
+            if let Some(chat) = tab.chat.as_ref() {
+                open.entry(chat.thread.as_str()).or_insert(tab);
+            }
+        }
         let mut rows: Vec<SidebarRow> = summaries
             .into_iter()
             .map(|s| {
-                let tab = tabs
-                    .iter()
-                    .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == s.id));
+                let tab = open.get(s.id.as_str()).copied();
                 let chat = tab.and_then(|t| t.chat.as_ref());
                 let badge = match chat {
                     Some(c) => badge_for(
@@ -1602,6 +1663,22 @@ impl AgentTerminalWindow {
     /// Redraws the sidebar from what is loaded, with the live state of the open pages. Cheap: a
     /// few dozen rows, rebuilt on state changes. Nothing loaded yet: asks for the load.
     pub(super) fn refresh_sidebar(&self) {
+        let started = std::time::Instant::now();
+        self.redraw_sidebar();
+        let calls = SIDEBAR_REFRESHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let rows = self
+            .sidebar
+            .borrow()
+            .as_ref()
+            .map_or(0, |s| s.drawn_rows.borrow().len());
+        debug!(
+            "sidebar refresh #{calls}: {rows} rows in {:.2} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// Does the work of [`Self::refresh_sidebar`].
+    fn redraw_sidebar(&self) {
         let Some(sidebar) = self.sidebar.borrow().clone() else {
             return;
         };
@@ -1617,10 +1694,32 @@ impl AgentTerminalWindow {
         let rows = self.sidebar_rows();
         let selected = self.selected_row_key();
         let focused = self.obj().is_active();
-        let (active, groups) =
-            sidebar_sections(rows, &sidebar.search.text(), self.show_archived.get());
+        let query = sidebar.search.text().to_string();
+        let (active, groups) = sidebar_sections(rows, &query, self.show_archived.get());
+        let model = SidebarModel {
+            active,
+            groups,
+            selected,
+            focused,
+            query,
+        };
+        let now = sidebar_now();
+        // Widgets that already show these rows are kept: a redraw replaces nothing the user may
+        // be holding (focus, a press, an open menu, a rename), and costs a few label writes.
+        let redraw = redraw_for(sidebar.drawn.borrow().as_ref(), &model);
+        if redraw != Redraw::Rebuild {
+            self.update_sidebar_in_place(&sidebar, &model, redraw, now);
+            return;
+        }
+        let SidebarModel {
+            active,
+            groups,
+            selected,
+            focused,
+            ..
+        } = model.clone();
+        let mut drawn_rows: Vec<DrawnRow> = Vec::new();
         let home = env::var("HOME").unwrap_or_default();
-        let now = now_ms();
 
         // A refresh replaces widgets, but it must not replace the keyboard user's place.
         // Remember the thread identity and trailing control before removing the old rows.
@@ -1671,6 +1770,7 @@ impl AgentTerminalWindow {
                 if Some(&row.key) == selected.as_ref() {
                     select = Some(widget.clone());
                 }
+                drawn_rows.push(DrawnRow::new(&widget));
                 keys.push(Some(row.key));
             }
             if !groups.is_empty() {
@@ -1710,10 +1810,13 @@ impl AgentTerminalWindow {
                 if Some(&row.key) == selected.as_ref() {
                     select = Some(widget.clone());
                 }
+                drawn_rows.push(DrawnRow::new(&widget));
                 keys.push(Some(row.key));
             }
         }
         *sidebar.keys.borrow_mut() = keys;
+        *sidebar.drawn_rows.borrow_mut() = drawn_rows;
+        *sidebar.drawn.borrow_mut() = Some(model);
         sidebar.list.select_row(select.as_ref());
         sidebar.rebuilding.set(false);
         if let Some((key, control)) = sidebar_focus {
@@ -1743,6 +1846,52 @@ impl AgentTerminalWindow {
             } else {
                 sidebar.search.grab_focus();
             }
+        }
+        self.update_sidebar_toggle_attention();
+    }
+
+    /// The cheap redraw: the rows are the ones on screen, so only what follows the clock or the
+    /// window changes, written onto the existing widgets. Nothing is removed or re-added, so
+    /// focus, the selection's scroll position, a press in progress, an open menu and a rename
+    /// all stay as they are.
+    fn update_sidebar_in_place(
+        &self,
+        sidebar: &Sidebar,
+        model: &SidebarModel,
+        redraw: Redraw,
+        now: i64,
+    ) {
+        let widgets = sidebar.drawn_rows.borrow();
+        if redraw == Redraw::Restyle {
+            for (row, drawn) in model.rows().zip(widgets.iter()) {
+                if needs_attention(row, model.selected.as_ref(), model.focused) {
+                    drawn.row.add_css_class("needs-attention");
+                } else {
+                    drawn.row.remove_css_class("needs-attention");
+                }
+            }
+            let selected = model
+                .rows()
+                .zip(widgets.iter())
+                .find(|(row, _)| Some(&row.key) == model.selected.as_ref())
+                .map(|(_, drawn)| drawn.row.clone());
+            if sidebar.list.selected_row() != selected {
+                // Selecting is not a click on the row.
+                sidebar.rebuilding.set(true);
+                sidebar.list.select_row(selected.as_ref());
+                sidebar.rebuilding.set(false);
+            }
+        }
+        for (row, drawn) in model.rows().zip(widgets.iter()) {
+            let age = relative_time(now, row.updated_ms);
+            if drawn.age.label() != age {
+                drawn.age.set_label(&age);
+            }
+        }
+        drop(widgets);
+        if let Some(drawn) = sidebar.drawn.borrow_mut().as_mut() {
+            drawn.selected = model.selected.clone();
+            drawn.focused = model.focused;
         }
         self.update_sidebar_toggle_attention();
     }
@@ -4529,6 +4678,101 @@ pub(super) mod tests {
             sidebar_focus_target(&sidebar, &focus),
             Some((key, Some("thread-close")))
         );
+    }
+
+    /// A refresh with the same rows, an aged clock, or only the focus changed keeps the row
+    /// widgets (and so focus, an open menu and a rename in them); only the age and the glow move.
+    pub(crate) fn sidebar_updates_in_place(window: &crate::window::AgentTerminalWindow) {
+        let imp = window.imp();
+        let sidebar = imp.sidebar.borrow().clone().expect("sidebar");
+        if let Some(tab) = imp.tabs.borrow_mut().get_mut(0) {
+            if let Some(chat) = tab.chat.as_mut() {
+                chat.approval = true;
+            }
+        }
+        imp.refresh_sidebar();
+        let model = sidebar.drawn.borrow().clone().expect("drawn model");
+        let (index, waiting) = model
+            .rows()
+            .enumerate()
+            .find(|(_, r)| r.badge == Some(Badge::NeedsApproval))
+            .expect("a row waiting for approval");
+        let widget = || sidebar.drawn_rows.borrow()[index].row.clone();
+        let before = widget();
+
+        // The same rows, a clock three hours on: the widget stays, its age moves.
+        CLOCK_SKEW_MS.with(|s| s.set(3 * 3_600_000));
+        imp.refresh_sidebar();
+        CLOCK_SKEW_MS.with(|s| s.set(0));
+        assert_eq!(widget(), before, "an age tick keeps the row widgets");
+        let age = sidebar.drawn_rows.borrow()[index].age.label();
+        let expected = relative_time(now_ms() + 3 * 3_600_000, waiting.updated_ms);
+        assert_eq!(age, expected, "the age label moved on");
+
+        // Focus and the shown row decide the glow and nothing else.
+        let now = sidebar_now();
+        let restyle = |selected: Option<RowKey>, focused: bool| {
+            let next = SidebarModel {
+                selected,
+                focused,
+                ..model.clone()
+            };
+            imp.update_sidebar_in_place(&sidebar, &next, Redraw::Restyle, now);
+        };
+        restyle(None, false);
+        assert!(widget().has_css_class("needs-attention"));
+        restyle(Some(waiting.key.clone()), true);
+        assert!(
+            !widget().has_css_class("needs-attention"),
+            "looking at it clears the glow"
+        );
+        assert_eq!(sidebar.list.selected_row(), Some(widget()));
+        restyle(None, true);
+        assert!(widget().has_css_class("needs-attention"));
+        assert_eq!(widget(), before, "restyling keeps the row widgets");
+        imp.refresh_sidebar();
+    }
+
+    /// Times `refresh_sidebar` over a realistic list (75 stored threads) for each trigger the
+    /// plan names: a repeat with nothing changed, the 60 s age tick, and a focus change.
+    /// Prints the numbers (`cargo test -- --nocapture`).
+    pub(crate) fn sidebar_refresh_cost(window: &crate::window::AgentTerminalWindow) {
+        use agent_kit::store::ThreadSummary;
+        let imp = window.imp();
+        let saved = imp.summaries.borrow().clone();
+        let now = now_ms();
+        let list: Vec<ThreadSummary> = (0..75)
+            .map(|i| ThreadSummary {
+                id: format!("bench-{i}"),
+                title: format!("Bench thread {i}"),
+                cwd: format!("/tmp/bench-{}", i % 9),
+                updated_at: now - i64::from(i) * 1_700_000,
+                driver: Some(if i % 2 == 0 { "claude" } else { "agy" }.to_owned()),
+                model: None,
+                unread: i % 7 == 0,
+                archived: false,
+            })
+            .collect();
+        *imp.summaries.borrow_mut() = Some(list);
+        imp.refresh_sidebar();
+        let time = |what: &str, runs: u32, step: &dyn Fn(u32)| {
+            let started = std::time::Instant::now();
+            for n in 0..runs {
+                step(n);
+            }
+            eprintln!(
+                "sidebar bench: {what}: {:.3} ms per call over {runs}",
+                started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs)
+            );
+        };
+        time("repeat, nothing changed", 20, &|_| imp.refresh_sidebar());
+        time("age tick (clock 2 min on)", 20, &|n| {
+            CLOCK_SKEW_MS.with(|s| s.set(i64::from(n + 1) * 120_000));
+            imp.refresh_sidebar();
+        });
+        CLOCK_SKEW_MS.with(|s| s.set(0));
+        *imp.summaries.borrow_mut() = saved;
+        imp.refresh_sidebar();
     }
 
     /// A thread menu hangs off the sidebar list, so a rebuild while it is open must clear the

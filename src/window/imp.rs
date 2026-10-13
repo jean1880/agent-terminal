@@ -50,6 +50,15 @@ const NARROW_SP: f64 = 480.0;
 /// space. It is temporarily hidden by a breakpoint and returns when the window grows again.
 const DIFF_HIDE_SP: f64 = 880.0;
 
+/// A transcript path: the remembered one while its file is still there, else a fresh search
+/// (the file was moved, rotated or removed, so the old answer is not trusted).
+fn remembered_or_found(
+    known: Option<std::path::PathBuf>,
+    find: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    known.filter(|path| path.is_file()).or_else(find)
+}
+
 /// Runs `update` once the window has been allocated at a new surface size: a resize, maximize,
 /// restore or fullscreen. A widget has no `width` property, so `notify::width` never fires; the
 /// surface's `layout` signal does, and the idle runs after the frame has allocated the window, so
@@ -1078,6 +1087,9 @@ pub struct AgentTerminalWindow {
     /// Set while a transcript quota check is running off-thread, so a slow
     /// disk cannot stack up overlapping checks.
     quota_poll_running: std::cell::Cell<bool>,
+    /// Where the quota poll found each 2.x session's transcript, by (store, session id), so a
+    /// poll does not list the store's directories again. A new session id is a new key.
+    transcript_paths: RefCell<std::collections::HashMap<(String, String), std::path::PathBuf>>,
     /// Wraps the tab view, for short confirmations that need no dialog.
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
     /// The header's "New Thread With" submenu, refilled when agent detection finishes.
@@ -6207,32 +6219,49 @@ impl AgentTerminalWindow {
             self.apply_quota_state(&page, state);
         }
 
+        // Only live sessions keep a remembered path.
+        self.transcript_paths
+            .borrow_mut()
+            .retain(|key, _| jobs.contains(key));
         if jobs.is_empty() || self.quota_poll_running.get() {
             return;
         }
         self.quota_poll_running.set(true);
+        let known: Vec<Option<std::path::PathBuf>> = jobs
+            .iter()
+            .map(|key| self.transcript_paths.borrow().get(key).cloned())
+            .collect();
         let obj = self.obj();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
-                // Ceiling: each check lists the store's project directories to
-                // find the transcript, a few hundred stat calls every poll.
-                // Upgrade path: remember the path once it is found.
-                let states = gtk4::gio::spawn_blocking(move || {
-                    jobs.iter()
-                        .map(|(store, id)| {
-                            crate::utils::find_transcript(store, id)
-                                .map_or(QuotaState::Unknown, |path| {
-                                    crate::handoff::transcript_quota_state(&path)
-                                })
+                // Finding a transcript lists the store's project directories (a few hundred
+                // stat calls), so a path found once is reused while the file is still there.
+                let (states, found): (Vec<_>, Vec<_>) = gtk4::gio::spawn_blocking(move || {
+                    jobs.into_iter()
+                        .zip(known)
+                        .map(|((store, id), known)| {
+                            let path = remembered_or_found(known, || {
+                                crate::utils::find_transcript(&store, &id)
+                            });
+                            let state = path.as_ref().map_or(QuotaState::Unknown, |path| {
+                                crate::handoff::transcript_quota_state(path)
+                            });
+                            (state, path.map(|path| ((store, id), path)))
                         })
-                        .collect::<Vec<_>>()
+                        .unzip()
                 })
                 .await
                 .unwrap_or_default();
                 let imp = obj.imp();
                 imp.quota_poll_running.set(false);
+                {
+                    let mut paths = imp.transcript_paths.borrow_mut();
+                    for (key, path) in found.into_iter().flatten() {
+                        paths.insert(key, path);
+                    }
+                }
                 for (page, state) in pages.iter().zip(states) {
                     imp.apply_quota_state(page, state);
                 }
@@ -6512,6 +6541,29 @@ mod tests {
             std::env::set_var("GTK_A11Y", "test");
             gtk4::init().expect("GTK init failed");
         }
+    }
+
+    #[test]
+    fn a_remembered_transcript_is_reused_only_while_its_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let searched = std::cell::Cell::new(0);
+        let search = |found: Option<std::path::PathBuf>| {
+            searched.set(searched.get() + 1);
+            found
+        };
+        // Still there: no search.
+        let got = remembered_or_found(Some(file.clone()), || search(None));
+        assert_eq!((got, searched.get()), (Some(file.clone()), 0));
+        // Never found: searched.
+        let got = remembered_or_found(None, || search(Some(file.clone())));
+        assert_eq!((got, searched.get()), (Some(file.clone()), 1));
+        // Gone: searched again, and the new answer wins.
+        std::fs::remove_file(&file).unwrap();
+        let moved = dir.path().join("moved.jsonl");
+        let got = remembered_or_found(Some(file), || search(Some(moved.clone())));
+        assert_eq!((got, searched.get()), (Some(moved), 2));
     }
 
     /// The font picker shows one installed family of a fallback chain, never the chain (which
@@ -7134,6 +7186,8 @@ mod tests {
         assert!(!toggle.has_css_class("needs-attention"));
 
         threads::tests::sidebar_focus_survives_refresh(window);
+        threads::tests::sidebar_updates_in_place(window);
+        threads::tests::sidebar_refresh_cost(window);
 
         // Archive and delete go through the store; the sidebar follows the loaded list.
         let ids: Vec<String> = rows
