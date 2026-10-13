@@ -33,10 +33,20 @@
 //!
 //! The cost of the box is memory proportional to how far up the user has scrolled, which the
 //! trim on return bounds.
+//!
+//! # Filling the window in steps
+//!
+//! A [`TranscriptView::reset`] builds only the newest [`FIRST_PAINT`] rows, so the thread shows
+//! at once; the rest of the window is prepended in idle steps of about [`FILL_BUDGET`], below
+//! layout and paint in priority, through the same anchored prepend as loading older rows. A jump
+//! to a row the fill has not built yet builds the rest at once and scrolls once it is laid out.
+//! Measured on real threads of 42k–47k envelopes (release build), building the whole window
+//! was 70–80% of the 36–64 ms a thread open held the main thread.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -48,6 +58,11 @@ use super::model::{ItemId, Transcript};
 pub const WINDOW: usize = 150;
 /// Rows materialised per scroll-up step.
 pub const PAGE: usize = 60;
+/// Top-level rows a reset builds before it returns: more than a tall window shows.
+pub const FIRST_PAINT: usize = 30;
+/// Time after which a fill step stops starting new rows and yields to the next frame. Checked
+/// between top-level rows, so one large row (a sub-agent card and its children) can overrun it.
+const FILL_BUDGET: Duration = Duration::from_millis(6);
 /// Distance from the end (px) that counts as reaching the bottom when scrolling down.
 const STICK_SLOP: f64 = 48.0;
 
@@ -89,12 +104,25 @@ pub struct TranscriptView {
     ticks: Cell<u64>,
     sink: RowSink,
     empty: gtk4::Box,
+    /// The model the rows are built from (set by `connect_load_older`), for the fill steps.
+    model: RefCell<Weak<RefCell<Transcript>>>,
+    /// The pending fill of the window after a reset (see [`FIRST_PAINT`]).
+    fill: RefCell<Option<glib::SourceId>>,
+    /// A card a jump built just now: it has no position until the next layout, so
+    /// [`Self::settle`] scrolls to it then.
+    jump_to: RefCell<Option<String>>,
+    /// The pending jump also brings the card's focused control into view (an interruption
+    /// shelf jump focuses the card's first answer).
+    reveal_after_jump: Cell<bool>,
 }
 
 impl Drop for TranscriptView {
     fn drop(&mut self) {
         if let Some((clock, handler)) = self.layout_handler.get_mut().take() {
             clock.disconnect(handler);
+        }
+        if let Some(fill) = self.fill.get_mut().take() {
+            fill.remove();
         }
     }
 }
@@ -184,6 +212,10 @@ impl TranscriptView {
             ticks: Cell::new(0),
             sink,
             empty,
+            model: RefCell::new(Weak::new()),
+            fill: RefCell::new(None),
+            jump_to: RefCell::new(None),
+            reveal_after_jump: Cell::new(false),
         });
         view.connect_scrolling();
         view
@@ -318,6 +350,34 @@ impl TranscriptView {
     /// Broadway: value 3133 with the list drawn at -2911, the previous value, for seconds).
     fn settle(&self) {
         let adj = self.scroller.vadjustment();
+        let pending = self.jump_to.borrow().clone();
+        if let Some(id) = pending {
+            // Gone meanwhile, or hidden (never allocated): nothing to jump to.
+            let row = self
+                .rows
+                .borrow()
+                .get(&id)
+                .map(Row::widget)
+                .filter(WidgetExt::is_mapped);
+            match row {
+                // Built since the last layout: no allocation yet (the frame tick runs before
+                // layout), and its bounds would be a stale zero-sized rectangle. A later
+                // settle, after the layout, places it.
+                Some(w) if w.height() == 0 => return,
+                Some(w) => {
+                    self.jump_to.take();
+                    let reveal = self.reveal_after_jump.replace(false);
+                    if let Some(bounds) = w.compute_bounds(&self.scroller) {
+                        self.move_to(self.jump_target(&adj, bounds.y(), reveal));
+                        return;
+                    }
+                }
+                None => {
+                    self.jump_to.take();
+                    self.reveal_after_jump.set(false);
+                }
+            }
+        }
         let end = adj.upper() - adj.page_size();
         if self.stick.get() {
             self.restore_to.set(None);
@@ -351,7 +411,13 @@ impl TranscriptView {
     /// height or the visible height changed since the last look is a relayout (GTK clamping a
     /// shrunk transcript, the composer growing or shrinking around a send), never the user.
     pub fn user_moved_up(now: Look, last: Look) -> bool {
-        now.value < last.value - 0.5
+        now.value < last.value - 0.5 && Self::user_moved(now, last)
+    }
+
+    /// Whether a value move the view did not make itself is the user scrolling, either way: the
+    /// value moved while neither height did (see [`Self::user_moved_up`]).
+    pub fn user_moved(now: Look, last: Look) -> bool {
+        (now.value - last.value).abs() > 0.5
             && (now.upper - last.upper).abs() < 0.5
             && (now.page - last.page).abs() < 0.5
     }
@@ -432,6 +498,11 @@ impl TranscriptView {
                 upper: view.last_upper.replace(now.upper),
                 page: view.last_page.replace(now.page),
             };
+            // The user scrolling, either way, takes over from a jump still waiting for layout.
+            if Self::user_moved(now, last) {
+                view.jump_to.take();
+                view.reveal_after_jump.set(false);
+            }
             if Self::user_moved_up(now, last) {
                 view.stick.set(false);
             } else if now.value > last.value && now.value + now.page >= now.upper - STICK_SLOP {
@@ -481,6 +552,7 @@ impl TranscriptView {
     /// Connects the "scrolled to the top" edge to loading older rows. Separate from `new` because
     /// it needs the model, which the view owns.
     pub fn connect_load_older(self: &Rc<Self>, model: Rc<RefCell<Transcript>>) {
+        *self.model.borrow_mut() = Rc::downgrade(&model);
         let weak = Rc::downgrade(self);
         let weak_model = Rc::downgrade(&model);
         self.scroller.connect_edge_reached(move |_, pos| {
@@ -517,6 +589,8 @@ impl TranscriptView {
     }
 
     pub fn scroll_to_end(&self) {
+        self.jump_to.take();
+        self.reveal_after_jump.set(false);
         self.stick.set(true);
         self.anchor.set(None);
         self.restore_to.set(None);
@@ -527,19 +601,65 @@ impl TranscriptView {
 
     /// Scrolls the transcript to the row for `id`, or to the end if not found.
     pub fn scroll_to_card(&self, id: &str) {
+        self.jump_to.take();
+        self.reveal_after_jump.set(false);
+        // It may be in the part of the window still filling in. Built now, it has no position
+        // until the next layout: `settle` scrolls to it then, and nothing else (the fill's
+        // "keep my place" above all) moves the view meanwhile.
+        if !self.rows.borrow().contains_key(id)
+            && self.finish_fill()
+            && self.rows.borrow().contains_key(id)
+        {
+            self.stick.set(false);
+            self.anchor.set(None);
+            self.restore_to.set(None);
+            *self.jump_to.borrow_mut() = Some(id.to_owned());
+            return;
+        }
         if let Some(row) = self.rows.borrow().get(id) {
             if let Some(bounds) = row.widget().compute_bounds(&self.scroller) {
                 let adj = self.scroller.vadjustment();
-                let target = adj.value() + f64::from(bounds.y()) - 40.0;
                 self.stick.set(false);
-                self.move_to(target.clamp(
-                    adj.lower(),
-                    (adj.upper() - adj.page_size()).max(adj.lower()),
-                ));
+                self.move_to(Self::card_target(&adj, bounds.y()));
                 return;
             }
         }
         self.scroll_to_end();
+    }
+
+    /// Where the view goes to show a card whose top is `y` px below the visible area's top: the
+    /// card 40 px from the top, within the scrollable range.
+    fn card_target(adj: &gtk4::Adjustment, y: f32) -> f64 {
+        Self::clamp_value(adj, adj.value() + f64::from(y) - 40.0)
+    }
+
+    fn clamp_value(adj: &gtk4::Adjustment, value: f64) -> f64 {
+        value.clamp(
+            adj.lower(),
+            (adj.upper() - adj.page_size()).max(adj.lower()),
+        )
+    }
+
+    /// [`Self::card_target`] for a pending jump; with `reveal_focus`, moved further down when
+    /// the card's focused control (a tall card's first answer) would otherwise be below the fold.
+    fn jump_target(&self, adj: &gtk4::Adjustment, y: f32, reveal_focus: bool) -> f64 {
+        let target = Self::card_target(adj, y);
+        let focus = reveal_focus
+            .then(|| self.scroller.root().and_then(|r| r.focus()))
+            .flatten()
+            .filter(|f| f.is_ancestor(&self.list))
+            .and_then(|f| f.compute_bounds(&self.scroller));
+        match focus {
+            Some(b) => {
+                let bottom = adj.value() + f64::from(b.y() + b.height());
+                if bottom + 16.0 > target + adj.page_size() {
+                    Self::clamp_value(adj, bottom + 16.0 - adj.page_size())
+                } else {
+                    target
+                }
+            }
+            None => target,
+        }
     }
 
     /// An explicit question/approval jump reveals and focuses its first pending choice.
@@ -551,8 +671,11 @@ impl TranscriptView {
             .borrow()
             .get(id)
             .is_some_and(Row::focus_pending_action);
+        // A card built just now is revealed by the pending jump once laid out.
         if focused {
-            if let Some(focus) = self.scroller.root().and_then(|r| r.focus()) {
+            if self.jump_to.borrow().is_some() {
+                self.reveal_after_jump.set(true);
+            } else if let Some(focus) = self.scroller.root().and_then(|r| r.focus()) {
                 self.reveal_widget(&focus);
             }
         }
@@ -589,15 +712,21 @@ impl TranscriptView {
         }
     }
 
-    /// Rebuilds everything from the model (initial load, or a thread swap).
-    pub fn reset(&self, model: &Transcript) {
+    /// Rebuilds everything from the model (initial load, or a thread swap): the newest
+    /// [`FIRST_PAINT`] rows now, the rest of the window in idle steps.
+    pub fn reset(self: &Rc<Self>, model: &Transcript) {
+        if let Some(fill) = self.fill.take() {
+            fill.remove();
+        }
+        self.jump_to.take();
+        self.reveal_after_jump.set(false);
         for (_, row) in self.rows.borrow_mut().drain() {
             if row.widget().parent().as_ref() == Some(self.list.upcast_ref()) {
                 self.list.remove(&row.widget());
             }
         }
         let order = model.order();
-        let first = order.len().saturating_sub(WINDOW);
+        let first = order.len().saturating_sub(FIRST_PAINT);
         self.first.set(first);
         for id in &order[first..] {
             if let Some(w) = self.build_tree(model, id) {
@@ -606,6 +735,82 @@ impl TranscriptView {
         }
         self.empty.set_visible(order.is_empty());
         self.stick.set(true);
+        if first > order.len().saturating_sub(WINDOW) {
+            self.queue_fill();
+        }
+    }
+
+    /// Fills the window up to [`WINDOW`] rows, one [`FILL_BUDGET`] step per idle. Below layout
+    /// and paint in priority, so a frame is never held for longer than one step.
+    fn queue_fill(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let started = Instant::now();
+        let source = glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let Some(model) = view.model.borrow().upgrade() else {
+                view.fill.take();
+                return glib::ControlFlow::Break;
+            };
+            // Being reduced into right now: try again on the next idle.
+            let Ok(model) = model.try_borrow() else {
+                return glib::ControlFlow::Continue;
+            };
+            if !view.fill_step(&model, FILL_BUDGET) {
+                return glib::ControlFlow::Continue;
+            }
+            view.fill.take();
+            tracing::debug!(
+                ms = started.elapsed().as_millis() as u64,
+                "chat transcript: filled the window"
+            );
+            glib::ControlFlow::Break
+        });
+        *self.fill.borrow_mut() = Some(source);
+    }
+
+    /// Prepends older rows until the window is full or `budget` is spent, keeping the viewport
+    /// where it was. Whether the window is full.
+    fn fill_step(&self, model: &Transcript, budget: Duration) -> bool {
+        let order = model.order();
+        // Recomputed each step: rows streamed in since the reset move the window's start.
+        let target = order.len().saturating_sub(WINDOW);
+        if self.first.get() <= target {
+            return true;
+        }
+        let started = Instant::now();
+        self.hold_place();
+        while self.first.get() > target && started.elapsed() < budget {
+            let first = self.first.get() - 1;
+            if let Some(w) = self.build_tree(model, &order[first]) {
+                self.list.prepend(&w);
+            }
+            self.first.set(first);
+        }
+        self.first.get() <= target
+    }
+
+    /// Builds the rest of the window now, for a caller that needs one of its rows. Whether a
+    /// fill was pending.
+    fn finish_fill(&self) -> bool {
+        let Some(fill) = self.fill.take() else {
+            return false;
+        };
+        fill.remove();
+        if let Some(model) = self.model.borrow().upgrade() {
+            if let Ok(model) = model.try_borrow() {
+                self.fill_step(&model, Duration::MAX);
+            }
+        }
+        true
+    }
+
+    /// Rows are about to be prepended: keep the viewport where it is (unless following the
+    /// bottom, which wins; see the size handler).
+    fn hold_place(&self) {
+        let adj = self.scroller.vadjustment();
+        self.anchor.set(Some(adj.upper() - adj.value()));
     }
 
     /// Builds a row and its nested children, registering every one.
@@ -637,6 +842,11 @@ impl TranscriptView {
     /// the row of the item before it, else first. A new item is usually the last; an approval goes
     /// just before the step it asks about, so its outcome reads before the step's result.
     fn place(&self, container: &gtk4::Box, siblings: &[String], id: &str, widget: &gtk4::Widget) {
+        // The usual case, checked first: a long thread's order is thousands of items long.
+        if siblings.last().is_some_and(|s| s == id) {
+            container.append(widget);
+            return;
+        }
         let pos = siblings.iter().position(|s| s == id);
         if pos.is_none_or(|p| p + 1 == siblings.len()) {
             container.append(widget);
@@ -670,18 +880,19 @@ impl TranscriptView {
                     .and_then(|r| r.children_box().cloned());
                 if let Some(children) = parent_box {
                     if let Some(w) = self.build_tree(model, id) {
-                        let siblings = model
-                            .get(parent)
-                            .map(|p| p.children.clone())
-                            .unwrap_or_default();
-                        self.place(&children, &siblings, id, &w);
+                        let siblings = model.get(parent).map_or(&[][..], |p| &p.children[..]);
+                        self.place(&children, siblings, id, &w);
                     }
                     self.updated(model, parent);
                 }
             }
             None => {
                 let order = model.order();
-                let pos = order.iter().position(|o| o == id).unwrap_or(order.len());
+                let pos = if order.last().is_some_and(|o| o == id) {
+                    order.len() - 1
+                } else {
+                    order.iter().position(|o| o == id).unwrap_or(order.len())
+                };
                 if pos < self.first.get() {
                     // Above the materialised window: it appears when older rows load. The window
                     // still starts at the same item, now one further down.
@@ -738,8 +949,7 @@ impl TranscriptView {
             return;
         }
         let new_first = first.saturating_sub(PAGE);
-        let adj = self.scroller.vadjustment();
-        self.anchor.set(Some(adj.upper() - adj.value()));
+        self.hold_place();
         for id in model.order()[new_first..first].iter().rev() {
             if let Some(w) = self.build_tree(model, id) {
                 self.list.prepend(&w);
@@ -769,7 +979,6 @@ impl TranscriptView {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)] // kept as API for the spike measurements
     pub fn materialised(&self) -> usize {
         let mut n = 0;
         let mut child = self.list.first_child();
