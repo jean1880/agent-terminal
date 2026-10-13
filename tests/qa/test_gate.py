@@ -51,6 +51,42 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all("stream_cost" not in name for name in names))
 
+    def test_an_ignored_test_outside_both_lists_is_reported_and_so_is_a_stale_exclusion(self):
+        listing = "a::tests::native_one: test\na::tests::bench: test\nb::tests::forgotten: test\n\n3 tests, 0 benchmarks\n"
+        orphans, stale = gate.unaccounted_ignored(listing, ["a::tests::native_one"], {"a::tests::bench": "why", "c::gone": "why"})
+        self.assertEqual(orphans, ["b::tests::forgotten"])
+        self.assertEqual(stale, ["c::gone"])
+        self.assertEqual(gate.unaccounted_ignored(listing.replace("b::tests::forgotten: test\n", ""), ["a::tests::native_one"], {"a::tests::bench": "why"}), ([], []))
+
+    def test_every_exclusion_gives_a_reason_and_none_is_also_native(self):
+        excluded = json.loads((gate.ROOT / "tests/qa/native-excluded.json").read_text())
+        native = json.loads((gate.ROOT / "tests/qa/native-tests.json").read_text())
+        self.assertTrue(all(isinstance(reason, str) and reason.strip() for reason in excluded.values()))
+        self.assertFalse(set(excluded) & set(native))
+
+    def test_the_test_binary_is_the_one_app_bin_artifact(self):
+        def artifact(name, kind, test, executable):
+            return json.dumps({"reason": "compiler-artifact", "target": {"name": name, "kind": kind}, "profile": {"test": test}, "executable": executable})
+        log = "\n".join([
+            "   Compiling agent-terminal v3.5.0",
+            artifact("agent-core", ["lib"], True, "/t/agent_core-1"),
+            artifact("agent-terminal", ["bin"], False, "/t/agent-terminal"),
+            artifact("agent-terminal", ["bin"], True, "/t/agent_terminal-2"),
+            '{"reason": "build-finished", "success": true}',
+        ])
+        self.assertEqual(gate.test_binary(log), "/t/agent_terminal-2")
+        with self.assertRaises(RuntimeError):
+            gate.test_binary("no json here")
+        with self.assertRaises(RuntimeError):
+            gate.test_binary(log + "\n" + artifact("agent-terminal", ["bin"], True, "/t/other"))
+
+    def test_parallel_cases_start_their_display_search_apart(self):
+        commands = [gate.native_command("/t/bin", "x::y", index) for index in range(25)]
+        starts = [int(command[command.index("-n") + 1]) for command in commands]
+        self.assertEqual(len(set(starts)), len(starts))
+        self.assertTrue(all(b - a >= 10 for a, b in zip(starts, starts[1:])))
+        self.assertEqual(commands[0][-5:], ["x::y", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+
     def test_missing_executable_fails_and_keeps_a_diagnostic(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

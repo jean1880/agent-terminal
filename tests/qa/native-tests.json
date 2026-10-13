@@ -17,5 +17,7 @@
   "chat::view::gap_tests::native_background_tasks_are_listed_and_a_shell_task_shows_its_output",
   "window::imp::setup::tests::native_welcome_button_is_inside_the_dialog",
   "window::imp::agents_prefs::tests::native_dropdown_rows_show_their_whole_value",
-  "window::imp::closing::tests::native_closing_waits_for_agents_then_closes"
+  "window::imp::closing::tests::native_closing_waits_for_agents_then_closes",
+  "window::imp::threads::tests::clear_rows_ends_and_keeps_an_open_menu",
+  "brand_css_tests::coloured_buttons_keep_their_text_colour"
 ]

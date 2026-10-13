@@ -2,6 +2,7 @@
 """Shared source gate. No live app, provider, credentials or user settings."""
 
 import argparse
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,45 @@ def exact_native_result(output, test):
     )
 
 
+def unaccounted_ignored(listing, native, excluded):
+    """Ignored tests the gate would never run, and exclusions naming no ignored test.
+
+    `listing` is `cargo test -- --list --ignored` output. Every ignored test must be a native
+    case or excluded with a reason; otherwise an `#[ignore]` silently drops it from every run.
+    """
+    ignored = set(re.findall(r"^(\S+): test$", listing, re.MULTILINE))
+    return sorted(ignored - set(native) - set(excluded)), sorted(set(excluded) - ignored)
+
+
+def test_binary(build_log):
+    """The app's unit-test executable named in `cargo test --no-run --message-format=json`."""
+    found = []
+    for line in build_log.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        target = message.get("target", {})
+        if (message.get("reason") == "compiler-artifact" and message.get("executable")
+                and message.get("profile", {}).get("test")
+                and target.get("name") == "agent-terminal" and target.get("kind") == ["bin"]):
+            found.append(message["executable"])
+    if len(found) != 1:
+        raise RuntimeError(f"expected one agent-terminal test binary, found {found}")
+    return found[0]
+
+
+def native_command(binary, test, index):
+    # xvfb-run -a searches upward from -n; spacing the starts keeps parallel cases from
+    # racing for the same display number.
+    return [
+        "xvfb-run", "-a", "-n", str(100 + 10 * index), "dbus-run-session", "--",
+        binary, test, "--exact", "--ignored", "--nocapture", "--test-threads=1",
+    ]
+
+
 def run_logged(command, log, env, timeout, cwd=ROOT):
     """Bound the complete process group, including fixture/tool descendants."""
     started = time.monotonic()
@@ -107,9 +147,12 @@ def main():
     parser.add_argument("--delivery", action="store_true", help="require clean source matching the tested commit")
     parser.add_argument("--artifacts", type=Path, default=ROOT / "target/qa-artifacts")
     parser.add_argument("--native-timeout", type=int, default=240)
+    parser.add_argument("--jobs", type=int, default=1, help="native cases run side by side")
     args = parser.parse_args()
     if args.native_timeout < 1:
         parser.error("--native-timeout must be positive")
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
     if args.delivery and args.native_only:
         parser.error("--native-only cannot satisfy --delivery")
     if args.native_test and not args.native_only:
@@ -145,15 +188,15 @@ def main():
                 ("format", ["cargo", "fmt", "--all", "--", "--check"], 120, None),
                 ("clippy", ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"], 1200, None),
                 ("macos-mvp-check", ["cargo", "check", "--locked", "--no-default-features"], 300, None),
-                ("workspace", ["xvfb-run", "-a", "dbus-run-session", "--", "cargo", "test", "--locked", "--workspace", "--all-targets"], 1200, None),
+                # nextest: each test in its own process (.config/nextest.toml, profile ci).
+                ("workspace", ["xvfb-run", "-a", "dbus-run-session", "--", "cargo", "nextest", "run", "--locked", "--workspace", "--all-targets", "--profile", "ci"], 1200, None),
+                ("ignored-inventory", ["cargo", "test", "--locked", "--offline", "--workspace", "--all-targets", "--", "--list", "--ignored"], 300, None),
             ])
-        for index, test in enumerate(native):
-            steps.append((
-                f"native-{index + 1}",
-                ["xvfb-run", "-a", "dbus-run-session", "--", "cargo", "test", "--locked", "--offline", "-p", "agent-terminal", "--bin", "agent-terminal", test, "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                args.native_timeout, test,
-            ))
-        for label, command, timeout, test in steps:
+        # The native cases run the test binary itself: concurrent `cargo test`s would queue on
+        # the build lock, and the build is already done.
+        steps.append(("native-build", ["cargo", "test", "--locked", "--offline", "-p", "agent-terminal", "--bin", "agent-terminal", "--no-run", "--message-format=json-render-diagnostics"], 1200, None))
+
+        def run_step(label, command, timeout, test):
             # Every GTK case gets a new process, D-Bus session, display and home.
             with tempfile.TemporaryDirectory(prefix="agent-terminal-qa-") as directory:
                 env = isolated_env(Path(directory))
@@ -167,11 +210,43 @@ def main():
                 result["exact_test_passed"] = exact_native_result(
                     (artifacts / result["log"]).read_text(errors="replace"), test,
                 )
+            return result
+
+        def record(label, result, test):
             identity["steps"].append(result)
             save()
-            print(f"{label}: exit={result['exit_code']} timeout={result['timed_out']} log={result['log']}", flush=True)
+            print(f"{label}: exit={result['exit_code']} timeout={result['timed_out']} {result['elapsed_seconds']}s log={result['log']}", flush=True)
             if result["exit_code"] or result["timed_out"] or (test and not result["exact_test_passed"]):
                 raise RuntimeError(f"{test or label} failed; see {artifacts / result['log']}")
+
+        binary = None
+        for label, command, timeout, test in steps:
+            record(label, run_step(label, command, timeout, test), test)
+            log = (artifacts / f"{label}.log").read_text(errors="replace")
+            if label == "native-build":
+                binary = test_binary(log)
+            if label == "ignored-inventory":
+                excluded = json.loads((ROOT / "tests/qa/native-excluded.json").read_text())
+                orphans, stale = unaccounted_ignored(log, native, excluded)
+                if orphans or stale:
+                    raise RuntimeError(
+                        f"ignored tests no gate runs: {orphans}; exclusions naming no ignored test: {stale}. "
+                        "Add each to native-tests.json or, with its reason, to native-excluded.json",
+                    )
+        cases = [
+            (f"native-{index + 1}", native_command(binary, test, index), args.native_timeout, test)
+            for index, test in enumerate(native)
+        ]
+        # Cases are independent (own display, bus and home), so they may run side by side;
+        # results are recorded in list order and the first failure stops the rest.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = [pool.submit(run_step, *case) for case in cases]
+            try:
+                for (label, _, _, test), future in zip(cases, futures):
+                    record(label, future.result(), test)
+            finally:
+                for future in futures:
+                    future.cancel()
         if commit() != identity["commit"]:
             raise RuntimeError("checkout commit changed while the gate was running")
         if args.delivery and dirty():

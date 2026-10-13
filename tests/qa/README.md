@@ -12,6 +12,43 @@ local developer runs record working-tree edits instead of claiming commit-only p
 For a targeted developer rerun, combine `--native-only` with
 `--native-test <exact name from native-tests.json>`; this cannot satisfy delivery.
 
+Native cases run the built test binary directly, so `--jobs N` can run them side by
+side; each still has its own display (`xvfb-run -a -n` starting points are spaced
+apart), D-Bus session and home. Every `#[ignore]`d test must either be listed in
+`native-tests.json` or appear, with its reason, in `native-excluded.json`; the
+`ignored-inventory` step fails on any that are in neither, and on exclusions that no
+longer name an ignored test. Without this, an `#[ignore]` quietly drops a test from
+every run.
+
+## Running only what a change needs
+
+`python3 tests/qa/affected.py` (add `--dry-run` to only print the plan) compares against
+the merge base with `origin/master`, including uncommitted edits, and runs:
+- the packages the change touches, plus the ones that depend on them (agent-core →
+  agent-kit → app);
+- the native cases selected by the area rules in `native-areas.json` (first matching
+  prefix wins; a Rust or asset path that no rule matches selects every case);
+- the QA scripts' own unit tests, when `tests/qa/` changed.
+
+Docs and workflow edits select nothing, and anything it does not recognize selects
+everything. It is a developer shortcut only: CI and delivery always run the whole gate.
+
+## Coverage
+
+`python3 tests/qa/coverage.py` (needs `cargo install --locked cargo-llvm-cov` and
+`rustup component add llvm-tools-preview`) runs the workspace tests and every native
+case under instrumentation, and reports **production** line coverage. Lines inside
+`#[cfg(test)]` items, and files declared only under `#[cfg(test)]`, are not counted, so
+tests cannot raise the figure by covering their own code. It fails when the figure drops
+below `lines` in `coverage-floor.json`; `--update-floor` raises the floor after an
+improvement, so coverage can ratchet up toward `target` but never quietly slip. `--html`
+writes a browsable report and `--skip-native` gives a faster run whose (lower) figure is
+not checked against the floor. **A release always takes the full run:** `release.yml`
+calls `coverage.yml` (the whole workspace and every native case, never `--skip-native`
+or an affected subset), and Publish requires the commit it covered to equal the release
+SHA, as it already does for the gate. Output: `target/qa-artifacts/coverage/summary.json`
+(per crate and per file, worst first) and `lcov.info`.
+
 Diagnostics live in `target/qa-artifacts`: the selected name, exit status,
 timeout state and exact source commit/version accompany logs. Native tests print
 their synthetic fixture/geometry evidence into those logs. Native tests receive

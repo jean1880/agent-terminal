@@ -5971,16 +5971,18 @@ pub(super) mod tests {
             thread: thread.clone(),
             provider: handle.new_id().expect("id"),
         };
+        // A write ahead of everything holds the writer until the main thread has checked,
+        // so the check cannot race the writer however loaded the machine is.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        handle
+            .write("wait", None, move |_| {
+                let _ = held.recv();
+                Ok(())
+            })
+            .expect("queued");
         handle
             .write("create a thread", Some(&thread), move |s| {
                 record_new_thread_as(s, &ids, "/w", Some("t"), Driver::Claude, None, None)
-            })
-            .expect("queued");
-        // A slow write ahead keeps the rest queued while the main thread carries on.
-        handle
-            .write("wait", None, |_| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                Ok(())
             })
             .expect("queued");
         let say = |n: usize| {
@@ -5995,6 +5997,7 @@ pub(super) mod tests {
             reader.thread_summary(&thread).expect("read").is_none(),
             "nothing was written on the main thread"
         );
+        release.send(()).expect("the writer is waiting");
 
         let got = in_loop(|ctx| {
             let out = Rc::new(RefCell::new(None));
