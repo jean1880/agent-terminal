@@ -1622,19 +1622,46 @@ pub struct ApprovalCard {
     sink: RowSink,
 }
 
-/// A row of buttons that wraps onto more lines when the card is narrow, in the order given.
-pub(super) fn button_row() -> gtk4::FlowBox {
+/// A flow box of chips or buttons that wraps onto more lines when its card is narrow, with every
+/// child at its own natural width.
+///
+/// Its `halign` stays Fill, never Start or End. A flow box with another alignment is measured
+/// on its own natural width by `gtk_widget_allocate`, and a row not yet given a width then has
+/// its children measured at 0 px ("Trying to measure GtkFlowBoxChild ... for width of 0"). Left
+/// to fill, the children still pack at the start of each line; for the end, see [`button_row`].
+pub(super) fn chip_flow(max_per_line: u32) -> gtk4::FlowBox {
     let flow = gtk4::FlowBox::new();
     flow.set_selection_mode(gtk4::SelectionMode::None);
     flow.set_homogeneous(false);
     flow.set_column_spacing(8);
     flow.set_row_spacing(8);
-    flow.set_min_children_per_line(1);
-    flow.set_max_children_per_line(8);
-    flow.set_activate_on_single_click(false);
-    flow.set_halign(gtk4::Align::End);
-    flow.set_valign(gtk4::Align::Center);
+    flow.set_max_children_per_line(max_per_line);
     flow
+}
+
+/// A row of buttons, pushed to the end of its card, that wraps onto more lines when the card is
+/// narrow, in the order given. Returns the row to put in the card and the flow box to fill; show
+/// or hide them together with [`set_row_visible`].
+pub(super) fn button_row() -> (gtk4::Box, gtk4::FlowBox) {
+    let flow = chip_flow(8);
+    flow.set_min_children_per_line(1);
+    flow.set_activate_on_single_click(false);
+    // A plain spacer takes the free width, so the buttons sit at the end without the flow box
+    // itself being aligned (see `chip_flow`).
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    row.append(&spacer);
+    row.append(&flow);
+    (row, flow)
+}
+
+/// Shows or hides a [`button_row`]'s flow box with the row around it, which would leave a gap.
+pub(super) fn set_row_visible(flow: &gtk4::FlowBox, visible: bool) {
+    flow.set_visible(visible);
+    if let Some(row) = flow.parent() {
+        row.set_visible(visible);
+    }
 }
 
 /// Adds `button` to a [`button_row`]. The flow box's own wrapper takes no focus, so Tab goes
@@ -1906,9 +1933,9 @@ impl ApprovalCard {
         let outcome = content_label("", &["approval-outcome"]);
         wrapping(&outcome);
         outcome.set_visible(false);
-        let buttons = button_row();
+        let (buttons_row, buttons) = button_row();
         footer.append(&outcome);
-        footer.append(&buttons);
+        footer.append(&buttons_row);
         root.append(&footer);
         Self {
             root,
@@ -2203,7 +2230,7 @@ impl ApprovalCard {
         self.outcome.set_text(&outcome);
         self.outcome.set_visible(!outcome.is_empty());
         self.buttons.set_sensitive(sensitive);
-        self.buttons.set_visible(show_buttons);
+        set_row_visible(&self.buttons, show_buttons);
         // While the choice is open, say what the remembering buttons keep: the gate wrote it
         // (`approval_server::card_note`), judged where the call runs.
         let remembering = a.options.contains(&Decision::AllowForSession)
@@ -2385,12 +2412,7 @@ impl QuestionCardWidget {
             if q.multi_select {
                 qbox.append(&label("Choose any", &["question-hint"]));
             }
-            let flow = gtk4::FlowBox::new();
-            flow.set_selection_mode(gtk4::SelectionMode::None);
-            flow.set_max_children_per_line(4);
-            flow.set_column_spacing(8);
-            flow.set_row_spacing(8);
-            flow.set_homogeneous(false);
+            let flow = chip_flow(4);
             let mut group: Option<gtk4::ToggleButton> = None;
             for (oi, opt) in q.options.iter().enumerate() {
                 let b = gtk4::ToggleButton::new();
@@ -2611,12 +2633,7 @@ pub(super) fn suggestion_flow(
     if suggestions.len() <= 1 {
         return None;
     }
-    let flow = gtk4::FlowBox::new();
-    flow.set_selection_mode(gtk4::SelectionMode::None);
-    flow.set_max_children_per_line(3);
-    flow.set_column_spacing(8);
-    flow.set_row_spacing(8);
-    flow.set_homogeneous(false);
+    let flow = chip_flow(3);
 
     let in_sync = Rc::new(Cell::new(false));
     let mut toggle_buttons: Vec<(gtk4::ToggleButton, String)> = Vec::new();

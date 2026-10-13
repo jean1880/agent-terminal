@@ -187,6 +187,18 @@ fn native_request_cards_wrap_and_never_take_focus() {
     use serde_json::json;
 
     let ctx = init();
+    let warnings = crate::testutil::GtkWarningCapture::start();
+    // A new card is measured before it has a width. Flow boxes of buttons or chips that are
+    // aligned (rather than left to fill) then have their children measured at 0 px. Checked
+    // once everything in a window has settled, and again at the end.
+    let no_flow_warnings = |what: &str| {
+        let warned = warnings.take();
+        assert!(
+            warned.iter().all(|w| !w.contains("GtkFlowBoxChild")),
+            "{what}: flow box children measured without a width:\n{}",
+            warned.join("\n")
+        );
+    };
     for (width, scale) in [(360, 1.0), (560, 2.0), (560, 1.0)] {
         let backend = super::tests::AnswerLog::new(Driver::Codex);
         let view = ChatView::new(backend.clone());
@@ -291,6 +303,62 @@ fn native_request_cards_wrap_and_never_take_focus() {
             })
             .request("l"),
         );
+        // The other chip rows: the agent's own question with choices, and quick replies under
+        // a finished reply.
+        let option = |label: &str| agent_core::event::QuestionOption {
+            label: label.into(),
+            description: None,
+        };
+        view.apply(
+            &Envelope::new(Event::QuestionRequested {
+                source: Default::default(),
+                questions: vec![agent_core::event::Question {
+                    id: "q".into(),
+                    header: "Layout".into(),
+                    question: "Which layout?".into(),
+                    options: vec![option("Tabs on top"), option("Tabs on the side")],
+                    multi_select: false,
+                }],
+            })
+            .request("q"),
+        );
+        for event in [
+            Event::TurnStarted { model: None },
+            Event::ItemStarted {
+                kind: agent_core::event::ItemKind::AssistantMessage,
+                title: String::new(),
+                input: None,
+                parent: None,
+            },
+        ] {
+            view.apply(&Envelope::new(event).item("a1"));
+        }
+        view.apply(
+            &Envelope::new(Event::ContentSnapshot {
+                stream: agent_core::event::StreamKind::Assistant,
+                text: "Which do you prefer?".into(),
+            })
+            .item("a1"),
+        );
+        view.apply(&Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
+        }));
+        view.apply(
+            &Envelope::new(Event::QuestionRequested {
+                source: agent_core::event::QuestionSource::Reply,
+                questions: vec![agent_core::event::Question {
+                    id: "reply".into(),
+                    header: "Quick replies".into(),
+                    question: "Which do you prefer?".into(),
+                    options: vec![option("Tabs on top"), option("Tabs on the side")],
+                    multi_select: false,
+                }],
+            })
+            .request("r"),
+        );
         assert!(
             pump_until(&ctx, || inner.transcript.frames() >= 3),
             "{width}: drawn"
@@ -364,5 +432,11 @@ fn native_request_cards_wrap_and_never_take_focus() {
                 Some(json!({"flavour": "v0", "repo_name": "octo"}))
             )]
         );
+        // Let what the interactions set off settle, then close the window with its view.
+        crate::testutil::settle(&ctx);
+        window.destroy();
+        crate::testutil::settle(&ctx);
+        no_flow_warnings(&format!("{width}px scale {scale}"));
     }
+    no_flow_warnings("after every window");
 }

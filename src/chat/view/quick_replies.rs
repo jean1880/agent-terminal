@@ -6,7 +6,7 @@
 
 use adw::prelude::*;
 
-use super::cards::{label, option_content, RowEvent, RowSink};
+use super::cards::{chip_flow, label, option_content, RowEvent, RowSink};
 
 /// The chips for `options` (rendered plain text, exactly what a chip puts in the composer).
 pub(super) fn row(options: &[String], sink: &RowSink) -> gtk4::Box {
@@ -19,15 +19,8 @@ pub(super) fn row(options: &[String], sink: &RowSink) -> gtk4::Box {
     heading.set_halign(gtk4::Align::Start);
     root.append(&heading);
 
-    let flow = gtk4::FlowBox::new();
-    flow.set_selection_mode(gtk4::SelectionMode::None);
-    flow.set_max_children_per_line(4);
-    flow.set_column_spacing(8);
-    flow.set_row_spacing(8);
-    flow.set_homogeneous(false);
     // Chips take the width of their text, not an equal share of the row.
-    flow.set_halign(gtk4::Align::Start);
-    flow.set_hexpand(false);
+    let flow = chip_flow(4);
     for text in options {
         let chip = gtk4::Button::new();
         chip.add_css_class("option-button");

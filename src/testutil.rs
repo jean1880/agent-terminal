@@ -54,6 +54,77 @@ pub fn pump_until(ctx: &glib::MainContext, secs: u64, mut cond: impl FnMut() -> 
     true
 }
 
+/// The kept warnings: `Some` while a [`GtkWarningCapture`] is alive, `None` otherwise. The flag
+/// and the buffer are one value under one lock, so checking and appending cannot interleave
+/// with a guard starting, draining or dropping.
+static GTK_WARNINGS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// Keeps GTK, Adwaita and GDK warnings and criticals (the layout ones: "Trying to measure ...
+/// for width of 0", "... exceeds ... width", "attempt to allocate ... width -N") while it lives.
+/// Only the domain and message text are kept. GLib lets a log writer be installed once, so the
+/// first guard installs a permanent one that forwards every record to the default writer
+/// unchanged and collects only while a guard is alive. Exclusive: the collection is
+/// process-wide, so starting a guard while another is alive panics (a test bug).
+pub struct GtkWarningCapture {
+    /// Only [`Self::start`] makes one.
+    _private: (),
+}
+
+impl GtkWarningCapture {
+    pub fn start() -> Self {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            glib::log_set_writer_func(|level, fields| {
+                if matches!(level, glib::LogLevel::Warning | glib::LogLevel::Critical) {
+                    let field = |key: &str| {
+                        fields
+                            .iter()
+                            .find(|f| f.key() == key)
+                            .and_then(|f| f.value_str())
+                            .unwrap_or("")
+                    };
+                    let domain = field("GLIB_DOMAIN");
+                    if matches!(domain, "Gtk" | "Adwaita" | "Gdk") {
+                        let message = format!("{domain}: {}", field("MESSAGE"));
+                        let mut kept = GTK_WARNINGS
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(all) = kept.as_mut() {
+                            all.push(message);
+                        }
+                    }
+                }
+                glib::log_writer_default(level, fields)
+            });
+        });
+        let mut kept = GTK_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            kept.is_none(),
+            "a GtkWarningCapture is already alive: captures do not nest"
+        );
+        *kept = Some(Vec::new());
+        Self { _private: () }
+    }
+
+    /// The warnings kept since the guard started or this was last called.
+    pub fn take(&self) -> Vec<String> {
+        let mut kept = GTK_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+}
+
+impl Drop for GtkWarningCapture {
+    fn drop(&mut self) {
+        *GTK_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// A widget's minimum size along `orientation` (unconstrained in the other).
 pub fn min_size(widget: &gtk4::Widget, orientation: gtk4::Orientation) -> i32 {
     use gtk4::prelude::*;
