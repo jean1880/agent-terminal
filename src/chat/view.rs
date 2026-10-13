@@ -2191,7 +2191,145 @@ pub(crate) mod tests {
         assert_eq!(expanded(&inner), [true, true], "any closed: open all");
     }
 
+    /// A replay builds the newest rows at once and the rest of the window on idle, around a row
+    /// streamed in meanwhile; jumping to a row not built yet builds the window first.
+    fn replay_fills_the_window_in_steps() {
+        use agent_core::event::{Event, ItemKind};
+        use transcript::{FIRST_PAINT, WINDOW};
+        let step = |id: &str| {
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: format!("echo {id}"),
+                input: None,
+                parent: None,
+            })
+            .item(id)
+        };
+        let history: Vec<Envelope> = (0..WINDOW + 50).map(|i| step(&format!("s{i}"))).collect();
+        let pump = || {
+            let ctx = glib::MainContext::default();
+            while ctx.iteration(false) {}
+        };
+
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        let inner = view.inner().expect("view");
+        view.replay(&history);
+        assert_eq!(inner.transcript.materialised(), FIRST_PAINT);
+        view.apply(&step("live"));
+        pump();
+        assert_eq!(inner.transcript.materialised(), WINDOW, "the window filled");
+        let built = |id: &str| inner.transcript.with_row(id, |_| ()).is_some();
+        assert!(
+            built("live") && built("s51"),
+            "the newest window, live row included"
+        );
+        assert!(!built("s50"), "nothing older than the window");
+
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        let inner = view.inner().expect("view");
+        view.replay(&history);
+        inner.transcript.scroll_to_card("s60");
+        assert!(
+            inner.transcript.with_row("s60", |_| ()).is_some(),
+            "a jump builds the rest of the window first"
+        );
+        assert_eq!(inner.transcript.materialised(), WINDOW);
+        pump();
+        assert_eq!(
+            inner.transcript.materialised(),
+            WINDOW,
+            "and the fill is over"
+        );
+
+        // A reset while a fill is pending cancels it and starts over; a view dropped mid-fill
+        // leaves nothing behind that runs.
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        let inner = view.inner().expect("view");
+        view.replay(&history);
+        inner.transcript.reset(&inner.model.borrow());
+        assert_eq!(inner.transcript.materialised(), FIRST_PAINT);
+        pump();
+        assert_eq!(inner.transcript.materialised(), WINDOW);
+        let dropped = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        dropped.replay(&history);
+        drop(dropped);
+        pump();
+    }
+
+    /// A jump to a card the fill has not built yet lands on it once it is laid out, and the
+    /// fill's "keep my place" does not move the view away afterwards. Run on a private display.
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn a_jump_to_an_unbuilt_card_lands_on_it() {
+        use agent_core::event::{Event, ItemKind};
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let ctx = glib::MainContext::default();
+        let view = ChatView::new(Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        }));
+        let window = gtk4::Window::new();
+        window.set_default_size(560, 460);
+        window.set_child(Some(&view));
+        window.present();
+        let inner = view.inner().expect("view");
+        let history: Vec<Envelope> = (0..transcript::WINDOW + 50)
+            .map(|i| {
+                Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::Command,
+                    title: format!("echo s{i}"),
+                    input: None,
+                    parent: None,
+                })
+                .item(format!("s{i}"))
+            })
+            .collect();
+        view.replay(&history);
+        assert!(
+            inner.transcript.with_row("s60", |_| ()).is_none(),
+            "s60 is in the window but not built yet"
+        );
+        inner.transcript.scroll_to_card("s60");
+        let top = || {
+            inner
+                .transcript
+                .row_bounds_in_viewport("s60")
+                .map(|(bounds, _)| bounds.y())
+        };
+        let pump_for = |ms: u64| {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < until {
+                while ctx.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        };
+        let landed = |y: Option<f32>| y.is_some_and(|y| (0.0..=120.0).contains(&y));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !landed(top()) && std::time::Instant::now() < deadline {
+            pump_for(50);
+        }
+        let first = top();
+        // Several more frames: nothing (the fill's anchor above all) throws the view elsewhere.
+        pump_for(3_000);
+        let after = top();
+        eprintln!("s60 top: on landing {first:?}, 3 s later {after:?}");
+        window.destroy();
+        assert!(landed(first), "the jump never showed s60: {first:?}");
+        assert!(landed(after), "the view moved off s60: {after:?}");
+    }
+
     pub(crate) fn ui_checks() {
+        replay_fills_the_window_in_steps();
         all_subagent_cards_toggle_together();
         model_chip_follows_pending_acceptance_and_rejection();
         stale_replay_checks();
@@ -3676,6 +3814,24 @@ pub(crate) mod tests {
             look(980.0, 2000.0, 600.0)
         ));
         assert!(!T::user_moved_up(
+            look(1000.0, 2000.0, 600.0),
+            look(1000.0, 2000.0, 600.0)
+        ));
+        // Either way counts as the user scrolling (it cancels a jump waiting for layout); a
+        // relayout or no move does not.
+        assert!(T::user_moved(
+            look(1000.0, 2000.0, 600.0),
+            look(980.0, 2000.0, 600.0)
+        ));
+        assert!(T::user_moved(
+            look(980.0, 2000.0, 600.0),
+            look(1000.0, 2000.0, 600.0)
+        ));
+        assert!(!T::user_moved(
+            look(1100.0, 2100.0, 600.0),
+            look(1000.0, 2000.0, 600.0)
+        ));
+        assert!(!T::user_moved(
             look(1000.0, 2000.0, 600.0),
             look(1000.0, 2000.0, 600.0)
         ));
