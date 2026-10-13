@@ -26,6 +26,17 @@ pub fn watch_config_file(app: &adw::Application) {
     imp::AgentTerminalWindow::watch_config_file(app);
 }
 
+/// Drains the thread store's writer and closes its connection, waiting at most `wait`. Once per
+/// process, from the application's `shutdown` (the windows are gone by then).
+pub fn close_store_writer(wait: std::time::Duration) {
+    imp::close_store_writer(wait);
+}
+
+/// From the panic hook (any thread): lets the store writer commit what is queued, at most `wait`.
+pub fn flush_store_for_panic(wait: std::time::Duration) {
+    imp::flush_store_for_panic(wait);
+}
+
 impl AgentTerminalWindow {
     /// Creates a new AgentTerminalWindow instance.
     pub fn new(app: &adw::Application) -> Self {

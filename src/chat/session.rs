@@ -31,6 +31,7 @@ use agent_core::transition::{
     decide_transition, plan_selection, ModelSelection, SessionState, Transition,
 };
 use agent_kit::store::{ProviderThreadId, Store, ThreadId, TranscriptMessage};
+use agent_kit::store_writer::StoreHandle;
 use gtk4::glib;
 use tracing::{debug, info, warn};
 
@@ -156,7 +157,9 @@ type PendingRule = (crate::always_allow::Action, Option<String>, Option<PathBuf>
 struct Inner {
     adapter: RefCell<Box<dyn Adapter>>,
     open: RefCell<OpenSession>,
-    store: Rc<Store>,
+    /// Writes are queued to the store writer (never run on this thread); the reads that need
+    /// this session's own writes go through its barrier ([`StoreHandle::read`]).
+    store: StoreHandle,
     thread: ThreadId,
     provider_thread: RefCell<ProviderThreadId>,
     sink: EnvelopeSink,
@@ -357,6 +360,30 @@ fn driver_label(driver: Driver) -> &'static str {
     driver.info().long_label
 }
 
+/// The store a session writes through, and the thread's active provider thread when its caller
+/// has already read it (off the main thread, after the store writer's barrier).
+pub struct SessionStore {
+    pub handle: StoreHandle,
+    /// `Some(None)`: the thread has none yet (one is created). `None`: not read; the session
+    /// reads it itself, behind the barrier.
+    pub provider: Option<Option<ProviderThreadId>>,
+}
+
+impl From<StoreHandle> for SessionStore {
+    fn from(handle: StoreHandle) -> Self {
+        Self {
+            handle,
+            provider: None,
+        }
+    }
+}
+
+impl From<Rc<Store>> for SessionStore {
+    fn from(store: Rc<Store>) -> Self {
+        StoreHandle::from(store).into()
+    }
+}
+
 impl ChatSession {
     /// Starts the agent process and returns the live session.
     ///
@@ -370,7 +397,7 @@ impl ChatSession {
     pub fn new(
         adapter: Box<dyn Adapter>,
         open: OpenSession,
-        store: Rc<Store>,
+        store: impl Into<SessionStore>,
         thread: ThreadId,
         sink: EnvelopeSink,
         approval: Option<ApprovalHandle>,
@@ -391,12 +418,16 @@ impl ChatSession {
     pub fn with_env(
         adapter: Box<dyn Adapter>,
         mut open: OpenSession,
-        store: Rc<Store>,
+        store: impl Into<SessionStore>,
         thread: ThreadId,
         sink: EnvelopeSink,
         approval: Approval,
         env: LaunchEnv,
     ) -> Rc<Self> {
+        let SessionStore {
+            handle: store,
+            provider: known_provider,
+        } = store.into();
         let driver = adapter.driver();
         let (approval, unbound) = match approval {
             Ok(handle) => (Some(handle), None),
@@ -406,9 +437,26 @@ impl ChatSession {
         let hookless_agy = driver == Driver::Agy && approval.is_none();
         let wanted_mode = open.mode;
         open.mode = effective_mode(hookless_agy, wanted_mode);
-        let provider_thread = match store.active_provider_thread(&thread) {
+        // Read by the caller off the main thread, after the writer's barrier, when it could;
+        // else here (behind the same barrier).
+        let active = match known_provider {
+            Some(known) => Ok(known),
+            None => store
+                .read(|s| s.active_provider_thread(&thread))
+                .and_then(|r| r),
+        };
+        let provider_thread = match active {
             Ok(Some(p)) => p,
-            _ => match create_provider_thread(&store, &thread, driver, open.model.as_deref()) {
+            // Never a second provider thread for a thread whose own could not be read.
+            Err(agent_kit::store::StoreError::Behind) => {
+                warn!("the store is behind; this session's events are stored without its agent");
+                String::new()
+            }
+            _ => match store.create_provider_thread(
+                &thread,
+                driver_name(driver),
+                open.model.as_deref().unwrap_or("default"),
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(error = %e, "could not create a provider thread");
@@ -564,6 +612,8 @@ impl ChatSession {
                 warn!(error = %e, "could not keep the closed thread read");
             }
         }
+        // Queued after the closing events: the store's heal tails of this thread can go.
+        self.inner.store.forget_thread(&self.inner.thread);
     }
 
     /// A watch on the running agent process, if one is alive: taken before [`Self::shutdown`],
@@ -589,6 +639,7 @@ impl ChatSession {
     }
 }
 
+#[cfg(test)]
 fn create_provider_thread(
     store: &Store,
     thread: &str,
@@ -680,6 +731,8 @@ impl Inner {
                     // A new Codex thread stays provisional until a turn completes (2.5).
                     if self.adapter.borrow().driver() == Driver::Codex && !resumed {
                         *self.provisional_native.borrow_mut() = Some((pt, native_id.clone()));
+                    } else if pt.is_empty() {
+                        // No provider thread to record it on (the store could not be read).
                     } else if let Err(e) = self.store.set_native_id(&pt, native_id) {
                         warn!(error = %e, "could not record the native session id");
                     }
@@ -842,6 +895,9 @@ impl Inner {
         if *self.provider_thread.borrow() != pt {
             return;
         }
+        if pt.is_empty() {
+            return;
+        }
         if let Err(e) = self.store.set_native_id(&pt, &native) {
             warn!(error = %e, "could not record the native session id");
         }
@@ -869,7 +925,11 @@ impl Inner {
         if self.pending_handoff.borrow().is_some() {
             return;
         }
-        let messages = match self.store.transcript_messages(&self.thread) {
+        let messages = match self
+            .store
+            .read(|s| s.transcript_messages(&self.thread))
+            .and_then(|r| r)
+        {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "could not read the thread to carry it into a new Codex thread");
@@ -2406,7 +2466,11 @@ impl Inner {
             let native = self.state.borrow().native_id.clone();
             // Transport writes are asynchronous: even a known native session might never
             // have received the latest task. Carry bounded context as well as native history.
-            let handoff = match self.store.transcript_messages(&self.thread) {
+            let handoff = match self
+                .store
+                .read(|s| s.transcript_messages(&self.thread))
+                .and_then(|r| r)
+            {
                 Ok(messages) => build_handoff(
                     &messages,
                     &format!("{} thread {}", driver_label(driver), self.thread),
@@ -2515,7 +2579,11 @@ impl Inner {
             return;
         };
         // Built from the store before anything is stopped, so a failure leaves the thread as it was.
-        let messages = match self.store.transcript_messages(&self.thread) {
+        let messages = match self
+            .store
+            .read(|s| s.transcript_messages(&self.thread))
+            .and_then(|r| r)
+        {
             Ok(m) => m,
             Err(e) => {
                 self.error(format!("Could not read the thread to hand it off: {e}"));
@@ -2539,14 +2607,18 @@ impl Inner {
         let model = model.or_else(|| launch.default_model.clone());
         let effort = effort.or_else(|| launch.default_effort.clone());
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
-        let new_pt =
-            match create_provider_thread(&self.store, &self.thread, driver, model.as_deref()) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.error(format!("Could not start the new agent's thread: {e}"));
-                    return;
-                }
-            };
+        // Queued to the store writer: a refusal there is reported by the writer, not here.
+        let new_pt = match self.store.create_provider_thread(
+            &self.thread,
+            driver_name(driver),
+            model.as_deref().unwrap_or("default"),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error(format!("Could not start the new agent's thread: {e}"));
+                return;
+            }
+        };
         // What this switch replaces, so a new agent that never starts can take the thread back.
         let previous = {
             let state = self.state.borrow();
@@ -4709,7 +4781,10 @@ mod tests {
             let store = session.inner.store.clone();
             let thread = session.inner.thread.clone();
             let chosen = || {
-                let events = store.events(&thread, None, 10_000).expect("events");
+                let events = store
+                    .reader()
+                    .events(&thread, None, 10_000)
+                    .expect("events");
                 chosen_mode(events.iter().map(|(_, e)| e))
             };
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);

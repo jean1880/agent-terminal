@@ -11,6 +11,8 @@ mod setup;
 mod thread_menu;
 mod threads;
 
+pub(crate) use threads::{close_store_writer, flush_store_for_panic};
+
 use super::diff_panel::DiffPanel;
 use super::loading;
 use crate::config::{Profile, SessionFormat};
@@ -1218,7 +1220,8 @@ impl WindowImpl for AgentTerminalWindow {
         // GNOME keeps a notification after its app exits, counted on the dock
         // badge until withdrawn, and nothing would be left to act on it.
         self.withdraw_notifications();
-        if stopping.is_empty() {
+        // Nothing to wait for: no agent leaving, no write still queued for the store.
+        if stopping.is_empty() && threads::store_writes_pending() == 0 {
             return self.parent_close_request();
         }
         self.begin_closing(stopping);
@@ -5271,10 +5274,19 @@ impl AgentTerminalWindow {
                 glib::ControlFlow::Break,
                 move || {
                     obj.imp().poll_quota();
+                    obj.imp().report_store_failure();
                     glib::ControlFlow::Continue
                 }
             ),
         );
+    }
+
+    /// Says, once, that the store could not save something since the last time it said so
+    /// (the store writer logs each failure in full; this is what the user sees of it).
+    fn report_store_failure(&self) {
+        if let Some(what) = threads::take_store_failure() {
+            self.show_toast(&format!("{what}. Some of a thread may not be saved."));
+        }
     }
 
     /// Checks every couple of seconds for tabs whose output has gone quiet.
