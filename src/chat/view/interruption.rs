@@ -196,7 +196,7 @@ impl InterruptionShelf {
             });
         }
 
-        Self {
+        let shelf = Self {
             revealer,
             card,
             icon,
@@ -212,7 +212,11 @@ impl InterruptionShelf {
             count,
             shown_count: std::cell::Cell::new(0),
             sink,
-        }
+        };
+        // A hidden shelf still counts towards the window's minimum width: the slots take their
+        // room only while an approval is shown, not with nothing waiting.
+        shelf.show_slots(false);
+        shelf
     }
 
     /// Answers the approval on show with `decision`, as its buttons would: a permission request
@@ -416,6 +420,7 @@ impl InterruptionShelf {
             }
             None => {
                 place(&self.more_btn, false);
+                self.show_slots(false);
                 self.revealer.set_reveal_child(false);
             }
         }
