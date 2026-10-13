@@ -1300,8 +1300,9 @@ mod tests {
         let item_rows = stored.iter().filter(|(_, e)| e.item.is_some()).count();
         assert_eq!(item_rows, 3 + sent, "every item event is stored");
         let all = serde_json::to_string(&stored).expect("json");
-        for frag in frags {
-            assert!(!all.contains(frag), "a fragment survived: {frag}");
+        // The failure names the fragment by position, never its text (secret-shaped).
+        for (n, frag) in frags.iter().enumerate() {
+            assert!(!all.contains(frag), "fragment {n} survived");
         }
         assert_eq!(
             all.matches("****0123").count(),

@@ -3095,9 +3095,10 @@ mod tests {
                     None => scanned.push((stream, vec![(seq, text)])),
                 }
             }
-            assert_eq!(
-                streams, scanned,
-                "{context}: the tail of {thread}/{item} is not what the store holds"
+            // No values in the failure: the streams hold secret-shaped text.
+            assert!(
+                streams == scanned,
+                "{context}: a trusted tail is not what the store holds"
             );
         }
     }
