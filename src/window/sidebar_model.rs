@@ -266,12 +266,54 @@ pub fn sidebar_sections(
     (active, groups)
 }
 
+/// A folder group as the sidebar draws it: its header, and the rows under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderGroup {
+    pub folder: String,
+    /// The rows drawn under the header: all of them when expanded, else only the shown row.
+    pub rows: Vec<SidebarRow>,
+    pub expanded: bool,
+    /// Rows the collapsed header hides.
+    pub hidden: usize,
+}
+
+/// Folds the folder groups: each is collapsed unless the user expanded it (`expanded`) or a
+/// search is on (its matches must be seen). A collapsed group still draws the `selected` row,
+/// so the thread on screen never vanishes from the list.
+pub fn fold_groups(
+    groups: Vec<(String, Vec<SidebarRow>)>,
+    expanded: &std::collections::HashSet<String>,
+    searching: bool,
+    selected: Option<&RowKey>,
+) -> Vec<FolderGroup> {
+    groups
+        .into_iter()
+        .map(|(folder, rows)| {
+            let open = searching || expanded.contains(&folder);
+            let total = rows.len();
+            let rows: Vec<SidebarRow> = if open {
+                rows
+            } else {
+                rows.into_iter()
+                    .filter(|r| Some(&r.key) == selected)
+                    .collect()
+            };
+            FolderGroup {
+                hidden: total - rows.len(),
+                folder,
+                rows,
+                expanded: open,
+            }
+        })
+        .collect()
+}
+
 /// Everything one sidebar redraw depends on, apart from the clock: the sections, which row is
 /// shown, whether the window has focus (it decides which rows glow) and the search text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarModel {
     pub active: Vec<SidebarRow>,
-    pub groups: Vec<(String, Vec<SidebarRow>)>,
+    pub groups: Vec<FolderGroup>,
     pub selected: Option<RowKey>,
     pub focused: bool,
     pub query: String,
@@ -282,7 +324,7 @@ impl SidebarModel {
     pub fn rows(&self) -> impl Iterator<Item = &SidebarRow> {
         self.active
             .iter()
-            .chain(self.groups.iter().flat_map(|(_, rows)| rows.iter()))
+            .chain(self.groups.iter().flat_map(|g| g.rows.iter()))
     }
 }
 
@@ -769,7 +811,7 @@ mod tests {
         let (active, groups) = sidebar_sections(rows, "", false);
         SidebarModel {
             active,
-            groups,
+            groups: fold_groups(groups, &Default::default(), true, None),
             selected: selected.map(|id| RowKey::Thread(id.into())),
             focused,
             query: String::new(),
@@ -928,6 +970,64 @@ mod tests {
         running.badge = Some(Badge::Running);
         assert!(!needs_attention(&running, Some(&shown("other")), false));
         assert!(!needs_attention(&row("n", "/w", 1), None, false));
+    }
+
+    /// Folder groups start collapsed; an expanded one, or any during a search, lists every row,
+    /// and a collapsed one keeps only the thread on screen, counting the rest as hidden.
+    #[test]
+    fn folder_groups_start_collapsed_but_keep_the_shown_thread() {
+        let groups = group_rows(
+            vec![
+                row("a", "/w/one", 3),
+                row("b", "/w/one", 2),
+                row("c", "/w/two", 1),
+            ],
+            "",
+            false,
+        );
+        let shape = |folded: Vec<FolderGroup>| -> Vec<(String, bool, usize, Vec<String>)> {
+            folded
+                .into_iter()
+                .map(|g| {
+                    let ids = g.rows.iter().map(|r| r.title.clone()).collect();
+                    (g.folder, g.expanded, g.hidden, ids)
+                })
+                .collect()
+        };
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            shape(fold_groups(groups.clone(), &none, false, None)),
+            [
+                ("/w/one".into(), false, 2, vec![]),
+                ("/w/two".into(), false, 1, vec![]),
+            ],
+            "collapsed by default"
+        );
+        let shown = RowKey::Thread("b".into());
+        assert_eq!(
+            shape(fold_groups(groups.clone(), &none, false, Some(&shown)))[0],
+            ("/w/one".into(), false, 1, vec!["Thread b".into()]),
+            "the shown thread stays in its collapsed folder"
+        );
+        let one: std::collections::HashSet<String> = ["/w/one".to_owned()].into();
+        assert_eq!(
+            shape(fold_groups(groups.clone(), &one, false, None)),
+            [
+                (
+                    "/w/one".into(),
+                    true,
+                    0,
+                    vec!["Thread a".into(), "Thread b".into()]
+                ),
+                ("/w/two".into(), false, 1, vec![]),
+            ]
+        );
+        assert!(
+            fold_groups(groups, &none, true, None)
+                .iter()
+                .all(|g| g.expanded && g.hidden == 0),
+            "a search shows every match"
+        );
     }
 
     /// Active threads get their own section, most urgent first, and leave their folder group;

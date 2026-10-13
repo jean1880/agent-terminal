@@ -35,11 +35,11 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, continue_label, driver_key, driver_label, forbids_unasked_edits, held_finish_due,
-    is_busy, limit_over, needs_attention, parse_driver, react, redraw_for, relative_time,
-    resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading, stored_model,
-    thread_title, turn_finishes_thread, Attention, Badge, Redraw, ResumeAs, RowKey, SidebarModel,
-    SidebarRow,
+    badge_for, continue_label, driver_key, driver_label, fold_groups, forbids_unasked_edits,
+    held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, redraw_for,
+    relative_time, resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading,
+    stored_model, thread_title, turn_finishes_thread, Attention, Badge, FolderGroup, Redraw,
+    ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -1333,6 +1333,8 @@ pub(super) struct Sidebar {
     search: gtk4::SearchEntry,
     /// Row index → what it opens (`None` for a folder header).
     pub(super) keys: RefCell<Vec<Option<RowKey>>>,
+    /// The folder groups the user expanded; every other one is drawn collapsed.
+    expanded: RefCell<std::collections::HashSet<String>>,
     /// Set while the list is rebuilt, so selecting the current row is not taken as a click.
     rebuilding: std::cell::Cell<bool>,
     /// What the list on screen shows (`None`: nothing drawn yet), to skip or shrink a redraw.
@@ -1733,6 +1735,7 @@ impl AgentTerminalWindow {
             list: list.clone(),
             search: search.clone(),
             keys: RefCell::new(Vec::new()),
+            expanded: RefCell::new(std::collections::HashSet::new()),
             rebuilding: std::cell::Cell::new(false),
             drawn: RefCell::new(None),
             drawn_rows: RefCell::new(Vec::new()),
@@ -1984,6 +1987,12 @@ impl AgentTerminalWindow {
         let focused = self.obj().is_active();
         let query = sidebar.search.text().to_string();
         let (active, groups) = sidebar_sections(rows, &query, self.show_archived.get());
+        let groups = fold_groups(
+            groups,
+            &sidebar.expanded.borrow(),
+            !query.trim().is_empty(),
+            selected.as_ref(),
+        );
         let model = SidebarModel {
             active,
             groups,
@@ -2073,23 +2082,12 @@ impl AgentTerminalWindow {
                 keys.push(None);
             }
         }
-        for (folder, rows) in groups {
-            let header = gtk4::ListBoxRow::builder()
-                .activatable(false)
-                .selectable(false)
-                .css_classes(["folder-row"])
-                .build();
-            let label = Label::builder()
-                .label(crate::utils::tildify(&folder, &home))
-                .xalign(0.0)
-                .ellipsize(gtk4::pango::EllipsizeMode::Start)
-                .css_classes(["folder-label", "caption-heading"])
-                .tooltip_text(&folder)
-                .build();
-            header.set_child(Some(&label));
-            sidebar.list.append(&header);
+        for group in groups {
+            sidebar
+                .list
+                .append(&self.folder_header(&sidebar, &group, &home));
             keys.push(None);
-            for row in rows {
+            for row in group.rows {
                 let widget = self.sidebar_row_widget(&row, now);
                 if needs_attention(&row, selected.as_ref(), focused) {
                     widget.add_css_class("needs-attention");
@@ -2136,6 +2134,108 @@ impl AgentTerminalWindow {
             }
         }
         self.update_sidebar_toggle_attention();
+    }
+
+    /// A folder group's header: a toggle that expands or collapses the group (with a count of
+    /// what a collapsed one hides) and a button that starts a new thread in the folder.
+    fn folder_header(
+        &self,
+        sidebar: &Rc<Sidebar>,
+        group: &FolderGroup,
+        home: &str,
+    ) -> gtk4::ListBoxRow {
+        let obj = self.obj();
+        let folder = group.folder.clone();
+        let header = gtk4::ListBoxRow::builder()
+            .activatable(false)
+            .selectable(false)
+            .css_classes(["folder-row"])
+            .build();
+        let line = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(2)
+            .build();
+        let inner = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        inner.append(&gtk4::Image::from_icon_name(if group.expanded {
+            "at-pan-down-symbolic"
+        } else {
+            "at-pan-end-symbolic"
+        }));
+        inner.append(
+            &Label::builder()
+                .label(crate::utils::tildify(&folder, home))
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::Start)
+                .css_classes(["folder-label", "caption-heading"])
+                .build(),
+        );
+        if group.hidden > 0 {
+            inner.append(
+                &Label::builder()
+                    .label(group.hidden.to_string())
+                    .css_classes(["folder-count", "dim-label", "caption"])
+                    .build(),
+            );
+        }
+        let toggle = Button::builder()
+            .child(&inner)
+            .hexpand(true)
+            .tooltip_text(&folder)
+            .css_classes(["flat", "folder-toggle"])
+            .build();
+        toggle.update_state(&[gtk4::accessible::State::Expanded(Some(group.expanded))]);
+        let weak_sidebar = Rc::downgrade(sidebar);
+        toggle.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            folder,
+            move |_| {
+                let Some(sidebar) = weak_sidebar.upgrade() else {
+                    return;
+                };
+                {
+                    let mut expanded = sidebar.expanded.borrow_mut();
+                    if !expanded.remove(&folder) {
+                        expanded.insert(folder.clone());
+                    }
+                }
+                obj.imp().refresh_sidebar();
+                // The rebuild replaced the header: keep the keyboard on the new one.
+                let mut row = sidebar.list.first_child();
+                while let Some(widget) = row {
+                    row = widget.next_sibling();
+                    if widget.widget_name() == folder.as_str() {
+                        if let Some(toggle) = widget.first_child().and_then(|l| l.first_child()) {
+                            toggle.grab_focus();
+                        }
+                        break;
+                    }
+                }
+            }
+        ));
+        let new = Button::builder()
+            .icon_name("at-list-add-symbolic")
+            .tooltip_text("New Thread in This Folder")
+            .valign(Align::Center)
+            .css_classes(["flat", "folder-new-thread"])
+            .build();
+        new.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            folder,
+            move |_| obj.imp().new_chat_thread(None, Some(folder.clone()), None)
+        ));
+        line.append(&toggle);
+        line.append(&new);
+        header.set_widget_name(&folder);
+        header.set_child(Some(&line));
+        header
     }
 
     /// The cheap redraw: the rows are the ones on screen, so only what follows the clock or the
