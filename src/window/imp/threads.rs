@@ -441,22 +441,52 @@ pub(super) async fn write_job<T: Send + 'static>(
     what: &'static str,
     job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
 ) -> Option<agent_kit::store::Result<T>> {
+    write_job_or_late(what, job, || {}).await
+}
+
+/// [`write_job`], and when it does not answer in time, `late` runs on the main thread once the
+/// writer does run it (however long that takes): what a caller does to show a write that lands
+/// late (reload the thread list), never relying on a guess at when it will.
+pub(super) async fn write_job_or_late<T: Send + 'static>(
+    what: &'static str,
+    job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
+    late: impl FnOnce() + 'static,
+) -> Option<agent_kit::store::Result<T>> {
+    use std::sync::mpsc::RecvTimeoutError;
     let Some(writer) = store_writer() else {
         // All of it or none of it, as on the writer.
         return store_job(move |s| s.atomically(job)).await;
     };
     let answer = writer.call_result(what, job);
-    gtk4::gio::spawn_blocking(move || answer.recv_timeout(WORKER_FLUSH_WAIT).ok())
-        .await
-        .ok()
-        .flatten()
-        .or_else(|| {
+    let waited = gtk4::gio::spawn_blocking(move || match answer.recv_timeout(WORKER_FLUSH_WAIT) {
+        Ok(result) => Ok(Some(result)),
+        Err(RecvTimeoutError::Timeout) => Err(answer),
+        Err(RecvTimeoutError::Disconnected) => Ok(None),
+    })
+    .await;
+    match waited {
+        Ok(Ok(Some(result))) => Some(result),
+        Ok(Err(answer)) => {
             error!(
-                "A store write job did not answer in time (the writer is far behind or stopped, \
-                 or the job panicked); it may still be saved"
+                "A store write job did not answer in time (the writer is far behind); it may \
+                 still be saved"
             );
+            glib::MainContext::default().spawn_local(async move {
+                let answered = gtk4::gio::spawn_blocking(move || answer.recv().is_ok())
+                    .await
+                    .unwrap_or(false);
+                if answered {
+                    info!("A late store write job finished");
+                    late();
+                }
+            });
             None
-        })
+        }
+        Ok(Ok(None)) | Err(_) => {
+            error!("A store write job did not answer (the writer stopped, or the job panicked)");
+            None
+        }
+    }
 }
 
 /// Shows (once per failure) that the store writer could not save something: a toast naming the
@@ -1804,7 +1834,13 @@ impl AgentTerminalWindow {
     ) {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            if let Some(Err(e)) = write_job(what, job).await {
+            let reload = obj.clone();
+            let late = move || {
+                if let Some(obj) = reload.upgrade() {
+                    obj.imp().reload_summaries();
+                }
+            };
+            if let Some(Err(e)) = write_job_or_late(what, job, late).await {
                 warn!("Cannot {what}: {e}");
             }
             if let Some(obj) = obj.upgrade() {
@@ -4135,7 +4171,14 @@ impl AgentTerminalWindow {
         // not be stored gets the dialog, never a page whose every write would fail.
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let stored = write_job("create a thread", record).await;
+            let reload = obj.clone();
+            let stored = write_job_or_late("create a thread", record, move || {
+                // Landed after all: the list shows it now.
+                if let Some(obj) = reload.upgrade() {
+                    obj.imp().reload_summaries();
+                }
+            })
+            .await;
             let Some(obj) = obj.upgrade() else { return };
             match stored {
                 Some(Ok(())) => {
@@ -4150,8 +4193,6 @@ impl AgentTerminalWindow {
                         "The thread store is far behind. The thread may still be saved: it \
                          will show in the list once it is.",
                     );
-                    // After the writer's barrier: a create that landed late shows.
-                    obj.imp().reload_summaries();
                 }
             }
         });
@@ -4233,7 +4274,13 @@ impl AgentTerminalWindow {
         }
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let stored = write_job("resume a session as a thread", record).await;
+            let reload = obj.clone();
+            let stored = write_job_or_late("resume a session as a thread", record, move || {
+                if let Some(obj) = reload.upgrade() {
+                    obj.imp().reload_summaries();
+                }
+            })
+            .await;
             let Some(obj) = obj.upgrade() else { return };
             match stored {
                 Some(Ok(())) => opened(obj.imp()),
@@ -4245,7 +4292,6 @@ impl AgentTerminalWindow {
                         "The thread store is far behind. The session may still be saved as a \
                          thread: it will show in the list once it is.",
                     );
-                    obj.imp().reload_summaries();
                 }
             }
         });
