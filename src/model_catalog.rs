@@ -69,31 +69,39 @@ fn decode_cache(text: &str) -> CacheFile {
 }
 
 /// Writes the cache off the main thread (an fsync can stall). Writes are numbered so a slow,
-/// older one never lands over a newer one; each is the shared private (0600) atomic write.
+/// older one never lands over a newer one *of the same file*; each is the shared private (0600)
+/// atomic write. Per file: a newer write of another file (another catalog, a parallel test) is
+/// no reason to drop this one, and dropping it lost the last list from the cache.
 fn write_cache(path: PathBuf, bytes: Vec<u8>) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    static WRITTEN: Mutex<u64> = Mutex::new(0);
     let generation = NEXT.fetch_add(1, Ordering::Relaxed);
-    let write = move || {
-        let mut written = WRITTEN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *written > generation {
-            return; // a newer write already landed
-        }
-        if let Err(e) = agent_kit::fsutil::write_private_atomic(&path, &bytes) {
-            warn!(error = %e, "could not write the model cache");
-        }
-        *written = generation;
-    };
+    let write = move || write_numbered(&path, &bytes, generation);
     // Unit tests read the file straight back and run without a main loop: write in place.
     if cfg!(test) {
         write();
     } else {
         drop(gtk4::gio::spawn_blocking(write));
     }
+}
+
+/// Writes `bytes` to `path` unless a newer write (`generation`) of that same file already landed.
+fn write_numbered(path: &std::path::Path, bytes: &[u8], generation: u64) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static WRITTEN: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    let mut written = WRITTEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last = written.entry(path.to_path_buf()).or_insert(0);
+    if *last > generation {
+        return; // a newer write of this file already landed
+    }
+    if let Err(e) = agent_kit::fsutil::write_private_atomic(path, bytes) {
+        warn!(error = %e, "could not write the model cache");
+    }
+    *last = generation;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -702,6 +710,25 @@ mod tests {
         assert_eq!(decode_cache("not json"), CacheFile::default());
         assert_eq!(decode_cache("{\"agy\": 3}"), CacheFile::default());
         assert_eq!(decode_cache("{}"), CacheFile::default());
+    }
+
+    /// Regression: the newest-write guard was shared by every file, so a newer write of another
+    /// cache (a parallel test's) dropped this one, and the beta build's gate failed on a cache
+    /// missing its last list. An older write is skipped only for the same file.
+    #[test]
+    fn an_older_write_is_skipped_only_for_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        write_numbered(&b, b"newer, other file", 20);
+        write_numbered(&a, b"older, this file", 10);
+        assert_eq!(std::fs::read(&a).unwrap(), b"older, this file");
+        write_numbered(&a, b"newest", 30);
+        write_numbered(&a, b"stale", 25);
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            b"newest",
+            "a stale write of the same file"
+        );
     }
 
     #[test]
