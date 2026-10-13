@@ -402,6 +402,30 @@ enum CheckpointResult {
     Failed(String),
 }
 
+/// An indicator's three states, without the value text that changes between checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndicatorKind {
+    Ok,
+    Problem,
+    Unreadable,
+}
+
+impl IndicatorKind {
+    fn of(state: &crate::utils::IndicatorState) -> Self {
+        match state {
+            crate::utils::IndicatorState::Ok { .. } => Self::Ok,
+            crate::utils::IndicatorState::Warn { .. } => Self::Problem,
+            crate::utils::IndicatorState::Unknown { .. } => Self::Unreadable,
+        }
+    }
+}
+
+/// Whether an evaluation is logged at info: the first one, and any change of
+/// state. A value-only change within one state is debug noise.
+fn indicator_log_at_info(previous: Option<IndicatorKind>, now: IndicatorKind) -> bool {
+    previous != Some(now)
+}
+
 /// A tab's tooltip: the worktree branch it was opened on, if any, and its
 /// latest checkpoint, if any.
 fn tab_tooltip(branch: Option<&str>, checkpoint: Option<&str>) -> String {
@@ -1937,6 +1961,9 @@ impl AgentTerminalWindow {
         // One check at a time: a check slower than the refresh interval would
         // otherwise overlap the next, and the older result could land last.
         let in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+        // The state the last evaluation landed in, so only a transition is logged at info.
+        let last_kind: std::rc::Rc<std::cell::Cell<Option<IndicatorKind>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
         let evaluate = move || -> bool {
             let Some(button) = button.upgrade() else {
                 return false;
@@ -1947,6 +1974,7 @@ impl AgentTerminalWindow {
             let indicator = indicator.clone();
             let detail = detail.clone();
             let in_flight = in_flight.clone();
+            let last_kind = last_kind.clone();
             glib::MainContext::default().spawn_local(async move {
                 let source = indicator.source.clone();
                 // A configured command is arbitrary and may block; it never runs
@@ -1989,7 +2017,12 @@ impl AgentTerminalWindow {
                     ),
                 };
 
-                info!("Indicator {}", tooltip);
+                let kind = IndicatorKind::of(&state);
+                if indicator_log_at_info(last_kind.replace(Some(kind)), kind) {
+                    info!("Indicator {}", tooltip);
+                } else {
+                    debug!("Indicator {}", tooltip);
+                }
                 button.set_icon_name(icon);
                 button.set_tooltip_text(Some(&tooltip));
                 for class in [
@@ -6455,6 +6488,22 @@ fn directory_is_usable(dir: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indicator_logs_at_info_only_on_a_state_transition() {
+        use IndicatorKind::{Ok, Problem, Unreadable};
+        // First evaluation.
+        assert!(indicator_log_at_info(None, Ok));
+        assert!(indicator_log_at_info(None, Unreadable));
+        // Same state with a changed value: debug.
+        assert!(!indicator_log_at_info(Some(Ok), Ok));
+        assert!(!indicator_log_at_info(Some(Problem), Problem));
+        assert!(!indicator_log_at_info(Some(Unreadable), Unreadable));
+        // Transitions.
+        assert!(indicator_log_at_info(Some(Ok), Problem));
+        assert!(indicator_log_at_info(Some(Problem), Unreadable));
+        assert!(indicator_log_at_info(Some(Unreadable), Ok));
+    }
 
     fn init_gtk() {
         if !gtk4::is_initialized_main_thread() {
