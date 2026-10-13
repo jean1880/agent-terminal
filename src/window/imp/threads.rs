@@ -5439,6 +5439,12 @@ pub(super) mod tests {
                             })
                 })
                 .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            // A dialog still animating in ignores its buttons: click only once it is shown.
+            assert!(
+                pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()),
+                "{heading}'s {button} button is shown"
+            );
+            crate::testutil::settle(&ctx);
             target.emit_clicked();
             // Closing is animated: wait for it to go (bounded), never a fixed number of turns.
             assert!(
