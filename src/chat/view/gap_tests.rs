@@ -1,6 +1,6 @@
 //! Native tests for the cross-agent gaps the app polyfills: `@` files for every agent and the
-//! context gauge. They build real views, so they run under a display
-//! (`tests/qa/native-tests.json`).
+//! context gauge. They build real views, so they are `#[ignore]`d and run under a display by
+//! `make test-display` (part of `make check`).
 
 use super::tests::status_of;
 use super::*;

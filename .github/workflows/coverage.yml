@@ -1,7 +1,7 @@
-name: Full coverage
+name: make coverage
 
-# The whole suite (workspace tests and every native case) under instrumentation, held to the
-# floor in tests/qa/coverage-floor.json. Release requires it on the exact release commit.
+# The whole suite (and the display tests) under instrumentation, held to COVERAGE_FLOOR in the
+# Makefile. Runs on every PR; a release requires it on the exact release commit.
 on:
   workflow_call:
     outputs:
@@ -40,11 +40,12 @@ jobs:
             target
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-coverage-
-      - name: Full coverage against the floor
+      - name: make coverage
         id: coverage
+        env:
+          NEXTEST_PROFILE: ci
         run: |
-          python3 tests/qa/test_coverage.py
-          python3 tests/qa/coverage.py --html
+          make coverage
           echo "tested_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Preserve the coverage report
         if: always()

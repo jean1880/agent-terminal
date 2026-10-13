@@ -12,3 +12,7 @@ permissions:
 jobs:
   gate:
     uses: ./.github/workflows/quality-gate.yml
+
+  # A coverage drop shows on the PR, not first at release.
+  coverage:
+    uses: ./.github/workflows/coverage.yml

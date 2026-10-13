@@ -1,0 +1,5 @@
+#!/bin/sh
+# Opt in with `make hooks`. Fast checks only; the tests run in CI (`make check`).
+set -e
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --quiet -- -D warnings

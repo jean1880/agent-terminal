@@ -1,83 +1,48 @@
-# Source and delivery gates
+# Testing
 
-Run `python3 tests/qa/gate.py` from any directory. It keeps formatting, Clippy
-and workspace tests, then runs the exact ignored tests in `native-tests.json`.
-Every native case has a private Xvfb display, D-Bus session and temporary
-HOME/XDG settings. Zero tests, ignored tests and timeouts fail. Measurement-only
-tests remain excluded. `--native-only` is a development shortcut and does not
-satisfy the delivery gate. Python 3.11+, Rust with rustfmt/Clippy, the project's
-native development libraries, Xvfb, xauth and dbus-run-session are required.
-CI and beta use `--delivery`, which refuses a dirty checkout or a changed commit;
-local developer runs record working-tree edits instead of claiming commit-only proof.
-For a targeted developer rerun, combine `--native-only` with
-`--native-test <exact name from native-tests.json>`; this cannot satisfy delivery.
+Everything runs through the Makefile, with standard tools: `cargo nextest` for the tests and
+`cargo llvm-cov` for coverage (`make test-deps` installs both). Nothing here is run by hand.
 
-Native cases run the built test binary directly, so `--jobs N` can run them side by
-side; each still has its own display (`xvfb-run -a -n` starting points are spaced
-apart), D-Bus session and home. Every `#[ignore]`d test must either be listed in
-`native-tests.json` or appear, with its reason, in `native-excluded.json`; the
-`ignored-inventory` step fails on any that are in neither, and on exclusions that no
-longer name an ignored test. Without this, an `#[ignore]` quietly drops a test from
-every run.
+| Command | What it runs | Where it runs |
+|---|---|---|
+| `make test` | The suite, each test in its own process, in parallel (about 35 s) | You, while working |
+| `make check` | fmt, Clippy, the no-default-features build, the suite, the display tests, and these scripts' unit tests | CI on every push and PR (`gate / check`, required), and a release |
+| `make coverage` | The suite and the display tests instrumented; HTML and lcov in `target/qa-artifacts/coverage`; fails under `COVERAGE_FLOOR` (Makefile) | CI on every PR; a release requires it on the release commit |
+| `make hooks` | Opt in to a pre-commit hook: fmt and Clippy only | Your clone |
 
-## Running only what a change needs
+Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
+private XDG directories under `target/test-home`, in-memory GSettings and no global or
+system git config, so no test touches your settings, thread store or keyring.
 
-`python3 tests/qa/affected.py` (add `--dry-run` to only print the plan) compares against
-the merge base with `origin/master`, including uncommitted edits, and runs:
-- the packages the change touches, plus the ones that depend on them (agent-core →
-  agent-kit → app);
-- the native cases selected by the area rules in `native-areas.json` (first matching
-  prefix wins; a Rust or asset path that no rule matches selects every case);
-- the QA scripts' own unit tests, when `tests/qa/` changed.
+**Display tests** present windows and measure layout. They are `#[ignore]`d so `make test`
+stays fast, and `make check` runs all of them (`--run-ignored only`) one at a time, so none
+is measured while another loads the machine. A new `#[ignore]`d test is picked up
+automatically; the only ones never run are named in `.config/nextest.toml`'s
+`default-filter`, each with its reason (network, a benchmark, a measurement). Screenshots the
+layout tests take land in `target/qa-artifacts/screenshots`, which CI uploads.
 
-Docs and workflow edits select nothing, and anything it does not recognize selects
-everything. It is a developer shortcut only: CI and delivery always run the whole gate.
+**Coverage** counts every line llvm-cov instruments. `COVERAGE_FLOOR` only goes up: raise it
+when coverage rises, never lower it to get a change through.
 
-## Coverage
-
-`python3 tests/qa/coverage.py` (needs `cargo install --locked cargo-llvm-cov` and
-`rustup component add llvm-tools-preview`) runs the workspace tests and every native
-case under instrumentation, and reports **production** line coverage. Lines inside
-`#[cfg(test)]` items, and files declared only under `#[cfg(test)]`, are not counted, so
-tests cannot raise the figure by covering their own code. It fails when the figure drops
-below `lines` in `coverage-floor.json`; `--update-floor` raises the floor after an
-improvement, so coverage can ratchet up toward `target` but never quietly slip. `--html`
-writes a browsable report and `--skip-native` gives a faster run whose (lower) figure is
-not checked against the floor. **A release always takes the full run:** `release.yml`
-calls `coverage.yml` (the whole workspace and every native case, never `--skip-native`
-or an affected subset), and Publish requires the commit it covered to equal the release
-SHA, as it already does for the gate. Output: `target/qa-artifacts/coverage/summary.json`
-(per crate and per file, worst first) and `lcov.info`.
+**Releases**: `release.yml` runs `make check` and `make coverage` on its own checkout, and
+Publish requires both to have passed on exactly the release commit, with nothing edited or
+generated in the tree during the run. The debian-maintainer beta task runs `make check` on
+the checkout it packages.
 
 ## Mutation testing
 
 Coverage says a line ran; it cannot say a test checked it. `cargo mutants` (config in
-`.cargo/mutants.toml`) changes `agent-core` and `agent-kit` one small edit at a time (a
-`<` to `<=`, a return value replaced, a match arm deleted) and runs the tests. A mutant
-every test still passes is listed in `mutants.out/missed.txt`: code that runs but that
-nothing verifies. Fix it with a test that asserts the behaviour, never by excluding it.
+`.cargo/mutants.toml`) changes `agent-core` and `agent-kit` one small edit at a time and
+runs the tests; a mutant every test still passes is code nothing verifies. Fix it with a
+test that asserts the behaviour.
 
-**CI only. Never run it on a workstation.** By design some mutants turn a bounded loop
-into an unbounded one that allocates until it is killed (`i += 1` made `i *= 1` in a
-parser, for one): a run here once crashed a desktop at 30 GB, and even inside a 16 GB
-memory cap it filled the cap. `mutants.yml` runs it weekly, and by hand (Actions → Mutation
-testing → Run workflow), on GitHub's disposable runners under `ulimit -v`, and lists missed
-mutants in the run summary; it reports, it does not gate. Fix a missed mutant by writing the
-test that asserts the behaviour, then let the next CI run confirm it.
+**CI only. Never run it on a workstation.** By design some mutants turn a bounded loop into
+one that allocates until it is killed; a run here once crashed a desktop. `mutants.yml` runs
+it weekly, and by hand (Actions → Mutation testing → Run workflow), on GitHub's disposable
+runners under `ulimit -v`, and lists missed mutants in the run summary. It reports; it does
+not gate.
 
-Diagnostics live in `target/qa-artifacts`: the selected name, exit status,
-timeout state and exact source commit/version accompany logs. Native tests print
-their synthetic fixture/geometry evidence into those logs. Native tests receive
-`AGENT_TERMINAL_QA_ARTIFACTS`; the UX matrix saves snapshots before geometry
-assertions in `screenshots/`. Capture failure cannot hide assertion failures. CI uploads
-the directory even on failure. No user history or tokens are copied.
-
-CI on master, beta branches, PRs and manual runs calls `quality-gate.yml`.
-Release invokes that same workflow on its own checkout; builds depend on it,
-and Publish additionally requires its tested commit to equal the release SHA.
-The beta task in debian-maintainer runs the checked-out script before packaging.
-Its source config must be deployed through the normal pipeline before the live
-mounted config adopts this gate; editing the file does not deploy it.
+## Packaged builds and probes
 
 Release packages carry `<package>.identity.json` with their checksum, source
 commit and Cargo version. The opt-in **packaged identity and startup smoke**

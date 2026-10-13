@@ -1,5 +1,0 @@
-{
-  "chat::view::tests::stream_cost_of_a_long_thinking_block": "measurement: prints the cost of streaming, asserts nothing",
-  "store::tests::append_bench": "benchmark: needs AGENT_TERMINAL_BENCH_DB, a scratch copy of a real store",
-  "update::tests::live_latest_release_of_this_repository": "network: queries api.github.com, which the gate never reaches"
-}
