@@ -1,0 +1,68 @@
+name: Mutation testing
+
+# Do the tests check what they run? cargo-mutants changes agent-core and agent-kit one small
+# edit at a time; a mutant every test still passes ("missed") is code nothing verifies.
+# Weekly and by hand: it is too slow for every push, and it reports rather than gates.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to mutate
+        type: choice
+        options: [agent-core, agent-kit]
+        default: agent-core
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.package)) || fromJSON('["agent-core","agent-kit"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest@0.9.148,cargo-mutants@27.1.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-mutants-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-mutants-
+      - name: Mutate ${{ matrix.package }}
+        # A mutant can loop without bound and allocate until the runner dies: every process
+        # gets 6 GiB of address space, so a runaway one fails (and counts as caught) instead.
+        # Exit 2 (missed) and 3 (timeouts) are findings, listed below; 1 (usage) or 4 (the
+        # unmutated tests failed) mean the run itself is broken.
+        run: |
+          ulimit -v 6291456
+          status=0
+          cargo mutants --package "${{ matrix.package }}" --jobs 2 --output target/mutants-out || status=$?
+          echo "cargo-mutants exit: $status"
+          case "$status" in 0|2|3) ;; *) exit "$status" ;; esac
+      - name: Missed mutants
+        if: always()
+        run: |
+          if [ -s target/mutants-out/mutants.out/missed.txt ]; then
+            {
+              echo "### Mutants no test caught in ${{ matrix.package }}"
+              echo '```'
+              cat target/mutants-out/mutants.out/missed.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-${{ matrix.package }}-${{ github.sha }}
+          path: target/mutants-out/mutants.out/
+          if-no-files-found: warn
+          retention-days: 30

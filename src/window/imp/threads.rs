@@ -5227,6 +5227,128 @@ pub(super) mod tests {
         );
     }
 
+    /// A thread page drives a real agent process end to end: the deterministic Codex fixture
+    /// (`tests/support/scripted_codex.py`; no provider, tool or network). Its session starts,
+    /// a turn runs and finishes, an approval marks the thread busy and needing the user in the
+    /// sidebar, and Stop clears both. Run from the window walkthrough (GTK has one thread).
+    pub(crate) fn a_thread_page_runs_a_real_session(window: &crate::window::AgentTerminalWindow) {
+        use crate::chat::ChatBackend;
+        use crate::testutil::pump_until;
+        let imp = window.imp();
+        let ctx = glib::MainContext::default();
+        let dir = tempfile::tempdir().expect("tmp");
+        let folder = dir.path().to_string_lossy().into_owned();
+        let frames =
+            || std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap_or_default();
+
+        // Codex resolves to python3 running the fixture, which keeps its frames in `dir`.
+        let (command, env_file) = {
+            let config = imp.config.borrow();
+            let codex = config
+                .agent_profile(Driver::Codex)
+                .expect("a Codex profile");
+            (codex.command.clone(), codex.env_file.clone())
+        };
+        for profile in imp.config.borrow_mut().profiles.iter_mut() {
+            if profile.command == command {
+                profile.args = vec![
+                    "-I".into(),
+                    format!(
+                        "{}/tests/support/scripted_codex.py",
+                        env!("CARGO_MANIFEST_DIR")
+                    ),
+                    folder.clone(),
+                ];
+            }
+        }
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (command.clone(), env_file.clone()),
+                ResolvedAgent {
+                    program: Some("/usr/bin/python3".into()),
+                    env: Vec::new(),
+                },
+            )
+        });
+        let availability = AgentAvailability::shared();
+        let before = availability.get(Driver::Codex);
+        availability.set(
+            Driver::Codex,
+            Availability::Ready("/usr/bin/python3".into()),
+        );
+
+        imp.new_chat_thread(Some(Driver::Codex), Some(folder.clone()), None);
+        let thread = imp
+            .tabs
+            .borrow()
+            .last()
+            .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+            .expect("a thread page");
+        let state = |f: &dyn Fn(&ChatTab) -> bool| {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .find(|c| c.thread == thread)
+                .is_some_and(f)
+        };
+        let slot = imp.slot_of(&thread).expect("the page's slot");
+        assert!(
+            pump_until(&ctx, 15, || slot.get().is_some()),
+            "the session starts; fixture frames: {}",
+            frames()
+        );
+
+        // A plain turn: sent to the agent, finished, and nothing left needing the user.
+        slot.send_prompt("success");
+        assert!(
+            pump_until(&ctx, 15, || frames().contains("turn/completed")
+                && state(&|c| !c.running)),
+            "the turn finishes; fixture frames: {}",
+            frames()
+        );
+        assert!(
+            app_store().has_messages(&thread).expect("read"),
+            "the prompt is stored"
+        );
+        assert!(!imp.row_is_busy(&RowKey::Thread(thread.clone())));
+
+        // An approval: the thread is busy and asks for the user, in its page and its row.
+        slot.send_prompt("approve this");
+        assert!(
+            pump_until(&ctx, 15, || state(&|c| c.approval)),
+            "the approval reaches the page; fixture frames: {}",
+            frames()
+        );
+        assert!(
+            imp.row_is_busy(&RowKey::Thread(thread.clone())),
+            "closing would cut work short"
+        );
+        imp.reload_summaries();
+        let badge = || {
+            imp.sidebar_rows()
+                .into_iter()
+                .find(|r| r.key == RowKey::Thread(thread.clone()))
+                .and_then(|r| r.badge)
+        };
+        assert_eq!(badge(), Some(Badge::NeedsApproval));
+
+        // Stop: the agent is told, the turn ends, and nothing is left waiting.
+        slot.interrupt();
+        assert!(
+            pump_until(&ctx, 15, || state(&|c| !c.approval && !c.running)),
+            "stop ends the turn; fixture frames: {}",
+            frames()
+        );
+        assert!(frames().contains("turn/interrupt"));
+        assert!(!imp.row_is_busy(&RowKey::Thread(thread.clone())));
+        assert_ne!(badge(), Some(Badge::NeedsApproval));
+
+        imp.close_row_now(&RowKey::Thread(thread.clone()));
+        availability.set(Driver::Codex, before);
+        RESOLVED.with(|r| r.borrow_mut().remove(&(command, env_file)));
+    }
+
     /// A refresh with the same rows, an aged clock, or only the focus changed keeps the row
     /// widgets (and so focus, an open menu and a rename in them); only the age and the glow move.
     pub(crate) fn sidebar_updates_in_place(window: &crate::window::AgentTerminalWindow) {

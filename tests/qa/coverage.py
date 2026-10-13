@@ -90,6 +90,35 @@ def test_only(path):
 
 def production_lines(lcov_text):
     """{relative path: (covered, total)} counting only production lines."""
+    return {
+        name: (sum(1 for c in hits.values() if c), len(hits))
+        for name, hits in production_hits(lcov_text).items()
+    }
+
+
+def uncovered_ranges(hits, source, gap=3):
+    """[(first, last, enclosing fn)] of the never-run lines in `hits` ({line: count}); runs
+    split by no more than `gap` lines merge. `source` is the file's lines."""
+    missed = sorted(n for n, c in hits.items() if c == 0)
+    ranges = []
+    for n in missed:
+        if ranges and n <= ranges[-1][1] + gap:
+            ranges[-1][1] = n
+        else:
+            ranges.append([n, n])
+    out = []
+    for first, last in ranges:
+        name = next(
+            (m.group(1) for i in range(min(first, len(source)) - 1, -1, -1)
+             if (m := re.search(r"\bfn (\w+)", source[i]))),
+            "",
+        )
+        out.append((first, last, name))
+    return out
+
+
+def production_hits(lcov_text):
+    """{relative path: {line: count}} for production lines only."""
     records, current = {}, None
     for line in lcov_text.splitlines():
         if line.startswith("SF:"):
@@ -109,7 +138,7 @@ def production_lines(lcov_text):
             continue
         kept = {n: c for n, c in hits.items() if n not in test_lines.get(path, ())}
         if kept:
-            result[str(path.relative_to(ROOT))] = (sum(1 for c in kept.values() if c), len(kept))
+            result[str(path.relative_to(ROOT))] = kept
     return result
 
 
@@ -121,9 +150,19 @@ def main():
     parser.add_argument("--native-timeout", type=int, default=600)
     parser.add_argument("--html", action="store_true", help="also write an HTML report")
     parser.add_argument("--update-floor", action="store_true", help="raise the floor to this run's figure")
+    parser.add_argument("--uncovered", metavar="FILE", help="list FILE's never-run lines from the last run, and stop")
     args = parser.parse_args()
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
+    if args.uncovered:
+        hits = production_hits((artifacts / "lcov.info").read_text()).get(args.uncovered)
+        if hits is None:
+            print(f"{args.uncovered}: not in the last report")
+            return 1
+        source = (ROOT / args.uncovered).read_text(errors="replace").splitlines()
+        for first, last, name in uncovered_ranges(hits, source):
+            print(f"{first}-{last} ({last - first + 1})  {name}")
+        return 0
     native = json.loads((ROOT / "tests/qa/native-tests.json").read_text())
 
     steps = []

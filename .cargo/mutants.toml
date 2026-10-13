@@ -1,0 +1,13 @@
+# cargo-mutants: breaks the code one small change at a time and checks a test notices.
+# A "missed" mutant is code the tests run but never check. See tests/qa/README.md.
+#
+# A mutant can turn a bounded loop into an unbounded one: run it only under a memory cap
+# (systemd-run -p MemoryMax=…, or ulimit -v in CI). An uncapped run once took a 59 GB
+# workstation down.
+
+# Each test in its own process, with the same timeouts as the gate.
+test_tool = "nextest"
+
+# The GTK app rebuilds for a minute per mutant and its UI is covered by the native cases;
+# mutation runs target the pure and GTK-free crates.
+exclude_globs = ["src/**", "build.rs"]

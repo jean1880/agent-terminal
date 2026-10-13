@@ -7390,6 +7390,7 @@ mod tests {
         );
         assert!(imp.summary_of(&ids[0]).is_none());
         thread_menu::tests::actions_carry_out_each_choice(window);
+        threads::tests::a_thread_page_runs_a_real_session(window);
     }
 
     fn diff_panel_shows_each_outcome() {

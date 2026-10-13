@@ -67,5 +67,13 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(totals, {"src/main.rs": (1, 2)})
 
 
+    def test_uncovered_ranges_merge_small_gaps_and_name_their_function(self):
+        source = ["fn first() {", "    a();", "    b();", "}", "", "", "", "", "fn second() {", "    c();", "}"]
+        hits = {2: 0, 3: 1, 4: 0, 10: 0, 11: 5}
+        self.assertEqual(coverage.uncovered_ranges(hits, source), [(2, 4, "first"), (10, 10, "second")])
+        self.assertEqual(coverage.uncovered_ranges(hits, source, gap=1), [(2, 2, "first"), (4, 4, "first"), (10, 10, "second")])
+        self.assertEqual(coverage.uncovered_ranges({1: 3}, source), [])
+
+
 if __name__ == "__main__":
     unittest.main()

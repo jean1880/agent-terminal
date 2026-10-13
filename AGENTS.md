@@ -229,7 +229,14 @@ The graph is a snapshot: confirm what it says in the source before editing. Refr
    instance to work around this; it is someone's live session.
 4. **Linting**: `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`.
    CI enforces fmt, clippy, and tests under Xvfb.
-5. **Installation**: do **NOT** run `make install` on developer/daily-driver
+5. **Testing**: `xvfb-run -a dbus-run-session -- cargo nextest run --workspace --all-targets`
+   (each test in its own process; `.config/nextest.toml`). `python3 tests/qa/affected.py`
+   runs only what a change needs (a shortcut, never delivery); `python3 tests/qa/gate.py` is
+   the full gate. A release also needs `tests/qa/coverage.py` (production lines, floor in
+   `coverage-floor.json`). Mutation testing (`cargo mutants`) and every heavy run go inside a
+   memory cap (`systemd-run --user --scope -p MemoryMax=16G`): one runaway mutant took a
+   workstation down. All of it is in `tests/qa/README.md`.
+6. **Installation**: do **NOT** run `make install` on developer/daily-driver
    machines. Deployment is the `debian-maintainer` apt pipeline
    (`apt.nuvek.ca`), which builds every pushed commit. A manual `make install`
    shadows the apt-delivered package in PATH, so the machine silently keeps

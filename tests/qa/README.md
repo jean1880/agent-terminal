@@ -49,6 +49,26 @@ or an affected subset), and Publish requires the commit it covered to equal the 
 SHA, as it already does for the gate. Output: `target/qa-artifacts/coverage/summary.json`
 (per crate and per file, worst first) and `lcov.info`.
 
+## Mutation testing
+
+Coverage says a line ran; it cannot say a test checked it. `cargo mutants` (config in
+`.cargo/mutants.toml`) changes `agent-core` and `agent-kit` one small edit at a time (a
+`<` to `<=`, a return value replaced, a match arm deleted) and runs the tests. A mutant
+every test still passes is listed in `mutants.out/missed.txt`: code that runs but that
+nothing verifies. Fix it with a test that asserts the behaviour, never by excluding it.
+
+**Always cap its memory.** A mutant can turn a bounded loop into an unbounded one; one
+grew to 30 GB and took a workstation down. Locally:
+
+```
+systemd-run --user --scope --quiet -p MemoryMax=16G -p MemorySwapMax=0 \
+    cargo mutants --package agent-core --jobs 3 --output target/mutants-core
+```
+
+Scope a run to what changed with `--in-diff <(git diff origin/master)` or `--file <path>`.
+In CI, `mutants.yml` runs weekly (and by hand) under `ulimit -v`, and lists missed mutants
+in the run summary; it reports, it does not gate.
+
 Diagnostics live in `target/qa-artifacts`: the selected name, exit status,
 timeout state and exact source commit/version accompany logs. Native tests print
 their synthetic fixture/geometry evidence into those logs. Native tests receive
