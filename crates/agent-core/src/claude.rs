@@ -1797,6 +1797,9 @@ mod tests {
         assert_eq!(changed(&a.feed(&init("default"))), [Mode::Ask]);
         // A mode the picker has no entry for is not forced onto it.
         assert!(changed(&a.feed(&init("bypassPermissions"))).is_empty());
+        // Claude entering plan or accept-edits on its own is reported as exactly that.
+        assert_eq!(changed(&a.feed(&init("plan"))), [Mode::Plan]);
+        assert_eq!(changed(&a.feed(&init("acceptEdits"))), [Mode::AcceptEdits]);
     }
 
     #[test]
