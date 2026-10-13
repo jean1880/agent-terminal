@@ -266,6 +266,53 @@ pub fn sidebar_sections(
     (active, groups)
 }
 
+/// Everything one sidebar redraw depends on, apart from the clock: the sections, which row is
+/// shown, whether the window has focus (it decides which rows glow) and the search text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarModel {
+    pub active: Vec<SidebarRow>,
+    pub groups: Vec<(String, Vec<SidebarRow>)>,
+    pub selected: Option<RowKey>,
+    pub focused: bool,
+    pub query: String,
+}
+
+impl SidebarModel {
+    /// The rows in the order the list draws them: the active section, then each folder group.
+    pub fn rows(&self) -> impl Iterator<Item = &SidebarRow> {
+        self.active
+            .iter()
+            .chain(self.groups.iter().flat_map(|(_, rows)| rows.iter()))
+    }
+}
+
+/// How much of the list must be redrawn to go from the last model to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redraw {
+    /// The same rows in the same order: keep every widget (only the age labels, which follow the
+    /// clock, are brought up to date).
+    InPlace,
+    /// The rows are the same but the shown row or the window focus changed: keep the widgets,
+    /// restyle the glow and the selection.
+    Restyle,
+    /// The rows (or the search) changed, or nothing is drawn yet: rebuild the list.
+    Rebuild,
+}
+
+/// What the next redraw has to do, given the model that is on screen.
+pub fn redraw_for(drawn: Option<&SidebarModel>, next: &SidebarModel) -> Redraw {
+    let Some(drawn) = drawn else {
+        return Redraw::Rebuild;
+    };
+    if drawn.active != next.active || drawn.groups != next.groups || drawn.query != next.query {
+        Redraw::Rebuild
+    } else if drawn.selected != next.selected || drawn.focused != next.focused {
+        Redraw::Restyle
+    } else {
+        Redraw::InPlace
+    }
+}
+
 /// A compact age: `now`, `5m`, `3h`, `2d`, `6w`.
 pub fn relative_time(now_ms: i64, then_ms: i64) -> String {
     let secs = (now_ms - then_ms).max(0) / 1000;
@@ -703,6 +750,101 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_row(id: &str, badge: Option<Badge>) -> SidebarRow {
+        SidebarRow {
+            key: RowKey::Thread(id.into()),
+            title: id.into(),
+            folder: "/work".into(),
+            updated_ms: 1_000,
+            driver: None,
+            badge,
+            background: Vec::new(),
+            open: true,
+            archived: false,
+        }
+    }
+
+    fn model_of(rows: Vec<SidebarRow>, selected: Option<&str>, focused: bool) -> SidebarModel {
+        let (active, groups) = sidebar_sections(rows, "", false);
+        SidebarModel {
+            active,
+            groups,
+            selected: selected.map(|id| RowKey::Thread(id.into())),
+            focused,
+            query: String::new(),
+        }
+    }
+
+    #[test]
+    fn nothing_drawn_yet_means_a_rebuild() {
+        let next = model_of(vec![model_row("a", None)], None, true);
+        assert_eq!(redraw_for(None, &next), Redraw::Rebuild);
+    }
+
+    #[test]
+    fn the_same_model_keeps_every_widget() {
+        let rows = vec![model_row("a", None), model_row("b", Some(Badge::Running))];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        assert_eq!(
+            redraw_for(Some(&drawn), &model_of(rows, Some("a"), true)),
+            Redraw::InPlace
+        );
+    }
+
+    #[test]
+    fn focus_or_the_shown_row_changing_only_restyles() {
+        let rows = vec![
+            model_row("a", Some(Badge::NeedsApproval)),
+            model_row("b", None),
+        ];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        for next in [
+            model_of(rows.clone(), Some("a"), false),
+            model_of(rows.clone(), Some("b"), true),
+            model_of(rows.clone(), None, true),
+        ] {
+            assert_eq!(redraw_for(Some(&drawn), &next), Redraw::Restyle);
+        }
+    }
+
+    #[test]
+    fn a_changed_row_or_search_rebuilds() {
+        let rows = vec![model_row("a", None), model_row("b", None)];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        // A new badge, a new title, a row less, a newer activity time (which also re-orders).
+        let mut badged = rows.clone();
+        badged[0].badge = Some(Badge::Unread);
+        let mut renamed = rows.clone();
+        renamed[1].title = "other".into();
+        let mut newer = rows.clone();
+        newer[1].updated_ms += 60_000;
+        for next in [
+            model_of(badged, Some("a"), true),
+            model_of(renamed, Some("a"), true),
+            model_of(rows[..1].to_vec(), Some("a"), true),
+            model_of(newer, Some("a"), true),
+        ] {
+            assert_eq!(redraw_for(Some(&drawn), &next), Redraw::Rebuild);
+        }
+        let mut searched = model_of(rows, Some("a"), true);
+        searched.query = "a".into();
+        assert_eq!(redraw_for(Some(&drawn), &searched), Redraw::Rebuild);
+    }
+
+    #[test]
+    fn model_rows_follow_the_drawing_order() {
+        let model = model_of(
+            vec![
+                model_row("idle", None),
+                model_row("busy", Some(Badge::Running)),
+            ],
+            None,
+            true,
+        );
+        let ids: Vec<_> = model.rows().map(|r| r.title.as_str()).collect();
+        assert_eq!(ids, ["busy", "idle"]);
+    }
 
     #[test]
     fn busy_means_running_or_waiting_and_the_heading_counts() {
