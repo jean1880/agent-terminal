@@ -451,7 +451,10 @@ pub(super) async fn write_job<T: Send + 'static>(
         .ok()
         .flatten()
         .or_else(|| {
-            error!("A store write job did not answer (the writer stopped or is far behind, or the job panicked)");
+            error!(
+                "A store write job did not answer in time (the writer is far behind or stopped, \
+                 or the job panicked); it may still be saved"
+            );
             None
         })
 }
@@ -4140,11 +4143,16 @@ impl AgentTerminalWindow {
                     obj.imp().open_created(&thread, created);
                 }
                 Some(Err(e)) => present_message(&obj, "Cannot Create a Thread", &e.to_string()),
-                None => present_message(
-                    &obj,
-                    "Cannot Create a Thread",
-                    "The thread store did not answer. The journal has the details.",
-                ),
+                None => {
+                    present_message(
+                        &obj,
+                        "The Thread Is Not Ready Yet",
+                        "The thread store is far behind. The thread may still be saved: it \
+                         will show in the list once it is.",
+                    );
+                    // After the writer's barrier: a create that landed late shows.
+                    obj.imp().reload_summaries();
+                }
             }
         });
         None
@@ -4230,11 +4238,15 @@ impl AgentTerminalWindow {
             match stored {
                 Some(Ok(())) => opened(obj.imp()),
                 Some(Err(e)) => present_message(&obj, "Cannot Resume the Session", &e.to_string()),
-                None => present_message(
-                    &obj,
-                    "Cannot Resume the Session",
-                    "The thread store did not answer. The journal has the details.",
-                ),
+                None => {
+                    present_message(
+                        &obj,
+                        "The Session Is Not Ready Yet",
+                        "The thread store is far behind. The session may still be saved as a \
+                         thread: it will show in the list once it is.",
+                    );
+                    obj.imp().reload_summaries();
+                }
             }
         });
     }

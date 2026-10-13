@@ -275,8 +275,9 @@ impl Closing {
                 if let Some(button) = closing.quit_now.child() {
                     if !button.has_css_class("suggested-action") {
                         warn!(left, "close: the store is not keeping up; Quit Now offered");
+                        // The default, highlighted, but focus is left where it is: a stray
+                        // Enter must not quit with writes unsaved.
                         button.add_css_class("suggested-action");
-                        button.grab_focus();
                     }
                 }
             }
