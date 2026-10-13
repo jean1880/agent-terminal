@@ -624,6 +624,15 @@ fn import_native_history(
     }
 }
 
+/// Which background probes [`AgentTerminalWindow::refresh_agent_data`] runs after its scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Probes {
+    /// Only what the catalogue's and the account status's clocks say is due.
+    IfDue,
+    /// Every ready agent: its profile changed, or the user asked to check again.
+    Force,
+}
+
 /// How long a session start waits for its agent's model list to be fetched in this run, so a
 /// model the agent retired is ported before it reaches argv. A slow probe does not hold a thread
 /// hostage: after this it starts, and the later `set_retired` path still catches the model.
@@ -646,13 +655,12 @@ pub(super) async fn wait_until(
 }
 
 /// Waits (at most [`CATALOG_WAIT`]) for `driver`'s model list to be fresh, or for its fetch to
-/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s.
+/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s. Only a
+/// fetch in this run settles it, never the cache's age: argv decisions use the same predicate.
+/// The one start-up fetch per ready agent makes the wait rare after the first seconds.
 async fn wait_for_fresh_catalog(driver: Driver) {
     let catalog = ModelCatalog::shared();
-    wait_until(CATALOG_WAIT, std::time::Duration::from_millis(100), || {
-        catalog.is_settled(driver)
-    })
-    .await;
+    wait_for_catalog(&catalog, driver, CATALOG_WAIT).await;
     if !catalog.is_fresh(driver) {
         info!(
             "{} model list not fresh after {:?}; starting on the stored model",
@@ -660,6 +668,18 @@ async fn wait_for_fresh_catalog(driver: Driver) {
             CATALOG_WAIT
         );
     }
+}
+
+/// Waits at most `limit` for `catalog`'s fetch of `driver` in this run to settle; whether it did.
+async fn wait_for_catalog(
+    catalog: &ModelCatalog,
+    driver: Driver,
+    limit: std::time::Duration,
+) -> bool {
+    wait_until(limit, std::time::Duration::from_millis(100), || {
+        catalog.is_settled(driver)
+    })
+    .await
 }
 
 /// Everything [`AgentTerminalWindow::build_thread`] needs once the agent is resolved and the
@@ -4146,9 +4166,11 @@ impl AgentTerminalWindow {
     // -----------------------------------------------------------------------------------------
 
     /// Resolves both chat agents and refreshes the model catalogue and the account status with
-    /// their binaries; again every ten minutes while the window is focused.
+    /// their binaries; checks again every ten minutes while the window is focused, probing only
+    /// what is due.
     fn watch_account_status(&self) {
-        self.refresh_agent_data();
+        // The start-up round: nothing was fetched in this run yet, so every ready agent is due.
+        self.refresh_agent_data(Probes::IfDue);
         let obj = self.obj();
         // An agent found signed out (or signed in again) re-shows its threads' banners. The
         // listener goes with the window (the status is app-wide).
@@ -4167,7 +4189,7 @@ impl AgentTerminalWindow {
                 glib::ControlFlow::Break,
                 move || {
                     if obj.is_active() {
-                        obj.imp().refresh_agent_data();
+                        obj.imp().refresh_agent_data(Probes::IfDue);
                     }
                     glib::ControlFlow::Continue
                 }
@@ -4179,7 +4201,13 @@ impl AgentTerminalWindow {
     /// driver's [`Availability`] (the one source for every menu and picker), then the model
     /// catalogue and the account status for the agents that turned out Ready. A switched-off
     /// agent is known at once; the others keep their last state until the scan answers.
-    pub(super) fn refresh_agent_data(&self) {
+    ///
+    /// The scan itself spawns no agent (cached resolutions, a stat per binary). With
+    /// [`Probes::IfDue`] the catalogue and the account status probe only what their clocks say
+    /// is due (an agent back from missing always is), so regaining focus with fresh data spawns
+    /// nothing; [`Probes::Force`] probes every ready agent (Settings changed it, or the user
+    /// asked to check again).
+    pub(super) fn refresh_agent_data(&self, probes: Probes) {
         // Also what a switch to agy needs: its hook verdict, read off the main thread.
         refresh_hook_verdict();
         let availability = AgentAvailability::shared();
@@ -4242,7 +4270,17 @@ impl AgentTerminalWindow {
                         unset: unset_list(&clear),
                     },
                 ));
-                availability.set(driver, classify(false, Some(resolved.program.as_deref())));
+                let state = classify(false, Some(resolved.program.as_deref()));
+                // Back from missing (installed, or switched on again): its list may be new.
+                if state.is_ready()
+                    && matches!(
+                        availability.get(driver),
+                        Availability::Missing | Availability::Disabled
+                    )
+                {
+                    ModelCatalog::shared().mark_due(driver);
+                }
+                availability.set(driver, state);
             }
             // Only what is Ready is probed. The same gate holds for a thread's session
             // (`build_thread`, `start_session`) and a cross-agent switch (`agent_launch`): a
@@ -4253,8 +4291,17 @@ impl AgentTerminalWindow {
                     .map(|(_, env)| env.clone())
                     .unwrap_or_default()
             });
-            ModelCatalog::shared().refresh(&targets);
-            AccountStatus::shared().refresh(&targets);
+            match probes {
+                Probes::IfDue => {
+                    let now = crate::freshness::now_epoch();
+                    ModelCatalog::shared().refresh_if_due(&targets, now);
+                    AccountStatus::shared().refresh_if_due(&targets, now);
+                }
+                Probes::Force => {
+                    ModelCatalog::shared().refresh(&targets);
+                    AccountStatus::shared().refresh(&targets);
+                }
+            }
             if let Some(obj) = obj.upgrade() {
                 obj.imp().on_availability_changed();
             }
@@ -4277,8 +4324,10 @@ impl AgentTerminalWindow {
             move || obj.imp().evaluate_models()
         ));
         obj.connect_is_active_notify(|window| {
+            // Only the cheap rescan, and the probes whose clocks are due: focus alone is not a
+            // reason to spawn agents (it used to cost a probe round on nearly every focus).
             if window.is_active() && AgentAvailability::shared().scan_is_stale() {
-                window.imp().refresh_agent_data();
+                window.imp().refresh_agent_data(Probes::IfDue);
             }
             // The thread in view is looked at again: its unread mark and notifications go.
             if window.is_active() {
@@ -4432,7 +4481,7 @@ impl AgentTerminalWindow {
     /// The banner stays until the probe answers.
     pub(super) fn check_sign_in(&self, driver: Driver) {
         AccountStatus::shared().recheck(driver);
-        self.refresh_agent_data();
+        self.refresh_agent_data(Probes::Force);
         self.show_toast(&format!("Checking {}…", driver.info().label));
     }
 
@@ -5053,6 +5102,92 @@ pub(super) mod tests {
             decide_live_model(&list, true, None, None),
             (None, None, None)
         );
+    }
+
+    fn sonnet() -> agent_core::catalog::CatalogModel {
+        agent_core::catalog::CatalogModel {
+            driver: Driver::Claude,
+            id: "sonnet".into(),
+            display: "Sonnet".into(),
+            description: None,
+            efforts: vec!["low".into(), "high".into()],
+            default_effort: None,
+            via: None,
+        }
+    }
+
+    /// A catalogue holding only a recent cached Claude list (fetched a minute ago, last run).
+    fn cached_catalog(dir: &std::path::Path) -> Rc<ModelCatalog> {
+        let path = dir.join("models.json");
+        let cache = serde_json::json!({
+            "claude": [sonnet()],
+            "read_at": {"claude": crate::freshness::now_epoch() - 60},
+        });
+        std::fs::write(&path, cache.to_string()).unwrap();
+        Rc::new(ModelCatalog::with_cache(Some(path)))
+    }
+
+    /// A start from a list fetched in this run does not wait.
+    #[test]
+    fn a_thread_started_after_this_runs_fetch_does_not_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = cached_catalog(dir.path());
+        catalog.land_fetch(Driver::Claude, vec![sonnet()]);
+        let ctx = glib::MainContext::new();
+        let started = std::time::Instant::now();
+        assert!(ctx.block_on(wait_for_catalog(&catalog, Driver::Claude, CATALOG_WAIT)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    /// A cached list, however recent, is neither a reason to skip the wait nor to port a model
+    /// in argv: the start waits (at most CATALOG_WAIT) for this run's fetch, which then ports a
+    /// retired model before it reaches argv.
+    #[test]
+    fn a_thread_started_from_only_a_cached_list_waits_then_ports_a_retired_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = cached_catalog(dir.path());
+        assert_eq!(catalog.models_of(Driver::Claude).len(), 1, "cache read");
+        assert!(
+            !catalog.is_settled(Driver::Claude),
+            "cache alone does not settle"
+        );
+        // On the cached list alone, nothing is ported.
+        let retired = || {
+            (
+                Some("claude-sonnet-3-7".to_owned()),
+                Some("high".to_owned()),
+            )
+        };
+        let decide = |c: &ModelCatalog| {
+            let (m, e) = retired();
+            decide_live_model(
+                &c.models_of(Driver::Claude),
+                c.is_fresh(Driver::Claude),
+                m,
+                e,
+            )
+        };
+        assert_eq!(decide(&catalog).0.as_deref(), Some("claude-sonnet-3-7"));
+        crate::testutil::in_loop(|ctx| {
+            // This run's fetch lands while the start waits.
+            let landing = catalog.clone();
+            ctx.spawn_local(async move {
+                glib::timeout_future(std::time::Duration::from_millis(150)).await;
+                landing.land_fetch(Driver::Claude, vec![sonnet()]);
+            });
+            let started = std::time::Instant::now();
+            let settled = ctx.block_on(wait_for_catalog(&catalog, Driver::Claude, CATALOG_WAIT));
+            assert!(settled);
+            let waited = started.elapsed();
+            assert!(waited >= std::time::Duration::from_millis(100), "it waited");
+            assert!(waited <= CATALOG_WAIT);
+        });
+        let (model, effort, ported) = decide(&catalog);
+        assert_eq!(
+            (model.as_deref(), effort.as_deref()),
+            (Some("sonnet"), Some("high"))
+        );
+        assert_eq!(ported.expect("recorded").model, "claude-sonnet-3-7");
     }
 
     #[test]

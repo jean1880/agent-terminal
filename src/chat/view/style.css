@@ -64,7 +64,12 @@
 .usage-bar progress { min-height: 4px; border-radius: 2px; background-color: @at_success; }
 .usage-bar.usage-warn progress { background-color: @at_warning; }
 .usage-bar.usage-crit progress { background-color: @at_danger; }
+/* An Aging reading (freshness.rs): never the healthy green, and the whole meter muted. */
+.usage-bar.usage-stale progress { background-color: @at_fg_dim; }
+.usage-stale-meter { opacity: 0.6; }
 .usage-text { font-family: monospace; font-size: 0.85em; color: @at_fg_dim; }
+.model-footer-text { font-size: 0.85em; }
+.model-footer-text.stale { font-style: italic; }
 .subagent-button { padding: 2px 8px; border-radius: 8px; }
 .subagent-count { font-size: 0.85em; color: @at_fg; }
 .subagent-name { font-weight: 600; color: @at_fg_strong; }

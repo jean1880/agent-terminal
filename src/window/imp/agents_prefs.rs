@@ -1363,7 +1363,7 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 imp.edit_agent_profile(driver, |p| p.disabled = !on);
                 // The scan decides what is offered: run it again with the new setting.
-                imp.refresh_agent_data();
+                imp.refresh_agent_data(super::threads::Probes::Force);
             }
         ));
         // The row says what detection found: ready (where), missing (how to install), or off.
@@ -1525,7 +1525,7 @@ impl AgentTerminalWindow {
                 imp.edit_agent_profile(driver, |p| p.command = text.clone());
                 detect(text);
                 imp.refresh_profile_selection();
-                imp.refresh_agent_data();
+                imp.refresh_agent_data(super::threads::Probes::Force);
             }
         ));
         group.add(&command);
@@ -1595,7 +1595,7 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 if imp.agent_profile_now(driver).env_file != value {
                     imp.edit_agent_profile(driver, |p| p.env_file = value);
-                    imp.refresh_agent_data();
+                    imp.refresh_agent_data(super::threads::Probes::Force);
                 }
             }
         ));
