@@ -5344,7 +5344,79 @@ pub(super) mod tests {
         assert!(!imp.row_is_busy(&RowKey::Thread(thread.clone())));
         assert_ne!(badge(), Some(Badge::NeedsApproval));
 
-        imp.close_row_now(&RowKey::Thread(thread.clone()));
+        // Busy again, for what must ask before it cuts the turn short.
+        slot.send_prompt("approve again");
+        assert!(
+            pump_until(&ctx, 15, || state(&|c| c.approval)),
+            "a second approval"
+        );
+        let key = RowKey::Thread(thread.clone());
+        // Answers the open dialog with `heading` through its own response signal.
+        let answer = |heading: &str, response: &str| {
+            let open = || {
+                adw::prelude::AdwApplicationWindowExt::visible_dialog(window)
+                    .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+                    .filter(|d| d.heading().as_deref() == Some(heading))
+            };
+            assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
+            let dialog = open().expect("the dialog");
+            dialog.emit_by_name::<()>("response", &[&response]);
+            dialog.force_close();
+            for _ in 0..20 {
+                ctx.iteration(false);
+            }
+        };
+
+        // Fork while busy: a second thread on the same agent and folder; this one is untouched.
+        let pages = imp.tabs.borrow().len();
+        imp.view_action(&thread, &ViewAction::Fork);
+        assert!(
+            pump_until(&ctx, 15, || imp.tabs.borrow().len() == pages + 1),
+            "a fork opens"
+        );
+        let fork = {
+            let tabs = imp.tabs.borrow();
+            let new = tabs.last().expect("the fork's page");
+            let chat = new.chat.as_ref().expect("a thread");
+            assert_ne!(chat.thread, thread);
+            assert_eq!(
+                (chat.driver, new.dir.as_str()),
+                (Driver::Codex, folder.as_str())
+            );
+            chat.thread.clone()
+        };
+        assert!(state(&|c| c.approval), "forking leaves the source waiting");
+        imp.close_row_now(&RowKey::Thread(fork));
+
+        // Closing a busy thread asks once (a second close while it asks adds nothing); Cancel
+        // keeps the thread and its turn.
+        imp.close_row(&key);
+        imp.close_row(&key);
+        answer("Stop the Running Turn and Close?", "cancel");
+        assert!(
+            adw::prelude::AdwApplicationWindowExt::visible_dialog(window).is_none(),
+            "the second close asked nothing more"
+        );
+        assert!(state(&|c| c.approval), "cancel keeps the thread waiting");
+
+        // Switching agents mid-turn asks too; Keep Waiting changes nothing.
+        imp.view_action(
+            &thread,
+            &ViewAction::Handoff {
+                target: Some(Driver::Claude),
+            },
+        );
+        answer("Switch agents now?", "cancel");
+        assert_eq!(slot.get().map(|s| s.status().driver), Some(Driver::Codex));
+        assert!(state(&|c| c.approval));
+
+        // Stop and Close: the page goes, and the thread with it from the open pages.
+        imp.close_row(&key);
+        answer("Stop the Running Turn and Close?", "stop");
+        assert!(
+            pump_until(&ctx, 5, || imp.page_of_thread(&thread).is_none()),
+            "stop and close closes the page"
+        );
         availability.set(Driver::Codex, before);
         RESOLVED.with(|r| r.borrow_mut().remove(&(command, env_file)));
     }
