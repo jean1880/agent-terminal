@@ -1442,6 +1442,9 @@ fn control_request_body(control: &Control) -> Value {
         }
         Control::ContextUsage => json!({"subtype": "get_context_usage"}),
         Control::Usage => json!({"subtype": "get_usage"}),
+        Control::TaskOutput { task_id } => {
+            json!({"subtype": "get_task_output", "task_id": task_id})
+        }
     }
 }
 
@@ -3555,6 +3558,12 @@ mod tests {
                 json!({"subtype": "get_context_usage"}),
             ),
             (Control::Usage, json!({"subtype": "get_usage"})),
+            (
+                Control::TaskOutput {
+                    task_id: "b1".into(),
+                },
+                json!({"subtype": "get_task_output", "task_id": "b1"}),
+            ),
         ];
         for (control, body) in cases {
             assert_eq!(

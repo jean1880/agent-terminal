@@ -145,6 +145,27 @@ pub fn context_breakdown(v: &Value) -> ContextBreakdown {
     }
 }
 
+/// The end of a background task's output (`get_task_output`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskOutput {
+    pub text: String,
+    /// The whole output's size; `None` when the reply does not say.
+    pub total_bytes: Option<u64>,
+    /// `text` is only the end of a longer output.
+    pub truncated: bool,
+}
+
+/// `get_task_output` (Claude: `output`, `total_bytes`, `truncated`).
+pub fn task_output(v: &Value) -> TaskOutput {
+    TaskOutput {
+        text: str_field(v, &["output", "text"])
+            .unwrap_or_default()
+            .to_owned(),
+        total_bytes: u64_field(v, &["total_bytes", "totalBytes"]),
+        truncated: v.get("truncated").and_then(Value::as_bool) == Some(true),
+    }
+}
+
 /// Flattens JSON into `(dotted.path, value)` rows for the read-only settings and usage views.
 /// Scalars render as JSON; empty containers as `{}` / `[]`. Long values are cut at `max_len`.
 pub fn flatten(v: &Value, max_len: usize) -> Vec<(String, String)> {
@@ -447,6 +468,19 @@ mod tests {
             ["d.md"]
         );
         assert!(file_suggestions(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn task_output_reads_claude_fields_and_tolerates_gaps() {
+        assert_eq!(
+            task_output(&json!({"output": "ok\n", "total_bytes": 9000, "truncated": true})),
+            TaskOutput {
+                text: "ok\n".to_owned(),
+                total_bytes: Some(9000),
+                truncated: true,
+            }
+        );
+        assert_eq!(task_output(&json!(null)), TaskOutput::default());
     }
 
     #[test]

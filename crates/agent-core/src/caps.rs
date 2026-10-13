@@ -39,6 +39,10 @@ pub struct Capabilities {
     /// runs a message written mid-turn as the next turn anyway (verified 2026-10-11).
     #[serde(default)]
     pub live_input: bool,
+    /// Reads a background shell task's output while it runs (`Control::TaskOutput`, Claude
+    /// `get_task_output`).
+    #[serde(default)]
+    pub task_output: bool,
 }
 
 impl Capabilities {
@@ -73,6 +77,8 @@ impl Capabilities {
             // A user line written mid-turn is folded into that turn: one `result`, no new
             // `init` (probe, 2026-10-11).
             live_input: true,
+            // `get_task_output`: the last 8 KiB of a shell or Monitor task (CLI 2.1.296 schema).
+            task_output: true,
         }
     }
 
@@ -99,6 +105,8 @@ impl Capabilities {
             forms: false,
             // A message written mid-turn waits and runs as the next turn (probe, 2026-10-11).
             live_input: false,
+            // agy reports no background tasks.
+            task_output: false,
         }
     }
 
@@ -135,6 +143,8 @@ impl Capabilities {
             forms: true,
             // `turn/steer` (codex-cli 0.161.0's own schema).
             live_input: true,
+            // Its workers are sub-agents, shown in the sub-agent panel; no shell task to read.
+            task_output: false,
         }
     }
 }
@@ -161,10 +171,11 @@ pub enum Feature {
     PlanMode,
     Forms,
     LiveInput,
+    TaskOutput,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 16] = [
+    pub const ALL: [Feature; 17] = [
         Feature::ModelSwitch,
         Feature::LiveApprovals,
         Feature::InterruptKeepsProcess,
@@ -181,6 +192,7 @@ impl Feature {
         Feature::PlanMode,
         Feature::Forms,
         Feature::LiveInput,
+        Feature::TaskOutput,
     ];
 
     /// Where the app renders this fact (for people reading the contract test; the test checks
@@ -205,6 +217,7 @@ impl Feature {
             Feature::PlanMode => "mode picker: Plan",
             Feature::Forms => "form cards (a tool server's form or link)",
             Feature::LiveInput => "composer while a turn runs: sent at once, or queued",
+            Feature::TaskOutput => "background task list: a shell task's live output",
         }
     }
 }
@@ -229,6 +242,7 @@ impl Capabilities {
             Feature::PlanMode => self.plan_mode,
             Feature::Forms => self.forms,
             Feature::LiveInput => self.live_input,
+            Feature::TaskOutput => self.task_output,
         }
     }
 
@@ -269,6 +283,7 @@ impl Capabilities {
                 "{agent} cannot take a message while it works; it is queued and sent when the \
                  turn ends."
             ),
+            Feature::TaskOutput => format!("{agent} does not share a background task's output."),
         })
     }
 }
@@ -299,6 +314,7 @@ mod tests {
             plan_mode: _,
             forms: _,
             live_input: _,
+            task_output: _,
         } = Capabilities::claude();
         let mut seen = std::collections::HashSet::new();
         assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
@@ -326,7 +342,8 @@ mod tests {
                 Questions => Some(PlanMode),
                 PlanMode => Some(Forms),
                 Forms => Some(LiveInput),
-                LiveInput => None,
+                LiveInput => Some(TaskOutput),
+                TaskOutput => None,
             }
         }
         let mut walked = vec![ModelSwitch];

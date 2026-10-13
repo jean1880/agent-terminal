@@ -678,8 +678,13 @@ impl Inner {
         let env = self.route_codex_permission(env);
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        if let Err(e) = self.store.append_event(&self.thread, provider, &env) {
-            warn!(error = %e, "could not persist an event");
+        // A control reply answers a live request and replay drops it; storing it would also
+        // write a polled background task's output to the store once a second.
+        let transient = matches!(env.event, Event::ControlResult { .. });
+        if !transient {
+            if let Err(e) = self.store.append_event(&self.thread, provider, &env) {
+                warn!(error = %e, "could not persist an event");
+            }
         }
         self.apply(&env);
         self.reply_turn.borrow_mut().observe(&env);

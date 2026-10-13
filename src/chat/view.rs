@@ -14,6 +14,7 @@
 //! Re-entrancy rule: a backend may call the sink synchronously from inside any trait method,
 //! so no `RefCell` borrow is ever held across a backend call.
 
+mod background;
 mod cards;
 mod composer;
 pub mod demo;
@@ -48,7 +49,7 @@ use adw::subclass::prelude::*;
 use agent_core::adapter::{Control, Driver, Mode};
 use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
 use agent_core::event::Event;
-use agent_core::event::{Envelope, PlanStep, StepStatus};
+use agent_core::event::{BackgroundTask, BackgroundTaskKind, Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
@@ -149,6 +150,14 @@ glib::wrapper! {
         @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Orientable;
 }
 
+/// What picking a background task shows.
+enum BackgroundTarget {
+    /// The sub-agent panel for this item.
+    Subagent(String),
+    /// The task's output, read from the agent.
+    Output,
+}
+
 /// The view's state. Held strongly only by the widget; every handler holds a `Weak`.
 pub(crate) struct Inner {
     backend: Rc<dyn ChatBackend>,
@@ -187,6 +196,10 @@ pub(crate) struct Inner {
     subagent_panel: RefCell<Option<Rc<subagents::SubagentPanel>>>,
     /// Sub-agent items (and their steps) changed since the last flush.
     subagent_changes: RefCell<Vec<String>>,
+    /// The thinking strip's list of background tasks.
+    background_button: Rc<background::BackgroundButton>,
+    /// The background shell task whose output is shown, while its dialog is open.
+    task_panel: RefCell<Option<Rc<background::TaskOutputPanel>>>,
     /// The thread's folder: what the app's own `@` file index lists for agents that do not
     /// answer `Control::FileSuggestions` themselves.
     workspace: RefCell<Option<std::path::PathBuf>>,
@@ -231,6 +244,12 @@ impl ChatView {
                 },
             );
             let w = weak.clone();
+            let background_button = background::BackgroundButton::new(move |task| {
+                if let Some(inner) = w.upgrade() {
+                    inner.open_background(task);
+                }
+            });
+            let w = weak.clone();
             let interruption = interruption::InterruptionShelf::new(sink.clone(), move |id| {
                 if let Some(inner) = w.upgrade() {
                     inner.transcript.focus_pending_card(&id);
@@ -261,6 +280,8 @@ impl ChatView {
                 subagent_shelf,
                 subagent_panel: RefCell::new(None),
                 subagent_changes: RefCell::new(Vec::new()),
+                background_button,
+                task_panel: RefCell::new(None),
                 workspace: RefCell::new(None),
                 file_seq: Cell::new(0),
                 file_index: RefCell::new(workspace_files::Index::default()),
@@ -268,6 +289,7 @@ impl ChatView {
         });
 
         inner.header.set_subagents(inner.subagent_button.widget());
+        inner.thinking.append(inner.background_button.widget());
         view.append(&inner.header.bin);
         // Toasts cover the transcript only, never the shelves or the composer where the next
         // action is (see `ChatView::toast_overlay`).
@@ -693,6 +715,9 @@ impl Inner {
             let summary = agents.iter().find(|a| a.id == panel.id());
             panel.refresh(&model, summary, changed);
         }
+        drop(model);
+        // A background sub-agent's row opens once its item is known.
+        self.refresh_background();
     }
 
     /// Expands every sub-agent card in the thread, or collapses them all when every one is
@@ -800,6 +825,101 @@ impl Inner {
         *self.subagent_panel.borrow_mut() = Some(panel);
     }
 
+    /// Where a background task leads: its sub-agent's panel, or its output (`None`: nothing).
+    fn background_target(&self, task: &BackgroundTask) -> Option<BackgroundTarget> {
+        if task.kind == BackgroundTaskKind::Agent {
+            // Claude's tasks name their `Agent` call; a provider worker is its own item.
+            let id = task.tool_use_id.as_deref().unwrap_or(&task.id);
+            let known = self.model.borrow().subagents().iter().any(|a| a.id == id);
+            return known.then(|| BackgroundTarget::Subagent(id.to_owned()));
+        }
+        self.backend
+            .status()
+            .capabilities
+            .task_output
+            .then_some(BackgroundTarget::Output)
+    }
+
+    /// The strip's background task list, from the model.
+    fn refresh_background(&self) {
+        let tasks = self.model.borrow().background_tasks();
+        let listed = tasks
+            .into_iter()
+            .map(|task| background::ListedTask {
+                openable: self.background_target(&task).is_some(),
+                task,
+            })
+            .collect();
+        self.background_button.set(listed);
+    }
+
+    fn open_background(self: &Rc<Self>, task: &BackgroundTask) {
+        match self.background_target(task) {
+            Some(BackgroundTarget::Subagent(id)) => self.open_subagent(&id),
+            Some(BackgroundTarget::Output) => self.open_task_output(task),
+            None => {}
+        }
+    }
+
+    /// Shows one background task's output in a dialog, read from the agent once a second until
+    /// the dialog closes or the task has ended (then once more, for its last lines).
+    fn open_task_output(self: &Rc<Self>, task: &BackgroundTask) {
+        let panel = background::TaskOutputPanel::new(task);
+        let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) else {
+            return;
+        };
+        adw::prelude::AdwDialogExt::present(panel.dialog(), Some(&parent));
+        *self.task_panel.borrow_mut() = Some(panel.clone());
+        if self.poll_task_output(&panel) == glib::ControlFlow::Break {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let panel = Rc::downgrade(&panel);
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            match (weak.upgrade(), panel.upgrade()) {
+                (Some(inner), Some(panel)) => inner.poll_task_output(&panel),
+                _ => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    fn poll_task_output(&self, panel: &Rc<background::TaskOutputPanel>) -> glib::ControlFlow {
+        if panel.closed() {
+            let mut open = self.task_panel.borrow_mut();
+            if open.as_ref().is_some_and(|p| Rc::ptr_eq(p, panel)) {
+                *open = None;
+            }
+            return glib::ControlFlow::Break;
+        }
+        let running = self
+            .model
+            .borrow()
+            .background_tasks()
+            .iter()
+            .any(|t| t.id == panel.task_id());
+        if !running {
+            panel.mark_ended();
+        }
+        if !panel.begin_read() {
+            return glib::ControlFlow::Continue;
+        }
+        let weak = Rc::downgrade(panel);
+        let control = Control::TaskOutput {
+            task_id: panel.task_id().to_owned(),
+        };
+        self.requests
+            .ask(self.backend.as_ref(), control, move |result| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.show(result.map(|v| payload::task_output(&v)));
+                }
+            });
+        if panel.ended() {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    }
+
     fn control_result(&self, request: &str, result: Result<serde_json::Value, String>) {
         if self.composer.is_waiting_for(request) {
             let files = result
@@ -839,6 +959,7 @@ impl Inner {
         );
         self.thinking
             .set(&activity, cards::driver_name(status.driver));
+        self.refresh_background();
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
         self.header
