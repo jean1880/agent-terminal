@@ -15,7 +15,7 @@ use gtk4::prelude::*;
 use serde_json::Value;
 
 use super::cards::{
-    add_button, button_row, content_label, label, mono, wrapping, RowEvent, RowSink,
+    add_button, button_row, chip_flow, content_label, label, mono, wrapping, RowEvent, RowSink,
 };
 use super::form_draft::{choose_hint, number_value, Draft};
 use super::model::{FormCard, FormState};
@@ -226,9 +226,9 @@ impl Inner {
         let status = label("", &["approval-outcome"]);
         wrapping(&status);
         status.set_visible(false);
-        let buttons = button_row();
+        let (buttons_row, buttons) = button_row();
         footer.append(&status);
-        footer.append(&buttons);
+        footer.append(&buttons_row);
         root.append(&footer);
         let sent_to = label(
             &format!("Sent to {}.", card.server),
@@ -504,7 +504,7 @@ impl Inner {
         let open = matches!(state, FormState::Pending | FormState::Sent);
         self.body.set_visible(open);
         self.body.set_sensitive(state == FormState::Pending);
-        self.buttons.set_visible(open);
+        super::cards::set_row_visible(&self.buttons, open);
         self.buttons.set_sensitive(state == FormState::Pending);
         self.sent_to.set_visible(open);
         if !open || !link {
@@ -887,13 +887,7 @@ fn build_field(
             multi: false,
             ..
         } => {
-            let flow = gtk4::FlowBox::new();
-            flow.set_selection_mode(gtk4::SelectionMode::None);
-            flow.set_max_children_per_line(4);
-            flow.set_column_spacing(8);
-            flow.set_row_spacing(8);
-            flow.set_homogeneous(false);
-            flow.set_halign(gtk4::Align::Start);
+            let flow = chip_flow(4);
             let guard = Rc::new(Cell::new(false));
             let toggles: Vec<gtk4::ToggleButton> = options
                 .iter()
