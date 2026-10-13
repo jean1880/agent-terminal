@@ -5234,6 +5234,12 @@ pub(super) mod tests {
     pub(crate) fn a_thread_page_runs_a_real_session(window: &crate::window::AgentTerminalWindow) {
         use crate::chat::ChatBackend;
         use crate::testutil::pump_until;
+        // The app's own log lines (why a thread opened with or without a session) go to the
+        // test's output, so a failure here explains itself.
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
         let imp = window.imp();
         let ctx = glib::MainContext::default();
         let dir = tempfile::tempdir().expect("tmp");
@@ -5311,8 +5317,13 @@ pub(super) mod tests {
         };
         assert!(
             pump_until(&ctx, 15, || slot.get().is_some()),
-            "the session starts; Codex is {:?}; page: {:?}; fixture frames: {}",
+            "the session starts; Codex is {:?}; resolved now: {:?}; page: {:?}; fixture frames: {}",
             availability.get(Driver::Codex),
+            imp.config
+                .borrow()
+                .agent_profile(Driver::Codex)
+                .and_then(cached_agent)
+                .map(|r| r.program),
             page_state(),
             frames()
         );
@@ -5380,9 +5391,14 @@ pub(super) mod tests {
             let dialog = open().expect("the dialog");
             dialog.emit_by_name::<()>("response", &[&response]);
             dialog.force_close();
-            for _ in 0..20 {
-                ctx.iteration(false);
-            }
+            // Closing is animated: wait for it to go (bounded), never a fixed number of turns.
+            assert!(
+                pump_until(&ctx, 10, || {
+                    adw::prelude::AdwApplicationWindowExt::visible_dialog(window)
+                        .is_none_or(|d| d != dialog.clone().upcast::<adw::Dialog>())
+                }),
+                "{heading} closes once answered"
+            );
         };
 
         // Fork while busy: a second thread on the same agent and folder; this one is untouched.
@@ -5411,6 +5427,8 @@ pub(super) mod tests {
         imp.close_row(&key);
         imp.close_row(&key);
         answer("Stop the Running Turn and Close?", "cancel");
+        // A second question would be the next dialog up, and it would not go away by itself.
+        crate::testutil::settle(&ctx);
         assert!(
             adw::prelude::AdwApplicationWindowExt::visible_dialog(window).is_none(),
             "the second close asked nothing more"
