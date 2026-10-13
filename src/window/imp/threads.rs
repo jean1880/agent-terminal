@@ -623,6 +623,15 @@ fn import_native_history(
     }
 }
 
+/// Which background probes [`AgentTerminalWindow::refresh_agent_data`] runs after its scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Probes {
+    /// Only what the catalogue's and the account status's clocks say is due.
+    IfDue,
+    /// Every ready agent: its profile changed, or the user asked to check again.
+    Force,
+}
+
 /// How long a session start waits for its agent's model list to be fetched in this run, so a
 /// model the agent retired is ported before it reaches argv. A slow probe does not hold a thread
 /// hostage: after this it starts, and the later `set_retired` path still catches the model.
@@ -645,9 +654,14 @@ pub(super) async fn wait_until(
 }
 
 /// Waits (at most [`CATALOG_WAIT`]) for `driver`'s model list to be fresh, or for its fetch to
-/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s.
+/// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s. A
+/// cached list fetched within the TTL does not wait at all (it is still not used to port a
+/// model; the fetch landing later re-judges the thread).
 async fn wait_for_fresh_catalog(driver: Driver) {
     let catalog = ModelCatalog::shared();
+    if catalog.may_start_without_waiting(driver, crate::freshness::now_epoch()) {
+        return;
+    }
     wait_until(CATALOG_WAIT, std::time::Duration::from_millis(100), || {
         catalog.is_settled(driver)
     })
@@ -3997,9 +4011,11 @@ impl AgentTerminalWindow {
     // -----------------------------------------------------------------------------------------
 
     /// Resolves both chat agents and refreshes the model catalogue and the account status with
-    /// their binaries; again every ten minutes while the window is focused.
+    /// their binaries; checks again every ten minutes while the window is focused, probing only
+    /// what is due.
     fn watch_account_status(&self) {
-        self.refresh_agent_data();
+        // The start-up round: nothing was fetched in this run yet, so every ready agent is due.
+        self.refresh_agent_data(Probes::IfDue);
         let obj = self.obj();
         // An agent found signed out (or signed in again) re-shows its threads' banners. The
         // listener goes with the window (the status is app-wide).
@@ -4018,7 +4034,7 @@ impl AgentTerminalWindow {
                 glib::ControlFlow::Break,
                 move || {
                     if obj.is_active() {
-                        obj.imp().refresh_agent_data();
+                        obj.imp().refresh_agent_data(Probes::IfDue);
                     }
                     glib::ControlFlow::Continue
                 }
@@ -4030,7 +4046,13 @@ impl AgentTerminalWindow {
     /// driver's [`Availability`] (the one source for every menu and picker), then the model
     /// catalogue and the account status for the agents that turned out Ready. A switched-off
     /// agent is known at once; the others keep their last state until the scan answers.
-    pub(super) fn refresh_agent_data(&self) {
+    ///
+    /// The scan itself spawns no agent (cached resolutions, a stat per binary). With
+    /// [`Probes::IfDue`] the catalogue and the account status probe only what their clocks say
+    /// is due (an agent back from missing always is), so regaining focus with fresh data spawns
+    /// nothing; [`Probes::Force`] probes every ready agent (Settings changed it, or the user
+    /// asked to check again).
+    pub(super) fn refresh_agent_data(&self, probes: Probes) {
         // Also what a switch to agy needs: its hook verdict, read off the main thread.
         refresh_hook_verdict();
         let availability = AgentAvailability::shared();
@@ -4093,7 +4115,17 @@ impl AgentTerminalWindow {
                         unset: unset_list(&clear),
                     },
                 ));
-                availability.set(driver, classify(false, Some(resolved.program.as_deref())));
+                let state = classify(false, Some(resolved.program.as_deref()));
+                // Back from missing (installed, or switched on again): its list may be new.
+                if state.is_ready()
+                    && matches!(
+                        availability.get(driver),
+                        Availability::Missing | Availability::Disabled
+                    )
+                {
+                    ModelCatalog::shared().mark_due(driver);
+                }
+                availability.set(driver, state);
             }
             // Only what is Ready is probed. The same gate holds for a thread's session
             // (`build_thread`, `start_session`) and a cross-agent switch (`agent_launch`): a
@@ -4104,8 +4136,17 @@ impl AgentTerminalWindow {
                     .map(|(_, env)| env.clone())
                     .unwrap_or_default()
             });
-            ModelCatalog::shared().refresh(&targets);
-            AccountStatus::shared().refresh(&targets);
+            match probes {
+                Probes::IfDue => {
+                    let now = crate::freshness::now_epoch();
+                    ModelCatalog::shared().refresh_if_due(&targets, now);
+                    AccountStatus::shared().refresh_if_due(&targets, now);
+                }
+                Probes::Force => {
+                    ModelCatalog::shared().refresh(&targets);
+                    AccountStatus::shared().refresh(&targets);
+                }
+            }
             if let Some(obj) = obj.upgrade() {
                 obj.imp().on_availability_changed();
             }
@@ -4128,8 +4169,10 @@ impl AgentTerminalWindow {
             move || obj.imp().evaluate_models()
         ));
         obj.connect_is_active_notify(|window| {
+            // Only the cheap rescan, and the probes whose clocks are due: focus alone is not a
+            // reason to spawn agents (it used to cost a probe round on nearly every focus).
             if window.is_active() && AgentAvailability::shared().scan_is_stale() {
-                window.imp().refresh_agent_data();
+                window.imp().refresh_agent_data(Probes::IfDue);
             }
             // The thread in view is looked at again: its unread mark and notifications go.
             if window.is_active() {
@@ -4283,7 +4326,7 @@ impl AgentTerminalWindow {
     /// The banner stays until the probe answers.
     pub(super) fn check_sign_in(&self, driver: Driver) {
         AccountStatus::shared().recheck(driver);
-        self.refresh_agent_data();
+        self.refresh_agent_data(Probes::Force);
         self.show_toast(&format!("Checking {}…", driver.info().label));
     }
 
@@ -4809,6 +4852,42 @@ pub(super) mod tests {
             decide_live_model(&list, true, None, None),
             (None, None, None)
         );
+    }
+
+    /// A list read from the cache, however recent, never ports a thread's model in argv: only a
+    /// list fetched in this run does (`is_fresh`), so a thread that skipped the wait starts on
+    /// its stored model and the later fetch re-judges it.
+    #[test]
+    fn a_cached_list_never_swaps_argv_even_inside_its_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let now = crate::freshness::now_epoch();
+        let cache = serde_json::json!({
+            "claude": [{"driver": "claude", "id": "sonnet", "display": "Sonnet",
+                        "description": null, "efforts": [], "default_effort": null, "via": null}],
+            "read_at": {"claude": now - 60},
+        });
+        std::fs::write(&path, cache.to_string()).unwrap();
+        let catalog = ModelCatalog::with_cache(Some(path));
+        assert_eq!(catalog.models_of(Driver::Claude).len(), 1, "cache read");
+        assert!(
+            catalog.may_start_without_waiting(Driver::Claude, now),
+            "no wait"
+        );
+        assert!(!catalog.is_fresh(Driver::Claude));
+        let (model, effort, ported) = decide_live_model(
+            &catalog.models_of(Driver::Claude),
+            catalog.is_fresh(Driver::Claude),
+            Some("claude-sonnet-3-7".into()),
+            Some("high".into()),
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-sonnet-3-7"),
+            "argv unchanged"
+        );
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert!(ported.is_none());
     }
 
     #[test]

@@ -319,6 +319,61 @@ fn model_list(
     column.upcast()
 }
 
+/// The picker's footer: how old the lists are (`Updated 3 h ago`, `Refreshing…`, `Could not
+/// refresh; …`) and a Refresh button. `None` for a source with no clock. Muted unless every shown
+/// list is Fresh. Follows the source until the picker closes.
+fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<gtk4::Box> {
+    use crate::freshness::{age_of, freshness, Freshness, MODEL_TTL};
+    source.status()?;
+    let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    footer.add_css_class("model-picker-footer");
+    footer.set_margin_start(18);
+    footer.set_margin_end(18);
+    footer.set_margin_bottom(10);
+    let text = label("", &["dim-label", "model-footer-text"]);
+    text.set_hexpand(true);
+    text.set_xalign(0.0);
+    text.set_wrap(true);
+    let button = gtk4::Button::with_label("Refresh");
+    button.add_css_class("flat");
+    button.set_tooltip_text(Some("Fetch every agent's model list again"));
+    footer.append(&text);
+    footer.append(&button);
+    let update: Rc<dyn Fn()> = {
+        let (source, text, button) = (source.clone(), text.downgrade(), button.downgrade());
+        Rc::new(move || {
+            let (Some(text), Some(button), Some(status)) =
+                (text.upgrade(), button.upgrade(), source.status())
+            else {
+                return;
+            };
+            let now = super::usage::now_epoch();
+            text.set_text(&crate::freshness::picker_footer(status, now));
+            let fresh = !status.failed
+                && freshness(age_of(status.read_at, now), MODEL_TTL) == Freshness::Fresh;
+            if fresh || status.refreshing {
+                text.remove_css_class("stale");
+            } else {
+                text.add_css_class("stale");
+            }
+            button.set_sensitive(!status.refreshing);
+        })
+    };
+    update();
+    button.connect_clicked({
+        let source = source.clone();
+        move |_| source.clone().refresh(true)
+    });
+    if let Some(id) = source.connect_status_changed(Box::new({
+        let update = update.clone();
+        move || update()
+    })) {
+        let source = source.clone();
+        picker.connect_closed(move |_| source.disconnect_status(id));
+    }
+    Some(footer)
+}
+
 /// Asks before a switch that would stop `from`'s running turn (and any approval or question
 /// waiting in it); `then` runs only on "Switch and Continue". Cancel is the default.
 fn confirm_busy_switch(parent: &adw::Dialog, from: Driver, to: Driver, then: impl Fn() + 'static) {
@@ -415,14 +470,24 @@ pub fn model_picker(ctx: &PanelCtx) {
             *models.borrow_mut() = source.models();
             render();
             // Keep the list live while the picker is open; the view owns the single connection
-            // to the source and forwards to whoever is registered here.
+            // to the source and forwards to whoever is registered here. An unchanged list is
+            // not rebuilt, so a background refresh keeps the scroll position.
             let live = {
                 let (source, models, render) = (source.clone(), models.clone(), render.clone());
                 Rc::new(move || {
-                    *models.borrow_mut() = source.models();
-                    render();
+                    let now = source.models();
+                    if *models.borrow() != now {
+                        *models.borrow_mut() = now;
+                        render();
+                    }
                 }) as Rc<dyn Fn()>
             };
+            if let Some(footer) = picker_footer(source, &d) {
+                outer.append(&footer);
+            }
+            // Lists older than the picker's age are fetched in the background; the cached ones
+            // are already shown.
+            source.clone().refresh(false);
             *ctx.model_listener.borrow_mut() = Some(live);
             let slot = ctx.model_listener.clone();
             d.connect_closed(move |_| {

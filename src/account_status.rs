@@ -22,6 +22,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::agent_proc::{run_side_full, AGY_TIMEOUT};
+use crate::freshness::{age_of, freshness, is_due, Freshness, ACCOUNT_TTL};
 use crate::probe::{join_n, ListenerSet, ProbeTargets};
 use crate::{claude_probe, codex_probe};
 
@@ -35,6 +36,12 @@ pub struct Snapshot {
     /// The agent says no one is signed in to it: installed, but its login was skipped or has
     /// expired. Its turns fail and its usage cannot be read until the user signs in.
     pub signed_out: bool,
+    /// The last successful reading (epoch seconds): a probe that answered, or a live
+    /// `QuotaUpdated` from a thread. How it may be shown follows from this
+    /// ([`crate::freshness`]); `None` reads as Expired.
+    pub read_at: Option<i64>,
+    /// The last probe failed (an error or a timeout): old data says it could not refresh.
+    pub refresh_failed: bool,
 }
 
 /// Merges an update in: a new account replaces the old one (`None` keeps it), and windows are
@@ -80,6 +87,14 @@ pub fn merge(
     changed
 }
 
+fn driver_index(driver: Driver) -> usize {
+    match driver {
+        Driver::Claude => 0,
+        Driver::Agy => 1,
+        Driver::Codex => 2,
+    }
+}
+
 fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -96,12 +111,27 @@ pub fn google_accounts_path(home: Option<&str>) -> Option<PathBuf> {
     )
 }
 
+/// The app-wide account and usage of each agent.
+///
+/// Ceiling: ONE slot per driver. Every profile of a driver shares it, and [`Self::observe`] takes
+/// no profile, so two profiles signed in to different accounts of one agent would overwrite each
+/// other here; the probe runs in the agent's configured profile's environment. Keying by
+/// profile is a separate change; any key it introduces must come from the profile name and the
+/// env-file path, never from env values, and is never logged or persisted.
+///
+/// When to probe: [`Self::refresh_if_due`] (focus, the periodic timer) probes an agent only when
+/// its last reading or attempt is [`ACCOUNT_TTL`] old; a live `QuotaUpdated` counts as a reading,
+/// so an agent in use is never probed. A signed-out agy is never probed by a clock: only
+/// [`Self::recheck`] (the user's "Check again") does.
 pub struct AccountStatus {
     claude: RefCell<Snapshot>,
     agy: RefCell<Snapshot>,
     codex: RefCell<Snapshot>,
     listeners: ListenerSet,
     refreshing: Cell<bool>,
+    /// Each agent's last finished probe in this run (Claude, agy, Codex), successful or not: with
+    /// `read_at`, the due clock.
+    tried_at: Cell<[Option<i64>; 3]>,
     /// Agents the user asked to check again ([`Self::recheck`]): probed by the next refresh even
     /// if signed out (agy is otherwise skipped then).
     forced: RefCell<Vec<Driver>>,
@@ -122,6 +152,7 @@ impl AccountStatus {
             codex: RefCell::default(),
             listeners: ListenerSet::default(),
             refreshing: Cell::new(false),
+            tried_at: Cell::new([None; 3]),
             forced: RefCell::default(),
             queued: RefCell::default(),
         }
@@ -159,15 +190,59 @@ impl AccountStatus {
     }
 
     fn update(&self, driver: Driver, account: Option<Account>, windows: Vec<QuotaWindow>) {
-        let changed = merge(
-            &mut self.slot(driver).borrow_mut(),
-            account,
-            windows,
-            now_epoch(),
-        );
+        self.update_at(driver, account, windows, now_epoch());
+    }
+
+    /// A successful reading at `now` (a probe that answered, or a live update): merged in, and
+    /// the agent's clock restarts. Listeners hear of it when the data changed or it was not
+    /// already shown as Fresh.
+    fn update_at(
+        &self,
+        driver: Driver,
+        account: Option<Account>,
+        windows: Vec<QuotaWindow>,
+        now: i64,
+    ) {
+        let changed = {
+            let mut snap = self.slot(driver).borrow_mut();
+            let was_fresh = !snap.refresh_failed
+                && freshness(age_of(snap.read_at, now), ACCOUNT_TTL) == Freshness::Fresh;
+            snap.read_at = Some(now);
+            snap.refresh_failed = false;
+            merge(&mut snap, account, windows, now) || !was_fresh
+        };
         if changed {
             self.notify();
         }
+    }
+
+    /// A probe of `driver` failed: what is shown stays, and says it could not refresh.
+    fn probe_failed(&self, driver: Driver) {
+        let changed = !std::mem::replace(&mut self.slot(driver).borrow_mut().refresh_failed, true);
+        if changed {
+            self.notify();
+        }
+    }
+
+    fn mark_tried(&self, driver: Driver, now: i64) {
+        let mut tried = self.tried_at.get();
+        tried[driver_index(driver)] = Some(now);
+        self.tried_at.set(tried);
+    }
+
+    /// Whether a background check at `now` should probe `driver`: the user asked to check it, or
+    /// its last reading (or failed attempt) is [`ACCOUNT_TTL`] old, or there was none.
+    pub fn is_due(&self, driver: Driver, now: i64) -> bool {
+        if self.is_rechecking(driver) {
+            return true;
+        }
+        let read = self.slot(driver).borrow().read_at;
+        let tried = self.tried_at.get()[driver_index(driver)];
+        let last = match (read, tried) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        is_due(last, now, ACCOUNT_TTL)
     }
 
     /// Records whether `driver` says no one is signed in. Signing out also forgets the account
@@ -230,11 +305,46 @@ impl AccountStatus {
             *self.queued.borrow_mut() = Some(targets.clone());
             return;
         }
+        self.run(targets, |_| true);
+    }
+
+    /// The background check (focus, the periodic timer): probes only the agents that are due at
+    /// `now` ([`Self::is_due`]). Nothing due: nothing spawns. A refresh already running answers
+    /// for this one.
+    pub fn refresh_if_due(self: &Rc<Self>, targets: &ProbeTargets, now: i64) {
+        if self.refreshing.get() {
+            debug!("account status refresh already running");
+            return;
+        }
+        let due: Vec<Driver> = Driver::ALL
+            .into_iter()
+            .filter(|d| self.is_due(*d, now))
+            .collect();
+        if due
+            .iter()
+            .all(|d| !self.probeable(*d) || targets.get(*d).is_none())
+        {
+            return;
+        }
+        self.refreshing.set(true);
+        // An agent whose reading has aged is redrawn muted while its probe runs.
+        self.notify();
+        self.run(targets, |d| due.contains(&d));
+    }
+
+    /// A signed-out agy is never probed unless the user asked to check it: probing it starts
+    /// agy's own login, which opens a browser.
+    fn probeable(&self, driver: Driver) -> bool {
+        !(driver == Driver::Agy && self.is_signed_out(driver) && !self.is_rechecking(driver))
+    }
+
+    /// Probes the agents with a target that `wanted` accepts; `refreshing` is already set.
+    fn run(self: &Rc<Self>, targets: &ProbeTargets, wanted: impl Fn(Driver) -> bool) {
         // Missing, disabled and still-detecting agents have no target; a signed-out agy is
         // skipped unless the user asked to check it.
         let jobs: Vec<(Driver, crate::probe::ProbeTarget)> = Driver::ALL
             .into_iter()
-            .filter(|d| !(*d == Driver::Agy && self.is_signed_out(*d) && !self.is_rechecking(*d)))
+            .filter(|d| self.probeable(*d) && wanted(*d))
             .filter_map(|d| targets.get(d).map(|t| (d, t.clone())))
             .collect();
         // Each probed agent's own check is answered by this refresh.
@@ -260,19 +370,27 @@ impl AccountStatus {
             match driver {
                 Driver::Claude => {
                     claude_probe::probe_shared(&target.program, &target.env, move |result| {
-                        if let Ok(probe) = result {
-                            me.set_signed_out(driver, probe.signed_out);
-                            me.update(driver, probe.account.clone(), probe.windows.clone());
+                        match result {
+                            Ok(probe) => {
+                                me.set_signed_out(driver, probe.signed_out);
+                                me.update(driver, probe.account.clone(), probe.windows.clone());
+                            }
+                            Err(_) => me.probe_failed(driver),
                         }
+                        me.mark_tried(driver, now_epoch());
                         done();
                     });
                 }
                 Driver::Codex => {
                     codex_probe::probe_shared(&target.program, &target.env, move |result| {
-                        if let Ok(probe) = result {
-                            me.set_signed_out(driver, probe.signed_out);
-                            me.update(driver, probe.account.clone(), probe.windows.clone());
+                        match result {
+                            Ok(probe) => {
+                                me.set_signed_out(driver, probe.signed_out);
+                                me.update(driver, probe.account.clone(), probe.windows.clone());
+                            }
+                            Err(_) => me.probe_failed(driver),
                         }
+                        me.mark_tried(driver, now_epoch());
                         done();
                     });
                 }
@@ -298,20 +416,23 @@ impl AccountStatus {
                         if agy_signed_out(&side.stderr) || agy_signed_out(&out) {
                             warn!("agy is not signed in");
                             me.set_signed_out(Driver::Agy, true);
+                            me.mark_tried(Driver::Agy, now_epoch());
                             done();
                             return;
                         }
-                        let windows = if ok {
-                            serde_json::from_str::<Value>(out.trim())
-                                .map(|v| agy_usage(&v))
-                                .unwrap_or_default()
-                        } else {
+                        if !ok {
+                            // Nothing was read: what is shown stays, says it could not refresh,
+                            // and the reading's clock does not restart.
                             warn!("agy /usage failed or timed out");
-                            Vec::new()
-                        };
-                        if ok {
-                            me.set_signed_out(Driver::Agy, false);
+                            me.probe_failed(Driver::Agy);
+                            me.mark_tried(Driver::Agy, now_epoch());
+                            done();
+                            return;
                         }
+                        let windows = serde_json::from_str::<Value>(out.trim())
+                            .map(|v| agy_usage(&v))
+                            .unwrap_or_default();
+                        me.set_signed_out(Driver::Agy, false);
                         // A few hundred bytes of JSON, read off the main thread like all file I/O
                         // here.
                         let account =
@@ -327,6 +448,7 @@ impl AccountStatus {
                                 None => None,
                             };
                         me.update(Driver::Agy, account, windows);
+                        me.mark_tried(Driver::Agy, now_epoch());
                         done();
                     });
                 }
@@ -463,6 +585,129 @@ mod tests {
         assert_eq!(st.snapshot(Driver::Codex).windows[0].used, 0.7);
         assert_eq!(st.snapshot(Driver::Agy).windows[0].used, 0.3);
         assert_eq!(st.snapshot(Driver::Claude).windows[0].used, 0.5);
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn an_agent_is_due_by_its_clock_and_a_live_update_restarts_it() {
+        use crate::freshness::DUE_SLACK;
+        let st = AccountStatus::new();
+        assert!(st.is_due(Driver::Claude, NOW), "never read");
+        st.update_at(Driver::Claude, None, vec![win(None, "5-hour", 0.1)], NOW);
+        assert!(!st.is_due(Driver::Claude, NOW + 60));
+        assert!(!st.is_due(Driver::Claude, NOW + ACCOUNT_TTL - DUE_SLACK - 1));
+        assert!(st.is_due(Driver::Claude, NOW + ACCOUNT_TTL));
+        // A turn's QuotaUpdated at NOW + 500 is a reading: not due at NOW + TTL any more.
+        st.update_at(
+            Driver::Claude,
+            None,
+            vec![win(None, "5-hour", 0.2)],
+            NOW + 500,
+        );
+        assert!(!st.is_due(Driver::Claude, NOW + ACCOUNT_TTL));
+        // And through `observe`, on the real clock.
+        st.observe(
+            Driver::Agy,
+            &Envelope::new(Event::QuotaUpdated {
+                account: None,
+                windows: vec![win(None, "Weekly", 0.3)],
+            }),
+        );
+        assert!(!st.is_due(Driver::Agy, now_epoch() + ACCOUNT_TTL - DUE_SLACK - 5));
+        // A failed attempt restarts the clock too (no retry on every focus) and is shown.
+        st.mark_tried(Driver::Codex, NOW);
+        st.probe_failed(Driver::Codex);
+        assert!(!st.is_due(Driver::Codex, NOW + 60));
+        assert!(st.snapshot(Driver::Codex).refresh_failed);
+        // A future reading (the clock moved back) is due.
+        assert!(st.is_due(Driver::Claude, NOW - 3600));
+        // The user's "Check again" is due at once.
+        st.recheck(Driver::Claude);
+        assert!(st.is_due(Driver::Claude, NOW + 60));
+    }
+
+    #[test]
+    fn freshness_follows_the_last_success_not_the_last_attempt() {
+        use crate::freshness::{age_of, freshness, Freshness};
+        let st = AccountStatus::new();
+        st.update_at(Driver::Claude, None, vec![win(None, "5-hour", 0.1)], NOW);
+        st.mark_tried(Driver::Claude, NOW + 3 * ACCOUNT_TTL);
+        st.probe_failed(Driver::Claude);
+        let snap = st.snapshot(Driver::Claude);
+        assert_eq!(snap.read_at, Some(NOW));
+        assert_eq!(
+            freshness(age_of(snap.read_at, NOW + 3 * ACCOUNT_TTL), ACCOUNT_TTL),
+            Freshness::Aging
+        );
+        // The next success clears the failure.
+        st.update_at(Driver::Claude, None, vec![], NOW + 4 * ACCOUNT_TTL);
+        assert!(!st.snapshot(Driver::Claude).refresh_failed);
+    }
+
+    /// Fake agents that leave a mark each time one is started.
+    fn marking_targets(dir: &std::path::Path) -> (ProbeTargets, std::path::PathBuf) {
+        let mark = dir.join("started");
+        let program = crate::claude_probe::tests::fake_claude(
+            dir,
+            &format!("echo x >> '{}'\nexit 1", mark.display()),
+        );
+        let target = crate::probe::ProbeTarget {
+            program,
+            env: crate::agent_proc::AgentEnv::default(),
+        };
+        let targets = ProbeTargets::new(
+            Driver::ALL
+                .into_iter()
+                .map(|d| (d, target.clone()))
+                .collect(),
+        );
+        (targets, mark)
+    }
+
+    #[test]
+    fn a_check_with_fresh_readings_spawns_nothing() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (targets, mark) = marking_targets(dir.path());
+        in_loop(|ctx| {
+            let st = Rc::new(AccountStatus::new());
+            let now = now_epoch();
+            for d in Driver::ALL {
+                st.update_at(d, None, vec![win(None, "5-hour", 0.1)], now);
+            }
+            st.refresh_if_due(&targets, now + 60);
+            assert!(!st.refreshing.get(), "no probe started");
+            pump_until(ctx, 1, || false);
+            assert!(!mark.exists(), "focus with fresh data spawned an agent");
+        });
+    }
+
+    #[test]
+    fn a_signed_out_agy_is_never_probed_by_a_clock_only_by_check_again() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (all, mark) = marking_targets(dir.path());
+        let agy_only = ProbeTargets::new(vec![(
+            Driver::Agy,
+            all.get(Driver::Agy).cloned().expect("agy target"),
+        )]);
+        in_loop(|ctx| {
+            let st = Rc::new(AccountStatus::new());
+            st.set_signed_out(Driver::Agy, true);
+            // Long overdue, yet a clock never probes it (probing opens agy's browser login).
+            st.refresh_if_due(&agy_only, NOW + 100 * ACCOUNT_TTL);
+            assert!(!st.refreshing.get());
+            pump_until(ctx, 1, || false);
+            assert!(!mark.exists(), "a signed-out agy was probed by a clock");
+            // "Check again" does.
+            st.recheck(Driver::Agy);
+            st.refresh_if_due(&agy_only, NOW);
+            assert!(st.refreshing.get());
+            assert!(pump_until(ctx, 30, || !st.refreshing.get()));
+            assert!(mark.exists());
+            assert!(!st.is_rechecking(Driver::Agy), "answered");
+        });
     }
 
     #[test]

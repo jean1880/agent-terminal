@@ -17,6 +17,7 @@ use gtk4::prelude::*;
 use super::cards::{accent_class, brand_image, driver_name, label};
 use crate::account_status::{AccountStatus, Snapshot};
 use crate::availability::AgentAvailability;
+use crate::freshness::{age_of, ago, freshness, last_read_text, Freshness, ACCOUNT_TTL};
 
 const WARN_AT: f64 = 0.75;
 const CRITICAL_AT: f64 = 0.90;
@@ -234,7 +235,7 @@ impl UsageIndicator {
         let now = now_epoch();
         for (driver, snap) in shown {
             if self.filter.get().is_none_or(|f| f == *driver) {
-                self.compact.append(&compact_form(*driver, snap));
+                self.compact.append(&compact_form(*driver, snap, now));
             }
             self.details.append(&detail_form(*driver, snap, now));
         }
@@ -250,8 +251,47 @@ impl UsageIndicator {
     }
 }
 
+/// How a snapshot's reading may be shown at `now` (see [`crate::freshness`]).
+pub fn reading_freshness(snap: &Snapshot, now: i64) -> Freshness {
+    freshness(age_of(snap.read_at, now), ACCOUNT_TTL)
+}
+
+/// `14:32`, local time, for a reading taken at `at`.
+fn clock(at: i64) -> String {
+    gtk4::glib::DateTime::from_unix_local(at)
+        .and_then(|t| t.format("%H:%M"))
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// The line saying when an agent's usage was read: `Updated 14:32` while Fresh, `Last read 14:32
+/// (38 min ago)` once Aging, and for Expired data that was once read, why it is not shown.
+pub fn reading_text(snap: &Snapshot, now: i64) -> Option<String> {
+    let at = snap.read_at?;
+    let age = age_of(Some(at), now).unwrap_or(0);
+    Some(match reading_freshness(snap, now) {
+        Freshness::Fresh if !snap.refresh_failed => format!("Updated {}", clock(at)),
+        Freshness::Fresh | Freshness::Aging => last_read_text(&clock(at), age, snap.refresh_failed),
+        Freshness::Expired => format!(
+            "Could not read recently (last read {}, {})",
+            clock(at),
+            ago(age)
+        ),
+    })
+}
+
+/// The severity class a value is drawn with: an Aging reading never gets the healthy colour.
+fn shown_class(used: f64, aging: bool) -> &'static str {
+    match severity(used) {
+        Severity::Normal if aging => "usage-stale",
+        s => s.css_class(),
+    }
+}
+
 /// Accent dot + one thin row per window kind: `5h` and `wk`, each with its bar and percentage.
-fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
+/// Only a Fresh reading is drawn as is; an Aging one is muted (never green) with when it was
+/// read; an Expired one is the could-not-read state ("Unknown").
+fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     b.add_css_class(accent_class(driver));
     b.append(&brand_image(driver));
@@ -264,10 +304,19 @@ fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
         )));
         return b;
     }
+    let state = reading_freshness(snap, now);
+    let read = reading_text(snap, now);
     let (short, weekly) = split_windows(&snap.windows);
-    if short.is_none() && weekly.is_none() {
+    if state == Freshness::Expired || (short.is_none() && weekly.is_none()) {
         b.append(&label("Unknown", &["usage-text"]));
+        if let Some(read) = read {
+            b.set_tooltip_text(Some(&format!("{} · {read}", driver_name(driver))));
+        }
         return b;
+    }
+    let aging = state == Freshness::Aging || snap.refresh_failed;
+    if aging {
+        b.add_css_class("usage-stale-meter");
     }
     let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
     rows.set_valign(gtk4::Align::Center);
@@ -276,14 +325,20 @@ fn compact_form(driver: Driver, snap: &Snapshot) -> gtk4::Box {
         let Some(w) = window else { continue };
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
         row.append(&label(tag, &["usage-text", "usage-tag"]));
-        row.append(&bar(w.used, 48));
+        let meter = bar(w.used, 48);
+        if aging {
+            meter.remove_css_class(severity(w.used).css_class());
+            meter.add_css_class(shown_class(w.used, true));
+        }
+        row.append(&meter);
         row.append(&label(
             &percent_text(w.used),
-            &["usage-text", severity(w.used).css_class()],
+            &["usage-text", shown_class(w.used, aging)],
         ));
         rows.append(&row);
         tips.push(format!("{} {}", window_title(w), percent_text(w.used)));
     }
+    tips.extend(read);
     b.append(&rows);
     b.set_tooltip_text(Some(&tips.join(" · ")));
     b
@@ -318,12 +373,27 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         l.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         section.append(&l);
     }
-    if snap.windows.is_empty() {
+    let state = reading_freshness(snap, now);
+    let aging = state == Freshness::Aging || (state == Freshness::Fresh && snap.refresh_failed);
+    if let Some(text) = reading_text(snap, now) {
+        let l = label(&text, &["dim-label", "usage-resets"]);
+        l.set_halign(gtk4::Align::Start);
+        l.set_wrap(true);
+        l.set_xalign(0.0);
+        section.append(&l);
+    }
+    // Expired: the could-not-read state; values that old are not shown as current.
+    let windows: &[QuotaWindow] = if state == Freshness::Expired {
+        &[]
+    } else {
+        &snap.windows
+    };
+    if windows.is_empty() {
         let l = label("No usage data yet", &["dim-label"]);
         l.set_halign(gtk4::Align::Start);
         section.append(&l);
     }
-    for w in &snap.windows {
+    for w in windows {
         let row = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
         let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let title = label(&window_title(w), &["usage-window"]);
@@ -333,10 +403,14 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         top.append(&title);
         top.append(&label(
             &format!("{} used", percent_text(w.used)),
-            &["usage-text", severity(w.used).css_class()],
+            &["usage-text", shown_class(w.used, aging)],
         ));
         row.append(&top);
         let b = bar(w.used, -1);
+        if aging {
+            b.remove_css_class(severity(w.used).css_class());
+            b.add_css_class(shown_class(w.used, true));
+        }
         b.set_hexpand(true);
         row.append(&b);
         if let Some(text) = resets_text(w, now) {
@@ -357,6 +431,7 @@ pub(crate) mod tests {
         let usage = UsageIndicator::new(Rc::new(AccountStatus::new()), Some(Driver::Codex));
         let mut zero = Snapshot::default();
         zero.windows.push(named("5-hour", 0.0));
+        zero.read_at = Some(now_epoch());
         let snapshots = [
             (Driver::Claude, zero),
             (Driver::Agy, Snapshot::default()),
@@ -450,6 +525,56 @@ pub(crate) mod tests {
         assert_eq!(split_windows(&only_week).0, None);
         assert!(split_windows(&only_week).1.is_some());
         assert_eq!(split_windows(&[]), (None, None));
+    }
+
+    #[test]
+    fn only_a_fresh_reading_is_healthy_and_old_ones_say_when_they_were_read() {
+        let now = 1_800_000_000;
+        let snap = |age: Option<i64>, failed| Snapshot {
+            windows: vec![named("5-hour", 0.1)],
+            read_at: age.map(|a| now - a),
+            refresh_failed: failed,
+            ..Snapshot::default()
+        };
+        // Fresh: healthy colour, "Updated HH:MM".
+        assert_eq!(
+            reading_freshness(&snap(Some(60), false), now),
+            Freshness::Fresh
+        );
+        assert!(
+            reading_text(&snap(Some(60), false), now).is_some_and(|t| t.starts_with("Updated "))
+        );
+        assert_eq!(shown_class(0.1, false), "usage-ok");
+        // Aging (over 2×TTL): never green, and the line says how old.
+        let aging = snap(Some(3 * ACCOUNT_TTL), true);
+        assert_eq!(reading_freshness(&aging, now), Freshness::Aging);
+        assert_eq!(shown_class(0.1, true), "usage-stale");
+        assert_eq!(
+            shown_class(0.95, true),
+            "usage-crit",
+            "a warning stays a warning"
+        );
+        let text = reading_text(&aging, now).unwrap();
+        assert!(
+            text.starts_with("Last read ") && text.ends_with("(30 min ago); could not refresh"),
+            "{text}"
+        );
+        // Fresh but the last refresh failed: not shown as a clean "Updated".
+        assert!(
+            reading_text(&snap(Some(60), true), now).is_some_and(|t| t.starts_with("Last read "))
+        );
+        // Expired (over 6×TTL) or never read: the could-not-read state.
+        assert_eq!(
+            reading_freshness(&snap(Some(7 * ACCOUNT_TTL), false), now),
+            Freshness::Expired
+        );
+        assert_eq!(
+            reading_freshness(&snap(None, false), now),
+            Freshness::Expired
+        );
+        assert_eq!(reading_text(&snap(None, false), now), None);
+        assert!(reading_text(&snap(Some(7 * ACCOUNT_TTL), false), now)
+            .is_some_and(|t| t.starts_with("Could not read recently")));
     }
 
     #[test]

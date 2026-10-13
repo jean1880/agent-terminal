@@ -84,6 +84,20 @@ pub trait ModelSource {
     fn connect_changed(&self, f: Box<dyn Fn()>) -> u64;
     /// Removes a listener added by [`Self::connect_changed`].
     fn disconnect(&self, id: u64);
+    /// How old the shown lists are and whether a fetch is running, for the picker's footer.
+    /// `None`: the source has no clock (a static one), and the picker shows no footer.
+    fn status(&self) -> Option<crate::freshness::CatalogStatus> {
+        None
+    }
+    /// The picker opened (`force`: its Refresh button): fetch in the background what is old.
+    /// Returns at once; the lists show from cache meanwhile.
+    fn refresh(self: std::rc::Rc<Self>, _force: bool) {}
+    /// Calls `f` when [`Self::status`] may have changed; `None` when it never does.
+    fn connect_status_changed(&self, _f: Box<dyn Fn()>) -> Option<u64> {
+        None
+    }
+    /// Removes a listener added by [`Self::connect_status_changed`].
+    fn disconnect_status(&self, _id: u64) {}
 }
 
 /// What a file-change card asks about: the transcript item and its tool input.
