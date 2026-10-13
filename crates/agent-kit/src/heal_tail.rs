@@ -21,6 +21,11 @@
 //!   `TurnCompleted`, `SessionExited`, a deleted or closed thread clear the thread's tails.
 //!
 //! The text kept is the scrubbed text of each row as stored, never the raw input.
+//!
+//! Above all, the tails are transactional ([`HealTails::begin`] / `release` / `rollback`, tied
+//! to every transaction and savepoint the store opens): a change made by a write that is then
+//! rolled back, for whatever reason, is taken back with it. Outside a transaction, a trusted tail
+//! holds exactly the item's committed delta rows; the store's tests check that after every step.
 
 use std::collections::HashMap;
 
@@ -38,30 +43,52 @@ pub(crate) const ROW_OVERHEAD: usize = std::mem::size_of::<(i64, String)>();
 /// One stream's rows: `(seq, scrubbed text)` in append order.
 pub(crate) type StreamRows = Vec<(i64, String)>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ItemTail {
     trusted: bool,
     bytes: usize,
     streams: Vec<(StreamKind, StreamRows)>,
 }
 
-impl ItemTail {
-    fn distrust(&mut self) -> usize {
-        self.trusted = false;
-        self.streams.clear();
-        std::mem::take(&mut self.bytes)
-    }
+type Key = (String, String);
+
+/// How to take one change back (see the transaction notes on [`HealTails`]).
+#[derive(Debug)]
+enum Undo {
+    /// Put the key back as it was (`None`: it was absent).
+    Restore(Key, Option<ItemTail>),
+    /// Take back the last row appended to stream `stream` of the key (and the stream itself
+    /// when the row created it).
+    PopRow {
+        key: Key,
+        stream: usize,
+        created_stream: bool,
+        cost: usize,
+    },
 }
 
 /// Every tail of one store connection.
+///
+/// **Transactional.** The tails follow the store's transactions, so they only ever vouch for
+/// rows the database really holds: [`HealTails::begin`] opens a level (a batch, a job's or an
+/// append's savepoint), and every change made inside it is journalled. [`HealTails::release`]
+/// keeps the level's changes (folded into the level around it; at the outermost level they are
+/// committed), [`HealTails::rollback`] takes them all back. A level is released only when its
+/// SQL savepoint or transaction was released or committed, and rolled back whenever that was
+/// rolled back (an error, an `Err` job, a panic, a lost transaction, a failed COMMIT). Changes
+/// made outside any level are already committed.
 #[derive(Debug)]
 pub(crate) struct HealTails {
-    items: HashMap<(String, String), ItemTail>,
+    items: HashMap<Key, ItemTail>,
     total: usize,
     item_cap: usize,
     total_cap: usize,
     max_items: usize,
     enabled: bool,
+    /// Changes made inside open levels, oldest first.
+    journal: Vec<Undo>,
+    /// Where each open level's changes start in `journal`.
+    levels: Vec<usize>,
 }
 
 impl Default for HealTails {
@@ -73,11 +100,13 @@ impl Default for HealTails {
             total_cap: TOTAL_CAP,
             max_items: MAX_ITEMS,
             enabled: true,
+            journal: Vec::new(),
+            levels: Vec::new(),
         }
     }
 }
 
-fn key(thread: &str, item: &str) -> (String, String) {
+fn key(thread: &str, item: &str) -> Key {
     (thread.to_owned(), item.to_owned())
 }
 
@@ -88,6 +117,7 @@ impl HealTails {
         if !enabled {
             self.items.clear();
             self.total = 0;
+            self.journal.clear();
         }
     }
 
@@ -102,6 +132,93 @@ impl HealTails {
         self.max_items = max_items;
     }
 
+    // ---- transactions ----
+
+    /// Opens a level: what changes from here is taken back if it is rolled back.
+    pub(crate) fn begin(&mut self) {
+        self.levels.push(self.journal.len());
+    }
+
+    /// Keeps the innermost level's changes. At the outermost level they are committed.
+    pub(crate) fn release(&mut self) {
+        self.levels.pop();
+        if self.levels.is_empty() {
+            self.journal.clear();
+        }
+    }
+
+    /// Takes the innermost level's changes back.
+    pub(crate) fn rollback(&mut self) {
+        let Some(start) = self.levels.pop() else {
+            return;
+        };
+        while self.journal.len() > start {
+            let Some(undo) = self.journal.pop() else {
+                break;
+            };
+            match undo {
+                Undo::Restore(key, old) => {
+                    let gone = match old {
+                        Some(tail) => {
+                            self.total += tail.bytes;
+                            self.items.insert(key, tail)
+                        }
+                        None => self.items.remove(&key),
+                    };
+                    if let Some(gone) = gone {
+                        self.total -= gone.bytes;
+                    }
+                }
+                Undo::PopRow {
+                    key,
+                    stream,
+                    created_stream,
+                    cost,
+                } => {
+                    if let Some(tail) = self.items.get_mut(&key) {
+                        if let Some((_, rows)) = tail.streams.get_mut(stream) {
+                            rows.pop();
+                        }
+                        if created_stream {
+                            tail.streams.truncate(stream);
+                        }
+                        tail.bytes -= cost;
+                        self.total -= cost;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether a level is open (changes are journalled).
+    #[cfg(test)]
+    pub(crate) fn in_level(&self) -> bool {
+        !self.levels.is_empty()
+    }
+
+    fn journal(&mut self, undo: Undo) {
+        if !self.levels.is_empty() {
+            self.journal.push(undo);
+        }
+    }
+
+    /// Replaces the key's tail (`None`: removes it), journalled; returns nothing, keeps `total`.
+    fn set(&mut self, key: Key, new: Option<ItemTail>) {
+        let old = match new {
+            Some(tail) => {
+                self.total += tail.bytes;
+                self.items.insert(key.clone(), tail)
+            }
+            None => self.items.remove(&key),
+        };
+        if let Some(old) = &old {
+            self.total -= old.bytes;
+        }
+        self.journal(Undo::Restore(key, old));
+    }
+
+    // ---- changes ----
+
     /// Whether [`HealTails::arm`] would start a new trusted tail for the item: the store then
     /// first checks the item has no rows yet ([`HealTails::refuse`] if it has).
     pub(crate) fn would_arm(&self, thread: &str, item: &str) -> bool {
@@ -112,17 +229,11 @@ impl HealTails {
 
     /// The item started, but already has rows in the store (a reused id): never trusted.
     pub(crate) fn refuse(&mut self, thread: &str, item: &str) {
-        if !self.enabled {
+        let k = key(thread, item);
+        if !self.enabled || (!self.items.contains_key(&k) && self.items.len() >= self.max_items) {
             return;
         }
-        let full = self.items.len() >= self.max_items;
-        match self.items.get_mut(&key(thread, item)) {
-            Some(tail) => self.total -= tail.distrust(),
-            None if !full => {
-                self.items.insert(key(thread, item), ItemTail::default());
-            }
-            None => {}
-        }
+        self.set(k, Some(ItemTail::default()));
     }
 
     /// The item started (its `ItemStarted` is stored).
@@ -130,20 +241,18 @@ impl HealTails {
         if !self.enabled {
             return;
         }
-        let full = self.items.len() >= self.max_items;
-        match self.items.get_mut(&key(thread, item)) {
+        let k = key(thread, item);
+        if self.items.contains_key(&k) {
             // Started twice, or deltas came first: the tail cannot know it has every row.
-            Some(tail) => self.total -= tail.distrust(),
-            None if !full => {
-                self.items.insert(
-                    key(thread, item),
-                    ItemTail {
-                        trusted: true,
-                        ..ItemTail::default()
-                    },
-                );
-            }
-            None => {}
+            self.set(k, Some(ItemTail::default()));
+        } else if self.items.len() < self.max_items {
+            self.set(
+                k,
+                Some(ItemTail {
+                    trusted: true,
+                    ..ItemTail::default()
+                }),
+            );
         }
     }
 
@@ -159,10 +268,11 @@ impl HealTails {
         if !self.enabled {
             return;
         }
-        let Some(tail) = self.items.get_mut(&key(thread, item)) else {
+        let k = key(thread, item);
+        let Some(tail) = self.items.get(&k) else {
             // Deltas before any `ItemStarted`: remember that this item cannot be trusted.
             if self.items.len() < self.max_items {
-                self.items.insert(key(thread, item), ItemTail::default());
+                self.set(k, Some(ItemTail::default()));
             }
             return;
         };
@@ -172,17 +282,29 @@ impl HealTails {
         // A row costs its text plus what keeping it costs (its seq, the String, the Vec slot).
         let cost = text.len() + ROW_OVERHEAD;
         if tail.bytes + cost > self.item_cap || self.total + cost > self.total_cap {
-            self.total -= tail.distrust();
             tracing::debug!("a heal tail overflowed; its item will heal by the SQL scan");
+            self.set(k, Some(ItemTail::default()));
             return;
         }
+        let Some(tail) = self.items.get_mut(&k) else {
+            return;
+        };
+        let (index, created_stream) = match tail.streams.iter().position(|(s, _)| *s == stream) {
+            Some(i) => (i, false),
+            None => {
+                tail.streams.push((stream, Vec::new()));
+                (tail.streams.len() - 1, true)
+            }
+        };
+        tail.streams[index].1.push((seq, text.to_owned()));
         tail.bytes += cost;
         self.total += cost;
-        let row = (seq, text.to_owned());
-        match tail.streams.iter_mut().find(|(s, _)| *s == stream) {
-            Some((_, rows)) => rows.push(row),
-            None => tail.streams.push((stream, vec![row])),
-        }
+        self.journal(Undo::PopRow {
+            key: k,
+            stream: index,
+            created_stream,
+            cost,
+        });
     }
 
     /// The item's rows by stream, when its tail is trusted.
@@ -197,9 +319,20 @@ impl HealTails {
             .map(|t| t.streams.clone())
     }
 
+    /// Every trusted tail: `((thread, item), rows by stream)`. For the invariant test.
+    #[cfg(test)]
+    pub(crate) fn all_trusted(&self) -> Vec<(Key, Vec<(StreamKind, StreamRows)>)> {
+        self.items
+            .iter()
+            .filter(|(_, t)| t.trusted)
+            .map(|(k, t)| (k.clone(), t.streams.clone()))
+            .collect()
+    }
+
     /// The stream's rows were healed: the first holds `whole`, the rest are empty.
     pub(crate) fn healed(&mut self, thread: &str, item: &str, stream: StreamKind, whole: &str) {
-        let Some(tail) = self.items.get_mut(&key(thread, item)) else {
+        let k = key(thread, item);
+        let Some(mut tail) = self.items.get(&k).cloned() else {
             return;
         };
         let Some((_, rows)) = tail.streams.iter_mut().find(|(s, _)| *s == stream) else {
@@ -213,40 +346,40 @@ impl HealTails {
                 String::new()
             };
         }
-        // Redaction only shortens or keeps the text in practice; account for either way.
         tail.bytes = tail.bytes - before + whole.len();
-        self.total = self.total - before + whole.len();
+        self.set(k, Some(tail));
     }
 
     /// The item completed: its tail is spent.
     pub(crate) fn consume(&mut self, thread: &str, item: &str) {
-        if let Some(tail) = self.items.remove(&key(thread, item)) {
-            self.total -= tail.bytes;
+        let k = key(thread, item);
+        if self.items.contains_key(&k) {
+            self.set(k, None);
         }
+    }
+
+    fn keys_of(&self, thread: &str) -> Vec<Key> {
+        self.items
+            .keys()
+            .filter(|(t, _)| t == thread)
+            .cloned()
+            .collect()
     }
 
     /// The thread's turn or session ended, or it was closed or deleted.
     pub(crate) fn clear_thread(&mut self, thread: &str) {
-        let mut freed = 0;
-        self.items.retain(|(t, _), tail| {
-            let keep = t != thread;
-            if !keep {
-                freed += tail.bytes;
-            }
-            keep
-        });
-        self.total -= freed;
+        for k in self.keys_of(thread) {
+            self.set(k, None);
+        }
     }
 
     /// Something on the thread failed: none of its tails can vouch for the DB any more.
     pub(crate) fn distrust_thread(&mut self, thread: &str) {
-        let mut freed = 0;
-        for ((t, _), tail) in self.items.iter_mut() {
-            if t == thread {
-                freed += tail.distrust();
+        for k in self.keys_of(thread) {
+            if self.items.get(&k).is_some_and(|t| t.trusted) {
+                self.set(k, Some(ItemTail::default()));
             }
         }
-        self.total -= freed;
     }
 
     #[cfg(test)]
@@ -319,6 +452,47 @@ mod tests {
         assert!(t.trusted("t", "k").is_some() && t.trusted("t", "m").is_none());
         t.consume("t", "k");
         assert_eq!(t.total_bytes(), 0);
+    }
+
+    #[test]
+    fn a_rolled_back_level_takes_every_change_back_and_a_released_one_keeps_them() {
+        let mut t = HealTails::default();
+        t.arm("t", "i");
+        t.record("t", "i", A, 1, "he");
+        let before = (t.all_trusted(), t.total_bytes());
+        // A batch, with a job that rows, heals, starts and consumes; rolled back.
+        t.begin();
+        t.begin();
+        t.record("t", "i", A, 2, "llo");
+        t.record("t", "i", StreamKind::Reasoning, 3, "x");
+        t.healed("t", "i", A, "hello");
+        t.arm("t", "new");
+        t.consume("t", "i");
+        t.rollback();
+        t.release();
+        // Only "i" was trusted before: compare it alone (and that "new" is gone).
+        assert_eq!(before.0.len(), 1);
+        assert_eq!(
+            (t.all_trusted(), t.total_bytes()),
+            (before.0.clone(), before.1)
+        );
+        // A job released inside a batch the batch then rolls back: also gone.
+        t.begin();
+        t.begin();
+        t.record("t", "i", A, 4, "llo");
+        t.release();
+        t.distrust_thread("t");
+        t.rollback();
+        assert_eq!(t.trusted("t", "i"), Some(vec![(A, vec![(1, "he".into())])]));
+        // Released at the outermost level: committed.
+        t.begin();
+        t.record("t", "i", A, 5, "y");
+        t.release();
+        assert!(!t.in_level());
+        assert_eq!(
+            t.trusted("t", "i"),
+            Some(vec![(A, vec![(1, "he".into()), (5, "y".into())])])
+        );
     }
 
     #[test]

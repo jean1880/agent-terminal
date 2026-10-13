@@ -61,6 +61,8 @@ pub enum StoreError {
     Behind,
     /// SQLite rolled the transaction back on its own (disk full, I/O error, …).
     TransactionLost,
+    /// A store job failed (its own error, as text): what the writer's batch saw of it.
+    Failed(String),
 }
 
 impl fmt::Display for StoreError {
@@ -77,6 +79,7 @@ impl fmt::Display for StoreError {
             Self::WriterGone => write!(f, "the store writer has stopped"),
             Self::Overloaded => write!(f, "the store writer is too far behind to take more"),
             Self::Behind => write!(f, "the store writer has not caught up yet"),
+            Self::Failed(why) => write!(f, "{why}"),
             Self::TransactionLost => {
                 write!(
                     f,
@@ -278,8 +281,9 @@ pub struct Store {
 
 /// A unit of work that commits or rolls back as one: a transaction, or inside a
 /// [`Store::batch`] a savepoint of the batch's transaction. Rolled back when dropped uncommitted.
+/// The heal tails follow it: a level opened with it, kept or taken back with it.
 struct Scope<'a> {
-    conn: &'a Connection,
+    store: &'a Store,
     savepoint: bool,
     done: bool,
 }
@@ -291,8 +295,9 @@ impl Scope<'_> {
         } else {
             "COMMIT"
         };
-        self.conn.execute_batch(sql)?;
+        self.store.conn.execute_batch(sql)?;
         self.done = true;
+        self.store.tails.borrow_mut().release();
         Ok(())
     }
 }
@@ -307,9 +312,12 @@ impl Drop for Scope<'_> {
         } else {
             "ROLLBACK"
         };
-        if let Err(e) = self.conn.execute_batch(sql) {
-            tracing::warn!(error = %e, "could not roll a store write back");
+        if !self.store.conn.is_autocommit() {
+            if let Err(e) = self.store.conn.execute_batch(sql) {
+                tracing::warn!(error = %e, "could not roll a store write back");
+            }
         }
+        self.store.tails.borrow_mut().rollback();
     }
 }
 
@@ -317,6 +325,30 @@ impl Drop for Scope<'_> {
 pub struct Batch<'a> {
     store: &'a Store,
     committed: bool,
+}
+
+/// One job's savepoint inside a batch, with its level of the heal tails: kept only if the job
+/// succeeded and its savepoint was released; else (an error, an `Err` result, a panic, a lost
+/// transaction, a failed RELEASE) both are taken back.
+struct JobLevel<'a> {
+    store: &'a Store,
+    done: bool,
+}
+
+impl Drop for JobLevel<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            self.store.tails.borrow_mut().release();
+            return;
+        }
+        if !self.store.conn.is_autocommit() {
+            let _ = self
+                .store
+                .conn
+                .execute_batch("ROLLBACK TO job; RELEASE job");
+        }
+        self.store.tails.borrow_mut().rollback();
+    }
 }
 
 impl Batch<'_> {
@@ -327,33 +359,27 @@ impl Batch<'_> {
         !self.store.conn.is_autocommit()
     }
 
-    /// Runs one job under a savepoint of its own: rolled back, leaving no partial rows, when it
-    /// fails or panics (the panic then carries on to the caller).
+    /// Runs one job under a savepoint of its own: rolled back, leaving no partial rows and no
+    /// tail change, when it fails, returns `Err` or panics (the panic then carries on).
     pub fn job<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let conn = &self.store.conn;
         conn.execute_batch("SAVEPOINT job")?;
-        struct Undo<'a> {
-            conn: &'a Connection,
-            done: bool,
-        }
-        impl Drop for Undo<'_> {
-            fn drop(&mut self) {
-                if !self.done && !self.conn.is_autocommit() {
-                    let _ = self.conn.execute_batch("ROLLBACK TO job; RELEASE job");
-                }
-            }
-        }
-        let mut undo = Undo { conn, done: false };
+        self.store.tails.borrow_mut().begin();
+        let mut level = JobLevel {
+            store: self.store,
+            done: false,
+        };
         let result = f(self.store);
         if result.is_ok() && self.alive() {
             conn.execute_batch("RELEASE job")?;
-            undo.done = true;
+            level.done = true;
         }
+        drop(level);
         result
     }
 
-    /// Commits the batch. On failure nothing of it is stored (and its threads' tails are
-    /// distrusted, as for any batch that does not commit).
+    /// Commits the batch. On failure nothing of it is stored, the tails take back everything
+    /// the batch changed, and its threads' tails are distrusted.
     pub fn commit(mut self) -> Result<()> {
         #[cfg(test)]
         if self.store.fail_next_commit.replace(false) {
@@ -376,13 +402,16 @@ impl Drop for Batch<'_> {
         store.in_batch.set(false);
         let threads: Vec<String> = store.batch_threads.borrow_mut().drain().collect();
         if self.committed {
+            // Committed: so are the tail changes.
+            store.tails.borrow_mut().release();
             return;
         }
         if !store.conn.is_autocommit() {
             let _ = store.conn.execute_batch("ROLLBACK");
         }
-        // The tails may hold rows this batch wrote and nothing now does.
         let mut tails = store.tails.borrow_mut();
+        tails.rollback();
+        // Belt and braces: the batch's threads are not vouched for until they start afresh.
         for t in threads {
             tails.distrust_thread(&t);
         }
@@ -470,6 +499,12 @@ impl Store {
         self.tails.borrow_mut().set_enabled(enabled);
     }
 
+    /// The item's tail may no longer vouch for it (one of its deltas was refused): it heals by
+    /// the scan.
+    pub fn distrust_tail(&self, thread: &str, item: &str) {
+        self.tails.borrow_mut().refuse(thread, item);
+    }
+
     /// Forgets the thread's heal tails (its page closed). Its next heal scans the table.
     pub fn forget_tails(&self, thread: &str) {
         self.tails.borrow_mut().clear_thread(thread);
@@ -511,6 +546,7 @@ impl Store {
     /// nothing of `f` stored) when the batch could not begin, SQLite rolled it back on its own
     /// meanwhile, or the COMMIT failed. A batch inside a batch just runs `f`.
     pub fn batch<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R> {
+        // (Tests and the writer use it; the tails follow the batch: see `Batch`.)
         if self.in_batch.get() {
             return Ok(f(self));
         }
@@ -552,6 +588,7 @@ impl Store {
         }
         self.in_batch.set(true);
         self.batch_threads.borrow_mut().clear();
+        self.tails.borrow_mut().begin();
         Ok(Batch {
             store: self,
             committed: false,
@@ -567,18 +604,65 @@ impl Store {
 
     /// A transaction, or a savepoint of the open batch (see [`Store::batch`]).
     fn scope(&self, behavior: rusqlite::TransactionBehavior) -> Result<Scope<'_>> {
-        let savepoint = self.in_batch.get();
+        // Inside any open transaction (a batch, `atomically`, another scope): a savepoint of it.
+        let savepoint = self.in_batch.get() || !self.conn.is_autocommit();
         let sql = match (savepoint, behavior) {
             (true, _) => "SAVEPOINT op",
             (false, rusqlite::TransactionBehavior::Immediate) => "BEGIN IMMEDIATE",
             (false, _) => "BEGIN DEFERRED",
         };
         self.conn.execute_batch(sql)?;
+        self.tails.borrow_mut().begin();
         Ok(Scope {
-            conn: &self.conn,
+            store: self,
             savepoint,
             done: false,
         })
+    }
+
+    /// Runs `f` under the named savepoint, with a level of the heal tails: both kept if it
+    /// succeeds, both taken back if it fails or panics.
+    fn in_savepoint<T>(&self, name: &str, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        self.tails.borrow_mut().begin();
+        struct Level<'a> {
+            store: &'a Store,
+            name: &'a str,
+            done: bool,
+        }
+        impl Drop for Level<'_> {
+            fn drop(&mut self) {
+                if self.done {
+                    return;
+                }
+                if !self.store.conn.is_autocommit() {
+                    let _ = self
+                        .store
+                        .conn
+                        .execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name));
+                }
+                self.store.tails.borrow_mut().rollback();
+            }
+        }
+        let mut level = Level {
+            store: self,
+            name,
+            done: false,
+        };
+        let out = f(self)?;
+        self.conn.execute_batch(&format!("RELEASE {name}"))?;
+        level.done = true;
+        self.tails.borrow_mut().release();
+        Ok(out)
+    }
+
+    /// Runs `f` as one unit: all of it stored, or (an `Err`, a panic) none of it, tails
+    /// included. Inside a batch, a savepoint of it; else a transaction of its own.
+    pub fn atomically<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let scope = self.scope(rusqlite::TransactionBehavior::Immediate)?;
+        let out = f(self)?;
+        scope.commit()?;
+        Ok(out)
     }
 
     fn now(&self) -> i64 {
@@ -1023,14 +1107,9 @@ impl Store {
             (Event::ItemCompleted { .. } | Event::ContentSnapshot { .. }, Some(item)) => {
                 // Under a savepoint: a heal that fails is undone on its own and the event is
                 // still stored (each delta row is already scrubbed alone).
-                self.conn.execute_batch("SAVEPOINT heal")?;
-                match self.heal(thread, item) {
-                    Ok(()) => self.conn.execute_batch("RELEASE heal")?,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "could not re-scrub an item's streamed text");
-                        self.conn.execute_batch("ROLLBACK TO heal; RELEASE heal")?;
-                        self.tails.borrow_mut().distrust_thread(thread);
-                    }
+                if let Err(e) = self.in_savepoint("heal", |s| s.heal(thread, item)) {
+                    tracing::warn!(error = %e, "could not re-scrub an item's streamed text");
+                    self.tails.borrow_mut().distrust_thread(thread);
                 }
                 if matches!(scrubbed.event, Event::ItemCompleted { .. }) {
                     self.tails.borrow_mut().consume(thread, item);
@@ -1093,16 +1172,10 @@ impl Store {
             tracing::debug!(path = "tail", "healing an item's streamed text");
             // Its own savepoint: a tail heal that fails is undone whole and the scan runs
             // instead, so a broken tail can never leave fragments the scan would have healed.
-            self.conn.execute_batch("SAVEPOINT tail_heal")?;
-            match self.heal_from_tail(thread, item, streams) {
-                Ok(()) => {
-                    self.conn.execute_batch("RELEASE tail_heal")?;
-                    return Ok(());
-                }
+            match self.in_savepoint("tail_heal", |s| s.heal_from_tail(thread, item, streams)) {
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "a heal tail did not match the store; scanning");
-                    self.conn
-                        .execute_batch("ROLLBACK TO tail_heal; RELEASE tail_heal")?;
                     self.tails.borrow_mut().distrust_thread(thread);
                     #[cfg(test)]
                     {
@@ -2633,8 +2706,18 @@ mod tests {
         /// The next batch's COMMIT fails.
         FailCommit,
         Forget(String),
+        /// One job doing these steps, then ending as `end` says: its savepoint (and its tail
+        /// level) kept, or taken back after an `Err` or a panic.
+        Job(Vec<Step>, End),
         /// These steps as one batch of the store writer (`store_writer::run_jobs_as_batch`).
         Batch(Vec<Step>),
+    }
+
+    #[derive(Clone, Copy)]
+    enum End {
+        Ok,
+        Err,
+        Panic,
     }
 
     fn split(rng: &mut Rng, secret: &str) -> Vec<String> {
@@ -2690,7 +2773,7 @@ mod tests {
             };
         for _ in 0..400 {
             let t = rng.below(2);
-            let step = match rng.below(26) {
+            let step = match rng.below(27) {
                 0..=2 => {
                     // A new item; sometimes one open already (started twice), sometimes one
                     // completed before (a reused id).
@@ -2790,6 +2873,49 @@ mod tests {
                         4 => steps.extend([Step::Panic, delta("lost ")]),
                         _ => steps.extend([Step::Fail, delta("lost ")]),
                     }
+                    steps.push(delta(&secret[at..]));
+                    closed.push((t, item.clone()));
+                    Step::Append(threads[t].into(), completed(&item, ItemStatus::Completed))
+                }
+                25 => {
+                    // Codex's case: a job appends the rest of a split secret and a snapshot
+                    // that heals it, then fails, returns Err or panics. Its rows and its
+                    // heal go; the tail must forget them too, or the next completion would
+                    // trust healed text the store no longer holds.
+                    next_item += 1;
+                    let item = format!("j{next_item}");
+                    let at = 1 + rng.below(secret.len() - 1);
+                    let delta = |text: &str| {
+                        Step::Append(
+                            threads[t].into(),
+                            stream_delta(&item, StreamKind::Assistant, text),
+                        )
+                    };
+                    let snapshot = Step::Append(
+                        threads[t].into(),
+                        Envelope::new(Event::ContentSnapshot {
+                            stream: StreamKind::Reasoning,
+                            text: "snapshot".into(),
+                        })
+                        .item(item.as_str()),
+                    );
+                    steps.push(Step::Append(
+                        threads[t].into(),
+                        started(&item, ItemKind::AssistantMessage),
+                    ));
+                    steps.push(delta(&secret[..at]));
+                    let end = match rng.below(3) {
+                        0 => End::Err,
+                        1 => End::Panic,
+                        _ => End::Ok,
+                    };
+                    let job = Step::Job(vec![delta(&secret[at..]), snapshot], end);
+                    if rng.below(2) == 0 {
+                        steps.push(Step::Batch(vec![job]));
+                    } else {
+                        steps.push(job);
+                    }
+                    // The rest again (it was taken back, unless the job was Ok), then done.
                     steps.push(delta(&secret[at..]));
                     closed.push((t, item.clone()));
                     Step::Append(threads[t].into(), completed(&item, ItemStatus::Completed))
@@ -2898,22 +3024,85 @@ mod tests {
                     Ok(())
                 })
             }
+            Step::Job(inner, end) => {
+                let jobs: Vec<_> = inner.iter().map(job_of).collect();
+                let end = *end;
+                // Plain, as the writer's jobs are: inside a batch only the job's own savepoint
+                // (and its tail level) stands between a failed job and the store.
+                Box::new(move |s: &Store| {
+                    for job in jobs {
+                        job(s)?;
+                    }
+                    match end {
+                        End::Ok => Ok(()),
+                        End::Err => Err(StoreError::Failed("injected job error".into())),
+                        End::Panic => panic!("injected job panic"),
+                    }
+                })
+            }
             Step::Batch(_) => Box::new(|_: &Store| Ok(())),
+        }
+    }
+
+    /// The invariant the tails rest on: outside any transaction, every trusted tail holds
+    /// exactly the item's committed delta rows, stream by stream, as a fresh scan reads them.
+    fn assert_tails_match_committed(s: &Store, context: &str) {
+        let tails = s.tails.borrow();
+        assert!(!tails.in_level(), "{context}: a tail level left open");
+        for ((thread, item), streams) in tails.all_trusted() {
+            let mut stmt = s
+                .conn
+                .prepare(
+                    "SELECT seq, envelope_json FROM events WHERE thread_id = ?1
+                       AND json_extract(envelope_json, '$.item') = ?2
+                       AND json_extract(envelope_json, '$.event.type') = 'content_delta'
+                     ORDER BY seq",
+                )
+                .expect("prep");
+            let rows = stmt
+                .query_map(params![thread, item], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .expect("q");
+            let mut scanned: Vec<(StreamKind, crate::heal_tail::StreamRows)> = Vec::new();
+            for row in rows {
+                let (seq, json) = row.expect("row");
+                let env: Envelope = serde_json::from_str(&json).expect("json");
+                let Event::ContentDelta { stream, text } = env.event else {
+                    continue;
+                };
+                match scanned.iter_mut().find(|(st, _)| *st == stream) {
+                    Some((_, v)) => v.push((seq, text)),
+                    None => scanned.push((stream, vec![(seq, text)])),
+                }
+            }
+            assert_eq!(
+                streams, scanned,
+                "{context}: the tail of {thread}/{item} is not what the store holds"
+            );
         }
     }
 
     fn play(s: &Store, steps: &[Step]) {
         quiet_injected_panics();
-        for step in steps {
+        for (n, step) in steps.iter().enumerate() {
             match step {
                 Step::Batch(inner) => {
                     crate::store_writer::run_jobs_as_batch(s, inner.iter().map(job_of).collect());
+                }
+                step @ Step::Job(..) => {
+                    // On its own, a job runs as the inline store runs one: atomically.
+                    let job = job_of(step);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        s.atomically(job)
+                    }));
                 }
                 step => {
                     let job = job_of(step);
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(s)));
                 }
             }
+            assert_tails_match_committed(s, &format!("after step {n}"));
         }
         // A hook left set by the last steps must not leak into the comparison.
         s.fail_next_append.set(false);
@@ -3119,6 +3308,29 @@ mod tests {
         assert!(rows
             .iter()
             .any(|(seq, _, _, j)| *seq == first && j.contains("\"other\"")));
+    }
+
+    #[test]
+    fn atomically_nests_transactions_and_takes_everything_back_on_err() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        // Methods that open transactions of their own nest inside it.
+        s.atomically(|s| {
+            s.append_event(&t, None, &Envelope::new(Event::Unknown))?;
+            s.append_user_message(&t, None, "hi")?;
+            s.dismiss_native("claude", "n1")
+        })
+        .expect("ok");
+        assert_eq!(s.events(&t, None, 10).expect("events").len(), 3);
+        let failed = s.atomically(|s| -> Result<()> {
+            s.append_event(&t, None, &Envelope::new(Event::Unknown))?;
+            s.dismiss_native("claude", "n2")?;
+            Err(StoreError::Failed("no".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(s.events(&t, None, 10).expect("events").len(), 3);
+        assert!(!s.native_dismissed("claude", "n2").expect("q"));
+        assert!(s.conn.is_autocommit());
     }
 
     #[test]
