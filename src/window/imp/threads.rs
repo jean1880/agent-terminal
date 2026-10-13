@@ -1070,6 +1070,11 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     if let Some(found) = cached_agent(&profile) {
         return found;
     }
+    // Tests never find this machine's agents: only what a test seeded resolves, so no test can
+    // start a real agent on PATH (one once did, through a profile it could not place).
+    if cfg!(test) {
+        return ResolvedAgent::default();
+    }
     let (path, home, shell) = env_triplet();
     let command = profile.command.clone();
     let env_file = profile.env_file.clone();
@@ -5247,16 +5252,24 @@ pub(super) mod tests {
         let frames =
             || std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap_or_default();
 
-        // Codex resolves to python3 running the fixture, which keeps its frames in `dir`.
-        let (command, env_file) = {
+        // Codex resolves to python3 running the fixture, which keeps its frames in `dir`. The
+        // profile gets a command of its own: the resolution cache is keyed by command, and a
+        // Codex page an earlier check opened may still be resolving the old one, in the
+        // background, and would overwrite a seeded entry under it ("not found").
+        let (old_command, env_file) = {
             let config = imp.config.borrow();
             let codex = config
                 .agent_profile(Driver::Codex)
                 .expect("a Codex profile");
             (codex.command.clone(), codex.env_file.clone())
         };
+        // Still named `codex`: the window tells a profile's agent by its command's file name, and
+        // a profile it cannot place falls back to the default one, whose plain `codex` would
+        // resolve to a real install on PATH.
+        let command = "/nonexistent/scripted-fixture/codex".to_owned();
         for profile in imp.config.borrow_mut().profiles.iter_mut() {
-            if profile.command == command {
+            if profile.command == old_command {
+                profile.command = command.clone();
                 profile.args = vec![
                     "-I".into(),
                     format!(
@@ -5276,6 +5289,23 @@ pub(super) mod tests {
                 },
             )
         });
+        // Never a real agent: the profile the window will use for Codex must be this one, and
+        // resolve to python3 running the fixture, before anything is opened.
+        {
+            let config = imp.config.borrow();
+            let used = config
+                .agent_profile(Driver::Codex)
+                .expect("a Codex profile");
+            assert_eq!(
+                used.command, command,
+                "the window would use another profile"
+            );
+            assert_eq!(
+                cached_agent(used).and_then(|r| r.program).as_deref(),
+                Some("/usr/bin/python3"),
+                "the fixture's profile must resolve to python3"
+            );
+        }
         let availability = AgentAvailability::shared();
         let before = availability.get(Driver::Codex);
         availability.set(
@@ -5326,6 +5356,12 @@ pub(super) mod tests {
                 .map(|r| r.program),
             page_state(),
             frames()
+        );
+        // Nothing is sent until the fixture itself has answered: it counts its connections
+        // into `dir` the moment it starts. Anything else that started fails here, unprompted.
+        assert!(
+            pump_until(&ctx, 15, || dir.path().join("connections").exists()),
+            "the process that started is the fixture"
         );
 
         // A plain turn: sent to the agent, finished, and nothing left needing the user.
@@ -5380,8 +5416,9 @@ pub(super) mod tests {
             "a second approval"
         );
         let key = RowKey::Thread(thread.clone());
-        // Answers the open dialog with `heading` through its own response signal.
-        let answer = |heading: &str, response: &str| {
+        // Answers the open dialog with `heading` by clicking its `button`, as a user does; the
+        // dialog closes itself.
+        let answer = |heading: &str, button: &str| {
             let open = || {
                 adw::prelude::AdwApplicationWindowExt::visible_dialog(window)
                     .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
@@ -5389,8 +5426,20 @@ pub(super) mod tests {
             };
             assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
             let dialog = open().expect("the dialog");
-            dialog.emit_by_name::<()>("response", &[&response]);
-            dialog.force_close();
+            let target = crate::testutil::descendants(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+                .find(|b| {
+                    b.label().as_deref() == Some(button)
+                        || crate::testutil::descendants(b.upcast_ref())
+                            .iter()
+                            .any(|w| {
+                                w.downcast_ref::<gtk4::Label>()
+                                    .is_some_and(|l| l.text() == button)
+                            })
+                })
+                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            target.emit_clicked();
             // Closing is animated: wait for it to go (bounded), never a fixed number of turns.
             assert!(
                 pump_until(&ctx, 10, || {
@@ -5426,7 +5475,7 @@ pub(super) mod tests {
         // keeps the thread and its turn.
         imp.close_row(&key);
         imp.close_row(&key);
-        answer("Stop the Running Turn and Close?", "cancel");
+        answer("Stop the Running Turn and Close?", "Cancel");
         // A second question would be the next dialog up, and it would not go away by itself.
         crate::testutil::settle(&ctx);
         assert!(
@@ -5442,19 +5491,24 @@ pub(super) mod tests {
                 target: Some(Driver::Claude),
             },
         );
-        answer("Switch agents now?", "cancel");
+        answer("Switch agents now?", "Keep Waiting");
         assert_eq!(slot.get().map(|s| s.status().driver), Some(Driver::Codex));
         assert!(state(&|c| c.approval));
 
         // Stop and Close: the page goes, and the thread with it from the open pages.
         imp.close_row(&key);
-        answer("Stop the Running Turn and Close?", "stop");
+        answer("Stop the Running Turn and Close?", "Stop and Close");
         assert!(
             pump_until(&ctx, 5, || imp.page_of_thread(&thread).is_none()),
             "stop and close closes the page"
         );
         availability.set(Driver::Codex, before);
-        RESOLVED.with(|r| r.borrow_mut().remove(&(command, env_file)));
+        RESOLVED.with(|r| r.borrow_mut().remove(&(command.clone(), env_file)));
+        for profile in imp.config.borrow_mut().profiles.iter_mut() {
+            if profile.command == command {
+                profile.command = old_command.clone();
+            }
+        }
     }
 
     /// A refresh with the same rows, an aged clock, or only the focus changed keeps the row
