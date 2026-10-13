@@ -81,6 +81,9 @@ impl ListRow {
         name.set_xalign(0.0);
         name.set_wrap(true);
         name.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        // A wrapping label's minimum is one character: without a floor, a narrow list squeezed
+        // `senior-engineer` into a column of letters beside its status.
+        name.set_width_chars(16);
         name.set_max_width_chars(30);
         top.append(&name);
         let status = label("", &["subagent-status", "dim-label"]);
@@ -89,6 +92,8 @@ impl ListRow {
         let task = label("", &["subagent-task", "dim-label"]);
         task.set_xalign(0.0);
         task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        // The list takes its rows' natural width: a long task must not widen it past this.
+        task.set_max_width_chars(48);
         b.append(&task);
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&b));
@@ -153,6 +158,52 @@ pub struct SubagentButton {
     popover: gtk4::Popover,
     /// The ids behind the list's rows, in order, and their labels.
     rows: RefCell<Vec<(String, ListRow)>>,
+    /// Each row's group, in order: what the list's header function heads them with.
+    groups: Rc<RefCell<Vec<&'static str>>>,
+}
+
+/// The group a sub-agent is listed under.
+fn group(agent: &SubagentSummary) -> &'static str {
+    if agent.active() {
+        "Active"
+    } else if agent.finished() {
+        "History"
+    } else {
+        "Status unknown"
+    }
+}
+
+/// Heads each row that starts a group with its name. A list box places and draws a row's header
+/// only from its header function: one set on the row from outside was never shown, which left
+/// a blank gap above each group.
+fn head_groups(list: &gtk4::ListBox, groups: Rc<RefCell<Vec<&'static str>>>) {
+    list.set_header_func(move |row, before| {
+        let groups = groups.borrow();
+        let at = |row: &gtk4::ListBoxRow| {
+            usize::try_from(row.index())
+                .ok()
+                .and_then(|i| groups.get(i).copied())
+        };
+        let group = at(row).filter(|g| before.and_then(at) != Some(*g));
+        let Some(group) = group else {
+            row.set_header(None::<&gtk4::Widget>);
+            return;
+        };
+        if let Some(heading) = row.header().and_downcast::<gtk4::Label>() {
+            set_if_changed(&heading, group);
+            return;
+        }
+        let heading = gtk4::Label::builder()
+            .label(group)
+            .accessible_role(gtk4::AccessibleRole::Heading)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .margin_top(10)
+            .margin_bottom(6)
+            .margin_start(10)
+            .build();
+        row.set_header(Some(&heading));
+    });
 }
 
 impl SubagentButton {
@@ -174,9 +225,14 @@ impl SubagentButton {
         let list = gtk4::ListBox::new();
         list.add_css_class("subagent-list");
         list.set_selection_mode(gtk4::SelectionMode::None);
+        let groups = Rc::default();
+        head_groups(&list, Rc::clone(&groups));
         let scroller = gtk4::ScrolledWindow::new();
         scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scroller.set_propagate_natural_height(true);
+        // Its natural width, not its minimum: the popover is sized from the scroller, and the
+        // minimum gave every name one character per line.
+        scroller.set_propagate_natural_width(true);
         scroller.set_max_content_height(420);
         scroller.set_child(Some(&list));
         let popover = gtk4::Popover::new();
@@ -190,6 +246,7 @@ impl SubagentButton {
             list,
             popover,
             rows: RefCell::new(Vec::new()),
+            groups,
         });
         let weak = Rc::downgrade(&this);
         this.list.connect_row_activated(move |_, row| {
@@ -222,6 +279,8 @@ impl SubagentButton {
             .update_property(&[gtk4::accessible::Property::Label(&format!(
                 "Workers: {counts}; show all workers"
             ))]);
+        // Before any row is added: the list's header function reads it.
+        *self.groups.borrow_mut() = agents.iter().map(group).collect();
         let same = {
             let rows = self.rows.borrow();
             rows.len() == agents.len() && rows.iter().zip(agents).all(|((id, _), a)| *id == a.id)
@@ -255,41 +314,11 @@ impl SubagentButton {
                 }
             }
         }
-        let mut previous_group = None;
         for ((_, labels), agent) in self.rows.borrow().iter().zip(agents) {
             labels.set(agent);
-            let group = if agent.active() {
-                "Active"
-            } else if agent.finished() {
-                "History"
-            } else {
-                "Status unknown"
-            };
-            if previous_group != Some(group) {
-                if let Some(heading) = labels
-                    .row
-                    .header()
-                    .and_then(|w| w.downcast::<gtk4::Label>().ok())
-                {
-                    set_if_changed(&heading, group);
-                } else {
-                    let heading = gtk4::Label::builder()
-                        .label(group)
-                        .accessible_role(gtk4::AccessibleRole::Heading)
-                        .xalign(0.0)
-                        .selectable(true)
-                        .css_classes(["heading"])
-                        .margin_top(10)
-                        .margin_bottom(6)
-                        .margin_start(10)
-                        .build();
-                    labels.row.set_header(Some(&heading));
-                }
-            } else {
-                labels.row.set_header(None::<&gtk4::Widget>);
-            }
-            previous_group = Some(group);
         }
+        // The headings follow the groups (a worker finishing moves to History in place).
+        self.list.invalidate_headers();
     }
 
     /// Each listed row's status text, in order (tests).
@@ -532,6 +561,13 @@ pub(crate) mod tests {
                 .to_string()
         };
         assert_eq!(header(), "Active");
+        // In the list, so it is drawn: a header set on a row from outside the list's header
+        // function had no parent and showed as a blank gap.
+        assert_eq!(
+            first.header().and_then(|h| h.parent()).as_ref(),
+            Some(button.list.upcast_ref::<gtk4::Widget>()),
+            "the group heading is placed in the list"
+        );
         worker.lifecycle = Some(agent_core::event::WorkerState::Completed);
         button.set(&[worker]);
         assert_eq!(
@@ -543,6 +579,43 @@ pub(crate) mod tests {
             header(),
             "History",
             "completion updates grouping even when order is unchanged"
+        );
+    }
+
+    /// Regression: the list was as wide as its minimum, one character for a wrapping name, so
+    /// `senior-engineer` ran down the popover a letter per line beside its status. The list now
+    /// takes the rows' natural width (the whole name and its status on one line), and a name
+    /// squeezed anyway keeps a floor of several characters. Needs GTK (the window smoke test runs
+    /// it, through `chat::view::tests::ui_checks`).
+    pub(crate) fn names_are_never_squeezed_into_a_column() {
+        let button = SubagentButton::new(|_| {});
+        let mut worker = agent("w1", ToolStatus::Completed);
+        worker.name = "senior-engineer".to_owned();
+        worker.task = "Senior-engineer seat round 1: ".repeat(10);
+        worker.steps = 44;
+        button.set(&[worker]);
+        let rows = button.rows.borrow();
+        let labels = &rows[0].1;
+        let width = |w: &gtk4::Widget| w.measure(gtk4::Orientation::Horizontal, -1);
+        let scroller = button.popover.child().expect("the popover's scroller");
+        let (_, list_natural, _, _) = width(&scroller);
+        let (name_min, name_natural, _, _) = width(labels.name.upcast_ref());
+        let (_, status_natural, _, _) = width(labels.status.upcast_ref());
+        assert!(
+            list_natural >= name_natural + status_natural,
+            "the list ({list_natural}px) leaves the name ({name_natural}px) and its status \
+             ({status_natural}px) a line"
+        );
+        let letter = label("m", &["subagent-name"]);
+        let (_, letter_width, _, _) = width(letter.upcast_ref());
+        assert!(
+            name_min >= 8 * letter_width,
+            "a squeezed name keeps several characters ({name_min}px, one is {letter_width}px)"
+        );
+        let (_, task_natural, _, _) = width(labels.task.upcast_ref());
+        assert!(
+            task_natural < 60 * letter_width,
+            "a long task does not stretch the list ({task_natural}px)"
         );
     }
 

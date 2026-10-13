@@ -2348,6 +2348,7 @@ pub(crate) mod tests {
         approval_row_precedes_its_step();
         subagent_shelf::tests::shelf_follows_running_subagents();
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
+        subagents::tests::names_are_never_squeezed_into_a_column();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });
