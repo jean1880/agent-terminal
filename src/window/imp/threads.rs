@@ -16,6 +16,7 @@ use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
 use agent_core::catalog::{model_notice, ModelNotice};
 use agent_core::event::{BackgroundTask, Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
+use agent_kit::store_writer::{StoreHandle, StoreWriter, READ_FLUSH_WAIT};
 
 use super::diffs::ThreadDiffs;
 use super::*;
@@ -285,6 +286,11 @@ thread_local! {
     /// Where the app's store lives, once it opened a file one. `None` (memory only, tests): there
     /// is nothing a second connection could open, so store jobs run in place.
     static STORE_PATH: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    /// The store writer, once a file store opened: every write of the app goes through it, and
+    /// `STORE` is then only read. `None` (memory only, tests): writes run in place.
+    static WRITER: RefCell<Option<StoreWriter>> = const { RefCell::new(None) };
+    /// Store write failures already shown to the user (the writer's count).
+    static FAILURES_SHOWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Keyed by (command, env file): a profile edit is a new key, so nothing goes stale.
     static RESOLVED: RefCell<HashMap<(String, Option<String>), ResolvedAgent>> =
         RefCell::new(HashMap::new());
@@ -335,6 +341,12 @@ fn open_store() -> Result<Rc<Store>, String> {
     if let Some(path) = path {
         match Store::open(&path) {
             Ok(store) => {
+                // The writer opens its own connection (the schema is already migrated). Without
+                // it the app still works, writing on this connection as before.
+                match StoreWriter::spawn(&path) {
+                    Ok(writer) => WRITER.with(|w| *w.borrow_mut() = Some(writer)),
+                    Err(e) => error!("Cannot start the store writer; writing in place: {e}"),
+                }
                 STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
                 return Ok(Rc::new(store));
             }
@@ -351,8 +363,27 @@ fn store_is_async() -> bool {
     STORE_PATH.with(|p| p.borrow().is_some())
 }
 
+/// The store writer, when there is one (a file store).
+pub(super) fn store_writer() -> Option<StoreWriter> {
+    // Opened with the store.
+    let _ = try_app_store();
+    WRITER.with(|w| w.borrow().clone())
+}
+
+/// How the main thread reaches the store: writes queued to the writer and reads on the app's
+/// connection, or (memory only, tests, no writer) one store that runs writes in place.
+pub(super) fn app_handle() -> StoreHandle {
+    let reader = app_store();
+    match WRITER.with(|w| w.borrow().clone()) {
+        Some(writer) => StoreHandle::Queued { reader, writer },
+        None => StoreHandle::Inline(reader),
+    }
+}
+
 /// Runs `job` against the thread store off the main thread, on a connection of its own (SQLite
 /// connections are not `Send`; WAL lets it run beside the main one), and returns its result.
+/// It first waits (on the worker) for every write queued before it to be committed, so it reads
+/// the app's own writes. For reading: a job that writes goes through [`write_job`].
 /// `None`: the worker could not open the store or panicked, already logged. With no file store
 /// the job runs in place on the app's.
 pub(super) async fn store_job<T: Send + 'static>(
@@ -361,11 +392,19 @@ pub(super) async fn store_job<T: Send + 'static>(
     let Some(path) = STORE_PATH.with(|p| p.borrow().clone()) else {
         return Some(job(&app_store()));
     };
-    gtk4::gio::spawn_blocking(move || match Store::open(&path) {
-        Ok(store) => Some(job(&store)),
-        Err(e) => {
-            warn!("Cannot open the thread store on a worker: {e}");
-            None
+    let barrier = store_writer().map(|w| w.barrier());
+    gtk4::gio::spawn_blocking(move || {
+        if let Some(barrier) = barrier {
+            if barrier.recv_timeout(READ_FLUSH_WAIT).is_err() {
+                warn!("A store read ran before the writer caught up");
+            }
+        }
+        match Store::open(&path) {
+            Ok(store) => Some(job(&store)),
+            Err(e) => {
+                warn!("Cannot open the thread store on a worker: {e}");
+                None
+            }
         }
     })
     .await
@@ -375,10 +414,72 @@ pub(super) async fn store_job<T: Send + 'static>(
     })
 }
 
+/// Runs `job` on the store writer, in order after every write queued before it, and returns
+/// its result: for jobs that write (and may read their own writes back). `None`: the writer is
+/// gone or the job panicked, already logged. Without a writer it runs as [`store_job`] does.
+pub(super) async fn write_job<T: Send + 'static>(
+    job: impl FnOnce(&Store) -> T + Send + 'static,
+) -> Option<T> {
+    let Some(writer) = store_writer() else {
+        return store_job(job).await;
+    };
+    let answer = writer.call(job);
+    gtk4::gio::spawn_blocking(move || answer.recv().ok())
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| {
+            error!("A store write job did not answer (the writer stopped, or the job panicked)");
+            None
+        })
+}
+
+/// Shows (once per failure) that the store writer could not save something: a toast naming the
+/// last failure, which the journal has in full. Polled by every window; the first to see a new
+/// failure shows it.
+pub(super) fn take_store_failure() -> Option<String> {
+    let writer = WRITER.with(|w| w.borrow().clone())?;
+    let (count, last) = writer.failures();
+    if count <= FAILURES_SHOWN.with(std::cell::Cell::get) {
+        return None;
+    }
+    FAILURES_SHOWN.with(|s| s.set(count));
+    Some(last.unwrap_or_else(|| "Could not save part of a thread".to_owned()))
+}
+
+/// Writes still queued for the store (0 with no writer).
+pub(super) fn store_writes_pending() -> usize {
+    WRITER.with(|w| w.borrow().as_ref().map_or(0, StoreWriter::pending))
+}
+
+/// Drains the store writer and closes its connection, waiting at most `wait` (the app is
+/// quitting: the windows are gone, so nothing is left on screen to freeze).
+pub(crate) fn close_store_writer(wait: std::time::Duration) {
+    let Some(writer) = WRITER.with(|w| w.borrow_mut().take()) else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let pending = writer.pending();
+    if writer.shutdown(wait) {
+        debug!(
+            pending,
+            ms = started.elapsed().as_millis(),
+            "shutdown: store writer drained"
+        );
+    } else {
+        error!(
+            pending = writer.pending(),
+            "shutdown: the store writer did not finish in time; its last writes may be lost"
+        );
+    }
+}
+
 /// Stores a NEW thread in `cwd` on `driver`/`model`, with its provider thread active and `mode`
 /// recorded as the user's choice when one is carried over (a continued or forked thread keeps
 /// its source's mode rather than the profile's). Only the new thread is written: the source of
 /// a fork is never touched. The agent record failing is logged, not fatal: the thread exists.
+/// (The app queues [`record_new_thread_as`] to the store writer instead.)
+#[cfg(test)]
 fn record_new_thread(
     store: &Store,
     cwd: &str,
@@ -387,15 +488,46 @@ fn record_new_thread(
     model: Option<&str>,
     mode: Option<Mode>,
 ) -> agent_kit::store::Result<String> {
-    let thread = store.create_thread(cwd, title)?;
+    let ids = NewThreadIds {
+        thread: store.new_id()?,
+        provider: store.new_id()?,
+    };
+    record_new_thread_as(store, &ids, cwd, title, driver, model, mode)?;
+    Ok(ids.thread)
+}
+
+/// The ids a new thread and its provider thread are created under, made before the write is
+/// queued (so the page can open on the thread at once).
+struct NewThreadIds {
+    thread: String,
+    provider: String,
+}
+
+/// [`record_new_thread`] under ids made beforehand: what the store writer runs.
+fn record_new_thread_as(
+    store: &Store,
+    ids: &NewThreadIds,
+    cwd: &str,
+    title: Option<&str>,
+    driver: Driver,
+    model: Option<&str>,
+    mode: Option<Mode>,
+) -> agent_kit::store::Result<()> {
+    let NewThreadIds { thread, provider } = ids;
+    store.create_thread_with_id(thread, cwd, title)?;
     if let Err(e) = store
-        .add_provider_thread(&thread, driver_key(driver), model.unwrap_or("default"))
-        .and_then(|pt| {
-            store.set_active_provider_thread(&thread, &pt)?;
+        .add_provider_thread_with_id(
+            provider,
+            thread,
+            driver_key(driver),
+            model.unwrap_or("default"),
+        )
+        .and_then(|()| {
+            store.set_active_provider_thread(thread, provider)?;
             if let Some(mode) = mode {
                 store.append_event(
-                    &thread,
-                    Some(pt.as_str()),
+                    thread,
+                    Some(provider.as_str()),
                     &Envelope::new(Event::ModeChosen { mode }),
                 )?;
             }
@@ -404,7 +536,7 @@ fn record_new_thread(
     {
         warn!("Cannot record the thread's agent: {e}");
     }
-    Ok(thread)
+    Ok(())
 }
 
 /// A thread to create (see [`AgentTerminalWindow::create_chat_thread`]).
@@ -522,16 +654,38 @@ fn load_provider(
 ///
 /// A store error fails the whole load: a thread read as empty with no provider would start a
 /// fresh session and re-point the thread at it, losing the one it had.
+#[cfg_attr(not(test), allow(dead_code))] // the app goes through `load_thread_with`
 fn load_thread(
     store: &Store,
     thread: &str,
     home: Option<&std::path::Path>,
 ) -> agent_kit::store::Result<LoadedThread> {
+    load_thread_with(store, thread, home, None)
+}
+
+/// [`load_thread`], storing an import through the store `writer` when there is one (the
+/// history is read here, on the worker; only the insert runs on the writer).
+fn load_thread_with(
+    store: &Store,
+    thread: &str,
+    home: Option<&std::path::Path>,
+    writer: Option<&StoreWriter>,
+) -> agent_kit::store::Result<LoadedThread> {
     let provider = load_provider(store, thread)?;
     let mut history = read_history(store, thread)?;
     if history.is_empty() {
         if let (Some(home), Some(pt)) = (home, provider.as_ref()) {
-            if import_native_history(store, thread, pt, home) {
+            let imported = match writer {
+                None => import_native_history(store, thread, pt, home),
+                Some(writer) => native_history_of(pt, home).is_some_and(|(driver, envs)| {
+                    let (thread, pt) = (thread.to_owned(), pt.id.clone());
+                    writer
+                        .call(move |s| store_imported(s, &thread, &pt, driver, &envs))
+                        .recv()
+                        .unwrap_or(false)
+                }),
+            };
+            if imported {
                 history = read_history(store, thread)?;
             }
         }
@@ -585,9 +739,19 @@ fn import_native_history(
     pt: &agent_kit::store::ProviderThread,
     home: &std::path::Path,
 ) -> bool {
+    native_history_of(pt, home)
+        .is_some_and(|(driver, envs)| store_imported(store, thread, &pt.id, driver, &envs))
+}
+
+/// `pt`'s native session history (read from the agent's own files): what
+/// [`import_native_history`] stores. `None`: nothing to import.
+fn native_history_of(
+    pt: &agent_kit::store::ProviderThread,
+    home: &std::path::Path,
+) -> Option<(Driver, Vec<Envelope>)> {
     let (Some(native_id), Some(driver)) = (pt.native_id.clone(), Driver::from_key(&pt.driver))
     else {
-        return false;
+        return None;
     };
     let session = agent_kit::native::NativeSession {
         driver,
@@ -608,10 +772,18 @@ fn import_native_history(
             })]
         }
     };
-    if envs.is_empty() {
-        return false;
-    }
-    match store.import_events(thread, Some(&pt.id), &envs) {
+    (!envs.is_empty()).then_some((driver, envs))
+}
+
+/// Stores an imported history; whether anything was stored.
+fn store_imported(
+    store: &Store,
+    thread: &str,
+    provider_thread: &str,
+    driver: Driver,
+    envs: &[Envelope],
+) -> bool {
+    match store.import_events(thread, Some(provider_thread), envs) {
         Ok(n) => {
             info!("Imported {n} events of a {} session", driver_label(driver));
             true
@@ -1571,7 +1743,8 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Runs a store write off the main thread, logs a failure, then reloads the thread list.
+    /// Runs a store write on the store writer (in order with the threads' own writes), logs a
+    /// failure, then reloads the thread list.
     pub(super) fn write_store(
         &self,
         what: &'static str,
@@ -1579,7 +1752,7 @@ impl AgentTerminalWindow {
     ) {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            if let Some(Err(e)) = store_job(job).await {
+            if let Some(Err(e)) = write_job(job).await {
                 warn!("Cannot {what}: {e}");
             }
             if let Some(obj) = obj.upgrade() {
@@ -1589,14 +1762,20 @@ impl AgentTerminalWindow {
     }
 
     /// A stored thread's summary: from the loaded list, else (a thread made a moment ago) a
-    /// one-row read.
+    /// one-row read, after the store writer has committed what is queued (the thread's creation
+    /// may still be on its way).
     pub(super) fn summary_of(&self, thread: &str) -> Option<agent_kit::store::ThreadSummary> {
         let cached = self
             .summaries
             .borrow()
             .as_ref()
             .and_then(|l| l.iter().find(|s| s.id == thread).cloned());
-        cached.or_else(|| app_store().thread_summary(thread).ok().flatten())
+        cached.or_else(|| {
+            app_handle()
+                .read(|s| s.thread_summary(thread))
+                .ok()
+                .flatten()
+        })
     }
 
     /// Redraws the sidebar from what is loaded, with the live state of the open pages. Cheap: a
@@ -2172,7 +2351,7 @@ impl AgentTerminalWindow {
                     return;
                 };
                 drop(obj);
-                if let Some(Err(e)) = store_job(move |s| s.set_meta(OPEN_THREADS_KEY, &value)).await
+                if let Some(Err(e)) = write_job(move |s| s.set_meta(OPEN_THREADS_KEY, &value)).await
                 {
                     warn!("Cannot record the open threads: {e}");
                 }
@@ -2278,8 +2457,14 @@ impl AgentTerminalWindow {
         };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let added = store_job(move |store| {
-                let sessions = agent_kit::native::recent_native_sessions(&home, RECENT_SESSIONS);
+            // The scan reads the agents' files on a worker; only linking runs on the writer.
+            let scan_home = home.clone();
+            let sessions = gtk4::gio::spawn_blocking(move || {
+                agent_kit::native::recent_native_sessions(&scan_home, RECENT_SESSIONS)
+            })
+            .await
+            .unwrap_or_default();
+            let added = write_job(move |store| {
                 link_recent_sessions(store, &sessions, &home.to_string_lossy())
             })
             .await
@@ -2591,7 +2776,8 @@ impl AgentTerminalWindow {
                     let home = (store_is_async() && !cfg!(test))
                         .then(|| env::var_os("HOME").map(std::path::PathBuf::from))
                         .flatten();
-                    move |store| load_thread(store, &thread, home.as_deref())
+                    let writer = store_writer();
+                    move |store| load_thread_with(store, &thread, home.as_deref(), writer.as_ref())
                 })
                 .await;
                 // A thread that cannot be read is not built (an empty one would start a fresh
@@ -2804,7 +2990,7 @@ impl AgentTerminalWindow {
         if slot.get().is_some() {
             return; // already running
         }
-        let store = app_store();
+        let store = app_handle();
 
         let thread_id = thread.to_owned();
         let view_sink = view.sink();
@@ -3825,7 +4011,7 @@ impl AgentTerminalWindow {
         } else {
             resolve_working_directory(&requested, &home)
         };
-        let store = app_store();
+        let store = app_handle();
         // The agent is recorded now, so the sidebar and a later reopen know it before the
         // session starts. The session adopts this provider thread.
         let model = model.or_else(|| {
@@ -3836,14 +4022,28 @@ impl AgentTerminalWindow {
         });
         // A profile default the agent has retired is never started: the suggestion is used.
         let (model, effort, _) = live_model(driver, model, effort);
-        let thread = match record_new_thread(
-            &store,
-            &cwd,
-            title.as_deref(),
-            driver,
-            model.as_deref(),
-            mode,
-        ) {
+        // Queued to the store writer under ids made here; everything that reads the thread back
+        // (its page, the sidebar) waits for the writer first.
+        let made = store.new_id().and_then(|thread| {
+            let ids = NewThreadIds {
+                thread: thread.clone(),
+                provider: store.new_id()?,
+            };
+            let (cwd, title, model) = (cwd.clone(), title.clone(), model.clone());
+            store.write("create a thread", Some(&thread), move |s| {
+                record_new_thread_as(
+                    s,
+                    &ids,
+                    &cwd,
+                    title.as_deref(),
+                    driver,
+                    model.as_deref(),
+                    mode,
+                )
+            })?;
+            Ok(thread)
+        });
+        let thread = match made {
             Ok(id) => id,
             Err(e) => {
                 present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
@@ -3880,11 +4080,20 @@ impl AgentTerminalWindow {
             &dir.unwrap_or_else(|| self.config.borrow().starting_directory.clone()),
             &home,
         );
-        let store = app_store();
-        let made = store.create_thread(&cwd, None).and_then(|thread| {
-            let pt = store.add_provider_thread(&thread, driver_key(driver), "default")?;
-            store.set_native_id(&pt, native_id)?;
-            store.set_active_provider_thread(&thread, &pt)?;
+        let store = app_handle();
+        let made = store.new_id().and_then(|thread| {
+            let (t, pt, native, cwd) = (
+                thread.clone(),
+                store.new_id()?,
+                native_id.to_owned(),
+                cwd.clone(),
+            );
+            store.write("resume a session as a thread", Some(&thread), move |s| {
+                s.create_thread_with_id(&t, &cwd, None)?;
+                s.add_provider_thread_with_id(&pt, &t, driver_key(driver), "default")?;
+                s.set_native_id(&pt, &native)?;
+                s.set_active_provider_thread(&t, &pt)
+            })?;
             Ok(thread)
         });
         match made {
@@ -5071,5 +5280,84 @@ pub(super) mod tests {
         assert_eq!(title.expect("query").as_deref(), Some("t"));
         // A write from the worker is visible to the main connection (WAL).
         assert!(main_store.thread_summary(&thread).expect("read").is_some());
+    }
+
+    /// With a file store, the main thread's writes go to the store writer (none runs here),
+    /// and a store job queued right after them reads them back: it waits on the writer's
+    /// barrier before it reads on its own connection. A write job runs on the writer, in order.
+    #[test]
+    fn main_thread_writes_are_queued_and_store_jobs_read_them_back() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("threads.db");
+        let reader = Rc::new(Store::open(&path).expect("open"));
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
+        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+
+        let handle = app_handle();
+        assert!(handle.writer().is_some());
+        let thread = handle.new_id().expect("id");
+        let ids = NewThreadIds {
+            thread: thread.clone(),
+            provider: handle.new_id().expect("id"),
+        };
+        handle
+            .write("create a thread", Some(&thread), move |s| {
+                record_new_thread_as(s, &ids, "/w", Some("t"), Driver::Claude, None, None)
+            })
+            .expect("queued");
+        // A slow write ahead keeps the rest queued while the main thread carries on.
+        handle
+            .write("wait", None, |_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(())
+            })
+            .expect("queued");
+        let say = |n: usize| {
+            Envelope::new(Event::Notice {
+                text: format!("n{n}"),
+            })
+        };
+        for n in 0..300 {
+            handle.append_event(&thread, None, &say(n)).expect("queued");
+        }
+        assert!(
+            reader.thread_summary(&thread).expect("read").is_none(),
+            "nothing was written on the main thread"
+        );
+
+        let got = in_loop(|ctx| {
+            let out = Rc::new(RefCell::new(None));
+            let o = out.clone();
+            let id = thread.clone();
+            glib::spawn_future_local(async move {
+                let read = store_job({
+                    let id = id.clone();
+                    move |s| s.events(&id, None, 1000).map(|e| e.len())
+                })
+                .await;
+                let renamed = write_job(move |s| {
+                    s.rename_thread(&id, "renamed")?;
+                    s.thread_summary(&id).map(|s| s.map(|s| s.title))
+                })
+                .await;
+                *o.borrow_mut() = Some((read, renamed));
+            });
+            assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
+            let got = out.borrow_mut().take();
+            got
+        });
+        WRITER.with(|w| *w.borrow_mut() = None);
+        STORE_PATH.with(|p| *p.borrow_mut() = None);
+        STORE.with(|s| *s.borrow_mut() = None);
+        let (read, renamed) = got.expect("ran");
+        assert_eq!(read.expect("job").expect("events"), 300);
+        assert_eq!(
+            renamed.expect("job").expect("rename").as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(writer.failures().0, 0);
     }
 }

@@ -26,6 +26,12 @@ pub fn watch_config_file(app: &adw::Application) {
     imp::AgentTerminalWindow::watch_config_file(app);
 }
 
+/// Drains the thread store's writer and closes its connection, waiting at most `wait`. Once per
+/// process, from the application's `shutdown` (the windows are gone by then).
+pub fn close_store_writer(wait: std::time::Duration) {
+    imp::close_store_writer(wait);
+}
+
 impl AgentTerminalWindow {
     /// Creates a new AgentTerminalWindow instance.
     pub fn new(app: &adw::Application) -> Self {

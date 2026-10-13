@@ -222,6 +222,9 @@ fn main() -> glib::ExitCode {
             ms = started.elapsed().as_millis(),
             "shutdown: agents stopped"
         );
+        // After the agents: their last events are queued by now. A window waits for the queue
+        // before it goes (`closing`), so this normally finds it empty.
+        window::close_store_writer(std::time::Duration::from_secs(5));
     });
 
     app.connect_activate(|app| {

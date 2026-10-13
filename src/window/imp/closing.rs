@@ -11,6 +11,10 @@
 //! after [`QUIT_NOW_AFTER`], a quiet "Quit Now" that kills what is left. A fast close never shows
 //! it. An agent that ignores SIGTERM is killed after `agent_proc`'s grace, as before; nothing
 //! waits longer than [`CLOSE_CAP`].
+//!
+//! Once the agents are gone, the window also waits (off the main thread, same cap) for the store
+//! writer to commit what is queued, their closing events included, so the app's own shutdown
+//! finds the queue empty.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -124,6 +128,8 @@ pub(super) struct Closing {
     /// screen's own button can be reached from the keyboard.
     key_block: RefCell<Option<gtk4::EventControllerKey>>,
     timers: RefCell<Timers>,
+    /// Waiting for the store writer to commit the agents' last events.
+    saving: Cell<bool>,
     finished: Cell<bool>,
     window: glib::WeakRef<super::super::AgentTerminalWindow>,
 }
@@ -177,6 +183,7 @@ impl Closing {
             content: RefCell::new(None),
             key_block: RefCell::new(None),
             timers: RefCell::new(Timers::default()),
+            saving: Cell::new(false),
             finished: Cell::new(false),
             window: window.downgrade(),
         });
@@ -203,8 +210,41 @@ impl Closing {
             self.step.set_text(&line);
         }
         if phases.iter().all(|(_, _, p)| *p == StopPhase::Exited) {
-            self.finish();
+            self.save_then_finish();
         }
+    }
+
+    /// The agents are gone and their last events are queued for the store: the window goes
+    /// once the store writer has committed them, waited for off the main thread (the window
+    /// stays responsive, the cap still applies).
+    fn save_then_finish(&self) {
+        let Some(writer) = super::threads::store_writer().filter(|w| w.pending() > 0) else {
+            self.finish();
+            return;
+        };
+        if self.saving.replace(true) {
+            return;
+        }
+        debug!(
+            pending = writer.pending(),
+            "close: waiting for the store to save"
+        );
+        let window = self.window.clone();
+        let barrier = writer.barrier();
+        glib::spawn_future_local(async move {
+            let saved = gtk4::gio::spawn_blocking(move || barrier.recv_timeout(CLOSE_CAP).is_ok())
+                .await
+                .unwrap_or(false);
+            if !saved {
+                warn!("close: the store did not finish saving in time");
+            }
+            let closing = window
+                .upgrade()
+                .and_then(|w| w.imp().closing.borrow().clone());
+            if let Some(closing) = closing {
+                closing.finish();
+            }
+        });
     }
 
     fn kill_all(&self) {
