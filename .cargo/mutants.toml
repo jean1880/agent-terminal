@@ -1,8 +1,8 @@
 # cargo-mutants: breaks the code one small change at a time and checks a test notices.
 # A "missed" mutant is code the tests run but never check. See tests/qa/README.md.
 #
-# A mutant can turn a bounded loop into an unbounded one: run it only under a memory cap
-# (systemd-run -p MemoryMax=…, or ulimit -v in CI). An uncapped run once took a 59 GB
+# CI only (.github/workflows/mutants.yml, under ulimit -v). Never on a developer machine: a
+# mutant can turn a bounded loop into one that allocates until killed, and one took a
 # workstation down.
 
 # Each test in its own process, with the same timeouts as the gate.

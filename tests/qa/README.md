@@ -57,17 +57,13 @@ Coverage says a line ran; it cannot say a test checked it. `cargo mutants` (conf
 every test still passes is listed in `mutants.out/missed.txt`: code that runs but that
 nothing verifies. Fix it with a test that asserts the behaviour, never by excluding it.
 
-**Always cap its memory.** A mutant can turn a bounded loop into an unbounded one; one
-grew to 30 GB and took a workstation down. Locally:
-
-```
-systemd-run --user --scope --quiet -p MemoryMax=16G -p MemorySwapMax=0 \
-    cargo mutants --package agent-core --jobs 3 --output target/mutants-core
-```
-
-Scope a run to what changed with `--in-diff <(git diff origin/master)` or `--file <path>`.
-In CI, `mutants.yml` runs weekly (and by hand) under `ulimit -v`, and lists missed mutants
-in the run summary; it reports, it does not gate.
+**CI only. Never run it on a workstation.** By design some mutants turn a bounded loop
+into an unbounded one that allocates until it is killed (`i += 1` made `i *= 1` in a
+parser, for one): a run here once crashed a desktop at 30 GB, and even inside a 16 GB
+memory cap it filled the cap. `mutants.yml` runs it weekly, and by hand (Actions → Mutation
+testing → Run workflow), on GitHub's disposable runners under `ulimit -v`, and lists missed
+mutants in the run summary; it reports, it does not gate. Fix a missed mutant by writing the
+test that asserts the behaviour, then let the next CI run confirm it.
 
 Diagnostics live in `target/qa-artifacts`: the selected name, exit status,
 timeout state and exact source commit/version accompany logs. Native tests print
