@@ -2240,7 +2240,7 @@ pub(crate) mod tests {
             inner.header.extra_access_shown().is_none(),
             "nothing granted yet"
         );
-        assert!(!inner.interruption.allow_btn.is_visible());
+        assert!(!interruption::placed(&inner.interruption.allow_btn));
         let pressed = inner.transcript.with_row("approval:p", |row| match row {
             cards::Row::Approval(card) => Some(card.press("Allow for this session")),
             _ => None,

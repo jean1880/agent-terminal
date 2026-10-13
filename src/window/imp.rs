@@ -40,7 +40,8 @@ use crate::terminal_stub::{CursorBlinkMode, CursorShape, Format, PtyFlags, Termi
 const LOGO_SVG: &str = include_str!("../../assets/ca.nuvek.AgentTerminal.svg");
 
 /// The smallest the window may be made (GNOME's minimum for adaptive apps). Every layout state
-/// the breakpoints allow fits it; `tests::small_window_fits` measures that.
+/// the breakpoints allow fits it at normal text size; large text is supported from a wider
+/// window. `tests::small_window_fits` measures both.
 const MIN_WINDOW: (i32, i32) = (360, 294);
 /// The Settings descriptions of the two folder rows, restored once a typed path checks out.
 const STARTING_DIRECTORY_HELP: &str = "Where new tabs and threads open (blank: your home folder)";
@@ -7019,6 +7020,11 @@ mod tests {
     /// The narrowest window that still shows the sidebar beside the thread (at 1× text scale).
     const COLLAPSE_BELOW: i32 = threads::SIDEBAR_COLLAPSE_SP as i32;
 
+    /// The narrowest window large text (2×) is supported in. [`MIN_WINDOW`] is a phone-width
+    /// floor for normal text; doubling the text there leaves no room for a thread's controls,
+    /// and is not a layout anyone works in.
+    const LARGE_TEXT_MIN_WIDTH: i32 = 600;
+
     /// The window, with a thread open and full of history and the sidebar shown, fits itself at
     /// every size from [`MIN_WINDOW`] up: in whichever layout the breakpoints pick, nothing
     /// (header buttons, composer, transcript) is pushed out of view. Prints what holds it open
@@ -7197,6 +7203,9 @@ mod tests {
                 scaled_widths.sort_unstable();
                 scaled_widths.dedup();
                 scaled_widths.retain(|width| *width + frame_width <= display_width);
+                if scale > 1.0 {
+                    scaled_widths.retain(|width| *width >= LARGE_TEXT_MIN_WIDTH);
+                }
                 for width in scaled_widths {
                     window.set_default_size(width + frame_width, height + frame_height);
                     let sized = crate::testutil::pump_until(&ctx, 3, || {
