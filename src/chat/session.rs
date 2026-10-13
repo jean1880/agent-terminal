@@ -731,6 +731,8 @@ impl Inner {
                     // A new Codex thread stays provisional until a turn completes (2.5).
                     if self.adapter.borrow().driver() == Driver::Codex && !resumed {
                         *self.provisional_native.borrow_mut() = Some((pt, native_id.clone()));
+                    } else if pt.is_empty() {
+                        // No provider thread to record it on (the store could not be read).
                     } else if let Err(e) = self.store.set_native_id(&pt, native_id) {
                         warn!(error = %e, "could not record the native session id");
                     }
@@ -891,6 +893,9 @@ impl Inner {
             return;
         };
         if *self.provider_thread.borrow() != pt {
+            return;
+        }
+        if pt.is_empty() {
             return;
         }
         if let Err(e) = self.store.set_native_id(&pt, &native) {

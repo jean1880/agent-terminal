@@ -433,22 +433,25 @@ pub(super) async fn store_job<T: Send + 'static>(
 }
 
 /// Runs `job` on the store writer, in order after every write queued before it, and returns
-/// its result: for jobs that write (and may read their own writes back). `None`: the writer is
-/// gone or the job panicked, already logged. Without a writer it runs as [`store_job`] does.
+/// its result once its batch is committed: for jobs that write (and may read their own writes
+/// back). A job that returns `Err` leaves nothing behind (its savepoint is rolled back) and the
+/// error comes back for the caller to show. `None`: the writer is gone, far behind, or the job
+/// panicked; already logged. Without a writer it runs as [`store_job`] does, atomically.
 pub(super) async fn write_job<T: Send + 'static>(
     what: &'static str,
-    job: impl FnOnce(&Store) -> T + Send + 'static,
-) -> Option<T> {
+    job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
+) -> Option<agent_kit::store::Result<T>> {
     let Some(writer) = store_writer() else {
-        return store_job(job).await;
+        // All of it or none of it, as on the writer.
+        return store_job(move |s| s.atomically(job)).await;
     };
-    let answer = writer.call(what, job);
-    gtk4::gio::spawn_blocking(move || answer.recv().ok())
+    let answer = writer.call_result(what, job);
+    gtk4::gio::spawn_blocking(move || answer.recv_timeout(WORKER_FLUSH_WAIT).ok())
         .await
         .ok()
         .flatten()
         .or_else(|| {
-            error!("A store write job did not answer (the writer stopped, or the job panicked)");
+            error!("A store write job did not answer (the writer stopped or is far behind, or the job panicked)");
             None
         })
 }
@@ -517,7 +520,7 @@ pub(crate) fn flush_store_for_panic(wait: std::time::Duration) {
 /// Stores a NEW thread in `cwd` on `driver`/`model`, with its provider thread active and `mode`
 /// recorded as the user's choice when one is carried over (a continued or forked thread keeps
 /// its source's mode rather than the profile's). Only the new thread is written: the source of
-/// a fork is never touched. The agent record failing is logged, not fatal: the thread exists.
+/// a fork is never touched. All or nothing: the agent record failing fails the whole create.
 /// (The app queues [`record_new_thread_as`] to the store writer instead.)
 #[cfg(test)]
 fn record_new_thread(
@@ -532,7 +535,7 @@ fn record_new_thread(
         thread: store.new_id()?,
         provider: store.new_id()?,
     };
-    record_new_thread_as(store, &ids, cwd, title, driver, model, mode)?;
+    store.atomically(|s| record_new_thread_as(s, &ids, cwd, title, driver, model, mode))?;
     Ok(ids.thread)
 }
 
@@ -563,27 +566,22 @@ fn record_new_thread_as(
     mode: Option<Mode>,
 ) -> agent_kit::store::Result<()> {
     let NewThreadIds { thread, provider } = ids;
+    // All of it or none of it (the caller runs it as one unit): a thread without its agent
+    // would start a session on whatever the profile says, not on what was chosen.
     store.create_thread_with_id(thread, cwd, title)?;
-    if let Err(e) = store
-        .add_provider_thread_with_id(
-            provider,
+    store.add_provider_thread_with_id(
+        provider,
+        thread,
+        driver_key(driver),
+        model.unwrap_or("default"),
+    )?;
+    store.set_active_provider_thread(thread, provider)?;
+    if let Some(mode) = mode {
+        store.append_event(
             thread,
-            driver_key(driver),
-            model.unwrap_or("default"),
-        )
-        .and_then(|()| {
-            store.set_active_provider_thread(thread, provider)?;
-            if let Some(mode) = mode {
-                store.append_event(
-                    thread,
-                    Some(provider.as_str()),
-                    &Envelope::new(Event::ModeChosen { mode }),
-                )?;
-            }
-            Ok(())
-        })
-    {
-        warn!("Cannot record the thread's agent: {e}");
+            Some(provider.as_str()),
+            &Envelope::new(Event::ModeChosen { mode }),
+        )?;
     }
     Ok(())
 }
@@ -732,7 +730,7 @@ fn load_thread_with(
                         .call("import a session's history", move |s| {
                             store_imported(s, &thread, &pt, driver, &envs)
                         })
-                        .recv()
+                        .recv_timeout(WORKER_FLUSH_WAIT)
                         .unwrap_or(false)
                 }),
             };
@@ -2520,9 +2518,14 @@ impl AgentTerminalWindow {
             .await
             .unwrap_or_default();
             let added = write_job("list recent sessions as threads", move |store| {
-                link_recent_sessions(store, &sessions, &home.to_string_lossy())
+                Ok(link_recent_sessions(
+                    store,
+                    &sessions,
+                    &home.to_string_lossy(),
+                ))
             })
             .await
+            .and_then(Result::ok)
             .unwrap_or(0);
             if added > 0 {
                 info!("Listed {added} recent agent session(s) as threads");
@@ -4118,7 +4121,7 @@ impl AgentTerminalWindow {
         };
         if store.writer().is_none() {
             // In place (memory-only store, tests): the page opens at once.
-            if let Err(e) = record(store.reader()) {
+            if let Err(e) = store.reader().atomically(record) {
                 present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
                 return None;
             }
@@ -4214,7 +4217,7 @@ impl AgentTerminalWindow {
             imp.open_thread(&thread, true);
         };
         if store.writer().is_none() {
-            match record(store.reader()) {
+            match store.reader().atomically(record) {
                 Ok(()) => opened(self),
                 Err(e) => present_message(&self.obj(), "Cannot Resume the Session", &e.to_string()),
             }

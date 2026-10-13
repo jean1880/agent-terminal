@@ -34,6 +34,9 @@ pub(super) const SHOW_AFTER: Duration = Duration::from_millis(150);
 pub(super) const QUIT_NOW_AFTER: Duration = Duration::from_millis(1500);
 /// The longest the window waits for its agents; whatever is left is killed.
 pub(super) const CLOSE_CAP: Duration = Duration::from_secs(5);
+/// How long the closing screen waits for the store before it says it is not keeping up and
+/// makes Quit Now the way out.
+pub(super) const SAVE_DEADLINE: Duration = Duration::from_secs(10);
 /// The longest thread title the step line quotes in full.
 const TITLE_CHARS: usize = 40;
 
@@ -67,6 +70,20 @@ pub(super) fn step_line(targets: &[(&str, &str, StopPhase)]) -> String {
         ([(agent, title, _)], []) if title.trim().is_empty() => format!("Stopping {agent}…"),
         ([(agent, title, _)], []) => format!("Stopping {agent} in {}…", short_title(title)),
         (_, []) => format!("Stopping {} agents…", waiting.len()),
+    }
+}
+
+/// The step line while the store saves: how many writes are left, and past the deadline, what
+/// Quit Now would leave unsaved.
+pub(super) fn saving_line(left: usize, late: bool) -> String {
+    let writes = if left == 1 { "write" } else { "writes" };
+    match (left, late) {
+        (0, _) => "Saving threads…".to_owned(),
+        (_, false) => format!("Saving threads… ({left} {writes} left)"),
+        (_, true) => format!(
+            "The thread store is not keeping up: {left} {writes} still waiting. \
+             Quit Now leaves them unsaved."
+        ),
     }
 }
 
@@ -211,7 +228,8 @@ impl Closing {
             .map(|t| (t.agent.as_str(), t.title.as_str(), t.watch.phase()))
             .collect();
         let line = step_line(&phases);
-        if self.step.text().as_str() != line {
+        // Once saving, the saving line (kept by its own timer) stays.
+        if !self.saving.get() && self.step.text().as_str() != line {
             self.step.set_text(&line);
         }
         if phases.iter().all(|(_, _, p)| *p == StopPhase::Exited) {
@@ -235,8 +253,35 @@ impl Closing {
             "close: waiting for the store to save"
         );
         // Until it has saved (or the user quits now): the window does not go with writes still
-        // on their way, the cap included.
+        // on their way, the cap included. Past the deadline it says how many are left, and
+        // Quit Now becomes the way out.
         self.step.set_text("Saving threads…");
+        let started = Instant::now();
+        let ticker = self.window.clone();
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            let closing = ticker
+                .upgrade()
+                .and_then(|w| w.imp().closing.borrow().clone());
+            let Some(closing) = closing.filter(|c| !c.finished.get()) else {
+                return glib::ControlFlow::Break;
+            };
+            let left = super::threads::store_writes_pending();
+            let line = saving_line(left, started.elapsed() >= SAVE_DEADLINE);
+            if closing.step.text().as_str() != line {
+                closing.step.set_text(&line);
+            }
+            if started.elapsed() >= SAVE_DEADLINE {
+                closing.offer_quit_now();
+                if let Some(button) = closing.quit_now.child() {
+                    if !button.has_css_class("suggested-action") {
+                        warn!(left, "close: the store is not keeping up; Quit Now offered");
+                        button.add_css_class("suggested-action");
+                        button.grab_focus();
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
         let window = self.window.clone();
         let barrier = writer.barrier();
         glib::spawn_future_local(async move {
@@ -666,6 +711,15 @@ mod tests {
         let quit = Instant::now();
         crate::agent_proc::terminate_all();
         assert!(quit.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn the_saving_line_counts_what_is_left_and_says_when_it_is_late() {
+        assert_eq!(saving_line(0, false), "Saving threads…");
+        assert_eq!(saving_line(1, false), "Saving threads… (1 write left)");
+        assert_eq!(saving_line(12, false), "Saving threads… (12 writes left)");
+        assert!(saving_line(12, true).contains("12 writes still waiting"));
+        assert!(saving_line(12, true).contains("Quit Now leaves them unsaved"));
     }
 
     #[test]
