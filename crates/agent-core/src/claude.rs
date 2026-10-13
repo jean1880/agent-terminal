@@ -2639,6 +2639,67 @@ mod tests {
             .collect()
     }
 
+    /// The command list a frame announced, as (name, kind), if it announced one.
+    fn announced(out: &[Envelope]) -> Option<Vec<(String, AgentCommandKind)>> {
+        out.iter().find_map(|e| match &e.event {
+            Event::CommandsChanged { commands } => Some(
+                commands
+                    .iter()
+                    .map(|c| (c.name.clone(), c.kind))
+                    .collect(),
+            ),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn init_announces_the_command_list_only_when_it_changed() {
+        use AgentCommandKind::{Command as C, Skill as S, TerminalOnly as T};
+        let init = |slash: &[&str], skills: &[&str], terminal: &[&str]| {
+            json!({"type": "system", "subtype": "init", "model": "m", "session_id": "s",
+                   "slash_commands": slash, "skills": skills,
+                   "terminal_slash_commands": terminal})
+            .to_string()
+        };
+        let named = |list: &[(&str, AgentCommandKind)]| {
+            Some(list.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect::<Vec<_>>())
+        };
+        let mut a = ClaudeAdapter::new();
+        // The first init always announces; a terminal-only command is never a plain one.
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "s", "t"], &["s"], &["t"]))),
+            named(&[("a", C), ("s", S), ("t", T)])
+        );
+        // The same again: nothing to announce.
+        assert_eq!(announced(&a.feed(&init(&["a", "s", "t"], &["s"], &["t"]))), None);
+        // A new command, a skill change, or a terminal-only change each announce.
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "b", "s", "t"], &["s"], &["t"]))),
+            named(&[("a", C), ("b", C), ("s", S), ("t", T)])
+        );
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "b", "s", "t"], &[], &["t"]))),
+            named(&[("a", C), ("b", C), ("s", C), ("t", T)])
+        );
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "b", "s", "t"], &[], &["t", "b"]))),
+            named(&[("a", C), ("s", C), ("t", T), ("b", T)])
+        );
+
+        // Once the rich list has come, init only takes back what became terminal-only.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init(&[], &[], &[]));
+        a.feed(
+            &json!({"type": "system", "subtype": "commands_changed", "commands": [
+                {"name": "review", "description": "Review"}, {"name": "login"}]})
+            .to_string(),
+        );
+        assert_eq!(
+            announced(&a.feed(&init(&["ignored"], &[], &["login"]))),
+            named(&[("review", C), ("login", T)])
+        );
+    }
+
     /// The tool id each task in the newest task list carries.
     fn listed_tools(out: &[Envelope]) -> Vec<(String, Option<String>)> {
         task_lists(out)
