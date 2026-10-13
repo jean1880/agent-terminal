@@ -61,9 +61,12 @@ Architectural mandates, standards, and workflows for this codebase.
     threads, scrubbed events, app meta such as the open-thread list).
     `store_writer` is the one thread that writes it: the app's main thread
     queues every write there through a `StoreHandle` (never writing in place on
-    a file store), reads that need their own writes wait on its barrier, and
-    failures are counted and shown. Split-secret heals use the in-memory tails
-    of `heal_tail` when they can vouch for every row, else the SQL scan.
+    a file store), reads that need their own writes wait on its barrier (and
+    are not made at all if it does not answer: never read stale rows), its queue
+    is bounded, and failures (refused writes included) are counted and shown.
+    Split-secret heals use the in-memory tails of `heal_tail` only when they can
+    vouch for every row of the item, else the SQL scan; redaction must never be
+    weaker than the scan's.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the 2.x profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and

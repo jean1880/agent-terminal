@@ -11,7 +11,7 @@ mod setup;
 mod thread_menu;
 mod threads;
 
-pub(crate) use threads::close_store_writer;
+pub(crate) use threads::{close_store_writer, flush_store_for_panic};
 
 use super::diff_panel::DiffPanel;
 use super::loading;

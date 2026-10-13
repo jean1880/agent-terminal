@@ -16,7 +16,7 @@ use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
 use agent_core::catalog::{model_notice, ModelNotice};
 use agent_core::event::{BackgroundTask, Decision, Envelope, Event, ItemKind};
 use agent_kit::store::Store;
-use agent_kit::store_writer::{StoreHandle, StoreWriter, READ_FLUSH_WAIT};
+use agent_kit::store_writer::{Shutdown, StoreHandle, StoreWriter, WORKER_FLUSH_WAIT};
 
 use super::diffs::ThreadDiffs;
 use super::*;
@@ -291,6 +291,8 @@ thread_local! {
     static WRITER: RefCell<Option<StoreWriter>> = const { RefCell::new(None) };
     /// Store write failures already shown to the user (the writer's count).
     static FAILURES_SHOWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Why the store writer could not start, until a window has said so.
+    static WRITER_START_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Keyed by (command, env file): a profile edit is a new key, so nothing goes stale.
     static RESOLVED: RefCell<HashMap<(String, Option<String>), ResolvedAgent>> =
         RefCell::new(HashMap::new());
@@ -341,11 +343,24 @@ fn open_store() -> Result<Rc<Store>, String> {
     if let Some(path) = path {
         match Store::open(&path) {
             Ok(store) => {
-                // The writer opens its own connection (the schema is already migrated). Without
-                // it the app still works, writing on this connection as before.
+                // The writer opens its own connection (the schema is already migrated, so this
+                // is one quick open). If it cannot start, the app keeps saving the way it always
+                // did, on this connection: losing every write would be worse. That is an error,
+                // and the user is told (`take_store_failure`).
                 match StoreWriter::spawn(&path) {
-                    Ok(writer) => WRITER.with(|w| *w.borrow_mut() = Some(writer)),
-                    Err(e) => error!("Cannot start the store writer; writing in place: {e}"),
+                    Ok(writer) => {
+                        let _ = PANIC_WRITER.set(writer.clone());
+                        WRITER.with(|w| *w.borrow_mut() = Some(writer));
+                    }
+                    Err(e) => {
+                        error!("Cannot start the store writer; saving on the main thread: {e}");
+                        WRITER_START_ERROR.with(|s| {
+                            *s.borrow_mut() = Some(format!(
+                                "Threads are saved more slowly: the store writer could not start \
+                                 ({e})"
+                            ))
+                        });
+                    }
                 }
                 STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
                 return Ok(Rc::new(store));
@@ -384,7 +399,8 @@ pub(super) fn app_handle() -> StoreHandle {
 /// connections are not `Send`; WAL lets it run beside the main one), and returns its result.
 /// It first waits (on the worker) for every write queued before it to be committed, so it reads
 /// the app's own writes. For reading: a job that writes goes through [`write_job`].
-/// `None`: the worker could not open the store or panicked, already logged. With no file store
+/// `None`: the writer did not catch up in time (nothing is read then), or the worker could not
+/// open the store or panicked; already logged. With no file store
 /// the job runs in place on the app's.
 pub(super) async fn store_job<T: Send + 'static>(
     job: impl FnOnce(&Store) -> T + Send + 'static,
@@ -395,8 +411,10 @@ pub(super) async fn store_job<T: Send + 'static>(
     let barrier = store_writer().map(|w| w.barrier());
     gtk4::gio::spawn_blocking(move || {
         if let Some(barrier) = barrier {
-            if barrier.recv_timeout(READ_FLUSH_WAIT).is_err() {
-                warn!("A store read ran before the writer caught up");
+            // Never read stale rows: a page built from them could start a second session.
+            if barrier.recv_timeout(WORKER_FLUSH_WAIT).is_err() {
+                error!("The store writer did not catch up; a store read was not made");
+                return None;
             }
         }
         match Store::open(&path) {
@@ -418,12 +436,13 @@ pub(super) async fn store_job<T: Send + 'static>(
 /// its result: for jobs that write (and may read their own writes back). `None`: the writer is
 /// gone or the job panicked, already logged. Without a writer it runs as [`store_job`] does.
 pub(super) async fn write_job<T: Send + 'static>(
+    what: &'static str,
     job: impl FnOnce(&Store) -> T + Send + 'static,
 ) -> Option<T> {
     let Some(writer) = store_writer() else {
         return store_job(job).await;
     };
-    let answer = writer.call(job);
+    let answer = writer.call(what, job);
     gtk4::gio::spawn_blocking(move || answer.recv().ok())
         .await
         .ok()
@@ -438,6 +457,9 @@ pub(super) async fn write_job<T: Send + 'static>(
 /// last failure, which the journal has in full. Polled by every window; the first to see a new
 /// failure shows it.
 pub(super) fn take_store_failure() -> Option<String> {
+    if let Some(start) = WRITER_START_ERROR.with(|s| s.borrow_mut().take()) {
+        return Some(start);
+    }
     let writer = WRITER.with(|w| w.borrow().clone())?;
     let (count, last) = writer.failures();
     if count <= FAILURES_SHOWN.with(std::cell::Cell::get) {
@@ -460,17 +482,35 @@ pub(crate) fn close_store_writer(wait: std::time::Duration) {
     };
     let started = std::time::Instant::now();
     let pending = writer.pending();
-    if writer.shutdown(wait) {
-        debug!(
+    match writer.shutdown(wait) {
+        Shutdown::Drained => debug!(
             pending,
             ms = started.elapsed().as_millis(),
             "shutdown: store writer drained"
-        );
-    } else {
-        error!(
+        ),
+        Shutdown::TimedOut => error!(
             pending = writer.pending(),
             "shutdown: the store writer did not finish in time; its last writes may be lost"
-        );
+        ),
+        Shutdown::WriterGone => error!(
+            pending = writer.pending(),
+            "shutdown: the store writer had already stopped; writes still queued are lost"
+        ),
+    }
+}
+
+/// Set once with the writer: the panic hook may run on any thread, and the writer's
+/// thread-local handle lives on the main one.
+static PANIC_WRITER: std::sync::OnceLock<StoreWriter> = std::sync::OnceLock::new();
+
+/// From the panic hook: give the store writer up to `wait` to commit what is queued before the
+/// process goes down. Not on the writer's own thread (it cannot answer itself).
+pub(crate) fn flush_store_for_panic(wait: std::time::Duration) {
+    if std::thread::current().name() == Some("store-writer") {
+        return;
+    }
+    if let Some(writer) = PANIC_WRITER.get() {
+        let _ = writer.flush(wait);
     }
 }
 
@@ -501,6 +541,15 @@ fn record_new_thread(
 struct NewThreadIds {
     thread: String,
     provider: String,
+}
+
+/// What a thread made by `create_chat_thread` carries into its page once it is stored.
+struct CreatedThread {
+    driver: Driver,
+    prompt: Option<String>,
+    effort: Option<String>,
+    handoff: Option<(crate::chat::session::Handoff, String)>,
+    title: Option<String>,
 }
 
 /// [`record_new_thread`] under ids made beforehand: what the store writer runs.
@@ -680,7 +729,9 @@ fn load_thread_with(
                 Some(writer) => native_history_of(pt, home).is_some_and(|(driver, envs)| {
                     let (thread, pt) = (thread.to_owned(), pt.id.clone());
                     writer
-                        .call(move |s| store_imported(s, &thread, &pt, driver, &envs))
+                        .call("import a session's history", move |s| {
+                            store_imported(s, &thread, &pt, driver, &envs)
+                        })
                         .recv()
                         .unwrap_or(false)
                 }),
@@ -1752,7 +1803,7 @@ impl AgentTerminalWindow {
     ) {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            if let Some(Err(e)) = write_job(job).await {
+            if let Some(Err(e)) = write_job(what, job).await {
                 warn!("Cannot {what}: {e}");
             }
             if let Some(obj) = obj.upgrade() {
@@ -1774,6 +1825,7 @@ impl AgentTerminalWindow {
             app_handle()
                 .read(|s| s.thread_summary(thread))
                 .ok()
+                .and_then(Result::ok)
                 .flatten()
         })
     }
@@ -2351,7 +2403,10 @@ impl AgentTerminalWindow {
                     return;
                 };
                 drop(obj);
-                if let Some(Err(e)) = write_job(move |s| s.set_meta(OPEN_THREADS_KEY, &value)).await
+                if let Some(Err(e)) = write_job("record the open threads", move |s| {
+                    s.set_meta(OPEN_THREADS_KEY, &value)
+                })
+                .await
                 {
                     warn!("Cannot record the open threads: {e}");
                 }
@@ -2464,7 +2519,7 @@ impl AgentTerminalWindow {
             })
             .await
             .unwrap_or_default();
-            let added = write_job(move |store| {
+            let added = write_job("list recent sessions as threads", move |store| {
                 link_recent_sessions(store, &sessions, &home.to_string_lossy())
             })
             .await
@@ -2990,7 +3045,12 @@ impl AgentTerminalWindow {
         if slot.get().is_some() {
             return; // already running
         }
-        let store = app_handle();
+        // The provider was read off the main thread, behind the writer's barrier: the session
+        // does not read it again here.
+        let store = crate::chat::session::SessionStore {
+            handle: app_handle(),
+            provider: Some(provider.as_ref().map(|p| p.id.clone())),
+        };
 
         let thread_id = thread.to_owned();
         let view_sink = view.sink();
@@ -4022,15 +4082,22 @@ impl AgentTerminalWindow {
         });
         // A profile default the agent has retired is never started: the suggestion is used.
         let (model, effort, _) = live_model(driver, model, effort);
-        // Queued to the store writer under ids made here; everything that reads the thread back
-        // (its page, the sidebar) waits for the writer first.
-        let made = store.new_id().and_then(|thread| {
-            let ids = NewThreadIds {
-                thread: thread.clone(),
+        let ids = match store.new_id().and_then(|thread| {
+            Ok(NewThreadIds {
+                thread,
                 provider: store.new_id()?,
-            };
+            })
+        }) {
+            Ok(ids) => ids,
+            Err(e) => {
+                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
+                return None;
+            }
+        };
+        let thread = ids.thread.clone();
+        let record = {
             let (cwd, title, model) = (cwd.clone(), title.clone(), model.clone());
-            store.write("create a thread", Some(&thread), move |s| {
+            move |s: &Store| {
                 record_new_thread_as(
                     s,
                     &ids,
@@ -4040,19 +4107,58 @@ impl AgentTerminalWindow {
                     model.as_deref(),
                     mode,
                 )
-            })?;
-            Ok(thread)
-        });
-        let thread = match made {
-            Ok(id) => id,
-            Err(e) => {
+            }
+        };
+        let created = CreatedThread {
+            driver,
+            prompt,
+            effort,
+            handoff,
+            title,
+        };
+        if store.writer().is_none() {
+            // In place (memory-only store, tests): the page opens at once.
+            if let Err(e) = record(store.reader()) {
                 present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
                 return None;
             }
-        };
-        info!("New {} thread in {cwd}", driver_label(driver));
+            info!("New {} thread in {cwd}", driver_label(driver));
+            return self.open_created(&thread, created);
+        }
+        // Stored by the writer first, and the page opens only once it is: a thread that could
+        // not be stored gets the dialog, never a page whose every write would fail.
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let stored = write_job("create a thread", record).await;
+            let Some(obj) = obj.upgrade() else { return };
+            match stored {
+                Some(Ok(())) => {
+                    info!("New {} thread in {cwd}", driver_label(driver));
+                    obj.imp().open_created(&thread, created);
+                }
+                Some(Err(e)) => present_message(&obj, "Cannot Create a Thread", &e.to_string()),
+                None => present_message(
+                    &obj,
+                    "Cannot Create a Thread",
+                    "The thread store did not answer. The journal has the details.",
+                ),
+            }
+        });
+        None
+    }
+
+    /// Opens and shows a thread just stored by [`Self::create_chat_thread`], with what it
+    /// carries for its first start. Returns its page.
+    fn open_created(&self, thread: &str, created: CreatedThread) -> Option<adw::TabPage> {
+        let CreatedThread {
+            driver,
+            prompt,
+            effort,
+            handoff,
+            title,
+        } = created;
         self.reload_summaries();
-        let page = self.open_thread(&thread, false)?;
+        let page = self.open_thread(thread, false)?;
         if let Some(chat) = self
             .tabs
             .borrow_mut()
@@ -4068,12 +4174,12 @@ impl AgentTerminalWindow {
                 chat.title = title;
             }
         }
-        self.open_thread(&thread, true);
+        self.open_thread(thread, true);
         Some(page)
     }
 
     /// Resumes a native Claude or agy session as a chat thread: a new thread whose provider
-    /// thread carries that native id.
+    /// thread carries that native id. Its page opens once the thread is stored.
     pub(super) fn resume_as_thread(&self, driver: Driver, native_id: &str, dir: Option<String>) {
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let cwd = resolve_working_directory(
@@ -4081,31 +4187,53 @@ impl AgentTerminalWindow {
             &home,
         );
         let store = app_handle();
-        let made = store.new_id().and_then(|thread| {
-            let (t, pt, native, cwd) = (
-                thread.clone(),
-                store.new_id()?,
-                native_id.to_owned(),
-                cwd.clone(),
-            );
-            store.write("resume a session as a thread", Some(&thread), move |s| {
-                s.create_thread_with_id(&t, &cwd, None)?;
-                s.add_provider_thread_with_id(&pt, &t, driver_key(driver), "default")?;
-                s.set_native_id(&pt, &native)?;
-                s.set_active_provider_thread(&t, &pt)
-            })?;
-            Ok(thread)
-        });
-        match made {
-            Ok(thread) => {
-                info!(
-                    "Resuming {} session {native_id} as a thread",
-                    driver_label(driver)
-                );
-                self.open_thread(&thread, true);
+        let ids = match store.new_id().and_then(|t| Ok((t, store.new_id()?))) {
+            Ok(ids) => ids,
+            Err(e) => {
+                present_message(&self.obj(), "Cannot Resume the Session", &e.to_string());
+                return;
             }
-            Err(e) => present_message(&self.obj(), "Cannot Resume the Session", &e.to_string()),
+        };
+        let thread = ids.0.clone();
+        let record = {
+            let native = native_id.to_owned();
+            move |s: &Store| -> agent_kit::store::Result<()> {
+                let (t, pt) = &ids;
+                s.create_thread_with_id(t, &cwd, None)?;
+                s.add_provider_thread_with_id(pt, t, driver_key(driver), "default")?;
+                s.set_native_id(pt, &native)?;
+                s.set_active_provider_thread(t, pt)
+            }
+        };
+        let native = native_id.to_owned();
+        let opened = move |imp: &Self| {
+            info!(
+                "Resuming {} session {native} as a thread",
+                driver_label(driver)
+            );
+            imp.open_thread(&thread, true);
+        };
+        if store.writer().is_none() {
+            match record(store.reader()) {
+                Ok(()) => opened(self),
+                Err(e) => present_message(&self.obj(), "Cannot Resume the Session", &e.to_string()),
+            }
+            return;
         }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let stored = write_job("resume a session as a thread", record).await;
+            let Some(obj) = obj.upgrade() else { return };
+            match stored {
+                Some(Ok(())) => opened(obj.imp()),
+                Some(Err(e)) => present_message(&obj, "Cannot Resume the Session", &e.to_string()),
+                None => present_message(
+                    &obj,
+                    "Cannot Resume the Session",
+                    "The thread store did not answer. The journal has the details.",
+                ),
+            }
+        });
     }
 
     /// Routes a resume to a chat thread or, for a CLI with no adapter, a terminal page.
@@ -5338,7 +5466,7 @@ pub(super) mod tests {
                     move |s| s.events(&id, None, 1000).map(|e| e.len())
                 })
                 .await;
-                let renamed = write_job(move |s| {
+                let renamed = write_job("rename", move |s| {
                     s.rename_thread(&id, "renamed")?;
                     s.thread_summary(&id).map(|s| s.map(|s| s.title))
                 })

@@ -32,6 +32,11 @@ pub fn close_store_writer(wait: std::time::Duration) {
     imp::close_store_writer(wait);
 }
 
+/// From the panic hook (any thread): lets the store writer commit what is queued, at most `wait`.
+pub fn flush_store_for_panic(wait: std::time::Duration) {
+    imp::flush_store_for_panic(wait);
+}
+
 impl AgentTerminalWindow {
     /// Creates a new AgentTerminalWindow instance.
     pub fn new(app: &adw::Application) -> Self {

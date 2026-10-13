@@ -403,6 +403,9 @@ fn install_panic_hook() {
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("<non-string panic payload>");
         tracing::error!(panic.location = %location, "panic: {}", message);
+        // The thread store's queued writes (the last of every open conversation) get a moment
+        // to land before the process may go down.
+        window::flush_store_for_panic(std::time::Duration::from_secs(1));
         default_hook(info);
     }));
 }

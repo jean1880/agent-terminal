@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::AgentTerminalWindow;
 use crate::agent_proc::{ExitWatch, StopPhase};
@@ -190,7 +190,12 @@ impl Closing {
         let weak = Rc::downgrade(&closing);
         quit_button.connect_clicked(move |_| {
             if let Some(closing) = weak.upgrade() {
-                info!("close: Quit Now");
+                let pending = super::threads::store_writes_pending();
+                if pending > 0 {
+                    warn!(pending, "close: Quit Now with store writes still queued");
+                } else {
+                    info!("close: Quit Now");
+                }
                 closing.kill_all();
                 closing.finish();
             }
@@ -229,14 +234,17 @@ impl Closing {
             pending = writer.pending(),
             "close: waiting for the store to save"
         );
+        // Until it has saved (or the user quits now): the window does not go with writes still
+        // on their way, the cap included.
+        self.step.set_text("Saving threads…");
         let window = self.window.clone();
         let barrier = writer.barrier();
         glib::spawn_future_local(async move {
-            let saved = gtk4::gio::spawn_blocking(move || barrier.recv_timeout(CLOSE_CAP).is_ok())
+            let saved = gtk4::gio::spawn_blocking(move || barrier.recv().is_ok())
                 .await
                 .unwrap_or(false);
             if !saved {
-                warn!("close: the store did not finish saving in time");
+                error!("close: the store writer stopped before it had saved everything");
             }
             let closing = window
                 .upgrade()
@@ -364,7 +372,9 @@ impl AgentTerminalWindow {
         timer(TimerKind::Cap, CLOSE_CAP, |closing| {
             warn!("close: agents still running at the cap; killing them");
             closing.kill_all();
-            closing.finish();
+            // Gone now, unless the store still has writes queued: those it waits for (Quit Now
+            // stays on offer).
+            closing.save_then_finish();
         });
         self.closing.replace(Some(closing.clone()));
         closing.update();
