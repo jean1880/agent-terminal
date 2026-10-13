@@ -277,8 +277,86 @@ impl AgentTerminalWindow {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    /// The Diff Tool group, driven as a user drives it: what is typed or chosen is what is
+    /// saved, and an invalid command is shown and never saved. Run from the window test.
+    pub(in crate::window) fn the_diff_tool_group_saves_only_what_is_valid(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        let imp = window.imp();
+        let page = adw::PreferencesPage::new();
+        imp.add_diff_tool_group(&page);
+        let widgets = crate::testutil::descendants(page.upcast_ref());
+        let find = |pred: &dyn Fn(&gtk4::Widget) -> bool| {
+            widgets.iter().find(|w| pred(w)).cloned().expect("row")
+        };
+        let combo = find(&|w| w.is::<adw::ComboRow>())
+            .downcast::<adw::ComboRow>()
+            .expect("combo");
+        let entry = find(&|w| w.is::<adw::EntryRow>())
+            .downcast::<adw::EntryRow>()
+            .expect("entry");
+        let expand = find(&|w| w.is::<adw::SwitchRow>())
+            .downcast::<adw::SwitchRow>()
+            .expect("switch");
+        let saved = || imp.config.borrow().diff_tool.clone();
+
+        // A preset typed out selects it and is saved.
+        entry.set_text("meld {old} {new}");
+        assert_eq!(combo.selected(), 1);
+        assert_eq!(saved().map(|t| t.name).as_deref(), Some("Meld"));
+        // An edit that breaks it (the last brace deleted) is shown on the field, and the tool
+        // saved before it is left alone.
+        let end = entry.text().chars().count() as i32;
+        entry.delete_text(end - 1, end);
+        assert!(entry.has_css_class("error"));
+        assert_ne!(entry.title(), "Command", "the title says what is wrong");
+        assert_eq!(saved().map(|t| t.name).as_deref(), Some("Meld"));
+        // A mistyped placeholder is named in the title.
+        entry.set_text("meld {old} {nwe}");
+        assert!(entry.title().contains("{nwe}"), "{}", entry.title());
+        // Anything else valid is a custom tool, named after its program.
+        entry.set_text("/opt/bin/kompare {old} {new}");
+        assert!(!entry.has_css_class("error"));
+        assert_eq!(entry.title(), "Command");
+        assert_eq!(combo.selected(), CUSTOM_INDEX);
+        assert_eq!(saved().map(|t| t.name).as_deref(), Some("kompare"));
+        // Choosing a preset writes its command into the field and saves it.
+        combo.set_selected(2);
+        let second = PRESETS[1].tool();
+        assert_eq!(entry.text(), format_argv(&second.argv));
+        assert_eq!(saved(), Some(second));
+        // Custom keeps what is there; None clears both.
+        combo.set_selected(CUSTOM_INDEX);
+        assert_eq!(saved(), Some(PRESETS[1].tool()));
+        combo.set_selected(NONE_INDEX);
+        assert_eq!(entry.text(), "");
+        assert_eq!(saved(), None);
+
+        // Expand Diffs is saved as it is switched.
+        let before = imp.config.borrow().diffs_expanded;
+        expand.set_active(!before);
+        assert_eq!(imp.config.borrow().diffs_expanded, !before);
+        expand.set_active(before);
+        assert_eq!(imp.config.borrow().diffs_expanded, before);
+
+        // Before or after the installed-programs probe answers, a preset is listed under its own
+        // name or marked as not installed, never anything else.
+        crate::testutil::settle(&glib::MainContext::default());
+        let model = combo
+            .model()
+            .and_then(|m| m.downcast::<gtk4::StringList>().ok())
+            .expect("list");
+        for (i, preset) in PRESETS.iter().enumerate() {
+            let label = model.string(i as u32 + 1).expect("label").to_string();
+            assert!(
+                label == preset.name || label == format!("{} (not installed)", preset.name),
+                "{label}"
+            );
+        }
+    }
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|a| (*a).to_owned()).collect()

@@ -2642,12 +2642,9 @@ mod tests {
     /// The command list a frame announced, as (name, kind), if it announced one.
     fn announced(out: &[Envelope]) -> Option<Vec<(String, AgentCommandKind)>> {
         out.iter().find_map(|e| match &e.event {
-            Event::CommandsChanged { commands } => Some(
-                commands
-                    .iter()
-                    .map(|c| (c.name.clone(), c.kind))
-                    .collect(),
-            ),
+            Event::CommandsChanged { commands } => {
+                Some(commands.iter().map(|c| (c.name.clone(), c.kind)).collect())
+            }
             _ => None,
         })
     }
@@ -2662,7 +2659,11 @@ mod tests {
             .to_string()
         };
         let named = |list: &[(&str, AgentCommandKind)]| {
-            Some(list.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect::<Vec<_>>())
+            Some(
+                list.iter()
+                    .map(|(n, k)| ((*n).to_owned(), *k))
+                    .collect::<Vec<_>>(),
+            )
         };
         let mut a = ClaudeAdapter::new();
         // The first init always announces; a terminal-only command is never a plain one.
@@ -2671,7 +2672,10 @@ mod tests {
             named(&[("a", C), ("s", S), ("t", T)])
         );
         // The same again: nothing to announce.
-        assert_eq!(announced(&a.feed(&init(&["a", "s", "t"], &["s"], &["t"]))), None);
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "s", "t"], &["s"], &["t"]))),
+            None
+        );
         // A new command, a skill change, or a terminal-only change each announce.
         assert_eq!(
             announced(&a.feed(&init(&["a", "b", "s", "t"], &["s"], &["t"]))),

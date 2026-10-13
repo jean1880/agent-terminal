@@ -5293,9 +5293,27 @@ pub(super) mod tests {
                 .is_some_and(f)
         };
         let slot = imp.slot_of(&thread).expect("the page's slot");
+        let page_state = || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .find(|c| c.thread == thread)
+                .map(|c| {
+                    format!(
+                        "view built {}, building {}, starting {}, unavailable {}",
+                        c.view.is_some(),
+                        c.building,
+                        c.starting,
+                        c.unavailable
+                    )
+                })
+        };
         assert!(
             pump_until(&ctx, 15, || slot.get().is_some()),
-            "the session starts; fixture frames: {}",
+            "the session starts; Codex is {:?}; page: {:?}; fixture frames: {}",
+            availability.get(Driver::Codex),
+            page_state(),
             frames()
         );
 
