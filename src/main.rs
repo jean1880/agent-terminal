@@ -506,6 +506,18 @@ fn load_css() {
             color: @at_fg_soft;
             margin-left: 6px;
         }
+        .folder-toggle {
+            padding: 2px 4px;
+            min-height: 0;
+        }
+        .folder-toggle .folder-label {
+            margin-left: 0;
+        }
+        .folder-new-thread {
+            padding: 2px;
+            min-height: 0;
+            min-width: 0;
+        }
         .update-dot {
             color: @at_warning;
             font-size: 9px;
