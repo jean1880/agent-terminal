@@ -130,6 +130,35 @@ pub enum Mode {
     AcceptEdits,
     /// Read-only planning (Claude `plan`; agy `--mode plan`).
     Plan,
+    /// Dangerous permissive mode: every request is approved without asking (Claude
+    /// `bypassPermissions`; Codex `never` + `dangerFullAccess`; agy the skip flag with the hook
+    /// allowing everything). Session-only: never stored as a choice or a default, and a new
+    /// process (reopen, fork, agent switch) never starts in it ([`Mode::session_safe`]).
+    Bypass,
+}
+
+impl Mode {
+    /// The mode a newly started process may begin in: [`Mode::Bypass`] is dropped to
+    /// [`Mode::Ask`], everything else is kept.
+    pub fn session_safe(self) -> Mode {
+        match self {
+            Mode::Bypass => Mode::Ask,
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::Mode;
+
+    #[test]
+    fn no_process_starts_in_bypass() {
+        assert_eq!(Mode::Bypass.session_safe(), Mode::Ask);
+        for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
+            assert_eq!(m.session_safe(), m);
+        }
+    }
 }
 
 /// Everything needed to start (or restart) an agent process for one provider thread.

@@ -144,12 +144,16 @@ pub fn parse_command_line(text: &str, caps: &Capabilities) -> Option<CommandLine
     })
 }
 
-/// `/mode` argument → mode. Accepts the Claude names too.
+/// `/mode` argument → mode. Accepts the Claude names too. Dangerous permissive mode still asks
+/// for confirmation, however it is picked.
 pub fn parse_mode(arg: &str) -> Option<Mode> {
     match arg.trim().to_lowercase().replace(['_', ' '], "-").as_str() {
         "plan" => Some(Mode::Plan),
         "default" | "ask" => Some(Mode::Ask),
         "accept-edits" | "acceptedits" | "edits" | "edit" => Some(Mode::AcceptEdits),
+        "dangerous" | "danger" | "dangerous-permissive" | "bypass" | "bypasspermissions" => {
+            Some(Mode::Bypass)
+        }
         _ => None,
     }
 }
@@ -299,6 +303,8 @@ mod tests {
         assert_eq!(parse_mode("Accept-Edits"), Some(Mode::AcceptEdits));
         assert_eq!(parse_mode("acceptEdits"), Some(Mode::AcceptEdits));
         assert_eq!(parse_mode("default"), Some(Mode::Ask));
+        assert_eq!(parse_mode("Dangerous"), Some(Mode::Bypass));
+        assert_eq!(parse_mode("bypassPermissions"), Some(Mode::Bypass));
         assert_eq!(parse_mode("yolo"), None);
         assert_eq!(parse_driver("Antigravity"), Some(Driver::Agy));
         assert_eq!(parse_driver("claude"), Some(Driver::Claude));

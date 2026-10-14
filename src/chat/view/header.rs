@@ -17,22 +17,94 @@ fn label(text: &str, classes: &[&str]) -> gtk4::Label {
 }
 
 /// Dropdown order of the modes. Driven by index both ways; the guard test keeps it complete.
-pub const MODES: [Mode; 3] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan];
+/// The dangerous one is last, below a divider ([`mode_factory`]).
+pub const MODES: [Mode; 4] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan, Mode::Bypass];
 
 pub fn mode_label(mode: Mode) -> &'static str {
     match mode {
         Mode::Ask => "Ask before edits",
         Mode::AcceptEdits => "Accept edits",
         Mode::Plan => "Plan",
+        Mode::Bypass => "Dangerous permissive",
     }
 }
+
+/// The names the narrow header uses, in [`MODES`] order.
+const SHORT_NAMES: [&str; 4] = ["Ask", "Accept", "Plan", "Danger"];
 
 pub fn mode_index(mode: Mode) -> u32 {
     match mode {
         Mode::Ask => 0,
         Mode::AcceptEdits => 1,
         Mode::Plan => 2,
+        Mode::Bypass => 3,
     }
+}
+
+/// Draws the mode names: the dangerous mode with a warning icon in danger colours and, in the
+/// popup's list (`list`), a divider above it.
+fn mode_factory(list: bool) -> gtk4::SignalListItemFactory {
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(move |_, obj| {
+        let Some(item) = obj.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let divider = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        divider.add_css_class("mode-divider");
+        divider.set_visible(false);
+        column.append(&divider);
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let icon = gtk4::Image::from_icon_name("at-dialog-warning-symbolic");
+        icon.set_visible(false);
+        row.append(&icon);
+        let text = label("", &[]);
+        text.set_hexpand(true);
+        text.set_xalign(0.0);
+        row.append(&text);
+        // GTK's own list marks the current mode; a custom factory has to do it itself.
+        let check = gtk4::Image::from_icon_name("at-object-select-symbolic");
+        check.set_visible(false);
+        if list {
+            item.property_expression("selected")
+                .bind(&check, "visible", gtk4::Widget::NONE);
+        }
+        row.append(&check);
+        column.append(&row);
+        item.set_child(Some(&column));
+    });
+    factory.connect_bind(move |_, obj| {
+        let Some(item) = obj.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+        let Some(column) = item.child() else { return };
+        let (Some(divider), Some(row)) = (column.first_child(), column.last_child()) else {
+            return;
+        };
+        let (Some(icon), Some(text)) = (
+            row.first_child(),
+            row.first_child().and_then(|i| i.next_sibling()),
+        ) else {
+            return;
+        };
+        let Some(text) = text.downcast_ref::<gtk4::Label>() else {
+            return;
+        };
+        let name = item
+            .item()
+            .and_downcast::<gtk4::StringObject>()
+            .map(|s| s.string());
+        text.set_text(name.as_deref().unwrap_or(""));
+        let danger = item.position() == mode_index(Mode::Bypass);
+        divider.set_visible(list && danger);
+        icon.set_visible(danger);
+        if danger {
+            row.add_css_class("mode-danger-row");
+        } else {
+            row.remove_css_class("mode-danger-row");
+        }
+    });
+    factory
 }
 
 /// Gauge fill (0..=1) and the auto-compact threshold as a fraction, when known.
@@ -153,6 +225,8 @@ impl Header {
 
         let names: Vec<&str> = MODES.iter().map(|m| mode_label(*m)).collect();
         let mode = gtk4::DropDown::from_strings(&names);
+        mode.set_factory(Some(&mode_factory(false)));
+        mode.set_list_factory(Some(&mode_factory(true)));
         let mode_guard = Rc::new(Cell::new(false));
         mode.add_css_class("mode-dropdown");
         mode.set_tooltip_text(Some("Interaction mode (/mode)"));
@@ -308,7 +382,7 @@ impl Header {
                     root.add_css_class("compact");
                 }
                 if let Some(mode) = mode.upgrade() {
-                    set_mode_names(&mode, &guard, &["Ask", "Accept", "Plan"]);
+                    set_mode_names(&mode, &guard, &SHORT_NAMES);
                 }
             }
         });
@@ -403,6 +477,11 @@ impl Header {
         self.mode_guard.set(true);
         self.mode.set_selected(mode_index(mode));
         self.mode_guard.set(false);
+        if mode == Mode::Bypass {
+            self.mode.add_css_class("mode-danger");
+        } else {
+            self.mode.remove_css_class("mode-danger");
+        }
         self.mode
             .update_property(&[gtk4::accessible::Property::Label(mode_label(mode))]);
     }
@@ -594,13 +673,16 @@ mod tests {
     #[test]
     fn modes_array_is_complete_and_indexed_both_ways() {
         // Exhaustive: adding a Mode fails to compile until MODES and mode_index are updated.
-        for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
+        for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan, Mode::Bypass] {
             match m {
-                Mode::Ask | Mode::AcceptEdits | Mode::Plan => {}
+                Mode::Ask | Mode::AcceptEdits | Mode::Plan | Mode::Bypass => {}
             }
             assert_eq!(MODES[mode_index(m) as usize], m);
         }
-        assert_eq!(MODES.len(), 3);
+        assert_eq!(MODES.len(), 4);
+        assert_eq!(SHORT_NAMES.len(), MODES.len());
+        // The divider sets the dangerous mode apart from the others: it must stay last.
+        assert_eq!(MODES.last(), Some(&Mode::Bypass));
     }
 
     #[test]

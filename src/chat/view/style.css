@@ -49,6 +49,18 @@
     border: 1px solid @at_border;
     color: @at_fg;
 }
+/* Dangerous permissive mode: set apart by a divider in the list, and in danger colours (with
+   a warning icon and its own words, never by colour alone) wherever it shows. */
+.mode-dropdown.mode-danger > button {
+    background-color: alpha(@at_danger, 0.16);
+    border-color: alpha(@at_danger, 0.6);
+    color: @at_danger_soft;
+}
+/* The labels too: the window's own label colour would otherwise win over the inherited one. */
+.mode-dropdown.mode-danger > button label,
+.mode-dropdown .mode-danger-row,
+.mode-dropdown .mode-danger-row label { color: @at_danger_soft; font-weight: 700; }
+.mode-dropdown .mode-divider { margin: 4px 0; }
 
 .activity .activity-text { color: @at_fg_dim; font-size: 0.9em; }
 /* Only background work left (sub-agents, background commands): the sidebar's background colour. */

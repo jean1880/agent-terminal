@@ -1240,6 +1240,17 @@ impl Transcript {
         }
     }
 
+    /// Dangerous permissive mode ends with the process that ran it (no new process starts in
+    /// it): once that is gone, the header falls back to the session's own mode. True when it
+    /// was shown.
+    fn forget_bypass(&mut self) -> bool {
+        if self.mode == Some(Mode::Bypass) {
+            self.mode = None;
+            return true;
+        }
+        false
+    }
+
     /// Closes out what replayed history left open when no agent is alive to finish it: a thread
     /// stored by an older build (or cut off by a crash) can end mid-turn, with no
     /// `TurnCompleted`. The turn stops running, streaming text ends, Running tool and sub-agent
@@ -1253,6 +1264,7 @@ impl Transcript {
             self.mode = Some(mode);
             changed = true;
         }
+        changed |= self.forget_bypass();
         if self.running {
             self.last_outcome = Some(TurnState::Interrupted);
         }
@@ -1420,6 +1432,9 @@ impl Transcript {
                 })));
                 if let Some(mode) = self.pending_mode.take() {
                     self.mode = Some(mode);
+                    out.push(Change::Mode);
+                }
+                if self.forget_bypass() {
                     out.push(Change::Mode);
                 }
                 if self.settle_workers() {
@@ -2576,6 +2591,34 @@ mod tests {
         assert_eq!(exited.mode, Some(Mode::AcceptEdits));
         assert_eq!(exited.pending_mode, None);
         assert!(changes.iter().any(|change| matches!(change, Change::Mode)));
+    }
+
+    /// A replayed or exited dangerous permissive mode is not shown as running: no process
+    /// starts in it, so the header falls back to the session's own mode.
+    #[test]
+    fn dangerous_permissive_mode_is_forgotten_with_its_process() {
+        let bypass = ev(Event::ModeChanged { mode: Mode::Bypass });
+        let mut stale = Transcript::new();
+        stale.apply(&bypass, Driver::Claude);
+        assert_eq!(stale.mode, Some(Mode::Bypass));
+        assert!(stale.settle_stale());
+        assert_eq!(stale.mode, None);
+        let mut exited = Transcript::new();
+        exited.apply(&bypass, Driver::Claude);
+        let changes = exited.apply(
+            &ev(Event::SessionExited {
+                code: Some(0),
+                expected: true,
+            }),
+            Driver::Claude,
+        );
+        assert_eq!(exited.mode, None);
+        assert!(changes.iter().any(|change| matches!(change, Change::Mode)));
+        // A safe mode stays as it was.
+        let mut ask = Transcript::new();
+        ask.apply(&ev(Event::ModeChanged { mode: Mode::Ask }), Driver::Claude);
+        ask.settle_stale();
+        assert_eq!(ask.mode, Some(Mode::Ask));
     }
 
     #[test]

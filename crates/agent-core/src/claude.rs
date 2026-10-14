@@ -1209,6 +1209,17 @@ impl Adapter for ClaudeAdapter {
                 );
                 self.control_line(&id, json!({"subtype": "set_model", "model": model}))
             }
+            // A live `setMode` to `bypassPermissions` is a no-op unless the process was launched
+            // with bypass available (Claude Code docs, hooks: permission update entries), and
+            // no launch carries it otherwise: entering it is a resumed restart in that mode.
+            Command::SetMode { mode: Mode::Bypass } => {
+                return Ok(vec![Action::Respawn(OpenSessionDelta {
+                    model: None,
+                    effort: None,
+                    mode: Some(Mode::Bypass),
+                    resume: None,
+                })]);
+            }
             Command::SetMode { mode } => {
                 let id = self.next_id("mode");
                 self.mode_requests.insert(id.clone(), mode);
@@ -1412,16 +1423,17 @@ fn mode_name(mode: Mode) -> &'static str {
         Mode::Ask => "default",
         Mode::AcceptEdits => "acceptEdits",
         Mode::Plan => "plan",
+        Mode::Bypass => "bypassPermissions",
     }
 }
 
-/// [`mode_name`] backwards; `None` for Claude's modes the picker has no entry for
-/// (`bypassPermissions`, `dontAsk`).
+/// [`mode_name`] backwards; `None` for Claude's modes the picker has no entry for (`dontAsk`).
 fn mode_from_name(name: &str) -> Option<Mode> {
     match name {
         "default" => Some(Mode::Ask),
         "acceptEdits" => Some(Mode::AcceptEdits),
         "plan" => Some(Mode::Plan),
+        "bypassPermissions" => Some(Mode::Bypass),
         _ => None,
     }
 }
@@ -1796,7 +1808,9 @@ mod tests {
         // Claude changing it itself (a plan accepted) shows at the next turn.
         assert_eq!(changed(&a.feed(&init("default"))), [Mode::Ask]);
         // A mode the picker has no entry for is not forced onto it.
-        assert!(changed(&a.feed(&init("bypassPermissions"))).is_empty());
+        assert!(changed(&a.feed(&init("dontAsk"))).is_empty());
+        // Bypass (the dangerous permissive entry) is reported as itself.
+        assert_eq!(changed(&a.feed(&init("bypassPermissions"))), [Mode::Bypass]);
         // Claude entering plan or accept-edits on its own is reported as exactly that.
         assert_eq!(changed(&a.feed(&init("plan"))), [Mode::Plan]);
         assert_eq!(changed(&a.feed(&init("acceptEdits"))), [Mode::AcceptEdits]);
@@ -3141,6 +3155,33 @@ mod tests {
         s.new_session_id = None;
         let argv = a.argv(&s);
         assert!(argv.ends_with(&["--permission-mode".to_owned(), "default".to_owned()]));
+        s.mode = Mode::Bypass;
+        let argv = a.argv(&s);
+        assert!(argv.ends_with(&[
+            "--permission-mode".to_owned(),
+            "bypassPermissions".to_owned()
+        ]));
+        assert!(!argv.iter().any(|x| x.contains("dangerously")));
+    }
+
+    /// A live `setMode` to bypass is a no-op on a process not launched with it: entering it is
+    /// a resumed restart in that mode. Leaving it is a plain live request.
+    #[test]
+    fn entering_bypass_restarts_the_process_and_leaving_it_does_not() {
+        let mut a = ClaudeAdapter::new();
+        assert_eq!(
+            a.encode(Command::SetMode { mode: Mode::Bypass })
+                .expect("ok"),
+            [Action::Respawn(OpenSessionDelta {
+                model: None,
+                effort: None,
+                mode: Some(Mode::Bypass),
+                resume: None,
+            })]
+        );
+        let req = written(&mut a, Command::SetMode { mode: Mode::Ask });
+        assert_eq!(req["request"]["subtype"], "set_permission_mode");
+        assert_eq!(req["request"]["mode"], "default");
     }
 
     #[test]

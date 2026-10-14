@@ -402,6 +402,38 @@ fn confirm_busy_switch(parent: &adw::Dialog, from: Driver, to: Driver, then: imp
     dialog.present(Some(parent));
 }
 
+/// The warning before dangerous permissive mode on `driver`; `then` runs only on "Approve
+/// Everything". Cancel is the default, and what Escape answers.
+pub fn confirm_bypass(parent: &impl IsA<gtk4::Widget>, driver: Driver, then: impl Fn() + 'static) {
+    let agent = driver.info().label;
+    let sandbox = if driver == Driver::Codex {
+        " Codex also runs without its sandbox."
+    } else {
+        ""
+    };
+    let dialog = adw::AlertDialog::new(
+        Some("Turn On Dangerous Permissive Mode?"),
+        Some(&format!(
+            "Every request {agent} makes in this thread will be approved without asking you: \
+             shell commands, file edits and deletions anywhere your account can reach, network \
+             access and MCP tools.{sandbox} Nothing will stop a mistaken or harmful step before \
+             it runs.\n\nIt lasts for this agent session only: reopening the thread, restarting \
+             the app, forking it or switching agent turns it off. Only continue if you trust \
+             this agent with your files and accounts."
+        )),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("bypass", "Approve Everything")]);
+    dialog.set_response_appearance("bypass", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        if response == "bypass" {
+            then();
+        }
+    });
+    dialog.present(Some(parent));
+}
+
 /// The model picker: ONE searchable list of every model of both agents, so a thread can jump
 /// from an agy Gemini to a Claude model (or back) in a single click. Picking a row of the other
 /// agent is a handoff, which the backend's `switch` performs.
