@@ -65,6 +65,7 @@
 //! | `Ask`         | `untrusted`    | `readOnly`          | only known-safe reads run unasked; every edit and other command asks |
 //! | `AcceptEdits` | `untrusted`    | `workspaceWrite`    | every edit and other command asks; the app answers in-workspace edits itself, so shell still asks |
 //! | `Plan`        | `never`        | `readOnly`          | cannot write and never asks (T3 Code has no read-only row; this is the strictest the enums allow without the experimental `collaborationMode`) |
+//! | `Bypass`      | `never`        | `dangerFullAccess`  | runs everything unasked and unsandboxed (dangerous permissive mode; session-only) |
 //!
 //! `Ask` is T3's `approval-required` row. `AcceptEdits` is not T3's `auto-accept-edits`
 //! (`on-request`, under which Codex runs shell commands unasked): W0
@@ -2634,7 +2635,8 @@ impl Adapter for CodexAdapter {
     /// turn gets): `workspaceWrite` lets Codex write, and so rename, inside the workspace.
     fn workspace_writable(&self) -> Option<bool> {
         let mode = self.effective_mode.unwrap_or(self.mode);
-        Some(mode_policy(mode).1["type"] == "workspaceWrite")
+        let sandbox = mode_policy(mode).1;
+        Some(sandbox["type"] == "workspaceWrite" || sandbox["type"] == "dangerFullAccess")
     }
 }
 
@@ -2725,6 +2727,7 @@ fn mode_policy(mode: Mode) -> (&'static str, Value) {
         Mode::Ask => ("untrusted", json!({"type": "readOnly"})),
         Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
         Mode::Plan => ("never", json!({"type": "readOnly"})),
+        Mode::Bypass => ("never", json!({"type": "dangerFullAccess"})),
     }
 }
 
@@ -2733,6 +2736,7 @@ fn codex_mode_label(mode: Mode) -> &'static str {
         Mode::Ask => "Ask before edits",
         Mode::AcceptEdits => "Accept edits",
         Mode::Plan => "Plan",
+        Mode::Bypass => "Dangerous permissive",
     }
 }
 
@@ -4158,6 +4162,7 @@ mod tests {
                 json!({"type": "workspaceWrite"}),
             ),
             (Mode::Plan, "never", json!({"type": "readOnly"})),
+            (Mode::Bypass, "never", json!({"type": "dangerFullAccess"})),
         ];
         for (mode, approval, sandbox) in table {
             let mut a = started(mode);

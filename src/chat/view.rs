@@ -1020,10 +1020,27 @@ impl Inner {
             let Some(mode) = MODES.get(dd.selected() as usize).copied() else {
                 return;
             };
+            // Never offered as a default: session-only, and only once confirmed.
+            if mode == Mode::Bypass {
+                inner.confirm_bypass();
+                return;
+            }
             if inner.set_mode(mode) {
                 // Only a pick made in the header, never a mode the agent reported.
                 let driver = inner.backend.status().driver;
                 inner.emit(ViewAction::ModeChosen { driver, mode });
+            }
+        });
+    }
+
+    /// Asks before dangerous permissive mode, every time it is picked. Until the user agrees, the
+    /// picker shows the mode still running; Cancel (the default, and Escape) changes nothing.
+    fn confirm_bypass(self: &Rc<Self>) {
+        self.refresh_status();
+        let weak = Rc::downgrade(self);
+        panels::confirm_bypass(&self.header.mode, self.backend.status().driver, move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.set_mode(Mode::Bypass);
             }
         });
     }
@@ -1218,6 +1235,7 @@ impl Inner {
                 }
             },
             BuiltinAction::SetMode => match typeahead::parse_mode(args) {
+                Some(Mode::Bypass) => self.confirm_bypass(),
                 Some(mode) => {
                     self.set_mode(mode);
                 }

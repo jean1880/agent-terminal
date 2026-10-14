@@ -201,6 +201,9 @@ struct Inner {
     /// The mode the user last chose. The running mode can differ (agy without its hook cannot
     /// ask), and a switch to an agent that can honour it goes back to it.
     wanted_mode: Cell<Mode>,
+    /// The user's last choice other than [`Mode::Bypass`]: what is stored, and what a switch to
+    /// another agent goes back to, since dangerous permissive mode never outlives its agent.
+    safe_mode: Cell<Mode>,
     /// Open Claude and Codex approvals a rule can describe: the call and the working directory
     /// its rule is judged in (`None`: relative paths never resolve), by request id, so "Allow for
     /// session" / "Always allow" can record it (D1: app-owned).
@@ -435,7 +438,9 @@ impl ChatSession {
         };
         open.approval_hook = approval.is_some();
         let hookless_agy = driver == Driver::Agy && approval.is_none();
-        let wanted_mode = open.mode;
+        // No process starts in dangerous permissive mode, whatever asked for it (a stored
+        // choice, a fork, a profile default): it is only ever entered by the user, in-session.
+        let wanted_mode = open.mode.session_safe();
         open.mode = effective_mode(hookless_agy, wanted_mode);
         // Read by the caller off the main thread, after the writer's barrier, when it could;
         // else here (behind the same barrier).
@@ -500,6 +505,7 @@ impl ChatSession {
             generation: Cell::new(0),
             adapter_epoch: Cell::new(0),
             wanted_mode: Cell::new(wanted_mode),
+            safe_mode: Cell::new(wanted_mode),
             pending_rules: RefCell::new(HashMap::new()),
             session_rules: crate::approval_server::SessionRules::default(),
             saved_rules: RefCell::new(
@@ -545,9 +551,10 @@ impl ChatSession {
     /// Seeds a new thread with a budgeted, redacted handoff (fork, compact-by-handoff): it
     /// rides on the next real prompt, exactly like a cross-agent switch's.
     /// The mode the user chose, which the running one can differ from (agy without its hook
-    /// cannot ask).
+    /// cannot ask), as a new process would get it (a fork, a handoff): never dangerous
+    /// permissive mode, which ends with its agent; the last safe choice instead.
     pub fn wanted_mode(&self) -> Mode {
-        self.inner.wanted_mode.get()
+        self.inner.safe_mode.get()
     }
 
     pub fn seed_handoff(&self, handoff: Handoff, source: &str) {
@@ -1539,13 +1546,17 @@ impl Inner {
             && tool == "file_change"
             && self.state.borrow().mode == Mode::AcceptEdits
             && codex_edits_contained(input, &workspace, home.as_deref());
-        let auto = plain
-            && options.contains(&Decision::Allow)
-            && (accept_edit
-                || action.as_ref().is_some_and(|a| {
-                    let in_session = self.session_rules.borrow().matches_session(a, &ctx);
-                    in_session || self.saved_allow(a, &ctx)
-                }));
+        // Dangerous permissive mode: the agent's own bypass should leave nothing to ask, and
+        // whatever still arrives (escalations included) is approved, as the user agreed to.
+        let bypass = self.state.borrow().mode == Mode::Bypass;
+        let auto = options.contains(&Decision::Allow)
+            && (bypass
+                || plain
+                    && (accept_edit
+                        || action.as_ref().is_some_and(|a| {
+                            let in_session = self.session_rules.borrow().matches_session(a, &ctx);
+                            in_session || self.saved_allow(a, &ctx)
+                        })));
         // The folder the card offered (pinned: the answer keeps it only if it is still the same).
         let shown = action
             .as_ref()
@@ -2253,9 +2264,10 @@ impl Inner {
     /// Stores the mode the user chose (`wanted_mode`), so a reopened thread starts from it on
     /// whichever agent it is on, rather than from that agent's profile default: a thread switched
     /// from Claude in Ask to an agent whose profile defaults to Accept edits must not reopen there.
+    /// Dangerous permissive mode is never stored: the last safe choice is.
     fn record_chosen_mode(&self) {
         self.emit(Envelope::new(Event::ModeChosen {
-            mode: self.wanted_mode.get(),
+            mode: self.safe_mode.get(),
         }));
     }
 
@@ -2336,6 +2348,21 @@ impl Inner {
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
+        // Dangerous permissive agy is its hook allowing everything: with no hook, there is
+        // nothing to approve through, and the flag is never passed any other way.
+        if mode == Mode::Bypass && self.ask_unavailable() {
+            self.emit(Envelope::new(Event::Notice {
+                text: "Antigravity cannot run in dangerous permissive mode until the approval \
+                       hook is installed; it stays in its current mode."
+                    .to_owned(),
+            }));
+            let current = self.state.borrow().mode;
+            self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+            return;
+        }
+        if mode != Mode::Bypass {
+            self.safe_mode.set(mode);
+        }
         let previous = self.wanted_mode.replace(mode);
         if previous != mode {
             self.note_grants_outlive_mode();
@@ -2711,6 +2738,17 @@ impl Inner {
         *self.unbound.borrow_mut() = unbound;
         // The user's own mode, as far as the new agent can honour it (agy without its hook
         // cannot ask). A thread that went through hookless agy gets its Ask back here.
+        // Dangerous permissive mode ends with the agent it was entered on.
+        if self.wanted_mode.get() == Mode::Bypass {
+            self.wanted_mode.set(self.safe_mode.get());
+            self.emit(Envelope::new(Event::Notice {
+                text: format!(
+                    "Dangerous permissive mode has ended: it lasts for one agent session, so {} \
+                     starts in your previous mode.",
+                    driver_label(driver)
+                ),
+            }));
+        }
         let hookless_agy = driver == Driver::Agy && self.approval().is_none();
         let new_mode = effective_mode(hookless_agy, self.wanted_mode.get());
         let mode_changed = self.state.borrow().mode != new_mode;
@@ -4802,6 +4840,75 @@ mod tests {
         });
     }
 
+    /// Dangerous permissive mode is session-only: no process starts in it, it is never stored
+    /// as the thread's choice nor handed to a fork, and a switch to another agent ends it.
+    #[test]
+    fn dangerous_permissive_mode_is_never_stored_and_ends_with_its_agent() {
+        in_loop(|_| {
+            // Asked to start in it (a hand-edited default, say): it starts in Ask.
+            let log: Log = Rc::default();
+            let (session, _) = claude_on(Mode::Bypass, &log);
+            assert_eq!(session.status().mode, Mode::Ask);
+            assert_eq!(session.inner.open.borrow().mode, Mode::Ask);
+            assert_eq!(session.wanted_mode(), Mode::Ask);
+
+            let log: Log = Rc::default();
+            let (session, seen) = claude_on(Mode::AcceptEdits, &log);
+            let store = session.inner.store.clone();
+            let thread = session.inner.thread.clone();
+            let chosen = || {
+                let events = store
+                    .reader()
+                    .events(&thread, None, 10_000)
+                    .expect("events");
+                chosen_mode(events.iter().map(|(_, e)| e))
+            };
+            session.set_mode(Mode::Bypass);
+            assert!(log
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, Command::SetMode { mode: Mode::Bypass })));
+            // The agent confirms it.
+            session
+                .inner
+                .emit(Envelope::new(Event::ModeChanged { mode: Mode::Bypass }));
+            assert_eq!(session.status().mode, Mode::Bypass);
+            assert_eq!(chosen(), Some(Mode::AcceptEdits), "never stored");
+            assert_eq!(
+                session.wanted_mode(),
+                Mode::AcceptEdits,
+                "a fork gets the safe one"
+            );
+
+            session.switch(Driver::Codex, Some("gpt-5-codex".into()), None);
+            assert_eq!(session.status().driver, Driver::Codex);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            assert_eq!(session.inner.open.borrow().mode, Mode::AcceptEdits);
+            assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+                if text.starts_with("Dangerous permissive mode has ended"))));
+            assert_eq!(chosen(), Some(Mode::AcceptEdits));
+        });
+    }
+
+    /// Hookless agy has nothing to approve through: the pick is refused, and the flag never set.
+    #[test]
+    fn hookless_agy_refuses_dangerous_permissive_mode() {
+        in_loop(|_| {
+            let log: Log = Rc::default();
+            let (session, seen) = claude_on(Mode::Ask, &log);
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
+            let before = session.status().mode;
+            session.set_mode(Mode::Bypass);
+            assert_eq!(session.status().mode, before);
+            assert!(!log
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, Command::SetMode { mode: Mode::Bypass })));
+            assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+                if text.contains("cannot run in dangerous permissive mode"))));
+        });
+    }
+
     /// A side process (agy's usage, say) that finishes after the thread switched agent answers
     /// its request with an error; its output never reaches the new agent's adapter.
     #[test]
@@ -6787,6 +6894,38 @@ mod tests {
                 "U2: a contained edit can be kept always"
             );
             assert!(!offered(&seen, "e1").contains(&Decision::AllowAlways));
+        });
+    }
+
+    /// In dangerous permissive mode a request that still reaches the app (Codex should send
+    /// none on `never`) is approved by it, an escalation included: the user agreed to all.
+    #[test]
+    fn dangerous_permissive_mode_approves_whatever_still_asks() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::codex::CodexAdapter::new()),
+            );
+            session.set_mode(Mode::Bypass);
+            assert_eq!(session.inner.state.borrow().mode, Mode::Bypass);
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let frame =
+                serde_json::json!({"id": 0, "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "kind": "escalated", "threadId": "th", "turnId": "tu", "itemId": "i0",
+                    "command": "/usr/bin/zsh -lc 'rm -rf build'", "cwd": cwd,
+                    "availableDecisions": ["accept", "cancel"],
+                }})
+                .to_string();
+            feed(&session, &frame);
+            let card = request_for(&seen, "command_execution").expect("card");
+            assert!(pump_until(ctx, 10, || resolution(&seen, &card).is_some()));
+            assert_eq!(resolution(&seen, &card), Some(Decision::Allow));
+            assert!(pump_until(ctx, 10, || {
+                stdin_log(tmp.path()).contains(r#"{"id":0,"result":{"decision":"accept"}}"#)
+            }));
         });
     }
 

@@ -2291,14 +2291,17 @@ pub(super) mod tests {
 
     #[test]
     fn the_default_mode_dropdown_lists_every_mode_once() {
-        // Exhaustive: a new mode does not compile until it is placed in `MODES`.
+        // Exhaustive: a new mode does not compile until it is placed in `MODES` (or kept out).
         let slot = |m: Mode| match m {
             Mode::Ask | Mode::AcceptEdits | Mode::Plan => MODES.iter().position(|(x, _)| *x == m),
+            // Session-only: never a default.
+            Mode::Bypass => None,
         };
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
             let i = slot(m).expect("listed");
             assert_eq!(MODES[i].0, m);
         }
+        assert!(MODES.iter().all(|(m, _)| *m != Mode::Bypass));
         let mut seen: Vec<Mode> = MODES.iter().map(|(m, _)| *m).collect();
         seen.dedup();
         assert_eq!(seen.len(), MODES.len(), "no mode twice");
@@ -2323,6 +2326,7 @@ pub(super) mod tests {
         for (i, (mode, _)) in MODES.iter().enumerate() {
             match mode {
                 Mode::Ask | Mode::AcceptEdits | Mode::Plan => {}
+                Mode::Bypass => panic!("dangerous permissive mode is never a default"),
             }
             assert_eq!(MODES.iter().position(|(m, _)| m == mode), Some(i));
         }

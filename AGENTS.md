@@ -144,6 +144,15 @@ Architectural mandates, standards, and workflows for this codebase.
   but applies file edits in every mode, Plan included. The adapter strips the flag from
   profile arguments. The session's canary restarts agy without the flag if a tool step arrives
   without a hook query. Never add a path that sets the flag any other way.
+- **Dangerous permissive mode (`Mode::Bypass`) is confirmed, session-only and never a
+  default**: picking it (dropdown or `/mode`) always shows the warning first, and Cancel changes
+  nothing. No process starts in it (`ChatSession::with_env` applies `Mode::session_safe`), it is
+  never stored as the thread's choice (`ModeChosen` keeps the last safe mode), a fork or handoff
+  gets the safe mode, a switch to another agent ends it, and Settings never offers it. Natively:
+  Claude `bypassPermissions` (entered by a resumed restart, since a live `setMode` is a no-op),
+  Codex `never` + `dangerFullAccess`, agy the hook allowing everything; hookless agy refuses it.
+  It stays last in the picker, below its divider. The session tests
+  `dangerous_permissive_mode_*` prove these.
 - **Every persisted or injected text is redacted**: the store scrubs every
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the

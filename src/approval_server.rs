@@ -397,6 +397,7 @@ pub fn policy(mode: Mode, query: &ApprovalQuery, workspaces: &[PathBuf]) -> Verd
 /// | Plan | allow inside the workspace unless sensitive, else ask | deny | deny (network reads: ask) | ask |
 /// | Ask | allow inside the workspace unless sensitive, else ask | ask | ask | ask |
 /// | AcceptEdits | allow inside the workspace unless sensitive, else ask | allow inside the workspace unless sensitive, else ask | ask | ask |
+/// | Bypass | allow | allow | allow | allow |
 pub fn policy_with_home(
     mode: Mode,
     query: &ApprovalQuery,
@@ -405,6 +406,9 @@ pub fn policy_with_home(
 ) -> Verdict {
     let class = classify(&query.tool);
     match (class, mode) {
+        // Dangerous permissive mode: the user agreed to approve everything, sensitive targets
+        // included. Session-only (never a process's starting mode).
+        (_, Mode::Bypass) => Verdict::Allow,
         (ToolClass::ReadOnly, _) if read_allowed(query, workspaces, home) => Verdict::Allow,
         // Reads outside the workspace, of sensitive targets or through a symlink ask in every
         // mode, Plan included: plan mode refuses mutation, not disclosure.
@@ -1268,6 +1272,34 @@ mod tests {
 
     fn ws() -> Vec<PathBuf> {
         vec![PathBuf::from("/work/repo")]
+    }
+
+    /// Dangerous permissive mode allows every call, sensitive or outside the workspace alike.
+    #[test]
+    fn bypass_allows_everything() {
+        let w = ws();
+        let home = PathBuf::from("/home/u");
+        for query in [
+            cmd("rm -rf /"),
+            edit("write_to_file", "/etc/passwd"),
+            edit("write_to_file", "/work/repo/.git/hooks/pre-commit"),
+            q(
+                "view_file",
+                serde_json::json!({"AbsolutePath": "/home/u/.ssh/id_rsa"}),
+            ),
+            q(
+                "read_url_content",
+                serde_json::json!({"Url": "https://example.com"}),
+            ),
+            q("some_unknown_tool", Value::Null),
+        ] {
+            assert_eq!(
+                policy_with_home(Mode::Bypass, &query, &w, Some(&home)),
+                Verdict::Allow,
+                "{}",
+                query.tool
+            );
+        }
     }
 
     #[test]

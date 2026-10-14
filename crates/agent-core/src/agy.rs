@@ -527,13 +527,17 @@ impl Adapter for AgyAdapter {
         let plan = || ["--mode", "plan"].map(str::to_owned);
         let accept_edits = || ["--mode", "accept-edits"].map(str::to_owned);
         match (session.mode, session.approval_hook) {
-            (Mode::Plan, _) | (Mode::Ask, false) => argv.extend(plan()),
+            // Bypass is the hook allowing everything: with no hook to do it, the session never
+            // asks for it, and the strictest launch is the fallback.
+            (Mode::Plan, _) | (Mode::Ask | Mode::Bypass, false) => argv.extend(plan()),
             (Mode::AcceptEdits, false) => argv.extend(accept_edits()),
             (Mode::AcceptEdits, true) => {
                 argv.extend(accept_edits());
                 argv.push("--dangerously-skip-permissions".to_owned());
             }
-            (Mode::Ask, true) => argv.push("--dangerously-skip-permissions".to_owned()),
+            (Mode::Ask | Mode::Bypass, true) => {
+                argv.push("--dangerously-skip-permissions".to_owned())
+            }
         }
         argv
     }
@@ -1487,6 +1491,8 @@ mod tests {
         let plan = a.argv(&session(Mode::Plan, true));
         assert!(plan.windows(2).any(|w| w == ["--mode", "plan"]));
         assert!(!plan.contains(&"--dangerously-skip-permissions".to_owned()));
+        // Dangerous permissive: launched as Ask is; the hook is what allows everything.
+        assert_eq!(a.argv(&session(Mode::Bypass, true)), argv);
     }
 
     #[test]
@@ -1496,6 +1502,7 @@ mod tests {
             (Mode::Ask, "plan"),
             (Mode::AcceptEdits, "accept-edits"),
             (Mode::Plan, "plan"),
+            (Mode::Bypass, "plan"),
         ] {
             let argv = a.argv(&session(mode, false));
             assert!(argv.windows(2).any(|w| w == ["--mode", flag]), "{mode:?}");
