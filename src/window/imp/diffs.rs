@@ -123,19 +123,17 @@ impl ThreadDiffs {
 
     /// A file-change item started: it belongs to the turn in progress.
     pub(super) fn item_started(&self, item: &str) {
-        if let Some(slot) = self.current.borrow().clone() {
-            self.bases.borrow_mut().insert(item.to_owned(), slot);
+        if let Some(slot) = self.current.borrow().clone().filter(|_| self.in_turn.get()) {
+            self.bases
+                .borrow_mut()
+                .entry(item.to_owned())
+                .or_insert(slot);
         }
     }
 
     /// The item's baseline, once it is known (waits for one still being taken).
     async fn base_of(&self, item: &str) -> Option<TurnBase> {
-        let slot = self
-            .bases
-            .borrow()
-            .get(item)
-            .cloned()
-            .or_else(|| self.current.borrow().clone())?;
+        let slot = self.bases.borrow().get(item).cloned()?;
         wait_until(BASE_WAIT, Duration::from_millis(100), || !slot.pending()).await;
         slot.ready()
     }
@@ -150,6 +148,7 @@ impl ThreadDiffs {
         let slot = Rc::new(BaseSlot::default());
         *slot.state.borrow_mut() = BaseState::Ready(base);
         *self.current.borrow_mut() = Some(slot);
+        self.in_turn.set(true);
     }
 }
 
@@ -217,6 +216,47 @@ mod tests {
 
     fn diffs() -> Rc<ThreadDiffs> {
         ThreadDiffs::new("/nonexistent", 1, "test", Rc::new(|_| {}))
+    }
+
+    #[test]
+    fn a_replayed_item_never_uses_a_later_turn_base() {
+        let d = diffs();
+        d.set_ready_for_test(TurnBase {
+            toplevel: "/r".into(),
+            rev: "later".into(),
+        });
+        assert!(glib::MainContext::new()
+            .block_on(d.base_of("replayed"))
+            .is_none());
+        d.turn_ended();
+        d.item_started("outside-a-turn");
+        assert_eq!(d.bound_items(), 0);
+    }
+
+    #[test]
+    fn an_item_of_the_current_turn_uses_its_base() {
+        let d = diffs();
+        let slot = Rc::new(BaseSlot::default());
+        *d.current.borrow_mut() = Some(slot.clone());
+        d.in_turn.set(true);
+        d.item_started("edit"); // binds even while the baseline is pending
+        *slot.state.borrow_mut() = BaseState::Ready(TurnBase {
+            toplevel: "/r".into(),
+            rev: "first".into(),
+        });
+        d.turn_ended();
+        d.set_ready_for_test(TurnBase {
+            toplevel: "/r".into(),
+            rev: "second".into(),
+        });
+        d.item_started("edit"); // re-announced metadata keeps its original turn
+        assert_eq!(
+            glib::MainContext::new()
+                .block_on(d.base_of("edit"))
+                .unwrap()
+                .rev,
+            "first"
+        );
     }
 
     #[test]

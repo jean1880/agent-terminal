@@ -15,7 +15,7 @@ use std::rc::Rc;
 use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
 use agent_core::catalog::{model_notice, ModelNotice};
 use agent_core::event::{BackgroundTask, Decision, Envelope, Event, ItemKind};
-use agent_kit::store::Store;
+use agent_kit::store::{pending_prompt_key, Store};
 use agent_kit::store_writer::{Shutdown, StoreHandle, StoreWriter, WORKER_FLUSH_WAIT};
 
 use super::diffs::ThreadDiffs;
@@ -35,11 +35,11 @@ use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::config::{profile_driver, Profile};
 use crate::model_catalog::{retirement_banner, ModelCatalog};
 use crate::window::sidebar_model::{
-    badge_for, continue_label, driver_key, driver_label, fold_groups, forbids_unasked_edits,
-    held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, redraw_for,
-    relative_time, resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading,
-    stored_model, thread_title, turn_finishes_thread, Attention, Badge, FolderGroup, Redraw,
-    ResumeAs, RowKey, SidebarModel, SidebarRow,
+    badge_for, busy_reason, continue_label, driver_key, driver_label, fold_groups,
+    forbids_unasked_edits, held_finish_due, is_busy, limit_over, needs_attention, parse_driver,
+    react, redraw_for, relative_time, resume_as, row_tooltip, safe_handoff_target,
+    sidebar_sections, stop_heading, stored_model, thread_title, turn_finishes_thread, Attention,
+    Badge, FolderGroup, OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
@@ -50,8 +50,151 @@ fn clear_rows(list: &gtk4::ListBox) {
     }
 }
 
-/// The store key holding the open-thread list (`{"open": [ids], "selected": id}`).
+/// The store key holding each window's layout and the legacy merged open-thread list.
 const OPEN_THREADS_KEY: &str = "open_threads";
+
+/// A successful load still waits for the scan's answer; a failed load drops a parked switch.
+fn keep_pending_switch(read_ok: bool, own: &Availability) -> bool {
+    read_ok && matches!(own, Availability::Detecting)
+}
+
+fn scan_is_current(generation: u64) -> bool {
+    SCAN_GENERATION.with(|current| generation == current.get())
+}
+
+#[cfg(test)]
+pub(super) fn scan_generation_for_test() -> u64 {
+    SCAN_GENERATION.with(std::cell::Cell::get)
+}
+
+/// Resolve weak owners and discard expired entries rather than retaining a dead window.
+fn registry_owner<W, O>(
+    registry: &mut HashMap<String, W>,
+    thread: &str,
+    upgrade: impl FnOnce(&W) -> Option<O>,
+) -> Option<O> {
+    let owner = registry.get(thread).and_then(upgrade);
+    if owner.is_none() {
+        registry.remove(thread);
+    }
+    owner
+}
+
+pub(super) fn thread_owner(thread: &str) -> Option<super::super::AgentTerminalWindow> {
+    OPEN_THREADS.with(|registry| {
+        registry_owner(&mut registry.borrow_mut(), thread, |weak| {
+            weak.upgrade()
+                .filter(|window| window.imp().page_of_thread(thread).is_some())
+        })
+    })
+}
+
+fn save_pending_prompt(store: &Store, thread: &str, prompt: &str) -> agent_kit::store::Result<()> {
+    store.set_pending_prompt(thread, prompt)
+}
+
+#[derive(Default)]
+struct LatestLayout {
+    pending: Option<String>,
+    queued: bool,
+}
+
+impl LatestLayout {
+    fn offer(&mut self, value: String) -> bool {
+        self.pending = Some(value);
+        !std::mem::replace(&mut self.queued, true)
+    }
+
+    fn take(&mut self) -> Option<String> {
+        self.queued = false;
+        self.pending.take()
+    }
+}
+
+type LayoutWrites = std::sync::Arc<std::sync::Mutex<LatestLayout>>;
+
+struct LayoutTicket {
+    writes: LayoutWrites,
+    captured: bool,
+}
+
+impl Drop for LayoutTicket {
+    fn drop(&mut self) {
+        if !self.captured {
+            // A rejected enqueue or failed batch can discard the placeholder before it runs.
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .queued = false;
+        }
+    }
+}
+
+fn write_latest_layout(writes: &LayoutWrites, store: &Store) -> agent_kit::store::Result<()> {
+    let value = writes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(value) = value {
+        store.set_meta(OPEN_THREADS_KEY, &value)?;
+    }
+    Ok(())
+}
+
+/// The queued placeholder captures the newest value on the writer, so a close barrier always
+/// includes it. No main-loop completion callback or blocking waiter submits a later snapshot.
+fn queue_open_layout(
+    writer: &StoreWriter,
+    writes: &LayoutWrites,
+    value: String,
+) -> agent_kit::store::Result<()> {
+    if !writes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .offer(value)
+    {
+        return Ok(());
+    }
+    let mut ticket = LayoutTicket {
+        writes: writes.clone(),
+        captured: false,
+    };
+    writer.write("record the open threads", None, move |store| {
+        ticket.captured = true;
+        write_latest_layout(&ticket.writes, store)
+    })
+}
+
+fn window_layout(
+    closing: bool,
+    any_live_window: bool,
+    open: Vec<String>,
+    selected: Option<String>,
+) -> Option<serde_json::Value> {
+    // An individual close leaves only surviving windows in the reopen list. At quit, retain
+    // every remaining window's layout while its pages still exist, even though all are closing.
+    // This includes a previously closed window still waiting for its agents when the last closes.
+    (!closing || !any_live_window).then(|| serde_json::json!({"open": open, "selected": selected}))
+}
+
+/// Both shapes are written so an older build can still reopen every thread.
+fn saved_open_threads(
+    windows: &[serde_json::Value],
+    selected: Option<String>,
+) -> serde_json::Value {
+    let mut open = Vec::new();
+    for window in windows {
+        if let Some(ids) = window["open"].as_array() {
+            for id in ids {
+                if id.is_string() && !open.contains(id) {
+                    open.push(id.clone());
+                }
+            }
+        }
+    }
+    let selected = selected.filter(|id| open.iter().any(|v| v.as_str() == Some(id)));
+    serde_json::json!({"windows": windows, "open": open, "selected": selected})
+}
 /// Most events replayed into a thread's view when it opens.
 const REPLAY_LIMIT: usize = 50_000;
 /// How often the account/usage indicator refreshes while the window is focused.
@@ -116,7 +259,8 @@ pub(super) struct ChatTab {
     confirming_close: bool,
     /// The user message item awaiting its text, for the title of an untitled thread.
     title_item: Option<String>,
-    /// Sent once the session exists (Continue In from a terminal page).
+    /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
+    /// unsent metadata so closing during a build does not lose it.
     pending_prompt: Option<String>,
     /// Seeded into the session once it exists (fork, compact-by-handoff), with its source.
     pending_handoff: Option<(crate::chat::session::Handoff, String)>,
@@ -297,6 +441,9 @@ thread_local! {
     /// Keyed by (command, env file): a profile edit is a new key, so nothing goes stale.
     static RESOLVED: RefCell<HashMap<(String, Option<String>), ResolvedAgent>> =
         RefCell::new(HashMap::new());
+    static OPEN_THREADS: RefCell<HashMap<String, glib::WeakRef<super::super::AgentTerminalWindow>>> = RefCell::new(HashMap::new());
+    static OPEN_LAYOUT_WRITES: LayoutWrites = LayoutWrites::default();
+    static SCAN_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CHAT_RESTORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -710,6 +857,7 @@ struct StartJob {
 /// What a thread page needs from the store to be built, read in one off-thread job.
 #[derive(Default)]
 struct LoadedThread {
+    pending_prompt: Option<String>,
     /// Stored events, each with the agent that produced it when the store knows.
     history: Vec<(Option<Driver>, Envelope)>,
     /// The active provider thread (its native session id and model), to resume.
@@ -773,7 +921,21 @@ fn load_thread_with(
             }
         }
     }
-    Ok(LoadedThread { history, provider })
+    let pending_prompt = store
+        .meta(&pending_prompt_key(thread))?
+        .filter(|s| !s.is_empty());
+    // A close inside the send's sink can precede its metadata clear. The sent message is
+    // already queued then; never dispatch the same first prompt again on reopen.
+    let pending_prompt = if store.has_messages(thread)? {
+        None
+    } else {
+        pending_prompt
+    };
+    Ok(LoadedThread {
+        history,
+        provider,
+        pending_prompt,
+    })
 }
 
 /// How many of the agents' own recent sessions are listed as threads.
@@ -951,16 +1113,24 @@ struct BuildJob {
 
 /// The saved open-thread ids that still exist (archived or deleted ones drop out), at most `max`.
 fn restorable(saved: &serde_json::Value, known: &[String], max: usize) -> Vec<String> {
-    saved["open"]
+    let layouts = saved["windows"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .filter(|id| known.contains(id))
-                .take(max)
-                .collect()
-        })
-        .unwrap_or_default()
+        .cloned()
+        .unwrap_or_else(|| vec![saved.clone()]);
+    let mut open = Vec::new();
+    for layout in layouts {
+        for id in layout["open"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+        {
+            if open.len() < max && known.iter().any(|k| k == id) && !open.iter().any(|o| o == id) {
+                open.push(id.to_owned());
+            }
+        }
+    }
+    open
 }
 
 /// The thread to bring into view: the saved selection when it is among those reopened, else the
@@ -969,6 +1139,13 @@ fn selected_to_restore(saved: &serde_json::Value, open: &[String]) -> Option<Str
     saved["selected"]
         .as_str()
         .filter(|id| open.iter().any(|o| o == id))
+        .or_else(|| {
+            saved["windows"].as_array()?.iter().find_map(|w| {
+                w["selected"]
+                    .as_str()
+                    .filter(|id| open.iter().any(|o| o == id))
+            })
+        })
         .or(open.first().map(String::as_str))
         .map(str::to_owned)
 }
@@ -1937,7 +2114,13 @@ impl AgentTerminalWindow {
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    open: tab.is_some(),
+                    open: if tab.is_some() {
+                        OpenState::Here
+                    } else if thread_owner(&s.id).is_some() {
+                        OpenState::Elsewhere
+                    } else {
+                        OpenState::Closed
+                    },
                     archived: s.archived,
                 }
             })
@@ -1955,7 +2138,7 @@ impl AgentTerminalWindow {
                 driver: None,
                 badge: tab.page.needs_attention().then_some(Badge::Unread),
                 background: Vec::new(),
-                open: true,
+                open: OpenState::Here,
                 archived: false,
             });
         }
@@ -2409,7 +2592,7 @@ impl AgentTerminalWindow {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .css_classes(if row.open {
+            .css_classes(if row.open != OpenState::Closed {
                 vec!["thread-title", "open"]
             } else {
                 vec!["thread-title"]
@@ -2417,6 +2600,13 @@ impl AgentTerminalWindow {
             .tooltip_text(&row.title)
             .build();
         line.append(&title);
+        if row.open == OpenState::Elsewhere {
+            let mark = Label::builder()
+                .label("↗")
+                .tooltip_text(row.open.description())
+                .build();
+            line.append(&mark);
+        }
         if let Some(badge) = row.badge {
             // Spinning means not finished: the main agent working, or background work (sub-agents,
             // background commands) it is still waiting on, which spins in its own colour.
@@ -2443,7 +2633,7 @@ impl AgentTerminalWindow {
         line.append(&age);
         // One trailing button per row: an open row closes, a closed one deletes (shown on hover).
         // An open thread is deleted from its menu or with the Delete key.
-        if let (RowKey::Thread(thread_id), false) = (&row.key, row.open) {
+        if let (RowKey::Thread(thread_id), OpenState::Closed) = (&row.key, row.open) {
             let delete = Button::builder()
                 .icon_name("at-user-trash-symbolic")
                 .tooltip_text("Delete thread…")
@@ -2458,7 +2648,7 @@ impl AgentTerminalWindow {
             ));
             line.append(&delete);
         }
-        if row.open {
+        if row.open == OpenState::Here {
             let close = Button::builder()
                 .icon_name("at-window-close-symbolic")
                 .tooltip_text("Close (the thread stays in the list; a running turn is stopped)")
@@ -2477,7 +2667,7 @@ impl AgentTerminalWindow {
         let state = row
             .badge
             .map(|b| row_tooltip(b, &row.background))
-            .unwrap_or_else(|| if row.open { "Open" } else { "Closed" }.to_owned());
+            .unwrap_or_else(|| row.open.description().to_owned());
         widget.update_property(&[
             gtk4::accessible::Property::Label(&row.title),
             gtk4::accessible::Property::Description(&format!("{}, {state}", row.folder)),
@@ -2606,6 +2796,12 @@ impl AgentTerminalWindow {
 
     /// Closes the row's page, asking first when that would cut a turn short.
     pub(super) fn close_row(&self, key: &RowKey) {
+        if let RowKey::Thread(thread) = key {
+            if let Some(owner) = thread_owner(thread).filter(|w| w != &*self.obj()) {
+                owner.imp().close_row(key);
+                return;
+            }
+        }
         if let (true, RowKey::Thread(thread)) = (self.row_is_busy(key), key) {
             let key = key.clone();
             self.confirm_stop_then(thread, move |imp| imp.close_row_now(&key));
@@ -2616,6 +2812,14 @@ impl AgentTerminalWindow {
 
     /// Closes the row's page with no question (a thread being deleted was already confirmed).
     pub(super) fn close_row_now(&self, key: &RowKey) {
+        if matches!(key, RowKey::Thread(_)) {
+            self.for_each_window(|window| window.close_local_row_now(key));
+        } else {
+            self.close_local_row_now(key);
+        }
+    }
+
+    fn close_local_row_now(&self, key: &RowKey) {
         let page = self.tabs.borrow().iter().find_map(|t| {
             let matches = match key {
                 RowKey::Thread(id) => t.chat.as_ref().is_some_and(|c| &c.thread == id),
@@ -2686,7 +2890,7 @@ impl AgentTerminalWindow {
                 }
                 let imp = obj.imp();
                 imp.save_open_threads();
-                imp.refresh_sidebar();
+                imp.for_each_window(|window| window.refresh_sidebar());
             }
         ));
     }
@@ -2769,48 +2973,72 @@ impl AgentTerminalWindow {
 
     /// Records the open threads (and the one in view) so the next launch reopens them.
     pub(super) fn save_open_threads(&self) {
-        // Nothing to record before the shell exists, or while it is being torn down.
+        // Selection and detach callbacks during teardown must not shrink the closing snapshot.
+        if self.is_closing() {
+            return;
+        }
+        self.record_open_threads();
+    }
+
+    /// The close path's one snapshot, taken before agents stop or pages are detached.
+    pub(super) fn save_open_threads_at_close(&self) {
+        self.record_open_threads();
+    }
+
+    fn record_open_threads(&self) {
+        // Nothing to record before the shell exists or the previous layout has been restored.
         if self.tab_view.borrow().is_none() || !CHAT_RESTORED.with(std::cell::Cell::get) {
             return;
         }
-        let selected = self.selected_row_key();
-        let open: Vec<String> = self
-            .tabs
-            .borrow()
-            .iter()
-            .filter_map(|t| t.chat.as_ref().map(|c| c.thread.clone()))
-            .collect();
-        let selected = match selected {
-            Some(RowKey::Thread(id)) => Some(id),
-            _ => None,
-        };
-        let value = serde_json::json!({ "open": open, "selected": selected });
-        self.queue_open_threads(value.to_string());
-    }
-
-    /// Writes the open-thread list off the main thread. Writes are one at a time and in order,
-    /// and a burst (several pages opening) keeps only the newest value, so a slow disk can
-    /// neither reorder them nor pile them up.
-    fn queue_open_threads(&self, value: String) {
-        *self.open_threads_pending.borrow_mut() = Some(value);
-        if self.open_threads_writing.replace(true) {
-            return; // the running writer picks the new value up
-        }
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            loop {
-                let Some(obj) = obj.upgrade() else { return };
-                let next = obj.imp().open_threads_pending.borrow_mut().take();
-                let Some(value) = next else {
-                    obj.imp().open_threads_writing.set(false);
-                    return;
-                };
-                drop(obj);
-                if let Some(Err(e)) = write_job("record the open threads", move |s| {
-                    s.set_meta(OPEN_THREADS_KEY, &value)
-                })
-                .await
-                {
+        let windows = RefCell::new(Vec::new());
+        let focused = RefCell::new(None);
+        let any_live_window = std::cell::Cell::new(false);
+        self.for_each_window(|window| {
+            if !window.is_closing() {
+                any_live_window.set(true);
+            }
+        });
+        self.for_each_window(|window| {
+            let selected = match window.selected_row_key() {
+                Some(RowKey::Thread(id)) => Some(id),
+                _ => None,
+            };
+            let open: Vec<String> = window
+                .tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+                .collect();
+            if let Some(layout) = window_layout(
+                window.is_closing(),
+                any_live_window.get(),
+                open,
+                selected.clone(),
+            ) {
+                if window.obj().is_active() {
+                    *focused.borrow_mut() = Some(selected);
+                }
+                windows.borrow_mut().push(layout);
+            }
+        });
+        let selected = focused
+            .into_inner()
+            .unwrap_or_else(|| match self.selected_row_key() {
+                Some(RowKey::Thread(id)) => Some(id),
+                _ => None,
+            });
+        let value = saved_open_threads(&windows.into_inner(), selected).to_string();
+        OPEN_LAYOUT_WRITES.with(|writes| {
+            if let Some(writer) = store_writer() {
+                if let Err(e) = queue_open_layout(&writer, writes, value) {
+                    warn!("Cannot record the open threads: {e}");
+                }
+            } else {
+                writes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .offer(value);
+                if let Err(e) = app_store().atomically(|store| write_latest_layout(writes, store)) {
                     warn!("Cannot record the open threads: {e}");
                 }
             }
@@ -2945,6 +3173,18 @@ impl AgentTerminalWindow {
     /// Shows the thread's page, adding it if it is not open. `select` brings it into view (and
     /// so builds it).
     pub(super) fn open_thread(&self, thread: &str, select: bool) -> Option<adw::TabPage> {
+        if let Some(owner) = thread_owner(thread).filter(|w| w != &*self.obj()) {
+            if owner.imp().is_closing() {
+                self.show_toast("This thread is closing in another window");
+                return None;
+            }
+            let page = owner.imp().open_thread(thread, true);
+            owner.present();
+            return page;
+        }
+        if self.is_closing() {
+            return None;
+        }
         let existing = self.tabs.borrow().iter().find_map(|t| {
             t.chat
                 .as_ref()
@@ -2966,6 +3206,32 @@ impl AgentTerminalWindow {
             }
         }
         Some(page)
+    }
+
+    pub(super) fn register_thread(&self, thread: &str) {
+        OPEN_THREADS.with(|registry| {
+            registry
+                .borrow_mut()
+                .insert(thread.to_owned(), self.obj().downgrade());
+        });
+    }
+
+    pub(super) fn unregister_thread(&self, thread: &str) {
+        OPEN_THREADS.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            if registry
+                .get(thread)
+                .and_then(glib::WeakRef::upgrade)
+                .as_ref()
+                == Some(&*self.obj())
+            {
+                registry.remove(thread);
+            }
+        });
+    }
+
+    fn session_start_allowed(&self) -> bool {
+        !self.is_closing()
     }
 
     /// Adds an (unbuilt) page for a stored thread.
@@ -3182,13 +3448,18 @@ impl AgentTerminalWindow {
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);
         }
+        self.register_thread(thread);
+        self.save_open_threads();
         self.update_sign_in_banners();
-        self.refresh_sidebar();
+        self.for_each_window(|window| window.refresh_sidebar());
         Some(page)
     }
 
     /// Builds a thread's view and starts its session, the first time its page is shown.
     fn ensure_built(&self, page: &adw::TabPage) {
+        if self.is_closing() {
+            return;
+        }
         let job = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
@@ -3231,6 +3502,9 @@ impl AgentTerminalWindow {
             obj,
             async move {
                 let resolved = resolve_agent(profile.clone()).await;
+                if !obj.imp().session_start_allowed() {
+                    return;
+                }
                 // A long thread's history is read (and decoded) off the main thread; only the
                 // replay into the view happens here.
                 let loaded = store_job({
@@ -3244,6 +3518,9 @@ impl AgentTerminalWindow {
                     move |store| load_thread_with(store, &thread, home.as_deref(), writer.as_ref())
                 })
                 .await;
+                if !obj.imp().session_start_allowed() {
+                    return;
+                }
                 // A thread that cannot be read is not built (an empty one would start a fresh
                 // session and re-point the thread at it); selecting it again retries.
                 let loaded = match loaded {
@@ -3271,10 +3548,16 @@ impl AgentTerminalWindow {
                     }
                     Driver::Claude | Driver::Codex => Ok(()),
                 };
+                if !obj.imp().session_start_allowed() {
+                    return;
+                }
                 // A session that will start now waits (briefly) for a fresh model list, so a
                 // retired model is ported before it reaches argv.
                 if AgentAvailability::shared().is_ready(driver) {
                     wait_for_fresh_catalog(driver).await;
+                    if !obj.imp().session_start_allowed() {
+                        return;
+                    }
                 }
                 obj.imp().build_thread(
                     &page,
@@ -3302,6 +3585,7 @@ impl AgentTerminalWindow {
             .and_then(|t| t.chat.as_mut())
         {
             chat.building = false;
+            chat.pending_switch = None;
             // Not loading any more: the skeleton holds still until a retry.
             if let Some(skeleton) = chat.holder.first_child() {
                 loading::settle(&skeleton);
@@ -3311,6 +3595,9 @@ impl AgentTerminalWindow {
     }
 
     fn build_thread(&self, page: &adw::TabPage, job: BuildJob) {
+        if !self.session_start_allowed() {
+            return;
+        }
         let BuildJob {
             thread,
             driver,
@@ -3379,6 +3666,9 @@ impl AgentTerminalWindow {
             .and_then(|t| t.chat.as_mut())
         {
             chat.view = Some(view.clone());
+            if chat.pending_prompt.is_none() {
+                chat.pending_prompt = loaded.pending_prompt;
+            }
             chat.building = false;
             // A switch whose handoff never reached the new agent (a restart, or it died on its
             // first turn): the session re-arms it once it starts. Ceiling: only the replayed
@@ -3419,6 +3709,17 @@ impl AgentTerminalWindow {
                 "Thread {thread} opened without a session: {} is not ready",
                 driver_label(driver)
             );
+            if let Some(chat) = self
+                .tabs
+                .borrow_mut()
+                .iter_mut()
+                .find(|t| &t.page == page)
+                .and_then(|t| t.chat.as_mut())
+            {
+                if !keep_pending_switch(true, &AgentAvailability::shared().get(driver)) {
+                    chat.pending_switch = None;
+                }
+            }
             self.update_unavailable_banners();
             if self
                 .tab_view
@@ -3435,6 +3736,9 @@ impl AgentTerminalWindow {
 
     /// Starts the session of a thread whose view is built, and applies what was waiting for it.
     fn start_session(&self, page: &adw::TabPage, job: StartJob) {
+        if !self.session_start_allowed() {
+            return;
+        }
         // The demo window starts no agent, by any path (`build_thread`, a pending start when an
         // agent becomes ready, a fork): its threads run the demo script.
         #[cfg(not(test))]
@@ -3560,6 +3864,10 @@ impl AgentTerminalWindow {
             approval,
             launch_env,
         );
+        if !self.session_start_allowed() {
+            session.shutdown(true);
+            return;
+        }
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
         *slot.session.borrow_mut() = Some(session.clone());
@@ -3599,7 +3907,7 @@ impl AgentTerminalWindow {
         if let Some((driver, model, effort)) = switch {
             session.switch(driver, model, effort);
         }
-        if let Some(prompt) = prompt {
+        if let Some(prompt) = prompt.filter(|_| self.session_start_allowed()) {
             session.send_prompt(&prompt);
         }
         // The thread is built: judge its model against the current catalogue too.
@@ -4157,11 +4465,21 @@ impl AgentTerminalWindow {
     /// switched off) has nothing to switch, so it continues in a new thread on `target`, with
     /// the same handoff a fork carries, and says so.
     pub(super) fn switch_or_continue(&self, thread: &str, target: Driver) {
+        self.switch_or_continue_with(thread, target, None, None);
+    }
+
+    pub(super) fn switch_or_continue_with(
+        &self,
+        thread: &str,
+        target: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
         if slot.get().is_some() {
-            slot.switch(target, None, None);
+            slot.switch(target, model, effort);
             return;
         }
         let dir = self.page_of_thread(thread).and_then(|p| {
@@ -4171,7 +4489,7 @@ impl AgentTerminalWindow {
                 .find(|t| t.page == p)
                 .map(|t| t.dir.clone())
         });
-        self.fork_thread(thread, target, dir);
+        self.fork_thread_with(thread, target, dir, model, effort);
         self.show_toast(&format!(
             "{} is not running here: continued in a new {} thread",
             driver_label(slot.driver()),
@@ -4195,13 +4513,19 @@ impl AgentTerminalWindow {
     /// to", the 2.x Continue In) comes through here, as the header picker asks for itself. The
     /// switch stops the turn itself, so nothing is interrupted before `then` decides to switch.
     pub(super) fn when_not_busy(&self, thread: &str, then: impl Fn(&Self) + 'static) {
+        if self.is_closing() {
+            return;
+        }
         let busy = self
-            .slot_of(thread)
-            .and_then(|s| s.get())
-            .map(|s| s.status())
-            .filter(|s| s.running_turn)
-            .map(|s| s.driver);
-        let Some(from) = busy else {
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread && c.busy())
+            .and_then(|c| {
+                busy_reason(c.running, c.background.len(), c.approval).map(|why| (c.driver, why))
+            });
+        let Some((from, why)) = busy else {
             then(self);
             return;
         };
@@ -4212,10 +4536,9 @@ impl AgentTerminalWindow {
         let dialog = adw::AlertDialog::new(
             Some("Switch agents now?"),
             Some(&format!(
-                "{} is still working. Switching interrupts this turn and continues the \
-                 unfinished task with the selected agent. Any approval or question waiting \
-                 for your answer is cancelled; the new turn can ask again.",
-                driver_label(from)
+                "{} has unfinished work. {why} Switching continues with the selected agent; \
+                 the new turn can ask again.",
+                driver_label(from),
             )),
         );
         dialog.add_responses(&[
@@ -4233,7 +4556,7 @@ impl AgentTerminalWindow {
                 .await;
             let imp = window.imp();
             imp.unasked_prompt_open.set(false);
-            if response == "switch" {
+            if response == "switch" && !imp.is_closing() {
                 then(imp);
             }
         });
@@ -4320,6 +4643,21 @@ impl AgentTerminalWindow {
     /// off the main thread, and the handoff travels with the NEW thread's own record
     /// (`NewThread::handoff`), never through whichever page happens to be selected.
     fn fork_thread(&self, thread: &str, driver: Driver, dir: Option<String>) {
+        let model = self
+            .slot_of(thread)
+            .and_then(|s| s.get())
+            .and_then(|s| s.selected_model());
+        self.fork_thread_with(thread, driver, dir, model, None);
+    }
+
+    fn fork_thread_with(
+        &self,
+        thread: &str,
+        driver: Driver,
+        dir: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
         let title = self
             .tabs
             .borrow()
@@ -4337,10 +4675,7 @@ impl AgentTerminalWindow {
             format!("“{title}”")
         };
         let session = self.slot_of(thread).and_then(|s| s.get());
-        let (model, mode) = (
-            session.as_ref().and_then(|s| s.selected_model()),
-            session.as_ref().map(|s| s.wanted_mode()),
-        );
+        let mode = session.as_ref().map(|s| s.wanted_mode());
         let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
         glib::MainContext::default().spawn_local(async move {
             let loaded = store_job({
@@ -4368,6 +4703,7 @@ impl AgentTerminalWindow {
             imp.create_chat_thread(NewThread {
                 dir,
                 model,
+                effort,
                 mode,
                 handoff: Some((handoff, source)),
                 ..NewThread::new(driver)
@@ -4476,6 +4812,9 @@ impl AgentTerminalWindow {
     /// Creates a thread, opens and shows it. Whatever `new` leaves unset comes from the agent's
     /// profile. Returns its page.
     pub(super) fn create_chat_thread(&self, new: NewThread) -> Option<adw::TabPage> {
+        if self.is_closing() {
+            return None;
+        }
         let NewThread {
             driver,
             dir,
@@ -4526,6 +4865,7 @@ impl AgentTerminalWindow {
             }
         };
         let thread = ids.thread.clone();
+        let pending = prompt.clone();
         let record = {
             let (cwd, title, model) = (cwd.clone(), title.clone(), model.clone());
             move |s: &Store| {
@@ -4537,7 +4877,11 @@ impl AgentTerminalWindow {
                     driver,
                     model.as_deref(),
                     mode,
-                )
+                )?;
+                if let Some(prompt) = pending {
+                    save_pending_prompt(s, &ids.thread, &prompt)?;
+                }
+                Ok(())
             }
         };
         let created = CreatedThread {
@@ -4826,6 +5170,14 @@ impl AgentTerminalWindow {
     /// nothing; [`Probes::Force`] probes every ready agent (Settings changed it, or the user
     /// asked to check again).
     pub(super) fn refresh_agent_data(&self, probes: Probes) {
+        if self.is_closing() {
+            return;
+        }
+        let generation = SCAN_GENERATION.with(|current| {
+            let next = current.get().wrapping_add(1);
+            current.set(next);
+            next
+        });
         // Also what a switch to agy needs: its hook verdict, read off the main thread.
         let sources = RefCell::new((Vec::new(), Vec::new()));
         self.for_each_window(|window| {
@@ -4870,6 +5222,9 @@ impl AgentTerminalWindow {
             )
         };
         for (driver, profile) in &profiles {
+            if !scan_is_current(generation) {
+                return;
+            }
             if profile.disabled {
                 availability.set(*driver, Availability::Disabled);
             } else if availability.get(*driver) == Availability::Disabled {
@@ -4880,6 +5235,9 @@ impl AgentTerminalWindow {
         // missing. The window scans as it is built, so every window test would otherwise.
         if cfg!(test) {
             for (driver, profile) in &profiles {
+                if !scan_is_current(generation) {
+                    return;
+                }
                 if !profile.disabled {
                     availability.set(*driver, Availability::Missing);
                 }
@@ -4896,6 +5254,9 @@ impl AgentTerminalWindow {
                 crate::utils::shell_path();
             })
             .await;
+            if !scan_is_current(generation) {
+                return;
+            }
             let availability = AgentAvailability::shared();
             let mut envs: Vec<(Driver, AgentEnv)> = Vec::new();
             for (driver, profile) in profiles {
@@ -4903,6 +5264,9 @@ impl AgentTerminalWindow {
                     continue;
                 }
                 let resolved = resolve_agent(profile).await;
+                if !scan_is_current(generation) {
+                    return;
+                }
                 // Probes run where the threads run: the profile's env file and `clear_env`.
                 envs.push((
                     driver,
@@ -4921,11 +5285,20 @@ impl AgentTerminalWindow {
                 {
                     ModelCatalog::shared().mark_due(driver);
                 }
+                if !scan_is_current(generation) {
+                    return;
+                }
                 availability.set(driver, state);
+                if !scan_is_current(generation) {
+                    return;
+                }
             }
             // Only what is Ready is probed. The same gate holds for a thread's session
             // (`build_thread`, `start_session`) and a cross-agent switch (`agent_launch`): a
             // missing, switched-off or still-detecting agent is never spawned.
+            if !scan_is_current(generation) {
+                return;
+            }
             let targets = probe_targets(&availability.all(), |d| {
                 envs.iter()
                     .find(|(driver, _)| *driver == d)
@@ -4936,10 +5309,16 @@ impl AgentTerminalWindow {
                 Probes::IfDue => {
                     let now = crate::freshness::now_epoch();
                     ModelCatalog::shared().refresh_if_due(&targets, now);
+                    if !scan_is_current(generation) {
+                        return;
+                    }
                     AccountStatus::shared().refresh_if_due(&targets, now);
                 }
                 Probes::Force => {
                     ModelCatalog::shared().refresh(&targets);
+                    if !scan_is_current(generation) {
+                        return;
+                    }
                     AccountStatus::shared().refresh(&targets);
                 }
             }
@@ -5162,6 +5541,11 @@ impl AgentTerminalWindow {
             let other = safe_handoff_target(driver, |d| availability.is_ready(d), cannot_ask);
             match unavailable_banner(driver, &state, other.map(|(d, _)| d)) {
                 Some((title, button)) => {
+                    // A scan that answered Missing/Disabled ends a parked switch; installing
+                    // or enabling the agent later must not apply an old startup request.
+                    if chat.slot.get().is_none() {
+                        chat.pending_switch = None;
+                    }
                     // An agy that would edit unasked says so on the button.
                     let button = match other {
                         Some((target, true)) => Some(continue_label(target, true)),
@@ -5186,6 +5570,9 @@ impl AgentTerminalWindow {
     /// provider thread off the main thread, then waits briefly for a fresh model list, exactly
     /// like a first build.
     fn start_pending_sessions(&self) {
+        if self.is_closing() {
+            return;
+        }
         let availability = AgentAvailability::shared();
         let waiting: Vec<(adw::TabPage, String, Driver, String)> = self
             .tabs
@@ -5216,6 +5603,12 @@ impl AgentTerminalWindow {
             let hook_clear = self.config.borrow().clear_env.clone();
             glib::MainContext::default().spawn_local(async move {
                 let resolved = resolve_agent(profile.clone()).await;
+                if !obj
+                    .upgrade()
+                    .is_some_and(|w| w.imp().session_start_allowed())
+                {
+                    return;
+                }
                 // A store that cannot be read starts nothing: a session started without the
                 // thread's provider would re-point the thread at a fresh session.
                 let provider = match store_job({
@@ -5231,6 +5624,12 @@ impl AgentTerminalWindow {
                     }
                     None => None,
                 };
+                if !obj
+                    .upgrade()
+                    .is_some_and(|w| w.imp().session_start_allowed())
+                {
+                    return;
+                }
                 let hook = match driver {
                     Driver::Agy => {
                         let hook_env = AgentEnv {
@@ -5245,12 +5644,22 @@ impl AgentTerminalWindow {
                     }
                     Driver::Claude | Driver::Codex => Ok(()),
                 };
+                if !obj
+                    .upgrade()
+                    .is_some_and(|w| w.imp().session_start_allowed())
+                {
+                    return;
+                }
                 if AgentAvailability::shared().is_ready(driver) {
                     wait_for_fresh_catalog(driver).await;
                 }
                 let Some(obj) = obj.upgrade() else { return };
-                let ready =
-                    AgentAvailability::shared().is_ready(driver) && resolved.program.is_some();
+                if !obj.imp().session_start_allowed() {
+                    return;
+                }
+                let own = AgentAvailability::shared().get(driver);
+                let keep_switch = keep_pending_switch(provider.is_some(), &own);
+                let ready = own.is_ready() && resolved.program.is_some();
                 let Some(provider) = provider.filter(|_| ready) else {
                     // Gone again while resolving, or the store failed: wait for the next change.
                     if let Some(chat) = obj
@@ -5262,6 +5671,9 @@ impl AgentTerminalWindow {
                         .and_then(|t| t.chat.as_mut())
                     {
                         chat.starting = false;
+                        if !keep_switch {
+                            chat.pending_switch = None;
+                        }
                     }
                     return;
                 };
@@ -5311,6 +5723,519 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn layout_bursts_save_the_latest_value_before_a_close_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let store = Store::open(&path).unwrap();
+        let writer = StoreWriter::spawn(&path).unwrap();
+        let writes = LayoutWrites::default();
+        for burst in 0..2 {
+            let (entered, held) = std::sync::mpsc::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            writer
+                .write("hold the writer", None, move |_| {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            held.recv_timeout(WORKER_FLUSH_WAIT).unwrap();
+            for n in 0..20 {
+                queue_open_layout(&writer, &writes, format!("window-{burst}-{n}")).unwrap();
+            }
+            assert_eq!(
+                writer.pending(),
+                2,
+                "the held write and one coalesced placeholder"
+            );
+            let barrier = writer.barrier();
+            release.send(()).unwrap();
+            barrier.recv_timeout(WORKER_FLUSH_WAIT).unwrap();
+            assert_eq!(
+                store.meta(OPEN_THREADS_KEY).unwrap().as_deref(),
+                Some(format!("window-{burst}-19").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn a_discarded_layout_placeholder_allows_the_next_write() {
+        let writes = LayoutWrites::default();
+        assert!(writes.lock().unwrap().offer("first".into()));
+        drop(LayoutTicket {
+            writes: writes.clone(),
+            captured: false,
+        });
+        assert!(writes.lock().unwrap().offer("after batch failure".into()));
+        let mut captured = LayoutTicket {
+            writes: writes.clone(),
+            captured: false,
+        };
+        captured.captured = true;
+        assert_eq!(
+            writes.lock().unwrap().take().as_deref(),
+            Some("after batch failure")
+        );
+        assert!(writes.lock().unwrap().offer("after capture".into()));
+        drop(captured);
+        let pending = writes.lock().unwrap();
+        assert!(
+            pending.queued,
+            "the captured ticket must not cancel the next placeholder"
+        );
+        assert_eq!(pending.pending.as_deref(), Some("after capture"));
+    }
+
+    #[test]
+    fn closing_windows_and_their_selections_are_not_saved() {
+        let surviving =
+            window_layout(false, true, vec!["open".into()], Some("open".into())).unwrap();
+        assert!(
+            window_layout(true, true, vec!["closing".into()], Some("closing".into())).is_none()
+        );
+        let saved = saved_open_threads(&[surviving], Some("closing".into()));
+        assert_eq!(saved["open"], serde_json::json!(["open"]));
+        assert!(saved["selected"].is_null());
+        assert_eq!(
+            saved_open_threads(&[], Some("closing".into()))["open"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn the_last_close_keeps_the_reopen_snapshot() {
+        for (closing, has_threads, expected) in [
+            (vec![true, false], vec![true, true], vec!["window-1"]),
+            (vec![true], vec![true], vec!["window-0"]),
+            (
+                vec![true, true],
+                vec![true, true],
+                vec!["window-0", "window-1"],
+            ),
+            (vec![true, false], vec![true, false], vec![]),
+        ] {
+            let any_live = closing.iter().any(|closing| !closing);
+            let layouts: Vec<_> = closing
+                .iter()
+                .zip(has_threads)
+                .enumerate()
+                .filter_map(|(i, (closing, has_threads))| {
+                    let id = format!("window-{i}");
+                    let open = if has_threads {
+                        vec![id.clone()]
+                    } else {
+                        vec![]
+                    };
+                    window_layout(*closing, any_live, open, has_threads.then_some(id))
+                })
+                .collect();
+            let saved = saved_open_threads(&layouts, expected.first().map(|id| (*id).to_owned()));
+            assert_eq!(
+                saved["open"],
+                serde_json::json!(expected),
+                "closing windows: {closing:?}"
+            );
+            assert_eq!(
+                saved["windows"].as_array().unwrap().len(),
+                if any_live {
+                    closing.iter().filter(|closing| !**closing).count()
+                } else {
+                    closing.len()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_final_close_snapshot_is_saved_before_the_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let store = Store::open(&path).unwrap();
+        let writer = StoreWriter::spawn(&path).unwrap();
+        let writes = LayoutWrites::default();
+        let (entered, held) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        writer
+            .write("hold the writer", None, move |_| {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        held.recv_timeout(WORKER_FLUSH_WAIT).unwrap();
+        // The first close has left one live window. Before either window goes, both become
+        // closing; the final snapshot must replace the intermediate one on the same writer.
+        let remaining = window_layout(false, true, vec!["b".into()], Some("b".into())).unwrap();
+        queue_open_layout(
+            &writer,
+            &writes,
+            saved_open_threads(&[remaining], Some("b".into())).to_string(),
+        )
+        .unwrap();
+        let at_quit: Vec<_> = ["a", "b"]
+            .into_iter()
+            .filter_map(|id| window_layout(true, false, vec![id.into()], Some(id.into())))
+            .collect();
+        let final_value = saved_open_threads(&at_quit, Some("a".into()));
+        queue_open_layout(&writer, &writes, final_value.to_string()).unwrap();
+        let barrier = writer.barrier();
+        release.send(()).unwrap();
+        barrier.recv_timeout(WORKER_FLUSH_WAIT).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&store.meta(OPEN_THREADS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved, final_value);
+        assert_eq!(saved["open"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn the_last_window_keeps_its_snapshot_when_pages_detach() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.ClosingLayout")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ids: Vec<_> = (0..2)
+            .map(|_| {
+                window
+                    .imp()
+                    .create_chat_thread(NewThread::new(Driver::Claude))
+                    .unwrap();
+                window.imp().current_thread().unwrap()
+            })
+            .collect();
+        window.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window.is_realized()));
+        let store = app_store();
+        let read_layout = || -> serde_json::Value {
+            serde_json::from_str(&store.meta(OPEN_THREADS_KEY).unwrap().unwrap()).unwrap()
+        };
+        let before = read_layout();
+        assert_eq!(before["open"], serde_json::json!(ids));
+        let view = window.imp().tab_view.borrow().clone().unwrap();
+        let detached = Rc::new(std::cell::Cell::new(0));
+        let count = detached.clone();
+        view.connect_page_detached(move |_, _, _| count.set(count.get() + 1));
+
+        window.close();
+        assert!(window.imp().is_closing(), "the real close path must run");
+        assert_eq!(
+            read_layout(),
+            before,
+            "close must take a populated snapshot"
+        );
+        // Keep the widgets alive and detach explicitly: GTK disposal timing must not make
+        // this pass without exercising the selection and detach callbacks after closing.
+        while view.n_pages() > 0 {
+            view.close_page(&view.nth_page(0));
+            assert_eq!(read_layout(), before, "detach must not shrink the snapshot");
+        }
+        assert_eq!(detached.get(), 2);
+        assert!(window.imp().tabs.borrow().is_empty());
+        window.imp().save_open_threads();
+        window.destroy();
+        crate::testutil::settle(&ctx);
+        assert_eq!(read_layout(), before);
+    }
+
+    #[test]
+    fn a_parked_switch_survives_a_view_build_while_detecting() {
+        for (own, keep) in [
+            (Availability::Detecting, true),
+            (Availability::Ready("/bin/claude".into()), false),
+            (Availability::Missing, false),
+            (Availability::Disabled, false),
+        ] {
+            assert_eq!(keep_pending_switch(true, &own), keep, "{own:?}");
+            assert!(!keep_pending_switch(false, &own), "a failed load: {own:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn opening_a_thread_in_two_windows_keeps_one_page_and_remote_actions_reach_it() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.ThreadOwners")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let first = crate::window::AgentTerminalWindow::new(&app);
+        let second = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()
+            && second.imp().tab_view.borrow().is_some()));
+        first.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || first.is_mapped()));
+        CHAT_RESTORED.with(|done| done.set(true));
+        let page = first
+            .imp()
+            .create_chat_thread(NewThread::new(Driver::Claude))
+            .unwrap();
+        let id = first.imp().current_thread().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&app_store().meta(OPEN_THREADS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["open"], serde_json::json!([id]));
+        second.imp().reload_summaries();
+        assert_eq!(second.imp().open_thread(&id, true), Some(page.clone()));
+        assert_eq!(first.imp().thread_pages() + second.imp().thread_pages(), 1);
+        assert_eq!(
+            second
+                .imp()
+                .sidebar_rows()
+                .iter()
+                .find(|r| r.key == RowKey::Thread(id.clone()))
+                .unwrap()
+                .open,
+            OpenState::Elsewhere
+        );
+        assert_eq!(
+            first
+                .imp()
+                .tab_view
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .selected_page(),
+            Some(page)
+        );
+
+        // Background-only work must ask on a switch, and cancelling leaves it untouched.
+        {
+            let mut tabs = first.imp().tabs.borrow_mut();
+            let chat = tabs.iter_mut().find_map(|t| t.chat.as_mut()).unwrap();
+            chat.background = vec![BackgroundTask {
+                id: "worker".into(),
+                kind: Default::default(),
+                tool_use_id: None,
+                description: Some("Review".into()),
+            }];
+        }
+        let switched = Rc::new(std::cell::Cell::new(false));
+        let seen = switched.clone();
+        assert!(!first.imp().unasked_prompt_open.get());
+        first.imp().when_not_busy(&id, move |_| seen.set(true));
+        assert!(!switched.get());
+        // choose_future presents on its first poll, after the scheduled local future runs.
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_some_and(|dialog| dialog.is_mapped())));
+        let dialog = first
+            .visible_dialog()
+            .unwrap()
+            .downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert!(dialog.body().contains("1 background task will stop"));
+        let cancel = crate::testutil::descendants(dialog.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk4::Button>().ok())
+            .find(|button| {
+                button.label().as_deref() == Some("Keep Waiting")
+                    || crate::testutil::descendants(button.upcast_ref())
+                        .iter()
+                        .any(|widget| {
+                            widget
+                                .downcast_ref::<gtk4::Label>()
+                                .is_some_and(|label| label.text() == "Keep Waiting")
+                        })
+            })
+            .unwrap();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || cancel.is_mapped() && cancel.is_sensitive())
+        );
+        crate::testutil::settle(&ctx);
+        // Activate the real cancel response: choose_future waits on AlertDialog::response.
+        cancel.emit_clicked();
+        assert!(crate::testutil::pump_until(&ctx, 5, || !first
+            .imp()
+            .unasked_prompt_open
+            .get()));
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_none_or(
+                |open| open != dialog.clone().upcast::<adw::Dialog>()
+            )));
+        // A mapped dismissal must also deliver the configured close response on 1.5.
+        let seen = switched.clone();
+        first.imp().when_not_busy(&id, move |_| seen.set(true));
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_some_and(|dialog| dialog.is_mapped())));
+        let dismissed = first
+            .visible_dialog()
+            .unwrap()
+            .downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert_eq!(dismissed.close_response(), "cancel");
+        crate::testutil::settle(&ctx);
+        assert!(dismissed.close(), "the mapped question must close");
+        assert!(crate::testutil::pump_until(&ctx, 5, || !first
+            .imp()
+            .unasked_prompt_open
+            .get()));
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_none_or(
+                |open| open != dismissed.clone().upcast::<adw::Dialog>()
+            )));
+        assert!(!switched.get(), "cancelling must not run the switch");
+        assert_eq!(
+            first
+                .imp()
+                .tabs
+                .borrow()
+                .iter()
+                .find_map(|t| t.chat.as_ref())
+                .unwrap()
+                .background
+                .len(),
+            1
+        );
+        first.imp().closing_started.set(true);
+        second.present();
+        assert!(second.imp().open_thread(&id, true).is_none());
+        assert!(crate::testutil::pump_until(&ctx, 5, || {
+            crate::testutil::descendants(second.upcast_ref())
+                .iter()
+                .any(|w| {
+                    w.downcast_ref::<gtk4::Label>()
+                        .is_some_and(|l| l.text() == "This thread is closing in another window")
+                })
+        }));
+        second.imp().save_open_threads();
+        let saved: serde_json::Value =
+            serde_json::from_str(&app_store().meta(OPEN_THREADS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["open"], serde_json::json!([]));
+        second.imp().close_row_now(&RowKey::Thread(id.clone()));
+        assert!(first.imp().page_of_thread(&id).is_none());
+        assert!(thread_owner(&id).is_none());
+        first.destroy();
+        second.destroy();
+    }
+
+    #[test]
+    fn registry_returns_the_window_already_showing_a_thread() {
+        let first = Rc::new("first window");
+        let second = Rc::new("second window");
+        let mut registry = HashMap::new();
+        registry.insert("t".into(), Rc::downgrade(&first));
+        let found = registry_owner(&mut registry, "t", std::rc::Weak::upgrade).unwrap();
+        assert!(Rc::ptr_eq(&found, &first));
+        assert!(!Rc::ptr_eq(&found, &second));
+        drop(found);
+        drop(first);
+        assert!(registry_owner(&mut registry, "t", std::rc::Weak::upgrade).is_none());
+        assert!(!registry.contains_key("t"));
+    }
+
+    #[test]
+    fn open_threads_from_two_windows_are_both_saved() {
+        let layouts = vec![
+            serde_json::json!({"open": ["a"], "selected": "a"}),
+            serde_json::json!({"open": ["b", "a"], "selected": "b"}),
+        ];
+        let saved = saved_open_threads(&layouts, Some("b".into()));
+        assert_eq!(saved["windows"], serde_json::json!(layouts));
+        assert_eq!(saved["open"], serde_json::json!(["a", "b"]));
+        assert_eq!(saved["selected"], "b");
+        let known = vec!["a".into(), "b".into()];
+        let new_only = serde_json::json!({"windows": layouts});
+        assert_eq!(restorable(&new_only, &known, 5), known);
+        assert_eq!(restorable(&new_only, &known, 1), ["a"]);
+        assert_eq!(selected_to_restore(&saved, &known), Some("b".into()));
+    }
+
+    #[test]
+    fn the_old_open_threads_shape_still_restores() {
+        let saved = serde_json::json!({"open": ["gone", "b", "a", "b"], "selected": "b"});
+        let known = vec!["a".into(), "b".into()];
+        let open = restorable(&saved, &known, 10);
+        assert_eq!(open, ["b", "a"]);
+        assert_eq!(selected_to_restore(&saved, &open), Some("b".into()));
+    }
+
+    #[test]
+    fn closing_prevents_session_start() {
+        let window = AgentTerminalWindow::default();
+        assert!(window.session_start_allowed());
+        window.closing_started.set(true);
+        assert!(!window.session_start_allowed());
+    }
+
+    #[test]
+    fn a_stale_scan_does_not_overwrite_a_newer_one() {
+        SCAN_GENERATION.with(|current| {
+            current.set(1);
+            assert!(scan_is_current(1));
+            current.set(2); // a scan requested by another window supersedes it too
+            assert!(!scan_is_current(1));
+            assert!(scan_is_current(2));
+        });
+    }
+
+    #[test]
+    fn a_pending_first_prompt_is_restored_without_being_stored_as_sent() {
+        let store = Store::open_in_memory().unwrap();
+        let ids = NewThreadIds {
+            thread: "thread".into(),
+            provider: "provider".into(),
+        };
+        record_new_thread_as(&store, &ids, "/tmp", None, Driver::Claude, None, None).unwrap();
+        let text = "Please continue\nPASSWORD=private-value";
+        let prompt = agent_core::redact::redact(text);
+        save_pending_prompt(&store, &ids.thread, text).unwrap();
+        let loaded = load_thread(&store, &ids.thread, None).unwrap();
+        assert_eq!(loaded.pending_prompt, Some(prompt));
+        assert!(loaded.history.is_empty());
+        assert!(!store.has_messages(&ids.thread).unwrap());
+        assert!(!loaded.pending_prompt.unwrap().contains("private-value"));
+        store
+            .append_user_message(&ids.thread, Some(&ids.provider), "Please continue")
+            .unwrap();
+        assert!(load_thread(&store, &ids.thread, None)
+            .unwrap()
+            .pending_prompt
+            .is_none());
+        assert_eq!(
+            store
+                .meta(&pending_prompt_key(&ids.thread))
+                .unwrap()
+                .as_deref(),
+            None
+        );
+        save_pending_prompt(&store, &ids.thread, text).unwrap();
+        store.delete_thread(&ids.thread).unwrap();
+        assert_eq!(
+            store
+                .meta(&pending_prompt_key(&ids.thread))
+                .unwrap()
+                .as_deref(),
+            None
+        );
+    }
 
     #[test]
     fn only_agent_questions_and_approvals_are_interruptions() {

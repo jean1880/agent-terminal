@@ -106,6 +106,44 @@ pub fn is_busy(running: bool, background: bool, approval: bool) -> bool {
     running || background || approval
 }
 
+/// Why a switch must ask before it stops this thread's work.
+pub fn busy_reason(running: bool, background: usize, approval: bool) -> Option<String> {
+    if !is_busy(running, background > 0, approval) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if running {
+        reasons.push("The running turn will be interrupted".to_owned());
+    }
+    match background {
+        0 => {}
+        1 => reasons.push("1 background task will stop".to_owned()),
+        n => reasons.push(format!("{n} background tasks will stop")),
+    }
+    if approval {
+        reasons
+            .push("The approval or question waiting for your answer will be cancelled".to_owned());
+    }
+    Some(format!("{}.", reasons.join(". ")))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenState {
+    Closed,
+    Here,
+    Elsewhere,
+}
+
+impl OpenState {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Closed => "Closed",
+            Self::Here => "Open",
+            Self::Elsewhere => "Open in another window",
+        }
+    }
+}
+
 /// Whether a finished turn means the thread is finished: nothing left in the background. A
 /// turn that ends with background work still going is not announced; the turn Claude runs to
 /// read that work's result is.
@@ -193,8 +231,8 @@ pub struct SidebarRow {
     pub badge: Option<Badge>,
     /// What runs in the background (sub-agents, background commands), for the row's tooltip.
     pub background: Vec<String>,
-    /// Open as a page in this window.
-    pub open: bool,
+    /// Where the thread's page is open, if anywhere.
+    pub open: OpenState,
     /// Archived threads are hidden unless the sidebar's "Show archived" toggle is on.
     pub archived: bool,
 }
@@ -210,7 +248,7 @@ pub fn group_rows(
     let query = query.trim().to_lowercase();
     let mut groups: Vec<(String, Vec<SidebarRow>)> = Vec::new();
     for row in rows.into_iter().filter(|r| {
-        (show_archived || !r.archived || r.open)
+        (show_archived || !r.archived || r.open != OpenState::Closed)
             && (query.is_empty()
                 || r.title.to_lowercase().contains(&query)
                 || r.folder.to_lowercase().contains(&query))
@@ -793,6 +831,35 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn switches_ask_for_every_busy_reason() {
+        for running in [false, true] {
+            for background in [0, 2] {
+                for approval in [false, true] {
+                    let reason = busy_reason(running, background, approval);
+                    assert_eq!(reason.is_some(), is_busy(running, background > 0, approval));
+                    if background > 0 {
+                        assert!(reason.unwrap().contains("2 background tasks will stop"));
+                    }
+                }
+            }
+        }
+        assert!(busy_reason(false, 1, false)
+            .unwrap()
+            .contains("1 background task will stop"));
+    }
+
+    #[test]
+    fn a_thread_open_elsewhere_has_its_own_state() {
+        assert_eq!(OpenState::Elsewhere.description(), "Open in another window");
+        assert_ne!(OpenState::Elsewhere, OpenState::Here);
+        assert_ne!(OpenState::Elsewhere, OpenState::Closed);
+        let mut elsewhere = row("t", "/r", 0);
+        elsewhere.open = OpenState::Elsewhere;
+        elsewhere.archived = true;
+        assert_eq!(group_rows(vec![elsewhere], "", false).len(), 1);
+    }
+
     fn model_row(id: &str, badge: Option<Badge>) -> SidebarRow {
         SidebarRow {
             key: RowKey::Thread(id.into()),
@@ -802,7 +869,7 @@ mod tests {
             driver: None,
             badge,
             background: Vec::new(),
-            open: true,
+            open: OpenState::Here,
             archived: false,
         }
     }
@@ -949,7 +1016,7 @@ mod tests {
             driver: Some(Driver::Claude),
             badge: None,
             background: Vec::new(),
-            open: false,
+            open: OpenState::Closed,
             archived: false,
         }
     }
@@ -1087,7 +1154,7 @@ mod tests {
         archived.archived = true;
         let mut open_archived = row("open", "/w/one", 6);
         open_archived.archived = true;
-        open_archived.open = true;
+        open_archived.open = OpenState::Here;
         let rows = vec![row("a", "/w/one", 10), archived, open_archived];
         let ids = |groups: Vec<(String, Vec<SidebarRow>)>| -> Vec<String> {
             groups

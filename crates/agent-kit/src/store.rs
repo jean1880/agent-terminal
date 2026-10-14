@@ -39,6 +39,11 @@ const SCHEMA_VERSION: i64 = 3;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
 /// `driver:native_id`).
 const DISMISSED_KEY: &str = "dismissed_natives";
+
+/// The recovery metadata for a thread whose first prompt has not been sent.
+pub fn pending_prompt_key(thread: &str) -> String {
+    format!("pending_prompt:{thread}")
+}
 const MAX_DISMISSED_NATIVES: usize = 500;
 
 #[derive(Debug)]
@@ -819,6 +824,7 @@ impl Store {
             .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
             .collect();
         self.add_dismissed(&natives)?;
+        self.delete_meta(&pending_prompt_key(thread))?;
         let n = self
             .conn
             .execute("DELETE FROM threads WHERE id = ?1", params![thread])?;
@@ -897,6 +903,25 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Removes an app value entirely; removing a missing key is harmless.
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// An unsent first prompt, redacted and kept only until a user message is stored.
+    pub fn set_pending_prompt(&self, thread: &str, text: &str) -> Result<()> {
+        let tx = self.write_txn()?;
+        let key = pending_prompt_key(thread);
+        if self.has_messages(thread)? {
+            self.delete_meta(&key)?;
+        } else {
+            self.set_meta(&key, &redact(text))?;
+        }
+        tx.commit()
     }
 
     pub fn rename_thread(&self, thread: &str, title: &str) -> Result<()> {
@@ -1414,6 +1439,7 @@ impl Store {
             .and_then(|tx| {
                 self.append_in_txn(thread, provider_thread, &started)?;
                 self.append_in_txn(thread, provider_thread, &snapshot)?;
+                self.delete_meta(&pending_prompt_key(thread))?;
                 tx.commit()
             });
         guard.done = result.is_ok();
@@ -1856,6 +1882,59 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().expect("open")
+    }
+
+    #[test]
+    fn metadata_is_deleted_without_leaving_an_empty_row() {
+        let s = store();
+        s.set_meta("test", "value").unwrap();
+        s.delete_meta("test").unwrap();
+        assert_eq!(s.meta("test").unwrap(), None);
+        s.delete_meta("test").unwrap();
+    }
+
+    #[test]
+    fn pending_prompt_is_removed_when_a_message_is_stored_in_either_order() {
+        let s = store();
+        let before = s.create_thread("/w", None).unwrap();
+        let after = s.create_thread("/w", None).unwrap();
+        s.set_pending_prompt(&before, "PASSWORD=private-value")
+            .unwrap();
+        assert!(!s
+            .meta(&pending_prompt_key(&before))
+            .unwrap()
+            .unwrap()
+            .contains("private-value"));
+        s.append_user_message_with_id(&before, None, "queued-item", "hello")
+            .unwrap();
+        assert_eq!(s.meta(&pending_prompt_key(&before)).unwrap(), None);
+        s.append_user_message(&after, None, "hello").unwrap();
+        s.set_pending_prompt(&after, "already sent").unwrap();
+        assert_eq!(s.meta(&pending_prompt_key(&after)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_failed_message_preserves_the_pending_prompt() {
+        let s = store();
+        let t = s.create_thread("/w", None).unwrap();
+        s.set_pending_prompt(&t, "recover me").unwrap();
+        assert!(s
+            .append_user_message(&t, Some("nonexistent-provider"), "hello")
+            .is_err());
+        assert_eq!(
+            s.meta(&pending_prompt_key(&t)).unwrap().as_deref(),
+            Some("recover me")
+        );
+        assert!(!s.has_messages(&t).unwrap());
+    }
+
+    #[test]
+    fn deleting_a_thread_removes_its_pending_prompt() {
+        let s = store();
+        let t = s.create_thread("/w", None).unwrap();
+        s.set_pending_prompt(&t, "recover me").unwrap();
+        s.delete_thread(&t).unwrap();
+        assert_eq!(s.meta(&pending_prompt_key(&t)).unwrap(), None);
     }
 
     fn delta(item: &str, text: &str) -> Envelope {

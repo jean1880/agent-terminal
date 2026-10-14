@@ -366,12 +366,15 @@ impl Closing {
 impl AgentTerminalWindow {
     /// The window is waiting for its agents to exit before it goes.
     pub(in crate::window) fn is_closing(&self) -> bool {
-        self.closing.borrow().is_some()
+        self.closing_started.get()
     }
 
     /// Waits for `targets` to exit before the window goes; see the module docs. The window takes
     /// no more input from here on.
     pub(super) fn begin_closing(&self, targets: Vec<StopTarget>) {
+        self.closing_started.set(true);
+        self.flush_agent_edits();
+        self.flush_pending_save();
         let window = self.obj();
         info!(count = targets.len(), "close: waiting for agents to exit");
         // Nothing new may start: no action (menus, shortcuts), no click, no key.
