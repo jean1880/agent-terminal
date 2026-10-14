@@ -139,6 +139,8 @@ pub struct ModelCatalog {
     forced: RefCell<Vec<Driver>>,
     /// The probe targets of the last scan, for a refresh the picker asks for.
     targets: RefCell<ProbeTargets>,
+    /// A picker requested a refresh before targets were known: true preserves a forced fetch.
+    picker_wanted: Cell<Option<bool>>,
 }
 
 thread_local! {
@@ -179,6 +181,7 @@ impl ModelCatalog {
             failed: RefCell::new(Vec::new()),
             forced: RefCell::new(Vec::new()),
             targets: RefCell::new(ProbeTargets::default()),
+            picker_wanted: Cell::new(None),
         }
     }
 
@@ -405,12 +408,29 @@ impl ModelCatalog {
     /// are due at `now` against [`MODEL_TTL`] ([`Self::is_due`]). Nothing due: nothing spawns.
     pub fn refresh_if_due(self: &Rc<Self>, targets: &ProbeTargets, now: i64) {
         *self.targets.borrow_mut() = targets.clone();
-        self.fetch_due(now, MODEL_TTL);
+        if self.picker_wanted.get().is_some() && targets.count() > 0 {
+            if self.refreshing.get() {
+                return; // keep the picker request until this fetch ends
+            }
+            let force = self.picker_wanted.take().unwrap_or(false);
+            if force {
+                self.refresh(targets);
+            } else {
+                self.fetch_due(now, MODEL_PICKER_AGE);
+            }
+        } else {
+            self.fetch_due(now, MODEL_TTL);
+        }
     }
 
     /// The picker opened: lists older than [`MODEL_PICKER_AGE`] are fetched in the background
     /// while the cached ones show. With `force` (its Refresh button) every ready list is.
     pub fn refresh_for_picker(self: &Rc<Self>, force: bool, now: i64) {
+        if self.targets.borrow().count() == 0 {
+            self.picker_wanted
+                .set(Some(force || self.picker_wanted.get().unwrap_or(false)));
+            return;
+        }
         if force {
             let targets = self.targets.borrow().clone();
             self.refresh(&targets);
@@ -448,6 +468,10 @@ impl ModelCatalog {
                 // targets it brought.
                 if me.queued.replace(false) {
                     me.fetch_due(now_epoch(), MODEL_TTL);
+                }
+                if me.picker_wanted.get().is_some() {
+                    let targets = me.targets.borrow().clone();
+                    me.refresh_if_due(&targets, now_epoch());
                 }
             })
         };
@@ -966,6 +990,80 @@ mod tests {
             assert!(mark.exists());
             assert_eq!(cat.models_of(Driver::Claude).len(), 1);
             assert!(cat.status_of(|_| true).failed);
+        });
+    }
+
+    #[test]
+    fn a_picker_opened_before_targets_refreshes_once_they_arrive() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (targets, mark) = marking_claude(dir.path());
+        in_loop(|ctx| {
+            // Already fetched this run: startup alone is due even on the old code. The list
+            // is due only by the picker's shorter age while scan targets are unavailable.
+            let now = now_epoch();
+            let cat = Rc::new(fetched_at(now - MODEL_PICKER_AGE));
+            cat.refresh_for_picker(false, now);
+            cat.refresh_if_due(&ProbeTargets::default(), now);
+            assert!(!cat.refreshing.get());
+            assert!(!mark.exists());
+            // A refresh already running must not consume a request it cannot honour yet.
+            cat.refreshing.set(true);
+            cat.refresh_if_due(&targets, now);
+            assert_eq!(cat.picker_wanted.get(), Some(false));
+            cat.refreshing.set(false);
+            cat.refresh_if_due(&targets, now);
+            assert!(
+                cat.refreshing.get(),
+                "the picker request survived the empty scan"
+            );
+            assert!(pump_until(ctx, 15, || !cat.refreshing.get()));
+            assert!(mark.exists());
+            assert_eq!(cat.picker_wanted.get(), None);
+            let starts = std::fs::read_to_string(&mark).unwrap();
+            cat.refresh_if_due(&targets, now_epoch());
+            assert!(!cat.refreshing.get());
+            pump_until(ctx, 1, || false);
+            assert_eq!(
+                std::fs::read_to_string(&mark).unwrap(),
+                starts,
+                "consumed once"
+            );
+        });
+    }
+
+    #[test]
+    fn a_forced_picker_refresh_before_targets_fetches_even_a_fresh_list_once() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (targets, mark) = marking_claude(dir.path());
+        in_loop(|ctx| {
+            let now = now_epoch();
+            let cat = Rc::new(fetched_at(now));
+            cat.refresh_for_picker(true, now);
+            // Opening again must not downgrade the pending Refresh button to an age check.
+            cat.refresh_for_picker(false, now);
+            assert_eq!(cat.picker_wanted.get(), Some(true));
+            cat.refresh_if_due(&ProbeTargets::default(), now);
+            assert!(!cat.refreshing.get());
+            assert!(!mark.exists());
+            cat.refreshing.set(true);
+            cat.refresh_if_due(&targets, now);
+            assert_eq!(cat.picker_wanted.get(), Some(true));
+            cat.refreshing.set(false);
+            cat.refresh_if_due(&targets, now);
+            assert!(cat.refreshing.get(), "forced even though the list is fresh");
+            assert_eq!(cat.picker_wanted.get(), None);
+            assert!(pump_until(ctx, 15, || !cat.refreshing.get()));
+            let starts = std::fs::read_to_string(&mark).unwrap();
+            cat.refresh_if_due(&targets, now_epoch());
+            assert!(!cat.refreshing.get());
+            pump_until(ctx, 1, || false);
+            assert_eq!(
+                std::fs::read_to_string(&mark).unwrap(),
+                starts,
+                "consumed once"
+            );
         });
     }
 }
