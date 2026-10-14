@@ -363,6 +363,9 @@ fn hookless_text(unbound: Option<&str>) -> String {
              yet. {STILL} Once the check has run, switch to Antigravity again (or open a new \
              thread) to have it ask first."
         ),
+        Some(reason) if crate::hook_config::verification_refused(reason) => {
+            format!("Antigravity cannot ask you before acting in this thread: {reason}. {STILL}")
+        }
         Some(reason) => format!(
             "Antigravity cannot ask you before acting in this thread: its approval hook is \
              installed, but {reason}. {STILL}"
@@ -583,6 +586,11 @@ impl ChatSession {
     /// Lets `switch` build an adapter for the other driver (needed for `CreateWithHandoff`).
     pub fn set_adapter_factory(&self, factory: AdapterFactory) {
         *self.inner.factory.borrow_mut() = Some(factory);
+    }
+
+    /// The current launch environment, including any cross-agent switch since the thread opened.
+    pub(crate) fn launch_environment(&self) -> LaunchEnv {
+        self.inner.launch_env.borrow().clone()
     }
 
     /// Seeds a new thread with a budgeted, redacted handoff (fork, compact-by-handoff): it
@@ -4815,6 +4823,28 @@ mod tests {
     }
 
     #[test]
+    fn the_launch_environment_tracks_a_cross_agent_switch() {
+        in_loop(|_| {
+            let log: Log = Rc::default();
+            let (session, _) = claude_on(Mode::Plan, &log);
+            assert_eq!(session.launch_environment(), LaunchEnv::default());
+            let agy_env = LaunchEnv {
+                env: vec![("HOME".into(), "/agy/profile".into())],
+                unset: vec![],
+            };
+            let expected = agy_env.clone();
+            session.set_adapter_factory(Rc::new(move |driver| {
+                let mut launch = launch_of(FakeAdapter::boxed(driver, &log))?;
+                launch.env = agy_env.clone();
+                Ok(launch)
+            }));
+            session.switch(Driver::Agy, None, None);
+            assert_eq!(session.status().driver, Driver::Agy);
+            assert_eq!(session.launch_environment(), expected);
+        });
+    }
+
+    #[test]
     fn hookless_agy_keeps_accept_edits_and_turns_ask_into_plan_until_you_leave_it() {
         in_loop(|_| {
             // Accept edits is a real agy flag: it carries over.
@@ -5177,6 +5207,19 @@ mod tests {
         assert!(unchecked.contains("not been checked yet"), "{unchecked}");
         assert!(!unchecked.contains("not installed"), "{unchecked}");
         assert!(hookless_text(None).contains("not installed"));
+    }
+
+    #[test]
+    fn a_refused_hook_proof_says_why_without_claiming_it_is_installed() {
+        for reason in [
+            "cannot verify agy's approval hook: ANTIGRAVITY_APP_DATA_DIR is set and may redirect its configuration",
+            crate::hook_config::DIFFERENT_HOME,
+        ] {
+            let text = hookless_text(Some(reason));
+            assert!(text.contains(reason), "{text}");
+            assert!(!text.contains("installed"), "{text}");
+            assert!(text.contains("applies file edits"), "{text}");
+        }
     }
 
     /// An agy thread with one user message and a known native session, a sink, and logs of what

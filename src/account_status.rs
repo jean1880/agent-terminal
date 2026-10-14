@@ -89,13 +89,13 @@ pub fn merge(
 }
 
 /// `~/.gemini/google_accounts.json`, from the value of `HOME`.
-pub fn google_accounts_path(home: Option<&str>) -> Option<PathBuf> {
-    let home = home.filter(|h| std::path::Path::new(h).is_absolute())?;
-    Some(
-        PathBuf::from(home)
-            .join(".gemini")
-            .join("google_accounts.json"),
-    )
+pub fn google_accounts_path(home: Option<PathBuf>) -> Option<PathBuf> {
+    let home = home.filter(|h| h.is_absolute())?;
+    Some(home.join(".gemini/google_accounts.json"))
+}
+
+fn agy_accounts_path(env: &crate::agent_proc::AgentEnv) -> Option<PathBuf> {
+    google_accounts_path(crate::agent_home::effective_home(env))
 }
 
 /// The app-wide account and usage of each agent.
@@ -420,18 +420,17 @@ impl AccountStatus {
                         me.set_signed_out(Driver::Agy, false);
                         // A few hundred bytes of JSON, read off the main thread like all file I/O
                         // here.
-                        let account =
-                            match google_accounts_path(std::env::var("HOME").ok().as_deref()) {
-                                Some(path) => {
-                                    gio::spawn_blocking(move || std::fs::read_to_string(path))
-                                        .await
-                                        .ok()
-                                        .and_then(Result::ok)
-                                        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                                        .and_then(|v| agy_account(&v))
-                                }
-                                None => None,
-                            };
+                        let account = match agy_accounts_path(&target.env) {
+                            Some(path) => {
+                                gio::spawn_blocking(move || std::fs::read_to_string(path))
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok)
+                                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                                    .and_then(|v| agy_account(&v))
+                            }
+                            None => None,
+                        };
                         me.update(Driver::Agy, account, windows);
                         me.mark_tried(Driver::Agy, now_epoch());
                         done();
@@ -698,10 +697,36 @@ mod tests {
     #[test]
     fn accounts_file_lives_under_the_home() {
         assert_eq!(
-            google_accounts_path(Some("/home/u")),
+            google_accounts_path(Some("/home/u".into())),
             Some(PathBuf::from("/home/u/.gemini/google_accounts.json"))
         );
-        assert_eq!(google_accounts_path(Some("rel")), None);
+        assert_eq!(google_accounts_path(Some("rel".into())), None);
         assert_eq!(google_accounts_path(None), None);
+    }
+
+    #[test]
+    fn agy_account_is_read_from_the_profile_home() {
+        let profile = tempfile::tempdir().expect("profile home");
+        let path = profile.path().join(".gemini/google_accounts.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let json = serde_json::json!({"active": "profile@example.test"});
+        std::fs::write(&path, json.to_string()).expect("account");
+        let env = crate::agent_proc::AgentEnv {
+            env: vec![("HOME".into(), profile.path().to_string_lossy().into_owned())],
+            unset: vec!["HOME".into()],
+        };
+        let found = agy_accounts_path(&env).expect("path");
+        assert_eq!(found, path, "never read the app's account file");
+        let value = serde_json::from_str::<Value>(&std::fs::read_to_string(found).expect("read"))
+            .expect("json");
+        let account = agy_account(&value).expect("account");
+        assert_eq!(account.label, "profile@example.test");
+        assert_eq!(
+            agy_accounts_path(&crate::agent_proc::AgentEnv {
+                env: vec![],
+                unset: vec!["HOME".into()],
+            }),
+            None
+        );
     }
 }
