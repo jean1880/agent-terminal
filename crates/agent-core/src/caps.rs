@@ -8,6 +8,9 @@ pub struct Capabilities {
     /// `SetModel` applies to the next turn without a restart (Claude `set_model`, Codex
     /// `turn/start`). False (agy) means the session restarts and resumes with the new model.
     pub model_switch_in_session: bool,
+    /// Changing mode needs a process restart (agy); the hook can enforce it before that.
+    #[serde(default)]
+    pub mode_change_restarts: bool,
     /// Approvals can be answered live (Claude control protocol; agy via the approval hook).
     pub live_approvals: bool,
     /// Interrupt keeps the process (Claude); false means the process exits (agy SIGINT).
@@ -59,6 +62,7 @@ impl Capabilities {
     pub fn claude() -> Self {
         Self {
             model_switch_in_session: true,
+            mode_change_restarts: false,
             live_approvals: true,
             interrupt_keeps_process: true,
             file_suggestions: true,
@@ -85,6 +89,7 @@ impl Capabilities {
     pub fn agy() -> Self {
         Self {
             model_switch_in_session: false,
+            mode_change_restarts: true,
             live_approvals: true,
             interrupt_keeps_process: false,
             file_suggestions: false,
@@ -116,6 +121,7 @@ impl Capabilities {
         Self {
             // `turn/start` takes `model` and applies it to that turn and later ones.
             model_switch_in_session: true,
+            mode_change_restarts: false,
             // Approvals are server requests answered over the live connection.
             live_approvals: true,
             // `turn/interrupt` ends the turn, not the `app-server` process.
@@ -156,6 +162,7 @@ impl Capabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
     ModelSwitch,
+    ModeChangeRestarts,
     LiveApprovals,
     InterruptKeepsProcess,
     FileSuggestions,
@@ -175,8 +182,9 @@ pub enum Feature {
 }
 
 impl Feature {
-    pub const ALL: [Feature; 17] = [
+    pub const ALL: [Feature; 18] = [
         Feature::ModelSwitch,
+        Feature::ModeChangeRestarts,
         Feature::LiveApprovals,
         Feature::InterruptKeepsProcess,
         Feature::FileSuggestions,
@@ -200,6 +208,9 @@ impl Feature {
     pub fn surface(self) -> &'static str {
         match self {
             Feature::ModelSwitch => "model picker: applies at once, or restarts and resumes",
+            Feature::ModeChangeRestarts => {
+                "mode picker: restart after the turn, or confirm without a hook"
+            }
             Feature::LiveApprovals => "approval cards (Ask mode)",
             Feature::InterruptKeepsProcess => "stop button tooltip",
             Feature::FileSuggestions => {
@@ -227,6 +238,7 @@ impl Capabilities {
     pub fn supports(&self, feature: Feature) -> bool {
         match feature {
             Feature::ModelSwitch => self.model_switch_in_session,
+            Feature::ModeChangeRestarts => self.mode_change_restarts,
             Feature::LiveApprovals => self.live_approvals,
             Feature::InterruptKeepsProcess => self.interrupt_keeps_process,
             Feature::FileSuggestions => self.file_suggestions,
@@ -256,6 +268,7 @@ impl Capabilities {
             Feature::ModelSwitch => {
                 format!("{agent} restarts to switch models; the conversation resumes.")
             }
+            Feature::ModeChangeRestarts => format!("{agent} changes mode without restarting."),
             Feature::LiveApprovals => format!("{agent} cannot ask before acting."),
             Feature::InterruptKeepsProcess => {
                 format!("Stopping ends {agent}'s process; the next message restarts it.")
@@ -299,6 +312,7 @@ mod tests {
     fn every_field_has_a_feature() {
         let Capabilities {
             model_switch_in_session: _,
+            mode_change_restarts: _,
             live_approvals: _,
             interrupt_keeps_process: _,
             file_suggestions: _,
@@ -327,7 +341,8 @@ mod tests {
         use Feature::*;
         fn next(f: Feature) -> Option<Feature> {
             match f {
-                ModelSwitch => Some(LiveApprovals),
+                ModelSwitch => Some(ModeChangeRestarts),
+                ModeChangeRestarts => Some(LiveApprovals),
                 LiveApprovals => Some(InterruptKeepsProcess),
                 InterruptKeepsProcess => Some(FileSuggestions),
                 FileSuggestions => Some(McpPanel),
@@ -377,6 +392,12 @@ mod tests {
 
     #[test]
     fn the_matrix_matches_what_each_agent_does() {
+        for driver in Driver::ALL {
+            assert_eq!(
+                Capabilities::of(driver).mode_change_restarts,
+                driver == Driver::Agy
+            );
+        }
         let agy = Capabilities::agy();
         // Reasoning arrives as one whole block per step (from its transcript), not token by token.
         assert!(agy.supports(Feature::StreamsReasoning));

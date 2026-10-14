@@ -465,12 +465,30 @@ type Sink = Rc<dyn Fn(Envelope)>;
 
 struct Pending {
     conn: gio::SocketConnection,
+    /// Kept so a stricter mode can refuse a call already waiting for the user's answer.
+    query: ApprovalQuery,
     /// The call in canonical terms, when a rule can describe it.
     action: Option<crate::always_allow::Action>,
     cwd: Option<String>,
     /// The folder the card offered for "Allow for session" ([`crate::always_allow::session_folder`]
     /// when it was built): the answer keeps a folder only if it is still this one.
     shown_folder: Option<PathBuf>,
+}
+
+fn pending_denials<'a>(
+    mode: Mode,
+    queries: impl Iterator<Item = &'a ApprovalQuery>,
+    workspaces: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<(String, &'static str)> {
+    queries
+        .filter_map(
+            |query| match policy_with_home(mode, query, workspaces, home) {
+                Verdict::Deny(why) => Some((query.id.clone(), why)),
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// One thread's session rules, shared by its chat session (which clears them on a cross-agent
@@ -702,6 +720,29 @@ impl ApprovalHandle {
     /// The session's current mode (it changes what is asked).
     pub fn set_mode(&self, mode: Mode) {
         self.inner.mode.set(mode);
+        // Remove forbidden queries before delivering any events: the sink can answer or
+        // change mode synchronously. Surviving queries keep the choices the policy permits.
+        let denied: Vec<_> = {
+            let mut pending = self.inner.pending.borrow_mut();
+            let ids = pending_denials(
+                mode,
+                pending.values().map(|p| &p.query),
+                &self.inner.workspaces,
+                self.inner.home.as_deref(),
+            );
+            ids.into_iter()
+                .filter_map(|(id, why)| pending.remove(&id).map(|p| (id, p, why)))
+                .collect()
+        };
+        for (id, pending, why) in denied {
+            deny(pending.conn, why);
+            self.inner.emit(
+                Envelope::new(Event::ApprovalResolved {
+                    decision: Decision::Deny,
+                })
+                .request(id),
+            );
+        }
     }
 
     /// Uses up one recorded hook query for any of `tools`. The session calls this when a tool
@@ -759,6 +800,21 @@ impl ApprovalHandle {
         let Some(pending) = self.inner.pending.borrow_mut().remove(request) else {
             return false;
         };
+        if let Verdict::Deny(why) = policy_with_home(
+            self.inner.mode.get(),
+            &pending.query,
+            &self.inner.workspaces,
+            self.inner.home.as_deref(),
+        ) {
+            deny(pending.conn, why);
+            self.inner.emit(
+                Envelope::new(Event::ApprovalResolved {
+                    decision: Decision::Deny,
+                })
+                .request(request),
+            );
+            return false;
+        }
         let remember_decision = decision;
         let mut decision = decision;
         let keeps_rule = matches!(decision, Decision::AllowForSession | Decision::AllowAlways);
@@ -1185,6 +1241,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         id.clone(),
         Pending {
             conn: conn.clone(),
+            query: query.clone(),
             action,
             cwd: query.cwd.clone(),
             shown_folder,
@@ -2001,6 +2058,159 @@ mod tests {
         }));
         let line = got.borrow().clone().expect("reply");
         approval::parse_reply(&line).expect("reply json")
+    }
+
+    #[test]
+    fn a_stricter_mode_selects_pending_mutations_for_denial() {
+        let queries = [
+            with_id(edit("write_to_file", "/outside/file.rs"), "edit"),
+            with_id(cmd("touch file.rs"), "command"),
+            with_id(
+                q(
+                    "view_file",
+                    serde_json::json!({"AbsolutePath": "/outside/file.rs"}),
+                ),
+                "read",
+            ),
+            with_id(
+                q("search_web", serde_json::json!({"query": "Rust"})),
+                "network-read",
+            ),
+            with_id(q("unknown_tool", serde_json::json!({})), "unknown"),
+        ];
+        let mut denied = pending_denials(Mode::Plan, queries.iter(), &[], None);
+        denied.sort_unstable();
+        assert_eq!(
+            denied,
+            [
+                ("command".to_owned(), "plan mode is read-only"),
+                ("edit".to_owned(), "plan mode is read-only"),
+            ]
+        );
+        for mode in [Mode::Ask, Mode::AcceptEdits, Mode::Bypass] {
+            assert!(pending_denials(mode, queries.iter(), &[], None).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_stricter_mode_denies_pending_mutations_and_keeps_reads_interactive() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let requests = [
+                with_id(
+                    edit("write_to_file", &tmp.path().join("a.rs").to_string_lossy()),
+                    "edit",
+                ),
+                with_id(cmd("touch a.rs"), "command"),
+                with_id(
+                    q(
+                        "view_file",
+                        serde_json::json!({"AbsolutePath": "/outside/file.rs"}),
+                    ),
+                    "read",
+                ),
+                with_id(
+                    q("search_web", serde_json::json!({"query": "Rust"})),
+                    "network-read",
+                ),
+                with_id(q("unknown_tool", serde_json::json!({})), "unknown"),
+            ];
+            let replies = requests
+                .iter()
+                .map(|q| client(handle.socket_path().to_owned(), q.clone()))
+                .collect::<Vec<_>>();
+            assert!(pump_until(ctx, 10, || seen.borrow().len() == requests.len()));
+            handle.set_mode(Mode::Plan);
+            for (query, rx) in requests[..2].iter().zip(&replies[..2]) {
+                assert_eq!(wait_reply(ctx, rx).decision, Decision::Deny);
+                for decision in [
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::AllowAlways,
+                ] {
+                    assert!(
+                        !handle.respond(&query.id, decision),
+                        "a stale button grants nothing"
+                    );
+                }
+                assert!(!handle.inner.pending.borrow().contains_key(&query.id));
+                assert_eq!(
+                    seen.borrow()
+                        .iter()
+                        .filter(|e| e.request.as_deref() == Some(&query.id)
+                            && e.event
+                                == Event::ApprovalResolved {
+                                    decision: Decision::Deny
+                                })
+                        .count(),
+                    1
+                );
+            }
+            assert!(handle
+                .inner
+                .session_rules
+                .borrow()
+                .borrow()
+                .rules
+                .is_empty());
+            for (query, rx) in requests[2..].iter().zip(&replies[2..]) {
+                assert!(handle.inner.pending.borrow().contains_key(&query.id));
+                assert!(handle.respond(&query.id, Decision::Allow));
+                assert_eq!(wait_reply(ctx, rx).decision, Decision::Allow);
+            }
+        });
+    }
+
+    #[test]
+    fn an_answer_rechecks_plan_before_remembering_a_stale_allow() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let rules = tmp.path().join("always-allow.json");
+            handle.use_always_rules(rules.clone());
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("cargo test"), "command"),
+            );
+            assert!(pump_until(ctx, 10, || !seen.borrow().is_empty()));
+            // Simulate a pending query missed by the change-time sweep: the answer still denies.
+            handle.inner.mode.set(Mode::Plan);
+            assert!(!handle.respond("command", Decision::AllowAlways));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
+            assert!(handle
+                .inner
+                .session_rules
+                .borrow()
+                .borrow()
+                .rules
+                .is_empty());
+            assert!(!rules.exists());
+        });
+    }
+
+    #[test]
+    fn switching_from_accept_edits_to_ask_keeps_permitted_pending_choices() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::AcceptEdits, DEFAULT_DEADLINE);
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(edit("write_to_file", "/outside/file.rs"), "edit"),
+            );
+            assert!(pump_until(ctx, 10, || !seen.borrow().is_empty()));
+            let options = |e: &Envelope| match &e.event {
+                Event::ApprovalRequested { options, .. } => options.clone(),
+                _ => Vec::new(),
+            };
+            let before = options(&seen.borrow()[0]);
+            handle.set_mode(Mode::Ask);
+            assert_eq!(seen.borrow().len(), 1);
+            assert_eq!(options(&seen.borrow()[0]), before);
+            assert!(handle.inner.pending.borrow().contains_key("edit"));
+            assert!(handle.respond("edit", Decision::Allow));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+        });
     }
 
     fn request_id(seen: &Seen) -> Option<String> {

@@ -90,6 +90,14 @@ type ActionHandler = Rc<dyn Fn(&ViewAction)>;
 
 const STYLE: &str = include_str!("view/style.css");
 
+fn mode_change_asks_first(status: &SessionStatus, mode: Mode) -> bool {
+    status.running_turn
+        && status.capabilities.mode_change_restarts
+        && !status.capabilities.live_approvals
+        && mode != status.mode
+        && matches!(mode, Mode::Plan | Mode::AcceptEdits)
+}
+
 thread_local! {
     static STYLE_LOADED: Cell<bool> = const { Cell::new(false) };
 }
@@ -1026,11 +1034,7 @@ impl Inner {
                 inner.confirm_bypass();
                 return;
             }
-            if inner.set_mode(mode) {
-                // Only a pick made in the header, never a mode the agent reported.
-                let driver = inner.backend.status().driver;
-                inner.emit(ViewAction::ModeChosen { driver, mode });
-            }
+            inner.set_mode(mode, true);
         });
     }
 
@@ -1041,14 +1045,15 @@ impl Inner {
         let weak = Rc::downgrade(self);
         panels::confirm_bypass(&self.header.mode, self.backend.status().driver, move || {
             if let Some(inner) = weak.upgrade() {
-                inner.set_mode(Mode::Bypass);
+                inner.set_mode(Mode::Bypass, false);
             }
         });
     }
 
     /// Asks the backend for `mode`; false when the agent has no such mode (nothing was asked).
-    fn set_mode(self: &Rc<Self>, mode: Mode) -> bool {
-        let caps = self.backend.status().capabilities;
+    fn set_mode(self: &Rc<Self>, mode: Mode, header_pick: bool) -> bool {
+        let status = self.backend.status();
+        let caps = &status.capabilities;
         if mode == Mode::Plan && !caps.plan_mode {
             let changes = self
                 .model
@@ -1069,8 +1074,28 @@ impl Inner {
                 return false;
             }
         }
-        self.backend.set_mode(mode);
+        if mode_change_asks_first(&status, mode) {
+            self.refresh_status();
+            let weak = Rc::downgrade(self);
+            header::confirm_mode_switch(&self.header.mode, move || {
+                let Some(inner) = weak.upgrade() else { return };
+                // A dialog can outlive an agent switch. Never apply its choice to another agent.
+                if inner.backend.status().driver == status.driver {
+                    inner.apply_mode_choice(mode, header_pick);
+                }
+            });
+            return false;
+        }
+        self.apply_mode_choice(mode, header_pick);
         true
+    }
+
+    fn apply_mode_choice(&self, mode: Mode, header_pick: bool) {
+        self.backend.set_mode(mode);
+        if header_pick {
+            let driver = self.backend.status().driver;
+            self.emit(ViewAction::ModeChosen { driver, mode });
+        }
     }
 
     /// Takes the quick-reply chips away and hands focus back to the composer.
@@ -1238,7 +1263,7 @@ impl Inner {
             BuiltinAction::SetMode => match typeahead::parse_mode(args) {
                 Some(Mode::Bypass) => self.confirm_bypass(),
                 Some(mode) => {
-                    self.set_mode(mode);
+                    self.set_mode(mode, false);
                 }
                 None => {
                     // No (or an unknown) argument: open the dropdown instead of guessing.
@@ -1576,6 +1601,58 @@ pub(crate) mod tests {
             capabilities: agent_core::caps::Capabilities::of(driver),
             commands: Vec::new(),
         }
+    }
+
+    #[test]
+    fn hookless_agy_mode_change_asks_first() {
+        for driver in Driver::ALL {
+            let mut status = status_of(driver);
+            status.mode = Mode::Plan;
+            for running in [false, true] {
+                status.running_turn = running;
+                for hooked in [false, true] {
+                    status.capabilities.live_approvals = hooked;
+                    assert_eq!(
+                        mode_change_asks_first(&status, Mode::AcceptEdits),
+                        driver == Driver::Agy && running && !hooked
+                    );
+                    for unavailable_or_same in [Mode::Plan, Mode::Ask, Mode::Bypass] {
+                        assert!(!mode_change_asks_first(&status, unavailable_or_same));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn hookless_agy_mode_confirmation_cancel_changes_nothing() {
+        use adw::prelude::AdwWindowExt;
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        let backend = AnswerLog::new(Driver::Agy);
+        {
+            let mut status = backend.status.borrow_mut();
+            status.mode = Mode::Plan;
+            status.running_turn = true;
+            status.capabilities.live_approvals = false;
+        }
+        let view = ChatView::new(backend.clone());
+        let window = adw::Window::new();
+        window.set_content(Some(&view));
+        window.present();
+        let inner = view.imp().inner.borrow().clone().expect("inner");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let log = actions.clone();
+        view.connect_action(move |action| log.borrow_mut().push(action.clone()));
+        assert!(!inner.set_mode(Mode::AcceptEdits, true));
+        let dialog = window.visible_dialog().expect("confirmation");
+        dialog.emit_by_name::<()>("response", &[&"cancel"]);
+        assert_eq!(backend.status().mode, Mode::Plan);
+        assert!(backend.status().running_turn);
+        assert!(backend.modes.borrow().is_empty());
+        assert!(actions.borrow().is_empty());
+        window.close();
     }
 
     /// Every custom-drawn button class has a keyboard focus ring in the stylesheet.
@@ -2233,6 +2310,7 @@ pub(crate) mod tests {
     /// A backend that remembers how the user answered an approval or a form.
     pub(super) struct AnswerLog {
         pub(super) status: RefCell<SessionStatus>,
+        modes: RefCell<Vec<Mode>>,
         pub(super) approvals: RefCell<Vec<(String, Decision)>>,
         /// Answer `false` to `respond_form`, as an adapter that refused it does.
         pub(super) refuse: Cell<bool>,
@@ -2249,6 +2327,7 @@ pub(crate) mod tests {
         pub(super) fn new(driver: Driver) -> Rc<Self> {
             Rc::new(Self {
                 status: RefCell::new(status_of(driver)),
+                modes: RefCell::default(),
                 approvals: RefCell::default(),
                 refuse: Cell::new(false),
                 forms: RefCell::default(),
@@ -2278,7 +2357,9 @@ pub(crate) mod tests {
         }
         fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
         fn reload_session(&self) {}
-        fn set_mode(&self, _: Mode) {}
+        fn set_mode(&self, mode: Mode) {
+            self.modes.borrow_mut().push(mode);
+        }
         fn control(&self, _: Control) -> String {
             String::new()
         }

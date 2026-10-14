@@ -62,6 +62,10 @@ impl Fixture {
     }
 
     fn session(&self) -> Rc<ChatSession> {
+        self.session_observing(Rc::new(|_| {}))
+    }
+
+    fn session_observing(&self, observe: EnvelopeSink) -> Rc<ChatSession> {
         let model = self.model.clone();
         let seen = self.seen.clone();
         ChatSession::with_env(
@@ -72,6 +76,7 @@ impl Fixture {
             Rc::new(move |env| {
                 model.borrow_mut().apply(env, Driver::Codex);
                 seen.borrow_mut().push(env.clone());
+                observe(env);
             }),
             Err(None),
             minimal_env(self.dir.path()),
@@ -962,6 +967,335 @@ fn scripted_a_sensitive_permission_request_never_offers_or_sends_a_session_grant
                     }));
             assert_eq!(notices(&fixture.seen, "extra access"), 0);
             fixture.no_rules(&session);
+            session.shutdown(false);
+        }
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_grants_codex_permissions_as_shown() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        let outside = tempfile::tempdir().expect("resolved target");
+        std::os::unix::fs::symlink(outside.path(), fixture.dir.path().join("build")).expect("link");
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]},"network":{"enabled":true}}"#,
+        );
+        fixture.wait_finished(ctx);
+        let (request, options, input) = fixture.wait_card(ctx);
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        assert!(options.contains(&Decision::Allow));
+        assert_eq!(input["entries"][0]["target"]["resolved"], json!(real));
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {
+                "fileSystem": {"write": [real]}, "network": {"enabled": true}
+            }})]
+        );
+        assert!(fixture
+            .seen
+            .borrow()
+            .iter()
+            .any(|e| e.request.as_deref() == Some(&request)
+                && e.event
+                    == Event::ApprovalResolved {
+                        decision: Decision::Allow
+                    }));
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_never_persists_a_permission_grant() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        *session.inner.saved_rules.borrow_mut() = Some(crate::always_allow::StoreCache::new(
+            fixture.dir.path().join(crate::always_allow::FILE_NAME),
+        ));
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results()[0]["scope"], "turn");
+        fixture.no_rules(&session);
+        assert!(session.inner.codex_grants.borrow().is_empty());
+        assert!(session.inner.codex_grant_paths.borrow().is_empty());
+        assert!(
+            session.inner.codex_turn_grant_paths.borrow().is_empty(),
+            "turn ended"
+        );
+        assert_eq!(notices(&fixture.seen, "extra access"), 0);
+        assert!(!fixture
+            .dir
+            .path()
+            .join(crate::always_allow::FILE_NAME)
+            .exists());
+        let events = session
+            .inner
+            .store
+            .reader()
+            .events(&fixture.thread, None, 10_000)
+            .expect("events");
+        assert!(!events.iter().any(|(_, e)| matches!(
+            e.event,
+            Event::ApprovalResolved {
+                decision: Decision::AllowAlways | Decision::AllowForSession
+            }
+        )));
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_permission_recheck_honours_a_later_mode() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(&session, r#"permissions:{"network":{"enabled":true}}"#);
+        let (request, _, _) = fixture.wait_card(ctx);
+        assert!(session.inner.codex_permissions.borrow()[&request].checking);
+        // A real ModeChanged settles the effective policy; Codex's SetMode alone defers it.
+        session
+            .inner
+            .emit(Envelope::new(Event::ModeChanged { mode: Mode::Plan }));
+        settle(ctx);
+        assert!(
+            fixture.results().is_empty(),
+            "Bypass ended before the recheck finished"
+        );
+        assert!(!session.inner.codex_permissions.borrow()[&request].checking);
+        session.respond_approval(&request, Decision::Deny);
+        fixture.wait_finished(ctx);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_permission_request_asks_after_bypass_is_left_mid_turn() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let slot: Rc<RefCell<std::rc::Weak<ChatSession>>> = Rc::default();
+        let callback = slot.clone();
+        let session = fixture.session_observing(Rc::new(move |env| {
+            if matches!(env.event, Event::TurnStarted { .. }) {
+                callback
+                    .borrow()
+                    .upgrade()
+                    .expect("session")
+                    .set_mode(Mode::Ask);
+            }
+        }));
+        *slot.borrow_mut() = Rc::downgrade(&session);
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(&session, r#"permissions:{"network":{"enabled":true}}"#);
+        let (request, options, _) = fixture.wait_card(ctx);
+        assert_eq!(
+            session.status().mode,
+            Mode::Bypass,
+            "Codex retains this turn's mode"
+        );
+        assert_eq!(session.inner.wanted_mode.get(), Mode::Ask);
+        assert_eq!(fixture.model.borrow().pending_mode, Some(Mode::Ask));
+        settle(ctx);
+        assert!(
+            fixture.results().is_empty(),
+            "the new request needs an answer"
+        );
+        assert!(!session.inner.codex_permissions.borrow()[&request].checking);
+        assert!(options.contains(&Decision::Allow));
+        session.respond_approval(&request, Decision::Allow);
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {
+                "network": {"enabled": true}
+            }})]
+        );
+        fixture.no_rules(&session);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_permission_recheck_stops_when_ask_is_chosen_mid_turn() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(&session, r#"permissions:{"network":{"enabled":true}}"#);
+        let (request, _, _) = fixture.wait_card(ctx);
+        assert!(session.inner.codex_permissions.borrow()[&request].checking);
+        session.set_mode(Mode::Ask);
+        assert_eq!(session.status().mode, Mode::Bypass);
+        assert_eq!(session.inner.wanted_mode.get(), Mode::Ask);
+        assert_eq!(fixture.model.borrow().pending_mode, Some(Mode::Ask));
+        settle(ctx);
+        assert!(
+            fixture.results().is_empty(),
+            "Ask was selected before the recheck finished"
+        );
+        assert!(!session.inner.codex_permissions.borrow()[&request].checking);
+        session.respond_approval(&request, Decision::Deny);
+        fixture.wait_finished(ctx);
+        assert_eq!(fixture.results(), [json!({"permissions": {}})]);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_permission_rechecks_stop_after_three_rounds() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let outside = tempfile::tempdir().expect("outside");
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        let targets = (0..4)
+            .map(|n| real.join(format!("target-{n}")))
+            .collect::<Vec<_>>();
+        for target in &targets {
+            std::fs::create_dir(target).expect("target");
+        }
+        let link = fixture.dir.path().join("build");
+        let changes = targets.clone();
+        let count = Cell::new(0);
+        let session = fixture.session_observing(Rc::new(move |env| {
+            if matches!(&env.event, Event::ApprovalRequested { tool, .. }
+                if tool == agent_core::codex::PERMISSIONS_TOOL)
+            {
+                let round = count.get();
+                count.set(round + 1);
+                if let Some(target) = changes.get(round) {
+                    if round > 0 {
+                        std::fs::remove_file(&link).expect("unlink");
+                    }
+                    std::os::unix::fs::symlink(target, &link).expect("change the target");
+                }
+            }
+        }));
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        fixture.wait(ctx, "three automatic checks", || {
+            permission_cards(&fixture) >= 4
+        });
+        settle(ctx);
+        assert_eq!(permission_cards(&fixture), 4, "automatic checking stopped");
+        assert!(fixture.results().is_empty());
+        let (request, options, _) = fixture.wait_card(ctx);
+        assert!(options.contains(&Decision::Allow));
+        assert_eq!(session.inner.codex_permissions.borrow()[&request].round, 3);
+        assert!(!session.inner.codex_permissions.borrow()[&request].checking);
+        // Re-entering Bypass must not reset the request's automatic-check budget.
+        session.set_mode(Mode::Ask);
+        session.set_mode(Mode::Bypass);
+        session.inner.auto_codex_permissions(&request);
+        settle(ctx);
+        assert!(fixture.results().is_empty());
+        assert_eq!(permission_cards(&fixture), 4);
+        session.respond_approval(&request, Decision::Allow);
+        fixture.wait(
+            ctx,
+            "the manual recheck shows the last changed target",
+            || permission_cards(&fixture) == 5,
+        );
+        let (again, _, _) = fixture.wait_card(ctx);
+        session.respond_approval(&again, Decision::Allow);
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {
+                "fileSystem": {"write": [targets[3]]}
+            }})]
+        );
+        fixture.no_rules(&session);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_rechecks_a_target_changed_after_the_card() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let outside = tempfile::tempdir().expect("outside");
+        let real = std::fs::canonicalize(outside.path()).expect("real");
+        let target = real.clone();
+        let link = fixture.dir.path().join("build");
+        let swapped = Cell::new(false);
+        let session = fixture.session_observing(Rc::new(move |env| {
+            if matches!(&env.event, Event::ApprovalRequested { tool, .. }
+                if tool == agent_core::codex::PERMISSIONS_TOOL)
+                && !swapped.replace(true)
+            {
+                std::os::unix::fs::symlink(&target, &link).expect("swap after showing the card");
+            }
+        }));
+        session.set_mode(Mode::Bypass);
+        fixture.prompt(
+            &session,
+            r#"permissions:{"fileSystem":{"write":["build"]}}"#,
+        );
+        fixture.wait_finished(ctx);
+        assert_eq!(
+            permission_cards(&fixture),
+            2,
+            "the changed target was shown again"
+        );
+        let (_, _, input) = fixture.wait_card(ctx);
+        assert_eq!(input["entries"][0]["target"]["resolved"], json!(real));
+        assert_eq!(
+            fixture.results(),
+            [json!({"scope": "turn", "permissions": {
+                "fileSystem": {"write": [real]}
+            }})]
+        );
+        fixture.no_rules(&session);
+        session.shutdown(false);
+    });
+}
+
+#[test]
+fn dangerous_permissive_mode_checks_sensitive_and_unrenderable_permissions() {
+    in_loop(|ctx| {
+        for permissions in [
+            json!({"fileSystem": {"write": [".git/hooks"]}}),
+            json!({"fileSystem": {"entries": [{"access": "write",
+                "path": {"type": "special", "value": {"kind": "root"}}}]}}),
+        ] {
+            let fixture = Fixture::new();
+            let session = fixture.session();
+            session.set_mode(Mode::Bypass);
+            fixture.prompt(&session, &format!("permissions:{permissions}"));
+            fixture.wait_finished(ctx);
+            let (_, options, input) = fixture.wait_card(ctx);
+            assert!(!options.contains(&Decision::AllowForSession));
+            assert_eq!(input["session_allowed"], false);
+            assert_eq!(fixture.results()[0]["scope"], "turn");
+            fixture.no_rules(&session);
+            session.shutdown(false);
+        }
+        for permissions in [
+            json!({"unknown": true}),
+            json!({"fileSystem": {"write": ["/secret/password=super-sensitive-value/file"]}}),
+        ] {
+            let fixture = Fixture::new();
+            let session = fixture.session();
+            session.set_mode(Mode::Bypass);
+            fixture.prompt(&session, &format!("permissions:{permissions}"));
+            let (request, options, _) = fixture.wait_card(ctx);
+            settle(ctx);
+            assert!(!options.contains(&Decision::Allow));
+            assert!(fixture.results().is_empty());
+            session.respond_approval(&request, Decision::Deny);
+            fixture.wait_finished(ctx);
+            assert_eq!(fixture.results(), [json!({"permissions": {}})]);
             session.shutdown(false);
         }
     });
