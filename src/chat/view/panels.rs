@@ -24,6 +24,7 @@ type Reply = Box<dyn FnOnce(Result<Value, String>)>;
 #[derive(Default)]
 pub struct Requests {
     pending: RefCell<HashMap<String, Reply>>,
+    timeouts: RefCell<HashMap<String, glib::JoinHandle<()>>>,
     /// Replies that arrived before their callback was registered (a backend answering
     /// synchronously from inside `control`).
     early: RefCell<HashMap<String, Result<Value, String>>>,
@@ -31,7 +32,7 @@ pub struct Requests {
 
 impl Requests {
     pub fn ask(
-        &self,
+        self: &Rc<Self>,
         backend: &dyn ChatBackend,
         control: Control,
         reply: impl FnOnce(Result<Value, String>) + 'static,
@@ -44,13 +45,35 @@ impl Requests {
                 self.pending
                     .borrow_mut()
                     .insert(id.clone(), Box::new(reply));
+                let weak = Rc::downgrade(self);
+                let request = id.clone();
+                let timeout = glib::spawn_future_local(async move {
+                    glib::timeout_future(std::time::Duration::from_secs(30)).await;
+                    if let Some(requests) = weak.upgrade() {
+                        requests.timeouts.borrow_mut().remove(&request);
+                        requests.expire(&request);
+                    }
+                });
+                self.timeouts.borrow_mut().insert(id.clone(), timeout);
             }
         }
         id
     }
 
+    /// Ends only a request that is still waiting; a late timer never becomes an early reply.
+    pub fn expire(&self, id: &str) {
+        self.cancel_timeout(id);
+        let reply = self.pending.borrow_mut().remove(id);
+        if let Some(reply) = reply {
+            reply(Err(
+                "The agent did not answer within 30 seconds. Try again.".to_owned(),
+            ));
+        }
+    }
+
     /// Returns whether the reply had an owner here.
     pub fn resolve(&self, id: &str, result: Result<Value, String>) -> bool {
+        self.cancel_timeout(id);
         let reply = self.pending.borrow_mut().remove(id);
         match reply {
             Some(f) => {
@@ -66,6 +89,21 @@ impl Requests {
                 early.insert(id.to_owned(), result);
                 false
             }
+        }
+    }
+
+    fn cancel_timeout(&self, id: &str) {
+        let timeout = self.timeouts.borrow_mut().remove(id);
+        if let Some(timeout) = timeout {
+            timeout.abort();
+        }
+    }
+}
+
+impl Drop for Requests {
+    fn drop(&mut self) {
+        for (_, timeout) in self.timeouts.get_mut().drain() {
+            timeout.abort();
         }
     }
 }
@@ -896,6 +934,94 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_resolved_request_cancels_its_expiry_timer() {
+        crate::testutil::in_loop(|_| {
+            let backend = super::super::tests::SwitchableBackend {
+                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
+            };
+            let requests = Rc::new(Requests::default());
+            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let source = requests.timeouts.borrow()[&id].source().clone();
+            assert!(!source.is_destroyed());
+            requests.resolve(&id, Ok(serde_json::json!({})));
+            assert!(source.is_destroyed());
+            assert!(requests.timeouts.borrow().is_empty());
+            assert!(requests.pending.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn an_expired_request_cancels_its_expiry_timer() {
+        crate::testutil::in_loop(|_| {
+            let backend = super::super::tests::SwitchableBackend {
+                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
+            };
+            let requests = Rc::new(Requests::default());
+            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let source = requests.timeouts.borrow()[&id].source().clone();
+            requests.expire(&id);
+            assert!(source.is_destroyed());
+            assert!(requests.timeouts.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn dropping_requests_cancels_their_expiry_timers() {
+        crate::testutil::in_loop(|_| {
+            let backend = super::super::tests::SwitchableBackend {
+                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
+            };
+            let requests = Rc::new(Requests::default());
+            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let source = requests.timeouts.borrow()[&id].source().clone();
+            drop(requests);
+            assert!(source.is_destroyed());
+        });
+    }
+
+    #[test]
+    fn an_expired_request_resolves_with_an_error() {
+        let requests = Requests::default();
+        let result = Rc::new(RefCell::new(None));
+        let received = result.clone();
+        requests.pending.borrow_mut().insert(
+            "ctl-1".into(),
+            Box::new(move |reply| {
+                *received.borrow_mut() = Some(reply);
+            }),
+        );
+        requests.expire("ctl-1");
+        assert!(result
+            .borrow()
+            .as_ref()
+            .is_some_and(|r| r.as_ref().is_err_and(|e| e.contains("30 seconds"))));
+        assert!(requests.pending.borrow().is_empty());
+        requests.expire("ctl-1");
+        requests.expire("unknown");
+        assert!(
+            requests.early.borrow().is_empty(),
+            "spent timers manufacture no replies"
+        );
+    }
+
+    #[test]
+    fn a_resolved_request_is_not_expired_again() {
+        let requests = Requests::default();
+        let result = Rc::new(RefCell::new(None));
+        let received = result.clone();
+        requests.pending.borrow_mut().insert(
+            "ctl-1".into(),
+            Box::new(move |reply| {
+                *received.borrow_mut() = Some(reply);
+            }),
+        );
+        assert!(requests.resolve("ctl-1", Ok(serde_json::json!("answer"))));
+        requests.expire("ctl-1");
+        assert_eq!(*result.borrow(), Some(Ok(serde_json::json!("answer"))));
+        assert!(requests.early.borrow().is_empty());
+    }
 
     pub(crate) fn changing_effort_does_not_switch_until_row_activation() {
         let picks = Rc::new(RefCell::new(Vec::new()));

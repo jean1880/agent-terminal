@@ -191,9 +191,15 @@ struct Inner {
     selected: RefCell<Option<String>>,
     pending_model: RefCell<Option<PendingModel>>,
     ctl_seq: Cell<u64>,
-    local_seq: Cell<u64>,
     /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
     generation: Cell<u64>,
+    /// Deliberate teardown must not dispatch queued work from its closing envelopes.
+    stopping: Cell<bool>,
+    /// Retirement can switch agents while dispatching; that switch must not pop another prompt.
+    dispatching_queue: Cell<bool>,
+    /// Nested envelopes finish reaching the view before a queued prompt can start.
+    delivering: Cell<bool>,
+    queued_dispatch_pending: Cell<bool>,
     /// Bumped when the adapter is replaced (a switch to another agent, a rollback); unlike
     /// `generation`, a restart of the same agent keeps it. A side process (agy's usage or model
     /// list) that finishes after a switch is answered with an error, never fed to the new agent.
@@ -237,6 +243,8 @@ struct Inner {
     approval_deadline: Cell<Duration>,
     /// Claude's `--thinking-display summarized` for the running process (W3.2).
     thinking: ThinkingFlag,
+    /// User input written before Claude's init, retained only for the thinking-flag retry.
+    pre_init_prompts: RefCell<Vec<Sent>>,
     /// Open Codex permission requests, by request id: what the answer may be (see
     /// [`Inner::gate_codex_permissions`]). Never a rule.
     codex_permissions: RefCell<HashMap<String, PermissionCard>>,
@@ -298,7 +306,32 @@ struct ThinkingFlag {
 struct QueuedPrompt {
     item_id: String,
     text: String,
+    stored: bool,
+}
+
+struct Sent {
+    text: String,
     handoff: Option<Handoff>,
+}
+
+struct ScopedFlag<'a> {
+    flag: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl<'a> ScopedFlag<'a> {
+    fn set(flag: &'a Cell<bool>) -> Self {
+        Self {
+            flag,
+            previous: flag.replace(true),
+        }
+    }
+}
+
+impl Drop for ScopedFlag<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.previous);
+    }
 }
 
 /// The mode a session can actually run in. agy without its approval hook cannot ask before
@@ -501,8 +534,11 @@ impl ChatSession {
             selected: RefCell::new(selected),
             pending_model: RefCell::new(None),
             ctl_seq: Cell::new(0),
-            local_seq: Cell::new(0),
             generation: Cell::new(0),
+            stopping: Cell::new(false),
+            dispatching_queue: Cell::new(false),
+            delivering: Cell::new(false),
+            queued_dispatch_pending: Cell::new(false),
             adapter_epoch: Cell::new(0),
             wanted_mode: Cell::new(wanted_mode),
             safe_mode: Cell::new(wanted_mode),
@@ -522,6 +558,7 @@ impl ChatSession {
             agy_hold: RefCell::new(std::collections::VecDeque::new()),
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
             thinking: ThinkingFlag::default(),
+            pre_init_prompts: RefCell::new(Vec::new()),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
             held_permissions: RefCell::new(HashSet::new()),
@@ -682,6 +719,7 @@ impl Inner {
 
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
+        let delivery = ScopedFlag::set(&self.delivering);
         let env = self.route_codex_permission(env);
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
@@ -703,12 +741,17 @@ impl Inner {
         if let Some(ended) = turn_ended {
             self.offer_reply_question(&ended);
         }
+        drop(delivery);
+        self.flush_queued_dispatch();
     }
 
-    /// Delivers without persisting (the store already has it).
+    /// Delivers without persisting, including transient queued-item state.
     fn deliver(&self, env: &Envelope) {
+        let delivery = ScopedFlag::set(&self.delivering);
         self.apply(env);
         (self.sink)(&crate::approval_server::masked_for_view(env.clone()));
+        drop(delivery);
+        self.flush_queued_dispatch();
     }
 
     fn error(&self, message: impl Into<String>) {
@@ -784,27 +827,8 @@ impl Inner {
                 if *state == TurnState::Completed {
                     self.confirm_provisional_native();
                 }
-                if let Some(queued) = self.queued_prompts.borrow_mut().pop_front() {
-                    self.deliver(
-                        &Envelope::new(Event::ItemStarted {
-                            kind: ItemKind::UserMessage,
-                            title: String::new(),
-                            input: None,
-                            parent: None,
-                        })
-                        .item(queued.item_id),
-                    );
-                    let sent = match &queued.handoff {
-                        Some(h) => {
-                            provider_message_with_handoff(&h.summary, &h.fence, &queued.text)
-                        }
-                        None => queued.text,
-                    };
-                    self.prompt_in_flight.set(true);
-                    if let Some(strong) = self.weak_self.borrow().as_ref().and_then(|w| w.upgrade())
-                    {
-                        strong.dispatch_sent_prompt(&sent, queued.handoff);
-                    }
+                if !self.stopping.get() {
+                    self.queued_dispatch_pending.set(true);
                 }
             }
             // The agent produced an item: Codex has recorded the turn, so the thread can be
@@ -1086,6 +1110,7 @@ impl Inner {
                 // first: roll_back starts a process, whose own failure lands back here.
                 let previous = self.rollback.borrow_mut().take();
                 if let Some(previous) = previous {
+                    self.reject_model_change();
                     self.roll_back(previous, &e.to_string());
                     return;
                 }
@@ -1265,11 +1290,14 @@ impl Inner {
             self.thinking.refused.set(true);
             return;
         }
-        if !stderr && line.contains("\"claude_code_version\"") {
+        if !stderr && line.contains("\"init\"") {
             // What a Claude `init` says it is: the next launch's thinking-flag gate.
             if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(version) = agent_core::claude::session_version(&frame) {
+                if frame["type"] == "system" && frame["subtype"] == "init" {
                     self.thinking.init_seen.set(true);
+                    self.pre_init_prompts.borrow_mut().clear();
+                }
+                if let Some(version) = agent_core::claude::session_version(&frame) {
                     crate::claude_probe::note_version(&self.open.borrow().program, version);
                 }
             }
@@ -1739,6 +1767,7 @@ impl Inner {
         self.state.borrow_mut().mode = Mode::Plan;
         self.emit(Envelope::new(Event::ModeChanged { mode: Mode::Plan }));
         self.start_process();
+        self.dispatch_queue_after_restart();
     }
 
     fn on_exit(self: &Rc<Self>, generation: u64, code: Option<i32>) {
@@ -1778,6 +1807,8 @@ impl Inner {
             return false;
         }
         flag.retried.set(true);
+        let prompts = self.pre_init_prompts.take();
+        let _stopping = ScopedFlag::set(&self.stopping);
         let program = self.open.borrow().program.clone();
         crate::claude_probe::note_thinking_refused(&program);
         // The app restarts it, so the exit is not reported as a failure.
@@ -1803,6 +1834,10 @@ impl Inner {
             self.emit(env.item(id.clone()));
         }
         self.start_process();
+        for sent in prompts {
+            self.prompt_in_flight.set(true);
+            self.dispatch_sent_prompt(&sent.text, sent.handoff);
+        }
         true
     }
 
@@ -1822,6 +1857,7 @@ impl Inner {
             state.running_turn = false;
         }
         self.prompt_in_flight.set(false);
+        self.pre_init_prompts.borrow_mut().clear();
         // A dead process completed nothing: a pending handoff goes out with the next prompt,
         // even when the exit raised no turn of its own (it died before one opened).
         self.handoff_in_flight.set(false);
@@ -1855,6 +1891,8 @@ impl Inner {
 
     /// Stops the process on purpose; its own exit callback is then ignored.
     fn stop_current(&self) {
+        let _stopping = ScopedFlag::set(&self.stopping);
+        self.queued_dispatch_pending.set(false);
         self.generation.set(self.generation.get() + 1);
         self.clear_agy_read();
         self.adapter.borrow_mut().discard_queued_prompts();
@@ -1883,6 +1921,32 @@ impl Inner {
             self.stop_current();
         }
         self.ensure_alive();
+        self.dispatch_queue_after_restart();
+    }
+
+    fn dispatch_queue_after_restart(self: &Rc<Self>) {
+        let ready = {
+            let state = self.state.borrow();
+            state.alive && !state.running_turn
+        };
+        if !ready {
+            return;
+        }
+        self.queued_dispatch_pending.set(true);
+        if self.dispatching_queue.get() {
+            // A restart from the sink must let the interrupted dispatch requeue its item first.
+            let weak = Rc::downgrade(self);
+            let generation = self.generation.get();
+            glib::spawn_future_local(async move {
+                if let Some(inner) = weak.upgrade() {
+                    if inner.generation.get() == generation {
+                        inner.flush_queued_dispatch();
+                    }
+                }
+            });
+        } else {
+            self.flush_queued_dispatch();
+        }
     }
 
     // ---- commands ----
@@ -1926,6 +1990,10 @@ impl Inner {
     }
 
     fn execute(self: &Rc<Self>, actions: Vec<Action>) {
+        self.execute_with_control(actions, None);
+    }
+
+    fn execute_with_control(self: &Rc<Self>, actions: Vec<Action>, control: Option<&str>) {
         for action in actions {
             match action {
                 Action::Write(lines) => {
@@ -1942,7 +2010,17 @@ impl Inner {
                         }
                     };
                     if !written {
-                        self.error("The agent is not running.");
+                        if let Some(id) = control {
+                            self.emit(
+                                Envelope::new(Event::ControlResult {
+                                    ok: None,
+                                    error: Some("The agent is not running; send a message to start it again.".to_owned()),
+                                })
+                                .request(id),
+                            );
+                        } else {
+                            self.error("The agent is not running.");
+                        }
                     }
                 }
                 Action::Interrupt => {
@@ -2048,16 +2126,11 @@ impl Inner {
         })
     }
 
-    fn next_local_id(&self, prefix: &str) -> String {
-        let n = self.local_seq.get() + 1;
-        self.local_seq.set(n);
-        format!("{prefix}-{n}")
-    }
-
     /// A prompt must not start a turn on a retired model: move to its replacement first.
-    fn apply_retired(self: &Rc<Self>) {
+    /// False if the notice's sink stopped or switched the replacement process.
+    fn apply_retired(self: &Rc<Self>) -> bool {
         let Some(retired) = self.retired.borrow_mut().take() else {
-            return;
+            return true;
         };
         let driver = self.adapter.borrow().driver();
         self.switch(
@@ -2065,9 +2138,11 @@ impl Inner {
             Some(retired.replacement.model.clone()),
             retired.replacement.effort.clone(),
         );
+        let generation = self.generation.get();
         self.emit(Envelope::new(Event::Notice {
             text: retired_notice(&retired),
         }));
+        generation == self.generation.get()
     }
 
     /// Remembers the model the thread was set to, for the next time it is opened.
@@ -2083,22 +2158,7 @@ impl Inner {
     }
 
     fn queue_prompt(self: &Rc<Self>, text: &str) {
-        self.apply_retired();
-        let pt = self.provider_thread.borrow().clone();
-        let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let item = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => item,
-            Err(e) => {
-                warn!(error = %e, "could not persist the user message");
-                self.next_local_id("user")
-            }
-        };
-
-        let handoff = if Self::is_slash_command(text) || self.handoff_in_flight.get() {
-            None
-        } else {
-            self.pending_handoff.borrow().clone()
-        };
+        let item = glib::uuid_string_random().to_string();
 
         self.deliver(
             &Envelope::new(Event::ItemStarted {
@@ -2119,7 +2179,7 @@ impl Inner {
         self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
-            handoff,
+            stored: false,
         });
     }
 
@@ -2140,14 +2200,13 @@ impl Inner {
         if !live || Self::is_slash_command(text) || handoff_waiting {
             return self.queue_prompt(text);
         }
-        self.apply_retired();
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let item = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => item,
+        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => (item, true),
             Err(e) => {
                 warn!(error = %e, "could not persist the user message");
-                self.next_local_id("user")
+                (glib::uuid_string_random().to_string(), false)
             }
         };
         self.deliver(
@@ -2169,6 +2228,7 @@ impl Inner {
         if self.command(Command::Steer {
             text: text.to_owned(),
         }) {
+            self.remember_pre_init_prompt(text, None);
             return;
         }
         // Refused: it waits for the turn to end, as a message sent mid-turn always did.
@@ -2184,19 +2244,35 @@ impl Inner {
         self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
-            handoff: None,
+            stored,
         });
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
-        self.apply_retired();
+        if self.dispatching_queue.get()
+            || self.delivering.get()
+            || !self.state.borrow().running_turn && !self.queued_prompts.borrow().is_empty()
+        {
+            self.queue_prompt(text);
+            self.dispatch_queued_prompt();
+            return;
+        }
+        self.send_prompt_now(text);
+    }
+
+    /// A confirmed switch's continuation opens its own turn before queued user input.
+    fn send_prompt_now(self: &Rc<Self>, text: &str) {
+        if !self.state.borrow().running_turn && !self.apply_retired() {
+            self.queue_prompt(text);
+            return;
+        }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
         let item = match self.store.append_user_message(&self.thread, provider, text) {
             Ok(item) => item,
             Err(e) => {
                 warn!(error = %e, "could not persist the user message");
-                self.next_local_id("user")
+                glib::uuid_string_random().to_string()
             }
         };
 
@@ -2248,11 +2324,108 @@ impl Inner {
         let accepted = self.command(Command::Prompt {
             text: sent.to_owned(),
         });
+        if accepted {
+            self.remember_pre_init_prompt(sent, handoff.clone());
+        }
         if !accepted && starts_turn {
             self.state.borrow_mut().running_turn = was_running;
         }
         if accepted && handoff.is_some() {
             self.handoff_in_flight.set(true);
+        }
+    }
+
+    fn remember_pre_init_prompt(&self, text: &str, handoff: Option<Handoff>) {
+        if self.adapter.borrow().driver() == Driver::Claude && !self.thinking.init_seen.get() {
+            self.pre_init_prompts.borrow_mut().push(Sent {
+                text: text.to_owned(),
+                handoff,
+            });
+        }
+    }
+
+    fn flush_queued_dispatch(&self) {
+        if self.delivering.get() || self.dispatching_queue.get() {
+            return;
+        }
+        if self.queued_dispatch_pending.replace(false) {
+            let strong = self.weak_self.borrow().as_ref().and_then(|w| w.upgrade());
+            if let Some(strong) = strong {
+                strong.dispatch_queued_prompt();
+            }
+        }
+    }
+
+    fn dispatch_queued_prompt(self: &Rc<Self>) {
+        if self.stopping.get() || self.dispatching_queue.get() || self.state.borrow().running_turn {
+            return;
+        }
+        if self.delivering.get() {
+            self.queued_dispatch_pending.set(true);
+            return;
+        }
+        self.queued_dispatch_pending.set(false);
+        let _dispatching = ScopedFlag::set(&self.dispatching_queue);
+        // Each pass removes one queued item; an empty queue ends the synchronous drain.
+        loop {
+            let queued = self.queued_prompts.borrow_mut().pop_front();
+            let Some(queued) = queued else { return };
+            if !self.apply_retired() {
+                self.queued_prompts.borrow_mut().push_front(queued);
+                return;
+            }
+            let generation = self.generation.get();
+            self.deliver(
+                &Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::UserMessage,
+                    title: String::new(),
+                    input: None,
+                    parent: None,
+                })
+                .item(queued.item_id.clone()),
+            );
+            // The sink can close or switch this session. Keep the message unsent in that case.
+            if generation != self.generation.get() || self.state.borrow().running_turn {
+                let item = queued.item_id.clone();
+                self.queued_prompts.borrow_mut().push_front(queued);
+                self.deliver(
+                    &Envelope::new(Event::ItemStarted {
+                        kind: ItemKind::UserMessage,
+                        title: "queued".to_owned(),
+                        input: Some(serde_json::json!({"queued": true})),
+                        parent: None,
+                    })
+                    .item(item),
+                );
+                return;
+            }
+            let pt = self.provider_thread.borrow().clone();
+            let provider = (!pt.is_empty()).then_some(pt.as_str());
+            if !queued.stored {
+                if let Err(e) = self.store.append_user_message_with_id(
+                    &self.thread,
+                    provider,
+                    &queued.item_id,
+                    &queued.text,
+                ) {
+                    warn!(error = %e, "could not persist the queued user message");
+                }
+            }
+            let handoff = if Self::is_slash_command(&queued.text) || self.handoff_in_flight.get() {
+                None
+            } else {
+                self.pending_handoff.borrow().clone()
+            };
+            let sent = match &handoff {
+                Some(h) => provider_message_with_handoff(&h.summary, &h.fence, &queued.text),
+                None => queued.text,
+            };
+            self.prompt_in_flight.set(true);
+            self.dispatch_sent_prompt(&sent, handoff);
+            // A local slash command can finish synchronously. Drain its next turn iteratively.
+            if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false) {
+                return;
+            }
         }
     }
 
@@ -2405,7 +2578,7 @@ impl Inner {
         });
         match result {
             Ok(actions) => {
-                self.execute(actions);
+                self.execute_with_control(actions, Some(&id));
                 self.drain_outbox();
             }
             Err(e) => {
@@ -2583,6 +2756,9 @@ impl Inner {
             }
             Transition::Reject(reason) => self.error(reason),
         }
+        if !running {
+            self.dispatch_queued_prompt();
+        }
     }
 
     /// A confirmed busy switch continues the task once on the replacement process. The
@@ -2592,7 +2768,7 @@ impl Inner {
         if self.adapter.borrow().driver() != driver || !self.state.borrow().alive {
             return;
         }
-        self.send_prompt(
+        self.send_prompt_now(
             "Continue the unfinished task after the model switch. Review the existing context \
              and current workspace state, then proceed from where the interrupted turn left \
              off. Do not repeat completed actions. Any unanswered approval or question was \
@@ -3624,6 +3800,8 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    mod teardown_tests;
+
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
     const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";
 
@@ -4214,6 +4392,8 @@ mod tests {
         open_turn: bool,
         /// Its binary does not exist: spawning it fails.
         unspawnable: bool,
+        write_commands: bool,
+        refuse_steer: bool,
     }
 
     impl FakeAdapter {
@@ -4236,6 +4416,8 @@ mod tests {
                 refuse_set_model: false,
                 open_turn: false,
                 unspawnable: false,
+                write_commands: false,
+                refuse_steer: false,
             })
         }
 
@@ -4254,6 +4436,14 @@ mod tests {
         fn with_open_turn(driver: Driver, log: &Log) -> Box<dyn Adapter> {
             Box::new(Self {
                 open_turn: true,
+                ..*Self::unboxed(driver, log)
+            })
+        }
+
+        fn writing_with_open_turn(driver: Driver, log: &Log) -> Box<dyn Adapter> {
+            Box::new(Self {
+                open_turn: true,
+                write_commands: true,
                 ..*Self::unboxed(driver, log)
             })
         }
@@ -4280,13 +4470,25 @@ mod tests {
         }
         fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
             let refuse = self.refuse_set_model && matches!(command, Command::SetModel { .. });
+            let refuse_steer = self.refuse_steer && matches!(command, Command::Steer { .. });
+            let lines = self
+                .write_commands
+                .then(|| vec![serde_json::to_string(&command).expect("command")]);
             self.log.borrow_mut().push(command);
             if refuse {
                 return Err(AdapterError::Unsupported("set model"));
             }
-            Ok(Vec::new())
+            if refuse_steer {
+                return Err(AdapterError::Unsupported("steer"));
+            }
+            Ok(lines.map(Action::Write).into_iter().collect())
         }
-        fn feed(&mut self, _: &str) -> Vec<Envelope> {
+        fn feed(&mut self, line: &str) -> Vec<Envelope> {
+            if self.write_commands {
+                if let Ok(Command::Prompt { text }) = serde_json::from_str(line) {
+                    return vec![Envelope::new(Event::Notice { text })];
+                }
+            }
             Vec::new()
         }
         fn feed_stderr(&mut self, _: &str) -> Vec<Envelope> {
@@ -5199,7 +5401,12 @@ mod tests {
             let (sink, seen) = make_sink();
             let open = scripted(
                 tmp.path(),
-                "case \"$*\" in *--thinking-display*) \
+                "IFS= read -r handshake\n\
+                 IFS= read -r line\n\
+                 printf '%s\\n' \"$line\" >> \"$D/prompts.log\"\n\
+                 IFS= read -r line\n\
+                 printf '%s\\n' \"$line\" >> \"$D/prompts.log\"\n\
+                 case \"$*\" in *--thinking-display*) \
                  echo \"error: unknown option '--thinking-display'\" >&2; exit 1;; esac\n\
                  echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
                  exec sleep 30",
@@ -5214,11 +5421,41 @@ mod tests {
                 sink,
                 None,
             );
+            session.inner.arm_handoff(Handoff {
+                summary: "earlier context".into(),
+                fence: "retry-fence".into(),
+                carried: 1,
+                total: 1,
+            });
+            session.send_prompt("sent before init");
+            session.steer_prompt("also sent before init");
             let log = tmp.path().join("args.log");
             assert!(pump_until(ctx, 10, || {
                 session.status().alive
                     && std::fs::read_to_string(&log).is_ok_and(|l| l.lines().count() == 2)
+                    && lines(tmp.path().join("prompts.log")).len() == 4
             }));
+            let sent = lines(tmp.path().join("prompts.log"));
+            assert_eq!(
+                sent[0], sent[2],
+                "the original prompt and handoff are replayed once"
+            );
+            assert_eq!(sent[1], sent[3], "pre-init live input is replayed once too");
+            assert!(sent[2].contains("sent before init"));
+            assert!(sent[2].contains("earlier context"));
+            assert!(sent[3].contains("also sent before init"));
+            assert!(!sent[3].contains("earlier context"));
+            assert_eq!(
+                session
+                    .inner
+                    .store
+                    .read(|s| s.transcript_messages(&session.inner.thread))
+                    .expect("read")
+                    .expect("messages")
+                    .len(),
+                2,
+                "replaying input never stores it twice"
+            );
             let launches = std::fs::read_to_string(&log).expect("args");
             let launches: Vec<&str> = launches.lines().collect();
             assert!(
