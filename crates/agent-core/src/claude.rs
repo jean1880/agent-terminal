@@ -787,6 +787,13 @@ impl ClaudeAdapter {
             text.contains("<local-command-stdout>") || text.contains("<local-command-stderr>");
         let interrupted = text.starts_with("[Request interrupted");
         if (synthetic || local || interrupted) && self.first_time(format!("{uuid}#user")) {
+            // TurnCompleted supplies the stop notice; a tool-use rejection keeps its own notice.
+            if interrupted
+                && (self.interrupt_pending
+                    || (self.turn_open && text == "[Request interrupted by user]"))
+            {
+                return Vec::new();
+            }
             return notice(strip_local_tags(&text));
         }
         Vec::new()
@@ -2138,6 +2145,81 @@ mod tests {
         // Skills are tagged as skills.
         assert!(last.iter().any(|c| c.kind == AgentCommandKind::Skill));
         assert!(last.iter().any(|c| c.kind == AgentCommandKind::Command));
+    }
+
+    #[test]
+    fn a_claude_stop_shows_one_interruption_notice() {
+        let (_, out) = replay(INTERRUPT);
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Interrupted,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!out.iter().any(|e| matches!(
+            &e.event, Event::Notice { text } if text.starts_with("[Request interrupted")
+        )));
+    }
+
+    #[test]
+    fn an_interruption_echo_is_deduplicated_but_an_idle_notice_is_kept() {
+        let echo = json!({"type": "user", "uuid": "echo", "message": {
+            "role": "user", "content": "[Request interrupted by user]"
+        }})
+        .to_string();
+        for pending in [false, true] {
+            let mut a = ClaudeAdapter::new();
+            a.turn_open = !pending;
+            a.interrupt_pending = pending;
+            assert!(a.feed(&echo).is_empty());
+            a.turn_open = false;
+            a.interrupt_pending = false;
+            assert!(a.feed(&echo).is_empty(), "replayed echoes stay suppressed");
+        }
+        let mut idle = ClaudeAdapter::new();
+        assert!(matches!(idle.feed(&echo).as_slice(), [Envelope {
+            event: Event::Notice { text }, ..
+        }] if text == "[Request interrupted by user]"));
+    }
+
+    #[test]
+    fn a_tool_use_interruption_keeps_its_notice_in_an_open_turn() {
+        let echo = include_str!("../tests/fixtures/claude-transcript-synthetic.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("fixture line"))
+            .find(|frame| frame["uuid"] == "u9")
+            .expect("tool-use interruption");
+        let mut a = ClaudeAdapter::new();
+        a.turn_open = true;
+        let out = a.feed(&echo.to_string());
+        assert!(matches!(out.as_slice(), [Envelope {
+            event: Event::Notice { text }, ..
+        }] if text == "[Request interrupted by user for tool use]"));
+        assert!(
+            a.feed(&echo.to_string()).is_empty(),
+            "the notice is not replayed"
+        );
+        let completed = a.feed(r#"{"type":"result","subtype":"success","is_error":false}"#);
+        assert!(completed.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                ..
+            }
+        )));
+        assert!(!completed.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                ..
+            }
+        )));
     }
 
     #[test]

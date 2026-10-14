@@ -265,7 +265,7 @@ struct PendingQuestion {
     rpc_id: Value,
     item: String,
     scope: RequestScope,
-    /// The app-server question ids, paired with the question text used by the shared card UI.
+    /// The app-server question ids, paired with the unique text shown by the shared card UI.
     keys: Vec<(String, String)>,
 }
 
@@ -1502,7 +1502,7 @@ impl CodexAdapter {
                 return;
             }
             let item = s(params, "itemId").unwrap_or_default().to_owned();
-            let questions: Vec<Question> = params
+            let mut questions: Vec<Question> = params
                 .get("questions")
                 .and_then(Value::as_array)
                 .into_iter()
@@ -1545,6 +1545,7 @@ impl CodexAdapter {
                 }));
                 return;
             }
+            disambiguate_question_texts(&mut questions);
             self.questions.insert(
                 key.clone(),
                 PendingQuestion {
@@ -3057,6 +3058,27 @@ pub fn parse_codex_models(result: &Value) -> Vec<CodexModel> {
 
 fn models_of(result: &Value) -> Value {
     serde_json::to_value(parse_codex_models(result)).unwrap_or(Value::Null)
+}
+
+/// Answers use the shown text. Reserve original texts too, so a suffix cannot take the key of
+/// a later question already named, for example, "Continue? (2)".
+fn disambiguate_question_texts(questions: &mut [Question]) {
+    let originals: HashSet<String> = questions.iter().map(|q| q.question.clone()).collect();
+    let mut shown = HashSet::new();
+    for question in questions {
+        if shown.insert(question.question.clone()) {
+            continue;
+        }
+        let mut suffix = 2;
+        loop {
+            let text = format!("{} ({suffix})", question.question);
+            if !originals.contains(&text) && shown.insert(text.clone()) {
+                question.question = text;
+                break;
+            }
+            suffix += 1;
+        }
+    }
 }
 
 /// A `TokenUsageBreakdown`: `inputTokens` includes cached input and `outputTokens` includes
@@ -5528,6 +5550,128 @@ mod tests {
             }),
             Err(AdapterError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn question_text_suffixes_preserve_originals_and_other_fields() {
+        let texts = ["Même?", "Même?", "Même? (2)", "Même?", "Même? (2)"];
+        let mut questions: Vec<Question> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Question {
+                id: i.to_string(),
+                header: format!("Header {i}"),
+                question: (*text).to_owned(),
+                options: vec![QuestionOption {
+                    label: "Yes".into(),
+                    description: Some("Continue".into()),
+                }],
+                multi_select: false,
+            })
+            .collect();
+        let originals = questions.clone();
+        disambiguate_question_texts(&mut questions);
+        for ((question, mut expected), text) in questions.iter().zip(originals).zip([
+            "Même?",
+            "Même? (3)",
+            "Même? (2)",
+            "Même? (4)",
+            "Même? (2) (2)",
+        ]) {
+            expected.question = text.to_owned();
+            assert_eq!(question, &expected);
+        }
+        let shown = questions.clone();
+        disambiguate_question_texts(&mut questions);
+        assert_eq!(questions, shown, "unique texts stay unchanged");
+        disambiguate_question_texts(&mut []);
+    }
+
+    #[test]
+    fn duplicate_codex_question_texts_get_their_own_answers() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(&json!({"id": 9, "method": "item/tool/requestUserInput", "params": {
+            "itemId": "ask-1", "questions": [
+                {"id": "first", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]},
+                {"id": "second", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]},
+                {"id": "third", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]}
+            ]
+        }}).to_string());
+        let Event::QuestionRequested { questions, .. } = &ev[0].event else {
+            panic!("expected questions");
+        };
+        let answer = one_write(a.encode(Command::Answer {
+            request: ev[0].request.clone().expect("request"),
+            answers: json!({"Continue?": "Yes", "Continue? (2)": "No", "Continue? (3)": "Other"}),
+        }).expect("answer"));
+        assert_eq!(
+            answer,
+            json!({"id": 9, "result": {"answers": {
+                "first": {"answers": ["Yes"]}, "second": {"answers": ["No"]}, "third": {"answers": ["Other"]}
+            }}})
+        );
+        assert_eq!(
+            questions
+                .iter()
+                .map(|q| q.question.as_str())
+                .collect::<Vec<_>>(),
+            ["Continue?", "Continue? (2)", "Continue? (3)"]
+        );
+        assert!(questions.iter().all(|q| !q.multi_select));
+    }
+
+    #[test]
+    fn duplicate_codex_questions_do_not_collide_with_existing_suffixes() {
+        let mut a = started(Mode::Ask);
+        let texts = [
+            "Continue?",
+            "Continue?",
+            "Continue? (2)",
+            "Continue?",
+            "Continue? (2)",
+        ];
+        let ev = a.feed(
+            &json!({"id": "q", "method": "item/tool/requestUserInput", "params": {
+                "itemId": "ask-1", "questions": texts.iter().enumerate().map(|(i, text)| {
+                    json!({"id": i.to_string(), "question": text, "options": [{"label": "Yes"}]})
+                }).collect::<Vec<_>>()
+            }})
+            .to_string(),
+        );
+        let Event::QuestionRequested { questions, .. } = &ev[0].event else {
+            panic!("expected questions");
+        };
+        assert_eq!(
+            questions
+                .iter()
+                .map(|q| q.question.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Continue?",
+                "Continue? (3)",
+                "Continue? (2)",
+                "Continue? (4)",
+                "Continue? (2) (2)"
+            ]
+        );
+        let answers: Map<String, Value> = questions
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.question.clone(), json!(format!("answer {i}"))))
+            .collect();
+        let answer = one_write(
+            a.encode(Command::Answer {
+                request: ev[0].request.clone().expect("request"),
+                answers: Value::Object(answers),
+            })
+            .expect("answer"),
+        );
+        for i in 0..texts.len() {
+            assert_eq!(
+                answer["result"]["answers"][i.to_string()]["answers"],
+                json!([format!("answer {i}")])
+            );
+        }
     }
 
     #[test]

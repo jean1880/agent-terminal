@@ -81,8 +81,10 @@ pub struct AgyAdapter {
     fallback_prefix: String,
     /// Accumulated text of each open response item, flushed as a snapshot on completion.
     resp_text: HashMap<String, String>,
-    /// Cumulative token count across turns in this session.
-    cumulative_tokens: u64,
+    /// Context before the last model call: its input, without adding output or cache reads again.
+    context_tokens: u64,
+    /// Latest model call's input this turn; result usage sums all calls in the recorded stream.
+    step_input_tokens: Option<u64>,
     /// The actions agy denied in its last turn ([`denied_name`]), until the next prompt: an
     /// unexpected exit right after names them.
     last_denied: Vec<String>,
@@ -112,7 +114,8 @@ impl AgyAdapter {
             exit_expected: false,
             fallback_prefix: format!("a{}", ADAPTER_SEQ.fetch_add(1, Ordering::Relaxed)),
             resp_text: HashMap::new(),
-            cumulative_tokens: 0,
+            context_tokens: 0,
+            step_input_tokens: None,
             last_denied: Vec::new(),
             outbox: Outbox::default(),
         }
@@ -273,6 +276,9 @@ impl AgyAdapter {
     fn on_step(&mut self, step: &Step, out: &mut Vec<Envelope>) {
         if let Some(id) = &step.conversation_id {
             self.conversation = Some(id.clone());
+        }
+        if let Some(usage) = step.usage.as_ref().filter(|u| u.input_tokens > 0) {
+            self.step_input_tokens = Some(usage.input_tokens);
         }
         // A missing index collapses onto 0; agy always sets it in practice.
         let index = step.step_index.unwrap_or(0);
@@ -462,9 +468,14 @@ impl AgyAdapter {
                 detail: Some(Value::String(result.status.clone())),
             }));
         }
-        if let Some(usage) = &result.usage {
-            let turn_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-            self.cumulative_tokens = self.cumulative_tokens.max(turn_tokens);
+        if let Some(input) = self.step_input_tokens.take().or_else(|| {
+            result
+                .usage
+                .as_ref()
+                .filter(|u| u.input_tokens > 0)
+                .map(|u| u.input_tokens)
+        }) {
+            self.context_tokens = input;
         }
         self.turn_open = false;
         out.push(env(Event::TurnCompleted {
@@ -575,6 +586,7 @@ impl Adapter for AgyAdapter {
                     "message": {"role": "user", "content": text},
                 });
                 self.prompt_pending = true;
+                self.step_input_tokens = None;
                 // A new turn: the last one's denials no longer explain an exit.
                 self.last_denied.clear();
                 Ok(vec![Action::Write(vec![line.to_string()])])
@@ -612,14 +624,14 @@ impl Adapter for AgyAdapter {
                     ),
                     Control::ContextUsage => {
                         let max = 1_048_576;
-                        let event = if self.cumulative_tokens > 0 {
+                        let event = if self.context_tokens > 0 {
                             self.outbox.events.push(Envelope::new(Event::UsageUpdated {
-                                used: self.cumulative_tokens,
+                                used: self.context_tokens,
                                 max: Some(max),
                                 auto_compact_at: None,
                             }));
                             Event::ControlResult {
-                                ok: Some(json!({"used": self.cumulative_tokens, "max": max})),
+                                ok: Some(json!({"used": self.context_tokens, "max": max})),
                                 error: None,
                             }
                         } else {
@@ -768,6 +780,7 @@ impl Adapter for AgyAdapter {
 
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         let mut out = Vec::new();
+        self.step_input_tokens = None;
         self.close_all(&mut out);
         let expected = std::mem::take(&mut self.exit_expected);
         // A prompt that never got its turn (agy died before `init`) failed all the same.
@@ -988,6 +1001,8 @@ struct Step {
     tool_name: Option<String>,
     #[serde(default)]
     tool_info: Option<ToolInfo>,
+    #[serde(default)]
+    usage: Option<AgyUsage>,
     /// The step's tool calls as agy's transcript recorded them, args decoded (`{name, args}`):
     /// put on the step by the session's transcript reader.
     #[serde(default)]
@@ -1180,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_control_reports_cumulative_tokens() {
+    fn context_usage_control_reports_input_tokens() {
         let mut a = AgyAdapter::default();
         a.encode(Command::Control {
             id: "cu1".into(),
@@ -1208,7 +1223,7 @@ mod tests {
         assert!(matches!(
             &outbox.events[0].event,
             Event::UsageUpdated {
-                used: 1200,
+                used: 1000,
                 max: Some(1_048_576),
                 ..
             }
@@ -1218,10 +1233,138 @@ mod tests {
                 ok: Some(val),
                 error: None,
             } => {
-                assert_eq!(val["used"], 1200);
+                assert_eq!(val["used"], 1000);
                 assert_eq!(val["max"], 1_048_576);
             }
             other => panic!("expected ControlResult ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_context_follows_the_latest_turn() {
+        let mut a = AgyAdapter::default();
+        for (usage, expected) in [
+            (json!({"input_tokens": 2000, "output_tokens": 300}), 2000),
+            (json!({"input_tokens": 500, "output_tokens": 5000}), 500),
+            (json!({"input_tokens": 0, "output_tokens": 100}), 500),
+            (json!({"input_tokens": null, "output_tokens": 100}), 500),
+            (Value::Null, 500),
+        ] {
+            a.feed(
+                &json!({"event": "result", "result": {"status": "SUCCESS", "usage": usage}})
+                    .to_string(),
+            );
+            a.encode(Command::Control {
+                id: "context".into(),
+                control: Control::ContextUsage,
+            })
+            .expect("control");
+            let out = a.drain_outbox();
+            assert!(
+                matches!(&out.events[0].event, Event::UsageUpdated { used, .. } if *used == expected)
+            );
+            assert!(
+                matches!(&out.events[1].event, Event::ControlResult { ok: Some(value), .. }
+                if value["used"] == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn agy_context_uses_the_last_model_call_instead_of_the_turn_total() {
+        let mut a = AgyAdapter::default();
+        for (fixture, expected) in [(EDIT, 14035), (HOOK, 12771)] {
+            for line in fixture.lines() {
+                let rec: Value = serde_json::from_str(line).expect("fixture");
+                if rec["dir"] == "out" {
+                    a.feed(&rec["frame"].to_string());
+                }
+            }
+            a.encode(Command::Control {
+                id: "context".into(),
+                control: Control::ContextUsage,
+            })
+            .expect("control");
+            let out = a.drain_outbox();
+            assert!(
+                matches!(&out.events[0].event, Event::UsageUpdated { used, .. } if *used == expected)
+            );
+        }
+
+        // A thinking-only call still reports context; missing/zero step usage cannot erase it.
+        for usage in [
+            json!({"input_tokens": 500}),
+            json!({"input_tokens": 0}),
+            Value::Null,
+        ] {
+            a.feed(
+                &json!({"event": "step_update", "step_update": {
+                    "step_type": "agent_response", "state": "DONE", "step_index": 8, "usage": usage
+                }})
+                .to_string(),
+            );
+        }
+        a.feed(r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":20000,"output_tokens":5000}}}"#);
+        a.encode(Command::Control {
+            id: "smaller".into(),
+            control: Control::ContextUsage,
+        })
+        .expect("control");
+        assert!(matches!(
+            &a.drain_outbox().events[0].event,
+            Event::UsageUpdated { used: 500, .. }
+        ));
+
+        // A later result-only turn uses its own input, rather than the previous turn's step.
+        a.feed(r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":800,"output_tokens":100}}}"#);
+        a.encode(Command::Control {
+            id: "fallback".into(),
+            control: Control::ContextUsage,
+        })
+        .expect("control");
+        assert!(matches!(
+            &a.drain_outbox().events[0].event,
+            Event::UsageUpdated { used: 800, .. }
+        ));
+    }
+
+    #[test]
+    fn agy_context_does_not_keep_an_unfinished_turns_step_usage() {
+        for exit in [false, true] {
+            let mut a = AgyAdapter::default();
+            a.feed(
+                r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":1000}}}"#,
+            );
+            a.feed(r#"{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","step_index":1,"usage":{"input_tokens":500}}}"#);
+            if exit {
+                a.on_exit(None);
+            } else {
+                a.encode(Command::Prompt {
+                    text: "next turn".into(),
+                })
+                .expect("prompt");
+            }
+            a.encode(Command::Control {
+                id: "retained".into(),
+                control: Control::ContextUsage,
+            })
+            .expect("control");
+            assert!(matches!(
+                &a.drain_outbox().events[0].event,
+                Event::UsageUpdated { used: 1000, .. }
+            ));
+            a.feed(
+                r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":800}}}"#,
+            );
+            a.encode(Command::Control {
+                id: "fallback".into(),
+                control: Control::ContextUsage,
+            })
+            .expect("control");
+            assert!(matches!(
+                &a.drain_outbox().events[0].event,
+                Event::UsageUpdated { used: 800, .. }
+            ));
         }
     }
 
