@@ -46,7 +46,7 @@ const MIN_WINDOW: (i32, i32) = (360, 294);
 /// The Settings descriptions of the two folder rows, restored once a typed path checks out.
 const STARTING_DIRECTORY_HELP: &str = "Where new tabs and threads open (blank: your home folder)";
 const WORKTREE_ROOT_HELP: &str =
-    "Where new worktrees go, as <folder>/<repo>/<branch> (blank: a hidden folder beside the repository)";
+    "Where new worktrees go, as &lt;folder&gt;/&lt;repo&gt;/&lt;branch&gt; (blank: a hidden folder beside the repository)";
 /// At or below this width the header drops its panel toggles ([`AgentTerminalWindow::add_narrow_breakpoint`]).
 const NARROW_SP: f64 = 480.0;
 /// Below this width a visible diff panel would compete with the thread sidebar for horizontal
@@ -1150,6 +1150,10 @@ pub struct AgentTerminalWindow {
     closing: RefCell<Option<std::rc::Rc<closing::Closing>>>,
     /// The wait is over: the next close request destroys the window.
     close_done: std::cell::Cell<bool>,
+    /// Sticky even when closing needs no screen or wait.
+    closing_started: std::cell::Cell<bool>,
+    /// Debounced Agent settings edits to flush before the window goes.
+    agent_edits: RefCell<Vec<std::rc::Weak<agents_prefs::EditDebounce>>>,
     /// Extra processes the next close waits on, as if they were threads' agents (tests).
     #[cfg(test)]
     test_stops: RefCell<Vec<closing::StopTarget>>,
@@ -1159,9 +1163,6 @@ pub struct AgentTerminalWindow {
     show_archived: std::cell::Cell<bool>,
     /// A new thread asked for while agents were still being detected: (folder, prompt).
     pending_new_thread: RefCell<Option<(Option<String>, Option<String>)>>,
-    /// The latest open-thread list not yet written, and whether a writer is running.
-    open_threads_pending: RefCell<Option<String>>,
-    open_threads_writing: std::cell::Cell<bool>,
     /// The thread sidebar beside the pages.
     split_view: RefCell<Option<adw::OverlaySplitView>>,
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
@@ -1236,7 +1237,10 @@ impl WindowImpl for AgentTerminalWindow {
         // Both before the window goes: a quick zoom-then-quit must not lose the
         // change still waiting on the debounce timer, and the tab layout is only
         // knowable while the tabs still exist.
+        self.closing_started.set(true);
+        self.flush_agent_edits();
         let started = std::time::Instant::now();
+        self.save_open_threads_at_close();
         self.save_session();
         self.flush_pending_save();
         tracing::debug!(ms = started.elapsed().as_millis(), "close: session saved");
@@ -2484,6 +2488,11 @@ impl AgentTerminalWindow {
                 let (leaving, staying): (Vec<TabState>, Vec<TabState>) =
                     imp.tabs.take().into_iter().partition(|t| &t.page == page);
                 imp.tabs.replace(staying);
+                for tab in &leaving {
+                    if let Some(chat) = &tab.chat {
+                        imp.unregister_thread(&chat.thread);
+                    }
+                }
 
                 if view.is_transferring_page() {
                     TRANSFERRING.with(|parked| parked.borrow_mut().extend(leaving));
@@ -2527,7 +2536,13 @@ impl AgentTerminalWindow {
                 });
                 if !adopted.is_empty() {
                     debug!("Adopting a tab dragged in from another window");
+                    for tab in &adopted {
+                        if let Some(chat) = &tab.chat {
+                            obj.imp().register_thread(&chat.thread);
+                        }
+                    }
                     obj.imp().tabs.borrow_mut().extend(adopted);
+                    obj.imp().for_each_window(|imp| imp.refresh_sidebar());
                 }
             }
         ));
@@ -4179,12 +4194,9 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .placeholder_text("Beside the repository")
             .build();
-        // Plain text: the description's <folder>/<repo> read as (broken) Pango markup, and the
-        // whole subtitle silently vanished.
         let worktree_root_row = adw::ActionRow::builder()
             .title("Worktree Folder")
             .subtitle(WORKTREE_ROOT_HELP)
-            .use_markup(false)
             .build();
         worktree_root_row.add_suffix(&worktree_root_entry);
 
@@ -6652,6 +6664,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_help_texts_are_valid_markup() {
+        for text in [STARTING_DIRECTORY_HELP, WORKTREE_ROOT_HELP] {
+            gtk4::pango::parse_markup(text, '\0').unwrap();
+        }
+        agents_prefs::tests::help_texts_are_valid_markup();
+    }
+
+    #[test]
     fn indicator_logs_at_info_only_on_a_state_transition() {
         use IndicatorKind::{Ok, Problem, Unreadable};
         // First evaluation.
@@ -7324,7 +7344,9 @@ mod tests {
         drop(tabs);
         let rows = imp.sidebar_rows();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.open && r.folder == dir_s));
+        assert!(rows
+            .iter()
+            .all(|r| r.open == crate::window::sidebar_model::OpenState::Here && r.folder == dir_s));
 
         // When sidebar is collapsed and a background thread is unread, toggle gets .has-unread
         if let Some(split) = imp.split_view.borrow().as_ref() {

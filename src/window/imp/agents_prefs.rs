@@ -56,6 +56,52 @@ const PERMISSION_SOURCES_HELP: &str =
     "Extra permissions.toml files to import from and export to, separated by ':' (absolute or \
      ~/ paths to existing files). Blank: none";
 
+const AGENT_EDIT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+#[derive(Default)]
+pub(super) struct EditDebounce {
+    source: RefCell<Option<glib::SourceId>>,
+    pending: RefCell<Option<std::boxed::Box<dyn FnOnce()>>>,
+}
+
+impl EditDebounce {
+    fn cancel(&self) {
+        if let Some(id) = self.source.borrow_mut().take() {
+            id.remove();
+        }
+        self.pending.borrow_mut().take();
+    }
+
+    fn flush(&self) {
+        if let Some(id) = self.source.borrow_mut().take() {
+            id.remove();
+        }
+        let pending = self.pending.borrow_mut().take();
+        if let Some(pending) = pending {
+            pending();
+        }
+    }
+
+    fn schedule(self: &Rc<Self>, then: impl FnOnce() + 'static) {
+        self.cancel();
+        *self.pending.borrow_mut() = Some(std::boxed::Box::new(then));
+        let weak = Rc::downgrade(self);
+        *self.source.borrow_mut() =
+            Some(glib::timeout_add_local_once(AGENT_EDIT_DELAY, move || {
+                if let Some(timer) = weak.upgrade() {
+                    timer.source.borrow_mut().take();
+                    timer.flush();
+                }
+            }));
+    }
+}
+
+impl Drop for EditDebounce {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 fn validation_row() -> adw::ActionRow {
     adw::ActionRow::builder()
         .title("Not Saved")
@@ -225,6 +271,20 @@ fn source_names(codex: bool) -> &'static str {
 }
 
 impl AgentTerminalWindow {
+    pub(super) fn flush_agent_edits(&self) {
+        let timers: Vec<_> = self
+            .agent_edits
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect();
+        for timer in timers {
+            timer.flush();
+        }
+        self.agent_edits
+            .borrow_mut()
+            .retain(|timer| timer.strong_count() > 0);
+    }
     /// The permission files the user named in Settings, `~/` expanded.
     fn permission_sources(&self) -> Vec<std::path::PathBuf> {
         self.config.borrow().permission_source_paths()
@@ -1499,7 +1559,23 @@ impl AgentTerminalWindow {
             }
         ));
         detect(profile.command.clone());
+        let command_timer = Rc::new(EditDebounce::default());
+        self.agent_edits
+            .borrow_mut()
+            .push(Rc::downgrade(&command_timer));
+        dialog.connect_closed(glib::clone!(
+            #[strong]
+            command_timer,
+            #[weak]
+            obj,
+            move |_| {
+                command_timer.flush();
+                obj.imp().flush_pending_save();
+            }
+        ));
         command.connect_changed(glib::clone!(
+            #[strong]
+            command_timer,
             #[weak]
             obj,
             #[strong]
@@ -1507,6 +1583,7 @@ impl AgentTerminalWindow {
             #[weak]
             command_error,
             move |row| {
+                command_timer.cancel();
                 let text = row.text().trim().to_owned();
                 if !command_ok(&text) {
                     show_validation(
@@ -1518,14 +1595,25 @@ impl AgentTerminalWindow {
                     return;
                 }
                 show_validation(row, &command_error, COMMAND_HELP, None);
-                let imp = obj.imp();
-                if imp.agent_profile_now(driver).command == text {
-                    return;
-                }
-                imp.edit_agent_profile(driver, |p| p.command = text.clone());
-                detect(text);
-                imp.refresh_profile_selection();
-                imp.refresh_agent_data(super::threads::Probes::Force);
+                let obj = obj.downgrade();
+                let detect = detect.clone();
+                command_timer.schedule(move || {
+                    let Some(obj) = obj.upgrade() else {
+                        return;
+                    };
+                    let imp = obj.imp();
+                    let changed = imp.agent_profile_now(driver).command != text;
+                    if changed {
+                        imp.edit_agent_profile(driver, |p| p.command = text.clone());
+                    }
+                    if !imp.is_closing() {
+                        detect(text);
+                        if changed {
+                            imp.refresh_profile_selection();
+                            imp.refresh_agent_data(super::threads::Probes::Force);
+                        }
+                    }
+                });
             }
         ));
         group.add(&command);
@@ -1574,12 +1662,29 @@ impl AgentTerminalWindow {
             .build();
         let env_error = validation_row();
         show_validation(&env_file, &env_error, ENV_FILE_HELP, None);
+        let env_timer = Rc::new(EditDebounce::default());
+        self.agent_edits
+            .borrow_mut()
+            .push(Rc::downgrade(&env_timer));
+        dialog.connect_closed(glib::clone!(
+            #[strong]
+            env_timer,
+            #[weak]
+            obj,
+            move |_| {
+                env_timer.flush();
+                obj.imp().flush_pending_save();
+            }
+        ));
         env_file.connect_changed(glib::clone!(
+            #[strong]
+            env_timer,
             #[weak]
             obj,
             #[weak]
             env_error,
             move |row| {
+                env_timer.cancel();
                 let text = row.text().trim().to_owned();
                 if !env_file_ok(&text) {
                     show_validation(
@@ -1592,11 +1697,19 @@ impl AgentTerminalWindow {
                 }
                 show_validation(row, &env_error, ENV_FILE_HELP, None);
                 let value = (!text.is_empty()).then_some(text);
-                let imp = obj.imp();
-                if imp.agent_profile_now(driver).env_file != value {
-                    imp.edit_agent_profile(driver, |p| p.env_file = value);
-                    imp.refresh_agent_data(super::threads::Probes::Force);
-                }
+                let obj = obj.downgrade();
+                env_timer.schedule(move || {
+                    let Some(obj) = obj.upgrade() else {
+                        return;
+                    };
+                    let imp = obj.imp();
+                    if imp.agent_profile_now(driver).env_file != value {
+                        imp.edit_agent_profile(driver, |p| p.env_file = value);
+                        if !imp.is_closing() {
+                            imp.refresh_agent_data(super::threads::Probes::Force);
+                        }
+                    }
+                });
             }
         ));
         group.add(&env_file);
@@ -2036,6 +2149,250 @@ fn detect_agent(command: &str) -> Result<String, String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_debounce_saves_its_pending_edit() {
+        let saved = Rc::new(std::cell::Cell::new(false));
+        let timer = EditDebounce::default();
+        let seen = saved.clone();
+        *timer.pending.borrow_mut() = Some(std::boxed::Box::new(move || seen.set(true)));
+        drop(timer);
+        assert!(saved.get());
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn closing_settings_and_window_flushes_agent_edits() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let env_file = config_home.path().join("agent.env");
+        std::fs::write(&env_file, "TEST_FLAG=yes\n").unwrap();
+        let app = adw::Application::builder()
+            .application_id("org.test.SettingsFlush")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        window.present();
+        let prefs = adw::PreferencesDialog::new();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::new();
+        page.add(&group);
+        prefs.add(&page);
+        let saved = window.imp().agent_profile_now(Driver::Codex);
+        window
+            .imp()
+            .add_agent_detail_rows(&group, Driver::Codex, &saved, &prefs);
+        prefs.present(Some(&window));
+        let widgets = crate::testutil::descendants(group.upcast_ref());
+        let field = |title: &str| {
+            widgets
+                .iter()
+                .find_map(|w| {
+                    w.downcast_ref::<adw::EntryRow>()
+                        .filter(|r| r.title() == title)
+                })
+                .unwrap()
+        };
+        let closed = Rc::new(std::cell::Cell::new(false));
+        let checked = closed.clone();
+        let weak = window.downgrade();
+        let expected_env = env_file.to_string_lossy().into_owned();
+        let expected = expected_env.clone();
+        prefs.connect_closed(move |_| {
+            let window = weak.upgrade().unwrap();
+            let profile = window.imp().agent_profile_now(Driver::Codex);
+            assert_eq!(profile.command, "/nonexistent/close-dialog/codex");
+            assert_eq!(profile.env_file.as_deref(), Some(expected.as_str()));
+            let on_disk = crate::config::TerminalConfig::load();
+            assert_eq!(
+                on_disk.agent_profile(Driver::Codex).unwrap().command,
+                profile.command
+            );
+            assert_eq!(
+                on_disk.agent_profile(Driver::Codex).unwrap().env_file,
+                profile.env_file
+            );
+            checked.set(true);
+        });
+        field("Command or Path").set_text("/nonexistent/close-dialog/codex");
+        field("Environment File").set_text(&expected_env);
+        prefs.close();
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || closed.get()));
+        // The rows are still alive here; the window close must flush its own registry too.
+        field("Command or Path").set_text("/nonexistent/close-window/codex");
+        field("Environment File").set_text("");
+        window.close();
+        let profile = window.imp().agent_profile_now(Driver::Codex);
+        assert_eq!(profile.command, "/nonexistent/close-window/codex");
+        assert_eq!(profile.env_file, None);
+        let on_disk = crate::config::TerminalConfig::load();
+        assert_eq!(
+            on_disk.agent_profile(Driver::Codex).unwrap().command,
+            profile.command
+        );
+        assert_eq!(on_disk.agent_profile(Driver::Codex).unwrap().env_file, None);
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn invalid_text_keeps_the_saved_command_detection() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.InvalidDetection")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let prefs = adw::PreferencesDialog::new();
+        let group = adw::PreferencesGroup::new();
+        let profile = Profile {
+            command: "/nonexistent/codex".into(),
+            ..crate::config::new_agent_profile(Driver::Codex)
+        };
+        window
+            .imp()
+            .add_agent_detail_rows(&group, Driver::Codex, &profile, &prefs);
+        let widgets = crate::testutil::descendants(group.upcast_ref());
+        let command = widgets
+            .iter()
+            .find_map(|w| {
+                w.downcast_ref::<adw::EntryRow>()
+                    .filter(|r| r.title() == "Command or Path")
+            })
+            .unwrap();
+        let status = widgets
+            .iter()
+            .find_map(|w| {
+                w.downcast_ref::<adw::ActionRow>()
+                    .filter(|r| r.title() == "Detected")
+            })
+            .unwrap();
+        command.set_text("--invalid"); // before the initial detection future can answer
+        assert!(crate::testutil::pump_until(
+            &glib::MainContext::default(),
+            10,
+            || status.subtitle().is_some_and(|s| s != "Checking…")
+        ));
+        assert!(status.has_css_class("error"));
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn typing_a_command_runs_one_scan() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.AgentDebounce")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        crate::testutil::settle(&ctx);
+        let group = adw::PreferencesGroup::new();
+        let prefs = adw::PreferencesDialog::new();
+        let saved = window.imp().agent_profile_now(Driver::Codex);
+        window
+            .imp()
+            .add_agent_detail_rows(&group, Driver::Codex, &saved, &prefs);
+        let widgets = crate::testutil::descendants(group.upcast_ref());
+        let field = widgets
+            .iter()
+            .find_map(|w| {
+                w.downcast_ref::<adw::EntryRow>()
+                    .filter(|r| r.title() == "Command or Path")
+            })
+            .unwrap();
+        let status = widgets
+            .iter()
+            .find_map(|w| {
+                w.downcast_ref::<adw::ActionRow>()
+                    .filter(|r| r.title() == "Detected")
+            })
+            .unwrap();
+        let before = super::super::threads::scan_generation_for_test();
+        // Preserve the executable basename: profile_driver deliberately gives wrappers with
+        // other names no chat adapter. This tests path edits within the Codex profile.
+        let final_command = "/nonexistent/final/codex";
+        for text in [
+            "/nonexistent/first/codex",
+            "/nonexistent/draft/codex",
+            final_command,
+        ] {
+            field.set_text(text);
+        }
+        assert_eq!(
+            window.imp().agent_profile_now(Driver::Codex).command,
+            saved.command
+        );
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .agent_profile_now(Driver::Codex)
+            .command
+            == final_command));
+        assert_eq!(
+            super::super::threads::scan_generation_for_test(),
+            before + 1
+        );
+
+        {
+            let config = window.imp().config.borrow();
+            let stored = config
+                .profiles
+                .iter()
+                .find(|p| p.name == saved.name)
+                .unwrap();
+            assert_eq!(
+                stored.command, final_command,
+                "the original profile stores the path"
+            );
+            assert_eq!(crate::config::profile_driver(stored), Some(Driver::Codex));
+        }
+        let before = super::super::threads::scan_generation_for_test();
+        field.set_text("/nonexistent/valid-draft/codex");
+        field.set_text("--invalid");
+        let elapsed = std::time::Instant::now();
+        assert!(crate::testutil::pump_until(&ctx, 2, || elapsed.elapsed() > AGENT_EDIT_DELAY * 2));
+        assert_eq!(
+            window.imp().agent_profile_now(Driver::Codex).command,
+            final_command
+        );
+        assert_eq!(super::super::threads::scan_generation_for_test(), before);
+
+        status.set_subtitle("Checking…");
+        field.set_text("/nonexistent/another-draft/codex");
+        field.set_text(final_command);
+        assert!(crate::testutil::pump_until(&ctx, 10, || status
+            .subtitle()
+            .is_some_and(|s| s != "Checking…")));
+        assert_eq!(
+            window.imp().agent_profile_now(Driver::Codex).command,
+            final_command
+        );
+        assert_eq!(super::super::threads::scan_generation_for_test(), before);
+        window.destroy();
+    }
+
+    pub(crate) fn help_texts_are_valid_markup() {
+        for text in [
+            COMMAND_HELP,
+            ARGS_HELP,
+            ENV_FILE_HELP,
+            PERMISSION_SOURCES_HELP,
+        ] {
+            gtk4::pango::parse_markup(text, '\0').unwrap();
+        }
+    }
 
     /// Called by the window smoke test on GTK's thread. Invalid text must give a lasting
     /// correction reason and must not change the profile used to launch the agent.

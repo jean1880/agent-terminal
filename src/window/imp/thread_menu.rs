@@ -17,6 +17,7 @@ use gtk4::gio;
 
 use super::threads::{store_job, NewThread, Sidebar};
 use super::*;
+use crate::availability::{AgentAvailability, Availability};
 use crate::chat::session::build_handoff;
 use crate::chat::ChatBackend;
 use crate::model_catalog::ModelCatalog;
@@ -29,6 +30,21 @@ use crate::window::sidebar_model::{
 const ACTION: &str = "win.thread-menu";
 /// The never-enabled twin that disabled items point at.
 const ACTION_OFF: &str = "win.thread-menu-off";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchRoute {
+    Switch,
+    Park,
+    Continue,
+}
+
+fn switch_route(has_session: bool, own: &Availability) -> SwitchRoute {
+    match (has_session, own) {
+        (true, _) => SwitchRoute::Switch,
+        (false, Availability::Ready(_) | Availability::Detecting) => SwitchRoute::Park,
+        (false, Availability::Missing | Availability::Disabled) => SwitchRoute::Continue,
+    }
+}
 
 /// A `gio::Menu` for `entries`: sections as sections, submenus as submenus, items as items. A
 /// disabled submenu (nothing to hand over, no agent ready) is a greyed-out item: GTK cannot
@@ -382,10 +398,26 @@ impl AgentTerminalWindow {
         model: Option<String>,
         effort: Option<String>,
     ) {
+        if let Some(owner) = super::threads::thread_owner(thread).filter(|w| w != &*self.obj()) {
+            owner.imp().switch_thread_to(thread, driver, model, effort);
+            owner.present();
+            return;
+        }
         let Some(_page) = self.open_thread(thread, true) else {
             return;
         };
-        if self.slot_of(thread).and_then(|s| s.get()).is_some() {
+        let Some(slot) = self.slot_of(thread) else {
+            return;
+        };
+        let route = switch_route(
+            slot.get().is_some(),
+            &AgentAvailability::shared().get(slot.driver()),
+        );
+        if route == SwitchRoute::Continue {
+            self.switch_or_continue_with(thread, driver, model, effort);
+            return;
+        }
+        if route == SwitchRoute::Switch {
             // Mid-turn, ask first: the switch stops the turn.
             let id = thread.to_owned();
             self.when_not_busy(thread, move |imp| {
@@ -464,6 +496,10 @@ impl AgentTerminalWindow {
     /// Hides (or brings back) a thread. Archiving closes its page; the thread stays in the store
     /// and behind the sidebar's "Show archived" toggle.
     fn set_thread_archived(&self, thread: &str, archived: bool) {
+        if let Some(owner) = super::threads::thread_owner(thread).filter(|w| w != &*self.obj()) {
+            owner.imp().set_thread_archived(thread, archived);
+            return;
+        }
         // Archiving ends a running turn like closing does: ask first, and do nothing if declined.
         let key = RowKey::Thread(thread.to_owned());
         if archived && self.row_is_busy(&key) {
@@ -557,6 +593,19 @@ fn continued_title(source: &str, driver: Driver) -> String {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn switching_a_thread_whose_agent_is_missing_forks() {
+        for (state, without_session) in [
+            (Availability::Ready("/bin/claude".into()), SwitchRoute::Park),
+            (Availability::Detecting, SwitchRoute::Park),
+            (Availability::Missing, SwitchRoute::Continue),
+            (Availability::Disabled, SwitchRoute::Continue),
+        ] {
+            assert_eq!(switch_route(false, &state), without_session, "{state:?}");
+            assert_eq!(switch_route(true, &state), SwitchRoute::Switch, "{state:?}");
+        }
+    }
     use crate::window::sidebar_model::MenuAgent;
 
     #[test]
@@ -880,7 +929,10 @@ pub(super) mod tests {
         assert_eq!(imp.thread_title_of(&thread), "Changed elsewhere");
 
         // Switch, for a thread that is not open: it is opened, and the switch waits for its
-        // session.
+        // session. A test scan marks every CLI Missing: model the startup interval where the
+        // source agent is still being detected, rather than a definitively missing agent.
+        let own_before = availability.get(Driver::Claude);
+        availability.set(Driver::Claude, Availability::Detecting);
         imp.run_thread_action(ThreadAction::SwitchTo {
             thread: thread.clone(),
             driver: Driver::Codex,
@@ -897,6 +949,25 @@ pub(super) mod tests {
             Some((Driver::Codex, Some("gpt-5".into()), None)),
             "the switch waits for the session"
         );
+        settle(&|| {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .any(|c| c.thread == thread && c.view.is_some())
+        });
+        assert_eq!(
+            chat_of(&thread).and_then(|c| c.2),
+            Some((Driver::Codex, Some("gpt-5".into()), None)),
+            "building the view while detecting must keep the parked switch"
+        );
+        availability.set(Driver::Claude, Availability::Missing);
+        assert_eq!(
+            chat_of(&thread).and_then(|c| c.2),
+            None,
+            "a definitive scan failure must cancel the parked switch"
+        );
+        availability.set(Driver::Claude, own_before);
 
         // Delete: the page closes and the thread leaves the store, its history with it.
         imp.delete_thread_now(&thread);

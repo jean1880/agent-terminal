@@ -817,6 +817,12 @@ impl StoreHandle {
         self.reader().new_id()
     }
 
+    /// Removes app metadata on the same writer as the thread's events.
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        let key = key.to_owned();
+        self.write("remove app metadata", None, move |s| s.delete_meta(&key))
+    }
+
     pub fn append_event(
         &self,
         thread: &str,
@@ -1009,6 +1015,32 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, std::path::PathBuf, StoreHandle) {
         setup_with(WriterConfig::default())
+    }
+
+    #[test]
+    fn pending_prompt_and_metadata_deletion_follow_the_message_writer() {
+        let (_dir, _path, handle) = setup();
+        let t = create(&handle);
+        let saved = t.clone();
+        handle
+            .write("save an unsent prompt", Some(&t), move |s| {
+                s.set_pending_prompt(&saved, "later")
+            })
+            .unwrap();
+        handle
+            .append_user_message_with_id(&t, None, "queued-item", "later")
+            .unwrap();
+        assert_eq!(
+            handle
+                .read(|s| s.meta(&crate::store::pending_prompt_key(&t)).unwrap())
+                .unwrap(),
+            None
+        );
+        handle
+            .write("save test metadata", None, |s| s.set_meta("test", "value"))
+            .unwrap();
+        handle.delete_meta("test").unwrap();
+        assert_eq!(handle.read(|s| s.meta("test").unwrap()).unwrap(), None);
     }
 
     fn create(handle: &StoreHandle) -> String {
