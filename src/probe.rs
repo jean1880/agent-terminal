@@ -2,6 +2,7 @@
 //! onto one process, and joining a fixed number of background tasks.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::agent_proc::AgentEnv;
@@ -40,41 +41,70 @@ impl ProbeTargets {
 }
 
 /// Callers waiting for one in-flight probe's result. A probe is expensive (a process), so the
-/// first caller starts it and the rest join it.
+/// first caller starts it and callers with the same target join it. Other targets wait for
+/// their own probe, coalesced by target and run in arrival order.
+/// Serial probes avoid overlapping processes; each target's wait is bounded by the probes' own timeouts.
 pub struct InFlight<R> {
-    waiters: RefCell<Option<Vec<Waiter<R>>>>,
+    running: RefCell<Option<Flight<R>>>,
+    queued: RefCell<VecDeque<Flight<R>>>,
 }
 
 type Waiter<R> = Box<dyn FnOnce(&R)>;
 
+struct Flight<R> {
+    target: ProbeTarget,
+    waiters: Vec<Waiter<R>>,
+}
+
 impl<R> InFlight<R> {
     pub const fn new() -> Self {
         Self {
-            waiters: RefCell::new(None),
+            running: RefCell::new(None),
+            queued: RefCell::new(VecDeque::new()),
         }
     }
 
     /// Registers `done`. True when the caller must start the probe (none was running).
-    pub fn join(&self, done: impl FnOnce(&R) + 'static) -> bool {
-        let mut waiters = self.waiters.borrow_mut();
-        match waiters.as_mut() {
-            Some(list) => {
-                list.push(Box::new(done));
+    pub fn join(&self, target: &ProbeTarget, done: impl FnOnce(&R) + 'static) -> bool {
+        let mut running = self.running.borrow_mut();
+        match running.as_mut() {
+            Some(flight) if flight.target == *target => {
+                flight.waiters.push(Box::new(done));
+                false
+            }
+            Some(_) => {
+                let mut queued = self.queued.borrow_mut();
+                if let Some(flight) = queued.iter_mut().find(|f| f.target == *target) {
+                    flight.waiters.push(Box::new(done));
+                } else {
+                    queued.push_back(Flight {
+                        target: target.clone(),
+                        waiters: vec![Box::new(done)],
+                    });
+                }
                 false
             }
             None => {
-                *waiters = Some(vec![Box::new(done)]);
+                *running = Some(Flight {
+                    target: target.clone(),
+                    waiters: vec![Box::new(done)],
+                });
                 true
             }
         }
     }
 
-    /// Hands `result` to every waiter and clears the slot for the next probe.
-    pub fn finish(&self, result: &R) {
-        let waiters = self.waiters.borrow_mut().take().unwrap_or_default();
-        for w in waiters {
+    /// Hands `result` only to this target's waiters. Returns the next target the owner must
+    /// probe, reserved before callbacks run so a reentrant caller joins rather than overtakes it.
+    pub fn finish(&self, result: &R) -> Option<ProbeTarget> {
+        let finished = self.running.borrow_mut().take();
+        let next = self.queued.borrow_mut().pop_front();
+        let target = next.as_ref().map(|f| f.target.clone());
+        *self.running.borrow_mut() = next;
+        for w in finished.into_iter().flat_map(|f| f.waiters) {
             w(result);
         }
+        target
     }
 }
 
@@ -136,17 +166,79 @@ mod tests {
         let flight: InFlight<u8> = InFlight::new();
         let got = Rc::new(RefCell::new(Vec::new()));
         let mut starts = 0;
+        let target = ProbeTarget::default();
         for i in 0..3 {
             let got = got.clone();
-            if flight.join(move |r| got.borrow_mut().push((i, *r))) {
+            if flight.join(&target, move |r| got.borrow_mut().push((i, *r))) {
                 starts += 1;
             }
         }
         assert_eq!(starts, 1);
-        flight.finish(&7);
+        assert_eq!(flight.finish(&7), None);
         assert_eq!(*got.borrow(), [(0, 7), (1, 7), (2, 7)]);
         // Cleared: the next caller starts a new probe.
-        assert!(flight.join(|_| {}));
+        assert!(flight.join(&target, |_| {}));
+    }
+
+    #[test]
+    fn a_caller_with_another_target_gets_its_own_probe() {
+        let flight: InFlight<String> = InFlight::new();
+        let got = Rc::new(RefCell::new(Vec::new()));
+        let a = ProbeTarget {
+            program: "old".into(),
+            ..Default::default()
+        };
+        let b = ProbeTarget {
+            program: "new".into(),
+            ..Default::default()
+        };
+        let mut c = b.clone();
+        c.env.unset.push("HOME".into());
+        for (i, target) in [(0, &a), (1, &b), (2, &b), (3, &c), (4, &a)] {
+            let got = got.clone();
+            assert_eq!(
+                flight.join(target, move |r| got.borrow_mut().push((i, r.clone()))),
+                i == 0
+            );
+        }
+        let mut target = Some(a.clone());
+        let mut starts = Vec::new();
+        while let Some(t) = target {
+            starts.push(t.clone());
+            // Fake runner: a target's program and environment determine its result.
+            target = flight.finish(&format!("{}:{:?}", t.program, t.env.unset));
+        }
+        assert_eq!(starts, [a, b, c]);
+        assert_eq!(
+            *got.borrow(),
+            [
+                (0, "old:[]".into()),
+                (4, "old:[]".into()),
+                (1, "new:[]".into()),
+                (2, "new:[]".into()),
+                (3, "new:[\"HOME\"]".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reentrant_waiter_joins_the_reserved_next_probe() {
+        let flight = Rc::new(InFlight::<u8>::new());
+        let a = ProbeTarget::default();
+        let b = ProbeTarget {
+            program: "next".into(),
+            ..Default::default()
+        };
+        let got = Rc::new(Cell::new(0));
+        let (f, target, g) = (flight.clone(), b.clone(), got.clone());
+        assert!(flight.join(&a, move |_| {
+            assert!(!f.join(&target, move |r| g.set(*r)));
+        }));
+        assert!(!flight.join(&b, |_| {}));
+        assert_eq!(flight.finish(&1), Some(b));
+        assert_eq!(got.get(), 0);
+        assert_eq!(flight.finish(&2), None);
+        assert_eq!(got.get(), 2);
     }
 
     #[test]

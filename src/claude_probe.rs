@@ -26,7 +26,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::agent_proc::{AgentEnv, AgentProcess, SpawnSpec};
-use crate::probe::InFlight;
+use crate::probe::{InFlight, ProbeTarget};
 
 const INIT_ID: &str = "catalog-1";
 const USAGE_ID: &str = "catalog-usage";
@@ -238,16 +238,22 @@ thread_local! {
 /// loop. The model catalog and the usage indicator both call this, so one refresh costs one
 /// Claude process.
 pub fn probe_shared(program: &str, env: &AgentEnv, done: impl FnOnce(&ProbeResult) + 'static) {
-    if !IN_FLIGHT.with(|f| f.join(done)) {
+    let target = ProbeTarget {
+        program: program.to_owned(),
+        env: env.clone(),
+    };
+    if !IN_FLIGHT.with(|f| f.join(&target, done)) {
         return;
     }
-    let (program, env) = (program.to_owned(), env.clone());
     glib::spawn_future_local(async move {
-        let result = probe_claude(&program, &env).await;
-        if let Err(why) = &result {
-            warn!(why, "claude probe failed");
+        let mut next = Some(target);
+        while let Some(target) = next {
+            let result = probe_claude(&target.program, &target.env).await;
+            if let Err(why) = &result {
+                warn!(why, "claude probe failed");
+            }
+            next = IN_FLIGHT.with(|f| f.finish(&result));
         }
-        IN_FLIGHT.with(|f| f.finish(&result));
     });
 }
 

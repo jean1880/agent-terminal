@@ -2481,14 +2481,36 @@ impl Inner {
             return;
         }
         if let Some(handle) = self.approval() {
-            if handle.respond_with_rule(request, decision, custom_rule.clone()) {
-                self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+            let keeps_rule = matches!(decision, Decision::AllowForSession | Decision::AllowAlways);
+            let responded = if keeps_rule {
+                let weak = Rc::downgrade(self);
+                let answered = request.to_owned();
+                handle.respond_with_rule_then(
+                    request,
+                    decision,
+                    custom_rule.clone(),
+                    move |decision| {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.emit(
+                                Envelope::new(Event::ApprovalResolved { decision })
+                                    .request(answered),
+                            );
+                        }
+                    },
+                )
+            } else {
+                handle.respond_with_rule(request, decision, custom_rule.clone())
+            };
+            if responded {
+                if !keeps_rule {
+                    self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+                }
                 // Stop turn: the hook was denied; end the turn as the stop button does (D4).
                 if decision == Decision::Cancel {
                     self.command(Command::Interrupt);
                 }
-                return;
             }
+            return; // the hook owns agy's answers; a taken request is no longer pending
         }
         // App-owned scope (D1): the rule is recorded here; the agent only ever hears a plain
         // allow (Claude without `updatedPermissions`, Codex `accept`). No rule, no claim of one:
@@ -5775,6 +5797,94 @@ mod tests {
             }));
             let reply = agent_core::approval::parse_reply(&reply).expect("reply");
             assert_eq!(reply.decision, Decision::Deny, "agy hears a deny");
+        });
+    }
+
+    #[test]
+    fn a_second_or_expired_agy_answer_sends_no_approval_command() {
+        for expired in [false, true] {
+            in_loop(|ctx| {
+                use std::io::Write as _;
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, seen) = make_sink();
+                let handle = bound_handle(tmp.path());
+                let log: Log = Rc::default();
+                let session = ChatSession::new(
+                    FakeAdapter::boxed(Driver::Agy, &log),
+                    scripted(tmp.path(), "exec sleep 30"),
+                    store,
+                    thread,
+                    sink,
+                    Some(handle.clone()),
+                );
+                let mut hook =
+                    std::os::unix::net::UnixStream::connect(handle.socket_path()).expect("connect");
+                let query = agent_core::approval::ApprovalQuery {
+                    id: "h1".into(),
+                    conversation_id: "c1".into(),
+                    tool: "run_command".into(),
+                    args: serde_json::json!({"CommandLine": "ls"}),
+                    cwd: None,
+                };
+                writeln!(
+                    hook,
+                    "{}",
+                    agent_core::approval::encode_query(&query).expect("encode")
+                )
+                .expect("send");
+                assert!(pump_until(ctx, 10, || handle.has_pending("h1")));
+                if expired {
+                    handle.expire_all("the approval deadline passed");
+                } else {
+                    session.respond_approval("h1", Decision::AllowForSession);
+                }
+                session.respond_approval("h1", Decision::AllowAlways);
+                assert!(!log
+                    .borrow()
+                    .iter()
+                    .any(|c| matches!(c, Command::Approve { .. })));
+                if !expired {
+                    assert!(pump_until(ctx, 10, || resolution(&seen, "h1")
+                        == Some(Decision::AllowForSession)));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_hookless_agy_answer_reports_unsupported_and_never_resolves() {
+        in_loop(|_| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            for decision in [
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::AllowAlways,
+                Decision::Deny,
+                Decision::Cancel,
+            ] {
+                let before = seen.borrow().len();
+                session.respond_approval("gone", decision);
+                assert!(
+                    seen.borrow()[before..].iter().any(|e| matches!(&e.event,
+                    Event::Error { message } if message.contains("not supported"))),
+                    "{decision:?}"
+                );
+                assert_eq!(resolution(&seen, "gone"), None);
+                assert!(session.inner.session_rules.borrow().rules.is_empty());
+            }
         });
     }
 

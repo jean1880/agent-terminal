@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::agent_proc::{AgentEnv, AgentProcess, SpawnSpec};
-use crate::probe::InFlight;
+use crate::probe::{InFlight, ProbeTarget};
 
 const INIT_ID: u64 = 1;
 const MODELS_ID: u64 = 2;
@@ -172,16 +172,22 @@ thread_local! {
 /// Runs [`probe_codex`], or joins the one already running; `done` gets the result on the main
 /// loop. The catalogue and the usage indicator both call this, so one refresh costs one process.
 pub fn probe_shared(program: &str, env: &AgentEnv, done: impl FnOnce(&ProbeResult) + 'static) {
-    if !IN_FLIGHT.with(|f| f.join(done)) {
+    let target = ProbeTarget {
+        program: program.to_owned(),
+        env: env.clone(),
+    };
+    if !IN_FLIGHT.with(|f| f.join(&target, done)) {
         return;
     }
-    let (program, env) = (program.to_owned(), env.clone());
     glib::spawn_future_local(async move {
-        let result = probe_codex(&program, &env).await;
-        if let Err(why) = &result {
-            warn!(why, "codex probe failed");
+        let mut next = Some(target);
+        while let Some(target) = next {
+            let result = probe_codex(&target.program, &target.env).await;
+            if let Err(why) = &result {
+                warn!(why, "codex probe failed");
+            }
+            next = IN_FLIGHT.with(|f| f.finish(&result));
         }
-        IN_FLIGHT.with(|f| f.finish(&result));
     });
 }
 

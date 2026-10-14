@@ -483,6 +483,8 @@ struct ServerInner {
     listener: gio::SocketListener,
     sink: RefCell<Option<Sink>>,
     pending: RefCell<HashMap<String, Pending>>,
+    /// Expiring a process also invalidates grants whose reply is still being written.
+    response_generation: Cell<u64>,
     mode: Cell<Mode>,
     workspaces: Vec<PathBuf>,
     /// The user's home, for the dotfile rule of [`sensitive_target`]; `None` applies no such rule.
@@ -654,6 +656,7 @@ impl ApprovalHandle {
             listener: listener.clone(),
             sink: RefCell::new(None),
             pending: RefCell::new(HashMap::new()),
+            response_generation: Cell::new(0),
             mode: Cell::new(mode),
             workspaces: vec![workspace.to_owned()],
             home,
@@ -740,12 +743,31 @@ impl ApprovalHandle {
         decision: Decision,
         custom_rule: Option<crate::always_allow::Rule>,
     ) -> bool {
+        self.respond_with_rule_then(request, decision, custom_rule, |_| {})
+    }
+
+    /// As above, notifying the session once the socket accepted the complete reply.
+    /// This does not prove agy read it. A remembering answer whose write fails or whose server
+    /// expires emits an expiry instead, so its card never claims a grant.
+    pub fn respond_with_rule_then(
+        &self,
+        request: &str,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+        done: impl FnOnce(Decision) + 'static,
+    ) -> bool {
         let Some(pending) = self.inner.pending.borrow_mut().remove(request) else {
             return false;
         };
+        let remember_decision = decision;
         let mut decision = decision;
-        if matches!(decision, Decision::AllowForSession | Decision::AllowAlways)
-            && !self.inner.remember(&pending, decision, custom_rule)
+        let keeps_rule = matches!(decision, Decision::AllowForSession | Decision::AllowAlways);
+        // Judge the choice before replying, but keep nothing until the write has succeeded.
+        if keeps_rule
+            && self
+                .inner
+                .rule_for(&pending, decision, custom_rule.clone())
+                .is_err()
         {
             decision = Decision::Allow;
         }
@@ -754,7 +776,43 @@ impl ApprovalHandle {
             Decision::Cancel => (Decision::Deny, Some("The user stopped the turn".to_owned())),
             d => (d, None),
         };
-        reply(pending.conn, ApprovalReply { decision, reason });
+        let weak = Rc::downgrade(&self.inner);
+        // Keep the original session's sink even if a restart drops this server mid-write.
+        let sink = self.inner.sink.borrow().clone();
+        let generation = self.inner.response_generation.get();
+        let request = request.to_owned();
+        reply_with_done(
+            pending.conn.clone(),
+            ApprovalReply { decision, reason },
+            move |written| {
+                let expire = || {
+                    if keeps_rule {
+                        if let Some(sink) = &sink {
+                            sink(masked_for_view(
+                                Envelope::new(Event::ApprovalExpired).request(request.clone()),
+                            ));
+                            sink(masked_for_view(
+                                Envelope::new(Event::Notice {
+                                    text: "The agent stopped waiting; nothing was kept.".to_owned(),
+                                })
+                                .request(request.clone()),
+                            ));
+                        }
+                    }
+                };
+                let Some(inner) = weak.upgrade() else {
+                    expire();
+                    return;
+                };
+                if written && generation == inner.response_generation.get() {
+                    let kept =
+                        !keeps_rule || inner.remember(&pending, remember_decision, custom_rule);
+                    done(if kept { decision } else { Decision::Allow });
+                } else {
+                    expire();
+                }
+            },
+        );
         true
     }
 
@@ -766,6 +824,9 @@ impl ApprovalHandle {
 
     /// Denies and expires everything still pending (the agent exited or restarted).
     pub fn expire_all(&self, reason: &str) {
+        self.inner
+            .response_generation
+            .set(self.inner.response_generation.get().wrapping_add(1));
         let drained: Vec<(String, Pending)> = self.inner.pending.borrow_mut().drain().collect();
         for (id, pending) in drained {
             reply(
@@ -782,6 +843,27 @@ impl ApprovalHandle {
 }
 
 impl ServerInner {
+    fn rule_for(
+        &self,
+        pending: &Pending,
+        decision: Decision,
+        custom: Option<crate::always_allow::Rule>,
+    ) -> Result<crate::always_allow::Rule, String> {
+        let ctx = self
+            .context(pending.cwd.as_deref())
+            .ok_or_else(|| "no workspace is available".to_owned())?;
+        crate::always_allow::decide_as_shown(
+            pending.action.as_ref(),
+            custom,
+            if decision == Decision::AllowAlways {
+                crate::always_allow::Scope::Always
+            } else {
+                crate::always_allow::Scope::Session
+            },
+            &ctx,
+            pending.shown_folder.as_deref(),
+        )
+    }
     /// Where a call is judged by the rules: agy, the session's workspace, and the call's cwd (the
     /// workspace when agy names none).
     fn context<'a>(&'a self, cwd: Option<&'a str>) -> Option<crate::always_allow::Context<'a>> {
@@ -843,13 +925,7 @@ impl ServerInner {
         } else {
             Scope::Session
         };
-        let rule = match crate::always_allow::decide_as_shown(
-            pending.action.as_ref(),
-            custom,
-            scope,
-            &ctx,
-            pending.shown_folder.as_deref(),
-        ) {
+        let rule = match self.rule_for(pending, decision, custom) {
             Ok(rule) => {
                 let warnings = rule.warnings(scope, Some(&ctx));
                 if let Some(text) = crate::always_allow::kept_with_warnings(&rule, &warnings) {
@@ -973,21 +1049,50 @@ fn spawn_accept_loop(weak: Weak<ServerInner>, listener: gio::SocketListener) {
 
 /// Writes one reply line, then closes the connection. Never blocks, never panics.
 fn reply(conn: gio::SocketConnection, reply: ApprovalReply) {
+    reply_with_done(conn, reply, |_| {});
+}
+
+/// Calls `done` only after the entire reply was written (or the write failed).
+fn reply_with_done(
+    conn: gio::SocketConnection,
+    reply: ApprovalReply,
+    done: impl FnOnce(bool) + 'static,
+) {
     glib::spawn_future_local(async move {
-        match approval::encode_reply(&reply) {
+        let written = match approval::encode_reply(&reply) {
             Ok(mut line) => {
                 line.push('\n');
                 let out = conn.output_stream();
-                if let Err((_, e)) = out.write_all_future(line.into_bytes(), IO_PRIORITY).await {
-                    warn!(error = %e.message(), "approval reply could not be written");
-                }
+                reply_written(out.write_all_future(line.into_bytes(), IO_PRIORITY).await)
             }
-            Err(e) => warn!(error = %e, "approval reply could not be encoded"),
-        }
+            Err(e) => {
+                warn!(error = %e, "approval reply could not be encoded");
+                false
+            }
+        };
+        done(written);
         if let Err(e) = conn.close_future(IO_PRIORITY).await {
             debug!(error = %e.message(), "approval connection close failed");
         }
     });
+}
+
+/// GIO represents a write that failed after some bytes as `Ok` with an attached error.
+/// A grant requires the socket to accept the entire line, including its newline, with no error.
+type ReplyWrite = Result<(Vec<u8>, usize, Option<glib::Error>), (Vec<u8>, glib::Error)>;
+
+fn reply_written(result: ReplyWrite) -> bool {
+    match result {
+        Ok((bytes, written, None)) if written == bytes.len() => true,
+        Ok((_, _, Some(e))) | Err((_, e)) => {
+            warn!(error = %e.message(), "approval reply could not be written");
+            false
+        }
+        Ok((_, _, None)) => {
+            warn!("approval reply was only partly written");
+            false
+        }
+    }
 }
 
 fn deny(conn: gio::SocketConnection, reason: &str) {
@@ -1111,7 +1216,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     let Some(inner) = weak.upgrade() else { return };
     let still_pending = inner.pending.borrow_mut().remove(&id);
     let Some(pending) = still_pending else {
-        return; // answered; `respond` replied and closed.
+        return; // answered; the reply future owns the write and close.
     };
     if outcome.is_err() {
         deny(pending.conn, "no answer in agent-terminal");
@@ -2193,6 +2298,8 @@ mod tests {
             drop(s);
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 2));
             assert_eq!(seen.borrow()[1].event, Event::ApprovalExpired);
+            assert!(!handle.has_pending("g1"));
+            assert!(!handle.respond("g1", Decision::AllowForSession));
 
             // expire_all denies what is pending when the agent exits.
             let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "g2"));
@@ -2201,6 +2308,277 @@ mod tests {
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
             assert_eq!(seen.borrow()[3].event, Event::ApprovalExpired);
+        });
+    }
+
+    #[test]
+    fn a_partial_reply_is_not_a_successful_write() {
+        let line = b"reply\n".to_vec();
+        let error = || glib::Error::new(gio::IOErrorEnum::Closed, "synthetic closed stream");
+        assert!(reply_written(Ok((line.clone(), line.len(), None))));
+        assert!(!reply_written(Ok((line.clone(), line.len() - 1, None))));
+        // GIO reports a partial write with an error inside Ok, not in the outer Err.
+        assert!(!reply_written(Ok((line.clone(), 1, Some(error())))));
+        assert!(!reply_written(Err((line, error()))));
+    }
+
+    #[test]
+    fn a_grant_is_not_kept_when_the_hook_client_is_gone() {
+        for decision in [Decision::AllowForSession, Decision::AllowAlways] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+                let rules = tmp.path().join("always.json");
+                handle.use_always_rules(rules.clone());
+                let mut client = UnixStream::connect(handle.socket_path()).expect("connect");
+                let line = approval::encode_query(&with_id(cmd("ls -la"), "gone")).expect("encode");
+                writeln!(client, "{line}").expect("send");
+                assert!(pump_until(ctx, 10, || handle.has_pending("gone")));
+                drop(client);
+                // Answer before the EOF watch gets another main-loop iteration: the write
+                // completion must protect the rule even in this race.
+                assert!(handle.respond("gone", decision));
+                assert!(
+                    !handle.inner.rules_allow(
+                        &crate::always_allow::Action::of("run_command", &cmd("ls -la").args)
+                            .unwrap(),
+                        None
+                    ),
+                    "nothing kept synchronously"
+                );
+                assert!(pump_until(ctx, 10, || {
+                    seen.borrow().iter().any(|e| matches!(
+                    &e.event, Event::Notice { text } if text.contains("stopped waiting") && text.contains("nothing was kept")
+                ))
+                }));
+                assert!(!handle.inner.rules_allow(
+                    &crate::always_allow::Action::of("run_command", &cmd("ls -la").args).unwrap(),
+                    None
+                ));
+                assert!(!rules.exists(), "Always was never written");
+            });
+        }
+    }
+
+    #[test]
+    fn a_failed_reply_keeps_no_rule_even_with_a_live_client() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let rules = tmp.path().join("always.json");
+            handle.use_always_rules(rules.clone());
+            let _rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "fail"));
+            assert!(pump_until(ctx, 10, || handle.has_pending("fail")));
+            // Force a deterministic write error independently of the EOF watch.
+            handle.inner.pending.borrow()["fail"]
+                .conn
+                .output_stream()
+                .close(gio::Cancellable::NONE)
+                .expect("close output");
+            let (got, s) = (Rc::new(Cell::new(false)), seen.clone());
+            let g = got.clone();
+            assert!(handle.respond_with_rule_then(
+                "fail",
+                Decision::AllowAlways,
+                None,
+                move |decision| {
+                    g.set(true);
+                    s.borrow_mut()
+                        .push(Envelope::new(Event::ApprovalResolved { decision }).request("fail"));
+                }
+            ));
+            assert!(pump_until(ctx, 10, || seen.borrow().iter().any(
+                |e| matches!(
+                    &e.event, Event::Notice { text } if text.contains("nothing was kept")
+                )
+            )));
+            assert!(!handle.inner.rules_allow(
+                &crate::always_allow::Action::of("run_command", &cmd("ls").args).unwrap(),
+                None
+            ));
+            assert!(!rules.exists());
+            assert!(
+                !got.get(),
+                "a failed write must not resolve the card as allowed"
+            );
+            assert!(!seen
+                .borrow()
+                .iter()
+                .any(|e| matches!(e.event, Event::ApprovalResolved { .. })));
+            assert!(seen
+                .borrow()
+                .iter()
+                .any(|e| e.event == Event::ApprovalExpired));
+        });
+    }
+
+    #[test]
+    fn a_live_hook_keeps_its_rule_only_after_the_reply_is_written() {
+        for decision in [Decision::AllowForSession, Decision::AllowAlways] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (handle, _) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+                let rules = tmp.path().join("always.json");
+                handle.use_always_rules(rules.clone());
+                let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "live"));
+                assert!(pump_until(ctx, 10, || handle.has_pending("live")));
+                let action =
+                    crate::always_allow::Action::of("run_command", &cmd("ls").args).unwrap();
+                let completed = Rc::new(Cell::new(None));
+                let c = completed.clone();
+                assert!(
+                    handle.respond_with_rule_then("live", decision, None, move |d| c.set(Some(d)))
+                );
+                assert_eq!(completed.get(), None);
+                assert!(
+                    !handle.inner.rules_allow(&action, None),
+                    "write not completed yet"
+                );
+                assert_eq!(wait_reply(ctx, &rx).decision, decision);
+                assert!(pump_until(ctx, 10, || completed.get() == Some(decision)));
+                assert!(pump_until(ctx, 10, || handle
+                    .inner
+                    .rules_allow(&action, None)));
+                if decision == Decision::AllowAlways {
+                    assert!(pump_until(ctx, 10, || rules.exists()));
+                } else {
+                    assert!(!rules.exists());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn an_expired_agent_cannot_keep_a_grant_from_an_unfinished_reply() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let rules = tmp.path().join("always.json");
+            handle.use_always_rules(rules.clone());
+            let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "old"));
+            assert!(pump_until(ctx, 10, || handle.has_pending("old")));
+            assert!(handle.respond("old", Decision::AllowAlways));
+            handle.expire_all("the agent exited");
+            // A write may still succeed, but it belongs to the process that expired.
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::AllowAlways);
+            assert!(pump_until(ctx, 10, || seen.borrow().iter().any(
+                |e| matches!(
+                    &e.event, Event::Notice { text } if text.contains("nothing was kept")
+                )
+            )));
+            assert!(!handle.inner.rules_allow(
+                &crate::always_allow::Action::of("run_command", &cmd("ls").args).unwrap(),
+                None
+            ));
+            assert!(!rules.exists());
+        });
+    }
+
+    #[test]
+    fn nonremembering_answers_show_no_dropped_grant_notice_when_the_agent_exits() {
+        for decision in [Decision::Allow, Decision::Deny, Decision::Cancel] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+                let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "once"));
+                assert!(pump_until(ctx, 10, || handle.has_pending("once")));
+                let conn = handle.inner.pending.borrow()["once"].conn.clone();
+                assert!(handle.respond("once", decision));
+                handle.expire_all("the agent exited");
+                let expected = if decision == Decision::Cancel {
+                    Decision::Deny
+                } else {
+                    decision
+                };
+                assert_eq!(wait_reply(ctx, &rx).decision, expected);
+                // The client can read before the server's write callback runs. Closing is
+                // scheduled after that callback, so await it before checking for no notice.
+                assert!(pump_until(ctx, 10, || conn.is_closed()));
+                assert!(!seen
+                    .borrow()
+                    .iter()
+                    .any(|e| matches!(e.event, Event::Notice { .. } | Event::ApprovalExpired)));
+            });
+        }
+    }
+
+    #[test]
+    fn a_remembering_answer_expires_if_its_server_is_dropped_during_the_write() {
+        for decision in [Decision::AllowForSession, Decision::AllowAlways] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+                let rules = tmp.path().join("always.json");
+                handle.use_always_rules(rules.clone());
+                let session = SessionRules::default();
+                handle.share_session_rules(session.clone());
+                let rx = client(handle.socket_path().to_owned(), with_id(cmd("ls"), "gone"));
+                assert!(pump_until(ctx, 10, || handle.has_pending("gone")));
+                let completed = Rc::new(Cell::new(false));
+                let c = completed.clone();
+                assert!(handle.respond_with_rule_then("gone", decision, None, move |_| c.set(true)));
+                let weak = Rc::downgrade(&handle.inner);
+                drop(handle);
+                assert!(
+                    weak.upgrade().is_none(),
+                    "the write must not keep the server alive"
+                );
+                // Acceptance by the socket does not establish agy read the reply or kept a grant.
+                assert_eq!(wait_reply(ctx, &rx).decision, decision);
+                assert!(pump_until(ctx, 10, || seen.borrow().iter().any(|e| e
+                    .request
+                    .as_deref()
+                    == Some("gone")
+                    && e.event == Event::ApprovalExpired)));
+                assert_eq!(
+                    seen.borrow()
+                        .iter()
+                        .filter(|e| e.event == Event::ApprovalExpired)
+                        .count(),
+                    1
+                );
+                assert!(seen.borrow().iter().any(|e| matches!(&e.event,
+                    Event::Notice { text } if text.contains("nothing was kept"))));
+                assert!(
+                    !completed.get(),
+                    "no successful resolution for a dropped server"
+                );
+                assert!(session.borrow().rules.is_empty());
+                assert!(!rules.exists());
+            });
+        }
+    }
+
+    #[test]
+    fn an_unrememberable_rule_is_reported_as_allowed_once() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, _) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let rules = tmp.path().join("always.json");
+            handle.use_always_rules(rules.clone());
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("ls; pwd"), "once"),
+            );
+            assert!(pump_until(ctx, 10, || handle.has_pending("once")));
+            let completed = Rc::new(Cell::new(None));
+            let c = completed.clone();
+            // Shell syntax cannot be kept, even if a caller asks to keep it.
+            assert!(
+                handle.respond_with_rule_then("once", Decision::AllowAlways, None, move |d| c
+                    .set(Some(d)))
+            );
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+            assert!(pump_until(ctx, 10, || completed.get().is_some()));
+            assert_eq!(completed.get(), Some(Decision::Allow));
+            assert!(handle
+                .inner
+                .session_rules
+                .borrow()
+                .borrow()
+                .rules
+                .is_empty());
+            assert!(!rules.exists());
         });
     }
 
