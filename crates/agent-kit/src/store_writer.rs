@@ -855,6 +855,25 @@ impl StoreHandle {
         Ok(item)
     }
 
+    /// Stores a queued prompt under the item id already shown in the view.
+    pub fn append_user_message_with_id(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        item: &str,
+        text: &str,
+    ) -> Result<()> {
+        let (t, pt, i, text) = (
+            thread.to_owned(),
+            provider_thread.map(str::to_owned),
+            item.to_owned(),
+            text.to_owned(),
+        );
+        self.write("store a message", Some(thread), move |s| {
+            s.append_user_message_with_id(&t, pt.as_deref(), &i, &text)
+        })
+    }
+
     pub fn mark_read(&self, thread: &str) -> Result<()> {
         let t = thread.to_owned();
         self.write("mark the thread read", Some(thread), move |s| {

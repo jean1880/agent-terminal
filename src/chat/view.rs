@@ -938,7 +938,8 @@ impl Inner {
         let weak = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
             let Some(inner) = weak.upgrade() else { return };
-            if !inner.backend.status().capabilities.context_usage {
+            let status = inner.backend.status();
+            if !status.alive || !status.capabilities.context_usage {
                 return;
             }
             inner
@@ -1610,6 +1611,163 @@ pub(crate) mod tests {
         assert!(agy.starts_with("Message Antigravity"), "{agy}");
         assert!(!agy.contains("Claude"));
         assert!(placeholder_text(&status_of(Driver::Codex)).starts_with("Message Codex"));
+    }
+
+    struct PendingInitSession {
+        session: Rc<crate::chat::session::ChatSession>,
+        store: Rc<agent_kit::store::Store>,
+        thread: String,
+        events: Rc<RefCell<Vec<Envelope>>>,
+    }
+
+    fn pending_init_session() -> PendingInitSession {
+        let store = Rc::new(agent_kit::store::Store::open_in_memory().expect("store"));
+        let thread = store.create_thread("/", None).expect("thread");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let session = crate::chat::session::ChatSession::new(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            agent_core::adapter::OpenSession {
+                program: "/bin/cat".into(),
+                extra_args: Vec::new(),
+                cwd: "/".into(),
+                model: None,
+                effort: None,
+                mode: Mode::Ask,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+            },
+            store.clone(),
+            thread.clone(),
+            Rc::new(move |env| received.borrow_mut().push(env.clone())),
+            None,
+        );
+        PendingInitSession {
+            session,
+            store,
+            thread,
+            events,
+        }
+    }
+
+    struct ControlLog {
+        session: Rc<crate::chat::session::ChatSession>,
+        asked: RefCell<Vec<Control>>,
+    }
+
+    impl ChatBackend for ControlLog {
+        fn send_prompt(&self, text: &str) {
+            self.session.send_prompt(text);
+        }
+        fn interrupt(&self) {
+            self.session.interrupt();
+        }
+        fn respond_approval(&self, request: &str, decision: Decision) {
+            self.session.respond_approval(request, decision);
+        }
+        fn answer_questions(&self, request: &str, answers: serde_json::Value) {
+            self.session.answer_questions(request, answers);
+        }
+        fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
+            self.session.switch(driver, model, effort);
+        }
+        fn reload_session(&self) {
+            self.session.reload_session();
+        }
+        fn set_mode(&self, mode: Mode) {
+            self.session.set_mode(mode);
+        }
+        fn control(&self, control: Control) -> String {
+            self.asked.borrow_mut().push(control.clone());
+            self.session.control(control)
+        }
+        fn status(&self) -> SessionStatus {
+            self.session.status()
+        }
+    }
+
+    #[test]
+    fn an_unacknowledged_initialize_is_answered_on_shutdown() {
+        crate::testutil::in_loop(|_| {
+            let fixture = pending_init_session();
+            fixture.session.shutdown(false);
+            let replies: Vec<_> = fixture
+                .events
+                .borrow()
+                .iter()
+                .filter_map(|env| {
+                    if let Event::ControlResult { ok, error } = &env.event {
+                        Some((env.request.clone(), ok.clone(), error.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                replies,
+                [(
+                    Some("init-1".to_owned()),
+                    None,
+                    Some("agent exited".to_owned())
+                )]
+            );
+            assert!(!fixture
+                .store
+                .events(&fixture.thread, None, 1000)
+                .expect("events")
+                .iter()
+                .any(|(_, env)| matches!(env.event, Event::Error { .. })));
+        });
+    }
+
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn a_crash_does_not_store_a_context_poll_error() {
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        let context = glib::MainContext::default();
+        let _guard = context.acquire().expect("main context");
+        let fixture = pending_init_session();
+        let backend = Rc::new(ControlLog {
+            session: fixture.session.clone(),
+            asked: RefCell::new(Vec::new()),
+        });
+        let view = ChatView::new(backend.clone());
+        let inner = view.imp().inner.borrow().as_ref().expect("view").clone();
+        // It was alive when the idle poll was scheduled, then died before the callback.
+        inner.poll_context_soon();
+        fixture.session.shutdown(false);
+        let before = fixture
+            .store
+            .events(&fixture.thread, None, 1000)
+            .expect("events")
+            .len();
+        while context.pending() {
+            context.iteration(false);
+        }
+        // Shutdown answers the unacknowledged initialize handshake; that is not a context poll.
+        assert!(fixture.events.borrow().iter().any(|env| env.request.as_deref() == Some("init-1")
+            && matches!(&env.event, Event::ControlResult { error: Some(error), .. } if error == "agent exited")));
+        assert!(
+            !backend
+                .asked
+                .borrow()
+                .iter()
+                .any(|control| matches!(control, Control::ContextUsage)),
+            "the dead process was never polled for context"
+        );
+        let stored = fixture
+            .store
+            .events(&fixture.thread, None, 1000)
+            .expect("events");
+        assert!(
+            !stored
+                .iter()
+                .any(|(_, env)| matches!(env.event, Event::Error { .. })),
+            "a crash must not store a context-poll error"
+        );
+        assert_eq!(stored.len(), before);
     }
 
     /// A backend whose status the test changes, as a session does on a switch.
