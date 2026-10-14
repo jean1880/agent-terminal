@@ -60,6 +60,8 @@ pub fn escape(text: &str) -> String {
 /// One open list level: `Some(n)` is ordered with the next number.
 struct ListLevel {
     next: Option<u64>,
+    item_has_text: bool,
+    text_column: usize,
 }
 
 #[derive(Default)]
@@ -110,6 +112,9 @@ impl Builder {
         let kind = self.text_kind();
         self.begin_text(kind);
         self.markup.push_str(s);
+        if let Some(list) = self.lists.last_mut() {
+            list.item_has_text |= !s.is_empty();
+        }
     }
 
     fn push_markup(&mut self, s: &str) {
@@ -119,6 +124,9 @@ impl Builder {
         let kind = self.text_kind();
         self.begin_text(kind);
         self.markup.push_str(s);
+        if let Some(list) = self.lists.last_mut() {
+            list.item_has_text |= !s.is_empty();
+        }
     }
 
     fn newline_in_block(&mut self) {
@@ -209,6 +217,10 @@ fn start(b: &mut Builder, tag: Tag) {
         Tag::Paragraph => {
             if b.lists.is_empty() {
                 b.flush_text();
+            } else if b.lists.last().is_some_and(|list| list.item_has_text) {
+                let column = b.lists.last().map_or(0, |list| list.text_column);
+                b.newline_in_block();
+                b.push_markup(&" ".repeat(column));
             }
         }
         Tag::Heading { level, .. } => {
@@ -252,21 +264,30 @@ fn start(b: &mut Builder, tag: Tag) {
             } else {
                 b.newline_in_block();
             }
-            b.lists.push(ListLevel { next: first });
+            b.lists.push(ListLevel {
+                next: first,
+                item_has_text: false,
+                text_column: 0,
+            });
         }
         Tag::Item => {
             b.newline_in_block();
             let depth = b.lists.len().saturating_sub(1);
             let indent = "    ".repeat(depth);
             let bullet = match b.lists.last_mut() {
-                Some(ListLevel { next: Some(n) }) => {
+                Some(ListLevel { next: Some(n), .. }) => {
                     let s = format!("{n}.");
                     *n += 1;
                     s
                 }
                 _ => if depth == 0 { "•" } else { "◦" }.to_owned(),
             };
-            b.push_markup(&format!("{indent}{bullet} "));
+            let prefix = format!("{indent}{bullet} ");
+            b.push_markup(&prefix);
+            if let Some(list) = b.lists.last_mut() {
+                list.item_has_text = false;
+                list.text_column = prefix.chars().count();
+            }
         }
         Tag::Emphasis => b.push_markup("<i>"),
         Tag::Strong => b.push_markup("<b>"),
@@ -325,7 +346,9 @@ fn end(b: &mut Builder, tag: TagEnd) {
         }
         TagEnd::List(_) => {
             b.lists.pop();
-            if b.lists.is_empty() {
+            if let Some(parent) = b.lists.last_mut() {
+                parent.item_has_text = true;
+            } else {
                 b.flush_text();
             }
         }
@@ -395,6 +418,44 @@ fn render_table(rows: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_continuations_align_with_the_item_text_column() {
+        assert_eq!(
+            parse("- first\n\n  second"),
+            [text("• first\n  second", TextKind::List)]
+        );
+        assert_eq!(
+            parse("9. first\n\n   second\n10. next\n\n    last"),
+            [text(
+                "9. first\n   second\n10. next\n    last",
+                TextKind::List
+            )]
+        );
+        assert_eq!(
+            parse("- outer\n  - first\n\n    second"),
+            [text("• outer\n    ◦ first\n      second", TextKind::List)]
+        );
+    }
+
+    #[test]
+    fn a_loose_list_item_keeps_its_paragraphs_apart() {
+        assert_eq!(
+            parse("-\n  - child\n\n  after"),
+            [text("• \n    ◦ child\n  after", TextKind::List)]
+        );
+        assert_eq!(
+            parse("- first\n\n  second\n- next"),
+            [text("• first\n  second\n• next", TextKind::List)]
+        );
+        assert_eq!(
+            parse("- outer\n  - first\n\n    second\n  - next"),
+            [text(
+                "• outer\n    ◦ first\n      second\n    ◦ next",
+                TextKind::List
+            )]
+        );
+    }
 
     fn text(markup: &str, kind: TextKind) -> Block {
         Block::Text {

@@ -1415,8 +1415,10 @@ impl Transcript {
                     && self.last_model.is_some()
                     && model.as_deref() != self.last_model.as_deref();
                 if agent_changed || model_changed {
+                    self.gauge = None;
                     let returned = agent_changed && self.seen_drivers.contains(&driver);
                     out.extend(self.push_switch(driver, model.clone(), agent_changed, returned));
+                    out.push(Change::Gauge);
                 }
                 self.on_driver(driver);
                 if model.is_some() {
@@ -1859,16 +1861,15 @@ impl Transcript {
                 }
             }
             Event::RateLimited { resets_at, .. } => {
-                let text = match resets_at {
-                    Some(at) => format!("Rate limited. The quota resets at {at}."),
-                    None => "Rate limited by the provider.".to_owned(),
-                };
+                let text = rate_limit_notice(resets_at.as_deref(), crate::freshness::now_epoch());
                 out.extend(self.push_notice(text, Tone::Warning));
             }
             Event::ModelChanged { model } => {
                 if self.last_model.as_deref() != Some(model.as_str()) {
                     if self.last_model.is_some() {
                         out.extend(self.push_switch(driver, Some(model.clone()), false, false));
+                        self.gauge = None;
+                        out.push(Change::Gauge);
                     }
                     self.last_model = Some(model.clone());
                 }
@@ -2144,6 +2145,35 @@ impl Transcript {
     }
 }
 
+fn rate_limit_notice(resets_at: Option<&str>, now: i64) -> String {
+    let local = resets_at.and_then(|at| match at.parse::<i64>() {
+        Ok(epoch) => {
+            let seconds = if at.len() == 13 && at.bytes().all(|b| b.is_ascii_digit()) {
+                epoch / 1000
+            } else {
+                epoch
+            };
+            gtk4::glib::DateTime::from_unix_local(seconds).ok()
+        }
+        Err(_) => gtk4::glib::DateTime::from_iso8601(at, None)
+            .and_then(|at| at.to_local())
+            .ok(),
+    });
+    let today = gtk4::glib::DateTime::from_unix_local(now).ok();
+    let formatted = local.and_then(|at| {
+        let same_day = today.is_some_and(|today| {
+            (at.year(), at.month(), at.day_of_month())
+                == (today.year(), today.month(), today.day_of_month())
+        });
+        at.format(if same_day { "%H:%M" } else { "%Y-%m-%d %H:%M" })
+            .ok()
+    });
+    match formatted {
+        Some(at) => format!("Rate limited. The quota resets at {at}."),
+        None => "Rate limited by the provider.".to_owned(),
+    }
+}
+
 /// Compact token count for the gauge and the compaction divider: `950`, `21k`, `1.2M`.
 pub fn format_tokens(n: u64) -> String {
     if n < 1_000 {
@@ -2168,6 +2198,139 @@ mod tests {
 
     fn ev(e: Event) -> Envelope {
         Envelope::new(e)
+    }
+
+    #[test]
+    fn usage_before_the_first_model_report_survives_it() {
+        let mut t = Transcript::new();
+        t.apply(
+            &ev(Event::UsageUpdated {
+                used: 42_000,
+                max: Some(200_000),
+                auto_compact_at: Some(160_000),
+            }),
+            Driver::Codex,
+        );
+        let before = t.gauge;
+        let changes = t.apply(
+            &ev(Event::ModelChanged { model: "m1".into() }),
+            Driver::Codex,
+        );
+        assert_eq!(t.gauge, before);
+        assert!(!changes.contains(&Change::Gauge));
+        assert_eq!(t.last_model.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn a_rate_limit_reset_in_milliseconds_matches_epoch_seconds() {
+        let today =
+            gtk4::glib::DateTime::new(&gtk4::glib::TimeZone::local(), 2026, 10, 14, 13, 30, 0.0)
+                .unwrap();
+        for at in [today.add_hours(1).unwrap(), today.add_days(1).unwrap()] {
+            let seconds = at.to_unix();
+            let expected = rate_limit_notice(Some(&seconds.to_string()), today.to_unix());
+            for milliseconds in [seconds * 1000, seconds * 1000 + 999] {
+                assert_eq!(
+                    rate_limit_notice(Some(&milliseconds.to_string()), today.to_unix()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_switch_clears_the_context_gauge() {
+        for (driver, model) in [(Driver::Codex, "m1"), (Driver::Claude, "m2")] {
+            let mut t = Transcript::new();
+            let started = |model: &str| {
+                ev(Event::SessionStarted {
+                    native_id: "n".into(),
+                    model: Some(model.into()),
+                    cwd: None,
+                })
+            };
+            t.apply(&started("m1"), Driver::Claude);
+            t.apply(
+                &ev(Event::UsageUpdated {
+                    used: 42_000,
+                    max: Some(200_000),
+                    auto_compact_at: None,
+                }),
+                Driver::Claude,
+            );
+            let unchanged = t.apply(&started("m1"), Driver::Claude);
+            assert!(t.gauge.is_some());
+            assert!(!unchanged.contains(&Change::Gauge));
+            let changes = t.apply(&started(model), driver);
+            assert!(
+                t.gauge.is_none(),
+                "old context must leave with its agent or model"
+            );
+            assert!(changes.contains(&Change::Gauge));
+        }
+    }
+
+    #[test]
+    fn the_rate_limit_notice_shows_a_local_time() {
+        let today =
+            gtk4::glib::DateTime::new(&gtk4::glib::TimeZone::local(), 2026, 10, 14, 13, 30, 0.0)
+                .unwrap();
+        let now = today.to_unix();
+        for (at, format) in [
+            (today.add_hours(1).unwrap(), "%H:%M"),
+            (today.add_days(1).unwrap(), "%Y-%m-%d %H:%M"),
+        ] {
+            let expected = format!(
+                "Rate limited. The quota resets at {}.",
+                at.format(format).unwrap()
+            );
+            for input in [
+                at.to_unix().to_string(),
+                agent_core::quota::epoch_to_rfc3339(at.to_unix()),
+            ] {
+                assert_eq!(rate_limit_notice(Some(&input), now), expected);
+            }
+        }
+        for input in [
+            None,
+            Some("invalid"),
+            Some("9223372036854775807"),
+            Some("99999999999999999999-01-01T00:00:00Z"),
+        ] {
+            assert_eq!(
+                rate_limit_notice(input, now),
+                "Rate limited by the provider."
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_model_change_clears_the_context_gauge() {
+        let mut t = Transcript::new();
+        t.apply(
+            &ev(Event::ModelChanged { model: "m1".into() }),
+            Driver::Codex,
+        );
+        t.apply(
+            &ev(Event::UsageUpdated {
+                used: 42_000,
+                max: Some(200_000),
+                auto_compact_at: None,
+            }),
+            Driver::Codex,
+        );
+        let same = t.apply(
+            &ev(Event::ModelChanged { model: "m1".into() }),
+            Driver::Codex,
+        );
+        assert!(t.gauge.is_some());
+        assert!(!same.contains(&Change::Gauge));
+        let changed = t.apply(
+            &ev(Event::ModelChanged { model: "m2".into() }),
+            Driver::Codex,
+        );
+        assert!(t.gauge.is_none());
+        assert!(changed.contains(&Change::Gauge));
     }
 
     /// The reasoning items' views, in transcript order.
@@ -3772,7 +3935,7 @@ mod tests {
             }),
             Driver::Claude,
         );
-        assert_eq!(c.len(), 1);
+        assert!(matches!(c.as_slice(), [Change::Added(_), Change::Gauge]));
         let c = t.apply(&start("gemini"), Driver::Agy);
         let Some(Change::Added(id)) = c.first() else {
             panic!("expected a divider")

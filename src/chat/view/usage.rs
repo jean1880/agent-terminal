@@ -1,5 +1,5 @@
 //! The usage indicator: per agent, an accent dot and two thin bars with their percentages, the
-//! short (5-hour) window and the weekly one, each the most used of its kind (amber from 75 %, red
+//! non-weekly window and the weekly one, each the most used of its kind (amber from 75 %, red
 //! from 90 %); a popover lists the account and every window.
 //!
 //! It reads [`AccountStatus`] and repaints whenever that changes. One widget serves both the
@@ -71,7 +71,7 @@ pub fn resets_text(w: &QuotaWindow, now: i64) -> Option<String> {
     Some(resets_in_text(at - now))
 }
 
-/// The windows the compact meter shows: the most-used short window (the 5-hour one) and the
+/// The windows the compact meter shows: the most-used non-weekly window and the
 /// most-used weekly one (a per-model week such as "Weekly (Fable)" counts as weekly). Labels come
 /// from the adapters, which name every weekly window "Weekly…".
 pub fn split_windows(windows: &[QuotaWindow]) -> (Option<&QuotaWindow>, Option<&QuotaWindow>) {
@@ -86,6 +86,36 @@ pub fn split_windows(windows: &[QuotaWindow]) -> (Option<&QuotaWindow>, Option<&
             })
     };
     (most(false), most(true))
+}
+
+fn compact_visible(shown: &[(Driver, Snapshot)], filter: Option<Driver>) -> bool {
+    shown
+        .iter()
+        .any(|(driver, _)| filter.is_none_or(|f| f == *driver))
+}
+
+fn window_tag(w: &QuotaWindow) -> String {
+    if w.label.starts_with("Weekly") {
+        return "wk".to_owned();
+    }
+    if let Some((length, unit)) = w.label.split_once('-') {
+        let suffix = match unit {
+            "day" => Some("d"),
+            "hour" => Some("h"),
+            "min" => Some("m"),
+            _ => None,
+        };
+        if let Some(suffix) = suffix.filter(|_| length.parse::<u64>().is_ok_and(|n| n > 0)) {
+            return format!("{length}{suffix}");
+        }
+    }
+    w.label
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(4)
+        .collect()
 }
 
 fn bar(used: f64, width: i32) -> gtk4::ProgressBar {
@@ -259,7 +289,8 @@ impl UsageIndicator {
         while let Some(child) = self.details.first_child() {
             self.details.remove(&child);
         }
-        self.root.set_visible(!shown.is_empty());
+        self.root
+            .set_visible(compact_visible(shown, self.filter.get()));
         let label = match self.filter.get() {
             Some(driver) => format!("Usage for {}; show all agents", driver_name(driver)),
             None => "Agent usage; show all agents".to_owned(),
@@ -331,7 +362,7 @@ fn shown_class(used: f64, aging: bool) -> &'static str {
     }
 }
 
-/// Accent dot + one thin row per window kind: `5h` and `wk`, each with its bar and percentage.
+/// Accent dot + one thin row per window kind, labelled by its length, with a bar and percentage.
 /// Only a Fresh reading is drawn as is; an Aging one is muted (never green) with when it was
 /// read; an Expired one is the could-not-read state ("Unknown").
 fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
@@ -362,10 +393,10 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
     rows.set_valign(gtk4::Align::Center);
     let mut tips = vec![driver_name(driver).to_owned()];
-    for (tag, window) in [("5h", short), ("wk", weekly)] {
+    for window in [short, weekly] {
         let Some(w) = window else { continue };
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
-        row.append(&label(tag, &["usage-text", "usage-tag"]));
+        row.append(&label(&window_tag(w), &["usage-text", "usage-tag"]));
         let meter = bar(w.used, 48);
         if aging {
             meter.remove_css_class(severity(w.used).css_class());
@@ -467,6 +498,66 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_window_tags_fit_four_characters() {
+        for (label, tag) in [
+            ("Primary quota", "Prim"),
+            ("Secondary quota", "Seco"),
+            ("Échéance courte", "Éché"),
+            ("使用可能量", "使用可能"),
+            ("Now", "Now"),
+            ("", ""),
+        ] {
+            assert_eq!(window_tag(&named(label, 0.1)), tag);
+        }
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_usage_chip_hides_when_its_agent_is_not_shown() {
+        gtk4::init().expect("GTK init");
+        let usage = UsageIndicator::new(Rc::new(AccountStatus::new()), Some(Driver::Codex));
+        let shown = [(Driver::Claude, Snapshot::default())];
+        usage.render_snapshots(&shown);
+        assert!(!usage.root.property::<bool>("visible"));
+        assert!(usage.compact.first_child().is_none());
+        assert!(usage.details.first_child().is_some());
+        usage.filter.set(Some(Driver::Claude));
+        usage.render_snapshots(&shown);
+        assert!(usage.root.property::<bool>("visible"));
+        assert!(usage.compact.first_child().is_some());
+    }
+
+    #[test]
+    fn the_usage_chip_hides_when_its_agent_is_not_ready() {
+        let shown = [(Driver::Claude, Snapshot::default())];
+        assert!(!compact_visible(&shown, Some(Driver::Codex)));
+        assert!(compact_visible(&shown, Some(Driver::Claude)));
+        assert!(compact_visible(&shown, None));
+        assert!(!compact_visible(&[], None));
+        assert!(!compact_visible(&[], Some(Driver::Claude)));
+    }
+
+    #[test]
+    fn a_two_day_codex_window_is_not_tagged_5h() {
+        let windows = agent_core::quota::codex_rate_limits(&serde_json::json!({
+            "rateLimits": {"primary": {"usedPercent": 20, "windowDurationMins": 2880}}
+        }));
+        let (short, weekly) = split_windows(&windows);
+        assert!(weekly.is_none());
+        assert_eq!(window_tag(short.unwrap()), "2d");
+        for (label, tag) in [
+            ("5-hour", "5h"),
+            ("Weekly (Fable)", "wk"),
+            ("3-hour", "3h"),
+            ("15-min", "15m"),
+            ("Primary quota", "Prim"),
+            ("Échéance courte", "Éché"),
+        ] {
+            assert_eq!(window_tag(&named(label, 0.1)), tag);
+        }
+    }
 
     pub(crate) fn compact_scope_does_not_filter_provider_comparison() {
         let usage = UsageIndicator::new(Rc::new(AccountStatus::new()), Some(Driver::Codex));
