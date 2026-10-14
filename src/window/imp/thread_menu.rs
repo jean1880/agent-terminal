@@ -30,7 +30,9 @@ const ACTION: &str = "win.thread-menu";
 /// The never-enabled twin that disabled items point at.
 const ACTION_OFF: &str = "win.thread-menu-off";
 
-/// A `gio::Menu` for `entries`: sections as sections, submenus as submenus, items as items.
+/// A `gio::Menu` for `entries`: sections as sections, submenus as submenus, items as items. A
+/// disabled submenu (nothing to hand over, no agent ready) is a greyed-out item: GTK cannot
+/// grey a submenu, and an open one that is empty or all greyed offers nothing.
 fn to_gio_menu(entries: &[MenuEntry]) -> gio::Menu {
     let menu = gio::Menu::new();
     for entry in entries {
@@ -49,8 +51,22 @@ fn to_gio_menu(entries: &[MenuEntry]) -> gio::Menu {
             }
             // GTK's PopoverMenu draws no icon on a submenu entry (verified in the preview), so
             // agent submenus are plain labels: the brand icons live in the widgets, not here.
-            MenuEntry::Submenu { label, entries, .. } => {
+            MenuEntry::Submenu {
+                label,
+                entries,
+                enabled: true,
+            } => {
                 menu.append_submenu(Some(label), &to_gio_menu(entries));
+            }
+            MenuEntry::Submenu {
+                label,
+                enabled: false,
+                ..
+            } => {
+                let item = gio::MenuItem::new(Some(label), None);
+                // The disabled action takes a string; no choice is encoded, as none can be made.
+                item.set_action_and_target_value(Some(ACTION_OFF), Some(&"".to_variant()));
+                menu.append_item(&item);
             }
             MenuEntry::Section(entries) => menu.append_section(None, &to_gio_menu(entries)),
         }
@@ -582,13 +598,15 @@ pub(super) mod tests {
             gio_menu_labels_of(&housekeeping),
             ["Rename…", "Archive", "Delete…"]
         );
-        // With no messages every "Continue in" leaf points at the disabled action; Switch does not.
-        let continue_in = section.item_link(0, "submenu").expect("submenu");
-        let claude = continue_in.item_link(0, "submenu").expect("claude");
-        let action = claude
-            .item_attribute_value(0, "action", None)
-            .and_then(|v| v.get::<String>());
-        assert_eq!(action.as_deref(), Some(ACTION_OFF));
+        // With no messages "Continue in" is one greyed-out item, not a submenu to open; Switch
+        // still opens.
+        let action_of = |model: &gio::MenuModel, index: i32| {
+            model
+                .item_attribute_value(index, "action", None)
+                .and_then(|v| v.get::<String>())
+        };
+        assert!(section.item_link(0, "submenu").is_none());
+        assert_eq!(action_of(&section, 0).as_deref(), Some(ACTION_OFF));
         let switch = section.item_link(1, "submenu").expect("submenu");
         let claude = switch.item_link(0, "submenu").expect("claude");
         let action = claude
@@ -609,6 +627,25 @@ pub(super) mod tests {
                 ..
             })
         ));
+
+        // No agent ready: neither entry opens an empty submenu; both are greyed out, with
+        // their labels.
+        let none = ThreadMenuInput {
+            has_messages: true,
+            agents: Vec::new(),
+            ..input
+        };
+        let menu = to_gio_menu(&thread_menu(&none));
+        let model: &gio::MenuModel = menu.upcast_ref();
+        let section = model.item_link(0, "section").expect("first section");
+        assert_eq!(
+            gio_menu_labels_of(&section),
+            ["Continue in a new thread", "Switch this thread to"]
+        );
+        for index in 0..2 {
+            assert!(section.item_link(index, "submenu").is_none(), "{index}");
+            assert_eq!(action_of(&section, index).as_deref(), Some(ACTION_OFF));
+        }
     }
 
     /// Each menu choice, carried out on a real window and store, does what its label says and
