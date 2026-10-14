@@ -1971,4 +1971,216 @@ mod tests {
             .collect();
         assert_eq!(texts, ["Reading the hostname file."]);
     }
+
+    /// One `step_update` for an adapter mid-turn in conversation `c1`.
+    fn step_of(a: &mut AgyAdapter, step: Value) -> Vec<Envelope> {
+        let mut frame = json!({"event": "step_update", "conversation_id": "c1"});
+        frame["step_update"] = step;
+        a.feed(&frame.to_string())
+    }
+
+    fn turn_adapter() -> AgyAdapter {
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        a
+    }
+
+    fn started_items(out: &[Envelope]) -> Vec<(ItemKind, String)> {
+        out.iter()
+            .filter_map(|e| match &e.event {
+                Event::ItemStarted { kind, title, .. } => Some((*kind, title.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_side_command_gets_its_own_id() {
+        let mut a = AgyAdapter::new("agy");
+        let ids: Vec<String> = ["/model", "/usage", "/model"]
+            .into_iter()
+            .map(
+                |text| match a.encode(Command::Prompt { text: text.into() }) {
+                    Ok(actions) => match &actions[0] {
+                        Action::SideProcess { id, .. } => id.clone(),
+                        other => panic!("{text}: {other:?}"),
+                    },
+                    Err(e) => panic!("{text}: {e}"),
+                },
+            )
+            .collect();
+        assert_eq!(ids, ["side-1", "side-2", "side-3"]);
+    }
+
+    #[test]
+    fn agy_needs_no_handshake() {
+        // Nothing may be written before the first prompt: agy reads stdin as the user turn.
+        assert!(AgyAdapter::default().handshake().is_empty());
+    }
+
+    #[test]
+    fn web_mcp_and_subagent_tools_have_their_own_kinds() {
+        for (name, kind) in [
+            ("search_web", ItemKind::WebSearch),
+            ("read_url_content", ItemKind::WebSearch),
+            ("call_mcp_tool", ItemKind::McpTool),
+            ("start_subagent", ItemKind::Subagent),
+            ("invoke_subagent", ItemKind::Subagent),
+            ("something_new", ItemKind::Tool),
+        ] {
+            assert_eq!(tool_kind(name), kind, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_tool_step_is_a_tool_whether_typed_or_only_named() {
+        let mut a = turn_adapter();
+        // Typed "tool", named only in its info.
+        let out = step_of(
+            &mut a,
+            json!({"step_type": "tool", "step_index": 1, "state": "ACTIVE",
+                   "tool_info": {"name": "run_command", "parameters": {"CommandLine": "ls"}}}),
+        );
+        assert_eq!(started_items(&out), [(ItemKind::Command, "ls".to_owned())]);
+        // A step type this build does not know, but carrying a tool name, is still that tool.
+        let out = step_of(
+            &mut a,
+            json!({"step_type": "tool_call_v2", "step_index": 2, "state": "ACTIVE",
+                   "tool_name": "view_file", "tool_info": {"parameters": {"AbsolutePath": "/a"}}}),
+        );
+        assert_eq!(started_items(&out), [(ItemKind::FileRead, "/a".to_owned())]);
+        // Neither: unknown, never a made-up item.
+        let out = step_of(&mut a, json!({"step_type": "telemetry", "step_index": 3}));
+        assert!(started_items(&out).is_empty());
+        assert!(out.iter().any(|e| matches!(e.event, Event::Unknown)));
+    }
+
+    #[test]
+    fn a_failed_response_step_fails_its_item() {
+        let mut a = turn_adapter();
+        let step = |state: &str| {
+            json!({"step_type": "agent_response", "step_index": 4, "state": state,
+                   "text_delta": "partial"})
+        };
+        step_of(&mut a, step("ACTIVE"));
+        let out = step_of(&mut a, step("ERROR"));
+        assert!(
+            out.iter().any(|e| matches!(
+                e.event,
+                Event::ItemCompleted {
+                    status: ItemStatus::Failed,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_completes_only_when_its_step_is_done() {
+        let mut a = turn_adapter();
+        let step = |state: &str| {
+            json!({"step_type": "thinking", "step_index": 6, "state": state,
+                   "thinking": "weighing it"})
+        };
+        let done = |out: &[Envelope]| {
+            out.iter()
+                .any(|e| matches!(e.event, Event::ItemCompleted { .. }))
+        };
+        assert!(!done(&step_of(&mut a, step("ACTIVE"))), "still thinking");
+        assert!(done(&step_of(&mut a, step("DONE"))), "done thinking");
+    }
+
+    #[test]
+    fn tool_parameters_fall_back_to_the_transcript_and_always_name_the_tool() {
+        let mut a = turn_adapter();
+        let input_of = |out: &[Envelope]| {
+            out.iter()
+                .find_map(|e| match &e.event {
+                    Event::ItemStarted { input, .. } => input.clone(),
+                    _ => None,
+                })
+                .expect("an input")
+        };
+        // Empty stdout parameters lose to the transcript's record of the call.
+        let out = step_of(
+            &mut a,
+            json!({"step_type": "tool", "step_index": 1, "state": "ACTIVE",
+                   "tool_name": "view_file", "tool_info": {"parameters": {}},
+                   "transcript_calls": [{"name": "view_file",
+                                         "args": {"AbsolutePath": "\"/etc/hosts\""}}]}),
+        );
+        let input = input_of(&out);
+        assert_eq!(input["AbsolutePath"], "/etc/hosts");
+        assert_eq!(
+            input["tool_name"], "view_file",
+            "the tool is named in its input"
+        );
+        // A tool_name the parameters already carry is kept, not overwritten.
+        let out = step_of(
+            &mut a,
+            json!({"step_type": "tool", "step_index": 2, "state": "ACTIVE",
+                   "tool_name": "call_mcp_tool",
+                   "tool_info": {"parameters": {"tool_name": "github.search"}}}),
+        );
+        assert_eq!(input_of(&out)["tool_name"], "github.search");
+    }
+
+    #[test]
+    fn a_file_change_card_is_titled_by_its_tool() {
+        let mut a = turn_adapter();
+        let out = step_of(
+            &mut a,
+            json!({"step_type": "tool", "step_index": 3, "state": "ACTIVE",
+                   "tool_name": "write_to_file",
+                   "tool_info": {"parameters": {"TargetFile": "/w/a.rs"}}}),
+        );
+        assert_eq!(
+            started_items(&out),
+            [(ItemKind::FileChange, "write_to_file".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_empty_conversation_id_does_not_make_an_empty_item_prefix() {
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        let out = a.feed(
+            &json!({"event": "step_update", "step_update": {"conversation_id": "",
+                     "step_type": "tool", "step_index": 1, "state": "ACTIVE",
+                     "tool_name": "run_command"}})
+            .to_string(),
+        );
+        let id = out.iter().find_map(|e| e.item.clone()).expect("an item id");
+        assert!(!id.starts_with(':'), "{id}");
+        assert!(id.ends_with(":step-1"), "{id}");
+    }
+
+    #[test]
+    fn a_turn_with_an_error_fails_even_when_the_status_says_success() {
+        let mut a = turn_adapter();
+        let out =
+            a.feed(r#"{"event":"result","result":{"status":"SUCCESS","error":"tool crashed"}}"#);
+        assert!(
+            out.iter().any(|e| matches!(
+                &e.event,
+                Event::TurnCompleted { state: TurnState::Failed, error: Some(m), .. } if m == "tool crashed"
+            )),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_quota_error_raises_a_rate_limit_whatever_the_status() {
+        let mut a = turn_adapter();
+        let out = a.feed(
+            r#"{"event":"result","result":{"status":"FAILED","error":"You have exhausted your quota"}}"#,
+        );
+        assert!(
+            out.iter()
+                .any(|e| matches!(e.event, Event::RateLimited { .. })),
+            "{out:?}"
+        );
+    }
 }

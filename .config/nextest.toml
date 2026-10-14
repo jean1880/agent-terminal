@@ -1,0 +1,43 @@
+# cargo-nextest: every test in its own process, so one test's GTK, glib or global state can
+# never leak into another's. Run through the Makefile (`make test`, `make check`), which gives
+# the run a private display, D-Bus session and XDG directories. The #[ignore]d display tests
+# run in `make test-display` (part of `make check`), one at a time.
+
+[profile.default]
+# Quiet unless something is wrong: slow and failing tests, and the summary.
+status-level = "slow"
+final-status-level = "fail"
+failure-output = "final"
+# Never run, ignored or not: each needs something a test run must not touch. Everything else
+# that is #[ignore]d is a display test and runs in `make test-display`.
+default-filter = """
+not (
+    test(=update::tests::live_latest_release_of_this_repository)
+    | test(=store::tests::append_bench)
+    | test(=chat::view::tests::stream_cost_of_a_long_thinking_block)
+)
+"""
+# The three above: the live GitHub release API (network), a benchmark that needs a scratch copy
+# of a real store, and a measurement that prints costs and asserts nothing.
+# A test that hangs is a failure, not a stalled run: warn every 60 s, kill after 5 minutes.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The store's randomised equivalence checks run hundreds of scripted stores each and take
+# tens of seconds in a debug build. Started first, they overlap the rest of the suite
+# instead of trailing after it.
+[[profile.default.overrides]]
+filter = "package(agent-kit) & test(/healing_from_tails|longer_than_the_heal_window/)"
+priority = 100
+
+# The git-backed tests each make real repositories in temp dirs and run git many times.
+[[profile.default.overrides]]
+filter = "package(agent-kit) & test(/::repo::/)"
+priority = 50
+
+[profile.ci]
+# Report every failure in one run, not just the first.
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"

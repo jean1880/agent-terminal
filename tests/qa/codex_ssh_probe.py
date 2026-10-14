@@ -12,14 +12,14 @@ import shutil
 import sys
 import tempfile
 
-import gate
+import qa_env
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", default="codex")
     args = parser.parse_args()
-    artifacts = gate.ROOT / "target/qa-codex-ssh"
+    artifacts = qa_env.ROOT / "target/qa-codex-ssh"
     artifacts.mkdir(parents=True, exist_ok=True)
     codex = shutil.which(args.codex)
     if not codex:
@@ -27,7 +27,7 @@ def main():
     # Current Codex refuses helper binaries under /tmp; use disposable repo build output.
     with tempfile.TemporaryDirectory(prefix="probe-", dir=artifacts) as temporary:
         home = Path(temporary)
-        env = gate.isolated_env(home)
+        env = qa_env.isolated_env(home)
         env.pop("CARGO_HOME")
         env.pop("RUSTUP_HOME")
         codex_home = home / "codex"
@@ -36,16 +36,16 @@ def main():
         config = home / "synthetic-ssh-config"
         config.write_text("Host fixture\n  HostName fixture.invalid\n  User qa\n  CanonicalizeHostname no\n")
         config.chmod(0o600)
-        command = [sys.executable, str(gate.ROOT / "tests/qa/ssh_config_probe.py"), str(config)]
+        command = [sys.executable, str(qa_env.ROOT / "tests/qa/ssh_config_probe.py"), str(config)]
         checks = [
             ("version", [codex, "--version"]),
             ("outside", command),
             ("inside", [codex, "sandbox", "linux", "--", *command]),
         ]
-        summary = {"commit": gate.commit(), "steps": [], "compatible": False}
+        summary = {"commit": qa_env.commit(), "steps": [], "compatible": False}
         try:
             for label, invocation in checks:
-                result = gate.run_logged(invocation, artifacts / f"{label}.log", env, 30, cwd=home)
+                result = qa_env.run_logged(invocation, artifacts / f"{label}.log", env, 30, cwd=home)
                 result["name"] = label
                 summary["steps"].append(result)
                 if result["exit_code"] or result["timed_out"]:

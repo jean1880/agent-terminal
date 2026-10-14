@@ -7,10 +7,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import gate
+import qa_env
 import package_smoke
 
-spec = importlib.util.spec_from_file_location("artifact_manifest", gate.ROOT / "packaging/artifact-manifest.py")
+spec = importlib.util.spec_from_file_location("artifact_manifest", qa_env.ROOT / "packaging/artifact-manifest.py")
 manifest = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(manifest)
 

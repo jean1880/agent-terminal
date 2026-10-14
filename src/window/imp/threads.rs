@@ -1070,6 +1070,11 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     if let Some(found) = cached_agent(&profile) {
         return found;
     }
+    // Tests never find this machine's agents: only what a test seeded resolves, so no test can
+    // start a real agent on PATH (one once did, through a profile it could not place).
+    if cfg!(test) {
+        return ResolvedAgent::default();
+    }
     let (path, home, shell) = env_triplet();
     let command = profile.command.clone();
     let env_file = profile.env_file.clone();
@@ -5227,6 +5232,291 @@ pub(super) mod tests {
         );
     }
 
+    /// A thread page drives a real agent process end to end: the deterministic Codex fixture
+    /// (`tests/support/scripted_codex.py`; no provider, tool or network). Its session starts,
+    /// a turn runs and finishes, an approval marks the thread busy and needing the user in the
+    /// sidebar, and Stop clears both. Run from the window walkthrough (GTK has one thread).
+    pub(crate) fn a_thread_page_runs_a_real_session(window: &crate::window::AgentTerminalWindow) {
+        use crate::chat::ChatBackend;
+        use crate::testutil::pump_until;
+        // The app's own log lines (why a thread opened with or without a session) go to the
+        // test's output, so a failure here explains itself.
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let imp = window.imp();
+        let ctx = glib::MainContext::default();
+        let dir = tempfile::tempdir().expect("tmp");
+        let folder = dir.path().to_string_lossy().into_owned();
+        let frames =
+            || std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap_or_default();
+
+        // Codex resolves to python3 running the fixture, which keeps its frames in `dir`. The
+        // profile gets a command of its own: the resolution cache is keyed by command, and a
+        // Codex page an earlier check opened may still be resolving the old one, in the
+        // background, and would overwrite a seeded entry under it ("not found").
+        let (old_command, env_file) = {
+            let config = imp.config.borrow();
+            let codex = config
+                .agent_profile(Driver::Codex)
+                .expect("a Codex profile");
+            (codex.command.clone(), codex.env_file.clone())
+        };
+        // Still named `codex`: the window tells a profile's agent by its command's file name, and
+        // a profile it cannot place falls back to the default one, whose plain `codex` would
+        // resolve to a real install on PATH.
+        let command = "/nonexistent/scripted-fixture/codex".to_owned();
+        for profile in imp.config.borrow_mut().profiles.iter_mut() {
+            if profile.command == old_command {
+                profile.command = command.clone();
+                profile.args = vec![
+                    "-I".into(),
+                    format!(
+                        "{}/tests/support/scripted_codex.py",
+                        env!("CARGO_MANIFEST_DIR")
+                    ),
+                    folder.clone(),
+                ];
+            }
+        }
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (command.clone(), env_file.clone()),
+                ResolvedAgent {
+                    program: Some("/usr/bin/python3".into()),
+                    env: Vec::new(),
+                },
+            )
+        });
+        // Never a real agent: the profile the window will use for Codex must be this one, and
+        // resolve to python3 running the fixture, before anything is opened.
+        {
+            let config = imp.config.borrow();
+            let used = config
+                .agent_profile(Driver::Codex)
+                .expect("a Codex profile");
+            assert_eq!(
+                used.command, command,
+                "the window would use another profile"
+            );
+            assert_eq!(
+                cached_agent(used).and_then(|r| r.program).as_deref(),
+                Some("/usr/bin/python3"),
+                "the fixture's profile must resolve to python3"
+            );
+        }
+        let availability = AgentAvailability::shared();
+        let before = availability.get(Driver::Codex);
+        availability.set(
+            Driver::Codex,
+            Availability::Ready("/usr/bin/python3".into()),
+        );
+
+        imp.new_chat_thread(Some(Driver::Codex), Some(folder.clone()), None);
+        let thread = imp
+            .tabs
+            .borrow()
+            .last()
+            .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+            .expect("a thread page");
+        let state = |f: &dyn Fn(&ChatTab) -> bool| {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .find(|c| c.thread == thread)
+                .is_some_and(f)
+        };
+        let slot = imp.slot_of(&thread).expect("the page's slot");
+        let page_state = || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .find(|c| c.thread == thread)
+                .map(|c| {
+                    format!(
+                        "view built {}, building {}, starting {}, unavailable {}",
+                        c.view.is_some(),
+                        c.building,
+                        c.starting,
+                        c.unavailable
+                    )
+                })
+        };
+        assert!(
+            pump_until(&ctx, 15, || slot.get().is_some()),
+            "the session starts; Codex is {:?}; resolved now: {:?}; page: {:?}; fixture frames: {}",
+            availability.get(Driver::Codex),
+            imp.config
+                .borrow()
+                .agent_profile(Driver::Codex)
+                .and_then(cached_agent)
+                .map(|r| r.program),
+            page_state(),
+            frames()
+        );
+        // Nothing is sent until the fixture itself has answered: it counts its connections
+        // into `dir` the moment it starts. Anything else that started fails here, unprompted.
+        assert!(
+            pump_until(&ctx, 15, || dir.path().join("connections").exists()),
+            "the process that started is the fixture"
+        );
+
+        // A plain turn: sent to the agent, finished, and nothing left needing the user.
+        slot.send_prompt("success");
+        assert!(
+            pump_until(&ctx, 15, || frames().contains("turn/completed")
+                && state(&|c| !c.running)),
+            "the turn finishes; fixture frames: {}",
+            frames()
+        );
+        assert!(
+            app_store().has_messages(&thread).expect("read"),
+            "the prompt is stored"
+        );
+        assert!(!imp.row_is_busy(&RowKey::Thread(thread.clone())));
+
+        // An approval: the thread is busy and asks for the user, in its page and its row.
+        slot.send_prompt("approve this");
+        assert!(
+            pump_until(&ctx, 15, || state(&|c| c.approval)),
+            "the approval reaches the page; fixture frames: {}",
+            frames()
+        );
+        assert!(
+            imp.row_is_busy(&RowKey::Thread(thread.clone())),
+            "closing would cut work short"
+        );
+        imp.reload_summaries();
+        let badge = || {
+            imp.sidebar_rows()
+                .into_iter()
+                .find(|r| r.key == RowKey::Thread(thread.clone()))
+                .and_then(|r| r.badge)
+        };
+        assert_eq!(badge(), Some(Badge::NeedsApproval));
+
+        // Stop: the agent is told, the turn ends, and nothing is left waiting.
+        slot.interrupt();
+        assert!(
+            pump_until(&ctx, 15, || state(&|c| !c.approval && !c.running)),
+            "stop ends the turn; fixture frames: {}",
+            frames()
+        );
+        assert!(frames().contains("turn/interrupt"));
+        assert!(!imp.row_is_busy(&RowKey::Thread(thread.clone())));
+        assert_ne!(badge(), Some(Badge::NeedsApproval));
+
+        // Busy again, for what must ask before it cuts the turn short.
+        slot.send_prompt("approve again");
+        assert!(
+            pump_until(&ctx, 15, || state(&|c| c.approval)),
+            "a second approval"
+        );
+        let key = RowKey::Thread(thread.clone());
+        // Answers the open dialog with `heading` by clicking its `button`, as a user does; the
+        // dialog closes itself.
+        let answer = |heading: &str, button: &str| {
+            let open = || {
+                adw::prelude::AdwApplicationWindowExt::visible_dialog(window)
+                    .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+                    .filter(|d| d.heading().as_deref() == Some(heading))
+            };
+            assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
+            let dialog = open().expect("the dialog");
+            let target = crate::testutil::descendants(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+                .find(|b| {
+                    b.label().as_deref() == Some(button)
+                        || crate::testutil::descendants(b.upcast_ref())
+                            .iter()
+                            .any(|w| {
+                                w.downcast_ref::<gtk4::Label>()
+                                    .is_some_and(|l| l.text() == button)
+                            })
+                })
+                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            // A dialog still animating in ignores its buttons: click only once it is shown.
+            assert!(
+                pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()),
+                "{heading}'s {button} button is shown"
+            );
+            crate::testutil::settle(&ctx);
+            target.emit_clicked();
+            // Closing is animated: wait for it to go (bounded), never a fixed number of turns.
+            assert!(
+                pump_until(&ctx, 10, || {
+                    adw::prelude::AdwApplicationWindowExt::visible_dialog(window)
+                        .is_none_or(|d| d != dialog.clone().upcast::<adw::Dialog>())
+                }),
+                "{heading} closes once answered"
+            );
+        };
+
+        // Fork while busy: a second thread on the same agent and folder; this one is untouched.
+        let pages = imp.tabs.borrow().len();
+        imp.view_action(&thread, &ViewAction::Fork);
+        assert!(
+            pump_until(&ctx, 15, || imp.tabs.borrow().len() == pages + 1),
+            "a fork opens"
+        );
+        let fork = {
+            let tabs = imp.tabs.borrow();
+            let new = tabs.last().expect("the fork's page");
+            let chat = new.chat.as_ref().expect("a thread");
+            assert_ne!(chat.thread, thread);
+            assert_eq!(
+                (chat.driver, new.dir.as_str()),
+                (Driver::Codex, folder.as_str())
+            );
+            chat.thread.clone()
+        };
+        assert!(state(&|c| c.approval), "forking leaves the source waiting");
+        imp.close_row_now(&RowKey::Thread(fork));
+
+        // Closing a busy thread asks once (a second close while it asks adds nothing); Cancel
+        // keeps the thread and its turn.
+        imp.close_row(&key);
+        imp.close_row(&key);
+        answer("Stop the Running Turn and Close?", "Cancel");
+        // A second question would be the next dialog up, and it would not go away by itself.
+        crate::testutil::settle(&ctx);
+        assert!(
+            adw::prelude::AdwApplicationWindowExt::visible_dialog(window).is_none(),
+            "the second close asked nothing more"
+        );
+        assert!(state(&|c| c.approval), "cancel keeps the thread waiting");
+
+        // Switching agents mid-turn asks too; Keep Waiting changes nothing.
+        imp.view_action(
+            &thread,
+            &ViewAction::Handoff {
+                target: Some(Driver::Claude),
+            },
+        );
+        answer("Switch agents now?", "Keep Waiting");
+        assert_eq!(slot.get().map(|s| s.status().driver), Some(Driver::Codex));
+        assert!(state(&|c| c.approval));
+
+        // Stop and Close: the page goes, and the thread with it from the open pages.
+        imp.close_row(&key);
+        answer("Stop the Running Turn and Close?", "Stop and Close");
+        assert!(
+            pump_until(&ctx, 5, || imp.page_of_thread(&thread).is_none()),
+            "stop and close closes the page"
+        );
+        availability.set(Driver::Codex, before);
+        RESOLVED.with(|r| r.borrow_mut().remove(&(command.clone(), env_file)));
+        for profile in imp.config.borrow_mut().profiles.iter_mut() {
+            if profile.command == command {
+                profile.command = old_command.clone();
+            }
+        }
+    }
+
     /// A refresh with the same rows, an aged clock, or only the focus changed keeps the row
     /// widgets (and so focus, an open menu and a rename in them); only the age and the glow move.
     pub(crate) fn sidebar_updates_in_place(window: &crate::window::AgentTerminalWindow) {
@@ -5971,16 +6261,18 @@ pub(super) mod tests {
             thread: thread.clone(),
             provider: handle.new_id().expect("id"),
         };
+        // A write ahead of everything holds the writer until the main thread has checked,
+        // so the check cannot race the writer however loaded the machine is.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        handle
+            .write("wait", None, move |_| {
+                let _ = held.recv();
+                Ok(())
+            })
+            .expect("queued");
         handle
             .write("create a thread", Some(&thread), move |s| {
                 record_new_thread_as(s, &ids, "/w", Some("t"), Driver::Claude, None, None)
-            })
-            .expect("queued");
-        // A slow write ahead keeps the rest queued while the main thread carries on.
-        handle
-            .write("wait", None, |_| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                Ok(())
             })
             .expect("queued");
         let say = |n: usize| {
@@ -5995,6 +6287,7 @@ pub(super) mod tests {
             reader.thread_summary(&thread).expect("read").is_none(),
             "nothing was written on the main thread"
         );
+        release.send(()).expect("the writer is waiting");
 
         let got = in_loop(|ctx| {
             let out = Rc::new(RefCell::new(None));

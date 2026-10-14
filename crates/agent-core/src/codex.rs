@@ -4834,6 +4834,42 @@ mod tests {
     }
 
     #[test]
+    fn a_command_approval_without_a_folder_still_says_what_it_would_remember() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","command":"cargo test","availableDecisions":["accept","decline"]}}"#,
+        );
+        assert!(
+            matches!(&ev[0].event, Event::ApprovalRequested { remembers: Some(r), .. } if r == "`cargo test`"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn a_question_needs_both_an_id_and_its_text() {
+        // Without an id the answer could not be sent back; without text there is nothing to
+        // ask. Either makes the question unusable, and a request with none usable is refused.
+        for question in [
+            r#"{"id":"","header":"H","question":"Pick one","options":[{"label":"A"}]}"#,
+            r#"{"id":"q1","header":"H","question":"","options":[{"label":"A"}]}"#,
+        ] {
+            let mut a = started(Mode::Ask);
+            let out = a.feed(&format!(
+                r#"{{"id":"question-2","method":"item/tool/requestUserInput","params":{{"threadId":"th-1","turnId":"tu","itemId":"q","questions":[{question}]}}}}"#
+            ));
+            assert!(
+                !out.iter()
+                    .any(|e| matches!(e.event, Event::QuestionRequested { .. })),
+                "{question}: {out:?}"
+            );
+            assert_eq!(
+                writes(&a.drain_outbox().actions)[0]["error"]["code"],
+                -32602
+            );
+        }
+    }
+
+    #[test]
     fn a_decision_the_server_did_not_offer_is_refused_and_the_request_stays_open() {
         let mut a = started(Mode::Ask);
         let ev = a.feed(

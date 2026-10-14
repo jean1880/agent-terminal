@@ -1797,6 +1797,9 @@ mod tests {
         assert_eq!(changed(&a.feed(&init("default"))), [Mode::Ask]);
         // A mode the picker has no entry for is not forced onto it.
         assert!(changed(&a.feed(&init("bypassPermissions"))).is_empty());
+        // Claude entering plan or accept-edits on its own is reported as exactly that.
+        assert_eq!(changed(&a.feed(&init("plan"))), [Mode::Plan]);
+        assert_eq!(changed(&a.feed(&init("acceptEdits"))), [Mode::AcceptEdits]);
     }
 
     #[test]
@@ -2634,6 +2637,201 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The command list a frame announced, as (name, kind), if it announced one.
+    fn announced(out: &[Envelope]) -> Option<Vec<(String, AgentCommandKind)>> {
+        out.iter().find_map(|e| match &e.event {
+            Event::CommandsChanged { commands } => {
+                Some(commands.iter().map(|c| (c.name.clone(), c.kind)).collect())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn init_announces_the_command_list_only_when_it_changed() {
+        use AgentCommandKind::{Command as C, Skill as S, TerminalOnly as T};
+        let init = |slash: &[&str], skills: &[&str], terminal: &[&str]| {
+            json!({"type": "system", "subtype": "init", "model": "m", "session_id": "s",
+                   "slash_commands": slash, "skills": skills,
+                   "terminal_slash_commands": terminal})
+            .to_string()
+        };
+        let named = |list: &[(&str, AgentCommandKind)]| {
+            Some(
+                list.iter()
+                    .map(|(n, k)| ((*n).to_owned(), *k))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut a = ClaudeAdapter::new();
+        // The first init always announces; a terminal-only command is never a plain one.
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "s", "t"], &["s"], &["t"]))),
+            named(&[("a", C), ("s", S), ("t", T)])
+        );
+        // The same again: nothing to announce.
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "s", "t"], &["s"], &["t"]))),
+            None
+        );
+        // A new command, a skill change, or a terminal-only change each announce.
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "b", "s", "t"], &["s"], &["t"]))),
+            named(&[("a", C), ("b", C), ("s", S), ("t", T)])
+        );
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "b", "s", "t"], &[], &["t"]))),
+            named(&[("a", C), ("b", C), ("s", C), ("t", T)])
+        );
+        assert_eq!(
+            announced(&a.feed(&init(&["a", "b", "s", "t"], &[], &["t", "b"]))),
+            named(&[("a", C), ("s", C), ("t", T), ("b", T)])
+        );
+
+        // Once the rich list has come, init only takes back what became terminal-only.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init(&[], &[], &[]));
+        a.feed(
+            &json!({"type": "system", "subtype": "commands_changed", "commands": [
+                {"name": "review", "description": "Review"}, {"name": "login"}]})
+            .to_string(),
+        );
+        assert_eq!(
+            announced(&a.feed(&init(&["ignored"], &[], &["login"]))),
+            named(&[("review", C), ("login", T)])
+        );
+    }
+
+    /// The tool id each task in the newest task list carries.
+    fn listed_tools(out: &[Envelope]) -> Vec<(String, Option<String>)> {
+        task_lists(out)
+            .last()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .map(|t| (t.id.clone(), t.tool_use_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn task_started_of(task: &str, tool: &str, task_type: &str) -> String {
+        json!({"type": "system", "subtype": "task_started", "task_id": task, "run_id": "r1",
+            "tool_use_id": tool, "description": "Test", "is_backgrounded": true,
+            "task_type": task_type})
+        .to_string()
+    }
+
+    fn child_call(parent: &str, child: &str) -> String {
+        json!({"type": "assistant", "uuid": format!("u-{child}"), "parent_tool_use_id": parent,
+            "message": {"id": format!("m-{child}"), "role": "assistant", "content": [
+                {"type": "tool_use", "id": child, "name": "Read", "input": {"file_path": "/x"}}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn a_backgrounded_shell_command_completes_on_its_own_result() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let call = json!({"type": "assistant", "uuid": "u-sh", "parent_tool_use_id": null,
+            "message": {"id": "m-sh", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_sh", "name": "Bash",
+                 "input": {"command": "sleep 9", "run_in_background": true}}]}});
+        a.feed(&call.to_string());
+        a.feed(&task_started_of("sh1", "toolu_sh", "local_bash"));
+        let result = json!({"type": "user", "uuid": "r-sh", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "toolu_sh", "content": "Command running in background"}]}});
+        let out = a.feed(&result.to_string());
+        // Unlike a background sub-agent, its "running in background" result is its answer.
+        assert_eq!(completions(&out, "toolu_sh").len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_task_keeps_the_first_tool_it_was_started_by() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        a.feed(&tasks_changed(&["t1"]));
+        let first = a.feed(&task_started("t1", "toolu_a", true));
+        assert_eq!(
+            listed_tools(&first),
+            [("t1".to_owned(), Some("toolu_a".to_owned()))]
+        );
+        let again = a.feed(&task_started("t1", "toolu_b", true));
+        assert!(task_lists(&again).is_empty(), "no second list: {again:?}");
+    }
+
+    #[test]
+    fn a_tool_id_outlives_an_unlisted_task_but_not_a_listed_one_that_ended() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        // Started before any list names it: kept through lists without it, including one that
+        // arrives while other tasks are already listed.
+        a.feed(&task_started("t1", "toolu_1", true));
+        a.feed(&tasks_changed(&["other"]));
+        a.feed(&tasks_changed(&["other"]));
+        let out = a.feed(&tasks_changed(&["other", "t1"]));
+        assert_eq!(
+            listed_tools(&out),
+            [
+                ("other".to_owned(), None),
+                ("t1".to_owned(), Some("toolu_1".to_owned()))
+            ]
+        );
+        // Listed, then gone from the list: forgotten, so a reused id starts bare.
+        a.feed(&tasks_changed(&["other"]));
+        let out = a.feed(&tasks_changed(&["other", "t1"]));
+        assert_eq!(listed_tools(&out)[1], ("t1".to_owned(), None));
+    }
+
+    #[test]
+    fn a_notification_forgets_only_a_task_no_list_still_shows() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        // Never listed, then finished: its tool id goes.
+        a.feed(&task_started("t2", "toolu_2", true));
+        a.feed(&task_notification("t2", "toolu_2", "completed", "done"));
+        // Still listed when its notification came: kept.
+        a.feed(&tasks_changed(&["t3"]));
+        a.feed(&task_started("t3", "toolu_3", true));
+        a.feed(&task_notification("t3", "toolu_3", "completed", "done"));
+        let out = a.feed(&tasks_changed(&["t2", "t3"]));
+        assert_eq!(
+            listed_tools(&out),
+            [
+                ("t2".to_owned(), None),
+                ("t3".to_owned(), Some("toolu_3".to_owned()))
+            ]
+        );
+    }
+
+    #[test]
+    fn each_finished_sub_agent_interrupts_only_its_own_open_children() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        for (agent, task, child) in [("toolu_x", "tx", "child_x"), ("toolu_y", "ty", "child_y")] {
+            a.feed(&agent_call(agent, true));
+            a.feed(&task_started(task, agent, true));
+            a.feed(&async_launched(agent));
+            a.feed(&child_call(agent, child));
+        }
+        let out = a.feed(&task_notification("tx", "toolu_x", "completed", "X"));
+        assert_eq!(completions(&out, "child_x").len(), 1, "{out:?}");
+        assert!(completions(&out, "child_y").is_empty(), "{out:?}");
+        // Y's child is still Y's after X finished.
+        let out = a.feed(&task_notification("ty", "toolu_y", "completed", "Y"));
+        assert!(
+            matches!(
+                completions(&out, "child_y").as_slice(),
+                [Event::ItemCompleted {
+                    status: ItemStatus::Interrupted,
+                    ..
+                }]
+            ),
+            "{out:?}"
+        );
     }
 
     #[test]

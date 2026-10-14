@@ -10,7 +10,24 @@ LOCAL_DESKTOP = $(HOME)/.local/share/applications/$(APP_ID).desktop
 LOCAL_ICON_DIR = $(HOME)/.local/share/icons/hicolor/scalable/apps
 LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 
-.PHONY: all build start-local clean install uninstall package deps help bump-version bum-version release
+.PHONY: all build start-local clean install uninstall package deps help bump-version bum-version release \
+	test check coverage hooks lint test-display test-qa test-deps
+
+# ---- Tests -----------------------------------------------------------------------------------
+# Tools: cargo-nextest and cargo-llvm-cov (`make test-deps`), plus xvfb-run and dbus-run-session.
+# GTK tests need a display: every run gets a private Xvfb and D-Bus session, and private XDG
+# directories, so no test reads or writes the real settings, thread store or keyring.
+# Line coverage as llvm-cov counts it (86.5% on 2026-10-13). Raise it as coverage rises.
+COVERAGE_FLOOR ?= 86
+TEST_HOME := $(CURDIR)/target/test-home
+QA_ARTIFACTS := $(CURDIR)/target/qa-artifacts
+DISPLAY_RUN = env XDG_CONFIG_HOME=$(TEST_HOME)/config XDG_DATA_HOME=$(TEST_HOME)/data \
+	XDG_STATE_HOME=$(TEST_HOME)/state XDG_CACHE_HOME=$(TEST_HOME)/cache \
+	GSETTINGS_BACKEND=memory GTK_A11Y=test GDK_BACKEND=x11 LANG=C.UTF-8 \
+	GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+	AGENT_TERMINAL_QA_ARTIFACTS=$(QA_ARTIFACTS)/screenshots \
+	xvfb-run -a dbus-run-session --
+NEXTEST_PROFILE ?= default
 
 all: build
 
@@ -23,6 +40,11 @@ help:
 	@echo "  make uninstall            - Remove local installation and assets"
 	@echo "  make package              - Generate a .deb package using cargo-deb"
 	@echo "  make clean                - Remove build artifacts"
+	@echo "  make test                 - Run the test suite (parallel, about 35 s)"
+	@echo "  make check                - Everything CI and a release run: lint, all tests, display tests"
+	@echo "  make coverage             - Instrumented run, HTML report, fails under COVERAGE_FLOOR ($(COVERAGE_FLOOR)%)"
+	@echo "  make hooks                - Opt in to the pre-commit hook (fmt and clippy)"
+	@echo "  make test-deps            - Install cargo-nextest and cargo-llvm-cov"
 	@echo "  make bump-version <option>- Bump SemVer version (option: patch | minor | major | X.Y.Z, default: patch)"
 	@echo "  make release <option>     - Bump version, create release doc, commit and tag"
 
@@ -81,6 +103,49 @@ uninstall:
 clean:
 	@echo "Cleaning project..."
 	cargo clean
+
+test-deps:
+	rustup component add llvm-tools-preview
+	cargo install --locked cargo-nextest cargo-llvm-cov
+
+$(TEST_HOME):
+	mkdir -p -m 700 $(TEST_HOME)/config $(TEST_HOME)/data $(TEST_HOME)/state $(TEST_HOME)/cache
+
+# The suite, each test in its own process (.config/nextest.toml).
+test: $(TEST_HOME)
+	$(DISPLAY_RUN) cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE)
+
+# Tests that present windows and measure layout: #[ignore]d so `test` stays fast, run here one
+# at a time so none is measured while another loads the machine.
+test-display: $(TEST_HOME)
+	$(DISPLAY_RUN) cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
+		--run-ignored only --test-threads 1
+
+# The QA scripts' own unit tests (package smoke, live-smoke checks): no network, no quota.
+test-qa:
+	python3 -m unittest discover -s tests/qa -p 'test_*.py'
+
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --locked --workspace --all-targets -- -D warnings
+	cargo check --locked --no-default-features
+
+# What CI and a release run.
+check: lint test test-display test-qa
+
+# The same two runs instrumented. COVERAGE_FLOOR only ever goes up.
+coverage: $(TEST_HOME)
+	cargo llvm-cov clean --workspace
+	$(DISPLAY_RUN) cargo llvm-cov nextest --no-report --locked --workspace --all-targets --profile $(NEXTEST_PROFILE)
+	$(DISPLAY_RUN) cargo llvm-cov nextest --no-report --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
+		--run-ignored only --test-threads 1
+	cargo llvm-cov report --workspace --html --output-dir $(QA_ARTIFACTS)/coverage
+	cargo llvm-cov report --workspace --lcov --output-path $(QA_ARTIFACTS)/coverage/lcov.info
+	cargo llvm-cov report --workspace --summary-only --fail-under-lines $(COVERAGE_FLOOR)
+
+hooks:
+	git config core.hooksPath .githooks
+	@echo "Pre-commit hook on: fmt and clippy run before each commit."
 
 # Intercept argument passed to bump-version or release, e.g. `make bump-version patch`
 ifeq ($(filter bump-version bum-version release,$(firstword $(MAKECMDGOALS))),$(firstword $(MAKECMDGOALS)))

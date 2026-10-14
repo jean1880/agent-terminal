@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import tomllib
 
-import gate
+import qa_env
 
 
 def verify_run(path, expected_commit):
@@ -28,9 +28,9 @@ def verify_run(path, expected_commit):
 
 
 def installed(directory, expected_commit):
-    artifacts = gate.ROOT / "target/qa-package"
+    artifacts = qa_env.ROOT / "target/qa-package"
     artifacts.mkdir(parents=True, exist_ok=True)
-    version = tomllib.loads((gate.ROOT / "Cargo.toml").read_text())["package"]["version"]
+    version = tomllib.loads((qa_env.ROOT / "Cargo.toml").read_text())["package"]["version"]
     packages = sorted(directory.glob("*.deb"))
     if len(packages) != 1:
         raise ValueError("expected exactly one Debian package")
@@ -42,7 +42,7 @@ def installed(directory, expected_commit):
         raise ValueError("package identity mismatch")
     with tempfile.TemporaryDirectory(prefix="agent-terminal-package-") as temporary:
         home = Path(temporary)
-        env = gate.isolated_env(home)
+        env = qa_env.isolated_env(home)
         # Cargo homes are unnecessary for the installed app. No user homes remain.
         env.pop("CARGO_HOME")
         env.pop("RUSTUP_HOME")
@@ -58,7 +58,7 @@ def installed(directory, expected_commit):
             installed_hash = hashlib.file_digest(stream, "sha256").hexdigest()
         if expected_hash != installed_hash:
             raise ValueError("installed executable bytes differ from the downloaded package")
-        result = gate.run_logged([str(installed_binary), "--help"], artifacts / "startup.log", env, 30)
+        result = qa_env.run_logged([str(installed_binary), "--help"], artifacts / "startup.log", env, 30)
         output = (artifacts / "startup.log").read_text(errors="replace")
         reported = re.findall(r"Starting Agent Terminal \(v([^\)]+)\)", output)
         result.update({"commit": expected_commit, "version": version, "reported_versions": reported, "installed_binary_sha256": installed_hash, "passed": False, "coverage": "package identity and startup; source-native UX is gated separately"})

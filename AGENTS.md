@@ -229,7 +229,12 @@ The graph is a snapshot: confirm what it says in the source before editing. Refr
    instance to work around this; it is someone's live session.
 4. **Linting**: `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`.
    CI enforces fmt, clippy, and tests under Xvfb.
-5. **Installation**: do **NOT** run `make install` on developer/daily-driver
+5. **Testing**: `make test` while working; `make check` is what CI and a release run (lint,
+   the suite, the `#[ignore]`d display tests one at a time); `make coverage` holds
+   `COVERAGE_FLOOR`. Never run a test script by hand. Mutation testing (`cargo mutants`) runs
+   in CI only (`mutants.yml`), never on a developer machine: its mutants can loop and allocate
+   without bound, and one took a workstation down. Details: `tests/qa/README.md`.
+6. **Installation**: do **NOT** run `make install` on developer/daily-driver
    machines. Deployment is the `debian-maintainer` apt pipeline
    (`apt.nuvek.ca`), which builds every pushed commit. A manual `make install`
    shadows the apt-delivered package in PATH, so the machine silently keeps

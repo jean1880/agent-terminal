@@ -1,30 +1,48 @@
-# Source and delivery gates
+# Testing
 
-Run `python3 tests/qa/gate.py` from any directory. It keeps formatting, Clippy
-and workspace tests, then runs the exact ignored tests in `native-tests.json`.
-Every native case has a private Xvfb display, D-Bus session and temporary
-HOME/XDG settings. Zero tests, ignored tests and timeouts fail. Measurement-only
-tests remain excluded. `--native-only` is a development shortcut and does not
-satisfy the delivery gate. Python 3.11+, Rust with rustfmt/Clippy, the project's
-native development libraries, Xvfb, xauth and dbus-run-session are required.
-CI and beta use `--delivery`, which refuses a dirty checkout or a changed commit;
-local developer runs record working-tree edits instead of claiming commit-only proof.
-For a targeted developer rerun, combine `--native-only` with
-`--native-test <exact name from native-tests.json>`; this cannot satisfy delivery.
+Everything runs through the Makefile, with standard tools: `cargo nextest` for the tests and
+`cargo llvm-cov` for coverage (`make test-deps` installs both). Nothing here is run by hand.
 
-Diagnostics live in `target/qa-artifacts`: the selected name, exit status,
-timeout state and exact source commit/version accompany logs. Native tests print
-their synthetic fixture/geometry evidence into those logs. Native tests receive
-`AGENT_TERMINAL_QA_ARTIFACTS`; the UX matrix saves snapshots before geometry
-assertions in `screenshots/`. Capture failure cannot hide assertion failures. CI uploads
-the directory even on failure. No user history or tokens are copied.
+| Command | What it runs | Where it runs |
+|---|---|---|
+| `make test` | The suite, each test in its own process, in parallel (about 35 s) | You, while working |
+| `make check` | fmt, Clippy, the no-default-features build, the suite, the display tests, and these scripts' unit tests | CI on every push and PR (`gate / check`, required), and a release |
+| `make coverage` | The suite and the display tests instrumented; HTML and lcov in `target/qa-artifacts/coverage`; fails under `COVERAGE_FLOOR` (Makefile) | CI on every PR; a release requires it on the release commit |
+| `make hooks` | Opt in to a pre-commit hook: fmt and Clippy only | Your clone |
 
-CI on master, beta branches, PRs and manual runs calls `quality-gate.yml`.
-Release invokes that same workflow on its own checkout; builds depend on it,
-and Publish additionally requires its tested commit to equal the release SHA.
-The beta task in debian-maintainer runs the checked-out script before packaging.
-Its source config must be deployed through the normal pipeline before the live
-mounted config adopts this gate; editing the file does not deploy it.
+Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
+private XDG directories under `target/test-home`, in-memory GSettings and no global or
+system git config, so no test touches your settings, thread store or keyring.
+
+**Display tests** present windows and measure layout. They are `#[ignore]`d so `make test`
+stays fast, and `make check` runs all of them (`--run-ignored only`) one at a time, so none
+is measured while another loads the machine. A new `#[ignore]`d test is picked up
+automatically; the only ones never run are named in `.config/nextest.toml`'s
+`default-filter`, each with its reason (network, a benchmark, a measurement). Screenshots the
+layout tests take land in `target/qa-artifacts/screenshots`, which CI uploads.
+
+**Coverage** counts every line llvm-cov instruments. `COVERAGE_FLOOR` only goes up: raise it
+when coverage rises, never lower it to get a change through.
+
+**Releases**: `release.yml` runs `make check` and `make coverage` on its own checkout, and
+Publish requires both to have passed on exactly the release commit, with nothing edited or
+generated in the tree during the run. The debian-maintainer beta task runs `make check` on
+the checkout it packages.
+
+## Mutation testing
+
+Coverage says a line ran; it cannot say a test checked it. `cargo mutants` (config in
+`.cargo/mutants.toml`) changes `agent-core` and `agent-kit` one small edit at a time and
+runs the tests; a mutant every test still passes is code nothing verifies. Fix it with a
+test that asserts the behaviour.
+
+**CI only. Never run it on a workstation.** By design some mutants turn a bounded loop into
+one that allocates until it is killed; a run here once crashed a desktop. `mutants.yml` runs
+it weekly, and by hand (Actions → Mutation testing → Run workflow), on GitHub's disposable
+runners under `ulimit -v`, and lists missed mutants in the run summary. It reports; it does
+not gate.
+
+## Packaged builds and probes
 
 Release packages carry `<package>.identity.json` with their checksum, source
 commit and Cargo version. The opt-in **packaged identity and startup smoke**

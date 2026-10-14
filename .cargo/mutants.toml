@@ -1,0 +1,20 @@
+# cargo-mutants: breaks the code one small change at a time and checks a test notices.
+# A "missed" mutant is code the tests run but never check. See tests/qa/README.md.
+#
+# CI only (.github/workflows/mutants.yml, under ulimit -v). Never on a developer machine: a
+# mutant can turn a bounded loop into one that allocates until killed, and one took a
+# workstation down.
+
+# Each test in its own process, with the same timeouts as the gate.
+test_tool = "nextest"
+
+# The GTK app rebuilds for a minute per mutant and its UI is covered by the native cases;
+# mutation runs target the pure and GTK-free crates.
+exclude_globs = ["src/**", "build.rs"]
+
+# Equivalent mutants: no behaviour can tell them apart from the code, so no test can catch
+# them. Each entry says why; anything else that survives is a missing check.
+exclude_re = [
+    # `all_decisions` is true on every path that reaches the guard (both served methods).
+    "replace match guard all_decisions with true in CodexAdapter::on_server_request",
+]

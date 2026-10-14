@@ -24,6 +24,10 @@ jobs:
   gate:
     uses: ./.github/workflows/quality-gate.yml
 
+  # The full suite under coverage, held to the floor: no release on a partial run.
+  coverage:
+    uses: ./.github/workflows/coverage.yml
+
   version:
     name: Version
     runs-on: ubuntu-latest
@@ -118,8 +122,8 @@ jobs:
 
   release:
     name: Publish
-    if: startsWith(github.ref, 'refs/tags/v') && needs.gate.outputs.tested_commit == github.sha
-    needs: [version, gate, build, smoke]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.gate.outputs.tested_commit == github.sha && needs.coverage.outputs.tested_commit == github.sha
+    needs: [version, gate, coverage, build, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
