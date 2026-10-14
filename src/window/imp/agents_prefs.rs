@@ -1804,7 +1804,8 @@ impl AgentTerminalWindow {
             .subtitle(
                 "Add it as a top-level key of ~/.gemini/config/hooks.json. Until it is \
                  installed, Antigravity cannot ask before acting: it refuses shell commands but \
-                 applies file edits on its own, in Plan mode too.",
+                 applies file edits on its own, in Plan mode too. Each thread's own directory \
+                 is checked when the thread opens.",
             )
             .build();
         expander.add_row(&json);
@@ -1815,12 +1816,11 @@ impl AgentTerminalWindow {
             #[weak]
             hook,
             async move {
-                // One read off the main thread serves the row and the verdict new Antigravity
-                // sessions use.
-                let home = std::env::var("HOME").ok();
+                // Settings checks the home-level installation, never a thread's launch proof.
+                let target = super::threads::agy_hook_target(None).await;
                 let (probe, bound) = gtk4::gio::spawn_blocking(move || {
                     (
-                        crate::hook_config::probe(home.as_deref()),
+                        crate::hook_config::probe_settings(&target),
                         crate::approval_server::socket_bindable(),
                     )
                 })
@@ -1833,7 +1833,6 @@ impl AgentTerminalWindow {
                         false,
                     )
                 });
-                super::threads::remember_hook_probe(&probe);
                 let badge = crate::hook_config::badge(&probe, bound);
                 crate::hook_config::log_verdict(badge, &probe, bound);
                 let (text, class) = match badge {
@@ -1846,11 +1845,15 @@ impl AgentTerminalWindow {
                         Some("error"),
                     ),
                     crate::hook_config::HookBadge::Unreadable => (
-                        "Could not verify: hooks.json is unreadable or the runtime directory is unavailable. Treat Antigravity as ungated",
+                        "Could not verify the approval hook for a thread. Treat Antigravity as ungated",
                         Some("warning"),
                     ),
                 };
-                hook.set_subtitle(text);
+                let detail = match &probe {
+                    crate::hook_config::HookProbe::Unreadable(why) => format!("Could not verify: {why}"),
+                    _ => text.to_owned(),
+                };
+                hook.set_subtitle(&detail);
                 hook.remove_css_class("error");
                 hook.remove_css_class("warning");
                 if let Some(class) = class {

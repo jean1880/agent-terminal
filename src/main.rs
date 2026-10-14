@@ -11,6 +11,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod account_status;
+mod agent_home;
 mod agent_proc;
 mod always_allow;
 mod approval_hook;

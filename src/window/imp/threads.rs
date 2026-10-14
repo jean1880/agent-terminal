@@ -1167,15 +1167,29 @@ fn agent_launch_with(
         return Err(not_ready_reason(driver, &Availability::Missing));
     };
     let adapter = make_adapter(driver, &program);
+    let env = LaunchEnv {
+        env: resolved.env,
+        unset: unset_list(&clear),
+    };
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
         Driver::Claude | Driver::Codex => Err(None),
-        Driver::Agy => bind_approval(
-            cached_hook_verdict(),
-            thread,
-            cwd,
-            profile.default_mode.unwrap_or_default(),
-        ),
+        Driver::Agy => {
+            let target = crate::hook_config::HookTarget::new(&env, Some(cwd.into()));
+            let verdict = cached_hook_verdict(&target);
+            // A switch cannot await I/O. Its missing proof is checked explicitly for the next launch.
+            if HOOK_VERDICTS.with(|cache| cache.borrow().needs_check(&target)) {
+                glib::MainContext::default().spawn_local(async move {
+                    let _ = check_hook(target).await;
+                });
+            }
+            bind_approval(
+                verdict,
+                thread,
+                cwd,
+                profile.default_mode.unwrap_or_default(),
+            )
+        }
     };
     Ok(AgentLaunch {
         adapter,
@@ -1183,10 +1197,7 @@ fn agent_launch_with(
         extra_args: profile.args.clone(),
         default_model: profile.effective_default_model(None),
         default_effort: profile.default_effort.clone(),
-        env: LaunchEnv {
-            env: resolved.env,
-            unset: unset_list(&clear),
-        },
+        env,
         approval,
     })
 }
@@ -1225,6 +1236,11 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
 /// but the socket failed, the reason (`Err(Some(_))`, such as a binary replaced by an upgrade).
 fn bind_approval(hook: Result<(), String>, thread: &str, cwd: &str, mode: Mode) -> Approval {
     let installed = hook.is_ok();
+    let refusal = hook
+        .as_ref()
+        .err()
+        .filter(|reason| crate::hook_config::verification_refused(reason))
+        .cloned();
     // Not checked yet is not "not installed": the notice says which.
     let unchecked = hook
         .as_ref()
@@ -1233,6 +1249,8 @@ fn bind_approval(hook: Result<(), String>, thread: &str, cwd: &str, mode: Mode) 
         info!("agy runs without its approval hook in this thread: {reason}");
         if unchecked {
             Some(crate::chat::session::HOOK_NOT_CHECKED.to_owned())
+        } else if let Some(refusal) = &refusal {
+            Some(refusal.clone())
         } else {
             installed.then_some(reason)
         }
@@ -1240,46 +1258,120 @@ fn bind_approval(hook: Result<(), String>, thread: &str, cwd: &str, mode: Mode) 
 }
 
 thread_local! {
-    /// The last verdict on agy's hooks file; `None` until the first check finishes.
-    static HOOK_VERDICT: RefCell<Option<Result<(), String>>> = const { RefCell::new(None) };
+    /// Independent launch proofs for the most recently checked home/directory pairs.
+    static HOOK_VERDICTS: RefCell<crate::hook_config::HookCache> = RefCell::new(crate::hook_config::HookCache::default());
 }
 
 /// Reads agy's hooks file off the main thread and remembers the verdict. A thread being built
 /// awaits this; a switch to agy (which cannot wait) uses [`cached_hook_verdict`].
-pub(super) async fn check_hook() -> Result<(), String> {
-    let home = env::var("HOME").ok();
-    let verdict =
-        gtk4::gio::spawn_blocking(move || crate::hook_config::check_installed(home.as_deref()))
-            .await
-            .unwrap_or_else(|_| Err("the hooks check panicked".to_owned()));
-    HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(verdict.clone()));
+pub(super) async fn check_hook(target: crate::hook_config::HookTarget) -> Result<(), String> {
+    let checked = target.clone();
+    let verdict = gtk4::gio::spawn_blocking(move || crate::hook_config::check_target(&target))
+        .await
+        .unwrap_or_else(|_| Err("the hooks check panicked".to_owned()));
+    HOOK_VERDICTS.with(|cache| cache.borrow_mut().remember(&checked, verdict.clone()));
     verdict
 }
 
-/// Remembers the verdict of a probe made elsewhere (Settings), so one file read serves both.
-pub(super) fn remember_hook_probe(probe: &crate::hook_config::HookProbe) {
-    use crate::hook_config::HookProbe;
-    let verdict = match probe {
-        HookProbe::Installed => Ok(()),
-        HookProbe::Missing(why) | HookProbe::Unreadable(why) => Err(why.clone()),
-    };
-    HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(verdict));
+/// Seeds test proofs through the same cache write as the asynchronous launch check.
+#[cfg(test)]
+fn remember_hook_probe(
+    target: crate::hook_config::HookTarget,
+    probe: &crate::hook_config::HookProbe,
+) {
+    HOOK_VERDICTS.with(|cache| {
+        cache
+            .borrow_mut()
+            .remember(&target, crate::hook_config::probe_verdict(probe))
+    });
 }
 
 /// The last [`check_hook`] verdict. Fail-closed: before any check has finished it is an `Err`, so
 /// agy starts without the skip flag rather than guess. (A stale `Ok` is safe too: the session's
 /// canary stops agy and restarts it without the flag when a tool runs without a hook query.)
-fn cached_hook_verdict() -> Result<(), String> {
-    HOOK_VERDICT
-        .with(|v| v.borrow().clone())
-        .unwrap_or_else(|| Err(crate::chat::session::HOOK_NOT_CHECKED.to_owned()))
+fn cached_hook_verdict(target: &crate::hook_config::HookTarget) -> Result<(), String> {
+    HOOK_VERDICTS.with(|cache| cache.borrow().lookup(target))
 }
 
-/// Starts a [`check_hook`] without waiting for it (window start, focus, the periodic refresh).
-pub(super) fn refresh_hook_verdict() {
-    glib::MainContext::default().spawn_local(async {
-        // Only the cached verdict matters here.
-        let _ = check_hook().await;
+/// A completed check is useful only if the launch still has the same proven sources.
+fn hook_for_launch(checked: Result<(), String>, env: &AgentEnv, cwd: &str) -> Result<(), String> {
+    cached_hook_verdict(&crate::hook_config::HookTarget::new(env, Some(cwd.into()))).and(checked)
+}
+
+/// The current agy profile's hook sources from the same cached resolution a switch uses. An
+/// unresolved profile is not a reason to guess the app's home.
+fn cached_agy_hook_target(
+    cwd: Option<std::path::PathBuf>,
+) -> Option<crate::hook_config::HookTarget> {
+    let config = SharedConfig::default();
+    let config = config.borrow();
+    let profile = config
+        .agent_profile(Driver::Agy)
+        .cloned()
+        .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Agy));
+    let resolved = cached_agent(&profile)?;
+    Some(crate::hook_config::HookTarget::new(
+        &AgentEnv {
+            env: resolved.env,
+            unset: unset_list(&config.clear_env),
+        },
+        cwd,
+    ))
+}
+
+/// Resolves the profile off the main thread before a refresh or Settings checks its hook.
+pub(super) async fn agy_hook_target(
+    cwd: Option<std::path::PathBuf>,
+) -> crate::hook_config::HookTarget {
+    let config = SharedConfig::default();
+    let (profile, clear) = {
+        let config = config.borrow();
+        (
+            config
+                .agent_profile(Driver::Agy)
+                .cloned()
+                .unwrap_or_else(|| crate::config::new_agent_profile(Driver::Agy)),
+            config.clear_env.clone(),
+        )
+    };
+    let resolved = resolve_agent(profile).await;
+    crate::hook_config::HookTarget::new(
+        &AgentEnv {
+            env: resolved.env,
+            unset: unset_list(&clear),
+        },
+        cwd,
+    )
+}
+
+/// Every active agy environment and every possible switch target, without retaining env values.
+fn hook_refresh_targets(
+    directories: Vec<std::path::PathBuf>,
+    mut active: Vec<crate::hook_config::HookTarget>,
+    profile: crate::hook_config::HookTarget,
+) -> Vec<crate::hook_config::HookTarget> {
+    active.extend(directories.into_iter().map(|cwd| {
+        let mut target = profile.clone();
+        target.cwd = Some(cwd);
+        target
+    }));
+    let mut seen = std::collections::HashSet::new();
+    active.retain(|target| seen.insert(target.clone()));
+    active
+}
+
+/// Explicitly checks each open thread's sources (window start, focus, the periodic refresh).
+fn refresh_hook_verdict(
+    directories: Vec<std::path::PathBuf>,
+    active: Vec<crate::hook_config::HookTarget>,
+) {
+    glib::MainContext::default().spawn_local(async move {
+        let profile = agy_hook_target(None).await;
+        let targets = hook_refresh_targets(directories, active, profile);
+        HOOK_VERDICTS.with(|cache| cache.borrow_mut().set_refresh_size(targets.len()));
+        for target in targets {
+            let _ = check_hook(target).await;
+        }
     });
 }
 
@@ -3133,6 +3225,7 @@ impl AgentTerminalWindow {
             .unwrap_or_else(|| crate::config::new_agent_profile(driver));
         let obj = self.obj();
         let page = page.clone();
+        let hook_clear = self.config.borrow().clear_env.clone();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
@@ -3165,7 +3258,17 @@ impl AgentTerminalWindow {
                 };
                 // agy's hooks file is read off the main thread too; the verdict gates the socket.
                 let hook = match driver {
-                    Driver::Agy => check_hook().await,
+                    Driver::Agy => {
+                        let hook_env = AgentEnv {
+                            env: resolved.env.clone(),
+                            unset: unset_list(&hook_clear),
+                        };
+                        check_hook(crate::hook_config::HookTarget::new(
+                            &hook_env,
+                            Some(dir.clone().into()),
+                        ))
+                        .await
+                    }
                     Driver::Claude | Driver::Codex => Ok(()),
                 };
                 // A session that will start now waits (briefly) for a fresh model list, so a
@@ -3432,11 +3535,18 @@ impl AgentTerminalWindow {
             approval_hook: false,
         };
         let adapter = make_adapter(driver, &program);
+        let clear = self.config.borrow().clear_env.clone();
+        let launch_env = LaunchEnv {
+            env: resolved.env,
+            unset: unset_list(&clear),
+        };
         let approval = match driver {
             Driver::Claude | Driver::Codex => Err(None),
-            Driver::Agy => bind_approval(hook, thread, dir, mode),
+            Driver::Agy => {
+                // Settings may have changed clear_env while the hook check or catalogue waited.
+                bind_approval(hook_for_launch(hook, &launch_env, dir), thread, dir, mode)
+            }
         };
-        let clear = self.config.borrow().clear_env.clone();
         info!(
             "Opening thread {thread} on {} in {dir}",
             driver_label(driver)
@@ -3448,10 +3558,7 @@ impl AgentTerminalWindow {
             thread.to_owned(),
             sink,
             approval,
-            LaunchEnv {
-                env: resolved.env,
-                unset: unset_list(&clear),
-            },
+            launch_env,
         );
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
@@ -4016,7 +4123,15 @@ impl AgentTerminalWindow {
             .slot_of(thread)
             .and_then(|s| s.get())
             .map(|s| s.wanted_mode());
-        forbids_unasked_edits(wanted) && cached_hook_verdict().is_err()
+        let cwd = self.tabs.borrow().iter().find_map(|t| {
+            t.chat
+                .as_ref()
+                .filter(|c| c.thread == thread)
+                .map(|_| t.dir.clone().into())
+        });
+        forbids_unasked_edits(wanted)
+            && cached_agy_hook_target(cwd)
+                .is_none_or(|target| cached_hook_verdict(&target).is_err())
     }
 
     /// The banners' "Continue in" button and a bare `/handoff`: hand the thread to the next
@@ -4712,7 +4827,30 @@ impl AgentTerminalWindow {
     /// asked to check again).
     pub(super) fn refresh_agent_data(&self, probes: Probes) {
         // Also what a switch to agy needs: its hook verdict, read off the main thread.
-        refresh_hook_verdict();
+        let sources = RefCell::new((Vec::new(), Vec::new()));
+        self.for_each_window(|window| {
+            let mut sources = sources.borrow_mut();
+            for tab in window.tabs.borrow().iter().filter(|tab| tab.chat.is_some()) {
+                sources.0.push(std::path::PathBuf::from(&tab.dir));
+                if let Some(session) = tab.chat.as_ref().and_then(|chat| chat.slot.get()) {
+                    sources.1.push((tab.dir.clone(), session));
+                }
+            }
+        });
+        let (directories, sessions) = sources.into_inner();
+        // Session reads happen after every tab borrow has ended; a switch replaces its env.
+        let active = sessions
+            .into_iter()
+            .filter_map(|(cwd, session)| {
+                (session.status().driver == Driver::Agy).then(|| {
+                    crate::hook_config::HookTarget::new(
+                        &session.launch_environment(),
+                        Some(cwd.into()),
+                    )
+                })
+            })
+            .collect();
+        refresh_hook_verdict(directories, active);
         let availability = AgentAvailability::shared();
         availability.mark_scan_started();
         let (profiles, clear): (Vec<(Driver, Profile)>, Vec<String>) = {
@@ -5006,9 +5144,16 @@ impl AgentTerminalWindow {
     /// another agent; the banner goes away again when the agent is back.
     fn update_unavailable_banners(&self) {
         let availability = AgentAvailability::shared();
-        let hook_unproven = cached_hook_verdict().is_err();
+        let hook_target = cached_agy_hook_target(None);
         let mut tabs = self.tabs.borrow_mut();
-        for chat in tabs.iter_mut().filter_map(|t| t.chat.as_mut()) {
+        for tab in tabs.iter_mut() {
+            let Some(chat) = tab.chat.as_mut() else {
+                continue;
+            };
+            let hook_unproven = hook_target.clone().is_none_or(|mut target| {
+                target.cwd = Some(tab.dir.clone().into());
+                cached_hook_verdict(&target).is_err()
+            });
             let driver = chat.slot.driver();
             let state = availability.get(driver);
             // As agy_cannot_ask_for (inline: the tabs are borrowed here).
@@ -5068,6 +5213,7 @@ impl AgentTerminalWindow {
                 .cloned()
                 .unwrap_or_else(|| crate::config::new_agent_profile(driver));
             let obj = self.obj().downgrade();
+            let hook_clear = self.config.borrow().clear_env.clone();
             glib::MainContext::default().spawn_local(async move {
                 let resolved = resolve_agent(profile.clone()).await;
                 // A store that cannot be read starts nothing: a session started without the
@@ -5086,7 +5232,17 @@ impl AgentTerminalWindow {
                     None => None,
                 };
                 let hook = match driver {
-                    Driver::Agy => check_hook().await,
+                    Driver::Agy => {
+                        let hook_env = AgentEnv {
+                            env: resolved.env.clone(),
+                            unset: unset_list(&hook_clear),
+                        };
+                        check_hook(crate::hook_config::HookTarget::new(
+                            &hook_env,
+                            Some(dir.clone().into()),
+                        ))
+                        .await
+                    }
                     Driver::Claude | Driver::Codex => Ok(()),
                 };
                 if AgentAvailability::shared().is_ready(driver) {
@@ -5978,10 +6134,29 @@ pub(super) mod tests {
         assert_eq!(ported.expect("recorded").model, "claude-sonnet-3-7");
     }
 
+    fn hook_target(
+        home: Option<&std::path::Path>,
+        cwd: Option<&std::path::Path>,
+    ) -> crate::hook_config::HookTarget {
+        let mut env = AgentEnv {
+            env: home
+                .map(|home| vec![("HOME".into(), home.to_string_lossy().into_owned())])
+                .unwrap_or_default(),
+            unset: crate::hook_config::CONFIG_REDIRECT_VARS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        env.unset.push("HOME".into());
+        crate::hook_config::HookTarget::new(&env, cwd.map(std::path::Path::to_path_buf))
+    }
+
     #[test]
     fn an_unchecked_hook_fails_closed_and_says_it_is_not_checked_yet() {
-        HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
-        let before = cached_hook_verdict();
+        let home = std::path::Path::new("/test/home");
+        let target = hook_target(Some(home), Some(std::path::Path::new("/tmp")));
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        let before = cached_hook_verdict(&target);
         assert!(before
             .as_ref()
             .is_err_and(|e| e.contains("not been checked")));
@@ -6002,11 +6177,370 @@ pub(super) mod tests {
             bind_approval(Ok(()), "t", "relative", Mode::Ask),
             Err(Some(reason)) if !reason.is_empty()
         ));
-        HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Err("not installed".into())));
-        assert_eq!(cached_hook_verdict(), Err("not installed".to_owned()));
-        HOOK_VERDICT.with(|v| *v.borrow_mut() = Some(Ok(())));
-        assert_eq!(cached_hook_verdict(), Ok(()));
-        HOOK_VERDICT.with(|v| *v.borrow_mut() = None);
+        remember_hook_probe(
+            target.clone(),
+            &crate::hook_config::HookProbe::Missing("not installed".into()),
+        );
+        assert_eq!(
+            cached_hook_verdict(&target),
+            Err("not installed".to_owned())
+        );
+        remember_hook_probe(target.clone(), &crate::hook_config::HookProbe::Installed);
+        assert_eq!(cached_hook_verdict(&target), Ok(()));
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
+    #[test]
+    fn hook_check_uses_the_profile_home() {
+        crate::testutil::in_loop(|ctx| {
+            let app = tempfile::tempdir().expect("app home");
+            let profile = tempfile::tempdir().expect("profile home");
+            let dir = app.path().join(".gemini/config");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(
+                dir.join("hooks.json"),
+                crate::hook_config::install_entry_json(),
+            )
+            .expect("hook");
+            assert!(ctx
+                .block_on(check_hook(hook_target(Some(app.path()), Some(app.path()))))
+                .is_ok());
+            let env = AgentEnv {
+                env: vec![("HOME".into(), profile.path().to_string_lossy().into_owned())],
+                unset: crate::hook_config::CONFIG_REDIRECT_VARS
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            };
+            let home = crate::agent_home::effective_home(&env);
+            assert_eq!(home.as_deref(), Some(profile.path()));
+            let target = crate::hook_config::HookTarget::new(&env, Some(app.path().into()));
+            assert!(ctx.block_on(check_hook(target.clone())).is_err());
+            assert!(cached_hook_verdict(&target).is_err());
+            HOOK_VERDICTS
+                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        });
+    }
+
+    #[test]
+    fn no_home_fails_closed() {
+        crate::testutil::in_loop(|ctx| {
+            let cwd = tempfile::tempdir().expect("thread directory");
+            let env = AgentEnv {
+                env: vec![],
+                unset: std::iter::once("HOME")
+                    .chain(crate::hook_config::CONFIG_REDIRECT_VARS)
+                    .map(str::to_owned)
+                    .collect(),
+            };
+            let home = crate::agent_home::effective_home(&env);
+            assert_eq!(home, None);
+            let target = crate::hook_config::HookTarget::new(&env, Some(cwd.path().into()));
+            assert!(ctx.block_on(check_hook(target.clone())).is_err());
+            // Even an installed Settings probe with no resolvable home cannot prove a hook.
+            remember_hook_probe(target.clone(), &crate::hook_config::HookProbe::Installed);
+            assert_eq!(
+                cached_hook_verdict(&target),
+                Err(crate::chat::session::HOOK_NOT_CHECKED.into())
+            );
+            HOOK_VERDICTS
+                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        });
+    }
+
+    #[test]
+    fn a_verdict_for_another_home_is_not_reused() {
+        let app = std::path::Path::new("/app/home");
+        let profile = std::path::Path::new("/profile/home");
+        let cwd = std::path::Path::new("/tmp");
+        let app = hook_target(Some(app), Some(cwd));
+        let profile = hook_target(Some(profile), Some(cwd));
+        remember_hook_probe(app.clone(), &crate::hook_config::HookProbe::Installed);
+        assert_eq!(cached_hook_verdict(&app), Ok(()));
+        assert_eq!(
+            cached_hook_verdict(&profile),
+            Err(crate::hook_config::DIFFERENT_HOME.into())
+        );
+        assert!(
+            cached_hook_verdict(&hook_target(None, Some(cwd))).is_err(),
+            "clear_env changed before launch"
+        );
+        remember_hook_probe(
+            profile.clone(),
+            &crate::hook_config::HookProbe::Missing("no entry".into()),
+        );
+        assert_eq!(cached_hook_verdict(&profile), Err("no entry".into()));
+        assert_eq!(
+            cached_hook_verdict(&app),
+            Ok(()),
+            "another home's check cannot erase this proof"
+        );
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
+    #[test]
+    fn a_launch_without_home_rejects_an_earlier_hook_proof() {
+        let home = std::path::Path::new("/app/home");
+        let target = hook_target(Some(home), Some(std::path::Path::new("/tmp")));
+        remember_hook_probe(target.clone(), &crate::hook_config::HookProbe::Installed);
+        let checked = cached_hook_verdict(&target);
+        assert!(checked.is_ok());
+        let cleared = AgentEnv {
+            env: vec![],
+            unset: std::iter::once("HOME")
+                .chain(crate::hook_config::CONFIG_REDIRECT_VARS)
+                .map(str::to_owned)
+                .collect(),
+        };
+        assert!(matches!(
+            bind_approval(hook_for_launch(checked, &cleared, "/tmp"), "t", "/tmp", Mode::Ask),
+            Err(Some(reason)) if reason == crate::chat::session::HOOK_NOT_CHECKED
+        ));
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
+    #[test]
+    fn a_redirect_added_before_launch_invalidates_the_hook_proof() {
+        let home = std::path::Path::new("/app/home");
+        let target = hook_target(Some(home), Some(std::path::Path::new("/tmp")));
+        remember_hook_probe(target.clone(), &crate::hook_config::HookProbe::Installed);
+        assert!(cached_hook_verdict(&target).is_ok());
+        let env = AgentEnv {
+            env: vec![
+                ("HOME".into(), "/app/home".into()),
+                (
+                    "ANTIGRAVITY_APP_DATA_DIR".into(),
+                    "private-config-value".into(),
+                ),
+            ],
+            unset: crate::hook_config::CONFIG_REDIRECT_VARS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let refusal = hook_for_launch(Ok(()), &env, "/tmp");
+        assert!(matches!(bind_approval(refusal, "t", "/tmp", Mode::Ask),
+            Err(Some(why)) if why.contains("ANTIGRAVITY_APP_DATA_DIR") && !why.contains("private-config-value")));
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
+    #[test]
+    fn a_verdict_for_another_directory_is_not_reused() {
+        let home = std::path::Path::new("/app/home");
+        let first = hook_target(Some(home), Some(std::path::Path::new("/first")));
+        let second = hook_target(Some(home), Some(std::path::Path::new("/second")));
+        remember_hook_probe(first.clone(), &crate::hook_config::HookProbe::Installed);
+        assert_eq!(cached_hook_verdict(&first), Ok(()));
+        assert_eq!(
+            cached_hook_verdict(&second),
+            Err(crate::hook_config::DIFFERENT_DIRECTORY.into())
+        );
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
+    #[test]
+    fn two_thread_proofs_coexist_and_refresh_independently() {
+        crate::testutil::in_loop(|ctx| {
+            let home = tempfile::tempdir().expect("home");
+            let hooks = home.path().join(".gemini/config/hooks.json");
+            std::fs::create_dir_all(hooks.parent().expect("parent")).expect("mkdir");
+            std::fs::write(hooks, crate::hook_config::install_entry_json()).expect("home hook");
+            let a = tempfile::tempdir().expect("directory A");
+            let b = tempfile::tempdir().expect("directory B");
+            let target_a = hook_target(Some(home.path()), Some(a.path()));
+            let target_b = hook_target(Some(home.path()), Some(b.path()));
+            assert!(ctx.block_on(check_hook(target_a.clone())).is_ok());
+            assert!(ctx.block_on(check_hook(target_b.clone())).is_ok());
+            let env = AgentEnv {
+                env: vec![("HOME".into(), home.path().to_string_lossy().into_owned())],
+                unset: crate::hook_config::CONFIG_REDIRECT_VARS
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            };
+            for cwd in [a.path(), b.path()] {
+                assert!(
+                    hook_for_launch(Ok(()), &env, cwd.to_str().expect("cwd")).is_ok(),
+                    "checking B must not remove A's skip-flag proof"
+                );
+            }
+            for (changed, other) in [(&target_a, &target_b), (&target_b, &target_a)] {
+                let local = changed
+                    .cwd
+                    .as_ref()
+                    .expect("cwd")
+                    .join(".agents/hooks.json");
+                std::fs::create_dir_all(local.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&local, "{}").expect("changed hook");
+                assert!(ctx.block_on(check_hook(changed.clone())).is_err());
+                assert!(cached_hook_verdict(changed).is_err());
+                assert_eq!(cached_hook_verdict(other), Ok(()));
+                std::fs::remove_file(local).expect("remove");
+                assert!(ctx.block_on(check_hook(changed.clone())).is_ok());
+            }
+            let changed_home =
+                hook_target(Some(std::path::Path::new("/another/home")), Some(a.path()));
+            assert!(
+                cached_hook_verdict(&changed_home).is_err(),
+                "a new HOME requires its own proof"
+            );
+            HOOK_VERDICTS
+                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        });
+    }
+
+    #[test]
+    fn refresh_checks_all_directories_and_active_session_homes() {
+        let a = std::path::Path::new("/directory/a");
+        let b = std::path::Path::new("/directory/b");
+        let active = hook_target(Some(std::path::Path::new("/active/home")), Some(a));
+        let profile = hook_target(Some(std::path::Path::new("/profile/home")), None);
+        let targets = hook_refresh_targets(
+            vec![a.into(), b.into(), a.into()],
+            vec![active.clone()],
+            profile,
+        );
+        assert_eq!(targets.len(), 3, "duplicates are checked once");
+        assert!(targets.contains(&active));
+        for cwd in [a, b] {
+            assert!(
+                targets.contains(&hook_target(
+                    Some(std::path::Path::new("/profile/home")),
+                    Some(cwd)
+                )),
+                "every open thread can switch to the current profile"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refresh_keeps_all_twenty_open_directory_proofs() {
+        let directories: Vec<_> = (0..20)
+            .map(|i| std::path::PathBuf::from(format!("/directory/{i}")))
+            .collect();
+        let profile = hook_target(Some(std::path::Path::new("/profile/home")), None);
+        let active = hook_target(
+            Some(std::path::Path::new("/active/home")),
+            Some(&directories[0]),
+        );
+        let targets = hook_refresh_targets(directories, vec![active], profile);
+        assert_eq!(
+            targets.len(),
+            21,
+            "active and configured homes both count toward capacity"
+        );
+        let mut cache = crate::hook_config::HookCache::default();
+        cache.set_refresh_size(targets.len());
+        for target in &targets {
+            cache.remember(target, Ok(()));
+        }
+        for target in &targets {
+            assert_eq!(
+                cache.lookup(target),
+                Ok(()),
+                "refresh must not evict its own proofs"
+            );
+        }
+        cache.remember(&targets[0], Err("hook changed".into()));
+        assert_eq!(cache.lookup(&targets[0]), Err("hook changed".into()));
+        assert_eq!(cache.lookup(&targets[1]), Ok(()));
+        cache.set_refresh_size(0);
+        assert!(
+            cache.lookup(&targets[2]).is_err(),
+            "closed sources do not leave an unbounded cache"
+        );
+        assert_eq!(
+            cache.lookup(&targets[0]),
+            Err("hook changed".into()),
+            "the most recent failed proof remains a refusal"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_probe_cannot_replace_a_launch_proof() {
+        crate::testutil::in_loop(|ctx| {
+            let home = std::path::Path::new("/app/home");
+            let scoped = hook_target(Some(home), Some(std::path::Path::new("/tmp")));
+            let unscoped = hook_target(Some(home), None);
+            remember_hook_probe(scoped.clone(), &crate::hook_config::HookProbe::Installed);
+            assert!(ctx.block_on(check_hook(unscoped.clone())).is_err());
+            remember_hook_probe(unscoped.clone(), &crate::hook_config::HookProbe::Installed);
+            assert!(cached_hook_verdict(&unscoped).is_err());
+            assert_eq!(cached_hook_verdict(&scoped), Ok(()));
+            HOOK_VERDICTS
+                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+        });
+    }
+
+    #[test]
+    fn a_cache_mismatch_names_the_home_and_rejects_the_launch() {
+        let cached = hook_target(
+            Some(std::path::Path::new("/cached")),
+            Some(std::path::Path::new("/tmp")),
+        );
+        remember_hook_probe(cached, &crate::hook_config::HookProbe::Installed);
+        let env = AgentEnv {
+            env: vec![("HOME".into(), "/actual".into())],
+            unset: crate::hook_config::CONFIG_REDIRECT_VARS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let refusal = hook_for_launch(Ok(()), &env, "/tmp");
+        assert_eq!(refusal, Err(crate::hook_config::DIFFERENT_HOME.into()));
+        assert!(matches!(bind_approval(refusal, "t", "/tmp", Mode::Ask),
+            Err(Some(why)) if why == crate::hook_config::DIFFERENT_HOME));
+        HOOK_VERDICTS.with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+    }
+
+    #[test]
+    fn a_missing_agy_profile_uses_the_launch_fallback() {
+        crate::testutil::in_loop(|ctx| {
+            let config = SharedConfig::default();
+            let saved = config.borrow().clone();
+            config.borrow_mut().profiles.clear();
+            config.borrow_mut().clear_env = crate::hook_config::CONFIG_REDIRECT_VARS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let profile = crate::config::new_agent_profile(Driver::Agy);
+            let key = (profile.command.clone(), profile.env_file.clone());
+            let old = RESOLVED.with(|r| {
+                r.borrow_mut().insert(
+                    key.clone(),
+                    ResolvedAgent {
+                        program: Some("/fixture/agy".into()),
+                        env: vec![("HOME".into(), "/fallback/home".into())],
+                    },
+                )
+            });
+            HOOK_VERDICTS
+                .with(|cache| *cache.borrow_mut() = crate::hook_config::HookCache::default());
+            let cached = cached_agy_hook_target(Some("/tmp".into())).expect("fallback resolved");
+            let refreshed = ctx.block_on(agy_hook_target(Some("/tmp".into())));
+            let launch = agent_launch_with(
+                &Availability::Ready("/fixture/agy".into()),
+                Driver::Agy,
+                "t",
+                "/tmp",
+            )
+            .expect("launch description");
+            assert_eq!(
+                cached.home.as_deref(),
+                Some(std::path::Path::new("/fallback/home"))
+            );
+            assert_eq!(cached.home, refreshed.home);
+            assert_eq!(cached.home, crate::agent_home::effective_home(&launch.env));
+            *config.borrow_mut() = saved;
+            RESOLVED.with(|r| {
+                let mut r = r.borrow_mut();
+                if let Some(old) = old {
+                    r.insert(key, old);
+                } else {
+                    r.remove(&key);
+                }
+            });
+        });
     }
 
     #[test]

@@ -1,14 +1,91 @@
 //! Is agy's approval hook actually installed? agy runs with `--dangerously-skip-permissions`
 //! only when the answer is yes, so this is checked before an [`crate::approval_server`] socket
-//! is bound for it: a missing hook means plan mode, never an ungated agent.
+//! is bound for it. Without a proven hook, agy uses its native mode and cannot ask before acting.
 //!
-//! The file is `$HOME/.gemini/config/hooks.json`. Its shape (named groups, each mapping an
+//! The primary file is `$HOME/.gemini/config/hooks.json`. Its shape (named groups, each mapping an
 //! event to entries that are either a bare command or a `matcher` with nested `hooks`) is the
-//! one agy and agent-sync write. Parsing is pure; only [`check_installed`] reads the file.
+//! one agy and agent-sync write. Alternate sources must be covered too before a launch is proven.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+/// These agy-specific names may redirect its configuration. Their precedence is unproven, so
+/// any set value (even blank) prevents a proof. XDG_CONFIG_HOME does not move agy's hook files.
+pub const CONFIG_REDIRECT_VARS: [&str; 3] = [
+    "ANTIGRAVITY_APP_DATA_DIR",
+    "JETSKI_APP_DATA_DIR",
+    "CASCADE_GLOBAL_CONFIG_OVERRIDE",
+];
+
+pub const DIFFERENT_HOME: &str = "the cached approval hook was checked for a different home folder";
+pub const DIFFERENT_DIRECTORY: &str =
+    "the cached approval hook was checked for a different thread directory";
+const UNVERIFIED: &str = "cannot verify agy's approval hook: ";
+
+/// Only names and paths are kept with a proof, never environment values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HookTarget {
+    pub home: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    redirect: Option<&'static str>,
+}
+
+impl HookTarget {
+    pub fn new(env: &crate::agent_proc::AgentEnv, cwd: Option<PathBuf>) -> Self {
+        Self::from_child(&crate::agent_home::child_env(env), cwd)
+    }
+
+    fn from_child(child: &[(String, String)], cwd: Option<PathBuf>) -> Self {
+        Self {
+            home: crate::agent_home::home_in_child(child),
+            cwd,
+            redirect: CONFIG_REDIRECT_VARS
+                .into_iter()
+                .find(|name| child.iter().any(|(key, _)| key == name)),
+        }
+    }
+
+    fn environment_verdict(&self) -> Result<(), String> {
+        match self.redirect {
+            Some(name) => Err(format!(
+                "{UNVERIFIED}{name} is set and may redirect its configuration"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    pub fn context_verdict(&self) -> Result<(), String> {
+        self.environment_verdict()?;
+        if self.home.is_none() {
+            return Err(crate::chat::session::HOOK_NOT_CHECKED.to_owned());
+        }
+        if !self
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| agent_core::codex::is_plain_absolute(cwd))
+        {
+            return Err(format!(
+                "{UNVERIFIED}the thread directory is unknown or not a plain absolute path"
+            ));
+        }
+        Ok(())
+    }
+
+    fn key(&self) -> Result<(PathBuf, PathBuf), String> {
+        self.context_verdict()?;
+        match (&self.home, &self.cwd) {
+            (Some(home), Some(cwd)) => Ok((home.clone(), cwd.clone())),
+            _ => Err(crate::chat::session::HOOK_NOT_CHECKED.to_owned()),
+        }
+    }
+}
+
+/// These failures must reach the session notice instead of being called a missing installation.
+pub fn verification_refused(reason: &str) -> bool {
+    reason.starts_with(UNVERIFIED) || matches!(reason, DIFFERENT_HOME | DIFFERENT_DIRECTORY)
+}
 
 /// The one hook command agent-terminal accepts. Anything else (a substring match, a bare
 /// `agent-terminal` found on PATH, an `echo --approval-hook`) proves nothing about the gate.
@@ -33,9 +110,9 @@ pub fn install_entry_json() -> String {
 }
 
 /// `$HOME/.gemini/config/hooks.json`; takes the value so tests never read the real home.
-pub fn hooks_path(home: Option<&str>) -> Option<PathBuf> {
-    let home = home.filter(|h| !h.is_empty())?;
-    Some(PathBuf::from(home).join(".gemini/config/hooks.json"))
+pub fn hooks_path(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home.filter(|h| agent_core::codex::is_plain_absolute(h))?;
+    Some(home.join(".gemini/config/hooks.json"))
 }
 
 /// True when some `PreToolUse` entry runs `--approval-hook` and matches every tool: a matcher
@@ -90,14 +167,32 @@ pub enum HookProbe {
 }
 
 /// Reads the real file and classifies what is there.
-pub fn probe(home: Option<&str>) -> HookProbe {
-    let Some(path) = hooks_path(home) else {
-        return HookProbe::Unreadable("HOME is not set".to_owned());
+pub fn probe(home: Option<&Path>) -> HookProbe {
+    let (Some(home), Some(path)) = (home, hooks_path(home)) else {
+        return HookProbe::Unreadable("HOME is not an absolute path".to_owned());
     };
-    let text = match std::fs::read_to_string(&path) {
+    let primary = probe_path(&path);
+    if primary != HookProbe::Installed {
+        return primary;
+    }
+    let alternate = home.join(".gemini/antigravity-cli/hooks.json");
+    match present(&alternate) {
+        Ok(false) => HookProbe::Installed,
+        Ok(true) => match probe_path(&alternate) {
+            HookProbe::Installed => HookProbe::Installed,
+            HookProbe::Missing(why) | HookProbe::Unreadable(why) => {
+                HookProbe::Unreadable(format!("{UNVERIFIED}{why}"))
+            }
+        },
+        Err(why) => HookProbe::Unreadable(why),
+    }
+}
+
+fn probe_path(path: &Path) -> HookProbe {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return HookProbe::Missing(missing_message(&path));
+            return HookProbe::Missing(missing_message(path));
         }
         Err(e) => {
             return HookProbe::Unreadable(format!("cannot read {}: {e}", path.display()));
@@ -109,8 +204,96 @@ pub fn probe(home: Option<&str>) -> HookProbe {
     if value_installed(&root) {
         HookProbe::Installed
     } else {
-        HookProbe::Missing(missing_message(&path))
+        HookProbe::Missing(missing_message(path))
     }
+}
+
+/// `exists` would hide permission errors and dangling links. Both must fail closed.
+fn present(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!(
+            "{UNVERIFIED}cannot inspect {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn reject_workspace_hook(path: &Path) -> Result<(), String> {
+    if present(path)? {
+        return Err(format!(
+            "{UNVERIFIED}{} exists and may override the approval hook",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn hook_directories(cwd: &Path, toplevel: Option<&Path>) -> Vec<PathBuf> {
+    match toplevel.filter(|root| cwd.starts_with(root)) {
+        Some(root) => cwd
+            .ancestors()
+            .take_while(|dir| dir.starts_with(root))
+            .map(Path::to_path_buf)
+            .collect(),
+        None => vec![cwd.to_path_buf()],
+    }
+}
+
+fn repository_toplevel(
+    discovered: Result<Option<PathBuf>, String>,
+) -> Result<Option<PathBuf>, String> {
+    discovered.map_err(|_| format!(
+        "{UNVERIFIED}could not tell which repository this thread is in, so its workspace hook files could not be checked"
+    ))
+}
+
+/// A whole launch proof, including the sources whose precedence this app cannot assume.
+fn target_sources(target: &HookTarget) -> Result<(), String> {
+    target.environment_verdict()?;
+    let Some(cwd) = target.cwd.as_deref() else {
+        return Err(format!(
+            "{UNVERIFIED}the thread directory is unknown, so workspace hook files could not be checked"
+        ));
+    };
+    if !agent_core::codex::is_plain_absolute(cwd) {
+        return Err(format!(
+            "{UNVERIFIED}the thread directory is not a plain absolute path"
+        ));
+    }
+    reject_workspace_hook(&cwd.join(".agents/hooks.json"))?;
+    reject_workspace_hook(&cwd.join("hooks/hooks.json"))?;
+    // git returns the physical toplevel; resolve aliases before comparing the boundary. These
+    // read-only, timed queries use agent-kit's cleaned git environment, on the check's worker.
+    let physical = std::fs::canonicalize(cwd).map_err(|e| {
+        format!(
+        "{UNVERIFIED}could not resolve the thread directory to check its workspace hook files: {e}"
+    )
+    })?;
+    let toplevel = repository_toplevel(
+        agent_kit::git::discover(&physical).map(|repo| repo.map(|repo| repo.toplevel)),
+    )?;
+    for dir in hook_directories(&physical, toplevel.as_deref())
+        .into_iter()
+        .skip(1)
+    {
+        reject_workspace_hook(&dir.join(".agents/hooks.json"))?;
+    }
+    Ok(())
+}
+
+/// Settings proves only the home-level installation; each launch checks its own directory.
+pub fn probe_settings(target: &HookTarget) -> HookProbe {
+    match target.environment_verdict() {
+        Ok(()) => probe(target.home.as_deref()),
+        Err(why) => HookProbe::Unreadable(why),
+    }
+}
+
+pub fn check_target(target: &HookTarget) -> Result<(), String> {
+    target_sources(target)?;
+    check_installed(target.home.as_deref())
 }
 
 fn missing_message(path: &std::path::Path) -> String {
@@ -122,10 +305,106 @@ fn missing_message(path: &std::path::Path) -> String {
 }
 
 /// Reads the real file. `Err` carries the reason to show the user.
-pub fn check_installed(home: Option<&str>) -> Result<(), String> {
-    match probe(home) {
+pub fn check_installed(home: Option<&Path>) -> Result<(), String> {
+    probe_verdict(&probe(home))
+}
+
+pub fn probe_verdict(probe: &HookProbe) -> Result<(), String> {
+    match probe {
         HookProbe::Installed => Ok(()),
-        HookProbe::Missing(why) | HookProbe::Unreadable(why) => Err(why),
+        HookProbe::Missing(why) | HookProbe::Unreadable(why) => Err(why.clone()),
+    }
+}
+
+/// A hook proof belongs only to the home and thread directory checked.
+#[derive(Clone)]
+pub struct HookVerdict {
+    pub home: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    pub verdict: Result<(), String>,
+}
+
+impl HookVerdict {
+    pub fn for_target(&self, target: &HookTarget) -> Result<(), String> {
+        target.context_verdict()?;
+        if self.home != target.home {
+            return Err(DIFFERENT_HOME.to_owned());
+        }
+        if self.cwd != target.cwd {
+            return Err(DIFFERENT_DIRECTORY.to_owned());
+        }
+        self.verdict.clone()
+    }
+}
+
+const HOOK_CACHE_LIMIT: usize = 16;
+
+/// Bounded by the most recently checked sources, never by lookup side effects. A failed check
+/// replaces only its own entry; Settings and unresolved contexts cannot create launch proofs.
+pub struct HookCache {
+    entries: HashMap<(PathBuf, PathBuf), HookVerdict>,
+    checked: VecDeque<(PathBuf, PathBuf)>,
+    capacity: usize,
+}
+
+impl Default for HookCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            checked: VecDeque::new(),
+            capacity: HOOK_CACHE_LIMIT,
+        }
+    }
+}
+
+impl HookCache {
+    /// A refresh can retain every open source while inactive entries remain bounded.
+    pub fn set_refresh_size(&mut self, sources: usize) {
+        self.capacity = HOOK_CACHE_LIMIT.max(sources);
+        self.trim();
+    }
+
+    pub fn remember(&mut self, target: &HookTarget, verdict: Result<(), String>) {
+        let Ok(key) = target.key() else { return };
+        self.checked.retain(|old| old != &key);
+        self.checked.push_back(key.clone());
+        self.entries.insert(
+            key,
+            HookVerdict {
+                home: target.home.clone(),
+                cwd: target.cwd.clone(),
+                verdict,
+            },
+        );
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.checked.len() > self.capacity {
+            if let Some(oldest) = self.checked.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn lookup(&self, target: &HookTarget) -> Result<(), String> {
+        let key = target.key()?;
+        if let Some(verdict) = self.entries.get(&key) {
+            return verdict.for_target(target);
+        }
+        if self.entries.keys().any(|(_, cwd)| cwd == &key.1) {
+            return Err(DIFFERENT_HOME.to_owned());
+        }
+        if self.entries.keys().any(|(home, _)| home == &key.0) {
+            return Err(DIFFERENT_DIRECTORY.to_owned());
+        }
+        Err(crate::chat::session::HOOK_NOT_CHECKED.to_owned())
+    }
+
+    pub fn needs_check(&self, target: &HookTarget) -> bool {
+        target
+            .key()
+            .is_ok_and(|key| !self.entries.contains_key(&key))
     }
 }
 
@@ -170,6 +449,21 @@ pub fn log_verdict(badge: HookBadge, probe: &HookProbe, socket_bound: bool) {
 mod tests {
     use super::*;
 
+    fn installed_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("home");
+        let dir = home.path().join(".gemini/config");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("hooks.json"), GOOD).expect("hook");
+        home
+    }
+
+    fn target(home: &Path, cwd: Option<&Path>) -> HookTarget {
+        HookTarget::from_child(
+            &[("HOME".into(), home.to_string_lossy().into_owned())],
+            cwd.map(Path::to_path_buf),
+        )
+    }
+
     const GOOD: &str = r#"{
       "other": {"PostToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": "x"}]}]},
       "agent-terminal-approval": {"PreToolUse": [{"matcher": ".*", "hooks": [
@@ -192,10 +486,10 @@ mod tests {
 
     fn check_message_names_the_entry() -> bool {
         let tmp = tempfile::tempdir().expect("tmp");
-        let home = tmp.path().to_string_lossy().into_owned();
+        let home = tmp.path();
         std::fs::create_dir_all(tmp.path().join(".gemini/config")).expect("mk");
         std::fs::write(tmp.path().join(".gemini/config/hooks.json"), "{}").expect("write");
-        check_installed(Some(&home))
+        check_installed(Some(home))
             .err()
             .is_some_and(|m| m.contains("PreToolUse") && m.contains("--approval-hook"))
     }
@@ -243,9 +537,9 @@ mod tests {
     #[test]
     fn probe_separates_missing_from_unreadable() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let home = tmp.path().to_string_lossy().into_owned();
+        let home = tmp.path();
         assert!(
-            matches!(probe(Some(&home)), HookProbe::Missing(_)),
+            matches!(probe(Some(home)), HookProbe::Missing(_)),
             "no file"
         );
         assert!(matches!(probe(None), HookProbe::Unreadable(_)), "no HOME");
@@ -253,23 +547,20 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk");
         std::fs::write(dir.join("hooks.json"), "not json").expect("write");
         assert!(
-            matches!(probe(Some(&home)), HookProbe::Unreadable(_)),
+            matches!(probe(Some(home)), HookProbe::Unreadable(_)),
             "bad json"
         );
         std::fs::write(dir.join("hooks.json"), "{}").expect("write");
         assert!(
-            matches!(probe(Some(&home)), HookProbe::Missing(_)),
+            matches!(probe(Some(home)), HookProbe::Missing(_)),
             "no entry"
         );
         std::fs::write(dir.join("hooks.json"), GOOD).expect("write");
-        assert_eq!(probe(Some(&home)), HookProbe::Installed);
+        assert_eq!(probe(Some(home)), HookProbe::Installed);
         // A directory where the file should be is a read error, not "missing".
         std::fs::remove_file(dir.join("hooks.json")).expect("rm");
         std::fs::create_dir(dir.join("hooks.json")).expect("mkdir");
-        assert!(
-            matches!(probe(Some(&home)), HookProbe::Unreadable(_)),
-            "dir"
-        );
+        assert!(matches!(probe(Some(home)), HookProbe::Unreadable(_)), "dir");
     }
 
     #[test]
@@ -288,14 +579,304 @@ mod tests {
     #[test]
     fn check_installed_reads_the_file_under_a_given_home() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let home = tmp.path().to_string_lossy().into_owned();
-        assert!(check_installed(Some(&home)).is_err(), "no file");
+        let home = tmp.path();
+        assert!(check_installed(Some(home)).is_err(), "no file");
         assert!(check_installed(None).is_err());
         let dir = tmp.path().join(".gemini/config");
         std::fs::create_dir_all(&dir).expect("mk");
         std::fs::write(dir.join("hooks.json"), "{}").expect("write");
-        assert!(check_installed(Some(&home)).is_err(), "no entry");
+        assert!(check_installed(Some(home)).is_err(), "no entry");
         std::fs::write(dir.join("hooks.json"), GOOD).expect("write");
-        assert!(check_installed(Some(&home)).is_ok());
+        assert!(check_installed(Some(home)).is_ok());
+    }
+
+    #[test]
+    fn redirect_vars_fail_closed_in_the_launch_environment() {
+        let home = installed_home();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let proof = HookVerdict {
+            home: Some(home.path().into()),
+            cwd: Some(cwd.path().into()),
+            verdict: Ok(()),
+        };
+        for name in CONFIG_REDIRECT_VARS {
+            let inherited = vec![
+                ("HOME".into(), home.path().to_string_lossy().into_owned()),
+                (name.into(), "private-config-value".into()),
+            ];
+            let mut inputs = crate::codex_home::Inputs {
+                inherited,
+                ..crate::codex_home::Inputs::default()
+            };
+            for from_profile in [false, true] {
+                if from_profile {
+                    inputs.inherited.retain(|(key, _)| key != name);
+                    inputs.env_file = vec![(name.into(), "private-config-value".into())];
+                }
+                let target = HookTarget::from_child(
+                    &crate::codex_home::child_env(&inputs),
+                    Some(cwd.path().into()),
+                );
+                let why = check_target(&target).expect_err("redirect cannot be vouched for");
+                assert!(why.contains(name), "{why}");
+                assert!(
+                    !why.contains("private-config-value"),
+                    "never expose the value"
+                );
+                assert!(
+                    proof.for_target(&target).is_err(),
+                    "a cached proof cannot bypass the guard"
+                );
+            }
+            inputs.env_file.clear();
+            inputs
+                .inherited
+                .push((name.into(), "private-config-value".into()));
+            inputs.clear = vec![name.into()];
+            let cleared = HookTarget::from_child(
+                &crate::codex_home::child_env(&inputs),
+                Some(cwd.path().into()),
+            );
+            assert!(
+                check_target(&cleared).is_ok(),
+                "an unset inherited variable does not reach agy"
+            );
+            inputs.env_file = vec![(name.into(), "".into())];
+            let blank = HookTarget::from_child(
+                &crate::codex_home::child_env(&inputs),
+                Some(cwd.path().into()),
+            );
+            assert!(
+                check_target(&blank).is_err(),
+                "a blank override is still set after unset"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alternate_home_hooks_file_must_also_gate_every_tool() {
+        let home = installed_home();
+        assert!(check_installed(Some(home.path())).is_ok());
+        let alternate = home.path().join(".gemini/antigravity-cli/hooks.json");
+        std::fs::create_dir_all(alternate.parent().expect("parent")).expect("mkdir");
+        let narrow = GOOD.replace("\".*\"", "\"read_file\"");
+        for text in ["{}", "not json", narrow.as_str()] {
+            std::fs::write(&alternate, text).expect("hook");
+            let why = check_installed(Some(home.path())).expect_err("alternate hook must gate too");
+            assert!(why.contains("antigravity-cli/hooks.json"), "{why}");
+        }
+        std::fs::write(&alternate, GOOD).expect("hook");
+        assert!(check_installed(Some(home.path())).is_ok());
+        std::fs::remove_file(&alternate).expect("remove");
+        std::os::unix::fs::symlink("absent.json", &alternate).expect("dangling link");
+        assert!(
+            check_installed(Some(home.path())).is_err(),
+            "a dangling hook is not absent"
+        );
+    }
+
+    #[test]
+    fn workspace_hooks_are_not_covered_by_a_home_proof() {
+        let home = installed_home();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let target = target(home.path(), Some(cwd.path()));
+        assert!(check_target(&target).is_ok());
+        for relative in [".agents/hooks.json", "hooks/hooks.json"] {
+            let path = cwd.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, GOOD).expect("workspace hook");
+            let why = check_target(&target).expect_err("local precedence is unproven");
+            assert!(why.contains(relative), "{why}");
+            std::fs::remove_file(&path).expect("remove");
+            std::os::unix::fs::symlink("absent.json", &path).expect("dangling link");
+            assert!(
+                check_target(&target).is_err(),
+                "a dangling local hook is not absent"
+            );
+            std::fs::remove_file(&path).expect("remove link");
+        }
+        let blocked = tempfile::tempdir().expect("blocked cwd");
+        std::fs::write(blocked.path().join(".agents"), "a file, not a directory").expect("blocker");
+        assert!(
+            check_target(&self::target(home.path(), Some(blocked.path()))).is_err(),
+            "metadata errors must not be mistaken for an absent hook"
+        );
+    }
+
+    #[test]
+    fn a_hook_proof_without_a_thread_directory_fails_closed() {
+        let home = installed_home();
+        let target = target(home.path(), None);
+        let why = check_target(&target).expect_err("no directory means no local-source coverage");
+        assert!(why.contains("thread directory is unknown"), "{why}");
+        assert_eq!(probe_settings(&target), HookProbe::Installed);
+        assert_eq!(badge(&probe_settings(&target), true), HookBadge::Ready);
+        let mut cache = HookCache::default();
+        cache.remember(&target, probe_verdict(&probe_settings(&target)));
+        assert!(
+            cache.lookup(&target).is_err(),
+            "Settings cannot authorise a launch without its directory"
+        );
+        std::fs::remove_file(home.path().join(".gemini/config/hooks.json")).expect("remove hook");
+        assert!(matches!(probe_settings(&target), HookProbe::Missing(_)));
+        assert_eq!(badge(&probe_settings(&target), true), HookBadge::Missing);
+    }
+
+    #[test]
+    fn settings_checks_home_sources_without_authorising_workspace_hooks() {
+        let home = installed_home();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let target = target(home.path(), Some(cwd.path()));
+        let local = cwd.path().join(".agents/hooks.json");
+        std::fs::create_dir_all(local.parent().expect("parent")).expect("mkdir");
+        std::fs::write(local, GOOD).expect("local hook");
+        assert_eq!(probe_settings(&target), HookProbe::Installed);
+        assert!(
+            check_target(&target).is_err(),
+            "the home badge is not a launch proof"
+        );
+        let alternate = home.path().join(".gemini/antigravity-cli/hooks.json");
+        std::fs::create_dir_all(alternate.parent().expect("parent")).expect("mkdir");
+        std::fs::write(alternate, "{}").expect("alternate hook");
+        assert!(
+            matches!(probe_settings(&target), HookProbe::Unreadable(_)),
+            "Settings still checks both home sources"
+        );
+    }
+
+    #[test]
+    fn xdg_config_home_does_not_redirect_agy_hooks() {
+        let home = installed_home();
+        let cwd = tempfile::tempdir().expect("cwd");
+        for value in ["/another/config", ""] {
+            let target = HookTarget::from_child(
+                &[
+                    ("HOME".into(), home.path().to_string_lossy().into_owned()),
+                    ("XDG_CONFIG_HOME".into(), value.into()),
+                ],
+                Some(cwd.path().into()),
+            );
+            assert_eq!(probe_settings(&target), HookProbe::Installed);
+            assert!(check_target(&target).is_ok());
+            let mut cache = HookCache::default();
+            cache.remember(&target, Ok(()));
+            assert_eq!(cache.lookup(&target), Ok(()));
+        }
+    }
+
+    #[test]
+    fn hook_cache_is_bounded_and_lookup_does_not_change_recency() {
+        let home = Path::new("/profile/home");
+        let mut cache = HookCache::default();
+        let targets: Vec<_> = (0..=HOOK_CACHE_LIMIT)
+            .map(|i| target(home, Some(&PathBuf::from(format!("/thread/{i}")))))
+            .collect();
+        for target in &targets {
+            cache.remember(target, Ok(()));
+        }
+        assert_eq!(cache.entries.len(), HOOK_CACHE_LIMIT);
+        assert!(
+            cache.lookup(&targets[0]).is_err(),
+            "oldest proof is evicted, never guessed"
+        );
+        let order = cache.checked.clone();
+        for target in &targets[1..] {
+            assert_eq!(cache.lookup(target), Ok(()));
+        }
+        assert_eq!(cache.checked, order, "lookup is read-only");
+        cache.remember(&targets[1], Err("hook changed".into()));
+        assert_eq!(cache.entries.len(), HOOK_CACHE_LIMIT);
+        assert_eq!(cache.lookup(&targets[1]), Err("hook changed".into()));
+        assert_eq!(
+            cache.lookup(&targets[2]),
+            Ok(()),
+            "an update only touches its own key"
+        );
+    }
+
+    #[test]
+    fn ancestor_hook_checks_stop_at_the_repository_boundary() {
+        if !agent_kit::git::git_installed() {
+            return;
+        }
+        let outer = tempfile::tempdir().expect("outer directory");
+        let repo = outer.path().join("repo");
+        let cwd = repo.join("sub/deeper");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let initialized = agent_kit::git::git_output(
+            &repo,
+            ["-c", "init.templateDir=", "init", "--quiet"],
+            &[
+                ("GIT_CONFIG_GLOBAL", std::ffi::OsStr::new("/dev/null")),
+                ("GIT_CONFIG_SYSTEM", std::ffi::OsStr::new("/dev/null")),
+            ],
+            5,
+        )
+        .expect("git init");
+        assert!(initialized.status.success());
+        let home = installed_home();
+        let target = target(home.path(), Some(&cwd));
+        // A hook above the repository is outside the search boundary.
+        let above = outer.path().join(".agents/hooks.json");
+        std::fs::create_dir_all(above.parent().expect("parent")).expect("mkdir");
+        std::fs::write(above, GOOD).expect("above hook");
+        assert!(check_target(&target).is_ok());
+        let ancestor = repo.join(".agents/hooks.json");
+        std::fs::create_dir_all(ancestor.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&ancestor, GOOD).expect("ancestor hook");
+        let why = check_target(&target).expect_err("repository ancestor hook must fail closed");
+        assert!(
+            why.contains(&ancestor.to_string_lossy().into_owned()),
+            "{why}"
+        );
+        let alias = outer.path().join("alias");
+        std::os::unix::fs::symlink(&cwd, &alias).expect("directory alias");
+        assert!(
+            check_target(&self::target(home.path(), Some(&alias))).is_err(),
+            "aliases cannot skip ancestors"
+        );
+        let outside = outer.path().join("outside/deeper");
+        std::fs::create_dir_all(&outside).expect("outside");
+        assert!(
+            check_target(&self::target(home.path(), Some(&outside))).is_ok(),
+            "without a repository only the thread directory is checked"
+        );
+    }
+
+    #[test]
+    fn hook_search_without_a_known_ancestor_stays_in_the_thread_directory() {
+        let cwd = Path::new("/repo/sub/deeper");
+        assert_eq!(hook_directories(cwd, None), vec![cwd.to_path_buf()]);
+        assert_eq!(
+            hook_directories(cwd, Some(Path::new("/another"))),
+            vec![cwd.to_path_buf()]
+        );
+        assert_eq!(
+            hook_directories(cwd, Some(Path::new("/repo"))),
+            vec![cwd.to_path_buf(), "/repo/sub".into(), "/repo".into()]
+        );
+    }
+
+    #[test]
+    fn a_failed_repository_discovery_refuses_the_hook_proof() {
+        for error in ["git query timed out", "git query failed"] {
+            let why = repository_toplevel(Err(error.into()))
+                .expect_err("a failure is not a non-repository");
+            assert!(
+                why.contains("workspace hook files could not be checked"),
+                "{why}"
+            );
+            assert!(
+                verification_refused(&why),
+                "the refusal must reach the session notice"
+            );
+        }
+        assert_eq!(
+            repository_toplevel(Ok(None)),
+            Ok(None),
+            "only a known non-repository falls back"
+        );
+        let root = PathBuf::from("/repo");
+        assert_eq!(repository_toplevel(Ok(Some(root.clone()))), Ok(Some(root)));
     }
 }
