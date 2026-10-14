@@ -24,6 +24,21 @@ pub const DIFFERENT_DIRECTORY: &str =
     "the cached approval hook was checked for a different thread directory";
 const UNVERIFIED: &str = "cannot verify agy's approval hook: ";
 
+enum HomeHookSource {
+    File(&'static str),
+    Plugins(&'static str),
+}
+
+// A real agy strace (2026-10-14, agy-hooks-strace.txt) showed these home sources in
+// addition to the primary .gemini/config/hooks.json. Their precedence is unproven.
+const ALTERNATE_HOME_HOOK_SOURCES: [HomeHookSource; 5] = [
+    HomeHookSource::File(".gemini/antigravity-cli/hooks.json"),
+    HomeHookSource::File(".gemini/hooks.json"),
+    HomeHookSource::Plugins(".gemini/config/plugins"),
+    HomeHookSource::Plugins(".gemini/antigravity-cli/plugins"),
+    HomeHookSource::Plugins(".gemini/plugins"),
+];
+
 /// Only names and paths are kept with a proof, never environment values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HookTarget {
@@ -175,17 +190,43 @@ pub fn probe(home: Option<&Path>) -> HookProbe {
     if primary != HookProbe::Installed {
         return primary;
     }
-    let alternate = home.join(".gemini/antigravity-cli/hooks.json");
-    match present(&alternate) {
-        Ok(false) => HookProbe::Installed,
-        Ok(true) => match probe_path(&alternate) {
-            HookProbe::Installed => HookProbe::Installed,
-            HookProbe::Missing(why) | HookProbe::Unreadable(why) => {
-                HookProbe::Unreadable(format!("{UNVERIFIED}{why}"))
-            }
-        },
+    match check_home_sources(home) {
+        Ok(()) => HookProbe::Installed,
         Err(why) => HookProbe::Unreadable(why),
     }
+}
+
+fn check_home_sources(home: &Path) -> Result<(), String> {
+    for source in ALTERNATE_HOME_HOOK_SOURCES {
+        match source {
+            HomeHookSource::File(relative) => check_optional_hook(&home.join(relative))?,
+            HomeHookSource::Plugins(relative) => {
+                let root = home.join(relative);
+                if !present(&root)? {
+                    continue;
+                }
+                let listing_error = |e| format!("{UNVERIFIED}cannot list {}: {e}", root.display());
+                for entry in std::fs::read_dir(&root).map_err(listing_error)? {
+                    let path = entry.map_err(listing_error)?.path();
+                    // Follow linked plugin directories; metadata errors must never hide a source.
+                    let metadata = std::fs::metadata(&path).map_err(|e| {
+                        format!("{UNVERIFIED}cannot inspect {}: {e}", path.display())
+                    })?;
+                    if metadata.is_dir() {
+                        check_optional_hook(&path.join("hooks.json"))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_optional_hook(path: &Path) -> Result<(), String> {
+    if present(path)? {
+        probe_verdict(&probe_path(path)).map_err(|why| format!("{UNVERIFIED}{why}"))?;
+    }
+    Ok(())
 }
 
 fn probe_path(path: &Path) -> HookProbe {
@@ -673,6 +714,143 @@ mod tests {
             check_installed(Some(home.path())).is_err(),
             "a dangling hook is not absent"
         );
+    }
+
+    fn assert_home_source_refused(home: &Path, path: &Path) {
+        let why = check_installed(Some(home)).expect_err("every present source must gate tools");
+        assert!(why.contains(&path.to_string_lossy().into_owned()), "{why}");
+        assert!(verification_refused(&why), "{why}");
+        let cwd = tempfile::tempdir().expect("cwd");
+        assert!(check_target(&target(home, Some(cwd.path()))).is_err());
+        assert!(matches!(
+            probe_settings(&target(home, None)),
+            HookProbe::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_home_root_hooks_file_must_gate_every_tool() {
+        let home = installed_home();
+        let path = home.path().join(".gemini/hooks.json");
+        let narrow = GOOD.replace("\".*\"", "\"read_file\"");
+        for text in ["{}", "not json", narrow.as_str()] {
+            std::fs::write(&path, text).expect("hook");
+            assert_home_source_refused(home.path(), &path);
+        }
+        std::fs::write(&path, GOOD).expect("hook");
+        assert!(check_installed(Some(home.path())).is_ok());
+        assert_eq!(
+            probe_settings(&target(home.path(), None)),
+            HookProbe::Installed
+        );
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::create_dir(&path).expect("unreadable hook");
+        assert_home_source_refused(home.path(), &path);
+        std::fs::remove_dir(&path).expect("remove directory");
+        std::os::unix::fs::symlink("absent.json", &path).expect("dangling hook");
+        assert_home_source_refused(home.path(), &path);
+    }
+
+    #[test]
+    fn a_plugin_hooks_file_must_gate_every_tool() {
+        for root in [
+            ".gemini/config/plugins",
+            ".gemini/antigravity-cli/plugins",
+            ".gemini/plugins",
+        ] {
+            let home = installed_home();
+            let plugins = home.path().join(root);
+            let path = plugins.join("first/hooks.json");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("plugin");
+            let narrow = GOOD.replace("\".*\"", "\"read_file\"");
+            for text in ["{}", "not json", narrow.as_str()] {
+                std::fs::write(&path, text).expect("hook");
+                assert_home_source_refused(home.path(), &path);
+            }
+            std::fs::write(&path, GOOD).expect("hook");
+            assert!(check_installed(Some(home.path())).is_ok());
+            let second = plugins.join("second/hooks.json");
+            std::fs::create_dir_all(second.parent().expect("parent")).expect("second plugin");
+            std::fs::write(&second, "{}").expect("second hook");
+            assert_home_source_refused(home.path(), &second);
+            std::fs::write(&second, GOOD).expect("second hook");
+            assert!(check_installed(Some(home.path())).is_ok());
+            std::fs::remove_file(&path).expect("remove");
+            std::fs::create_dir(&path).expect("unreadable hook");
+            assert_home_source_refused(home.path(), &path);
+            std::fs::remove_dir(&path).expect("remove directory");
+            std::os::unix::fs::symlink("absent.json", &path).expect("dangling hook");
+            assert_home_source_refused(home.path(), &path);
+            std::fs::remove_file(&path).expect("remove link");
+            std::fs::write(&path, GOOD).expect("restore hook");
+            let linked = tempfile::tempdir().expect("linked plugin");
+            std::fs::write(linked.path().join("hooks.json"), "{}").expect("linked hook");
+            let alias = plugins.join("linked");
+            std::os::unix::fs::symlink(linked.path(), &alias).expect("linked directory");
+            assert_home_source_refused(home.path(), &alias.join("hooks.json"));
+            std::fs::write(linked.path().join("hooks.json"), GOOD).expect("linked hook");
+            assert!(check_installed(Some(home.path())).is_ok());
+            let unknown = plugins.join("unknown");
+            std::os::unix::fs::symlink("absent-plugin", &unknown).expect("dangling plugin");
+            assert_home_source_refused(home.path(), &unknown);
+        }
+    }
+
+    #[test]
+    fn an_unlistable_plugins_dir_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for root in [
+            ".gemini/config/plugins",
+            ".gemini/antigravity-cli/plugins",
+            ".gemini/plugins",
+        ] {
+            let home = installed_home();
+            let plugins = home.path().join(root);
+            std::fs::create_dir_all(plugins.parent().expect("parent")).expect("parent");
+            // Not a directory: a deterministic listing error, even for a privileged test runner.
+            std::fs::write(&plugins, "not a directory").expect("block listing");
+            assert_home_source_refused(home.path(), &plugins);
+            std::fs::remove_file(&plugins).expect("remove");
+            std::os::unix::fs::symlink("absent-plugins", &plugins).expect("dangling root");
+            assert_home_source_refused(home.path(), &plugins);
+            std::fs::remove_file(&plugins).expect("remove link");
+            std::fs::create_dir(&plugins).expect("plugins");
+            std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o000))
+                .expect("deny listing");
+            let cannot_list = std::fs::read_dir(&plugins).is_err();
+            let verdict = check_installed(Some(home.path()));
+            std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o700))
+                .expect("restore permissions");
+            if cannot_list {
+                let why = verdict.expect_err("permission errors must fail closed");
+                assert!(why.contains(root), "{why}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_plugin_hooks_do_not_block() {
+        let home = installed_home();
+        assert!(check_installed(Some(home.path())).is_ok(), "absent roots");
+        for root in [
+            ".gemini/config/plugins",
+            ".gemini/antigravity-cli/plugins",
+            ".gemini/plugins",
+        ] {
+            let plugins = home.path().join(root);
+            std::fs::create_dir_all(&plugins).expect("empty root");
+            assert!(check_installed(Some(home.path())).is_ok(), "empty root");
+            std::fs::create_dir(plugins.join("without-hooks")).expect("plugin");
+            std::fs::write(plugins.join("README.md"), "regular entry").expect("non-plugin");
+            assert!(check_installed(Some(home.path())).is_ok(), "no hook file");
+        }
+        assert_eq!(
+            probe_settings(&target(home.path(), None)),
+            HookProbe::Installed
+        );
+        let cwd = tempfile::tempdir().expect("cwd");
+        assert!(check_target(&target(home.path(), Some(cwd.path()))).is_ok());
     }
 
     #[test]

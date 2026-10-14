@@ -1966,6 +1966,10 @@ impl AgentTerminalWindow {
                     crate::hook_config::HookProbe::Unreadable(why) => format!("Could not verify: {why}"),
                     _ => text.to_owned(),
                 };
+                let detail = format!(
+                    "{detail}\nAny other Antigravity hooks file (home or plugin) must also route \
+                     through this app's approval hook, or Antigravity runs without skipping permissions."
+                );
                 hook.set_subtitle(&detail);
                 hook.remove_css_class("error");
                 hook.remove_css_class("warning");
