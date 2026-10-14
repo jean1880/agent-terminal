@@ -2186,6 +2186,10 @@ pub(super) mod tests {
             .imp()
             .add_agent_detail_rows(&group, Driver::Codex, &saved, &prefs);
         prefs.present(Some(&window));
+        let ctx = glib::MainContext::default();
+        // Closing during presentation is not the user's Settings path on libadwaita 1.5.
+        assert!(crate::testutil::pump_until(&ctx, 5, || prefs.is_mapped()));
+        crate::testutil::settle(&ctx);
         let widgets = crate::testutil::descendants(group.upcast_ref());
         let field = |title: &str| {
             widgets
@@ -2219,8 +2223,7 @@ pub(super) mod tests {
         });
         field("Command or Path").set_text("/nonexistent/close-dialog/codex");
         field("Environment File").set_text(&expected_env);
-        prefs.close();
-        let ctx = glib::MainContext::default();
+        assert!(prefs.close(), "the presented Settings dialog must close");
         assert!(crate::testutil::pump_until(&ctx, 5, || closed.get()));
         // The rows are still alive here; the window close must flush its own registry too.
         field("Command or Path").set_text("/nonexistent/close-window/codex");

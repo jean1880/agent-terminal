@@ -5988,6 +5988,8 @@ pub(super) mod tests {
             .borrow()
             .is_some()
             && second.imp().tab_view.borrow().is_some()));
+        first.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || first.is_mapped()));
         CHAT_RESTORED.with(|done| done.set(true));
         let page = first
             .imp()
@@ -6040,18 +6042,65 @@ pub(super) mod tests {
         // choose_future presents on its first poll, after the scheduled local future runs.
         assert!(crate::testutil::pump_until(&ctx, 5, || first
             .visible_dialog()
-            .is_some()));
+            .is_some_and(|dialog| dialog.is_mapped())));
         let dialog = first
             .visible_dialog()
             .unwrap()
             .downcast::<adw::AlertDialog>()
             .unwrap();
         assert!(dialog.body().contains("1 background task will stop"));
-        dialog.close();
+        let cancel = crate::testutil::descendants(dialog.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk4::Button>().ok())
+            .find(|button| {
+                button.label().as_deref() == Some("Keep Waiting")
+                    || crate::testutil::descendants(button.upcast_ref())
+                        .iter()
+                        .any(|widget| {
+                            widget
+                                .downcast_ref::<gtk4::Label>()
+                                .is_some_and(|label| label.text() == "Keep Waiting")
+                        })
+            })
+            .unwrap();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || cancel.is_mapped() && cancel.is_sensitive())
+        );
+        crate::testutil::settle(&ctx);
+        // Activate the real cancel response: choose_future waits on AlertDialog::response.
+        cancel.emit_clicked();
         assert!(crate::testutil::pump_until(&ctx, 5, || !first
             .imp()
             .unasked_prompt_open
             .get()));
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_none_or(
+                |open| open != dialog.clone().upcast::<adw::Dialog>()
+            )));
+        // A mapped dismissal must also deliver the configured close response on 1.5.
+        let seen = switched.clone();
+        first.imp().when_not_busy(&id, move |_| seen.set(true));
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_some_and(|dialog| dialog.is_mapped())));
+        let dismissed = first
+            .visible_dialog()
+            .unwrap()
+            .downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert_eq!(dismissed.close_response(), "cancel");
+        crate::testutil::settle(&ctx);
+        assert!(dismissed.close(), "the mapped question must close");
+        assert!(crate::testutil::pump_until(&ctx, 5, || !first
+            .imp()
+            .unasked_prompt_open
+            .get()));
+        assert!(crate::testutil::pump_until(&ctx, 5, || first
+            .visible_dialog()
+            .is_none_or(
+                |open| open != dismissed.clone().upcast::<adw::Dialog>()
+            )));
         assert!(!switched.get(), "cancelling must not run the switch");
         assert_eq!(
             first
