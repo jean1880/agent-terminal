@@ -293,6 +293,8 @@ pub struct Shown {
     pub origin: Origin,
     /// Lines left out by the cap.
     pub omitted_lines: usize,
+    /// At least one compared input side was cut by the built-in differ.
+    pub clipped: bool,
     /// The files the edit names, as the agent named them.
     pub files: Vec<String>,
 }
@@ -337,12 +339,16 @@ pub fn shown_for_item_in(
     };
     let from_checkpoint = base.and_then(|base| {
         let mut text = String::new();
+        let mut clipped = false;
         for path in &files {
             let full = resolve_file_path(path);
             let full_str = full.to_string_lossy();
             let file = resolve(&base.toplevel, &full_str).ok()?;
             match turn_file_diff(base, &file).ok()? {
-                FileDiff::Text(d) => text.push_str(&d.diff),
+                FileDiff::Text(d) => {
+                    text.push_str(&d.diff);
+                    clipped |= d.clipped;
+                }
                 FileDiff::Binary => {
                     text.push_str(&format!("# {path}: binary file, not shown\n"));
                 }
@@ -357,17 +363,22 @@ pub fn shown_for_item_in(
         if text.is_empty() {
             None
         } else {
-            Some(text)
+            Some((text, clipped))
         }
     });
-    let (text, origin) = match from_checkpoint {
-        Some(text) => (text, Origin::Checkpoint),
+    let (text, origin, clipped) = match from_checkpoint {
+        Some((text, clipped)) => (text, Origin::Checkpoint, clipped),
         None => {
             let agent_text = preview.iter().map(|e| e.diff.as_str()).collect::<String>();
             if !agent_text.is_empty() {
-                (agent_text, Origin::AgentEdit)
+                (
+                    agent_text,
+                    Origin::AgentEdit,
+                    preview.iter().any(|edit| edit.clipped),
+                )
             } else if !files.is_empty() {
                 let mut fallback = String::new();
+                let mut clipped = false;
                 for path in &files {
                     let full = resolve_file_path(path);
                     let mut file_handled = false;
@@ -381,6 +392,7 @@ pub fn shown_for_item_in(
                                 };
                                 if let Ok(FileDiff::Text(d)) = turn_file_diff(&head_base, &file) {
                                     fallback.push_str(&d.diff);
+                                    clipped |= d.clipped;
                                     file_handled = true;
                                 }
                             }
@@ -395,12 +407,13 @@ pub fn shown_for_item_in(
                                 let content = String::from_utf8_lossy(&bytes);
                                 let d = editdiff::file_diff(path, None, &content);
                                 fallback.push_str(&d.diff);
+                                clipped |= d.clipped;
                             }
                         }
                     }
                 }
                 if !fallback.is_empty() {
-                    (fallback, Origin::Checkpoint)
+                    (fallback, Origin::Checkpoint, clipped)
                 } else {
                     return Err(format!("No diff is available for {}", files.join(", ")));
                 }
@@ -418,6 +431,7 @@ pub fn shown_for_item_in(
         text: kept.to_owned(),
         origin,
         omitted_lines,
+        clipped,
         files,
     })
 }
@@ -761,6 +775,24 @@ mod tests {
         let write_shown = shown_for_item(None, &write_input).expect("shown");
         assert_eq!(write_shown.origin, Origin::AgentEdit);
         assert!(write_shown.text.contains("+def multiply(a, b):"));
+    }
+
+    #[test]
+    fn a_shown_edit_keeps_clipping_when_display_truncation_hides_the_trailer() {
+        use serde_json::json;
+        for input in [
+            json!({"file_path": "big.txt", "content": "é\n".repeat(editdiff::MAX_SIDE_BYTES)}),
+            json!({"TargetFile": "big.txt", "CodeContent": "é\n".repeat(editdiff::MAX_SIDE_BYTES)}),
+        ] {
+            let shown = shown_for_item(None, &input).expect("shown");
+            assert_eq!(shown.origin, Origin::AgentEdit);
+            assert!(shown.clipped);
+            assert!(shown.omitted_lines > 0);
+            assert!(!shown.text.contains("Only the first"));
+        }
+        let small =
+            shown_for_item(None, &json!({"file_path": "a", "content": "x\n"})).expect("shown");
+        assert!(!small.clipped);
     }
 
     #[test]

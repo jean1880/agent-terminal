@@ -3714,6 +3714,7 @@ pub(crate) mod tests {
                 text: diff_text.to_owned(),
                 origin: Origin::Checkpoint,
                 omitted_lines: 0,
+                clipped: false,
                 files: vec!["src/a.rs".to_owned()],
             }),
         });

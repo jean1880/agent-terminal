@@ -20,8 +20,11 @@ use crate::git::{
     commit_tree, create_ref, git_raw, snapshot_tree, RepoInfo, Skipped, SnapshotOutcome,
     QUERY_TIMEOUT_SECS, REF_ROOT, SNAPSHOT_TIMEOUT_SECS,
 };
-use std::ffi::OsStr;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 /// The working tree pinned before a restore.
@@ -69,13 +72,98 @@ fn covers(p: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Pathspecs that leave `protected` out of a restore or a diff. `top`: from
+/// Pathspecs that leave `protected` out of a restore. `top`: from
 /// the toplevel; `literal`: a `*` in a name is not a glob.
 fn exclusions(protected: &[String]) -> Vec<String> {
     protected
         .iter()
         .map(|p| format!(":(top,exclude,literal){p}"))
         .collect()
+}
+
+/// Leave headroom for the environment and git's other arguments. Count
+/// terminators and argv pointers too, not just pathspec text.
+const RESTORE_ARG_BYTES: usize = 32 * 1024;
+
+struct PathspecFile(PathBuf);
+
+impl PathspecFile {
+    fn create(repo: &RepoInfo, specs: &[String]) -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = repo.git_dir.join("agent-terminal");
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("Could not create the restore pathspec directory: {err}"))?;
+        let path = dir.join(format!(
+            "pathspec-{}-{}-{}",
+            std::process::id(),
+            unix_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|err| format!("Could not create the restore pathspec file: {err}"))?;
+        // Own cleanup only after exclusive creation succeeds, so a collision
+        // never removes someone else's file.
+        let temp = Self(path);
+        for spec in specs {
+            file.write_all(spec.as_bytes())
+                .and_then(|()| file.write_all(&[0]))
+                .map_err(|err| format!("Could not write the restore pathspec file: {err}"))?;
+        }
+        Ok(temp)
+    }
+}
+
+impl Drop for PathspecFile {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.0) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("Could not remove the restore pathspec file: {err}");
+            }
+        }
+    }
+}
+
+fn restore_files(
+    repo: &RepoInfo,
+    toplevel: &Path,
+    target: &str,
+    protected: &[String],
+) -> Result<(), String> {
+    let mut args: Vec<OsString> = [
+        "restore".to_owned(),
+        format!("--source={target}"),
+        "--worktree".into(),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    let specs: Vec<String> = std::iter::once(":/".into())
+        .chain(exclusions(protected))
+        .collect();
+    let bytes: usize = specs
+        .iter()
+        .map(|s| s.len() + 1 + std::mem::size_of::<usize>())
+        .sum();
+    let temp = if bytes > RESTORE_ARG_BYTES {
+        Some(PathspecFile::create(repo, &specs)?)
+    } else {
+        None
+    };
+    if let Some(temp) = &temp {
+        let mut from_file = OsString::from("--pathspec-from-file=");
+        from_file.push(&temp.0);
+        args.extend([from_file, "--pathspec-file-nul".into()]);
+    } else {
+        args.push("--".into());
+        args.extend(specs.into_iter().map(OsString::from));
+    }
+    git_raw(toplevel, args, &[], RESTORE_TIMEOUT_SECS)?;
+    Ok(())
 }
 
 /// Failing once files may already have changed: says so, and how to get
@@ -139,13 +227,7 @@ pub fn pin(repo: &RepoInfo, key: u64) -> Result<Pinned, String> {
     })
 }
 
-fn names(
-    repo: &RepoInfo,
-    from: &str,
-    to: &str,
-    filter: Option<&str>,
-    excluded: &[String],
-) -> Result<Vec<u8>, String> {
+fn names(repo: &RepoInfo, from: &str, to: &str, filter: Option<&str>) -> Result<Vec<u8>, String> {
     let mut args: Vec<String> = ["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff"]
         .map(String::from)
         .to_vec();
@@ -153,24 +235,56 @@ fn names(
         args.push(filter.to_string());
     }
     args.extend([from.to_string(), to.to_string()]);
-    if !excluded.is_empty() {
-        args.push("--".into());
-        args.push(":/".into());
-        args.extend(exclusions(excluded));
-    }
     git_raw(&repo.toplevel, args, &[], SNAPSHOT_TIMEOUT_SECS)
+}
+
+fn ignored_in_target(repo: &RepoInfo, target_set: &HashSet<&[u8]>) -> Result<Vec<String>, String> {
+    let ignored = git_raw(
+        &repo.toplevel,
+        [
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ],
+        &[],
+        SNAPSHOT_TIMEOUT_SECS,
+    )?;
+    // A build directory can contain hundreds of thousands of ignored paths.
+    // Compare raw names first; allocate strings only for target files.
+    Ok(ignored
+        .split(|b| *b == 0)
+        .filter(|path| target_set.contains(path))
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
 }
 
 /// Pins the working tree and works out what restoring to `target` would do.
 /// With nothing to undo, the pin is discarded again and the plan is empty.
 pub fn prepare(repo: &RepoInfo, key: u64, target: &str) -> Result<RestorePlan, String> {
-    let pinned = pin(repo, key)?;
-    let target_files = nul_paths(&git_raw(
+    let mut pinned = pin(repo, key)?;
+    let target_listing = git_raw(
         &repo.toplevel,
         ["ls-tree", "-r", "--name-only", "-z", target],
         &[],
         SNAPSHOT_TIMEOUT_SECS,
-    )?);
+    )?;
+    let target_files = nul_paths(&target_listing);
+    // An untracked file captured then but ignored now has no pin copy.
+    // Tracked (including force-added) files still have one and may be restored.
+    let target_set = target_listing
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    pinned.untouched.extend(
+        ignored_in_target(repo, &target_set)?
+            .into_iter()
+            .map(|path| Skipped {
+                path,
+                reason: crate::git::SkipReason::IgnoredNow,
+            }),
+    );
     // Skipped paths are matched against the target by name to protect them,
     // and a name that is not valid UTF-8 reaches here only approximately
     // (lossily decoded). Such a file cannot be proved protected, so refuse
@@ -189,7 +303,7 @@ pub fn prepare(repo: &RepoInfo, key: u64, target: &str) -> Result<RestorePlan, S
     }
     let skipped: Vec<String> = pinned.untouched.iter().map(|s| s.path.clone()).collect();
     let protected = protected_paths(&skipped, &target_files);
-    let changed: Vec<String> = nul_paths(&names(repo, &pinned.commit, target, None, &[])?)
+    let changed: Vec<String> = nul_paths(&names(repo, &pinned.commit, target, None)?)
         .into_iter()
         .filter(|path| !protected.iter().any(|p| covers(p, path)))
         .collect();
@@ -198,7 +312,6 @@ pub fn prepare(repo: &RepoInfo, key: u64, target: &str) -> Result<RestorePlan, S
         target,
         &pinned.commit,
         Some("--diff-filter=A"),
-        &[],
     )?);
     if changed.is_empty() && deleted.is_empty() {
         discard(repo, &pinned);
@@ -252,20 +365,27 @@ pub fn summary(plan: &RestorePlan, to: &str, mid_turn: bool) -> String {
             plan.changed.len() - LISTED_PATHS
         ));
     }
-    if !plan.pinned.untouched.is_empty() {
-        let some: Vec<&str> = plan
+    for (ignored_now, wording) in [
+        (
+            false,
+            "Left exactly as they are, since checkpoints never capture them",
+        ),
+        (true, "Left as they are because git now ignores them"),
+    ] {
+        let paths: Vec<&str> = plan
             .pinned
             .untouched
             .iter()
-            .take(5)
+            .filter(|s| (s.reason == crate::git::SkipReason::IgnoredNow) == ignored_now)
             .map(|s| s.path.as_str())
             .collect();
-        text.push_str(&format!(
-            "\nLeft exactly as they are, since checkpoints never capture them: {} \
-             file(s), such as {}.\n",
-            plan.pinned.untouched.len(),
-            some.join(", ")
-        ));
+        if !paths.is_empty() {
+            text.push_str(&format!(
+                "\n{wording}: {} file(s), such as {}.\n",
+                paths.len(),
+                paths.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     text.push_str(
         "\nCommits and staged changes are not touched. The files as they are now \
@@ -341,15 +461,7 @@ fn restore_checked(
     toplevel: &Path,
 ) -> Result<Restored, String> {
     let toplevel = toplevel.to_path_buf();
-    let mut args = vec![
-        "restore".to_string(),
-        format!("--source={}", plan.target),
-        "--worktree".into(),
-        "--".into(),
-        ":/".into(),
-    ];
-    args.extend(exclusions(&plan.protected));
-    git_raw(&toplevel, args, &[], RESTORE_TIMEOUT_SECS)?;
+    restore_files(repo, &toplevel, &plan.target, &plan.protected)?;
 
     // `restore` removes files that are tracked but absent from the target;
     // what it leaves are the untracked ones added since. Asked again rather
@@ -409,7 +521,34 @@ fn restore_checked(
         }
     };
     let target_tree = format!("{}^{{tree}}", plan.target);
-    let mismatched = nul_paths(&names(repo, &target_tree, &after, None, &plan.protected)?);
+    let target_listing = git_raw(
+        &toplevel,
+        ["ls-tree", "-r", "--name-only", "-z", plan.target.as_str()],
+        &[],
+        SNAPSHOT_TIMEOUT_SECS,
+    )?;
+    let target_set = target_listing
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let ignored = ignored_in_target(repo, &target_set)?;
+    let excluded: HashSet<&str> = plan
+        .protected
+        .iter()
+        .chain(&ignored)
+        .map(String::as_str)
+        .collect();
+    // git diff has no pathspec-file option. Filter its names here so a
+    // large protected set cannot overflow its argv either.
+    let mismatched = nul_paths(&names(repo, &target_tree, &after, None)?)
+        .into_iter()
+        .filter(|path| {
+            !excluded.contains(path.as_str())
+                && !path
+                    .match_indices('/')
+                    .any(|(end, _)| excluded.contains(&path[..end]))
+        })
+        .collect();
     Ok(Restored {
         mismatched,
         refused,
@@ -454,6 +593,36 @@ mod tests {
             ..plan
         };
         assert!(summary(&many, "x", false).contains("… and 4 more\n"));
+    }
+
+    #[test]
+    fn the_summary_distinguishes_files_ignored_now_from_files_never_captured() {
+        let plan = RestorePlan {
+            pinned: Pinned {
+                refname: "r".into(),
+                commit: "c".into(),
+                tree: "t".into(),
+                untouched: vec![
+                    Skipped {
+                        path: "data.bin".into(),
+                        reason: crate::git::SkipReason::IgnoredNow,
+                    },
+                    Skipped {
+                        path: ".env".into(),
+                        reason: crate::git::SkipReason::Secret,
+                    },
+                ],
+            },
+            target: "x".into(),
+            changed: vec!["a.rs".into()],
+            deleted: Vec::new(),
+            protected: vec!["data.bin".into()],
+        };
+        let text = summary(&plan, "the checkpoint", false);
+        assert!(text.contains(
+            "Left as they are because git now ignores them: 1 file(s), such as data.bin."
+        ));
+        assert!(text.contains("never capture them: 1 file(s), such as .env."));
     }
 
     #[test]
@@ -551,6 +720,183 @@ mod tests {
             sh(dir.path(), &["add", "."]);
             sh(dir.path(), &["commit", "-q", "-m", "init"]);
             Some(dir)
+        }
+
+        #[test]
+        fn an_ignored_file_present_now_is_left_alone() {
+            use crate::git::{take_checkpoint, CheckpointOutcome};
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            let repo = discover(dir).unwrap().unwrap();
+            fs::write(dir.join("data.bin"), "captured\n").unwrap();
+            let CheckpointOutcome::Created(cp, _) = take_checkpoint(&repo, 8, "t").unwrap() else {
+                panic!("expected a checkpoint");
+            };
+            fs::write(dir.join(".git/info/exclude"), "data.bin\n").unwrap();
+            fs::write(dir.join("data.bin"), "ignored now, never pinned\n").unwrap();
+            fs::write(dir.join("keep.txt"), "later\n").unwrap();
+            let index = fs::read(&repo.index).unwrap();
+            let plan = prepare(&repo, 8, &cp.commit).unwrap();
+            // Check the real trigger before the metadata, so old code proves the data loss.
+            let done = apply(&repo, &plan).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("data.bin")).unwrap(),
+                "ignored now, never pinned\n"
+            );
+            assert!(done.mismatched.is_empty());
+            assert_eq!(plan.protected, vec!["data.bin"]);
+            assert!(!plan.changed.iter().any(|p| p == "data.bin"));
+            assert!(plan
+                .pinned
+                .untouched
+                .iter()
+                .any(|s| s.path == "data.bin" && s.to_string().contains("ignored now")));
+            let text = summary(&plan, "the checkpoint", false);
+            assert!(
+                text.contains("Left as they are because git now ignores them")
+                    && text.contains("data.bin")
+            );
+            assert_eq!(fs::read(&repo.index).unwrap(), index);
+            let back = prepare(&repo, 8, &plan.pinned.commit).unwrap();
+            apply(&repo, &back).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("data.bin")).unwrap(),
+                "ignored now, never pinned\n"
+            );
+            assert_eq!(fs::read_to_string(dir.join("keep.txt")).unwrap(), "later\n");
+        }
+
+        #[test]
+        fn an_ignored_file_absent_now_is_restored() {
+            use crate::git::{take_checkpoint, CheckpointOutcome};
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            let repo = discover(dir).unwrap().unwrap();
+            fs::write(dir.join("data.bin"), "captured\n").unwrap();
+            let CheckpointOutcome::Created(cp, _) = take_checkpoint(&repo, 8, "t").unwrap() else {
+                panic!("expected a checkpoint");
+            };
+            fs::write(dir.join(".git/info/exclude"), "data.bin\n").unwrap();
+            fs::remove_file(dir.join("data.bin")).unwrap();
+            let plan = prepare(&repo, 8, &cp.commit).unwrap();
+            assert!(plan.protected.is_empty());
+            let done = apply(&repo, &plan).unwrap();
+            assert!(done.mismatched.is_empty(), "{:?}", done.mismatched);
+            assert_eq!(
+                fs::read_to_string(dir.join("data.bin")).unwrap(),
+                "captured\n"
+            );
+        }
+
+        #[test]
+        fn thousands_of_protected_files_restore_without_an_oversized_argv() {
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            let prefix = format!(
+                "ignored/{}/{}/{}/",
+                "a".repeat(100),
+                "b".repeat(100),
+                "c".repeat(100)
+            );
+            fs::create_dir_all(dir.join(&prefix)).unwrap();
+            let files: Vec<String> = (0..5000)
+                .map(|i| format!("{prefix}{i:04}-{}", "x".repeat(170)))
+                .collect();
+            for path in &files {
+                fs::write(dir.join(path), "captured\n").unwrap();
+            }
+            let tracked = format!("{prefix}tracked.txt");
+            fs::write(dir.join(&tracked), "tracked target\n").unwrap();
+            sh(dir, &["add", "--", "ignored"]);
+            let repo = discover(dir).unwrap().unwrap();
+            let target = pin(&repo, 8).unwrap();
+            sh(dir, &["rm", "--cached", "-q", "-r", "--", "ignored"]);
+            fs::write(dir.join(".git/info/exclude"), "ignored/\n").unwrap();
+            sh(dir, &["add", "-f", "--", &tracked]);
+            fs::write(dir.join(&tracked), "tracked current\n").unwrap();
+            for path in &files {
+                fs::write(dir.join(path), "ignored current\n").unwrap();
+            }
+            fs::write(dir.join("keep.txt"), "later\n").unwrap();
+            let index = fs::read(&repo.index).unwrap();
+            let plan = prepare(&repo, 8, &target.commit).unwrap();
+            assert_eq!(plan.protected.len(), files.len());
+            let done = apply(&repo, &plan).unwrap();
+            assert!(done.mismatched.is_empty());
+            for path in &files {
+                assert_eq!(
+                    fs::read_to_string(dir.join(path)).unwrap(),
+                    "ignored current\n"
+                );
+            }
+            assert_eq!(fs::read_to_string(dir.join("keep.txt")).unwrap(), "v1\n");
+            assert_eq!(
+                fs::read_to_string(dir.join(&tracked)).unwrap(),
+                "tracked target\n"
+            );
+            assert_eq!(fs::read(&repo.index).unwrap(), index);
+            assert!(fs::read_dir(repo.git_dir.join("agent-terminal"))
+                .unwrap()
+                .next()
+                .is_none());
+        }
+
+        #[test]
+        fn restore_pathspec_files_are_private_literal_and_cleaned_after_errors() {
+            use std::os::unix::fs::PermissionsExt;
+            let Some(tmp) = new_repo() else { return };
+            let repo = discover(tmp.path()).unwrap().unwrap();
+            let specs = vec![
+                ":/".into(),
+                ":(top,exclude,literal)odd *name\n-dash.txt".into(),
+            ];
+            let path;
+            {
+                let temp = PathspecFile::create(&repo, &specs).unwrap();
+                path = temp.0.clone();
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    b":/\0:(top,exclude,literal)odd *name\n-dash.txt\0"
+                );
+            }
+            assert!(!path.exists());
+            let protected: Vec<String> = (0..2000).map(|i| format!("protected-{i}")).collect();
+            let err = restore_files(&repo, tmp.path(), "not-a-revision", &protected).unwrap_err();
+            assert!(!err.is_empty());
+            assert!(fs::read_dir(repo.git_dir.join("agent-terminal"))
+                .unwrap()
+                .next()
+                .is_none());
+        }
+
+        #[test]
+        fn a_force_added_ignored_file_is_pinned_and_restored() {
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            fs::write(dir.join(".git/info/exclude"), "data.bin\n").unwrap();
+            fs::write(dir.join("data.bin"), "force added\n").unwrap();
+            sh(dir, &["add", "-f", "--", "data.bin"]);
+            let repo = discover(dir).unwrap().unwrap();
+            let target = pin(&repo, 8).unwrap();
+            fs::write(dir.join("data.bin"), "pinned current\n").unwrap();
+            let plan = prepare(&repo, 8, &target.commit).unwrap();
+            assert!(plan.protected.is_empty());
+            let done = apply(&repo, &plan).unwrap();
+            assert!(done.mismatched.is_empty());
+            assert_eq!(
+                fs::read_to_string(dir.join("data.bin")).unwrap(),
+                "force added\n"
+            );
+            let back = prepare(&repo, 8, &plan.pinned.commit).unwrap();
+            apply(&repo, &back).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("data.bin")).unwrap(),
+                "pinned current\n"
+            );
         }
 
         #[test]

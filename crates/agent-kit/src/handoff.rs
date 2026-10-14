@@ -323,19 +323,22 @@ pub fn render_brief(input: &BriefInput) -> String {
     if let Some(first) = &c.first_prompt {
         doc.push_str(&format!(
             "\n## Original request\n\n{}\n",
-            quote(&cap(first, MAX_PROMPT_CHARS))
+            quote(&cap(&redact(first), MAX_PROMPT_CHARS))
         ));
     }
     if !c.recent_prompts.is_empty() {
         doc.push_str("\n## Latest requests (oldest first)\n\n");
         for prompt in &c.recent_prompts {
-            doc.push_str(&format!("{}\n\n", quote(&cap(prompt, MAX_PROMPT_CHARS))));
+            doc.push_str(&format!(
+                "{}\n\n",
+                quote(&cap(&redact(prompt), MAX_PROMPT_CHARS))
+            ));
         }
     }
     if let Some(reply) = &c.last_reply {
         doc.push_str(&format!(
             "\n## {from}'s last reply\n\n{}\n",
-            quote(&cap(reply, MAX_REPLY_CHARS))
+            quote(&cap(&redact(reply), MAX_REPLY_CHARS))
         ));
     }
     if !c.touched_files.is_empty() {
@@ -707,6 +710,52 @@ mod tests {
             latest_agy_session_in(history, "/q", 0).as_deref(),
             Some("b")
         );
+    }
+
+    #[test]
+    fn a_secret_cut_by_the_cap_is_not_half_visible() {
+        for (kind, limit) in [
+            ("first", MAX_PROMPT_CHARS),
+            ("recent", MAX_PROMPT_CHARS),
+            ("reply", MAX_REPLY_CHARS),
+        ] {
+            let text = format!("{} ghp_{}WXYZ", "x".repeat(limit - 11), "a".repeat(36));
+            let mut input = BriefInput::default();
+            match kind {
+                "first" => input.conversation.first_prompt = Some(text),
+                "recent" => input.conversation.recent_prompts.push(text),
+                _ => input.conversation.last_reply = Some(text),
+            }
+            let brief = render_brief(&input);
+            assert!(!brief.contains("ghp_"), "{kind}: token prefix survived");
+            assert!(
+                brief.contains("****WXYZ"),
+                "{kind}: full token was not redacted before the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn a_password_cut_by_the_cap_is_redacted_before_the_cut() {
+        for (kind, limit) in [
+            ("first", MAX_PROMPT_CHARS),
+            ("recent", MAX_PROMPT_CHARS),
+            ("reply", MAX_REPLY_CHARS),
+        ] {
+            let text = format!("{} PASSWORD={}WXYZ", "é".repeat(limit - 19), "a".repeat(36));
+            let mut input = BriefInput::default();
+            match kind {
+                "first" => input.conversation.first_prompt = Some(text),
+                "recent" => input.conversation.recent_prompts.push(text),
+                _ => input.conversation.last_reply = Some(text),
+            }
+            let brief = render_brief(&input);
+            assert!(
+                brief.contains("PASSWORD=****WXYZ"),
+                "{kind}: partial password was masked instead of the full value"
+            );
+            assert!(!brief.contains("PASSWORD=****aaaa"));
+        }
     }
 
     #[test]

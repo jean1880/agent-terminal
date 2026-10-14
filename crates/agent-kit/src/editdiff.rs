@@ -25,6 +25,9 @@ pub const MAX_EDIT_DISTANCE: usize = 1_000;
 /// full.
 pub const MAX_SIDE_BYTES: usize = 512 * 1024;
 
+const CLIPPED_TRAILER: &str =
+    "# Only the first 512 KiB of each side were compared; the change may lie beyond.\n";
+
 /// One file's diff as a ready unified-diff text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEdit {
@@ -33,6 +36,8 @@ pub struct FileEdit {
     pub diff: String,
     pub added: usize,
     pub removed: usize,
+    /// At least one input side was cut to [`MAX_SIDE_BYTES`].
+    pub clipped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,18 +166,19 @@ pub enum Numbering {
 }
 
 /// `text` cut to at most [`MAX_SIDE_BYTES`] at a line boundary.
-fn cut(text: &str) -> &str {
+fn cut(text: &str) -> (&str, bool) {
     if text.len() <= MAX_SIDE_BYTES {
-        return text;
+        return (text, false);
     }
     let mut end = MAX_SIDE_BYTES;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    match text[..end].rfind('\n') {
+    let kept = match text[..end].rfind('\n') {
         Some(nl) => &text[..=nl],
         None => &text[..end],
-    }
+    };
+    (kept, true)
 }
 
 /// The path as a diff header shows it: an absolute one loses its leading `/`, so `a/` and `b/`
@@ -195,14 +201,16 @@ pub fn unified(path: &str, old: Option<&str>, new: &str, numbering: Numbering) -
     // A fragment (`old_string`) rarely ends in a newline and says nothing about the file's own
     // ending, so the marker would only be noise: both sides are given one.
     let terminated = |text: &str| {
-        let text = cut(text);
         if numbering == Numbering::Fragment && !text.is_empty() && !text.ends_with('\n') {
             format!("{text}\n")
         } else {
             text.to_owned()
         }
     };
-    let (old_text, new_text) = (terminated(old.unwrap_or("")), terminated(new));
+    let (old_cut, old_clipped) = cut(old.unwrap_or(""));
+    let (new_cut, new_clipped) = cut(new);
+    let clipped = old_clipped || new_clipped;
+    let (old_text, new_text) = (terminated(old_cut), terminated(new_cut));
     let old_lines = lines(&old_text);
     let new_lines = lines(&new_text);
     let ops = diff_ops(&old_lines, &new_lines);
@@ -294,11 +302,15 @@ pub fn unified(path: &str, old: Option<&str>, new: &str, numbering: Numbering) -
             }
         }
     }
+    if clipped {
+        out.push_str(CLIPPED_TRAILER);
+    }
     FileEdit {
         path: path.to_owned(),
         diff: out,
         added,
         removed,
+        clipped,
     }
 }
 
@@ -455,11 +467,19 @@ fn fragments(path: &str, pairs: &[(&str, &str)]) -> FileEdit {
         diff: format!("--- a/{p}\n+++ b/{p}\n"),
         added: 0,
         removed: 0,
+        clipped: false,
     };
     for (old, new) in pairs {
         let part = unified(path, Some(old), new, Numbering::Fragment);
         // Drop the part's two header lines; keep its hunk.
-        let body: String = part.diff.lines().skip(2).fold(String::new(), |mut acc, l| {
+        let diff = if part.clipped {
+            part.diff
+                .strip_suffix(CLIPPED_TRAILER)
+                .unwrap_or(&part.diff)
+        } else {
+            &part.diff
+        };
+        let body: String = diff.lines().skip(2).fold(String::new(), |mut acc, l| {
             acc.push_str(l);
             acc.push('\n');
             acc
@@ -467,8 +487,61 @@ fn fragments(path: &str, pairs: &[(&str, &str)]) -> FileEdit {
         merged.diff.push_str(&body);
         merged.added += part.added;
         merged.removed += part.removed;
+        merged.clipped |= part.clipped;
+    }
+    if merged.clipped {
+        merged.diff.push_str(CLIPPED_TRAILER);
     }
     merged
+}
+
+/// Counts only hunk bodies, so content resembling file headers is still a change.
+fn hunk_counts(diff: &str) -> (usize, usize) {
+    let (mut old_left, mut new_left) = (0usize, 0usize);
+    let (mut added, mut removed) = (0, 0);
+    let count = |range: &str, sign: char| -> Option<usize> {
+        let range = range.strip_prefix(sign)?;
+        let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+        start.parse::<usize>().ok()?;
+        count.parse().ok()
+    };
+    for line in diff.lines() {
+        if old_left == 0 && new_left == 0 {
+            if let Some(header) = line.strip_prefix("@@ ") {
+                let mut fields = header.split_whitespace();
+                if let (Some(old), Some(new), Some("@@")) =
+                    (fields.next(), fields.next(), fields.next())
+                {
+                    if let (Some(old), Some(new)) = (count(old, '-'), count(new, '+')) {
+                        old_left = old;
+                        new_left = new;
+                    }
+                }
+            }
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') if new_left > 0 => {
+                added += 1;
+                new_left -= 1;
+            }
+            Some(b'-') if old_left > 0 => {
+                removed += 1;
+                old_left -= 1;
+            }
+            None | Some(b' ') if old_left > 0 && new_left > 0 => {
+                old_left -= 1;
+                new_left -= 1;
+            }
+            // The no-newline marker consumes no line on either side.
+            Some(b'\\') => {}
+            _ => {
+                old_left = 0;
+                new_left = 0;
+            }
+        }
+    }
+    (added, removed)
 }
 
 /// One entry of Codex's `changes`: `{path, kind: {type}, diff}`. A `diff` with hunks is used as
@@ -491,19 +564,13 @@ fn codex_change(change: &Value) -> Option<FileEdit> {
         if !text.ends_with('\n') {
             text.push('\n');
         }
-        let (mut added, mut removed) = (0, 0);
-        for l in diff.lines() {
-            if l.starts_with('+') && !l.starts_with("+++") {
-                added += 1;
-            } else if l.starts_with('-') && !l.starts_with("---") {
-                removed += 1;
-            }
-        }
+        let (added, removed) = hunk_counts(diff);
         return Some(FileEdit {
             path: path.to_owned(),
             diff: text,
             added,
             removed,
+            clipped: false,
         });
     }
     match kind {
@@ -525,6 +592,7 @@ fn codex_change(change: &Value) -> Option<FileEdit> {
             diff: format!("--- a/{p}\n+++ b/{p}\n{diff}\n"),
             added: 0,
             removed: 0,
+            clipped: false,
         }),
     }
 }
@@ -560,6 +628,97 @@ fn strip_marker(diff: &str, marker: char) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_change_past_the_cut_says_so() {
+        let prefix = "x\n".repeat(300 * 1024);
+        let old = format!("{prefix}old\n");
+        let new = format!("{prefix}new\n");
+        let edit = file_diff("big", Some(&old), &new);
+        assert_eq!((edit.added, edit.removed), (0, 0));
+        assert!(edit.clipped);
+        assert!(edit.diff.contains(
+            "# Only the first 512 KiB of each side were compared; the change may lie beyond."
+        ));
+    }
+
+    #[test]
+    fn small_edits_are_not_marked_clipped() {
+        let edit = file_diff("small", Some("old\n"), "new\n");
+        assert!(!edit.clipped);
+        assert!(!edit.diff.contains("Only the first"));
+        let exact = "x".repeat(MAX_SIDE_BYTES);
+        assert!(!file_diff("exact", Some(&exact), &exact).clipped);
+    }
+
+    #[test]
+    fn clipping_either_side_keeps_a_multibyte_boundary() {
+        let big = format!("{}é", "x".repeat(MAX_SIDE_BYTES - 1));
+        let (kept, clipped) = cut(&big);
+        assert!(clipped);
+        assert_eq!(kept.len(), MAX_SIDE_BYTES - 1);
+        for (old, new) in [(big.as_str(), "small"), ("small", big.as_str())] {
+            let edit = file_diff("big", Some(old), new);
+            assert!(edit.clipped);
+            assert!(edit.diff.ends_with(CLIPPED_TRAILER));
+        }
+    }
+
+    #[test]
+    fn replacement_readers_keep_clipping_across_chunks() {
+        let big = "x\n".repeat(MAX_SIDE_BYTES / 2 + 1);
+        for input in [
+            json!({"file_path": "a", "edits": [
+                {"old_string": big, "new_string": big},
+                {"old_string": "one", "new_string": "two"},
+            ]}),
+            json!({"TargetFile": "a", "ReplacementChunks": [
+                {"TargetContent": big, "ReplacementContent": big},
+                {"TargetContent": "one", "ReplacementContent": "two"},
+            ]}),
+        ] {
+            let edits = preview_from_input(&input);
+            assert!(edits[0].clipped);
+            assert_eq!(edits[0].diff.matches(CLIPPED_TRAILER).count(), 1);
+            assert!(edits[0].diff.ends_with(CLIPPED_TRAILER));
+            assert_eq!((edits[0].added, edits[0].removed), (1, 1));
+        }
+    }
+
+    #[test]
+    fn codex_counts_changes_after_a_blank_context_line() {
+        for blank in ["", " "] {
+            let edits = preview_from_input(&json!([{
+                "path": "a.rs", "diff": format!("@@ -1,3 +1,3 @@\n keep\n{blank}\n-old\n+new\n")
+            }]));
+            assert_eq!((edits[0].added, edits[0].removed), (1, 1));
+        }
+    }
+
+    #[test]
+    fn an_unclipped_fragment_keeps_content_resembling_the_trailer() {
+        let edits = preview_from_input(&json!({
+            "file_path": "a", "old_string": "old\n", "new_string": CLIPPED_TRAILER,
+        }));
+        assert!(!edits[0].clipped);
+        assert!(edits[0].diff.ends_with(&format!("+{CLIPPED_TRAILER}")));
+    }
+
+    #[test]
+    fn codex_counts_lines_that_look_like_headers() {
+        let edits = preview_from_input(&json!([{
+            "path": "a.rs", "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n--- old comment\n+++i;\n"
+        }]));
+        assert_eq!((edits[0].added, edits[0].removed), (1, 1));
+    }
+
+    #[test]
+    fn codex_multi_hunk_counts() {
+        let edits = preview_from_input(&json!([{
+            "path": "a.rs", "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n keep\n--- old comment\n+++i;\n@@ -8,0 +9,2 @@\n+one\n+two\n\\ No newline at end of file\n@@ -12,1 +14,0 @@\n---gone\n"
+        }]));
+        assert_eq!((edits[0].added, edits[0].removed), (3, 2));
+    }
 
     #[test]
     fn a_changed_line_shows_with_context_and_real_numbers() {

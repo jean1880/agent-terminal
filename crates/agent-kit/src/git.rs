@@ -39,8 +39,10 @@ pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 const AUTHOR_NAME: &str = "agent-terminal";
 const AUTHOR_EMAIL: &str = "agent-terminal@localhost";
-/// Paths per `update-index` call, to stay well inside `ARG_MAX`.
-const UPDATE_INDEX_BATCH: usize = 500;
+/// Up to 2,000 short paths per `update-index` call; a 64 KiB byte bound
+/// (including terminators and argv pointers) keeps long paths inside ARG_MAX.
+const UPDATE_INDEX_BATCH: usize = 2_000;
+const UPDATE_INDEX_BYTES: usize = 64 * 1024;
 /// Skipped paths listed in a checkpoint's commit message.
 const MAX_SKIPPED_IN_MESSAGE: usize = 50;
 
@@ -175,18 +177,43 @@ pub struct RepoInfo {
 /// run in `dir`. `--git-path` may answer relative to `dir`.
 fn parse_rev_parse(stdout: &[u8], dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
     let mut lines = stdout
+        .strip_suffix(b"\n")
+        .unwrap_or(stdout)
         .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
         .map(|line| PathBuf::from(OsStr::from_bytes(line)));
     let toplevel = lines.next()?;
     let git_dir = lines.next()?;
     let index = lines.next()?;
+    if lines.next().is_some()
+        || [&toplevel, &git_dir, &index]
+            .iter()
+            .any(|p| p.as_os_str().is_empty())
+    {
+        return None;
+    }
     let index = if index.is_absolute() {
         index
     } else {
         dir.join(index)
     };
     Some((toplevel, git_dir, index))
+}
+
+fn rev_parse_failure(stdout: &[u8]) -> String {
+    let mut records = stdout
+        .strip_suffix(b"\n")
+        .unwrap_or(stdout)
+        .split(|b| *b == b'\n');
+    let mut count = 0;
+    let empty = records.any(|record| {
+        count += 1;
+        record.is_empty()
+    });
+    if empty || count > 3 {
+        "This repository's path contains a line break, which checkpoints do not support".to_string()
+    } else {
+        "git rev-parse gave an unexpected answer".to_string()
+    }
 }
 
 /// Finds the repository `dir` belongs to. `Ok(None)` means it is not in one,
@@ -218,8 +245,8 @@ pub fn discover(dir: &Path) -> Result<Option<RepoInfo>, String> {
         }
         return Err(message);
     }
-    let (toplevel, git_dir, index) = parse_rev_parse(&output.stdout, dir)
-        .ok_or_else(|| "git rev-parse gave an unexpected answer".to_string())?;
+    let (toplevel, git_dir, index) =
+        parse_rev_parse(&output.stdout, dir).ok_or_else(|| rev_parse_failure(&output.stdout))?;
 
     let head = git_output(
         dir,
@@ -256,6 +283,8 @@ pub fn discover(dir: &Path) -> Result<Option<RepoInfo>, String> {
 /// Why an untracked path was left out of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
+    /// Ignored now, though an older checkpoint may have captured it.
+    IgnoredNow,
     /// A repository of its own; adding it would create a gitlink.
     NestedRepo,
     /// Its name marks it as likely to hold a secret.
@@ -278,6 +307,7 @@ pub struct Skipped {
 impl std::fmt::Display for Skipped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let why = match &self.reason {
+            SkipReason::IgnoredNow => "ignored now".to_string(),
             SkipReason::NestedRepo => "nested repository".to_string(),
             SkipReason::Secret => "may hold a secret".to_string(),
             SkipReason::TooLarge(bytes) => format!("{} KiB", bytes / 1024),
@@ -450,6 +480,30 @@ fn untracked_size(path: &Path) -> Option<u64> {
     (kind.is_file() || kind.is_symlink()).then_some(meta.len())
 }
 
+fn update_index_batches(paths: &[OsString]) -> impl Iterator<Item = &[OsString]> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start == paths.len() {
+            return None;
+        }
+        let mut end = start;
+        let mut bytes = 0;
+        while end < paths.len() && end - start < UPDATE_INDEX_BATCH {
+            let next = paths[end].len() + 1 + std::mem::size_of::<usize>();
+            // A single over-limit path must still reach git, which reports
+            // its error; ordinary filesystem paths are much smaller.
+            if end > start && bytes + next > UPDATE_INDEX_BYTES {
+                break;
+            }
+            bytes += next;
+            end += 1;
+        }
+        let batch = &paths[start..end];
+        start = end;
+        Some(batch)
+    })
+}
+
 /// Snapshots `repo`'s working tree — tracked changes and untracked,
 /// non-ignored files, less anything [`filter_untracked`] skips — into a tree
 /// object, without touching the user's index. `tag` keeps concurrent
@@ -496,6 +550,30 @@ pub fn snapshot_tree(repo: &RepoInfo, tag: &str) -> Result<SnapshotOutcome, Stri
     }
 
     let add_tracked = || {
+        // The user's promise to git is not a promise to checkpoints. Clear
+        // assume-unchanged only on our copy; skip-worktree stays in force.
+        let listing = git_raw(
+            dir,
+            SNAPSHOT_CONFIG
+                .iter()
+                .copied()
+                .chain(["ls-files", "-v", "-z"]),
+            &env,
+            SNAPSHOT_TIMEOUT_SECS,
+        )?;
+        let assumed: Vec<OsString> = listing
+            .split(|b| *b == 0)
+            .filter(|entry| entry.len() > 2 && entry[0].is_ascii_lowercase() && entry[1] == b' ')
+            .map(|entry| OsStr::from_bytes(&entry[2..]).to_os_string())
+            .collect();
+        for batch in update_index_batches(&assumed) {
+            let args = SNAPSHOT_CONFIG
+                .iter()
+                .map(OsString::from)
+                .chain(["update-index", "--no-assume-unchanged", "--"].map(OsString::from))
+                .chain(batch.iter().cloned());
+            git_raw(dir, args, &env, SNAPSHOT_TIMEOUT_SECS)?;
+        }
         let args = SNAPSHOT_CONFIG.iter().copied().chain(["add", "-u"]);
         git_raw(dir, args, &env, SNAPSHOT_TIMEOUT_SECS)
     };
@@ -529,7 +607,7 @@ pub fn snapshot_tree(repo: &RepoInfo, tag: &str) -> Result<SnapshotOutcome, Stri
     // update-index, not `add`: it takes paths literally (a `*` in a name is
     // not a glob), and with --remove a file deleted since the listing is
     // skipped instead of failing the whole snapshot.
-    for batch in kept.chunks(UPDATE_INDEX_BATCH) {
+    for batch in update_index_batches(&kept) {
         let args = SNAPSHOT_CONFIG
             .iter()
             .map(OsString::from)
@@ -1063,6 +1141,52 @@ mod tests {
     }
 
     #[test]
+    fn update_index_batches_bound_both_argument_count_and_bytes() {
+        let short: Vec<OsString> = (0..2500).map(|i| format!("file-{i}").into()).collect();
+        let batches: Vec<_> = update_index_batches(&short).collect();
+        assert_eq!(batches[0].len(), 2000);
+        assert_eq!(batches.concat(), short);
+        let long: Vec<OsString> = (0..2500)
+            .map(|i| format!("{}/file-{i}", "x".repeat(4000)).into())
+            .collect();
+        let batches: Vec<_> = update_index_batches(&long).collect();
+        assert_eq!(batches.concat(), long);
+        assert!(batches.iter().all(|batch| batch
+            .iter()
+            .map(|p| p.len() + 1 + std::mem::size_of::<usize>())
+            .sum::<usize>()
+            <= 64 * 1024));
+    }
+
+    #[test]
+    fn rev_parse_failure_does_not_call_missing_records_a_line_break() {
+        for output in [b"/repo\n".as_slice(), b"/repo\n/repo/.git\n"] {
+            assert_eq!(
+                rev_parse_failure(output),
+                "git rev-parse gave an unexpected answer"
+            );
+        }
+        for output in [
+            b"/repo\n\n.git/index\n".as_slice(),
+            b"/repo/a\nb\n/repo/.git\n.git/index\n",
+        ] {
+            assert!(rev_parse_failure(output).contains("path contains a line break"));
+        }
+    }
+
+    #[test]
+    fn a_path_with_a_newline_is_refused_not_misread() {
+        assert!(
+            parse_rev_parse(b"/repo/a\nb\n/repo/.git\n.git/index\n", Path::new("/repo")).is_none()
+        );
+        assert!(parse_rev_parse(
+            b"/repo/a\n\n/external/git\n/external/git/index\n",
+            Path::new("/repo")
+        )
+        .is_none());
+    }
+
+    #[test]
     fn secret_paths_are_recognised_case_insensitively() {
         for path in [
             ".env",
@@ -1404,6 +1528,82 @@ mod tests {
             assert!(reasons.iter().any(|r| matches!(r, SkipReason::TooLarge(_))));
             // The private index is cleaned up.
             assert!(!repo.git_dir.join("agent-terminal/index-t").exists());
+        }
+
+        #[test]
+        fn an_assume_unchanged_edit_is_captured() {
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            sh(dir, &["update-index", "--assume-unchanged", "--", "a.txt"]);
+            fs::write(dir.join("a.txt"), "edited while assumed unchanged\n").unwrap();
+            let repo = discover(dir).unwrap().unwrap();
+            let snap = taken(snapshot_tree(&repo, "assumed").unwrap());
+            assert_eq!(
+                blob(dir, &snap.tree, "a.txt"),
+                "edited while assumed unchanged"
+            );
+        }
+
+        #[test]
+        fn the_real_index_keeps_its_assume_unchanged_bits() {
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            sh(dir, &["update-index", "--split-index"]);
+            sh(dir, &["update-index", "--assume-unchanged", "--", "a.txt"]);
+            fs::write(dir.join("a.txt"), "edited\n").unwrap();
+            let repo = discover(dir).unwrap().unwrap();
+            let before = user_state(dir, &repo);
+            let bits = sh(dir, &["ls-files", "-v"]);
+            assert!(bits.contains("h a.txt"));
+            let snap = taken(snapshot_tree(&repo, "bits").unwrap());
+            assert_eq!(user_state(dir, &repo), before);
+            assert_eq!(sh(dir, &["ls-files", "-v"]), bits);
+            assert_eq!(blob(dir, &snap.tree, "a.txt"), "edited");
+        }
+
+        #[test]
+        fn skip_worktree_entries_are_not_recorded_as_deleted() {
+            let Some(tmp) = new_repo() else { return };
+            let dir = tmp.path();
+            sh(dir, &["update-index", "--skip-worktree", "--", "gone.txt"]);
+            fs::remove_file(dir.join("gone.txt")).unwrap();
+            let repo = discover(dir).unwrap().unwrap();
+            let before = user_state(dir, &repo);
+            let snap = taken(snapshot_tree(&repo, "sparse").unwrap());
+            assert_eq!(blob(dir, &snap.tree, "gone.txt"), "bye");
+            assert_eq!(user_state(dir, &repo), before);
+            assert!(sh(dir, &["ls-files", "-v"]).contains("S gone.txt"));
+        }
+
+        #[test]
+        fn discovery_refuses_a_repository_path_with_a_newline() {
+            if !git_installed() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("a\nb");
+            fs::create_dir(&dir).unwrap();
+            sh(&dir, &["init", "-q"]);
+            let err = discover(&dir).unwrap_err();
+            assert_eq!(
+                err,
+                "This repository's path contains a line break, which checkpoints do not support"
+            );
+            // A trailing newline creates an empty record. An external git
+            // directory keeps the other two paths free of line breaks.
+            let dir = tmp.path().join("trailing\n");
+            let git_dir = tmp.path().join("external-git");
+            fs::create_dir(&dir).unwrap();
+            sh(
+                &dir,
+                &[
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    git_dir.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(discover(&dir).unwrap_err(), err);
         }
 
         #[test]
