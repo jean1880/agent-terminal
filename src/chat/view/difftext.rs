@@ -115,7 +115,11 @@ impl DiffText {
 }
 
 /// The notes under a diff: where it came from, and that it was cut.
-pub fn notes_for(origin: agent_kit::filediff::Origin, omitted_lines: usize) -> Vec<String> {
+pub fn notes_for(
+    origin: agent_kit::filediff::Origin,
+    omitted_lines: usize,
+    clipped: bool,
+) -> Vec<String> {
     use agent_kit::filediff::Origin;
     let mut notes = Vec::new();
     match origin {
@@ -127,6 +131,12 @@ pub fn notes_for(origin: agent_kit::filediff::Origin, omitted_lines: usize) -> V
             "Diff truncated, {omitted_lines} more lines — open externally"
         ));
     }
+    if clipped {
+        notes.push(
+            "Only the first 512 KiB of each side were compared; the change may lie beyond."
+                .to_owned(),
+        );
+    }
     notes
 }
 
@@ -137,11 +147,32 @@ mod tests {
 
     #[test]
     fn the_notes_say_where_the_diff_came_from_and_when_it_was_cut() {
-        assert_eq!(notes_for(Origin::Checkpoint, 0), ["Changes this turn"]);
-        assert_eq!(notes_for(Origin::AgentEdit, 0), ["from the agent's edit"]);
-        let cut = notes_for(Origin::Checkpoint, 12);
+        assert_eq!(
+            notes_for(Origin::Checkpoint, 0, false),
+            ["Changes this turn"]
+        );
+        assert_eq!(
+            notes_for(Origin::AgentEdit, 0, false),
+            ["from the agent's edit"]
+        );
+        let cut = notes_for(Origin::Checkpoint, 12, false);
         assert_eq!(cut.len(), 2);
         assert!(cut[1].starts_with("Diff truncated"), "{cut:?}");
         assert!(cut[1].ends_with("open externally"));
+    }
+
+    #[test]
+    fn a_clipped_comparison_warns_even_when_display_truncation_hides_the_trailer() {
+        let warning =
+            "Only the first 512 KiB of each side were compared; the change may lie beyond.";
+        for origin in [Origin::Checkpoint, Origin::AgentEdit] {
+            for omitted in [0, 12] {
+                let notes = notes_for(origin, omitted, true);
+                assert!(notes.iter().any(|n| n == warning), "{notes:?}");
+                assert!(!notes_for(origin, omitted, false)
+                    .iter()
+                    .any(|n| n == warning));
+            }
+        }
     }
 }

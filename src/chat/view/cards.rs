@@ -1385,7 +1385,7 @@ impl ToolCard {
             return; // closed again before the answer arrived
         }
         match reply {
-            Ok(shown) if shown.text.trim().is_empty() => {
+            Ok(shown) if shown.text.trim().is_empty() && !shown.clipped => {
                 ui.status.set_text("No changes");
                 ui.status.set_visible(true);
                 ui.text.widget().set_visible(false);
@@ -1393,7 +1393,7 @@ impl ToolCard {
             Ok(shown) => {
                 ui.text.set(
                     &shown.text,
-                    &difftext::notes_for(shown.origin, shown.omitted_lines),
+                    &difftext::notes_for(shown.origin, shown.omitted_lines, shown.clipped),
                 );
                 ui.status.set_visible(false);
                 ui.text.widget().set_visible(true);
@@ -2075,10 +2075,14 @@ impl ApprovalCard {
             );
             self.diff.set(
                 kept,
-                &difftext::notes_for(agent_kit::filediff::Origin::AgentEdit, omitted)
-                    .into_iter()
-                    .map(|n| n.replace("from the agent's edit", "Proposed change"))
-                    .collect::<Vec<_>>(),
+                &difftext::notes_for(
+                    agent_kit::filediff::Origin::AgentEdit,
+                    omitted,
+                    preview.iter().any(|e| e.clipped),
+                )
+                .into_iter()
+                .map(|n| n.replace("from the agent's edit", "Proposed change"))
+                .collect::<Vec<_>>(),
             );
             self.diff.widget().set_visible(true);
         }
@@ -2934,6 +2938,41 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_clipping_warning_reaches_both_diff_surfaces() {
+        gtk4::init().expect("GTK init");
+        let warning =
+            "Only the first 512 KiB of each side were compared; the change may lie beyond.";
+        let sink: RowSink = Rc::new(|_| {});
+        let card = ToolCard::new("edit", &sink);
+        card.diff.toggle.set_active(true);
+        card.show_diff(&Ok(agent_kit::filediff::Shown {
+            text: "@@ -1 +1 @@\n-old\n+new\n".into(),
+            origin: agent_kit::filediff::Origin::Checkpoint,
+            omitted_lines: 12,
+            clipped: true,
+            files: vec!["file.txt".into()],
+        }));
+        assert!(card.diff.text.notes().contains(warning));
+        let prefix = "same\n".repeat(120_000);
+        let (approval, _) = codex_card(
+            "Edit",
+            serde_json::json!({
+                "file_path": "/w/file.txt",
+                "old_string": format!("old\n{prefix}"),
+                "new_string": format!("new\n{prefix}"),
+            }),
+            vec![Decision::Allow, Decision::Deny],
+            None,
+        );
+        assert!(approval.diff.notes().contains(warning));
+        assert!(
+            !approval.diff.text().contains(warning),
+            "the trailer was cut from the display"
+        );
+    }
 
     /// Every `.card-section` and `.code-block` has a Copy button, and output cut to the last
     /// 40 lines can be shown whole (and copied whole).

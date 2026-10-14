@@ -20,7 +20,7 @@ use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
 use super::payload;
 
 /// The card's one-line summary: the running ones, then the finished ones still docked.
-pub fn title_text(running: usize, finished: usize) -> String {
+pub fn title_text(running: usize, finished: usize, unknown: usize) -> String {
     let active = match running {
         1 => "1 worker active".to_owned(),
         n => format!("{n} workers active"),
@@ -29,11 +29,27 @@ pub fn title_text(running: usize, finished: usize) -> String {
         1 => "1 worker finished".to_owned(),
         n => format!("{n} workers finished"),
     };
-    match (running, finished) {
+    let known = match (running, finished) {
         (_, 0) => active,
         (0, _) => done,
         (_, n) => format!("{active} · {n} finished"),
+    };
+    match (running + finished, unknown) {
+        (_, 0) => known,
+        (0, 1) => "1 worker unknown".to_owned(),
+        (0, n) => format!("{n} workers unknown"),
+        (_, n) => format!("{known} · {n} unknown"),
     }
+}
+
+fn counts(shown: &[&SubagentSummary]) -> (usize, usize, usize) {
+    let running = shown.iter().filter(|a| a.active()).count();
+    let finished = shown.iter().filter(|a| a.finished()).count();
+    (
+        running,
+        finished,
+        shown.len().saturating_sub(running + finished),
+    )
 }
 
 /// What sub-agent `id` is doing now: its running step, else its latest one (`None`: no step
@@ -274,9 +290,8 @@ impl SubagentShelf {
         if shown.is_empty() {
             return;
         }
-        let running = shown.iter().filter(|a| a.active()).count();
-        let finished = shown.len() - running;
-        set_if_changed(&self.title, &title_text(running, finished));
+        let (running, finished, unknown) = counts(&shown);
+        set_if_changed(&self.title, &title_text(running, finished, unknown));
         self.clear.set_visible(finished > 0);
         let same = {
             let rows = self.rows.borrow();
@@ -334,12 +349,41 @@ pub(crate) mod tests {
     use agent_core::event::{Envelope, Event, ItemKind};
 
     #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_unknown_worker_has_no_clear_finished_button() {
+        gtk4::init().expect("GTK init");
+        let t = transcript(&[subagent("s1", "Explore")]);
+        let shelf = SubagentShelf::new(|_| {}, || {});
+        let mut workers = t.subagents();
+        shelf.set(&t, &workers);
+        workers[0].lifecycle = Some(agent_core::event::WorkerState::Unknown);
+        shelf.set(&t, &workers);
+        assert_eq!(shelf.title.text(), "1 worker unknown");
+        assert!(!shelf.clear.property::<bool>("visible"));
+        assert!(shelf.state().0);
+    }
+
+    #[test]
     fn titles_count_the_running_ones() {
-        assert_eq!(title_text(1, 0), "1 worker active");
-        assert_eq!(title_text(3, 0), "3 workers active");
-        assert_eq!(title_text(0, 1), "1 worker finished");
-        assert_eq!(title_text(0, 2), "2 workers finished");
-        assert_eq!(title_text(1, 2), "1 worker active · 2 finished");
+        assert_eq!(title_text(1, 0, 0), "1 worker active");
+        assert_eq!(title_text(3, 0, 0), "3 workers active");
+        assert_eq!(title_text(0, 1, 0), "1 worker finished");
+        assert_eq!(title_text(0, 2, 0), "2 workers finished");
+        assert_eq!(title_text(1, 2, 0), "1 worker active · 2 finished");
+    }
+
+    #[test]
+    fn an_unknown_worker_is_not_called_finished() {
+        let t = transcript(&[subagent("s1", "Explore")]);
+        let mut worker = t.subagents().remove(0);
+        worker.lifecycle = Some(agent_core::event::WorkerState::Unknown);
+        let (running, finished, unknown) = counts(&[&worker]);
+        assert_eq!((running, finished, unknown), (0, 0, 1));
+        assert_eq!(title_text(running, finished, unknown), "1 worker unknown");
+        assert_eq!(
+            title_text(2, 1, 3),
+            "2 workers active · 1 finished · 3 unknown"
+        );
     }
 
     fn start(

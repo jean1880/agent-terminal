@@ -39,6 +39,18 @@ fn label(text: &str, classes: &[&str]) -> gtk4::Label {
 /// Debounce for `@file` suggestions (a round trip to the agent CLI).
 const FILE_DEBOUNCE: Duration = Duration::from_millis(120);
 
+fn keys_pass_to_ime(preedit_active: bool, key: Key) -> bool {
+    preedit_active
+        && matches!(
+            key,
+            Key::Enter | Key::Up | Key::Down | Key::Tab | Key::Escape
+        )
+}
+
+fn reset_preedit(active: &Cell<bool>) {
+    active.set(false);
+}
+
 /// Per-thread prompt recall. The draft is held while browsing, so Down restores exactly what
 /// the user had typed before they pressed Up.
 #[derive(Debug, Default)]
@@ -161,6 +173,7 @@ pub struct Composer {
     history: RefCell<PromptHistory>,
     /// Suppresses re-triggering while the composer itself edits the buffer.
     editing: Cell<bool>,
+    preedit_active: Cell<bool>,
     host: RefCell<Option<std::rc::Weak<dyn ComposerHost>>>,
 }
 
@@ -264,6 +277,7 @@ impl Composer {
             file_timer: Rc::new(RefCell::new(None)),
             history: RefCell::default(),
             editing: Cell::new(false),
+            preedit_active: Cell::new(false),
             host: RefCell::new(None),
         });
         composer.connect_signals();
@@ -304,6 +318,7 @@ impl Composer {
         self.editing.set(true);
         self.buffer.set_text(text);
         self.editing.set(false);
+        reset_preedit(&self.preedit_active);
         self.refresh_placeholder();
         self.refresh_trigger();
     }
@@ -415,6 +430,12 @@ impl Composer {
     }
 
     fn connect_signals(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.view.connect_preedit_changed(move |_, text| {
+            if let Some(c) = weak.upgrade() {
+                c.preedit_active.set(!text.is_empty());
+            }
+        });
         let keys = gtk4::EventControllerKey::new();
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
@@ -473,6 +494,7 @@ impl Composer {
         let weak = Rc::downgrade(self);
         focus.connect_leave(move |_| {
             if let Some(c) = weak.upgrade() {
+                reset_preedit(&c.preedit_active);
                 // Deferred: a click on a popup row moves focus before it activates.
                 let weak = Rc::downgrade(&c);
                 glib::timeout_add_local_once(Duration::from_millis(150), move || {
@@ -496,6 +518,9 @@ impl Composer {
             gdk::Key::Escape => Key::Escape,
             _ => Key::Other,
         };
+        if keys_pass_to_ime(self.preedit_active.get(), key) {
+            return glib::Propagation::Proceed;
+        }
         let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
         let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
         let meta = state.contains(gdk::ModifierType::META_MASK)
@@ -902,6 +927,111 @@ pub fn items_for(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_preedit_clears_on_reset_submit_and_focus_leave() {
+        gtk4::init().expect("GTK init");
+        let host = Rc::new(Host::default());
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        let resets: [fn(&Composer); 3] = [
+            |c| c.set_text("replacement"),
+            Composer::clear,
+            Composer::submit,
+        ];
+        for reset in resets {
+            composer.set_text("draft");
+            composer.view.emit_preedit_changed("入力");
+            assert!(composer.preedit_active.get());
+            reset(&composer);
+            assert!(!composer.preedit_active.get());
+        }
+        assert_eq!(*host.submitted.borrow(), ["draft"]);
+        composer.view.emit_preedit_changed("入力");
+        assert!(composer.preedit_active.get());
+        let controllers = composer.view.observe_controllers();
+        let focus = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .find_map(|controller| controller.downcast::<gtk4::EventControllerFocus>().ok())
+            .expect("composer focus controller");
+        focus.emit_by_name::<()>("leave", &[]);
+        assert!(!composer.preedit_active.get());
+        composer.set_text("after focus leave");
+        assert_eq!(
+            composer.on_key(gdk::Key::Return, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(*host.submitted.borrow(), ["draft", "after focus leave"]);
+        composer.dispose();
+    }
+
+    #[test]
+    fn resetting_preedit_returns_keys_to_the_composer() {
+        let active = Cell::new(true);
+        assert!(keys_pass_to_ime(active.get(), Key::Enter));
+        reset_preedit(&active);
+        for key in [Key::Enter, Key::Up, Key::Down, Key::Tab, Key::Escape] {
+            assert!(!keys_pass_to_ime(active.get(), key));
+        }
+        reset_preedit(&active);
+        assert!(!active.get());
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_preedit_signal_keeps_keys_out_of_composer_actions() {
+        gtk4::init().expect("GTK init");
+        let host = Rc::new(Host::default());
+        host.running.set(true);
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        composer.set_text("draft");
+        composer.view.emit_preedit_changed("入力");
+        assert!(composer.preedit_active.get());
+        for key in [
+            gdk::Key::Return,
+            gdk::Key::KP_Enter,
+            gdk::Key::ISO_Enter,
+            gdk::Key::Up,
+            gdk::Key::KP_Up,
+            gdk::Key::Down,
+            gdk::Key::KP_Down,
+            gdk::Key::Tab,
+            gdk::Key::ISO_Left_Tab,
+            gdk::Key::Escape,
+        ] {
+            for state in [
+                gdk::ModifierType::empty(),
+                gdk::ModifierType::SHIFT_MASK,
+                gdk::ModifierType::CONTROL_MASK,
+            ] {
+                assert_eq!(composer.on_key(key, state), glib::Propagation::Proceed);
+            }
+        }
+        assert!(host.submitted.borrow().is_empty());
+        assert_eq!(host.interrupts.get(), 0);
+        assert_eq!(composer.text(), "draft");
+        composer.view.emit_preedit_changed("");
+        assert!(!composer.preedit_active.get());
+        assert_eq!(
+            composer.on_key(gdk::Key::Return, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(*host.submitted.borrow(), ["draft"]);
+        composer.dispose();
+    }
+
+    #[test]
+    fn keys_pass_through_during_preedit() {
+        for key in [Key::Enter, Key::Up, Key::Down, Key::Tab, Key::Escape] {
+            assert!(keys_pass_to_ime(true, key));
+            assert!(!keys_pass_to_ime(false, key));
+        }
+        assert!(!keys_pass_to_ime(true, Key::Other));
+    }
 
     #[derive(Default)]
     struct Host {

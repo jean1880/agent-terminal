@@ -199,6 +199,7 @@ pub enum Event {
         account: Option<Account>,
         windows: Vec<QuotaWindow>,
     },
+    /// Provider quota refusal. `resets_at` is epoch seconds (Claude) or RFC 3339 (agy).
     RateLimited {
         #[serde(default)]
         resets_at: Option<String>,
