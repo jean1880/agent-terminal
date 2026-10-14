@@ -10,6 +10,31 @@ use agent_core::adapter::{Driver, Mode};
 use super::cards::{accent_class, driver_name};
 use super::model::{format_tokens, Activity, Gauge};
 
+/// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
+pub fn confirm_mode_switch(parent: &impl IsA<gtk4::Widget>, then: impl Fn() + 'static) {
+    let dialog = adw::AlertDialog::new(
+        Some("Change Antigravity mode now?"),
+        Some(
+            "Antigravity is still working without its approval hook. Changing mode interrupts \
+              this turn and continues the unfinished task in the selected mode. Any approval \
+              or question waiting for your answer is cancelled; the new turn can ask again.",
+        ),
+    );
+    dialog.add_responses(&[
+        ("cancel", "Keep Waiting"),
+        ("switch", "Switch and Continue"),
+    ]);
+    dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        if response == "switch" {
+            then();
+        }
+    });
+    dialog.present(Some(parent));
+}
+
 fn label(text: &str, classes: &[&str]) -> gtk4::Label {
     let l = super::cards::label(text, classes);
     l.set_selectable(false);

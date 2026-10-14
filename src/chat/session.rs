@@ -190,6 +190,8 @@ struct Inner {
     /// resolved id its events report: what is stored and what retirement is judged on.
     selected: RefCell<Option<String>>,
     pending_model: RefCell<Option<PendingModel>>,
+    /// The hook already enforces this mode; only agy's process restart waits for the turn.
+    deferred_mode: Cell<Option<Mode>>,
     ctl_seq: Cell<u64>,
     /// Bumped on every (re)start and stop: callbacks of an older process are ignored.
     generation: Cell<u64>,
@@ -536,6 +538,7 @@ impl ChatSession {
             retired: RefCell::new(None),
             selected: RefCell::new(selected),
             pending_model: RefCell::new(None),
+            deferred_mode: Cell::new(None),
             ctl_seq: Cell::new(0),
             generation: Cell::new(0),
             stopping: Cell::new(false),
@@ -1853,6 +1856,7 @@ impl Inner {
     /// `deliberate`: the app stopped it (a switch or a close), so its exit is expected and an
     /// open turn was interrupted, never failed.
     fn finish_process(&self, code: Option<i32>, deliberate: bool) {
+        self.deferred_mode.set(None);
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
         let mut envelopes = self.adapter.borrow_mut().on_exit(code);
@@ -2359,6 +2363,14 @@ impl Inner {
         if self.queued_dispatch_pending.replace(false) {
             let strong = self.weak_self.borrow().as_ref().and_then(|w| w.upgrade());
             if let Some(strong) = strong {
+                if !self.stopping.get() && !self.state.borrow().running_turn {
+                    if let Some(mode) = self.deferred_mode.take() {
+                        // Restart after the final envelope reached the view, before user input.
+                        let restarting = ScopedFlag::set(&self.dispatching_queue);
+                        strong.command(Command::SetMode { mode });
+                        drop(restarting);
+                    }
+                }
                 strong.dispatch_queued_prompt();
             }
         }
@@ -2452,6 +2464,17 @@ impl Inner {
         }));
     }
 
+    fn choose_mode(&self, mode: Mode) {
+        if mode != Mode::Bypass {
+            self.safe_mode.set(mode);
+        }
+        let previous = self.wanted_mode.replace(mode);
+        if previous != mode {
+            self.note_grants_outlive_mode();
+        }
+        self.record_chosen_mode();
+    }
+
     /// Arms `handoff` for the next prompt and stores it (under the current provider thread), so
     /// a restart before it is delivered re-arms it.
     fn arm_handoff(&self, handoff: Handoff) {
@@ -2477,12 +2500,12 @@ impl Inner {
     ) {
         let permission = self.codex_permissions.borrow().get(request).cloned();
         if let Some(card) = permission {
-            self.respond_codex_permissions(request, decision, &card);
+            self.respond_codex_permissions(request, decision, &card, false);
             return;
         }
         if let Some(handle) = self.approval() {
             let keeps_rule = matches!(decision, Decision::AllowForSession | Decision::AllowAlways);
-            let responded = if keeps_rule {
+            if keeps_rule {
                 let weak = Rc::downgrade(self);
                 let answered = request.to_owned();
                 handle.respond_with_rule_then(
@@ -2497,18 +2520,10 @@ impl Inner {
                             );
                         }
                     },
-                )
+                );
             } else {
-                handle.respond_with_rule(request, decision, custom_rule.clone())
-            };
-            if responded {
-                if !keeps_rule {
-                    self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
-                }
-                // Stop turn: the hook was denied; end the turn as the stop button does (D4).
-                if decision == Decision::Cancel {
-                    self.command(Command::Interrupt);
-                }
+                let answered = handle.respond_with_rule(request, decision, custom_rule.clone());
+                self.finish_hook_approval(request, decision, answered);
             }
             return; // the hook owns agy's answers; a taken request is no longer pending
         }
@@ -2550,6 +2565,16 @@ impl Inner {
         self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
     }
 
+    fn finish_hook_approval(self: &Rc<Self>, request: &str, decision: Decision, answered: bool) {
+        if answered {
+            self.emit(Envelope::new(Event::ApprovalResolved { decision }).request(request));
+        }
+        // Stop turn still stops when a stricter mode denied the call or its hook went away.
+        if decision == Decision::Cancel {
+            self.command(Command::Interrupt);
+        }
+    }
+
     fn set_mode(self: &Rc<Self>, mode: Mode) {
         // Dangerous permissive agy is its hook allowing everything: with no hook, there is
         // nothing to approve through, and the flag is never passed any other way.
@@ -2563,16 +2588,9 @@ impl Inner {
             self.emit(Envelope::new(Event::ModeChanged { mode: current }));
             return;
         }
-        if mode != Mode::Bypass {
-            self.safe_mode.set(mode);
-        }
-        let previous = self.wanted_mode.replace(mode);
-        if previous != mode {
-            self.note_grants_outlive_mode();
-        }
-        self.record_chosen_mode();
         if self.ask_unavailable() {
             if mode == Mode::Ask {
+                self.choose_mode(mode);
                 self.emit(Envelope::new(Event::Notice {
                     text:
                         "Antigravity cannot ask before edits until the approval hook is installed; \
@@ -2591,11 +2609,63 @@ impl Inner {
                 }));
             }
         }
+        let restarts = self.adapter.borrow().capabilities().mode_change_restarts;
+        let running = self.state.borrow().running_turn;
+        // Hookless agy's busy change was confirmed by the view. Carry the unfinished task
+        // as well as native history, since transport writes may not have reached the agent.
+        let handoff =
+            if restarts && running && self.approval().is_none() && mode != self.state.borrow().mode
+            {
+                match self
+                    .store
+                    .read(|s| s.transcript_messages(&self.thread))
+                    .and_then(|r| r)
+                {
+                    Ok(messages) => Some(build_handoff(
+                        &messages,
+                        &format!("Antigravity thread {}", self.thread),
+                    )),
+                    Err(e) => {
+                        self.error(format!(
+                            "Could not read the unfinished task to continue: {e}"
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+        // Failed preflight leaves the chosen and persisted modes exactly as they were.
+        self.choose_mode(mode);
+        if restarts && mode == self.state.borrow().mode {
+            return;
+        }
+        if restarts && running && self.approval().is_some() {
+            self.defer_mode(mode);
+            return;
+        }
         if self.command(Command::SetMode { mode }) {
             if let Some(a) = self.approval() {
                 a.set_mode(mode);
             }
+            if let Some(handoff) = handoff {
+                if handoff.carried > 0 {
+                    self.arm_handoff(handoff);
+                }
+                self.continue_after_switch(Driver::Agy);
+            }
         }
+    }
+
+    fn defer_mode(&self, mode: Mode) {
+        self.deferred_mode.set(Some(mode));
+        // State and launch settings follow the effective hook policy, so a reload or model
+        // switch cannot restore the old policy. The pending hint describes only the restart.
+        self.apply(&Envelope::new(Event::ModeChanged { mode }));
+        self.emit(Envelope::new(Event::ModeChangeDeferred {
+            requested: mode,
+            effective: mode,
+        }));
     }
 
     fn control(self: &Rc<Self>, control: Control) -> String {
@@ -3053,8 +3123,13 @@ impl Inner {
     }
 
     fn status(&self) -> SessionStatus {
+        let hookless = self.ask_unavailable();
         let adapter = self.adapter.borrow();
         let state = self.state.borrow();
+        let mut capabilities = adapter.capabilities().clone();
+        if hookless {
+            capabilities.live_approvals = false;
+        }
         SessionStatus {
             driver: adapter.driver(),
             model: state.model.clone(),
@@ -3067,7 +3142,7 @@ impl Inner {
             mode: state.mode,
             running_turn: state.running_turn,
             alive: state.alive,
-            capabilities: adapter.capabilities().clone(),
+            capabilities,
             commands: state.commands.clone(),
         }
     }
@@ -3203,8 +3278,33 @@ impl Inner {
             }
             let shown = inner.show_codex_permissions(&env, &request, verdict, None);
             inner.emit(shown);
+            inner.auto_codex_permissions(&request);
         });
         None
+    }
+
+    /// Bypass grants only what the checked card can show, for this turn, through the same
+    /// answer-time filesystem recheck as an explicit Allow. Deny-only cards still ask.
+    fn auto_codex_permissions(self: &Rc<Self>, shown: &str) {
+        if !self.codex_permission_bypass() {
+            return;
+        }
+        let card = self.codex_permissions.borrow().get(shown).cloned();
+        if let Some(card) = card.filter(|c| c.allow) {
+            if card.round >= 3 {
+                self.emit(Envelope::new(Event::Notice {
+                    text: "This permission request changed repeatedly; review its latest card \
+                           and answer it explicitly."
+                        .to_owned(),
+                }));
+                return;
+            }
+            self.respond_codex_permissions(shown, Decision::Allow, &card, true);
+        }
+    }
+
+    fn codex_permission_bypass(&self) -> bool {
+        self.wanted_mode.get() == Mode::Bypass && self.state.borrow().mode == Mode::Bypass
     }
 
     /// `env` with only Deny and Stop turn offered, marked unrenderable, with `warning`.
@@ -3346,6 +3446,7 @@ impl Inner {
         shown: &str,
         decision: Decision,
         card: &PermissionCard,
+        automatic: bool,
     ) {
         let refusal = match decision {
             Decision::AllowAlways => Some(
@@ -3394,6 +3495,12 @@ impl Inner {
             let Some(card) = card.filter(|_| inner.generation.get() == generation) else {
                 return; // expired or answered meanwhile
             };
+            if automatic && !inner.codex_permission_bypass() {
+                if let Some(open) = inner.codex_permissions.borrow_mut().get_mut(&shown) {
+                    open.checking = false;
+                }
+                return;
+            }
             if verdict.as_ref() == Some(&card.verdict) {
                 inner.send_codex_permissions(&shown, decision, &card);
                 return;
@@ -3417,6 +3524,9 @@ impl Inner {
                 next.round = round;
             }
             inner.emit(env);
+            if automatic {
+                inner.auto_codex_permissions(&again);
+            }
         });
     }
 
@@ -5094,6 +5204,93 @@ mod tests {
         });
     }
 
+    #[test]
+    fn hookless_agy_records_an_ask_choice_and_reopens_with_it() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, _) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            let store = session.inner.store.clone();
+            let thread = session.inner.thread.clone();
+            let chosen = || {
+                let events = store
+                    .reader()
+                    .events(&thread, None, 10_000)
+                    .expect("events");
+                chosen_mode(events.iter().map(|(_, e)| e))
+            };
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(chosen(), Some(Mode::AcceptEdits));
+            session.send_prompt("first");
+            let generation = session.inner.generation.get();
+            let argv = session.launch_spec().argv;
+            session.set_mode(Mode::Ask);
+            assert_eq!(chosen(), Some(Mode::Ask));
+            assert_eq!(session.inner.wanted_mode.get(), Mode::Ask);
+            assert_eq!(session.inner.safe_mode.get(), Mode::Ask);
+            assert_eq!(
+                session.status().mode,
+                Mode::AcceptEdits,
+                "the hookless process cannot ask"
+            );
+            assert_eq!(session.inner.open.borrow().mode, Mode::AcceptEdits);
+            assert_eq!(session.inner.generation.get(), generation);
+            assert_eq!(session.launch_spec().argv, argv);
+            assert!(session.status().running_turn);
+            let mut open = session.inner.open.borrow().clone();
+            open.mode = chosen().expect("stored choice");
+            session.shutdown(false);
+            let (sink, _) = make_sink();
+            let reopened = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                None,
+            );
+            assert_eq!(reopened.wanted_mode(), Mode::Ask);
+            assert_eq!(
+                reopened.status().mode,
+                Mode::Plan,
+                "reopening uses the safe fallback for Ask"
+            );
+            assert!(reopened
+                .launch_spec()
+                .argv
+                .windows(2)
+                .any(|a| a == ["--mode", "plan"]));
+        });
+    }
+
+    #[test]
+    fn a_hook_stop_turn_interrupts_even_when_its_reply_is_refused() {
+        in_loop(|_| {
+            for answered in [false, true] {
+                for decision in [Decision::Allow, Decision::Deny, Decision::Cancel] {
+                    let log: Log = Rc::default();
+                    let (session, seen) = claude_on(Mode::Ask, &log);
+                    session.switch(Driver::Agy, Some("gemini-flash".into()), None);
+                    log.borrow_mut().clear();
+                    // Exercise the hook's post-response path without a socket: false includes
+                    // an answer-time denial and a request the hook no longer waits for.
+                    session.inner.finish_hook_approval("h1", decision, answered);
+                    assert_eq!(
+                        log.borrow()
+                            .iter()
+                            .filter(|c| matches!(c, Command::Interrupt))
+                            .count(),
+                        usize::from(decision == Decision::Cancel)
+                    );
+                    assert!(!log
+                        .borrow()
+                        .iter()
+                        .any(|c| matches!(c, Command::Approve { .. })));
+                    assert_eq!(resolution(&seen, "h1"), answered.then_some(decision));
+                }
+            }
+        });
+    }
+
     /// Dangerous permissive mode is session-only: no process starts in it, it is never stored
     /// as the thread's choice nor handed to a fork, and a switch to another agent ends it.
     #[test]
@@ -5627,6 +5824,265 @@ mod tests {
         .expect("bind")
     }
 
+    #[test]
+    fn agy_mode_change_waits_for_the_turn() {
+        in_loop(|ctx| {
+            use std::io::{BufRead as _, Write as _};
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.send_prompt("work");
+            let generation = session.inner.generation.get();
+            session.set_mode(Mode::Plan);
+            assert_eq!(session.inner.generation.get(), generation, "no stop");
+            assert!(session.status().running_turn);
+            assert_eq!(session.inner.deferred_mode.get(), Some(Mode::Plan));
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::ModeChangeDeferred {
+                    requested: Mode::Plan,
+                    effective: Mode::Plan
+                }
+            )));
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut hook = std::os::unix::net::UnixStream::connect(socket).expect("connect");
+                hook.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("timeout");
+                let query = agent_core::approval::ApprovalQuery {
+                    id: "edit".into(),
+                    conversation_id: "c1".into(),
+                    tool: "write_to_file".into(),
+                    args: serde_json::json!({"TargetFile": "work.rs", "CodeContent": "x"}),
+                    cwd: None,
+                };
+                writeln!(
+                    hook,
+                    "{}",
+                    agent_core::approval::encode_query(&query).expect("query")
+                )
+                .expect("send");
+                let mut reply = String::new();
+                std::io::BufReader::new(hook)
+                    .read_line(&mut reply)
+                    .expect("read");
+                tx.send(agent_core::approval::parse_reply(&reply).expect("reply"))
+                    .expect("send reply");
+            });
+            let mut reply = None;
+            assert!(pump_until(ctx, 5, || {
+                reply = rx.try_recv().ok();
+                reply.is_some()
+            }));
+            assert_eq!(
+                reply.expect("reply").decision,
+                Decision::Deny,
+                "hook changed immediately"
+            );
+            session.inner.emit(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                error: None,
+                usage: None,
+                cost_usd: None,
+            }));
+            assert_eq!(
+                session.inner.generation.get(),
+                generation + 2,
+                "one stop and one start"
+            );
+            assert_eq!(session.inner.deferred_mode.get(), None);
+            let argv = session.launch_spec().argv;
+            assert!(argv.windows(2).any(|a| a == ["--mode", "plan"]), "{argv:?}");
+        });
+    }
+
+    #[test]
+    fn a_deferred_agy_mode_restarts_before_queued_input() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            session.send_prompt("first");
+            session.queue_prompt("second");
+            let generation = session.inner.generation.get();
+            // Exercise the hooked deferral path without binding a socket in the sandbox.
+            session.inner.defer_mode(Mode::AcceptEdits);
+            session.inner.defer_mode(Mode::Plan);
+            assert_eq!(session.inner.generation.get(), generation);
+            let mut model = crate::chat::view::model::Transcript::new();
+            for env in seen.borrow().iter() {
+                model.apply(env, Driver::Agy);
+            }
+            assert_eq!(model.pending_mode, Some(Mode::Plan));
+            session.inner.emit(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                error: None,
+                usage: None,
+                cost_usd: None,
+            }));
+            assert_eq!(session.inner.generation.get(), generation + 2);
+            assert_eq!(session.inner.deferred_mode.get(), None);
+            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("second")));
+            let argv = session.launch_spec().argv;
+            assert!(argv.windows(2).any(|a| a == ["--mode", "plan"]), "{argv:?}");
+            assert!(
+                session.status().running_turn,
+                "queued input opens the next turn"
+            );
+            for env in seen.borrow().iter() {
+                model.apply(env, Driver::Agy);
+            }
+            assert_eq!(model.pending_mode, None);
+        });
+    }
+
+    #[test]
+    fn hookless_agy_reselecting_its_mode_keeps_the_turn() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, _) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            session.send_prompt("first");
+            let generation = session.inner.generation.get();
+            assert_eq!(session.status().mode, Mode::Plan);
+            assert!(!session.status().capabilities.live_approvals);
+            session.set_mode(Mode::Plan);
+            assert_eq!(session.inner.generation.get(), generation);
+            assert!(session.status().running_turn);
+            assert_eq!(session.inner.deferred_mode.get(), None);
+        });
+    }
+
+    #[test]
+    fn a_confirmed_hookless_agy_mode_change_continues_before_queued_input() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, _) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            session.send_prompt("first");
+            session.queue_prompt("second");
+            let generation = session.inner.generation.get();
+            // The view calls the backend only after Switch and Continue was confirmed.
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.inner.generation.get(), generation + 2);
+            assert!(pump_until(ctx, 5, || stdin_log(tmp.path())
+                .contains("Continue the unfinished task")));
+            assert!(!stdin_log(tmp.path()).contains("second"));
+            assert!(session.status().running_turn);
+            session.inner.emit(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                error: None,
+                usage: None,
+                cost_usd: None,
+            }));
+            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("second")));
+            assert_eq!(stdin_log(tmp.path()).matches("second").count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_reload_adopts_the_deferred_agy_mode_without_an_extra_restart() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            session.send_prompt("first");
+            session.inner.defer_mode(Mode::AcceptEdits);
+            let generation = session.inner.generation.get();
+            session.reload_session();
+            assert_eq!(session.inner.generation.get(), generation + 2);
+            assert_eq!(session.inner.deferred_mode.get(), None);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            let mut model = crate::chat::view::model::Transcript::new();
+            for env in seen.borrow().iter() {
+                model.apply(env, Driver::Agy);
+            }
+            assert_eq!(model.pending_mode, None);
+            session.inner.emit(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                error: None,
+                usage: None,
+                cost_usd: None,
+            }));
+            assert_eq!(
+                session.inner.generation.get(),
+                generation + 2,
+                "no deferred restart remains"
+            );
+        });
+    }
+
+    #[test]
+    fn hookless_agy_mode_change_keeps_its_choice_when_the_store_read_fails() {
+        in_loop(|ctx| {
+            use agent_kit::store_writer::{Shutdown, StoreWriter};
+            let tmp = tempfile::tempdir().expect("tmp");
+            let path = tmp.path().join("threads.sqlite");
+            let store = Rc::new(Store::open(&path).expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let writer = StoreWriter::spawn(&path).expect("writer");
+            let handle = StoreHandle::Queued {
+                reader: store.clone(),
+                writer: writer.clone(),
+            };
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+                handle,
+                thread,
+                sink,
+                None,
+            );
+            session.send_prompt("first");
+            session.queue_prompt("second");
+            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("first")));
+            let generation = session.inner.generation.get();
+            let argv = session.launch_spec().argv;
+            let chosen = seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::ModeChosen { .. }))
+                .count();
+            assert_eq!(writer.shutdown(Duration::from_secs(5)), Shutdown::Drained);
+            assert!(
+                session.inner.store.read(|_| ()).is_err(),
+                "the read really fails"
+            );
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(
+                session.inner.wanted_mode.get(),
+                Mode::Ask,
+                "initial Ask is mapped to Plan without the hook"
+            );
+            assert_eq!(session.inner.safe_mode.get(), Mode::Ask);
+            assert_eq!(session.status().mode, Mode::Plan);
+            assert_eq!(session.inner.open.borrow().mode, Mode::Plan);
+            assert_eq!(session.inner.deferred_mode.get(), None);
+            assert_eq!(session.inner.pending_handoff.borrow().as_ref(), None);
+            assert_eq!(session.inner.generation.get(), generation);
+            assert_eq!(session.launch_spec().argv, argv);
+            assert!(session.status().running_turn);
+            assert_eq!(session.inner.queued_prompts.borrow().len(), 1);
+            assert_eq!(
+                seen.borrow()
+                    .iter()
+                    .filter(|e| matches!(e.event, Event::ModeChosen { .. }))
+                    .count(),
+                chosen
+            );
+            assert!(has(&seen, |e| matches!(e, Event::Error { message }
+                if message.contains("Could not read the unfinished task to continue"))));
+        });
+    }
+
     /// W1b 1.11 (F22): an agy thread in Ask keeps Ask through a model switch and through a
     /// compact-style same-agent restart onto a launch whose profile default is another mode.
     /// No mode change is announced, and the restart never passes `--mode plan`.
@@ -5885,6 +6341,75 @@ mod tests {
                 assert_eq!(resolution(&seen, "gone"), None);
                 assert!(session.inner.session_rules.borrow().rules.is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn agy_stop_turn_interrupts_after_plan_denies_the_pending_hook_card() {
+        in_loop(|ctx| {
+            use std::io::Write as _;
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let log: Log = Rc::default();
+            let session = ChatSession::new(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle.clone()),
+            );
+            session.send_prompt("first");
+            let mut hook = std::os::unix::net::UnixStream::connect(socket).expect("connect");
+            let query = agent_core::approval::ApprovalQuery {
+                id: "h1".into(),
+                conversation_id: "c1".into(),
+                tool: "run_command".into(),
+                args: serde_json::json!({"CommandLine": "touch x"}),
+                cwd: None,
+            };
+            writeln!(
+                hook,
+                "{}",
+                agent_core::approval::encode_query(&query).expect("query")
+            )
+            .expect("send");
+            assert!(pump_until(ctx, 10, || handle.has_pending("h1")));
+            session.set_mode(Mode::Plan);
+            assert!(!handle.has_pending("h1"));
+            assert_eq!(resolution(&seen, "h1"), Some(Decision::Deny));
+            session.respond_approval("h1", Decision::Cancel);
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|c| matches!(c, Command::Interrupt))
+                    .count(),
+                1
+            );
+            assert!(!log
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, Command::Approve { .. })));
+            assert_eq!(
+                resolution(&seen, "h1"),
+                Some(Decision::Deny),
+                "a stale Cancel does not overwrite the denial"
+            );
+            let resolutions = seen
+                .borrow()
+                .iter()
+                .filter_map(|e| match e.event {
+                    Event::ApprovalResolved { decision } if e.request.as_deref() == Some("h1") => {
+                        Some(decision)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(resolutions, [Decision::Deny]);
         });
     }
 
