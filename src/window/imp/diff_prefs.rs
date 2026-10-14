@@ -191,6 +191,11 @@ impl AgentTerminalWindow {
             }
         ));
 
+        // The field says at once whether it is valid, but saves only once the edit is over (the
+        // next idle turn), from what it then holds. Replacing the text (select all, paste) passes
+        // through an empty field, which is valid ("no tool"): saved at once, it cleared the
+        // tool even when the pasted command was then refused.
+        let save_pending = Rc::new(Cell::new(false));
         command_row.connect_changed(glib::clone!(
             #[weak]
             obj,
@@ -198,6 +203,8 @@ impl AgentTerminalWindow {
             preset_row,
             #[strong]
             syncing,
+            #[strong]
+            save_pending,
             move |entry| {
                 if syncing.get() {
                     return;
@@ -208,12 +215,33 @@ impl AgentTerminalWindow {
                         entry.add_css_class("error");
                         entry.set_title(&command_error_title(&why));
                     }
-                    Ok(tool) => {
+                    Ok(_) => {
                         entry.remove_css_class("error");
                         entry.set_title("Command");
-                        let want = row_of(tool.as_ref());
+                    }
+                }
+                if save_pending.replace(true) {
+                    return;
+                }
+                let (entry, save_pending, syncing) =
+                    (entry.clone(), save_pending.clone(), syncing.clone());
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[weak]
+                    preset_row,
+                    move || {
+                        save_pending.set(false);
+                        // Still invalid when the edit is over: nothing is saved.
+                        let Ok(tool) = tool_from_text(&entry.text()) else {
+                            return;
+                        };
                         // A typed argv that is a preset's selects it; otherwise it is Custom.
-                        let want = if tool.is_none() { NONE_INDEX } else { want };
+                        let want = if tool.is_none() {
+                            NONE_INDEX
+                        } else {
+                            row_of(tool.as_ref())
+                        };
                         if preset_row.selected() != want {
                             syncing.set(true);
                             preset_row.set_selected(want);
@@ -221,7 +249,7 @@ impl AgentTerminalWindow {
                         }
                         obj.imp().set_diff_tool(tool);
                     }
-                }
+                ));
             }
         ));
 
@@ -302,23 +330,41 @@ pub(super) mod tests {
             .downcast::<adw::SwitchRow>()
             .expect("switch");
         let saved = || imp.config.borrow().diff_tool.clone();
+        // A typed edit is saved once it is over (the next idle turn).
+        let ctx = glib::MainContext::default();
+        let type_in = |text: &str| {
+            entry.set_text(text);
+            crate::testutil::settle(&ctx);
+        };
 
         // A preset typed out selects it and is saved.
-        entry.set_text("meld {old} {new}");
+        type_in("meld {old} {new}");
         assert_eq!(combo.selected(), 1);
         assert_eq!(saved().map(|t| t.name).as_deref(), Some("Meld"));
         // An edit that breaks it (the last brace deleted) is shown on the field, and the tool
         // saved before it is left alone.
         let end = entry.text().chars().count() as i32;
         entry.delete_text(end - 1, end);
+        crate::testutil::settle(&ctx);
         assert!(entry.has_css_class("error"));
         assert_ne!(entry.title(), "Command", "the title says what is wrong");
         assert_eq!(saved().map(|t| t.name).as_deref(), Some("Meld"));
-        // A mistyped placeholder is named in the title.
-        entry.set_text("meld {old} {nwe}");
+        // Replacing the whole command with an invalid one (select all, paste) passes through an
+        // empty field; the saved tool survives it. The placeholder is named in the title.
+        type_in("meld {old} {new}");
+        type_in("meld {old} {nwe}");
         assert!(entry.title().contains("{nwe}"), "{}", entry.title());
+        assert_eq!(
+            saved().map(|t| t.name).as_deref(),
+            Some("Meld"),
+            "a refused paste keeps the saved tool"
+        );
+        // Clearing the field on purpose is "no tool", and is saved.
+        type_in("");
+        assert_eq!(saved(), None);
+        assert_eq!(combo.selected(), NONE_INDEX);
         // Anything else valid is a custom tool, named after its program.
-        entry.set_text("/opt/bin/kompare {old} {new}");
+        type_in("/opt/bin/kompare {old} {new}");
         assert!(!entry.has_css_class("error"));
         assert_eq!(entry.title(), "Command");
         assert_eq!(combo.selected(), CUSTOM_INDEX);
