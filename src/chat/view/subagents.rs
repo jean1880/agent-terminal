@@ -30,6 +30,63 @@ pub fn status_text(s: &SubagentSummary) -> String {
     }
 }
 
+fn provenance_text(value: &agent_core::delegation::identity::ValueProvenance) -> String {
+    use agent_core::delegation::identity::Provenance;
+    match value.source {
+        Provenance::ProviderReported => value.effective.as_deref().unwrap_or("unknown").to_owned(),
+        Provenance::ProviderAccepted => format!(
+            "{} (accepted; effective unknown)",
+            value.requested.as_deref().unwrap_or("unknown")
+        ),
+        Provenance::LaunchConfigured => format!(
+            "{} (configured; effective unknown)",
+            value.requested.as_deref().unwrap_or("unknown")
+        ),
+        Provenance::Unsupported => format!(
+            "{} (unsupported)",
+            value.requested.as_deref().unwrap_or("unknown")
+        ),
+        Provenance::Unknown => "unknown".to_owned(),
+    }
+}
+
+pub(super) fn identity_text(agent: &SubagentSummary) -> String {
+    let provider = agent
+        .driver
+        .map(|driver| driver.info().label)
+        .unwrap_or("Provider unknown");
+    match &agent.delegation {
+        Some(delegation) => format!(
+            "{provider} · {} · model {} · effort {}",
+            match delegation.origin {
+                agent_core::event::WorkerOrigin::Supervised => "supervised",
+                agent_core::event::WorkerOrigin::Native => "native",
+                agent_core::event::WorkerOrigin::Root => "root",
+            },
+            provenance_text(&delegation.model),
+            provenance_text(&delegation.effort)
+        ),
+        None => format!("{provider} · native · model unknown · effort unknown"),
+    }
+}
+
+pub(super) fn set_brand(image: &gtk4::Image, driver: Option<agent_core::adapter::Driver>) {
+    // Existing brand CSS tints `.accent-dot` below the provider's enclosing box.
+    let accent_owner = image.parent().unwrap_or_else(|| image.clone().upcast());
+    image.add_css_class("accent-dot");
+    for driver in agent_core::adapter::Driver::ALL {
+        accent_owner.remove_css_class(driver.info().accent_class);
+    }
+    if let Some(driver) = driver {
+        image.set_from_gicon(&crate::icons::driver_icon(driver));
+        accent_owner.add_css_class(driver.info().accent_class);
+        image.set_tooltip_text(Some(driver.info().label));
+        image.set_visible(true);
+    } else {
+        image.set_visible(false);
+    }
+}
+
 /// The explorer's order: running sub-agents first, then the finished ones, each in the order they
 /// began.
 pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
@@ -65,6 +122,8 @@ struct ListRow {
     name: gtk4::Label,
     status: gtk4::Label,
     task: gtk4::Label,
+    identity: gtk4::Label,
+    brand: gtk4::Image,
 }
 
 impl ListRow {
@@ -76,6 +135,9 @@ impl ListRow {
         b.set_margin_start(10);
         b.set_margin_end(10);
         let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let brand = gtk4::Image::new();
+        brand.set_pixel_size(14);
+        top.append(&brand);
         let name = label("", &["subagent-name"]);
         name.set_hexpand(true);
         name.set_xalign(0.0);
@@ -95,6 +157,11 @@ impl ListRow {
         // The list takes its rows' natural width: a long task must not widen it past this.
         task.set_max_width_chars(48);
         b.append(&task);
+        let identity = label("", &["dim-label"]);
+        identity.set_wrap(true);
+        identity.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        identity.set_max_width_chars(48);
+        b.append(&identity);
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&b));
         (
@@ -104,12 +171,16 @@ impl ListRow {
                 name,
                 status,
                 task,
+                identity,
+                brand,
             },
         )
     }
 
     fn set(&self, agent: &SubagentSummary) {
         set_if_changed(&self.name, &agent.name);
+        set_brand(&self.brand, agent.driver);
+        set_if_changed(&self.identity, &identity_text(agent));
         set_if_changed(&self.status, &status_text(agent));
         set_if_changed(
             &self.task,
@@ -362,6 +433,9 @@ pub struct SubagentPanel {
     reported_text: gtk4::Label,
     error: gtk4::Box,
     error_text: gtk4::Label,
+    identity: gtk4::Label,
+    controls: gtk4::Box,
+    brand: gtk4::Image,
     /// One row per step (nested steps included), built once and then updated.
     rows: RefCell<HashMap<String, Row>>,
 }
@@ -380,11 +454,24 @@ impl SubagentPanel {
 
         let title = label("", &["subagent-panel-title"]);
         title.set_xalign(0.0);
+        title.set_wrap(true);
+        title.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         let status = label("", &["dim-label"]);
         status.set_xalign(0.0);
         let head = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        head.append(&title);
+        let title_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let brand = gtk4::Image::new();
+        brand.set_pixel_size(18);
+        title_line.append(&brand);
+        title_line.append(&title);
+        head.append(&title_line);
         head.append(&status);
+        let identity = label("", &["dim-label"]);
+        identity.set_wrap(true);
+        identity.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        head.append(&identity);
+        let controls = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        head.append(&controls);
         body.append(&head);
         let (asked, asked_text) = section("Asked to");
         body.append(&asked);
@@ -420,6 +507,9 @@ impl SubagentPanel {
             reported_text,
             error,
             error_text,
+            identity,
+            controls,
+            brand,
             rows: RefCell::new(HashMap::new()),
         })
     }
@@ -450,6 +540,8 @@ impl SubagentPanel {
             }
             set_if_changed(&self.title, &s.name);
             set_if_changed(&self.status, &status_text(s));
+            set_if_changed(&self.identity, &identity_text(s));
+            set_brand(&self.brand, s.driver);
         }
         let Body::Tool(tool) = &item.body else {
             return;
@@ -481,6 +573,41 @@ impl SubagentPanel {
         let error = tool.error.as_deref().unwrap_or("").trim();
         set_if_changed(&self.error_text, error);
         self.error.set_visible(!error.is_empty());
+    }
+
+    /// Adds scoped worker controls above the transcript while reusing every native card.
+    pub(super) fn add_controls(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.controls.append(widget);
+    }
+
+    pub(super) fn reset_steps(&self) {
+        self.rows.borrow_mut().clear();
+        while let Some(child) = self.steps.first_child() {
+            self.steps.remove(&child);
+        }
+    }
+
+    /// A supervised worker owns its own reducer. Its turn/model/usage state never enters the
+    /// root reducer; this panel renders its top-level rows using the identical card builder.
+    pub(super) fn refresh_scoped(
+        &self,
+        model: &Transcript,
+        summary: &SubagentSummary,
+        changed: &[String],
+    ) {
+        self.dialog.set_title(&summary.name);
+        set_if_changed(&self.title, &summary.name);
+        set_if_changed(&self.status, &status_text(summary));
+        set_if_changed(&self.identity, &identity_text(summary));
+        set_brand(&self.brand, summary.driver);
+        self.asked.set_visible(false);
+        self.reported.set_visible(false);
+        self.error.set_visible(false);
+        self.empty.set_text("No activity recorded for this run.");
+        self.empty.set_visible(model.order().is_empty());
+        for id in model.order() {
+            self.sync(model, id, &self.steps, changed);
+        }
     }
 
     /// Builds `id` under `parent` the first time it is seen, else updates it when it changed;
@@ -545,6 +672,29 @@ fn section(title: &str) -> (gtk4::Box, gtk4::Label) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn configured_and_accepted_identity_never_claim_an_effective_value() {
+        use agent_core::delegation::identity::{Provenance, ValueProvenance};
+        let mut value = ValueProvenance {
+            requested: Some("requested-model".into()),
+            effective: Some("unconfirmed-effective".into()),
+            source: Provenance::LaunchConfigured,
+        };
+        assert_eq!(
+            provenance_text(&value),
+            "requested-model (configured; effective unknown)"
+        );
+        value.source = Provenance::ProviderAccepted;
+        assert_eq!(
+            provenance_text(&value),
+            "requested-model (accepted; effective unknown)"
+        );
+        value.source = Provenance::ProviderReported;
+        assert_eq!(provenance_text(&value), "unconfirmed-effective");
+        value.source = Provenance::Unknown;
+        assert_eq!(provenance_text(&value), "unknown");
+    }
 
     pub(crate) fn worker_group_updates_without_rebuilding_its_row() {
         let button = SubagentButton::new(|_| {});
@@ -628,6 +778,8 @@ pub(crate) mod tests {
             steps: 0,
             lifecycle: None,
             activity: None,
+            driver: None,
+            delegation: None,
         }
     }
 

@@ -1,0 +1,9 @@
+{
+  "G-X3": true,
+  "overlay_start_and_fresh_resume": true,
+  "token_leak_paths": [],
+  "provider": "codex-parent",
+  "model_transport": "local fixture; no cloud inference",
+  "version": "codex-cli 0.161.0",
+  "passed": true
+}

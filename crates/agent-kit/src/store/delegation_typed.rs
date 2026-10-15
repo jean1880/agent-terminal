@@ -335,6 +335,8 @@ pub enum DispatchFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSpec {
     pub worker: WorkerId,
+    /// Canonical generation independently of `run`; 0 means unknown.
+    pub process_generation: u64,
     pub run: Option<RunId>,
     pub category: EventCategory,
     /// An attested invocation id, when the event comes from one.
@@ -901,12 +903,14 @@ impl Store {
                 }),
                 links: vec![
                     LinkSpec {
+                        process_generation: 0,
                         worker: worker.clone(),
                         run: Some(run.clone()),
                         category: EventCategory::Lifecycle,
                         invocation: None,
                     },
                     LinkSpec {
+                        process_generation: 0,
                         worker: worker_id(&principal.id)?,
                         run: None,
                         category: EventCategory::Lifecycle,
@@ -1113,6 +1117,7 @@ impl Store {
                 provider_thread: None,
                 envelope: Envelope::new(Event::Notice { text }),
                 links: vec![LinkSpec {
+                    process_generation: 0,
                     worker: worker_id(&target.id)?,
                     run,
                     category: EventCategory::Lifecycle,
@@ -1251,12 +1256,14 @@ impl Store {
         });
         let links = vec![
             LinkSpec {
+                process_generation: 0,
                 worker: worker_id(&sender.id)?,
                 run: None,
                 category: EventCategory::Message,
                 invocation: None,
             },
             LinkSpec {
+                process_generation: 0,
                 worker: worker_id(&recipient.id)?,
                 run: row.target_run_id.as_deref().map(run_id).transpose()?,
                 category: EventCategory::Message,
@@ -1964,6 +1971,7 @@ impl Store {
                 run_id: l.run.as_ref().map(ToString::to_string),
                 category: name_of(&l.category),
                 invocation_id: l.invocation.clone(),
+                process_generation: i64_of(l.process_generation),
             })?;
         }
         let now = self.now();
@@ -2031,15 +2039,16 @@ impl Store {
             for (seq, l) in links {
                 s.conn.execute(
                     "INSERT OR IGNORE INTO delegation_event_links
-                         (event_seq, worker_id, root_id, run_id, category, invocation_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         (event_seq, worker_id, root_id, run_id, category, invocation_id, process_generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         seq,
                         l.worker.as_str(),
                         root.id,
                         l.run.as_ref().map(RunId::as_str),
                         name_of(&l.category),
-                        l.invocation
+                        l.invocation,
+                        i64_of(l.process_generation)
                     ],
                 )?;
             }
@@ -3619,6 +3628,7 @@ mod tests {
                     error: None,
                 }),
                 links: vec![LinkSpec {
+                    process_generation: 0,
                     worker: child.clone(),
                     run: Some(run.clone()),
                     category: EventCategory::Result,
@@ -3659,6 +3669,58 @@ mod tests {
     }
 
     #[test]
+    fn canonical_event_generation_is_independent_of_the_linked_last_run() {
+        let f = fx();
+        let op = spawn(&f.s, &f.root.worker, "generation-scope");
+        let child = op.worker.expect("worker");
+        let run = op.run.expect("run");
+        let thread =
+            f.s.delegation_worker(child.as_str())
+                .expect("read")
+                .expect("row")
+                .backing_thread_id
+                .expect("thread");
+        let link = LinkSpec {
+            worker: child.clone(),
+            process_generation: 7,
+            run: Some(run.clone()),
+            category: EventCategory::Lifecycle,
+            invocation: None,
+        };
+        let event = PublishEvent {
+            thread: thread.clone(),
+            provider_thread: None,
+            envelope: Envelope::new(Event::Notice {
+                text: "new process, last run".into(),
+            }),
+            links: vec![link.clone()],
+            worker_states: Vec::new(),
+            run_states: Vec::new(),
+            aliases: Vec::new(),
+        };
+        let published = f.s.publish_delegation_event(&event).expect("publish");
+        let stored = f.s.delegation_event_links(published.seq).expect("links");
+        assert_eq!(stored[0].process_generation, 7);
+        assert_eq!(stored[0].run_id.as_deref(), Some(run.as_str()));
+        assert_eq!(
+            f.s.delegation_run(run.as_str())
+                .expect("run")
+                .expect("row")
+                .process_generation,
+            1
+        );
+        let seq =
+            f.s.append_event(&thread, None, &event.envelope)
+                .expect("unlinked history");
+        f.s.relink_delegation_history(&f.root.worker, &[(seq, link)], &[])
+            .expect("relink");
+        assert_eq!(
+            f.s.delegation_event_links(seq).expect("relinked")[0].process_generation,
+            7
+        );
+    }
+
+    #[test]
     fn a_completion_commits_the_run_the_event_and_the_notification_together() {
         let f = fx();
         let op = spawn(&f.s, &f.root.worker, "k1");
@@ -3687,6 +3749,7 @@ mod tests {
                         text: "finished".into(),
                     }),
                     links: vec![LinkSpec {
+                        process_generation: 0,
                         worker: child.clone(),
                         run: Some(run.clone()),
                         category: EventCategory::Result,
@@ -3725,6 +3788,7 @@ mod tests {
                 provider_thread: None,
                 envelope: Envelope::new(Event::Notice { text: "x".into() }),
                 links: vec![LinkSpec {
+                    process_generation: 0,
                     worker: child.clone(),
                     run: None,
                     category: EventCategory::Result,
@@ -3746,6 +3810,7 @@ mod tests {
             provider_thread: None,
             envelope: Envelope::new(Event::Notice { text: text.into() }),
             links: vec![LinkSpec {
+                process_generation: 0,
                 worker: worker.clone(),
                 run: None,
                 category: EventCategory::Activity,
@@ -3840,6 +3905,7 @@ mod tests {
                 &[(
                     e2.seq,
                     LinkSpec {
+                        process_generation: 0,
                         worker: child.clone(),
                         run: None,
                         category: EventCategory::Activity,
@@ -4652,6 +4718,7 @@ mod tests {
             f.s.publish_delegation_event(&child_event(&b_thread, &b.worker, "b"))
                 .expect("b event");
         let link = |run: Option<RunId>| LinkSpec {
+            process_generation: 0,
             worker: a_worker.clone(),
             run,
             category: EventCategory::Activity,
@@ -4826,6 +4893,7 @@ mod tests {
             },
         };
         let a_link = LinkSpec {
+            process_generation: 0,
             worker: a_worker.clone(),
             run: None,
             category: EventCategory::Result,
@@ -4837,6 +4905,7 @@ mod tests {
             .is_err());
         // A's own run with an event that does not name A's worker is refused too.
         let root_link = LinkSpec {
+            process_generation: 0,
             worker: f.root.worker.clone(),
             run: None,
             category: EventCategory::Result,

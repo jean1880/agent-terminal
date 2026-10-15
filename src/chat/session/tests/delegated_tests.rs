@@ -94,6 +94,13 @@ impl ChildPublish for TestPublish {
 /// Delegation hooks that stage at most one binding and record every call.
 #[derive(Default)]
 struct TestHooks {
+    hold_spawn: Rc<Cell<bool>>,
+    completed_launch_checks: Rc<Cell<usize>>,
+    refuse_spawn: Cell<bool>,
+    launch_checks: RefCell<Vec<DelegationLaunchFacts>>,
+    hold_prompt: Cell<bool>,
+    hold_after_check: Cell<Option<usize>>,
+    prompt_checks: Cell<usize>,
     staged: RefCell<Option<(u64, LaunchBinding)>>,
     asked: RefCell<Vec<(Driver, u64)>>,
     started: RefCell<Vec<(u64, Option<i32>, ExitWatch)>>,
@@ -106,6 +113,34 @@ struct TestHooks {
 }
 
 impl DelegationHooks for TestHooks {
+    fn before_spawn(
+        &self,
+        facts: DelegationLaunchFacts,
+    ) -> crate::delegation::seam::LocalFuture<Result<(), String>> {
+        self.launch_checks.borrow_mut().push(facts);
+        let hold = self.hold_spawn.clone();
+        let completed = self.completed_launch_checks.clone();
+        let refuse = self.refuse_spawn.get();
+        Box::pin(async move {
+            while hold.get() {
+                glib::timeout_future(Duration::from_millis(1)).await;
+            }
+            completed.set(completed.get() + 1);
+            if refuse {
+                Err("synthetic final launch refusal".into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn before_root_prompt(&self) -> bool {
+        self.prompt_checks.set(self.prompt_checks.get() + 1);
+        !self.hold_prompt.get()
+            && self
+                .hold_after_check
+                .get()
+                .is_none_or(|n| self.prompt_checks.get() <= n)
+    }
     fn binding(&self, driver: Driver, generation: ProcessGeneration) -> Option<LaunchBinding> {
         self.asked.borrow_mut().push((driver, generation.0));
         let staged = self.staged.borrow_mut().take();
@@ -285,6 +320,7 @@ fn codex_child(mode: Mode, gate: Rc<TestGate>, prepare: impl FnOnce(&Path)) -> C
         Err(None),
         bare_env(dir.path()),
         SessionOptions {
+            generation_base: ProcessGeneration(0),
             hooks: Some(hooks.clone()),
             child: Some(ChildPolicy {
                 gate,
@@ -327,6 +363,7 @@ fn claude_child(
         Err(None),
         LaunchEnv::default(),
         SessionOptions {
+            generation_base: ProcessGeneration(0),
             hooks: None,
             child: Some(ChildPolicy {
                 gate,
@@ -692,6 +729,250 @@ fn a_stale_plain_allow_is_denied_for_claude_and_codex() {
     });
 }
 
+/// PR44 roots may fall back hookless, but a supervised agy child must never do so: Plan
+/// without a hook can still edit files. The fresh per-start proof is mandatory in every mode.
+#[test]
+fn agy_final_launch_guard_holds_writes_and_records_only_actual_generation_facts() {
+    for outcome in [0, 1, 2] {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let home = tmp.path().join("private-home");
+            std::fs::create_dir(&home).expect("home");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, _) = make_sink();
+            let hooks = Rc::new(TestHooks::default());
+            hooks.hold_spawn.set(true);
+            let session = ChatSession::with_options(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+                SessionStore::from(store),
+                thread,
+                sink,
+                Err(None),
+                LaunchEnv {
+                    env: vec![
+                        ("HOME".into(), home.to_string_lossy().into_owned()),
+                        (
+                            "UNRELATED_SECRET".into(),
+                            "synthetic-not-in-launch-facts".into(),
+                        ),
+                    ],
+                    unset: vec!["HOME".into()],
+                },
+                SessionOptions {
+                    generation_base: ProcessGeneration(7),
+                    hooks: Some(hooks.clone()),
+                    child: None,
+                },
+            );
+            assert!(pump_until(ctx, 10, || !hooks
+                .launch_checks
+                .borrow()
+                .is_empty()));
+            let facts = hooks.launch_checks.borrow()[0].clone();
+            assert_eq!(facts.generation, ProcessGeneration(8));
+            assert_eq!(
+                facts.physical_cwd,
+                tmp.path().canonicalize().expect("physical")
+            );
+            assert_eq!(facts.effective_home.as_ref(), Some(&home));
+            assert!(!facts.hook_proven);
+            assert!(!facts.argv.is_empty());
+            assert!(session.delegation_launch_facts().is_none());
+            session.send_prompt("held during final launch check");
+            assert!(!tmp.path().join("args.log").exists());
+            if outcome == 1 {
+                session.shutdown(false);
+            } else if outcome == 2 {
+                session.rebind_stop();
+                session.rebind_start();
+                assert!(pump_until(ctx, 10, || hooks.launch_checks.borrow().len() == 2));
+                session.send_prompt("replacement prompt");
+            }
+            hooks.hold_spawn.set(false);
+            assert!(pump_until(ctx, 10, || hooks.completed_launch_checks.get() > 0));
+            if outcome == 1 {
+                assert!(!tmp.path().join("args.log").exists());
+                assert!(session.delegation_launch_facts().is_none());
+                assert_eq!(session.process_generation(), ProcessGeneration(7));
+            } else {
+                let expected = if outcome == 2 {
+                    "replacement prompt"
+                } else {
+                    "held during final launch check"
+                };
+                assert!(stdin_has(ctx, tmp.path(), expected));
+                if outcome == 2 {
+                    let stdin =
+                        std::fs::read_to_string(tmp.path().join("stdin.log")).expect("input");
+                    assert!(!stdin.contains("held during final launch check"));
+                }
+                let actual = session.delegation_launch_facts().expect("successful facts");
+                assert_eq!(actual.generation, ProcessGeneration(8));
+                assert_eq!(actual.effective_home, Some(home));
+                assert_eq!(actual.physical_cwd, facts.physical_cwd);
+                assert_eq!(
+                    hooks.asked.borrow().len(),
+                    if outcome == 2 { 2 } else { 1 },
+                    "getter must not consume another binding"
+                );
+                session.shutdown(false);
+            }
+        });
+    }
+}
+
+#[test]
+fn agy_final_launch_refusal_exposes_no_process_or_successful_facts() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &tmp.path().to_string_lossy());
+        let (sink, _) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        hooks.refuse_spawn.set(true);
+        let session = ChatSession::with_options(
+            Box::new(AgyAdapter::new("agy")),
+            scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            LaunchEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        session.send_prompt("must not escape");
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        assert!(!tmp.path().join("args.log").exists());
+        assert!(session.delegation_launch_facts().is_none());
+        assert_eq!(session.process_generation(), ProcessGeneration(0));
+    });
+}
+
+#[test]
+fn shutdown_cancels_a_pending_proof_even_if_the_process_is_already_dead() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (session, _) = claude_child(ctx, tmp.path(), Mode::Ask, TestGate::defer(false));
+        session.shutdown(false);
+        let generation = session.inner.generation.get();
+        *session.inner.starting.borrow_mut() = Some(PendingStart {
+            generation,
+            writes: vec!["must not reach a replacement process".to_owned()],
+        });
+        let process_generation = session.process_generation();
+        session.shutdown(false);
+        assert!(session.inner.starting.borrow().is_none());
+        assert!(session.inner.pre_init_prompts.borrow().is_empty());
+        session.inner.finish_proven_start(generation, Ok(()));
+        assert_eq!(session.process_generation(), process_generation);
+        assert!(session.inner.proc.borrow().is_none());
+        assert!(!session.status().alive);
+    });
+}
+
+#[test]
+fn root_prompt_gate_holds_direct_and_automatic_queued_input_without_losing_it() {
+    for late in [false, true] {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, _) = make_sink();
+            let hooks = Rc::new(TestHooks::default());
+            hooks.hold_prompt.set(!late);
+            hooks.hold_after_check.set(late.then_some(1));
+            let session = ChatSession::with_options(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+                SessionStore::from(store),
+                thread,
+                sink,
+                Err(None),
+                LaunchEnv::default(),
+                SessionOptions {
+                    generation_base: ProcessGeneration(0),
+                    hooks: Some(hooks.clone()),
+                    child: None,
+                },
+            );
+            session.send_prompt("held direct prompt");
+            session.queue_prompt("held queued prompt");
+            session.inner.dispatch_queued_prompt();
+            assert_eq!(session.inner.queued_prompts.borrow().len(), 2);
+            assert_eq!(session.inner.queued_prompts.borrow()[0].stored, late);
+            assert!(!session.inner.prompt_in_flight.get());
+            assert!(hooks.prompt_checks.get() >= 2);
+            hooks.hold_prompt.set(false);
+            hooks.hold_after_check.set(None);
+            session.inner.dispatch_queued_prompt();
+            assert!(stdin_has(ctx, tmp.path(), "held direct prompt"));
+            assert_eq!(session.inner.queued_prompts.borrow().len(), 1);
+            assert_eq!(
+                session.inner.queued_prompts.borrow()[0].text,
+                "held queued prompt"
+            );
+            session.shutdown(false);
+        });
+    }
+}
+
+#[test]
+fn an_agy_child_never_falls_back_to_a_hookless_process() {
+    for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            set_test_hook_check(std::sync::Arc::new(|_| {
+                Err("workspace hook appeared".into())
+            }));
+            let handle = ApprovalHandle::bind(
+                &tmp.path().join("rt"),
+                "child",
+                tmp.path(),
+                mode,
+                Duration::from_secs(5),
+            )
+            .expect("socket");
+            let mut open = fake_agy(tmp.path());
+            open.mode = mode;
+            let session = ChatSession::with_options(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                SessionStore::from(store),
+                thread,
+                sink,
+                Ok(handle),
+                LaunchEnv::default(),
+                SessionOptions {
+                    generation_base: ProcessGeneration(0),
+                    hooks: Some(Rc::new(TestHooks::default())),
+                    child: Some(ChildPolicy {
+                        gate: TestGate::defer(false),
+                        publish: Rc::new(TestPublish::default()),
+                        mode,
+                    }),
+                },
+            );
+            assert!(pump_until(ctx, 10, || !session.status().alive));
+            assert_eq!(session.process_generation(), ProcessGeneration(0));
+            assert!(!tmp.path().join("args.log").exists());
+            assert!(has(
+                &seen,
+                |event| matches!(event, Event::Error {message} if message.contains("not started"))
+            ));
+            session.shutdown(false);
+        });
+    }
+}
+
 /// §5.2 step 3, Claude: a Plan child's edit, command and unknown tool are denied before any
 /// card or rule; a read passes to the existing policy.
 #[test]
@@ -1006,7 +1287,7 @@ fn the_staged_binding_is_used_once_and_inherited_credentials_are_stripped() {
         let (sink, _seen) = make_sink();
         let hooks = Rc::new(TestHooks::default());
         *hooks.staged.borrow_mut() = Some((
-            1,
+            8,
             LaunchBinding {
                 open: None,
                 env: vec![("AGENT_TERMINAL_DELEGATION_ENDPOINT".into(), "/run/x".into())],
@@ -1023,6 +1304,7 @@ fn the_staged_binding_is_used_once_and_inherited_credentials_are_stripped() {
             Err(None),
             LaunchEnv::default(),
             SessionOptions {
+                generation_base: ProcessGeneration(7),
                 hooks: Some(hooks.clone()),
                 child: None,
             },
@@ -1031,12 +1313,13 @@ fn the_staged_binding_is_used_once_and_inherited_credentials_are_stripped() {
             std::fs::read_to_string(tmp.path().join("args.log")).is_ok_and(|a| !a.is_empty())
         }));
         let args = std::fs::read_to_string(tmp.path().join("args.log")).expect("args");
+        assert_eq!(session.process_generation(), ProcessGeneration(8));
         assert!(args.contains("--replay-user-messages"));
         assert!(
             args.trim_end().ends_with("--mcp-config /run/overlay.json"),
             "{args}"
         );
-        // Generation 2 had nothing staged: no binding, and every inherited name is removed.
+        // A reopened principal starts above its persisted floor; generation 9 has no binding.
         let spec = session.launch_spec();
         assert!(!spec.argv.iter().any(|a| a == "--mcp-config"));
         assert!(!spec
@@ -1049,7 +1332,7 @@ fn the_staged_binding_is_used_once_and_inherited_credentials_are_stripped() {
         assert_eq!(session.inner.open.borrow().delegation, None);
         assert_eq!(
             *hooks.asked.borrow(),
-            vec![(Driver::Claude, 1), (Driver::Claude, 2)]
+            vec![(Driver::Claude, 8), (Driver::Claude, 9)]
         );
         session.shutdown(false);
     });

@@ -15,6 +15,8 @@ use crate::availability::AgentAvailability;
 use crate::config::Profile;
 use crate::model_catalog::ModelCatalog;
 
+mod delegation;
+
 /// The default-mode dropdown, by index both ways.
 const MODES: [(Mode, &str); 3] = [
     (Mode::Ask, "Ask before edits"),
@@ -413,7 +415,7 @@ impl AgentTerminalWindow {
 
     /// Applies `edit` to `driver`'s profile (created when missing) and schedules the save.
     fn edit_agent_profile(&self, driver: Driver, edit: impl FnOnce(&mut Profile)) {
-        {
+        let profile_id = {
             let mut config = self.config.borrow_mut();
             let index = match config.agent_profile_index(driver) {
                 Some(i) => i,
@@ -424,11 +426,15 @@ impl AgentTerminalWindow {
                     config.profiles.len() - 1
                 }
             };
-            if let Some(profile) = config.profiles.get_mut(index) {
+            config.profiles.get_mut(index).map(|profile| {
                 edit(profile);
-            }
-        }
+                profile.id.clone()
+            })
+        };
         self.schedule_config_save();
+        if let Some((supervisor, profile_id)) = crate::delegation::supervisor().zip(profile_id) {
+            supervisor.config_changed(&profile_id);
+        }
     }
 
     /// After the user picks `mode` in a thread's header: unless it already is `driver`'s default
@@ -494,6 +500,7 @@ impl AgentTerminalWindow {
             .build();
         general.add(&self.default_agent_row());
         page.add(&general);
+        page.add(&self.delegation_group(dialog));
 
         page.add(&self.permissions_group());
 
@@ -1398,6 +1405,21 @@ impl AgentTerminalWindow {
             .build();
         group.add(&self.agent_enabled_row(driver, dialog.upcast_ref()));
         group.add(&self.agent_account_row(driver, dialog.upcast_ref()));
+        let delegation = adw::SwitchRow::builder()
+            .title("Available for delegation")
+            .subtitle("Allow this agent to delegate and receive work in Agent Terminal. Verified routes only; writing agents use isolated worktrees.")
+            .active(profile.available_for_delegation)
+            .build();
+        let obj = self.obj();
+        delegation.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                obj.imp()
+                    .edit_agent_profile(driver, |p| p.available_for_delegation = row.is_active());
+            }
+        ));
+        group.add(&delegation);
         self.add_agent_detail_rows(&group, driver, &profile, dialog);
         group
     }

@@ -31,13 +31,12 @@ pub const CODEX_TOOL_TIMEOUT_SEC: u64 = 60;
 pub const CODEX_BUILTIN_SERVERS: &[&str] = &["codex_apps"];
 
 /// Claude child `--tools` for `plan`.
-pub const CLAUDE_CHILD_TOOLS_PLAN: &[&str] = &["Read", "Glob", "Grep", "TodoWrite"];
+pub const CLAUDE_CHILD_TOOLS_PLAN: &[&str] = &["Read", "Glob", "Grep"];
 /// Claude child `--tools` for `ask` and `accept_edits` (G-C1 decides `Bash`).
 pub const CLAUDE_CHILD_TOOLS_WRITE: &[&str] = &[
     "Read",
     "Glob",
     "Grep",
-    "TodoWrite",
     "Edit",
     "Write",
     "NotebookEdit",
@@ -299,7 +298,7 @@ mod tests {
         assert!(plan.contains(&"--restricted".to_owned()));
         assert!(plan.contains(&"--strict-mcp-config".to_owned()));
         let tools = plan.last().cloned().unwrap_or_default();
-        assert_eq!(tools, "Read,Glob,Grep,TodoWrite");
+        assert_eq!(tools, "Read,Glob,Grep");
         for forbidden in ["Edit", "Write", "Bash"] {
             assert!(!tools.split(',').any(|t| t == forbidden));
         }

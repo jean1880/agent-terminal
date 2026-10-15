@@ -1,0 +1,63 @@
+{
+  "evidence_kind": "codex-parent-resume",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "dir": "stdin",
+      "frame": {
+        "method": "thread/resume",
+        "params": {
+          "config": {
+            "features.multi_agent": false,
+            "features.multi_agent_v2": false,
+            "mcp_servers.ambient.enabled": false,
+            "mcp_servers.codex_apps.enabled": false
+          }
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {
+          "name": "agent_terminal",
+          "status": "starting"
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "result": {
+          "approvalPolicy": "never",
+          "sandbox": {
+            "networkAccess": false,
+            "type": "readOnly"
+          },
+          "thread": {
+            "id": "proof-id-5"
+          }
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {
+          "name": "agent_terminal",
+          "status": "ready"
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "completed": true,
+        "method": "turn/completed"
+      }
+    }
+  ],
+  "provider": "codex"
+}

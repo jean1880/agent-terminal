@@ -1,0 +1,127 @@
+{
+  "evidence_kind": "agy",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "at": 48.656204,
+      "dir": "stdout",
+      "frame": {
+        "conversation_id": "proof-id-6",
+        "event": "step_update",
+        "step_update": {
+          "state": "ACTIVE",
+          "step_index": 2,
+          "tool_info": {
+            "parameters": {
+              "Arguments": {
+                "message": "OK"
+              },
+              "ServerName": "agent_terminal",
+              "ToolName": "echo"
+            }
+          },
+          "tool_name": "call_mcp_tool"
+        }
+      }
+    },
+    {
+      "at": 48.706428,
+      "dir": "stdout",
+      "frame": {
+        "conversation_id": "proof-id-6",
+        "event": "step_update",
+        "step_update": {
+          "state": "DONE",
+          "step_index": 2,
+          "tool_info": {
+            "parameters": {
+              "Arguments": {
+                "message": "OK"
+              },
+              "ServerName": "agent_terminal",
+              "ToolName": "echo"
+            }
+          },
+          "tool_name": "call_mcp_tool"
+        }
+      }
+    },
+    {
+      "at": 51.523737,
+      "dir": "stdout",
+      "frame": {
+        "conversation_id": "proof-id-6",
+        "event": "step_update",
+        "step_update": {
+          "state": "ACTIVE",
+          "step_index": 4,
+          "tool_info": {
+            "parameters": {
+              "Arguments": {
+                "message": "OK"
+              },
+              "ServerName": "other",
+              "ToolName": "echo"
+            }
+          },
+          "tool_name": "call_mcp_tool"
+        }
+      }
+    },
+    {
+      "at": 51.57414,
+      "dir": "stdout",
+      "frame": {
+        "conversation_id": "proof-id-6",
+        "event": "step_update",
+        "step_update": {
+          "state": "ERROR",
+          "step_index": 4,
+          "tool_info": {
+            "parameters": {
+              "Arguments": {
+                "message": "OK"
+              },
+              "ServerName": "other",
+              "ToolName": "echo"
+            }
+          },
+          "tool_name": "call_mcp_tool"
+        }
+      }
+    },
+    {
+      "at": 56.001561,
+      "dir": "stdout",
+      "frame": {
+        "conversation_id": "proof-id-6",
+        "event": "step_update",
+        "step_update": {
+          "state": "ACTIVE",
+          "step_index": 6,
+          "tool_info": {
+            "parameters": {}
+          },
+          "tool_name": "invoke_subagent"
+        }
+      }
+    },
+    {
+      "at": 56.051919,
+      "dir": "stdout",
+      "frame": {
+        "conversation_id": "proof-id-6",
+        "event": "step_update",
+        "step_update": {
+          "state": "ERROR",
+          "step_index": 6,
+          "tool_info": {
+            "parameters": {}
+          },
+          "tool_name": "invoke_subagent"
+        }
+      }
+    }
+  ],
+  "provider": "agy"
+}

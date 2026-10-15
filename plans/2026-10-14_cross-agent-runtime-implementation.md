@@ -1,6 +1,8 @@
 # Cross-agent runtime — detailed implementation plan
 
-Status: reviewed and ready for P0 discovery; no implementation started.
+Status: implemented on `feat/cross-agent-runtime`; see `docs/qa/cross-agent-runtime.md`, PR checks and the adjacent progress log for
+verified commits, provider evidence and remaining gates. The original discovery sequence below is
+historical; P0 is closed by the amendments and frozen contract.
 
 Date: 2026-10-14. Baseline: `79304abb`, agent-terminal 3.5.0, store schema 3.
 

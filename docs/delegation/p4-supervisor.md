@@ -2,6 +2,12 @@
 
 Status: revision 3, 2026-10-15.
 
+Implementation clarification, 2026-10-15: a deliberate same-authority credential rotation
+revokes the old token and approvals without a duplicate synthetic `GenerationExited` epoch
+bump. Observed exit still releases process slots and old overlays. Real Stop, Close,
+restriction, configuration changes and unexpected exits retain their authority fences and
+override a pending rotation. See the implementation amendments in `contract-v1.md`.
+
 Revision 3 has three changes:
 - §1.1 and §1.2 are now the compiled Wave 0 code, verbatim. Wave 0 is built, and the code is the source of truth.
 - Codex Ask children use a child-specific `workspaceWrite` mapping (§10.1).

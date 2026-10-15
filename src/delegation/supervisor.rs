@@ -1,103 +1,2740 @@
-//! Lane A: the supervisor (§1.3, §2, §5.4). Wave 0 stub: every entry point fails closed.
-
-use std::rc::{Rc, Weak};
-
-use agent_core::adapter::Driver;
-use agent_core::delegation::authority::RevocationEvent;
-use agent_core::delegation::route::{RouteQuery, RouteSpec};
-use agent_core::delegation::{admit_route, ErrorCode, Limits, ToolError, WorkerId};
-
-use super::seam::{ChildStop, DelegationHooks, WorkerSubscriber};
+//! App-owned runtime. All mutable state belongs to the main context.
+use super::ipc::IpcServer;
+use super::seam::{
+    BindingRequest, ChildStop, ConnId, DelegationHooks, PreparedBinding, Role, RuntimeDir,
+    WorkerSubscriber,
+};
 use super::services::AppServices;
+use crate::agent_proc::ExitWatch;
 use crate::chat::session::ChatSession;
 use crate::config::Profile;
+use agent_core::adapter::{Driver, Mode};
+use agent_core::delegation::authority::{revocation, RevocationEvent, TaskMode};
+use agent_core::delegation::correlation::ObservedCalls;
+use agent_core::delegation::route::{RouteQuery, RouteSpec};
+use agent_core::delegation::wire::WorkerSummary;
+use agent_core::delegation::{
+    admit_route, AuthorityEpoch, CapabilityToken, ErrorCode, InstanceNonce, Limits, OperationId,
+    ProcessGeneration, RunId, ToolError, WorkerId,
+};
+use agent_core::event::WorkerState;
+use agent_kit::store::delegation::{RootRow, WorkerRow};
+use agent_kit::store::delegation_typed::NewRoot;
+use gtk4::{gio, glib};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
+use std::time::Instant;
 
-/// Which routes may be spawned. Production uses [`P1Routes`]; tests inject their own.
 pub(crate) trait RouteTable {
     fn admit(&self, q: &RouteQuery) -> RouteSpec;
 }
 
-/// The P1 table: every route `Unverified` until P5/P8 flip it.
-pub(crate) struct P1Routes;
+/// Buffers committed live delivery while a history snapshot is read, retaining sequence
+/// numbers so events included in that snapshot are never delivered twice.
+struct ReplayGate {
+    subscriber: Weak<dyn WorkerSubscriber>,
+    buffered: RefCell<Vec<(i64, agent_core::delegation::scope::ScopedEnvelope)>>,
+    bytes: std::cell::Cell<usize>,
+    overflow: std::cell::Cell<bool>,
+}
+impl WorkerSubscriber for ReplayGate {
+    fn registry(&self, thread: &str, workers: &[WorkerSummary]) {
+        if let Some(s) = self.subscriber.upgrade() {
+            s.registry(thread, workers);
+        }
+    }
+    fn scoped(&self, env: &agent_core::delegation::scope::ScopedEnvelope) {
+        self.committed(env, i64::MAX);
+    }
+    fn committed(&self, env: &agent_core::delegation::scope::ScopedEnvelope, seq: i64) {
+        let bytes = serde_json::to_vec(&env.envelope).map_or(4 * 1024 * 1024, |v| v.len());
+        if self.buffered.borrow().len() >= 4096
+            || self.bytes.get().saturating_add(bytes) > 4 * 1024 * 1024
+        {
+            self.overflow.set(true);
+            return;
+        }
+        self.bytes.set(self.bytes.get() + bytes);
+        self.buffered.borrow_mut().push((seq, env.clone()));
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegation::seam::{CallDispatcher, PeerFacts};
+    use agent_core::delegation::ipc::{ApiRange, BridgeInfo, Hello};
+    use agent_core::delegation::wire::*;
+    use agent_core::delegation::{IdempotencyKey, ProfileId};
+    use agent_kit::store::Store;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    struct Verified;
+    impl RouteTable for Verified {
+        fn admit(&self, _: &RouteQuery) -> RouteSpec {
+            RouteSpec {
+                status: agent_core::delegation::route::RouteStatus::Verified,
+                blockers: Vec::new(),
+            }
+        }
+    }
+    fn harness() -> (tempfile::TempDir, Rc<Supervisor>, WorkerId) {
+        let dir = tempfile::tempdir().expect("private directory");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = store
+            .create_thread(&dir.path().to_string_lossy(), Some("root"))
+            .expect("thread");
+        let profile = Profile {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            command: "claude".into(),
+            available_for_delegation: true,
+            ..Default::default()
+        };
+        let profiles = vec![profile.clone()];
+        let cwd = dir.path().to_owned();
+        let services = AppServices {
+            handle: store.clone().into(),
+            store_path: None,
+            app_pid: std::process::id(),
+            bridge_command: PathBuf::from("/usr/bin/agent-terminal"),
+            profiles: Rc::new(move || profiles.clone()),
+            resolve: Rc::new(move |_| {
+                if cwd.join("unavailable").exists() {
+                    return None;
+                }
+                if cwd.join("fail-resolve-after-first").exists() {
+                    std::fs::write(cwd.join("unavailable"), "").unwrap();
+                }
+                Some(super::super::seam::ResolvedChild {
+                    program: "/usr/bin/python3".into(),
+                    extra_args: vec![
+                        "-I".into(),
+                        format!(
+                            "{}/tests/support/scripted_claude.py",
+                            env!("CARGO_MANIFEST_DIR")
+                        ),
+                        cwd.to_string_lossy().into_owned(),
+                    ],
+                    env: crate::agent_proc::AgentEnv {
+                        unset: std::env::vars_os()
+                            .map(|(k, _)| k.to_string_lossy().into_owned())
+                            .collect(),
+                        env: vec![
+                            ("HOME".into(), cwd.to_string_lossy().into_owned()),
+                            ("PATH".into(), "/usr/bin:/bin".into()),
+                        ],
+                    },
+                    default_model: Some("synthetic-model".into()),
+                    default_effort: None,
+                })
+            }),
+            make_adapter: Rc::new(|_, _| Box::new(agent_core::claude::ClaudeAdapter::new())),
+            hook_check: Rc::new(|_| Box::pin(async { Err("not agy".into()) })),
+            tab_open_in: Rc::new(|_| false),
+            report: Rc::new(|e| eprintln!("delegation test: {e}")),
+        };
+        let root = store
+            .create_delegation_root(&NewRoot {
+                thread: thread.clone(),
+                driver: Driver::Claude,
+                profile_id: ProfileId::parse("fixture").unwrap(),
+                name: "root".into(),
+                policy_json: "{}".into(),
+            })
+            .expect("root");
+        let row = store.delegation_root(&root.root).unwrap().unwrap();
+        let worker = store
+            .delegation_worker(root.worker.as_str())
+            .unwrap()
+            .unwrap();
+        let runtime_dir = RuntimeDir::from_verified(dir.path().to_owned());
+        let sup = Rc::new_cyclic(|weak| Supervisor {
+            services,
+            limits: Limits::default(),
+            routes: Rc::new(Verified),
+            state: RefCell::new(Runtime::default()),
+            ipc: RefCell::new(None),
+            rundir: runtime_dir,
+            instance: InstanceNonce::from_bytes([7; 16]),
+            salt: [8; 16],
+            weak: weak.clone(),
+        });
+        let mut rt = sup.worker_rt(worker, root.worker.clone(), dir.path().to_owned());
+        rt.mode = Mode::Ask;
+        {
+            let mut state = sup.state.borrow_mut();
+            state.roots.insert(
+                root.worker.clone(),
+                RootRt {
+                    row,
+                    revoking: false,
+                    revision: 0,
+                    closed: false,
+                    transferring: false,
+                },
+            );
+            state.threads.insert(thread, root.worker.clone());
+            state.workers.insert(root.worker.clone(), rt);
+        }
+        (dir, sup, root.worker)
+    }
+    fn spawn_request(key: &str) -> SpawnRequest {
+        SpawnRequest {
+            profile_id: ProfileId::parse("fixture").unwrap(),
+            name: "worker".into(),
+            task: "do the task".into(),
+            task_mode: TaskMode::Plan,
+            model: Some("synthetic-model".into()),
+            effort: None,
+            workspace: WorkspaceRequest::SharedReadOnly,
+            expected_authority_epoch: None,
+            idempotency_key: IdempotencyKey::parse(key).unwrap(),
+        }
+    }
+    fn in_context(f: impl std::future::Future<Output = ()>) {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| context.block_on(f))
+            .expect("main context");
+    }
+    async fn pump_until(mut check: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !check() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "condition timed out"
+            );
+            glib::timeout_future(Duration::from_millis(10)).await;
+        }
+    }
+    async fn stop(sup: &Rc<Supervisor>) {
+        let stops = sup.shutdown();
+        for stop in stops {
+            super::super::capacity::wait_exit(&stop.watch).await;
+        }
+        glib::timeout_future(Duration::from_millis(20)).await;
+    }
+    async fn connect(sup: &Rc<Supervisor>, worker: &WorkerId, conn: ConnId) {
+        let cap = CapabilityToken::from_random([conn.0 as u8; 32]);
+        let epoch = sup.epoch(worker).unwrap();
+        {
+            let mut state = sup.state.borrow_mut();
+            let w = state.workers.get_mut(worker).unwrap();
+            let generation = w.generation;
+            w.token = Some(TokenSlot {
+                epoch,
+                generation,
+                token: cap.clone(),
+                consumed_by: None,
+                live_conn: None,
+                pid: Some(std::process::id()),
+                issued: Instant::now(),
+            });
+        }
+        sup.authenticate(
+            conn,
+            Hello {
+                api: ApiRange { min: 1, max: 1 },
+                instance: sup.instance.clone(),
+                cap,
+                bridge: BridgeInfo {
+                    version: "test".into(),
+                    pid: std::process::id(),
+                },
+            },
+            PeerFacts::default(),
+        )
+        .await
+        .unwrap();
+    }
+    async fn tool(sup: &Rc<Supervisor>, conn: ConnId, id: u64, request: ToolRequest) -> Value {
+        let call = agent_core::delegation::ipc::Call {
+            id,
+            tool: request.tool(),
+            args: request.args_value(),
+            timeout_ms: 1000,
+            invocation: None,
+        };
+        match sup.call(conn, call).await {
+            agent_core::delegation::ipc::CallOutcome::Ok(v) => v,
+            agent_core::delegation::ipc::CallOutcome::Err(e) => panic!("tool failed: {e:?}"),
+        }
+    }
+    #[test]
+    fn authenticated_tools_cover_catalogue_paging_wait_mailbox_and_close() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            connect(&sup, &root, ConnId(11)).await;
+            let caps = tool(
+                &sup,
+                ConnId(11),
+                1,
+                ToolRequest::Capabilities(Default::default()),
+            )
+            .await;
+            assert_eq!(caps["profiles"][0]["available"], true);
+            let receipt = tool(
+                &sup,
+                ConnId(11),
+                2,
+                ToolRequest::Spawn(spawn_request("tools-spawn")),
+            )
+            .await;
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            let listed = tool(&sup, ConnId(11), 3, ToolRequest::List(Default::default())).await;
+            assert!(listed.to_string().contains(worker.as_str()));
+            let read = tool(
+                &sup,
+                ConnId(11),
+                4,
+                ToolRequest::Read(ReadRequest {
+                    target: Some(worker.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert!(!read["events"].as_array().unwrap().is_empty());
+            let waited = tool(
+                &sup,
+                ConnId(11),
+                5,
+                ToolRequest::Wait(WaitRequest {
+                    workers: Some(vec![worker.clone()]),
+                    timeout_ms: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert!(!waited["events"].as_array().unwrap().is_empty());
+            connect(&sup, &worker, ConnId(12)).await;
+            let report = tool(
+                &sup,
+                ConnId(12),
+                6,
+                ToolRequest::Send(SendRequest {
+                    target: Target::Parent,
+                    text: "status report".into(),
+                    kind: agent_core::delegation::mailbox::MessageKind::Report,
+                    reply_to: None,
+                    delivery: Delivery::NextTurn,
+                    expected_run_id: None,
+                    expected_authority_epoch: None,
+                    idempotency_key: IdempotencyKey::parse("child-report").unwrap(),
+                }),
+            )
+            .await;
+            let inbox = tool(&sup, ConnId(11), 7, ToolRequest::Read(Default::default())).await;
+            assert!(inbox.to_string().contains("status report"));
+            let message =
+                agent_core::delegation::MessageId::parse(report["message_id"].as_str().unwrap())
+                    .unwrap();
+            let ack = ReadRequest {
+                acknowledge: Some(vec![message]),
+                idempotency_key: Some(IdempotencyKey::parse("ack-report").unwrap()),
+                ..Default::default()
+            };
+            tool(&sup, ConnId(11), 8, ToolRequest::Read(ack)).await;
+            let cancel = tool(
+                &sup,
+                ConnId(11),
+                9,
+                ToolRequest::Cancel(CancelRequest {
+                    worker_id: worker.clone(),
+                    expected_run_id: None,
+                    expected_authority_epoch: None,
+                    idempotency_key: IdempotencyKey::parse("idle-cancel").unwrap(),
+                }),
+            )
+            .await;
+            assert_eq!(cancel["state"], "idle");
+            tool(
+                &sup,
+                ConnId(11),
+                10,
+                ToolRequest::Close(CloseRequest {
+                    worker_id: worker.clone(),
+                    expected_authority_epoch: None,
+                    idempotency_key: IdempotencyKey::parse("tools-close").unwrap(),
+                }),
+            )
+            .await;
+            pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
+            assert_eq!(sup.state.borrow().workers[&worker].row.state, "closed");
+            stop(&sup).await;
+        });
+    }
+
+    #[test]
+    fn spawn_fake_child_runs_task_records_run_and_result() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("first"))
+                .await
+                .expect("spawn");
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| {
+                let state = sup.state.borrow();
+                let w = &state.workers[&worker];
+                assert_ne!(
+                    w.row.state, "failed",
+                    "worker failed: {:?}",
+                    w.row.delegation_reason
+                );
+                w.row.state == "completed"
+            })
+            .await;
+            let frame_text = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap();
+            let input: Vec<Value> = frame_text
+                .lines()
+                .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(|v| v["dir"] == "in" && v["frame"]["type"] == "user")
+                .collect();
+            assert_eq!(input.len(), 2);
+            assert!(input[0]["frame"]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("startup check"));
+            assert!(input[1]["frame"]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("do the task"));
+            let store = sup.services.handle.reader();
+            let run = store
+                .delegation_run(receipt["run_id"].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.state, "completed");
+            assert!(
+                !sup.state.borrow().workers[&worker].generations.is_empty(),
+                "idle child keeps process capacity"
+            );
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            assert!(
+                !sup.root_busy(&thread),
+                "idle completed child must not keep root busy"
+            );
+            let replay = sup
+                .spawn_worker(&root, spawn_request("first"))
+                .await
+                .unwrap();
+            assert_eq!(receipt["worker_id"], replay["worker_id"]);
+            assert_eq!(replay["replayed"], true);
+            assert_eq!(sup.state.borrow().workers.len(), 2);
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn cancel_during_async_binding_preparation_prevents_later_process_start() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let mut spawn = Box::pin(sup.spawn_worker(&root, spawn_request("cancel-preparation")));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(spawn.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let worker = sup
+                .state
+                .borrow()
+                .workers
+                .keys()
+                .find(|id| *id != &root)
+                .unwrap()
+                .clone();
+            assert!(sup.state.borrow().workers[&worker].session.is_none());
+            sup.cancel_worker_call(
+                &root,
+                CancelRequest {
+                    worker_id: worker.clone(),
+                    expected_run_id: None,
+                    expected_authority_epoch: None,
+                    idempotency_key: IdempotencyKey::parse("cancel-reserved").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            let receipt = spawn.await.unwrap();
+            assert!(sup.state.borrow().workers[&worker].session.is_none());
+            assert!(!dir.path().join("frames.ndjson").exists());
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(receipt["run_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_some_and(|r| matches!(r.state.as_str(), "failed" | "interrupted"))
+            })
+            .await;
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn delayed_old_terminal_receipt_cannot_complete_replacement_run() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("old-terminal"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            let old = sup.scope(&worker).unwrap();
+            let replacement = RunId::from_suffix(&"b".repeat(32)).unwrap();
+            {
+                let mut state = sup.state.borrow_mut();
+                let w = state.workers.get_mut(&worker).unwrap();
+                w.run = Some(replacement.clone());
+                w.row.state = "running".into();
+            }
+            sup.on_child_envelope(
+                &worker,
+                old,
+                agent_core::event::Envelope::new(agent_core::event::Event::TurnCompleted {
+                    state: agent_core::event::TurnState::Completed,
+                    usage: None,
+                    error: None,
+                    cost_usd: None,
+                }),
+                999,
+                false,
+            );
+            assert_eq!(
+                sup.state.borrow().workers[&worker].run.as_ref(),
+                Some(&replacement)
+            );
+            assert_eq!(sup.state.borrow().workers[&worker].row.state, "running");
+            sup.state.borrow_mut().workers.get_mut(&worker).unwrap().run = None;
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn failed_fresh_environment_resolution_never_launches_ambient_process() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            std::fs::write(dir.path().join("fail-resolve-after-first"), "").unwrap();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("resolve-failure"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            assert_eq!(sup.state.borrow().workers[&worker].row.state, "failed");
+            assert!(sup.state.borrow().workers[&worker].generations.is_empty());
+            assert!(!dir.path().join("frames.ndjson").exists());
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(receipt["run_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_some_and(|r| r.state == "failed")
+            })
+            .await;
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn provider_reported_model_is_sanitised_before_registry_and_storage() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let canary = format!("sk-{}", "z".repeat(48));
+            std::fs::write(dir.path().join("reported-model"), &canary).unwrap();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("reported-model-canary"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            let row = sup
+                .services
+                .handle
+                .reader()
+                .delegation_worker(worker.as_str())
+                .unwrap()
+                .unwrap();
+            assert!(!row.identity_json.unwrap().contains(&canary));
+            {
+                let runtime = sup.state.borrow();
+                let summary = sup.summary(&worker, &runtime.workers[&worker]).unwrap();
+                assert!(!serde_json::to_string(&summary).unwrap().contains(&canary));
+            }
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn secret_model_is_rejected_before_acceptance_or_provider_launch() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let mut request = spawn_request("secret-model");
+            request.model = Some(format!("sk-{}", "a".repeat(48)));
+            assert_eq!(
+                sup.spawn_worker(&root, request).await.unwrap_err().code,
+                ErrorCode::InvalidArgument
+            );
+            assert_eq!(sup.state.borrow().workers.len(), 1);
+            assert!(!dir.path().join("frames.ndjson").exists());
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn cancel_escalates_ignored_interrupt_and_waits_for_real_exit() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            std::fs::write(dir.path().join("ignore-interrupt"), "").unwrap();
+            let mut request = spawn_request("ignore-stop");
+            request.task = "hold".into();
+            let receipt = sup.spawn_worker(&root, request).await.unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| {
+                sup.state.borrow().workers[&worker].pending.is_none()
+                    && sup.state.borrow().workers[&worker].row.state == "running"
+            })
+            .await;
+            let watch = sup.state.borrow().workers[&worker]
+                .generations
+                .values()
+                .next()
+                .unwrap()
+                .watch
+                .clone();
+            sup.cancel_worker_call(
+                &root,
+                CancelRequest {
+                    worker_id: worker.clone(),
+                    expected_run_id: None,
+                    expected_authority_epoch: None,
+                    idempotency_key: IdempotencyKey::parse("cancel-ignore").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_ne!(watch.phase(), crate::agent_proc::StopPhase::Exited);
+            pump_until(|| watch.phase() == crate::agent_proc::StopPhase::Exited).await;
+            assert!(sup.state.borrow().workers[&worker].run.is_none());
+            assert!(sup.state.borrow().workers[&worker].generations.is_empty());
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn claude_bootstrap_tool_violation_latches_and_task_is_never_sent() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            std::fs::write(dir.path().join("bootstrap-tool"), "").unwrap();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("violated"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "failed").await;
+            let text = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap();
+            assert!(!text
+                .lines()
+                .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+                .any(|v| v["dir"] == "in"
+                    && v["frame"]["type"] == "user"
+                    && v["frame"]["message"]["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("do the task"))));
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn agy_opted_out_unbound_root_can_launch_but_child_cannot() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("optout-boundary"))
+                .await
+                .unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&child].run.is_none()).await;
+            let facts = super::super::seam::DelegationLaunchFacts {
+                generation: ProcessGeneration(1),
+                argv: vec!["agy".into()],
+                physical_cwd: dir.path().to_owned(),
+                effective_home: None,
+                config_redirect_vars: vec![],
+                hook_proven: false,
+            };
+            sup.state
+                .borrow_mut()
+                .workers
+                .get_mut(&root)
+                .unwrap()
+                .driver = Driver::Agy;
+            let hooks = super::super::attest::Hooks {
+                supervisor: Rc::downgrade(&sup),
+                worker: root.clone(),
+            };
+            assert!(hooks.before_spawn(facts.clone()).await.is_err());
+            sup.state
+                .borrow_mut()
+                .workers
+                .get_mut(&root)
+                .unwrap()
+                .row
+                .profile_id = "not-opted-in".into();
+            assert!(hooks.before_spawn(facts.clone()).await.is_ok());
+            {
+                let mut state = sup.state.borrow_mut();
+                let w = state.workers.get_mut(&child).unwrap();
+                w.driver = Driver::Agy;
+                w.row.profile_id = "not-opted-in".into();
+                w.token = None;
+            }
+            let hooks = super::super::attest::Hooks {
+                supervisor: Rc::downgrade(&sup),
+                worker: child,
+            };
+            assert!(hooks.before_spawn(facts).await.is_err());
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn agy_live_checks_use_successful_actual_launch_facts_after_profile_resolution_changes() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let recovery = dir.path().join(".config/agent-terminal/delegation");
+            agent_kit::delegation_config::apply(
+                agent_kit::delegation_config::preview(
+                    dir.path(),
+                    &recovery,
+                    &sup.services.bridge_command,
+                    agent_kit::delegation_config::Action::Configure,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            let profile = (sup.services.profiles)().remove(0);
+            let resolved = (sup.services.resolve)(&profile).unwrap();
+            let hooks = sup
+                .prepare_root(&thread, &profile, Driver::Agy)
+                .await
+                .unwrap();
+            let provider = sup
+                .services
+                .handle
+                .reader()
+                .add_provider_thread(&thread, "agy", "")
+                .unwrap();
+            let open = agent_core::adapter::OpenSession {
+                program: resolved.program.clone(),
+                extra_args: resolved.extra_args,
+                cwd: dir.path().to_string_lossy().into_owned(),
+                model: None,
+                effort: None,
+                mode: Mode::Plan,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+                delegation: None,
+            };
+            let session = ChatSession::with_options(
+                Box::new(agent_core::agy::AgyAdapter::new(&resolved.program)),
+                open,
+                crate::chat::session::SessionStore {
+                    handle: sup.services.handle.clone(),
+                    provider: Some(Some(provider)),
+                },
+                thread.clone(),
+                Rc::new(|_| {}),
+                Err(None),
+                resolved.env,
+                super::super::seam::SessionOptions {
+                    generation_base: sup.root_generation_base(&thread),
+                    hooks: Some(hooks),
+                    child: None,
+                },
+            );
+            sup.attach_root_session(&thread, Rc::downgrade(&session));
+            pump_until(|| session.delegation_launch_facts().is_some()).await;
+            assert_eq!(
+                session
+                    .delegation_launch_facts()
+                    .unwrap()
+                    .effective_home
+                    .as_deref(),
+                Some(dir.path())
+            );
+            std::fs::write(dir.path().join("unavailable"), "").unwrap();
+            assert!((sup.services.resolve)(&profile).is_none());
+            sup.recheck_agy(&root).await.unwrap();
+            std::fs::create_dir(dir.path().join(".agents")).unwrap();
+            std::fs::write(dir.path().join(".agents/mcp_config.json"), "{}").unwrap();
+            assert_eq!(
+                sup.recheck_agy(&root).await.unwrap_err().code,
+                ErrorCode::WorkspaceUntrusted
+            );
+            pump_until(|| sup.state.borrow().workers[&root].generations.is_empty()).await;
+            assert!(sup.state.borrow().workers[&root].token.is_none());
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn agy_live_generation_without_successful_launch_facts_is_refused() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let state = dir.path().join(".config/agent-terminal/delegation");
+            let preview = agent_kit::delegation_config::preview(
+                dir.path(),
+                &state,
+                &sup.services.bridge_command,
+                agent_kit::delegation_config::Action::Configure,
+            )
+            .unwrap();
+            agent_kit::delegation_config::apply(preview).unwrap();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("agy-poststart-policy"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            assert_eq!(
+                sup.recheck_agy(&worker).await.unwrap_err().code,
+                ErrorCode::WorkspaceUntrusted
+            );
+            assert!(sup.state.borrow().workers[&worker].token.is_none());
+            pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
+            assert_eq!(
+                sup.state.borrow().workers[&worker].row.delegation_status,
+                "workspace_untrusted"
+            );
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn agy_hello_expiry_ignores_consumed_and_rotated_credentials() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("hello-expiry"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            let generation = sup.state.borrow().workers[&worker].generation;
+            let old = sup.state.borrow().workers[&worker]
+                .token
+                .as_ref()
+                .unwrap()
+                .token
+                .clone();
+            sup.arm_agy_hello_window(&worker, generation, old, Duration::from_millis(5));
+            {
+                let mut state = sup.state.borrow_mut();
+                let token = state
+                    .workers
+                    .get_mut(&worker)
+                    .unwrap()
+                    .token
+                    .as_mut()
+                    .unwrap();
+                token.token = CapabilityToken::from_random([99; 32]);
+                token.consumed_by = Some(1);
+            }
+            let cap = sup.state.borrow().workers[&worker]
+                .token
+                .as_ref()
+                .unwrap()
+                .token
+                .clone();
+            sup.arm_agy_hello_window(&worker, generation, cap.clone(), Duration::from_millis(5));
+            glib::timeout_future(Duration::from_millis(20)).await;
+            assert!(sup.state.borrow().workers[&worker].token.is_some());
+            sup.state
+                .borrow_mut()
+                .workers
+                .get_mut(&worker)
+                .unwrap()
+                .token
+                .as_mut()
+                .unwrap()
+                .consumed_by = None;
+            sup.arm_agy_hello_window(&worker, generation, cap, Duration::from_millis(5));
+            pump_until(|| sup.state.borrow().workers[&worker].token.is_none()).await;
+            pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
+            assert_eq!(
+                sup.state.borrow().workers[&worker].row.delegation_status,
+                "rebind_required"
+            );
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn agy_managed_registration_requires_exact_entry_and_allow_rules() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home = dir.path();
+        let command = std::path::Path::new("/usr/bin/agent-terminal");
+        let state = home.join(".config/agent-terminal/delegation");
+        assert_eq!(
+            super::super::ops::managed_registration_ready(home, command)
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceUntrusted
+        );
+        let preview = agent_kit::delegation_config::preview(
+            home,
+            &state,
+            command,
+            agent_kit::delegation_config::Action::Configure,
+        )
+        .unwrap();
+        agent_kit::delegation_config::apply(preview).unwrap();
+        super::super::ops::managed_registration_ready(home, command).unwrap();
+        let path = home.join(".gemini/config/mcp_config.json");
+        let mut configured: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        configured["mcpServers"]["agent_terminal"]["command"] =
+            serde_json::json!("/tmp/other-bridge");
+        std::fs::write(&path, serde_json::to_vec(&configured).unwrap()).unwrap();
+        assert_eq!(
+            super::super::ops::managed_registration_ready(home, command)
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceUntrusted
+        );
+    }
+    #[test]
+    fn authentication_binds_one_connection_and_rejects_stale_capabilities() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let cap = CapabilityToken::from_random([4; 32]);
+            sup.state.borrow_mut().workers.get_mut(&root).unwrap().token = Some(TokenSlot {
+                epoch: AuthorityEpoch(0),
+                generation: ProcessGeneration(1),
+                token: cap.clone(),
+                consumed_by: None,
+                live_conn: None,
+                pid: Some(std::process::id()),
+                issued: Instant::now(),
+            });
+            let hello = Hello {
+                api: ApiRange { min: 1, max: 1 },
+                instance: sup.instance.clone(),
+                cap,
+                bridge: BridgeInfo {
+                    version: "test".into(),
+                    pid: std::process::id(),
+                },
+            };
+            let welcome = sup
+                .authenticate(ConnId(1), hello.clone(), PeerFacts::default())
+                .await
+                .unwrap();
+            assert_eq!(welcome.principal.worker_id, root);
+            assert_eq!(
+                sup.authenticate(ConnId(2), hello.clone(), PeerFacts::default())
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::AuthenticationFailed
+            );
+            sup.closed(ConnId(1));
+            assert!(sup
+                .authenticate(ConnId(3), hello.clone(), PeerFacts::default())
+                .await
+                .is_ok());
+            sup.state.borrow_mut().workers.get_mut(&root).unwrap().token = None;
+            assert_eq!(
+                sup.authenticate(ConnId(4), hello, PeerFacts::default())
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::AuthenticationFailed
+            );
+        });
+    }
+    #[test]
+    fn dead_ipc_rebind_rotates_credentials_without_revoking_accepted_followup() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("rebind-initial"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            let epoch = sup.epoch(&root).unwrap();
+            let generation = sup.state.borrow().workers[&worker].generation;
+            let original = sup.state.borrow().workers[&worker]
+                .token
+                .as_ref()
+                .unwrap()
+                .token
+                .clone();
+            sup.set_status(&worker, "rebind_required", "fixture lost IPC");
+            let request = SendRequest {
+                target: Target::Worker(worker.clone()),
+                text: "after rebind".into(),
+                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                reply_to: None,
+                delivery: Delivery::NextTurn,
+                expected_run_id: None,
+                expected_authority_epoch: Some(epoch.0),
+                idempotency_key: IdempotencyKey::parse("rebind-followup").unwrap(),
+            };
+            let send = sup.send_worker(&root, request).await.unwrap();
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_message(send["message_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_some_and(|m| m.delivery_state == "provider_confirmed")
+            })
+            .await;
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            assert_eq!(sup.epoch(&root).unwrap(), epoch);
+            assert!(sup.state.borrow().workers[&worker].generation > generation);
+            assert!(!sup.state.borrow().workers[&worker]
+                .token
+                .as_ref()
+                .unwrap()
+                .token
+                .ct_eq(original.expose_secret()));
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn queued_followup_is_reserved_once_and_idempotent_retry_starts_no_second_run() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("start-followup"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
+            let request = SendRequest {
+                target: Target::Worker(worker.clone()),
+                text: "follow-up".into(),
+                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                reply_to: None,
+                delivery: Delivery::NextTurn,
+                expected_run_id: None,
+                expected_authority_epoch: None,
+                idempotency_key: IdempotencyKey::parse("followup").unwrap(),
+            };
+            let first = sup.send_worker(&root, request.clone()).await.unwrap();
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_message(first["message_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_some_and(|m| m.delivery_state == "provider_confirmed")
+            })
+            .await;
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
+            let run = sup.state.borrow().workers[&worker]
+                .last_run
+                .clone()
+                .unwrap();
+            assert_ne!(Some(run.as_str()), receipt["run_id"].as_str());
+            let replay = sup.send_worker(&root, request).await.unwrap();
+            assert_eq!(first["message_id"], replay["message_id"]);
+            assert_eq!(
+                sup.state.borrow().workers[&worker].last_run.as_ref(),
+                Some(&run)
+            );
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn root_stop_revokes_queued_delivery_and_keeps_slots_until_observed_exit() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let mut req = spawn_request("hold-start");
+            req.task = "hold".into();
+            let receipt = sup.spawn_worker(&root, req).await.unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "running").await;
+            let request = SendRequest {
+                target: Target::Worker(worker.clone()),
+                text: "MUST_NOT_RUN".into(),
+                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                reply_to: None,
+                delivery: Delivery::NextTurn,
+                expected_run_id: None,
+                expected_authority_epoch: None,
+                idempotency_key: IdempotencyKey::parse("queued-before-stop").unwrap(),
+            };
+            let send = sup.send_worker(&root, request).await.unwrap();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            sup.root_stop(&thread);
+            assert!(
+                sup.usage(&root).live_processes >= 1,
+                "synthetic stop released a process slot"
+            );
+            assert!(sup.state.borrow().workers[&worker].token.is_none());
+            pump_until(|| sup.usage(&root).live_processes == 0).await;
+            let text = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap();
+            assert!(!text.contains("MUST_NOT_RUN"));
+            let message = sup
+                .services
+                .handle
+                .reader()
+                .delegation_message(send["message_id"].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.delivery_state, "cancelled");
+        });
+    }
+    struct Reentrant {
+        sup: Weak<Supervisor>,
+        thread: String,
+        count: std::cell::Cell<usize>,
+    }
+    impl WorkerSubscriber for Reentrant {
+        fn committed(&self, env: &agent_core::delegation::scope::ScopedEnvelope, seq: i64) {
+            let sup = self.sup.upgrade().unwrap();
+            let thread = sup.state.borrow().workers[&env.scope.worker]
+                .row
+                .backing_thread_id
+                .clone()
+                .unwrap();
+            let stored = sup
+                .services
+                .handle
+                .reader()
+                .events(&thread, Some(seq - 1), 1)
+                .unwrap();
+            assert_eq!(stored[0].0, seq);
+            assert_eq!(stored[0].1, env.envelope);
+            self.scoped(env);
+        }
+        fn scoped(&self, env: &agent_core::delegation::scope::ScopedEnvelope) {
+            let sup = self.sup.upgrade().unwrap();
+            let _ = sup.scope_is_current(&env.scope);
+            let _ = sup.child_workspace(&env.scope.worker);
+            let _ = sup.root_busy(&self.thread);
+            self.count.set(self.count.get() + 1);
+        }
+        fn registry(&self, thread: &str, workers: &[WorkerSummary]) {
+            let sup = self.sup.upgrade().unwrap();
+            let _ = sup.root_busy(thread);
+            for worker in workers {
+                let _ = sup.child_workspace(&worker.worker_id);
+            }
+        }
+    }
+    #[test]
+    fn subscribers_can_reenter_runtime_during_registry_and_scoped_publication() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            let subscriber = Rc::new(Reentrant {
+                sup: Rc::downgrade(&sup),
+                thread: thread.clone(),
+                count: std::cell::Cell::new(0),
+            });
+            let erased: Rc<dyn WorkerSubscriber> = subscriber.clone();
+            sup.subscribe(&thread, Rc::downgrade(&erased));
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("reentrant"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
+            assert!(subscriber.count.get() > 2);
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn production_start_reconciles_crash_without_replaying_or_signalling_old_process() {
+        const MARKER: &str = "AGENT_TERMINAL_RESTART_FIXTURE";
+        if std::env::var_os(MARKER).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let runtime = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","delegation::supervisor::tests::production_start_reconciles_crash_without_replaying_or_signalling_old_process","--nocapture"]).env(MARKER,"1").env("XDG_RUNTIME_DIR",runtime.path()).output().unwrap();
+            assert!(
+                result.status.success(),
+                "isolated restart fixture failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        in_context(async {
+            let (dir, old, root) = harness();
+            let mut request = spawn_request("crash-persisted");
+            request.task = "hold".into();
+            let receipt = old.spawn_worker(&root, request.clone()).await.unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| old.state.borrow().workers[&worker].pending.is_none()).await;
+            let watch = old.state.borrow().workers[&worker]
+                .generations
+                .values()
+                .next()
+                .unwrap()
+                .watch
+                .clone();
+            let before = std::fs::read(dir.path().join("frames.ndjson")).unwrap();
+            let s = &old.services;
+            let services = AppServices {
+                handle: s.handle.clone(),
+                store_path: s.store_path.clone(),
+                app_pid: s.app_pid,
+                bridge_command: s.bridge_command.clone(),
+                profiles: s.profiles.clone(),
+                resolve: s.resolve.clone(),
+                make_adapter: s.make_adapter.clone(),
+                hook_check: s.hook_check.clone(),
+                tab_open_in: s.tab_open_in.clone(),
+                report: s.report.clone(),
+            };
+            let recovered = Supervisor::start(services, Limits::default(), Rc::new(Verified))
+                .await
+                .unwrap();
+            assert_eq!(
+                old.services
+                    .handle
+                    .reader()
+                    .delegation_run(receipt["run_id"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "unknown"
+            );
+            assert_ne!(
+                watch.phase(),
+                crate::agent_proc::StopPhase::Exited,
+                "startup signalled the previously recorded process"
+            );
+            let thread = old.state.borrow().roots[&root].row.root_thread_id.clone();
+            let profile = (old.services.profiles)().remove(0);
+            assert!(recovered
+                .prepare_root(&thread, &profile, Driver::Claude)
+                .await
+                .is_some());
+            assert!(recovered.state.borrow().workers[&worker].session.is_none());
+            assert!(recovered.state.borrow().workers[&worker].pending.is_none());
+            assert!(recovered.state.borrow().child_specs.contains_key(&worker));
+            assert_eq!(
+                recovered.state.borrow().child_specs[&worker]
+                    .resume
+                    .as_deref(),
+                Some("synthetic-session")
+            );
+            let replay = recovered.spawn_worker(&root, request).await.unwrap();
+            assert_eq!(replay["replayed"], true);
+            assert_eq!(replay["worker_id"], receipt["worker_id"]);
+            glib::timeout_future(Duration::from_millis(30)).await;
+            assert_eq!(
+                std::fs::read(dir.path().join("frames.ndjson")).unwrap(),
+                before
+            );
+            assert_ne!(watch.phase(), crate::agent_proc::StopPhase::Exited);
+            stop(&recovered).await;
+            stop(&old).await;
+        });
+    }
+    #[test]
+    fn stop_during_root_binding_preparation_cannot_install_late_credentials() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            let profile = (sup.services.profiles)().remove(0);
+            let mut preparing = Box::pin(sup.prepare_root(&thread, &profile, Driver::Claude));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(preparing.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            sup.root_stop(&thread);
+            assert!(preparing.await.is_none());
+            assert!(sup.state.borrow().workers[&root].staged.is_none());
+            assert!(sup.state.borrow().workers[&root].token.is_none());
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn unavailable_child_profile_stops_its_subtree_and_rejects_later_delivery() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let mut request = spawn_request("profile-stop");
+            request.task = "hold".into();
+            let receipt = sup.spawn_worker(&root, request).await.unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].pending.is_none()).await;
+            sup.state
+                .borrow_mut()
+                .workers
+                .get_mut(&worker)
+                .unwrap()
+                .row
+                .profile_id = "removed-profile".into();
+            sup.config_changed("removed-profile");
+            assert!(sup.state.borrow().workers[&worker].token.is_none());
+            pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
+            pump_until(|| !sup.state.borrow().roots[&root].revoking).await;
+            let request = SendRequest {
+                target: Target::Worker(worker.clone()),
+                text: "must not execute".into(),
+                kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                reply_to: None,
+                delivery: Delivery::NextTurn,
+                expected_run_id: None,
+                expected_authority_epoch: None,
+                idempotency_key: IdempotencyKey::parse("after-profile-removal").unwrap(),
+            };
+            assert!(sup.send_worker(&root, request).await.is_err());
+            assert_eq!(sup.state.borrow().workers[&worker].row.state, "closed");
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn publication_failure_revokes_and_stops_descendants_and_persists_failure() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let parent_receipt = sup
+                .spawn_worker(&root, spawn_request("failure-parent"))
+                .await
+                .unwrap();
+            let parent = WorkerId::parse(parent_receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&parent].run.is_none()).await;
+            let mut request = spawn_request("failure-grandchild");
+            request.task = "hold".into();
+            let receipt = sup.spawn_worker(&parent, request).await.unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&child].pending.is_none()).await;
+            sup.fail_worker(
+                &parent,
+                error(
+                    ErrorCode::PersistenceFailed,
+                    "synthetic committed-feed failure",
+                ),
+            );
+            assert!(sup.state.borrow().workers[&child].token.is_none());
+            pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_worker(parent.as_str())
+                    .unwrap()
+                    .is_some_and(|w| w.state == "failed")
+            })
+            .await;
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(receipt["run_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_some_and(|r| {
+                        matches!(r.state.as_str(), "failed" | "interrupted" | "unknown")
+                    })
+            })
+            .await;
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn root_stop_rolls_back_tentative_provider_identity_without_touching_newer_ticket() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            {
+                let mut state = sup.state.borrow_mut();
+                let w = state.workers.get_mut(&root).unwrap();
+                w.switch_revision = 8;
+                w.switch_original = Some((8, Driver::Claude, "fixture".into()));
+                w.driver = Driver::Codex;
+                w.row.driver = "codex".into();
+                w.row.profile_id = "new-profile".into();
+            }
+            sup.rollback_root_switch(&root, Some(7));
+            assert_eq!(sup.state.borrow().workers[&root].driver, Driver::Codex);
+            sup.root_stop(&thread);
+            assert_eq!(sup.state.borrow().workers[&root].driver, Driver::Claude);
+            assert_eq!(sup.state.borrow().workers[&root].row.profile_id, "fixture");
+            assert!(sup.state.borrow().workers[&root].switch_original.is_none());
+            let stored = sup
+                .services
+                .handle
+                .reader()
+                .delegation_worker(root.as_str())
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.driver, "claude");
+            assert_eq!(stored.profile_id, "fixture");
+            stop(&sup).await;
+        });
+    }
+    #[test]
+    fn unrelated_root_cannot_read_send_cancel_or_close_a_child() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let store = sup.services.handle.reader();
+            let thread = store
+                .create_thread(&dir.path().to_string_lossy(), Some("other root"))
+                .unwrap();
+            let other = store
+                .create_delegation_root(&NewRoot {
+                    thread: thread.clone(),
+                    driver: Driver::Claude,
+                    profile_id: ProfileId::parse("fixture").unwrap(),
+                    name: "other".into(),
+                    policy_json: "{}".into(),
+                })
+                .unwrap();
+            let row = store.delegation_root(&other.root).unwrap().unwrap();
+            let w = store
+                .delegation_worker(other.worker.as_str())
+                .unwrap()
+                .unwrap();
+            let rt = sup.worker_rt(w, other.worker.clone(), dir.path().to_owned());
+            {
+                let mut state = sup.state.borrow_mut();
+                state.roots.insert(
+                    other.worker.clone(),
+                    RootRt {
+                        row,
+                        revoking: false,
+                        revision: 0,
+                        closed: false,
+                        transferring: false,
+                    },
+                );
+                state.threads.insert(thread, other.worker.clone());
+                state.workers.insert(other.worker.clone(), rt);
+            }
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("isolated"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            assert!(!sup.visible(&other.worker, &worker, true));
+            let close = CloseRequest {
+                worker_id: worker,
+                expected_authority_epoch: None,
+                idempotency_key: IdempotencyKey::parse("foreign-close").unwrap(),
+            };
+            assert!(sup.close_worker_call(&other.worker, close).await.is_err());
+            stop(&sup).await;
+        });
+    }
+}
+pub(crate) struct P1Routes;
 impl RouteTable for P1Routes {
     fn admit(&self, q: &RouteQuery) -> RouteSpec {
         admit_route(q)
     }
 }
-
-/// What `SessionSlot::send_prompt` does with a root prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootTurnGate {
     Proceed,
-    /// A rebind runs first: queue the prompt; the supervisor dispatches it after `rebind_start`.
     Deferred,
 }
-
-/// The app-owned supervisor (§2).
-pub(crate) struct Supervisor {
-    services: AppServices,
-    limits: Limits,
-    routes: Rc<dyn RouteTable>,
+pub(super) struct RootRt {
+    pub row: RootRow,
+    pub revoking: bool,
+    pub revision: u64,
+    pub closed: bool,
+    pub transferring: bool,
 }
-
-fn not_built() -> ToolError {
-    ToolError::new(ErrorCode::RuntimeUnavailable, "delegation is not built yet")
+pub(super) struct GenRt {
+    pub watch: ExitWatch,
+    pub overlay: Option<PathBuf>,
+}
+pub(super) struct TokenSlot {
+    pub epoch: AuthorityEpoch,
+    pub generation: ProcessGeneration,
+    pub token: CapabilityToken,
+    pub consumed_by: Option<u32>,
+    pub live_conn: Option<ConnId>,
+    pub pid: Option<u32>,
+    pub issued: Instant,
+}
+pub(super) struct WorkerRt {
+    pub row: WorkerRow,
+    pub root: WorkerId,
+    pub driver: Driver,
+    pub mode: Mode,
+    pub generation: ProcessGeneration,
+    pub rotating_generation: Option<ProcessGeneration>,
+    pub preparing: bool,
+    pub switch_revision: u64,
+    pub switch_original: Option<(u64, Driver, String)>,
+    pub session: Option<Rc<ChatSession>>,
+    pub root_session: Weak<ChatSession>,
+    pub staged: Option<PreparedBinding>,
+    pub pending_overlay: Option<PathBuf>,
+    pub token: Option<TokenSlot>,
+    pub generations: BTreeMap<ProcessGeneration, GenRt>,
+    pub observed: ObservedCalls,
+    pub seen_calls: std::collections::VecDeque<agent_core::delegation::correlation::InvocationKey>,
+    pub run: Option<RunId>,
+    pub last_run: Option<RunId>,
+    pub pending: Option<super::seam::DelegatedInput>,
+    pub dispatching: bool,
+    pub readback: super::readback::Readback,
+    pub cwd: PathBuf,
+}
+impl WorkerRt {
+    pub fn session(&self) -> Option<Rc<ChatSession>> {
+        self.session.clone().or_else(|| self.root_session.upgrade())
+    }
+}
+#[derive(Default)]
+pub(super) struct Runtime {
+    pub roots: HashMap<WorkerId, RootRt>,
+    pub threads: HashMap<String, WorkerId>,
+    pub workers: HashMap<WorkerId, WorkerRt>,
+    pub connections: HashMap<ConnId, WorkerId>,
+    pub dispatching: HashSet<OperationId>,
+    pub waits: HashMap<(ConnId, u64), WorkerId>,
+    pub subscribers: Vec<(String, Weak<dyn WorkerSubscriber>)>,
+    pub shutting_down: bool,
+    pub deferred: HashMap<WorkerId, std::collections::VecDeque<super::deferred::Delivery>>,
+    pub controls: HashMap<String, super::deferred::Delivery>,
+    pub child_specs: HashMap<WorkerId, super::child::ChildSpec>,
+    pub preparations: HashMap<String, u64>,
+}
+pub(crate) struct Supervisor {
+    pub(super) services: AppServices,
+    pub(super) limits: Limits,
+    pub(super) routes: Rc<dyn RouteTable>,
+    pub(super) state: RefCell<Runtime>,
+    pub(super) ipc: RefCell<Option<Rc<IpcServer>>>,
+    pub(super) rundir: RuntimeDir,
+    pub(super) instance: InstanceNonce,
+    pub(super) salt: [u8; 16],
+    pub(super) weak: Weak<Supervisor>,
+}
+pub(super) fn error(code: ErrorCode, text: &str) -> ToolError {
+    ToolError::new(code, text)
+}
+pub(super) fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+pub(super) fn enum_value<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+pub(super) fn parse_enum<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned())).ok()
+}
+pub(super) fn opted_in(p: &Profile) -> bool {
+    p.available_for_delegation && !p.disabled
 }
 
 impl Supervisor {
-    pub(crate) async fn start(
-        _services: AppServices,
-        _limits: Limits,
-        _routes: Rc<dyn RouteTable>,
-    ) -> Result<Rc<Self>, String> {
-        Err("delegation is not built yet".to_owned())
+    pub(crate) fn root_transfer_stop(self: &Rc<Self>, thread: &str) -> Vec<ChildStop> {
+        let children = self.root_closing(thread);
+        let data = {
+            let mut state = self.state.borrow_mut();
+            state.threads.get(thread).cloned().and_then(|root| {
+                state.roots.get_mut(&root)?.transferring = true;
+                let session = state.workers.get(&root)?.session()?;
+                Some((root, session))
+            })
+        };
+        if let Some((root, session)) = data {
+            self.rotate_before_stop(&root, session.process_generation());
+            session.rebind_stop();
+        }
+        children
     }
-
-    /// Waits for the previous root generation's exit, then stages a binding (§2.3).
+    pub(crate) async fn root_transfer_resume(
+        self: &Rc<Self>,
+        thread: &str,
+        profile: &Profile,
+        driver: Driver,
+    ) -> bool {
+        let root = self.state.borrow().threads.get(thread).cloned();
+        let Some(root) = root else {
+            return true;
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            let Some(r) = state
+                .roots
+                .get_mut(&root)
+                .filter(|r| r.closed && r.transferring)
+            else {
+                return false;
+            };
+            r.transferring = false;
+            r.closed = false;
+        }
+        self.prepare_root_switch(thread, profile, driver).await
+    }
+    pub(crate) async fn prepare_root_switch(
+        self: &Rc<Self>,
+        thread: &str,
+        profile: &Profile,
+        driver: Driver,
+    ) -> bool {
+        let data = {
+            let state = self.state.borrow();
+            state.threads.get(thread).and_then(|id| {
+                state
+                    .workers
+                    .get(id)
+                    .and_then(|w| w.session())
+                    .map(|s| (id.clone(), s))
+            })
+        };
+        let Some((worker, session)) = data else {
+            return true;
+        };
+        self.rollback_root_switch(&worker, None);
+        let ticket = {
+            let mut state = self.state.borrow_mut();
+            let Some(w) = state.workers.get_mut(&worker) else {
+                return false;
+            };
+            w.switch_revision = w.switch_revision.wrapping_add(1);
+            w.switch_original = Some((w.switch_revision, w.driver, w.row.profile_id.clone()));
+            w.switch_revision
+        };
+        let same_policy = {
+            let state = self.state.borrow();
+            let w = &state.workers[&worker];
+            w.driver == driver && w.row.profile_id == profile.id
+        };
+        if same_policy {
+            self.rotate_before_stop(&worker, session.process_generation());
+        }
+        if let Some(watch) = session.rebind_stop() {
+            super::capacity::wait_exit(&watch).await;
+        }
+        let start = Instant::now();
+        while self
+            .state
+            .borrow()
+            .roots
+            .get(&worker)
+            .is_some_and(|r| r.revoking)
+        {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                return false;
+            }
+            glib::timeout_future(std::time::Duration::from_millis(10)).await;
+        }
+        if !self.root_session_current(&worker, &session)
+            || self.state.borrow().workers[&worker].switch_revision != ticket
+        {
+            return false;
+        }
+        let id = worker.to_string();
+        let profile_id = profile.id.clone();
+        if self
+            .services
+            .durable("change root delegation profile", move |s| {
+                s.set_delegation_worker_profile(&id, driver, &profile_id)
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if self
+            .state
+            .borrow()
+            .workers
+            .get(&worker)
+            .is_none_or(|w| w.switch_revision != ticket)
+        {
+            return false;
+        }
+        if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
+            w.driver = driver;
+            w.row.driver = enum_value(&driver);
+            w.row.profile_id = profile.id.clone();
+        }
+        if !opted_in(profile) {
+            if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
+                w.switch_original = None;
+            }
+            return true;
+        }
+        let prepared = self
+            .stage(
+                &worker,
+                ProcessGeneration(session.process_generation().0 + 1),
+                profile,
+            )
+            .await
+            .is_ok()
+            && self.root_session_current(&worker, &session)
+            && self
+                .state
+                .borrow()
+                .workers
+                .get(&worker)
+                .is_some_and(|w| w.switch_revision == ticket);
+        if prepared {
+            if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
+                w.switch_original = None;
+            }
+        } else {
+            self.rollback_root_switch(&worker, Some(ticket));
+        }
+        prepared
+    }
+    fn rollback_root_switch(&self, worker: &WorkerId, ticket: Option<u64>) {
+        let restored = {
+            let mut state = self.state.borrow_mut();
+            let Some(w) = state.workers.get_mut(worker) else {
+                return;
+            };
+            let Some((_, driver, profile)) = w
+                .switch_original
+                .clone()
+                .filter(|(pending, _, _)| ticket.is_none_or(|expected| expected == *pending))
+            else {
+                return;
+            };
+            w.switch_original = None;
+            w.driver = driver;
+            w.row.driver = enum_value(&driver);
+            w.row.profile_id = profile.clone();
+            w.row.identity_json = None;
+            let overlay = w.staged.take().and_then(|b| b.overlay);
+            (driver, profile, overlay)
+        };
+        let (driver, profile, overlay) = restored;
+        let id = worker.to_string();
+        self.services
+            .write("restore cancelled root switch", None, true, move |s| {
+                s.set_delegation_worker_profile(&id, driver, &profile)
+            });
+        if let Some(path) = overlay {
+            gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+        }
+    }
+    fn root_session_current(&self, worker: &WorkerId, session: &Rc<ChatSession>) -> bool {
+        let state = self.state.borrow();
+        !state.shutting_down
+            && state.roots.get(worker).is_some_and(|r| !r.closed)
+            && state
+                .workers
+                .get(worker)
+                .and_then(WorkerRt::session)
+                .is_some_and(|s| Rc::ptr_eq(&s, session))
+    }
+    pub(crate) fn worker_scope(
+        &self,
+        thread: &str,
+        worker: &WorkerId,
+    ) -> Option<agent_core::delegation::scope::Scope> {
+        let scope = self.scope(worker)?;
+        self.scope_belongs_to_thread(&scope, thread)
+            .then_some(scope)
+    }
+    pub(crate) fn config_changed(self: &Rc<Self>, profile: &str) {
+        let enabled = (self.services.profiles)()
+            .iter()
+            .any(|p| p.id == profile && opted_in(p));
+        if enabled {
+            return;
+        }
+        let affected = self
+            .state
+            .borrow()
+            .workers
+            .iter()
+            .filter(|(_, w)| w.row.profile_id == profile)
+            .map(|(id, w)| (id.clone(), w.root.clone(), w.row.parent_id.is_none()))
+            .collect::<Vec<_>>();
+        for (worker, root, is_root) in affected {
+            if is_root {
+                let conn = self
+                    .state
+                    .borrow_mut()
+                    .workers
+                    .get_mut(&worker)
+                    .and_then(|w| w.token.take())
+                    .and_then(|t| t.live_conn);
+                if let (Some(conn), Some(ipc)) = (conn, self.ipc.borrow().as_ref()) {
+                    ipc.revoke(
+                        conn,
+                        error(
+                            ErrorCode::ProviderUnavailable,
+                            "profile disabled for delegation",
+                        ),
+                    );
+                }
+                self.begin_revoke(&root, RevocationEvent::RootStop);
+            } else {
+                self.begin_revoke(&root, RevocationEvent::Close(worker));
+            }
+        }
+    }
+    pub(super) fn profile_available(&self, worker: &WorkerId) -> bool {
+        let profile = self
+            .state
+            .borrow()
+            .workers
+            .get(worker)
+            .map(|w| w.row.profile_id.clone());
+        profile.is_some_and(|id| {
+            (self.services.profiles)()
+                .iter()
+                .any(|p| p.id == id && opted_in(p))
+        })
+    }
+    pub(crate) fn root_generation_base(&self, thread: &str) -> ProcessGeneration {
+        let state = self.state.borrow();
+        state
+            .threads
+            .get(thread)
+            .and_then(|id| state.workers.get(id))
+            .map_or(ProcessGeneration(0), |w| w.generation)
+    }
+    pub(crate) async fn start(
+        services: AppServices,
+        limits: Limits,
+        routes: Rc<dyn RouteTable>,
+    ) -> Result<Rc<Self>, String> {
+        super::reconcile::startup(&services)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (rundir, random) = gio::spawn_blocking(|| {
+            use std::io::Read;
+            let dir = super::rundir::verified()?;
+            let mut random = [0; 32];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut random))
+                .map_err(|e| e.to_string())?;
+            super::launch::sweep_overlays(&dir, &|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .ok()
+                    .is_some_and(|p| p.file_name().is_some_and(|n| n == "agent-terminal"))
+            });
+            Ok::<_, String>((dir, random))
+        })
+        .await
+        .map_err(|_| "delegation startup worker failed".to_owned())??;
+        let mut nonce = [0; 16];
+        nonce.copy_from_slice(&random[..16]);
+        let mut salt = [0; 16];
+        salt.copy_from_slice(&random[16..]);
+        let sup = Rc::new_cyclic(|weak| Self {
+            services,
+            limits,
+            routes,
+            state: RefCell::new(Runtime::default()),
+            ipc: RefCell::new(None),
+            rundir,
+            instance: InstanceNonce::from_bytes(nonce),
+            salt,
+            weak: weak.clone(),
+        });
+        *sup.ipc.borrow_mut() = Some(IpcServer::bind(
+            &sup.rundir,
+            sup.services.app_pid,
+            limits,
+            sup.clone(),
+        )?);
+        Ok(sup)
+    }
     pub(crate) async fn prepare_root(
         self: &Rc<Self>,
-        _thread: &str,
-        _profile: &Profile,
-        _driver: Driver,
+        thread: &str,
+        profile: &Profile,
+        driver: Driver,
     ) -> Option<Rc<dyn DelegationHooks>> {
-        None
+        if !opted_in(profile) || self.state.borrow().shutting_down {
+            return None;
+        }
+        let preparation = {
+            let mut state = self.state.borrow_mut();
+            let revision = state.preparations.entry(thread.into()).or_default();
+            *revision = revision.wrapping_add(1);
+            *revision
+        };
+        loop {
+            let revoking = {
+                let state = self.state.borrow();
+                state
+                    .threads
+                    .get(thread)
+                    .and_then(|id| state.roots.get(id))
+                    .is_some_and(|root| root.revoking)
+            };
+            if !revoking {
+                break;
+            }
+            glib::timeout_future(std::time::Duration::from_millis(10)).await;
+            if !self.preparation_current(thread, preparation) {
+                return None;
+            }
+        }
+        let req = NewRoot {
+            thread: thread.to_owned(),
+            driver,
+            profile_id: agent_core::delegation::ProfileId::parse(&profile.id).ok()?,
+            name: profile.name.clone(),
+            policy_json: "{}".into(),
+        };
+        let (row, worker, cwd, children) = self
+            .services
+            .durable("prepare delegation root", move |s| {
+                let row = match s.delegation_root_of_thread(&req.thread)? {
+                    Some(r) => {
+                        let w = WorkerId::parse(&r.root_worker_id)
+                            .map_err(|e| agent_kit::store::StoreError::Failed(e.to_string()))?;
+                        s.resume_delegation_root(&w)?;
+                        s.set_delegation_worker_profile(
+                            w.as_str(),
+                            req.driver,
+                            req.profile_id.as_str(),
+                        )?;
+                        s.delegation_root(&r.id)?
+                            .ok_or(agent_kit::store::StoreError::WriterGone)?
+                    }
+                    None => {
+                        let h = s.create_delegation_root(&req)?;
+                        s.delegation_root(&h.root)?
+                            .ok_or(agent_kit::store::StoreError::WriterGone)?
+                    }
+                };
+                let worker = s
+                    .delegation_worker(&row.root_worker_id)?
+                    .ok_or(agent_kit::store::StoreError::WriterGone)?;
+                let cwd = s
+                    .thread_summary(&req.thread)?
+                    .map(|t| t.cwd)
+                    .unwrap_or_default();
+                let children = s.delegation_workers_of_root(&row.id)?;
+                Ok((row, worker, cwd, children))
+            })
+            .await
+            .ok()?;
+        if !self.preparation_current(thread, preparation) {
+            return None;
+        }
+        let id = WorkerId::parse(&worker.id).ok()?;
+        let old = self
+            .state
+            .borrow()
+            .workers
+            .get(&id)
+            .map(|w| {
+                w.generations
+                    .values()
+                    .map(|g| g.watch.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for watch in old {
+            super::capacity::wait_exit(&watch).await;
+        }
+        if !self.preparation_current(thread, preparation) {
+            return None;
+        }
+        let generation = self
+            .state
+            .borrow()
+            .workers
+            .get(&id)
+            .map_or(ProcessGeneration(1), |w| {
+                ProcessGeneration(w.generation.0 + 1)
+            });
+        {
+            let mut state = self.state.borrow_mut();
+            state.threads.insert(thread.into(), id.clone());
+            state.roots.insert(
+                id.clone(),
+                RootRt {
+                    row,
+                    revoking: false,
+                    revision: 0,
+                    closed: false,
+                    transferring: false,
+                },
+            );
+            for child in children.into_iter().filter(|c| c.parent_id.is_some()) {
+                if let Ok(cid) = WorkerId::parse(&child.id) {
+                    state
+                        .workers
+                        .entry(cid)
+                        .or_insert_with(|| self.worker_rt(child, id.clone(), PathBuf::new()));
+                }
+            }
+            if let Some(w) = state.workers.get_mut(&id) {
+                w.row = worker;
+                w.driver = driver;
+                w.cwd = PathBuf::from(cwd);
+            } else {
+                state.workers.insert(
+                    id.clone(),
+                    self.worker_rt(worker, id.clone(), PathBuf::from(cwd)),
+                );
+            }
+        }
+        self.restore_children(&id).await;
+        if !self.preparation_current(thread, preparation) {
+            return None;
+        }
+        if let Err(e) = self.stage(&id, generation, profile).await {
+            (self.services.report)(&e.to_string());
+            return None;
+        }
+        if !self.preparation_current(thread, preparation) {
+            return None;
+        }
+        Some(Rc::new(super::attest::Hooks {
+            supervisor: self.weak.clone(),
+            worker: id,
+        }))
     }
-
-    pub(crate) fn attach_root_session(&self, _thread: &str, _session: Weak<ChatSession>) {}
-
-    pub(crate) fn before_root_turn(self: &Rc<Self>, _thread: &str) -> RootTurnGate {
-        RootTurnGate::Proceed
+    fn preparation_current(&self, thread: &str, revision: u64) -> bool {
+        let state = self.state.borrow();
+        !state.shutting_down && state.preparations.get(thread) == Some(&revision)
     }
-
-    pub(crate) fn on_root_turn_end(&self, _thread: &str) {}
-
-    pub(crate) fn root_stop(self: &Rc<Self>, _thread: &str) {}
-
-    /// Root Stop for a closing root page: every unexited descendant generation (§2.3).
-    pub(crate) fn root_closing(self: &Rc<Self>, _thread: &str) -> Vec<ChildStop> {
-        Vec::new()
+    pub(super) fn worker_rt(&self, row: WorkerRow, root: WorkerId, cwd: PathBuf) -> WorkerRt {
+        let driver = parse_enum(&row.driver).unwrap_or(Driver::Claude);
+        let mode = row
+            .task_mode
+            .as_deref()
+            .and_then(parse_enum::<TaskMode>)
+            .map(TaskMode::as_mode)
+            .unwrap_or(Mode::Ask);
+        WorkerRt {
+            row,
+            root,
+            driver,
+            mode,
+            generation: ProcessGeneration(0),
+            rotating_generation: None,
+            preparing: false,
+            switch_revision: 0,
+            switch_original: None,
+            session: None,
+            root_session: Weak::new(),
+            staged: None,
+            pending_overlay: None,
+            token: None,
+            generations: BTreeMap::new(),
+            observed: ObservedCalls::new(self.salt, self.limits.observed_calls as usize),
+            seen_calls: std::collections::VecDeque::new(),
+            run: None,
+            last_run: None,
+            pending: None,
+            dispatching: false,
+            readback: super::readback::Readback::default(),
+            cwd,
+        }
     }
-
-    pub(crate) fn root_busy(&self, _thread: &str) -> bool {
-        false
+    pub(super) async fn stage(
+        self: &Rc<Self>,
+        worker: &WorkerId,
+        generation: ProcessGeneration,
+        profile: &Profile,
+    ) -> Result<(), ToolError> {
+        let epoch = self.epoch(worker)?;
+        let (driver, role, task_mode) = {
+            let state = self.state.borrow();
+            let w = state
+                .workers
+                .get(worker)
+                .ok_or_else(|| error(ErrorCode::NotFound, "unknown worker"))?;
+            (
+                w.driver,
+                if w.row.parent_id.is_none() {
+                    Role::Root
+                } else {
+                    Role::Child
+                },
+                w.row.task_mode.as_deref().and_then(parse_enum),
+            )
+        };
+        let req = BindingRequest {
+            driver,
+            role,
+            worker: worker.clone(),
+            generation,
+            task_mode,
+            app_pid: self.services.app_pid,
+            bridge_command: self.services.bridge_command.clone(),
+            endpoint: self
+                .rundir
+                .path()
+                .join(format!("delegation-{}.sock", self.services.app_pid)),
+            instance: self.instance.clone(),
+            rundir: self.rundir.clone(),
+        };
+        if !opted_in(profile) {
+            return Err(error(
+                ErrorCode::ProviderUnavailable,
+                "profile unavailable for delegation",
+            ));
+        }
+        if driver == Driver::Agy {
+            self.recheck_agy(worker).await?;
+        }
+        let old = loop {
+            let acquired = {
+                let mut state = self.state.borrow_mut();
+                let w = state.workers.get_mut(worker).ok_or_else(|| {
+                    error(ErrorCode::NotFound, "worker closed during preparation")
+                })?;
+                if w.preparing {
+                    None
+                } else {
+                    w.preparing = true;
+                    Some(w.staged.take())
+                }
+            };
+            if let Some(old) = acquired {
+                break old;
+            }
+            glib::timeout_future(std::time::Duration::from_millis(10)).await;
+            self.epoch(worker)?;
+        };
+        if let Some(path) = old.and_then(|b| b.overlay) {
+            let _ = gio::spawn_blocking(move || super::launch::unlink_overlay(&path)).await;
+        }
+        let prepared = gio::spawn_blocking(move || super::launch::prepare_binding(&req)).await;
+        if let Some(w) = self.state.borrow_mut().workers.get_mut(worker) {
+            w.preparing = false;
+        }
+        let prep = prepared
+            .map_err(|_| error(ErrorCode::InternalError, "launch preparation worker failed"))?
+            .map_err(|_| {
+                error(
+                    ErrorCode::RuntimeUnavailable,
+                    "cannot prepare delegation binding",
+                )
+            })?;
+        let valid = self.epoch(worker) == Ok(epoch) && self.profile_available(worker) && {
+            let state = self.state.borrow();
+            state.workers.get(worker).is_some_and(|w| {
+                w.row.state != "closed"
+                    && (role != Role::Root || state.roots.get(&w.root).is_some_and(|r| !r.closed))
+            })
+        };
+        if !valid {
+            if let Some(path) = prep.overlay {
+                gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+            }
+            return Err(error(
+                ErrorCode::StaleEpoch,
+                "authority changed during binding preparation",
+            ));
+        }
+        let mut state = self.state.borrow_mut();
+        let w = state
+            .workers
+            .get_mut(worker)
+            .ok_or_else(|| error(ErrorCode::NotFound, "worker closed during preparation"))?;
+        w.staged = Some(prep);
+        Ok(())
     }
-
-    pub(crate) fn subscribe(&self, _root_thread: &str, _sub: Weak<dyn WorkerSubscriber>) {}
-
-    /// A child's session, for scoped approvals only (P6).
-    pub(crate) fn child_session(&self, _worker: &WorkerId) -> Option<Rc<ChatSession>> {
-        None
+    pub(crate) fn attach_root_session(&self, thread: &str, session: Weak<ChatSession>) {
+        let mut state = self.state.borrow_mut();
+        let Some(id) = state.threads.get(thread).cloned() else {
+            return;
+        };
+        if let Some(w) = state.workers.get_mut(&id) {
+            w.root_session = session;
+            if let Some(s) = w.root_session.upgrade() {
+                w.mode = s.effective_mode().session_safe();
+            }
+        }
     }
-
-    /// Human inspector input to a child: queued, reserved and E7-checked like any delivery (§4.5).
-    pub(crate) fn submit_human(self: &Rc<Self>, _worker: &WorkerId, _text: &str) {}
-
+    pub(crate) fn before_root_turn(self: &Rc<Self>, thread: &str) -> RootTurnGate {
+        let needed = {
+            let state = self.state.borrow();
+            let Some(id) = state.threads.get(thread) else {
+                return RootTurnGate::Proceed;
+            };
+            let Some(w) = state.workers.get(id) else {
+                return RootTurnGate::Proceed;
+            };
+            if state.shutting_down || state.roots.get(id).is_some_and(|r| r.revoking) {
+                return RootTurnGate::Deferred;
+            }
+            if (w.token.is_some() && w.row.delegation_status != "rebind_required")
+                || w.staged.is_some()
+            {
+                return RootTurnGate::Proceed;
+            }
+            (id.clone(), w.row.profile_id.clone(), w.session())
+        };
+        let Some(session) = needed.2 else {
+            return RootTurnGate::Proceed;
+        };
+        let Some(profile) = (self.services.profiles)()
+            .into_iter()
+            .find(|p| p.id == needed.1 && opted_in(p))
+        else {
+            return RootTurnGate::Proceed;
+        };
+        let sup = self.clone();
+        glib::spawn_future_local(async move {
+            let next = ProcessGeneration(session.process_generation().0 + 1);
+            if let Err(e) = sup.stage(&needed.0, next, &profile).await {
+                (sup.services.report)(&e.to_string());
+                return;
+            }
+            sup.rotate_before_stop(&needed.0, session.process_generation());
+            if let Some(watch) = session.rebind_stop() {
+                super::capacity::wait_exit(&watch).await;
+            }
+            if sup.root_session_current(&needed.0, &session) && sup.epoch(&needed.0).is_ok() {
+                session.note("Delegation was rebound; previous permission cards and session grants have expired.");
+                session.rebind_start();
+            }
+        });
+        RootTurnGate::Deferred
+    }
+    pub(crate) fn on_root_turn_end(&self, thread: &str) {
+        let id = self.state.borrow().threads.get(thread).cloned();
+        if let Some(id) = id {
+            self.release_waits(&id);
+        }
+    }
+    pub(crate) fn root_stop(self: &Rc<Self>, thread: &str) {
+        {
+            let mut state = self.state.borrow_mut();
+            let revision = state.preparations.entry(thread.into()).or_default();
+            *revision = revision.wrapping_add(1);
+        }
+        let root = self.state.borrow().threads.get(thread).cloned();
+        if let Some(root) = root {
+            let session = self
+                .state
+                .borrow()
+                .workers
+                .get(&root)
+                .and_then(WorkerRt::session);
+            if let Some(session) = session {
+                session.interrupt_run();
+            }
+            self.begin_revoke(&root, RevocationEvent::RootStop);
+        }
+    }
+    pub(crate) fn root_closing(self: &Rc<Self>, thread: &str) -> Vec<ChildStop> {
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(root) = state.threads.get(thread).cloned() {
+                if let Some(r) = state.roots.get_mut(&root) {
+                    r.closed = true;
+                    r.transferring = false;
+                }
+            }
+        }
+        self.root_stop(thread);
+        let state = self.state.borrow();
+        let Some(root) = state.threads.get(thread) else {
+            return Vec::new();
+        };
+        state
+            .workers
+            .values()
+            .filter(|w| &w.root == root && w.row.parent_id.is_some())
+            .flat_map(|w| {
+                w.generations.values().map(|g| ChildStop {
+                    agent: enum_value(&w.driver),
+                    title: w.row.name.clone(),
+                    watch: g.watch.clone(),
+                })
+            })
+            .collect()
+    }
+    pub(crate) fn root_busy(&self, thread: &str) -> bool {
+        let state = self.state.borrow();
+        let Some(root) = state.threads.get(thread) else {
+            return false;
+        };
+        state.workers.values().any(|w| {
+            &w.root == root
+                && w.row.parent_id.is_some()
+                && (w.run.is_some() || w.pending.is_some() || w.preparing || w.dispatching)
+        })
+    }
+    pub(crate) fn subscribe(&self, thread: &str, sub: Weak<dyn WorkerSubscriber>) {
+        let high_water = self.services.handle.writer().map(|w| {
+            w.durable_call("capture inspector replay boundary", |s| {
+                s.delegation_event_high_water()
+            })
+        });
+        let inline_water = if high_water.is_none() {
+            self.services
+                .handle
+                .reader()
+                .delegation_event_high_water()
+                .ok()
+        } else {
+            None
+        };
+        let gate = Rc::new(ReplayGate {
+            subscriber: sub.clone(),
+            buffered: RefCell::new(Vec::new()),
+            bytes: std::cell::Cell::new(0),
+            overflow: std::cell::Cell::new(false),
+        });
+        let erased: Rc<dyn WorkerSubscriber> = gate.clone();
+        let gate_weak = Rc::downgrade(&erased);
+        self.state
+            .borrow_mut()
+            .subscribers
+            .push((thread.into(), gate_weak.clone()));
+        self.notify_registry();
+        let Some(sup) = self.weak.upgrade() else {
+            return;
+        };
+        let thread = thread.to_owned();
+        let registered_thread = thread.clone();
+        glib::spawn_future_local(async move {
+            let high_water = if let Some(receiver) = high_water {
+                gio::spawn_blocking(move || {
+                    receiver
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .ok()
+                        .and_then(Result::ok)
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                inline_water
+            };
+            let Some(high_water) = high_water else {
+                (sup.services.report)(
+                    "Cannot load worker history: replay boundary was not committed.",
+                );
+                let mut state = sup.state.borrow_mut();
+                state
+                    .subscribers
+                    .retain(|(_, weak)| !weak.ptr_eq(&gate_weak));
+                state.subscribers.push((registered_thread, sub));
+                return;
+            };
+            let history = sup
+                .services
+                .read(move |s| {
+                    let Some(root) = s.delegation_root_of_thread(&thread)? else {
+                        return Ok::<_, agent_kit::store::StoreError>(Vec::new());
+                    };
+                    let root_id = WorkerId::parse(&root.root_worker_id)
+                        .map_err(|e| agent_kit::store::StoreError::Failed(e.to_string()))?;
+                    let mut out = Vec::new();
+                    let mut bytes = 0usize;
+                    for w in s
+                        .delegation_workers_of_root(&root.id)?
+                        .into_iter()
+                        .filter(|w| w.parent_id.is_some())
+                    {
+                        let Some(thread) = w.backing_thread_id else {
+                            continue;
+                        };
+                        let Ok(worker) = WorkerId::parse(&w.id) else {
+                            continue;
+                        };
+                        let mut after = None;
+                        let mut run = None;
+                        let mut generation = ProcessGeneration(0);
+                        'pages: loop {
+                            let page = s.events(&thread, after, 256)?;
+                            if page.is_empty() {
+                                break;
+                            }
+                            for (seq, envelope) in page {
+                                if seq>high_water {break 'pages;}
+                                after = Some(seq);
+                                for link in s
+                                    .delegation_event_links(seq)?
+                                    .into_iter()
+                                    .filter(|l| l.worker_id == w.id)
+                                {
+                                    generation=ProcessGeneration(link.process_generation.max(0) as u64);
+                                    run=link.run_id.and_then(|r|RunId::parse(&r).ok());
+                                }
+                                bytes += serde_json::to_vec(&envelope)?.len();
+                                if bytes > 4 * 1024 * 1024 || out.len() >= 4096 {
+                                    out.push(agent_core::delegation::scope::ScopedEnvelope{scope:agent_core::delegation::scope::Scope{root:root_id.clone(),worker:worker.clone(),generation,run:run.clone()},envelope:agent_core::event::Envelope::new(agent_core::event::Event::Notice{text:format!("Inspector replay truncated before event {seq}; older history remains available through paginated worker read.")})});
+                                    return Ok(out);
+                                }
+                                out.push(agent_core::delegation::scope::ScopedEnvelope {
+                                    scope: agent_core::delegation::scope::Scope {
+                                        root: root_id.clone(),
+                                        worker: worker.clone(),
+                                        generation,
+                                        run: run.clone(),
+                                    },
+                                    envelope,
+                                });
+                            }
+                        }
+                    }
+                    Ok(out)
+                })
+                .await;
+            if let (Some(sub), Some(Ok(history))) = (sub.upgrade(), history) {
+                for env in history {
+                    sub.replayed(&env);
+                }
+                loop {
+                    let buffered = std::mem::take(&mut *gate.buffered.borrow_mut());
+                    gate.bytes.set(0);
+                    if buffered.is_empty() {
+                        break;
+                    }
+                    for (seq, env) in buffered {
+                        if seq > high_water {
+                            sub.committed(&env, seq);
+                        }
+                    }
+                }
+                if gate.overflow.get() {
+                    (sup.services.report)("Worker inspector live catch-up exceeded its buffer; reopen it or use paginated worker read to resynchronise.");
+                }
+                let mut state = sup.state.borrow_mut();
+                state
+                    .subscribers
+                    .retain(|(_, weak)| !weak.ptr_eq(&gate_weak));
+                state
+                    .subscribers
+                    .push((registered_thread, Rc::downgrade(&sub)));
+            } else {
+                (sup.services.report)("Cannot load worker history; live activity remains available. Reopen the inspector to retry history.");
+                let mut state = sup.state.borrow_mut();
+                state
+                    .subscribers
+                    .retain(|(_, weak)| !weak.ptr_eq(&gate_weak));
+                state.subscribers.push((registered_thread, sub));
+            }
+        });
+    }
+    pub(crate) fn child_session(&self, worker: &WorkerId) -> Option<Rc<ChatSession>> {
+        self.state.borrow().workers.get(worker)?.session.clone()
+    }
+    pub(crate) fn submit_human(self: &Rc<Self>, worker: &WorkerId, text: &str) {
+        self.queue_human(worker, text);
+    }
+    pub(super) fn begin_revoke(self: &Rc<Self>, root: &WorkerId, event: RevocationEvent) {
+        self.latch_revoke(root, &event);
+        let revision = self
+            .state
+            .borrow()
+            .roots
+            .get(root)
+            .map_or(0, |r| r.revision);
+        let sup = self.clone();
+        let root = root.clone();
+        glib::spawn_future_local(async move {
+            if let Err(e) = sup.commit_revoke(&root, event, revision).await {
+                (sup.services.report)(&e.to_string());
+            }
+        });
+    }
+    pub(super) fn latch_revoke(&self, root: &WorkerId, event: &RevocationEvent) {
+        if matches!(
+            event,
+            RevocationEvent::RootStop
+                | RevocationEvent::RootRestriction { .. }
+                | RevocationEvent::AppShutdown
+        ) {
+            self.rollback_root_switch(root, None);
+        }
+        let (sessions, conns, overlays) = {
+            let mut state = self.state.borrow_mut();
+            let tree = state
+                .workers
+                .iter()
+                .filter(|(_, w)| &w.root == root)
+                .map(|(id, w)| {
+                    (
+                        id.clone(),
+                        w.row
+                            .parent_id
+                            .as_deref()
+                            .and_then(|p| WorkerId::parse(p).ok()),
+                        w.row.task_mode.as_deref().and_then(parse_enum),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let effect = revocation(event, &tree);
+            if matches!(
+                event,
+                RevocationEvent::RootStop
+                    | RevocationEvent::RootRestriction { .. }
+                    | RevocationEvent::AppShutdown
+            ) {
+                if let Some(thread) = state.roots.get(root).map(|r| r.row.root_thread_id.clone()) {
+                    let revision = state.preparations.entry(thread).or_default();
+                    *revision = revision.wrapping_add(1);
+                }
+                if let Some(w) = state.workers.get_mut(root) {
+                    w.switch_revision = w.switch_revision.wrapping_add(1);
+                }
+            }
+            if let Some(r) = state.roots.get_mut(root) {
+                r.revoking |= effect.bump;
+                if matches!(
+                    event,
+                    RevocationEvent::RootStop | RevocationEvent::AppShutdown
+                ) {
+                    r.transferring = false;
+                }
+                if effect.bump {
+                    r.revision = r.revision.wrapping_add(1);
+                }
+            }
+            let mut sessions = Vec::new();
+            let mut conns = Vec::new();
+            let mut overlays = Vec::new();
+            if effect.bump {
+                for w in state.workers.values_mut().filter(|w| &w.root == root) {
+                    if let Some(path) = w.staged.take().and_then(|b| b.overlay) {
+                        overlays.push(path);
+                    }
+                }
+            }
+            for id in &effect.kill_tokens {
+                if let Some(w) = state.workers.get_mut(id) {
+                    if let Some(t) = w.token.take() {
+                        if let Some(c) = t.live_conn {
+                            conns.push(c);
+                        }
+                    }
+                    w.pending = None;
+                }
+            }
+            for id in &effect.stop_processes {
+                if let Some(w) = state.workers.get_mut(id) {
+                    if let Some(s) = w.session() {
+                        sessions.push(s);
+                    }
+                }
+            }
+            state.waits.retain(|_, w| !effect.kill_tokens.contains(w));
+            state
+                .deferred
+                .retain(|worker, _| !effect.kill_tokens.contains(worker));
+            state
+                .controls
+                .retain(|_, entry| !effect.kill_tokens.contains(&entry.worker));
+            (sessions, conns, overlays)
+        };
+        for path in overlays {
+            gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+        }
+        for c in conns {
+            if let Some(ipc) = self.ipc.borrow().as_ref() {
+                ipc.revoke(
+                    c,
+                    error(ErrorCode::StaleEpoch, "delegation authority revoked"),
+                );
+            }
+        }
+        for s in sessions {
+            s.expire_approvals("Delegation authority revoked");
+            s.interrupt_run();
+            s.shutdown(true);
+        }
+    }
     pub(crate) async fn revoke(
         self: &Rc<Self>,
-        _root: &WorkerId,
-        _event: RevocationEvent,
+        root: &WorkerId,
+        event: RevocationEvent,
     ) -> Result<(), ToolError> {
-        Err(not_built())
+        self.latch_revoke(root, &event);
+        let revision = self
+            .state
+            .borrow()
+            .roots
+            .get(root)
+            .map_or(0, |r| r.revision);
+        self.commit_revoke(root, event, revision).await
+    }
+    async fn commit_revoke(
+        self: &Rc<Self>,
+        root: &WorkerId,
+        event: RevocationEvent,
+        revision: u64,
+    ) -> Result<(), ToolError> {
+        let root_id = root.clone();
+        let revoked = self
+            .services
+            .durable("revoke delegation", move |s| {
+                s.revoke_delegation(&root_id, &event)
+            })
+            .await?;
+        let mut state = self.state.borrow_mut();
+        if let Some(r) = state.roots.get_mut(root) {
+            r.row.authority_epoch = revoked.authority_epoch as i64;
+            if r.revision == revision {
+                r.revoking = false;
+            }
+        }
+        for id in revoked.effect.mark_restricted {
+            if let Some(w) = state.workers.get_mut(&id) {
+                w.row.delegation_status = "restricted".into();
+            }
+        }
+        for id in revoked.closed {
+            if let Some(w) = state.workers.get_mut(&id) {
+                w.row.state = "closed".into();
+            }
+        }
+        drop(state);
+        self.notify_registry();
+        Ok(())
+    }
+    pub(super) fn epoch(&self, worker: &WorkerId) -> Result<AuthorityEpoch, ToolError> {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return Err(error(
+                ErrorCode::RuntimeUnavailable,
+                "delegation is shutting down",
+            ));
+        }
+        let w = state
+            .workers
+            .get(worker)
+            .ok_or_else(|| error(ErrorCode::NotFound, "unknown worker"))?;
+        let r = state
+            .roots
+            .get(&w.root)
+            .ok_or_else(|| error(ErrorCode::RuntimeUnavailable, "root unavailable"))?;
+        if r.revoking {
+            return Err(error(
+                ErrorCode::StaleEpoch,
+                "delegation authority is changing",
+            ));
+        }
+        Ok(AuthorityEpoch(r.row.authority_epoch.max(0) as u64))
+    }
+    pub(super) fn principal_mode(&self, worker: &WorkerId) -> Mode {
+        self.state
+            .borrow()
+            .workers
+            .get(worker)
+            .map(|w| {
+                w.session()
+                    .map_or(w.mode, |s| s.effective_mode())
+                    .session_safe()
+            })
+            .unwrap_or(Mode::Plan)
+    }
+    pub(super) fn notify_registry(&self) {
+        let work = {
+            let mut state = self.state.borrow_mut();
+            state.subscribers.retain(|(_, s)| s.strong_count() > 0);
+            state
+                .subscribers
+                .iter()
+                .filter_map(|(t, s)| Some((t.clone(), s.upgrade()?)))
+                .collect::<Vec<_>>()
+        };
+        for (thread, sub) in work {
+            sub.registry(&thread, &self.summaries(&thread));
+        }
+    }
+    pub(super) fn summaries(&self, thread: &str) -> Vec<WorkerSummary> {
+        let state = self.state.borrow();
+        let Some(root) = state.threads.get(thread) else {
+            return Vec::new();
+        };
+        state
+            .workers
+            .iter()
+            .filter(|(_, w)| &w.root == root && w.row.parent_id.is_some())
+            .filter_map(|(id, w)| self.summary(id, w))
+            .collect()
+    }
+    pub(super) fn summary(&self, id: &WorkerId, w: &WorkerRt) -> Option<WorkerSummary> {
+        use agent_core::delegation::wire::*;
+        let mut summary = WorkerSummary {
+            worker_id: id.clone(),
+            parent_id: w
+                .row
+                .parent_id
+                .as_deref()
+                .and_then(|s| WorkerId::parse(s).ok()),
+            name: w.row.name.clone(),
+            origin: parse_enum(&w.row.origin)?,
+            state: parse_enum(&w.row.state).unwrap_or(WorkerState::Unknown),
+            run_id: w.run.clone(),
+            run_state: w
+                .run
+                .as_ref()
+                .map(|_| agent_core::delegation::lifecycle::RunState::Running),
+            identity: w
+                .row
+                .identity_json
+                .as_deref()
+                .and_then(|v| serde_json::from_str(v).ok()),
+            depth: w.row.depth as u8,
+            can_spawn: w.row.depth < self.limits.max_depth as i64,
+            controls: Controls {
+                send: w.row.state != "closed",
+                this_run: agent_core::delegation::route::DelegationCaps::of(w.driver).this_run,
+                cancel: w.run.is_some(),
+                close: w.row.state != "closed",
+            },
+            task_mode: w.row.task_mode.as_deref().and_then(parse_enum),
+            workspace: serde_json::from_str(&w.row.workspace_json).unwrap_or(WorkspaceInfo {
+                kind: WorkspaceKind::SharedReadOnly,
+                path: None,
+                base_commit: None,
+            }),
+            delegation: DelegationStatus {
+                code: parse_enum(&w.row.delegation_status)
+                    .unwrap_or(DelegationStatusCode::Unavailable),
+                reason: w.row.delegation_reason.clone(),
+                paths: Vec::new(),
+            },
+            last_activity: w.row.last_activity.clone(),
+            updated_at: agent_core::quota::epoch_to_rfc3339(w.row.updated_at / 1000),
+        };
+        fit_summary(&mut summary);
+        Some(summary)
+    }
+    pub(crate) fn shutdown(self: &Rc<Self>) -> Vec<ChildStop> {
+        self.state.borrow_mut().shutting_down = true;
+        let roots = self
+            .state
+            .borrow()
+            .roots
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for root in roots {
+            self.begin_revoke(&root, RevocationEvent::AppShutdown);
+        }
+        if let Some(ipc) = self.ipc.borrow().as_ref() {
+            ipc.close_all(error(
+                ErrorCode::RuntimeUnavailable,
+                "application shutting down",
+            ));
+        }
+        self.state
+            .borrow()
+            .workers
+            .values()
+            .filter(|w| w.row.parent_id.is_some())
+            .flat_map(|w| {
+                w.generations.values().map(|g| ChildStop {
+                    agent: enum_value(&w.driver),
+                    title: w.row.name.clone(),
+                    watch: g.watch.clone(),
+                })
+            })
+            .collect()
     }
 }

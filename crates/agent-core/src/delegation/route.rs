@@ -202,14 +202,62 @@ fn child_group(d: Driver, bridge: ChildBridge) -> &'static [RouteBlocker] {
     }
 }
 
-/// The routes whose evidence bundle is recorded and reviewed. Empty in P1: every route is
-/// `Unverified`. Flipping a route is a reviewed commit that also clears its blockers.
-const VERIFIED_EVIDENCE: &[RouteQuery] = &[];
+/// Reviewed evidence for an individual gate. A passing provider proof never clears a separate
+/// application/source-review gate. See `docs/qa/delegation-route-evidence.md` and its fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateEvidence {
+    Passed,
+    PendingReview,
+    Unsupported,
+}
+
+/// This exhaustive table is the admission checkpoint: each remaining implementation gate must
+/// be reviewed explicitly rather than being cleared by an unrelated successful provider run.
+pub fn gate_evidence(gate: RouteBlocker) -> GateEvidence {
+    use GateEvidence::*;
+    use RouteBlocker::*;
+    match gate {
+        ClaudeBashUnderRestricted
+        | ClaudeTokenPersistence
+        | CodexAmbientMcp
+        | CodexTokenPersistence
+        | CodexOverlayOnResume
+        | AgyHookProofFix
+        | AgyAttestation
+        | AgyHookPayloadUnrecorded
+        | AgyTokenPersistence
+        | AgyHookProofInWorktree
+        | AgyWorkspaceMcpCheck
+        | AgyPeerAndSingleUse
+        | AgyManagedEntry
+        | AgyAllowRules
+        | AgentSyncEntry => Passed,
+        // Codex 0.161.0 starts a native worker despite both process and thread disables.
+        CodexNativeDelegation => Unsupported,
+        // Bundle admission remains route-specific; bridge-free AGY is not implemented.
+        EvidenceBundle => PendingReview,
+    }
+}
+
+fn reviewed_bundle(q: &RouteQuery) -> bool {
+    match (q.child, q.child_bridge) {
+        (Driver::Claude, _) | (Driver::Agy, ChildBridge::WithBridge) => true,
+        (Driver::Codex, _) | (Driver::Agy, ChildBridge::WithoutBridge) => false,
+    }
+}
 
 /// Contract §11 route admission: the parent group plus the child group (variant-specific for
 /// agy), mode-conditional blockers counted only for their modes, plus the evidence bundle.
 /// `child_bridge` is ignored for a non-agy child (it always has its bridge).
 pub fn admit_route(q: &RouteQuery) -> RouteSpec {
+    // This measured provider limitation is independent of the parent. Do not bury its cause
+    // beneath unrelated pending gates or suggest another parent could make this child safe.
+    if q.child == Driver::Codex {
+        return RouteSpec {
+            status: RouteStatus::Unsupported,
+            blockers: vec![RouteBlocker::CodexNativeDelegation],
+        };
+    }
     let mut blockers: Vec<RouteBlocker> = Vec::new();
     let groups = parent_group(q.parent)
         .iter()
@@ -219,7 +267,7 @@ pub fn admit_route(q: &RouteQuery) -> RouteSpec {
             BlockerScope::AllModes => true,
             BlockerScope::WriterModes => q.task_mode.writes(),
         };
-        if counts && !blockers.contains(&b) {
+        if counts && gate_evidence(b) != GateEvidence::Passed && !blockers.contains(&b) {
             blockers.push(b);
         }
     }
@@ -231,7 +279,7 @@ pub fn admit_route(q: &RouteQuery) -> RouteSpec {
         },
         ..*q
     };
-    if !VERIFIED_EVIDENCE.contains(&normalised) {
+    if !reviewed_bundle(&normalised) {
         blockers.push(RouteBlocker::EvidenceBundle);
     }
     let status = if blockers.is_empty() {
@@ -521,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn every_route_is_unverified_in_p1() {
+    fn every_route_has_the_reviewed_status_and_unique_blockers() {
         for parent in Driver::ALL {
             for child in Driver::ALL {
                 for task_mode in TaskMode::ALL {
@@ -532,8 +580,17 @@ mod tests {
                             task_mode,
                             child_bridge,
                         });
-                        assert_eq!(spec.status, RouteStatus::Unverified);
-                        assert!(spec.blockers.contains(&RouteBlocker::EvidenceBundle));
+                        if child == Driver::Codex {
+                            assert_eq!(spec.status, RouteStatus::Unsupported);
+                            assert_eq!(spec.blockers, vec![RouteBlocker::CodexNativeDelegation]);
+                        } else if child == Driver::Agy && child_bridge == ChildBridge::WithoutBridge
+                        {
+                            assert_eq!(spec.status, RouteStatus::Unverified);
+                            assert_eq!(spec.blockers, vec![RouteBlocker::EvidenceBundle]);
+                        } else {
+                            assert_eq!(spec.status, RouteStatus::Verified);
+                            assert!(spec.blockers.is_empty());
+                        }
                         let mut seen = std::collections::HashSet::new();
                         assert!(spec.blockers.iter().all(|b| seen.insert(*b)));
                     }
@@ -558,75 +615,30 @@ mod tests {
     }
 
     #[test]
-    fn blockers_follow_the_contract_groups() {
+    fn reviewed_provider_and_application_gates_do_not_admit_unimplemented_variants() {
         use RouteBlocker::*;
-        let plan = blockers(
-            Driver::Claude,
-            Driver::Claude,
-            TaskMode::Plan,
-            ChildBridge::WithBridge,
-        );
-        assert!(!plan.contains(&ClaudeBashUnderRestricted));
-        assert!(plan.contains(&ClaudeTokenPersistence));
-        for m in [TaskMode::Ask, TaskMode::AcceptEdits] {
-            assert!(
-                blockers(Driver::Claude, Driver::Claude, m, ChildBridge::WithBridge)
-                    .contains(&ClaudeBashUnderRestricted)
-            );
+        for gate in RouteBlocker::ALL {
+            let expected = match gate {
+                CodexNativeDelegation => GateEvidence::Unsupported,
+                EvidenceBundle => GateEvidence::PendingReview,
+                _ => GateEvidence::Passed,
+            };
+            assert_eq!(gate_evidence(gate), expected, "{gate:?}");
         }
-        let to_codex = blockers(
-            Driver::Claude,
-            Driver::Codex,
-            TaskMode::Plan,
-            ChildBridge::WithBridge,
-        );
-        assert!(to_codex.contains(&CodexAmbientMcp));
-        assert!(to_codex.contains(&CodexNativeDelegation));
-        assert!(to_codex.contains(&ClaudeTokenPersistence));
-        let with = blockers(
-            Driver::Claude,
-            Driver::Agy,
-            TaskMode::Plan,
-            ChildBridge::WithBridge,
-        );
-        for b in [
-            AgyAttestation,
-            AgyPeerAndSingleUse,
-            AgyWorkspaceMcpCheck,
-            AgyTokenPersistence,
-        ] {
-            assert!(with.contains(&b), "{b:?}");
-        }
-        let without = blockers(
-            Driver::Claude,
-            Driver::Agy,
-            TaskMode::Plan,
-            ChildBridge::WithoutBridge,
-        );
-        for b in [
-            AgyAttestation,
-            AgyPeerAndSingleUse,
-            AgyWorkspaceMcpCheck,
-            AgyTokenPersistence,
-        ] {
-            assert!(!without.contains(&b), "{b:?}");
-        }
-        assert!(without.contains(&AgyHookPayloadUnrecorded));
-        assert!(without.contains(&AgyHookProofInWorktree));
-        let agy_parent = blockers(
-            Driver::Agy,
-            Driver::Claude,
-            TaskMode::Plan,
-            ChildBridge::WithBridge,
-        );
-        for b in [
-            AgyManagedEntry,
-            AgyAllowRules,
-            AgentSyncEntry,
-            AgyAttestation,
-            AgyTokenPersistence,
-        ] {
-            assert!(agy_parent.contains(&b), "{b:?}");
+        for parent in Driver::ALL {
+            for mode in TaskMode::ALL {
+                for child in [Driver::Claude, Driver::Agy] {
+                    assert!(blockers(parent, child, mode, ChildBridge::WithBridge).is_empty());
+                }
+                assert_eq!(
+                    blockers(parent, Driver::Codex, mode, ChildBridge::WithBridge),
+                    vec![CodexNativeDelegation]
+                );
+                assert_eq!(
+                    blockers(parent, Driver::Agy, mode, ChildBridge::WithoutBridge),
+                    vec![EvidenceBundle]
+                );
+            }
         }
         assert_eq!(
             blocker_scope(ClaudeBashUnderRestricted),
@@ -654,7 +666,11 @@ mod tests {
         assert_eq!(choose_agy_variant(Unverified, Unverified, true), None);
         for parent in Driver::ALL {
             for m in TaskMode::ALL {
-                assert_eq!(agy_child_variant(parent, m, true), None);
+                assert_eq!(
+                    agy_child_variant(parent, m, true),
+                    Some(ChildBridge::WithBridge)
+                );
+                assert_eq!(agy_child_variant(parent, m, false), None);
             }
         }
     }

@@ -2037,6 +2037,7 @@ impl CodexAdapter {
                     );
                     return;
                 };
+                let effective_names: HashSet<String> = names.iter().cloned().collect();
                 names.extend(
                     crate::delegation::launch::CODEX_BUILTIN_SERVERS
                         .iter()
@@ -2061,14 +2062,27 @@ impl CodexAdapter {
                     self.fail_startup("Missing delegated Codex launch configuration.".into(), out);
                     return;
                 };
+                let inert_command = config.get("mcp_servers.agent_terminal.command").cloned();
                 for name in names
                     .into_iter()
                     .filter(|name| name != crate::delegation::SERVER_NAME)
                 {
                     config.insert(format!("mcp_servers.{name}.enabled"), Value::Bool(false));
+                    if !effective_names.contains(&name) {
+                        // Codex validates a transport even on a disabled entry. A built-in
+                        // absent from config gets our inert, credential-free bridge transport;
+                        // if `enabled=false` is ever ignored, read-back rejects its name.
+                        if let Some(command) = &inert_command {
+                            config.insert(format!("mcp_servers.{name}.command"), command.clone());
+                            config.insert(
+                                format!("mcp_servers.{name}.args"),
+                                json!([crate::delegation::BRIDGE_ARG]),
+                            );
+                        }
+                    }
                 }
                 config.insert("features.multi_agent".into(), Value::Bool(false));
-                config.insert("features.collab".into(), Value::Bool(false));
+                config.insert("features.multi_agent_v2".into(), Value::Bool(false));
                 if method == "thread/resume" {
                     let mut fallback = params.clone();
                     if let Some(map) = fallback.as_object_mut() {
@@ -2266,6 +2280,11 @@ impl Adapter for CodexAdapter {
         *self.session() = Some(session.clone());
         let mut argv = vec![session.program.clone()];
         argv.extend(session.extra_args.iter().cloned());
+        if self.child {
+            argv.extend(
+                ["--disable", "multi_agent", "--disable", "multi_agent_v2"].map(str::to_owned),
+            );
+        }
         argv.push("app-server".to_owned());
         argv
     }
@@ -3731,7 +3750,14 @@ mod tests {
     fn a_supervised_child_requests_its_policy_at_thread_start_and_on_every_turn() {
         let mut child = CodexAdapter::new();
         child.supervise_as_child();
-        child.argv(&session(Mode::Ask, None));
+        let argv = child.argv(&session(Mode::Ask, None));
+        assert!(argv.ends_with(&[
+            "--disable".into(),
+            "multi_agent".into(),
+            "--disable".into(),
+            "multi_agent_v2".into(),
+            "app-server".into()
+        ]));
         let lines = child.handshake();
         let start: Value = serde_json::from_str(&lines[2]).expect("thread/start");
         assert_eq!(start["params"]["approvalPolicy"], "untrusted");
@@ -3796,6 +3822,15 @@ mod tests {
             let config = &start["params"]["config"];
             assert_eq!(config["mcp_servers.ambient.enabled"], false);
             assert_eq!(config["mcp_servers.codex_apps.enabled"], false);
+            assert_eq!(
+                config["mcp_servers.codex_apps.command"],
+                "/usr/bin/agent-terminal"
+            );
+            assert_eq!(
+                config["mcp_servers.codex_apps.args"],
+                json!(["--cross-agent-mcp"])
+            );
+            assert!(config.get("mcp_servers.codex_apps.env").is_none());
             assert!(config.get("mcp_servers.agent_terminal.enabled").is_none());
             assert_eq!(
                 config["mcp_servers.agent_terminal.command"],
@@ -3806,7 +3841,7 @@ mod tests {
                 "approve"
             );
             assert_eq!(config["features.multi_agent"], false);
-            assert_eq!(config["features.collab"], false);
+            assert_eq!(config["features.multi_agent_v2"], false);
             assert_eq!(start["params"]["sandbox"], "workspace-write");
             if resume.is_some() {
                 child.feed(&json!({"id":start["id"],"error":{"message":"no rollout found for thread id saved-thread"}}).to_string());

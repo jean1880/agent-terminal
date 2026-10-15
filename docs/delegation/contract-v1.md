@@ -11,6 +11,23 @@ Changing anything here after P1 starts needs a new contract version or an explic
 Proof gates are named `G-<provider><n>` (C Claude, X Codex, A agy). A gate is a recorded P5/P8 fixture. Until it passes,
 whatever depends on it is refused (fail closed), unless the text says the gate is advisory.
 
+Implementation amendments approved by the coordinator, 2026-10-15:
+
+- Schema 5 adds each event link's process generation independently of its run. A new process's
+  bootstrap or session events must never be replayed under the previous generation. The normal
+  backup and migration transaction upgrades schema 4; historical links retain zero for unknown.
+- A deliberate credential rotation within the same provider, profile, policy and workspace
+  invalidates the old generation's token immediately and expires its approvals. It does not
+  also apply a synthetic `GenerationExited` authority-epoch bump: that would invalidate the
+  already accepted follow-up which required the rotation. Capacity and overlay removal still
+  wait for observed process exit. A real Stop, Close, restriction, configuration change or
+  unexpected exit retains its revocation and wins over a pending rotation.
+- Claude Code 2.1.300 does not expose `TodoWrite` in strict tool readback. Explicit child tool
+  lists omit that obsolete name; all remaining requested tools still require exact readback.
+- Codex 0.161.0 executes native `collaboration.spawn_agent` despite both process and thread
+  feature disables. Codex child routes are `unsupported` until a new enforcement proof passes.
+  Its parent role is independently admissible. See `docs/qa/delegation-route-evidence.md`.
+
 ## 1. Names and versions
 
 | Item | Value |
@@ -630,7 +647,7 @@ What it does reach, per provider:
 | Effort provenance | `launch_configured` forever (bogus is silently accepted); validated pre-launch against `supportedEffortLevels` | `launch_configured` → `provider_accepted` (effective null) after a `completed` turn (bogus fails the turn) | `launch_configured` forever (whether it is honoured is unverified) |
 
 Claude child `--tools` lists (constants in `agent_core::delegation::launch`):
-- `plan`: `Read,Glob,Grep,TodoWrite`.
+- `plan`: `Read,Glob,Grep`.
 - `ask` and `accept_edits`: the same plus `Edit,Write,NotebookEdit,Bash`. **Proof gate G-C1 (P5):** a Bash call under
   `--restricted` must raise `can_use_tool`. If the fixture shows otherwise, remove `Bash`; the list is a launch
   constant, not part of the wire contract.

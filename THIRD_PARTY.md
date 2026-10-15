@@ -1,5 +1,14 @@
 # Third-party notices
 
+## Model Context Protocol Rust SDK
+
+The headless `--cross-agent-mcp` mode links the official Rust MCP SDK (`rmcp` 3.5.1,
+<https://github.com/modelcontextprotocol/rust-sdk>, MIT) and Tokio (MIT). The SDK handles
+the MCP lifecycle; Agent Terminal validates delegation schemas and owns local IPC,
+permissions and process supervision. Tokio runs only in the headless bridge process.
+These crates are compiled into the existing executable; no additional runtime service
+is installed. Their licences are checked by the repository's cargo-deny policy.
+
 ## T3 Code
 
 Parts of `crates/agent-core` port logic from T3 Code (<https://github.com/pingdotgg/t3code>):

@@ -1,0 +1,61 @@
+{
+  "evidence_kind": "claude",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "dir": "stdout",
+      "frame": {
+        "subtype": "init",
+        "tools": [
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "NotebookEdit",
+          "Read",
+          "Write"
+        ],
+        "type": "system"
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "request": {
+          "input": {
+            "command": "touch proof-denied"
+          },
+          "subtype": "can_use_tool",
+          "tool_name": "Bash"
+        },
+        "type": "control_request"
+      }
+    },
+    {
+      "dir": "stdin",
+      "frame": {
+        "response": {
+          "behavior": "deny"
+        },
+        "type": "control_response"
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "response": {
+          "behavior": "deny"
+        },
+        "type": "control_response"
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "is_error": false,
+        "type": "result"
+      }
+    }
+  ],
+  "provider": "claude"
+}

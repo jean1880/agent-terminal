@@ -123,10 +123,6 @@ impl ChildAuthority {
         Self { params }
     }
 
-    pub(crate) fn params(&self) -> &AuthorityParams {
-        &self.params
-    }
-
     fn live(&self) -> LiveAuthority {
         (self.params.live)()
     }
@@ -734,6 +730,41 @@ mod tests {
         // A secret-looking file: no read rule.
         let env = f.worktree.join(".env").to_string_lossy().into_owned();
         assert!(!gate.rule_may_apply(&Action::Read { path: env }, None));
+    }
+
+    #[test]
+    fn a_child_home_inside_its_lease_keeps_dotfiles_out_of_automatic_grants() {
+        let f = Fixture::new();
+        let child_home = f.worktree.join("private-home");
+        std::fs::create_dir_all(child_home.join(".config/autostart")).expect("home");
+        std::fs::create_dir_all(child_home.join("projects")).expect("projects");
+        for driver in DRIVERS {
+            let mut gate = f.gate(driver, TaskMode::AcceptEdits);
+            gate.params.home = Some(child_home.clone());
+            for relative in [".bashrc", ".config/autostart/start.desktop"] {
+                let path = child_home.join(relative).to_string_lossy().into_owned();
+                let tool = match driver {
+                    Driver::Claude => "Write",
+                    Driver::Codex => "file_change",
+                    Driver::Agy => "write_to_file",
+                };
+                let input = match driver {
+                    Driver::Claude => json!({"file_path":path}),
+                    Driver::Codex => json!({"changes":[{"path":path}]}),
+                    Driver::Agy => json!({"TargetFile":path}),
+                };
+                assert!(
+                    is_ask_only(&gate.judge(tool, &input, None)),
+                    "{driver:?}: {relative}"
+                );
+                assert!(!gate.rule_may_apply(&Action::Edit { path }, None));
+            }
+            let ordinary = child_home
+                .join("projects/example.rs")
+                .to_string_lossy()
+                .into_owned();
+            assert!(gate.rule_may_apply(&Action::Edit { path: ordinary }, None));
+        }
     }
 
     #[test]

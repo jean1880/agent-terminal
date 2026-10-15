@@ -320,7 +320,8 @@ impl StoreWriter {
             Ok(closed) if !*closed => {
                 let pending = self.shared.pending.load(Ordering::SeqCst);
                 let bytes = self.shared.queued_bytes.load(Ordering::SeqCst);
-                let full = pending >= config.max_queued || bytes + cost > config.max_queued_bytes;
+                let full = pending >= config.max_queued
+                    || bytes.saturating_add(cost) > config.max_queued_bytes;
                 if full && force && !self.shared.over_bound.swap(true, Ordering::SeqCst) {
                     // By design: items already in flight are never cut short, so the queue
                     // grows past its bound while the writer is stalled. Said once per stall.
@@ -406,6 +407,17 @@ impl StoreWriter {
         what: &'static str,
         job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Receiver<Result<T>> {
+        self.call_result_sized(what, DEFAULT_COST, job)
+    }
+
+    /// A commit receipt with the captured payload charged to the bounded write queue.
+    /// Like `call_result`, delivery occurs only after the whole batch commits.
+    pub fn call_result_sized<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        cost: usize,
+        job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> Receiver<Result<T>> {
         let (tx, rx) = mpsc::channel();
         let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
         let fill = slot.clone();
@@ -434,7 +446,7 @@ impl StoreWriter {
                 };
                 let _ = tx.send(answer);
             })),
-            cost: DEFAULT_COST,
+            cost,
             force: false,
             caller_reports: true,
         });
@@ -458,6 +470,16 @@ impl StoreWriter {
     pub fn durable_call<T: Send + 'static>(
         &self,
         what: &'static str,
+        job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> Receiver<Result<T>> {
+        self.durable_call_sized(what, DEFAULT_COST, job)
+    }
+
+    /// A durable control receipt whose retained capture is charged to the queue byte cap.
+    pub fn durable_call_sized<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        cost: usize,
         job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Receiver<Result<T>> {
         let (tx, rx) = mpsc::channel();
@@ -490,9 +512,9 @@ impl StoreWriter {
                 };
                 let _ = tx.send(answer);
             }),
-            cost: DEFAULT_COST,
+            cost,
         };
-        if let Err(e) = self.admit(what, None, DEFAULT_COST, false, Op::Durable(write)) {
+        if let Err(e) = self.admit(what, None, cost, false, Op::Durable(write)) {
             let _ = refused_tx.send(Err(e));
         }
         rx
@@ -1458,6 +1480,43 @@ mod tests {
         let t3 = t.clone();
         let ok = writer.call_result("a good job", move |s| s.rename_thread(&t3, "ok"));
         assert!(ok.recv().expect("answered").is_ok());
+    }
+
+    #[test]
+    fn sized_receipt_refuses_oversized_capture_without_executing_it() {
+        let (_dir, path, handle) = setup_with(WriterConfig {
+            max_queued_bytes: 1024,
+            ..WriterConfig::default()
+        });
+        let writer = handle.writer().unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_ran = ran.clone();
+        let answer = writer.call_result_sized("oversized captured frame", usize::MAX, move |_| {
+            job_ran.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(answer.recv_timeout(Duration::from_secs(2)).is_err());
+        assert!(!ran.load(Ordering::SeqCst));
+        let job_ran = ran.clone();
+        let durable =
+            writer.durable_call_sized("oversized durable result", usize::MAX, move |_| {
+                job_ran.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+        assert!(matches!(
+            durable.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(StoreError::Overloaded)
+        ));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(writer.flush(Duration::from_secs(2)));
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .list_threads(true)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     /// Under a tiny bound, a stalled writer: every event of an item is stored (none refused),

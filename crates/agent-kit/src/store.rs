@@ -42,7 +42,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -2037,6 +2037,16 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
     if current < 4 && target >= 4 {
         // Strictly additive (contract §8.1): new tables, indexes and triggers on them only.
         conn.execute_batch(delegation::SCHEMA_V4)?;
+    }
+    if current < 5 && target >= 5 {
+        // Scope generation is independent of the run: bootstrap/rebind events can belong to
+        // a new generation while still referring to the last completed run. Legacy links
+        // remain explicitly unknown (0), rather than inventing their process generation.
+        conn.execute_batch(
+            "ALTER TABLE delegation_event_links ADD COLUMN process_generation INTEGER NOT NULL
+                 DEFAULT 0 CHECK (process_generation >= 0);
+             INSERT INTO schema_version (version) VALUES (5);",
+        )?;
     }
     let broken: Option<String> = conn
         .query_row(

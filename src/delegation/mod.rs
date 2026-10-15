@@ -1,10 +1,7 @@
 //! The cross-agent delegation supervisor (`docs/delegation/p4-supervisor.md`).
 //!
-//! Wave 0: the frozen seam ([`seam`]) and a fail-closed stub for every module. Lanes A–D replace
-//! bodies, never the signatures listed in the design's §1.2. Nothing here is reachable from the
-//! app until Lane E wires it, so it ships dark.
-// Wave 0 stubs are not called yet; lanes A–E fill them in.
-#![allow(dead_code)]
+//! One application-owned runtime drives authenticated tools, scoped child sessions and
+//! committed worker activity. It is shared by windows and never owned by an MCP process.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -42,13 +39,49 @@ pub(crate) fn supervisor() -> Option<Rc<Supervisor>> {
     SUPERVISOR.with(|s| s.borrow().clone())
 }
 
-/// Starts the supervisor on the main context (reconcile, sweep, bind). Wave 0: does nothing.
-pub(crate) fn start(_services: AppServices) {}
+/// Starts the supervisor on the main context (reconcile, sweep, bind).
+pub(crate) fn start(services: AppServices) {
+    STARTING.with(|s| {
+        if s.replace(true) {
+            return;
+        }
+        gtk4::glib::spawn_future_local(async move {
+            match Supervisor::start(
+                services,
+                agent_core::delegation::Limits::default(),
+                Rc::new(supervisor::P1Routes),
+            )
+            .await
+            {
+                Ok(supervisor) => SUPERVISOR.with(|s| *s.borrow_mut() = Some(supervisor)),
+                Err(e) => tracing::error!("Cannot start delegation runtime: {e}"),
+            }
+            FINISHED.with(|s| s.set(true));
+        });
+    });
+}
+
+thread_local! {
+    static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FINISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Waits for startup reconciliation and socket binding. A failed startup stays unavailable.
+pub(crate) async fn ready() -> Option<Rc<Supervisor>> {
+    while STARTING.with(|s| s.get()) && !FINISHED.with(|s| s.get()) {
+        gtk4::glib::timeout_future(std::time::Duration::from_millis(10)).await;
+    }
+    supervisor()
+}
 
 /// The AppShutdown revocation row: every supervised process still to be seen exiting.
 pub(crate) fn shutdown_all() -> Vec<seam::ChildStop> {
-    Vec::new()
+    supervisor().map(|s| s.shutdown()).unwrap_or_default()
 }
 
 /// Removes the socket and the overlays of exited generations. Idempotent.
-pub(crate) fn final_cleanup() {}
+pub(crate) fn final_cleanup() {
+    SUPERVISOR.with(|s| {
+        s.borrow_mut().take();
+    });
+}

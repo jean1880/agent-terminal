@@ -316,6 +316,12 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Sub-agents stay docked.** A card above the composer lists the sub-agents at work, and
   keeps the finished ones (with how each ended) until your next prompt or **Clear
   finished**. `Ctrl+Shift+A` opens or closes every sub-agent card in the thread.
+- **Delegate between providers.** Opt profiles in from Settings → Agents to give a
+  parent a uniform delegation API. Supervised children use the worker dock and
+  inspector, with provider/model evidence, scoped approvals, messages and diffs.
+  Writing children use isolated git worktrees. Only reviewed routes are admitted;
+  Codex 0.161.0 is available as a parent while its child role is blocked by its native
+  delegation behaviour. See the [delegation guide](docs/delegation/user-guide.md).
 - **Pending approvals stay within reach.** A panel above the composer keeps approval
   controls available while you scroll, with extra choices in a popover when the
   agent supports them. Pending questions offer a jump back to their answer card.
@@ -566,6 +572,8 @@ rebuild:
 session. Nothing it prints reaches the terminal, because output before `exec` breaks the
 CLI's terminal handshake. Settings → Agents also sets each agent's extra arguments,
 environment file, default model, mode and effort, and whether it is enabled.
+`available_for_delegation` defaults to `false`; the corresponding Settings switch
+opts a profile in as a parent and child target. Route support remains a separate check.
 
 ## agy's approval hook
 

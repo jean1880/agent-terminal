@@ -1,4 +1,4 @@
-//! Lane A: what the supervisor needs from the app (§2.1). Wave 0 stub.
+//! Narrow application services shared by the supervisor and its single store writer.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -38,31 +38,81 @@ impl AppServices {
     /// A read on its own connection, after the writer's barrier (`threads::store_job`).
     pub(crate) async fn read<T: Send + 'static>(
         &self,
-        _job: impl FnOnce(&Store) -> T + Send + 'static,
+        job: impl FnOnce(&Store) -> T + Send + 'static,
     ) -> Option<T> {
-        None
+        let Some(path) = self.store_path.clone() else {
+            return Some(job(self.handle.reader()));
+        };
+        let barrier = self.handle.writer().map(|w| w.barrier());
+        gtk4::gio::spawn_blocking(move || {
+            if let Some(barrier) = barrier {
+                if barrier
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err()
+                {
+                    return None;
+                }
+            }
+            Store::open(&path).ok().map(|s| job(&s))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// A durable control write (`StoreWriter::durable_call`). Any failure is
     /// `persistence_failed`, and the caller dispatches nothing.
     pub(crate) async fn durable<T: Send + 'static>(
         &self,
-        _what: &'static str,
-        _job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
+        what: &'static str,
+        job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
     ) -> Result<T, ToolError> {
-        Err(ToolError::new(
-            ErrorCode::PersistenceFailed,
-            "delegation is not built yet",
-        ))
+        let answer = if let Some(writer) = self.handle.writer() {
+            let receiver = writer.durable_call(what, job);
+            gtk4::gio::spawn_blocking(move || {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| agent_kit::store::StoreError::WriterGone)?
+            })
+            .await
+            .unwrap_or(Err(agent_kit::store::StoreError::WriterGone))
+        } else {
+            self.handle.reader().atomically(job)
+        };
+        answer.map_err(|e| {
+            (self.report)(&format!("Cannot save delegation control state: {e}"));
+            ToolError::new(
+                ErrorCode::PersistenceFailed,
+                "cannot commit delegation control state",
+            )
+        })
     }
 
     /// An ordinary write (`StoreWriter::write_sized`).
     pub(crate) fn write(
         &self,
-        _what: &'static str,
-        _thread: Option<&str>,
-        _force: bool,
-        _job: impl FnOnce(&Store) -> agent_kit::store::Result<()> + Send + 'static,
+        what: &'static str,
+        thread: Option<&str>,
+        force: bool,
+        job: impl FnOnce(&Store) -> agent_kit::store::Result<()> + Send + 'static,
     ) {
+        self.write_sized(what, thread, 4096, force, job);
+    }
+    pub(crate) fn write_sized(
+        &self,
+        what: &'static str,
+        thread: Option<&str>,
+        bytes: usize,
+        force: bool,
+        job: impl FnOnce(&Store) -> agent_kit::store::Result<()> + Send + 'static,
+    ) {
+        let answer = if let Some(writer) = self.handle.writer() {
+            writer.write_sized(what, thread, bytes, force, job)
+        } else {
+            self.handle.reader().atomically(job)
+        };
+        if let Err(e) = answer {
+            (self.report)(&format!("Cannot save delegation activity: {e}"));
+        }
     }
 }

@@ -46,7 +46,7 @@ use crate::agent_proc::{
 };
 use crate::approval_server::ApprovalHandle;
 use crate::delegation::seam::{
-    ChildPolicy, DelegationHooks, GateVerdict, SessionOptions, TurnBoundary,
+    ChildPolicy, DelegationHooks, DelegationLaunchFacts, GateVerdict, SessionOptions, TurnBoundary,
 };
 use agent_core::delegation::ProcessGeneration;
 
@@ -137,6 +137,22 @@ fn set_test_hook_check(check: HookCheck) {
 struct PendingStart {
     generation: u64,
     writes: Vec<String>,
+}
+
+fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
+    use agent_core::delegation::agy_guard::{CONFIG_REDIRECT_VARS, REDIRECT_VAR_PREFIX};
+    let relevant =
+        |name: &str| CONFIG_REDIRECT_VARS.contains(&name) || name.starts_with(REDIRECT_VAR_PREFIX);
+    let mut names = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .filter(|name| relevant(name) && !spec.unset.contains(name))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (name, _) in &spec.env {
+        if relevant(name) {
+            names.insert(name.clone());
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// What a refused fresh hook proof changed, to be said once its hookless process has spawned.
@@ -285,6 +301,10 @@ struct Inner {
     rules_blocked_noticed: Cell<bool>,
     /// Queued user prompts submitted while a turn is already running.
     queued_prompts: RefCell<std::collections::VecDeque<QueuedPrompt>>,
+    /// Already published input held when a startup retry waits for root rebinding. Its text
+    /// already includes any handoff, so it must not enter the ordinary prompt builder again.
+    held_retries: RefCell<std::collections::VecDeque<Sent>>,
+    launch_facts: RefCell<Option<DelegationLaunchFacts>>,
     weak_self: RefCell<Option<std::rc::Weak<Inner>>>,
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
@@ -695,6 +715,8 @@ impl ChatSession {
             ),
             rules_blocked_noticed: Cell::new(false),
             queued_prompts: RefCell::new(std::collections::VecDeque::new()),
+            held_retries: RefCell::new(std::collections::VecDeque::new()),
+            launch_facts: RefCell::new(None),
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
@@ -714,8 +736,8 @@ impl ChatSession {
             reply_turn: RefCell::default(),
             hooks: opts.hooks,
             child: opts.child,
-            process_generation: Cell::new(0),
-            stopped_generation: Cell::new(0),
+            process_generation: Cell::new(opts.generation_base.0),
+            stopped_generation: Cell::new(opts.generation_base.0),
             watches: RefCell::new(Vec::new()),
             rebinding: Cell::new(false),
             native_turn: RefCell::new(None),
@@ -810,7 +832,10 @@ impl ChatSession {
     /// synchronously (a write queued for later may not finish before the process exits). A
     /// thread that really was unread stays unread.
     pub fn shutdown(&self, keep_read: bool) {
-        if !self.inner.state.borrow().alive && self.inner.proc.borrow().is_none() {
+        if !self.inner.state.borrow().alive
+            && self.inner.proc.borrow().is_none()
+            && self.inner.starting.borrow().is_none()
+        {
             return;
         }
         self.inner.stop_current();
@@ -832,6 +857,12 @@ impl ChatSession {
             .as_ref()
             .filter(|p| p.is_alive())
             .map(AgentProcess::exit_watch)
+    }
+
+    /// Safe facts of the last successfully spawned generation; never rebuilds a launch or
+    /// consumes its staged binding. No other environment values are retained here.
+    pub(crate) fn delegation_launch_facts(&self) -> Option<DelegationLaunchFacts> {
+        self.inner.launch_facts.borrow().clone()
     }
 
     #[cfg(test)]
@@ -1314,6 +1345,14 @@ impl Inner {
         self.clear_agy_read();
         self.canary_cancelled.borrow_mut().clear();
         *self.starting.borrow_mut() = None;
+        if self.child.is_some()
+            && self.adapter.borrow().driver() == Driver::Agy
+            && self.approval().is_none()
+        {
+            self.error("A delegated Antigravity agent requires a proven approval hook; it was not started.");
+            self.finish_process(Some(1), false);
+            return;
+        }
         if self.adapter.borrow().driver() != Driver::Agy || self.approval().is_none() {
             self.spawn_generation(generation);
             return;
@@ -1360,6 +1399,11 @@ impl Inner {
         // anything is emitted, and spawned only if this start is still the session's afterwards.
         let spec = match verdict {
             Ok(()) => self.launch_spec(),
+            Err(reason) if self.child.is_some() => {
+                self.error(format!("The delegated Antigravity agent's approval hook could not be proven: {reason}. It was not started."));
+                self.finish_process(Some(1), false);
+                return;
+            }
             Err(reason) => {
                 let refused = self.refuse_unproven_hook(reason);
                 let spec = self.launch_spec();
@@ -1370,14 +1414,7 @@ impl Inner {
         if self.generation.get() != generation || self.stopping.get() {
             return;
         }
-        self.spawn_spec(generation, spec);
-        if self.generation.get() == generation && !pending.writes.is_empty() {
-            if let Some(proc) = self.proc.borrow().as_ref().filter(|p| p.is_alive()) {
-                for line in &pending.writes {
-                    proc.write_line(line);
-                }
-            }
-        }
+        self.spawn_spec_with_writes(generation, spec, pending.writes);
     }
 
     /// The hook could not be proven right before a start: agy runs without the skip flag and
@@ -1432,6 +1469,150 @@ impl Inner {
     }
 
     fn spawn_spec(self: &Rc<Self>, generation: u64, spec: SpawnSpec) {
+        self.spawn_spec_with_writes(generation, spec, Vec::new());
+    }
+
+    fn spawn_spec_with_writes(
+        self: &Rc<Self>,
+        generation: u64,
+        mut spec: SpawnSpec,
+        writes: Vec<String>,
+    ) {
+        if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
+            self.spawn_spec_now(generation, spec, None);
+            self.flush_start_writes(generation, writes);
+            return;
+        }
+        let Some(hooks) = self.hooks.clone() else {
+            return;
+        };
+        use agent_core::delegation::agy_guard::CONFIG_REDIRECT_VARS;
+        let home = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| PathBuf::from(value))
+            .or_else(|| {
+                (!spec.unset.iter().any(|name| name == "HOME"))
+                    .then(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .flatten()
+            });
+        let redirects = delegation_redirect_names(&spec);
+        // Freeze inherited safety inputs across the asynchronous guard. Redirects are never
+        // allowed by a delegated launch, so absence is fixed explicitly in the final spec.
+        match &home {
+            Some(home) => spec
+                .env
+                .push(("HOME".into(), home.to_string_lossy().into_owned())),
+            None => spec.unset.push("HOME".into()),
+        }
+        for name in CONFIG_REDIRECT_VARS {
+            if !redirects.iter().any(|n| n == name) {
+                spec.unset.push(name.into());
+            }
+        }
+        let mut facts = DelegationLaunchFacts {
+            generation: ProcessGeneration(self.process_generation.get() + 1),
+            argv: spec.argv.clone(),
+            physical_cwd: PathBuf::new(),
+            effective_home: home,
+            config_redirect_vars: redirects,
+            hook_proven: self.approval().is_some()
+                && spec
+                    .argv
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"),
+        };
+        *self.starting.borrow_mut() = Some(PendingStart { generation, writes });
+        self.state.borrow_mut().alive = true;
+        let cwd = spec.cwd.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let physical = gtk4::gio::spawn_blocking(move || {
+                let cwd = cwd
+                    .map(PathBuf::from)
+                    .map(Ok)
+                    .unwrap_or_else(std::env::current_dir)?;
+                std::fs::canonicalize(cwd)
+            })
+            .await;
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.generation.get() != generation
+                || inner
+                    .starting
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|p| p.generation != generation)
+            {
+                return;
+            }
+            let verdict = match physical {
+                Ok(Ok(cwd)) => {
+                    facts.physical_cwd = cwd.clone();
+                    match (
+                        cwd.to_str(),
+                        facts
+                            .effective_home
+                            .as_ref()
+                            .is_none_or(|h| h.to_str().is_some()),
+                    ) {
+                        (Some(cwd), true) => {
+                            spec.cwd = Some(cwd.to_owned());
+                            hooks.before_spawn(facts.clone()).await
+                        }
+                        _ => Err("the checked launch paths are not valid UTF-8".into()),
+                    }
+                }
+                _ => Err("the agent's physical working directory could not be checked".into()),
+            };
+            if inner.generation.get() != generation || inner.stopping.get() {
+                return;
+            }
+            let Some(pending) = inner
+                .starting
+                .borrow_mut()
+                .take_if(|p| p.generation == generation)
+            else {
+                return;
+            };
+            if let Err(reason) = verdict {
+                inner.error(format!(
+                    "The agent's final delegation launch was refused: {reason}"
+                ));
+                if inner.generation.get() == generation {
+                    inner.finish_process(Some(1), false);
+                }
+                return;
+            }
+            if delegation_redirect_names(&spec) != facts.config_redirect_vars {
+                inner.error("The agent's configuration redirect environment changed during its launch check; it was not started.");
+                if inner.generation.get() == generation {
+                    inner.finish_process(Some(1), false);
+                }
+                return;
+            }
+            inner.spawn_spec_now(generation, spec, Some(facts));
+            inner.flush_start_writes(generation, pending.writes);
+        });
+    }
+
+    fn flush_start_writes(&self, generation: u64, writes: Vec<String>) {
+        if self.generation.get() == generation {
+            if let Some(proc) = self.proc.borrow().as_ref().filter(|p| p.is_alive()) {
+                for line in &writes {
+                    proc.write_line(line);
+                }
+            }
+        }
+    }
+
+    fn spawn_spec_now(
+        self: &Rc<Self>,
+        generation: u64,
+        spec: SpawnSpec,
+        facts: Option<DelegationLaunchFacts>,
+    ) {
         let (w_out, w_err, w_exit) = (
             Rc::downgrade(self),
             Rc::downgrade(self),
@@ -1459,6 +1640,7 @@ impl Inner {
             Ok(proc) => {
                 let process_generation = self.process_generation.get() + 1;
                 self.process_generation.set(process_generation);
+                *self.launch_facts.borrow_mut() = facts;
                 let (pid, watch) = (proc.pid(), proc.exit_watch());
                 {
                     let mut watches = self.watches.borrow_mut();
@@ -2178,6 +2360,12 @@ impl Inner {
     /// The hook is not gating agy: stop it now and carry on without the skip flag (plan mode, no
     /// socket), so commands are refused again.
     fn trip_canary(self: &Rc<Self>) {
+        if self.child.is_some() {
+            self.error("The delegated Antigravity agent ran a tool without its approval hook; it was stopped.");
+            self.stop_current();
+            *self.approval.borrow_mut() = None;
+            return;
+        }
         warn!("agy ran a tool without a hook query; restarting it without the skip flag");
         self.error(
             "agy ran a tool without asking agent-terminal; the approval hook is not active \u{2014} restarting it in plan mode without --dangerously-skip-permissions (it refuses commands, but may still edit files)",
@@ -2263,7 +2451,10 @@ impl Inner {
         self.start_process();
         for sent in prompts {
             self.prompt_in_flight.set(true);
-            self.dispatch_sent_prompt(&sent.text, sent.handoff);
+            if !self.dispatch_sent_prompt(&sent.text, sent.handoff.clone()) {
+                self.prompt_in_flight.set(false);
+                self.held_retries.borrow_mut().push_back(sent);
+            }
         }
         true
     }
@@ -2660,6 +2851,9 @@ impl Inner {
     /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
     /// one, so it is never lost.
     fn steer_prompt(self: &Rc<Self>, text: &str) {
+        if !self.root_prompt_allowed() {
+            return self.queue_prompt(text);
+        }
         if !self.state.borrow().running_turn {
             return self.send_prompt(text);
         }
@@ -2694,9 +2888,11 @@ impl Inner {
             })
             .item(item.clone()),
         );
-        if self.command(Command::Steer {
-            text: text.to_owned(),
-        }) {
+        if self.root_prompt_allowed()
+            && self.command(Command::Steer {
+                text: text.to_owned(),
+            })
+        {
             self.remember_pre_init_prompt(text, None);
             return;
         }
@@ -2736,17 +2932,21 @@ impl Inner {
 
     /// A confirmed switch's continuation opens its own turn before queued user input.
     fn send_prompt_now(self: &Rc<Self>, text: &str) {
+        if !self.root_prompt_allowed() {
+            self.queue_prompt(text);
+            return;
+        }
         if !self.state.borrow().running_turn && !self.apply_retired() {
             self.queue_prompt(text);
             return;
         }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let item = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => item,
+        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => (item, true),
             Err(e) => {
                 warn!(error = %e, "could not persist the user message");
-                glib::uuid_string_random().to_string()
+                (glib::uuid_string_random().to_string(), false)
             }
         };
 
@@ -2774,7 +2974,7 @@ impl Inner {
                 stream: StreamKind::Assistant,
                 text: agent_core::redact::redact(text),
             })
-            .item(item),
+            .item(item.clone()),
         );
 
         let sent = match &handoff {
@@ -2782,12 +2982,47 @@ impl Inner {
             None => text.to_owned(),
         };
         self.prompt_in_flight.set(true);
-        self.dispatch_sent_prompt(&sent, handoff);
+        if !self.dispatch_sent_prompt(&sent, handoff) {
+            self.hold_queued_prompt(QueuedPrompt {
+                item_id: item,
+                text: text.to_owned(),
+                stored,
+            });
+        }
+    }
+
+    fn root_prompt_allowed(&self) -> bool {
+        self.child.is_some()
+            || self
+                .hooks
+                .as_ref()
+                .is_none_or(|hooks| hooks.before_root_prompt())
+    }
+
+    fn hold_queued_prompt(&self, queued: QueuedPrompt) {
+        let item = queued.item_id.clone();
+        self.queued_prompts.borrow_mut().push_front(queued);
+        self.prompt_in_flight.set(false);
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: "queued".to_owned(),
+                input: Some(serde_json::json!({"queued": true})),
+                parent: None,
+            })
+            .item(item),
+        );
     }
 
     /// Sends `sent` as a prompt; true when the adapter took it.
     fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+        if !self.root_prompt_allowed() {
+            return false;
+        }
         self.ensure_alive();
+        if !self.root_prompt_allowed() {
+            return false;
+        }
         // A submitted/queued inference is already work: the user must be able to stop it
         // while waiting for the backend's turn/started, not only after that reply arrives.
         let starts_turn =
@@ -2852,6 +3087,26 @@ impl Inner {
         let _dispatching = ScopedFlag::set(&self.dispatching_queue);
         // Each pass removes one queued item; an empty queue ends the synchronous drain.
         loop {
+            if self.queued_prompts.borrow().is_empty() && self.held_retries.borrow().is_empty() {
+                return;
+            }
+            if !self.root_prompt_allowed() {
+                return;
+            }
+            let retry = self.held_retries.borrow_mut().pop_front();
+            if let Some(retry) = retry {
+                self.prompt_in_flight.set(true);
+                if !self.dispatch_sent_prompt(&retry.text, retry.handoff.clone()) {
+                    self.prompt_in_flight.set(false);
+                    self.held_retries.borrow_mut().push_front(retry);
+                    return;
+                }
+                if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false)
+                {
+                    return;
+                }
+                continue;
+            }
             let queued = self.queued_prompts.borrow_mut().pop_front();
             let Some(queued) = queued else { return };
             if !self.apply_retired() {
@@ -2902,10 +3157,16 @@ impl Inner {
             };
             let sent = match &handoff {
                 Some(h) => provider_message_with_handoff(&h.summary, &h.fence, &queued.text),
-                None => queued.text,
+                None => queued.text.clone(),
             };
             self.prompt_in_flight.set(true);
-            self.dispatch_sent_prompt(&sent, handoff);
+            if !self.dispatch_sent_prompt(&sent, handoff) {
+                self.hold_queued_prompt(QueuedPrompt {
+                    stored: true,
+                    ..queued
+                });
+                return;
+            }
             // A local slash command can finish synchronously. Drain its next turn iteratively.
             if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false) {
                 return;

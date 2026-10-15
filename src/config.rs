@@ -126,6 +126,10 @@ pub struct Profile {
     /// `enabled`, so a profile written by 2.x (which has neither) stays usable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Opt in to supervised cross-agent delegation, as a parent and as a child target.
+    /// Existing profiles remain unavailable until the user enables them in Settings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub available_for_delegation: bool,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -151,6 +155,7 @@ impl Default for Profile {
             default_mode: None,
             default_effort: None,
             disabled: false,
+            available_for_delegation: false,
         }
     }
 }
@@ -2624,6 +2629,7 @@ mod tests {
         config.profiles[0].default_mode = Some(Mode::AcceptEdits);
         config.profiles[0].default_effort = Some("high".into());
         config.profiles[1].disabled = true;
+        config.profiles[0].available_for_delegation = true;
         config.save_to(&path);
         let text = std::fs::read_to_string(&path).unwrap();
         let gemini_json = text.split("\"Gemini\"").nth(1).unwrap_or_default();
@@ -2637,6 +2643,8 @@ mod tests {
         assert_eq!(back.profiles[0].default_mode, Some(Mode::AcceptEdits));
         assert_eq!(back.profiles[0].default_effort.as_deref(), Some("high"));
         assert!(back.profiles[1].disabled);
+        assert!(back.profiles[0].available_for_delegation);
+        assert!(!back.profiles[1].available_for_delegation);
     }
 
     #[test]

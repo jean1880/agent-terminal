@@ -355,6 +355,8 @@ pub struct EventLinkRow {
     pub run_id: Option<String>,
     pub category: String,
     pub invocation_id: Option<String>,
+    /// Canonical process generation of this event; 0 is unknown for legacy links.
+    pub process_generation: i64,
 }
 
 /// One `delegation_native_aliases` row: a provider's native worker id → an app worker handle.
@@ -381,7 +383,8 @@ const OPERATION_COLS: &str = "id, root_id, principal_worker_id, kind, idempotenc
 const MESSAGE_COLS: &str = "id, root_id, operation_id, sender_worker_id, recipient_worker_id,
     kind, reply_to, body, delivery_policy, target_run_id, delivery_state, recipient_run_id,
     queued_at, submitted_at, confirmed_at, presented_at, acknowledged_at, updated_at, event_seq";
-const LINK_COLS: &str = "event_seq, worker_id, root_id, run_id, category, invocation_id";
+const LINK_COLS: &str =
+    "event_seq, worker_id, root_id, run_id, category, invocation_id, process_generation";
 
 fn root_row(r: &Row<'_>) -> rusqlite::Result<RootRow> {
     Ok(RootRow {
@@ -493,11 +496,17 @@ fn link_row(r: &Row<'_>) -> rusqlite::Result<EventLinkRow> {
         run_id: r.get(3)?,
         category: r.get(4)?,
         invocation_id: r.get(5)?,
+        process_generation: r.get(6)?,
     })
 }
 
 fn masked(text: Option<&str>) -> Option<String> {
     text.map(redact)
+}
+
+fn scrubbed_json(text: &str) -> Result<String> {
+    let value = serde_json::from_str(text)?;
+    Ok(serde_json::to_string(&super::scrub_value(None, value))?)
 }
 
 /// Refuses a value that is not one of the P1 enum's (`operations.kind` and
@@ -583,15 +592,15 @@ impl Store {
                 redact(&w.name),
                 w.driver,
                 w.profile_id,
-                w.launch_json,
+                scrubbed_json(&w.launch_json)?,
                 w.backing_thread_id,
                 w.state,
                 w.task_mode,
-                w.workspace_json,
-                w.identity_json,
+                scrubbed_json(&w.workspace_json)?,
+                w.identity_json.as_deref().map(scrubbed_json).transpose()?,
                 w.delegation_status,
                 masked(w.delegation_reason.as_deref()),
-                w.delegation_paths,
+                scrubbed_json(&w.delegation_paths)?,
                 masked(w.last_activity.as_deref()),
                 w.created_at,
                 w.updated_at
@@ -666,6 +675,38 @@ impl Store {
                  last_activity = COALESCE(?3, last_activity), updated_at = ?4
              WHERE id = ?1",
             params![id, state, masked(last_activity), at],
+        )?;
+        super::require_row(n, id)
+    }
+
+    /// Records identity observations without changing launch configuration or authority.
+    /// Caller uses the store writer; every string is scrubbed before persistence.
+    pub fn set_delegation_worker_identity(
+        &self,
+        id: &str,
+        identity: &agent_core::delegation::identity::Identity,
+    ) -> Result<()> {
+        let value = super::scrub_value(None, serde_json::to_value(identity)?);
+        let json = serde_json::to_string(&value)?;
+        let n = self.conn.execute(
+            "UPDATE delegation_workers SET identity_json = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, json, self.now()],
+        )?;
+        super::require_row(n, id)
+    }
+
+    /// Rebinds a principal to its selected profile. Identity observations from the previous
+    /// provider are invalidated; native IDs and credentials are never supplied here.
+    pub fn set_delegation_worker_profile(
+        &self,
+        id: &str,
+        driver: agent_core::adapter::Driver,
+        profile_id: &str,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE delegation_workers SET driver = ?2, profile_id = ?3,
+             identity_json = NULL, updated_at = ?4 WHERE id = ?1",
+            params![id, driver.info().key, profile_id, self.now()],
         )?;
         super::require_row(n, id)
     }
@@ -934,11 +975,19 @@ impl Store {
 
     // ---- event links and native aliases ----
 
+    /// Last committed transcript event, for a replay/live subscription fence. The caller must
+    /// read behind the writer's barrier; new events have strictly greater sequence numbers.
+    pub fn delegation_event_high_water(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?)
+    }
+
     pub fn insert_delegation_event_link(&self, link: &EventLinkRow) -> Result<()> {
         self.conn.execute(
             &format!(
                 "INSERT INTO delegation_event_links ({LINK_COLS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             ),
             params![
                 link.event_seq,
@@ -946,7 +995,8 @@ impl Store {
                 link.root_id,
                 link.run_id,
                 link.category,
-                link.invocation_id
+                link.invocation_id,
+                link.process_generation
             ],
         )?;
         Ok(())
@@ -1088,6 +1138,74 @@ mod tests {
     fn is_constraint(e: &StoreError) -> bool {
         matches!(e, StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _))
             if f.code == rusqlite::ErrorCode::ConstraintViolation)
+    }
+
+    #[test]
+    fn identity_observations_are_scrubbed_and_require_an_existing_worker() {
+        use agent_core::adapter::Driver;
+        use agent_core::delegation::identity::{Identity, Provenance, ValueProvenance};
+        use agent_core::delegation::ProfileId;
+        let tree = tree();
+        let mut identity = Identity::new(Driver::Codex, ProfileId::parse("codex-default").unwrap());
+        let canary = format!("{}{}", "ghp_", "x".repeat(36));
+        identity.model = ValueProvenance {
+            requested: Some(canary.clone()),
+            effective: None,
+            source: Provenance::LaunchConfigured,
+        };
+        tree.s
+            .set_delegation_worker_identity("w_child", &identity)
+            .unwrap();
+        let stored = tree
+            .s
+            .delegation_worker("w_child")
+            .unwrap()
+            .unwrap()
+            .identity_json
+            .unwrap();
+        assert!(
+            !stored.contains(&canary),
+            "identity must not persist unmasked credentials"
+        );
+        let back: Identity = serde_json::from_str(&stored).unwrap();
+        assert_eq!(back.model.source, Provenance::LaunchConfigured);
+        assert_eq!(back.model.effective, None);
+        assert!(tree
+            .s
+            .set_delegation_worker_identity("missing", &identity)
+            .is_err());
+        tree.s
+            .set_delegation_worker_profile("w_child", Driver::Claude, "claude-default")
+            .unwrap();
+        let rebound = tree.s.delegation_worker("w_child").unwrap().unwrap();
+        assert_eq!(rebound.driver, "claude");
+        assert_eq!(rebound.profile_id, "claude-default");
+        assert_eq!(rebound.identity_json, None);
+    }
+
+    #[test]
+    fn worker_launch_and_workspace_metadata_are_scrubbed_at_the_write_boundary() {
+        let tree = tree();
+        let canary = format!("{}{}", "ghp_", "y".repeat(36));
+        let mut row = worker("w_metadata", "ro", Some("w_roroot"), "supervised", 1);
+        row.backing_thread_id = Some(tree.s.create_thread("/w", Some("metadata")).unwrap());
+        row.launch_json = serde_json::json!({"model":canary,"effort":canary}).to_string();
+        row.workspace_json =
+            serde_json::json!({"kind":"shared_read_only","path":format!("/tmp/{canary}")})
+                .to_string();
+        row.identity_json = Some(serde_json::json!({"requested":canary}).to_string());
+        row.delegation_paths = serde_json::json!([format!("/tmp/{canary}")]).to_string();
+        tree.s.insert_delegation_worker(&row).unwrap();
+        let stored = tree.s.delegation_worker(&row.id).unwrap().unwrap();
+        for json in [
+            &stored.launch_json,
+            &stored.workspace_json,
+            stored.identity_json.as_ref().unwrap(),
+            &stored.delegation_paths,
+        ] {
+            assert!(!json.contains(&canary));
+            let _: serde_json::Value = serde_json::from_str(json).unwrap();
+        }
     }
 
     #[test]
@@ -1343,8 +1461,45 @@ mod tests {
     }
 
     #[test]
+    fn v4_links_upgrade_with_unknown_generation_and_keep_their_rows() {
+        let Tree { s, root_thread, .. } = tree();
+        let seq = s
+            .append_event(
+                &root_thread,
+                None,
+                &Envelope::new(Event::Notice { text: "old".into() }),
+            )
+            .expect("event");
+        s.conn
+            .execute_batch(
+                "ALTER TABLE delegation_event_links DROP COLUMN process_generation;
+            DELETE FROM schema_version WHERE version = 5;",
+            )
+            .expect("old v4 schema");
+        s.conn.execute("INSERT INTO delegation_event_links (event_seq,worker_id,root_id,run_id,category,invocation_id)
+            VALUES (?1,'w_child','ro',NULL,'lifecycle',NULL)", params![seq]).expect("old link");
+        super::super::migrate(&s.conn).expect("upgrade");
+        super::super::migrate(&s.conn).expect("idempotent");
+        let links = s.delegation_event_links(seq).expect("links");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].worker_id, "w_child");
+        assert_eq!(links[0].process_generation, 0);
+        let mut next = links[0].clone();
+        next.worker_id = "w_roroot".into();
+        next.process_generation = 8;
+        s.insert_delegation_event_link(&next)
+            .expect("new generation");
+        assert!(s
+            .delegation_event_links(seq)
+            .expect("read")
+            .iter()
+            .any(|l| l.process_generation == 8));
+    }
+
+    #[test]
     fn event_links_are_keyed_by_event_and_worker_and_aliases_map_native_ids() {
         let Tree { s, root_thread, .. } = tree();
+        let before = s.delegation_event_high_water().expect("water mark");
         let seq = s
             .append_event(
                 &root_thread,
@@ -1354,7 +1509,10 @@ mod tests {
                 }),
             )
             .expect("event");
+        assert!(before < seq);
+        assert_eq!(s.delegation_event_high_water().expect("water mark"), seq);
         let link = |worker: &str| EventLinkRow {
+            process_generation: 0,
             event_seq: seq,
             worker_id: worker.into(),
             root_id: "ro".into(),

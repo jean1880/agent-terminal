@@ -14,6 +14,7 @@ apt-get install -y --no-install-recommends \
 ensure_rust
 stage_source
 cargo build --release --locked
+make delegation-smoke DELEGATION_BINARY=target/release/agent-terminal
 cargo install cargo-deb --locked
 # $auto in the metadata derives the runtime dependencies from the binary (dpkg-shlibdeps).
 cargo deb --no-build --locked -o "$WORK/pkg/"

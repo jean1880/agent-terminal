@@ -218,7 +218,26 @@ pub(crate) enum TurnBoundary<'a> {
 
 /// Installed in a root or child `ChatSession`. Called on the main thread with no `RefCell` borrow
 /// held.
+#[derive(Clone)]
+pub(crate) struct DelegationLaunchFacts {
+    pub generation: ProcessGeneration,
+    pub argv: Vec<String>,
+    pub physical_cwd: PathBuf,
+    pub effective_home: Option<PathBuf>,
+    /// Presence only: configuration redirect values may themselves contain secrets.
+    pub config_redirect_vars: Vec<String>,
+    pub hook_proven: bool,
+}
+
 pub(crate) trait DelegationHooks {
+    fn before_spawn(&self, _facts: DelegationLaunchFacts) -> LocalFuture<Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Immediately before a root prompt can reach its adapter. False holds it unsent while
+    /// the supervisor rebinds; children use their separate typed dispatch boundary.
+    fn before_root_prompt(&self) -> bool {
+        true
+    }
     /// Takes the binding staged for exactly this generation. Never blocks, never does I/O.
     /// `None`: no token.
     fn binding(&self, driver: Driver, generation: ProcessGeneration) -> Option<LaunchBinding>;
@@ -256,6 +275,8 @@ pub(crate) struct ChildPolicy {
 pub(crate) struct SessionOptions {
     pub hooks: Option<Rc<dyn DelegationHooks>>,
     pub child: Option<ChildPolicy>,
+    /// The last persisted generation. A reopened session must not reuse generation one.
+    pub generation_base: ProcessGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +324,14 @@ pub(crate) enum DelegatedOutcome {
 /// P6 implements; the supervisor holds it weakly.
 pub(crate) trait WorkerSubscriber {
     fn scoped(&self, env: &ScopedEnvelope);
+    /// A live event whose store transaction committed at this sequence.
+    fn committed(&self, env: &ScopedEnvelope, _seq: i64) {
+        self.scoped(env);
+    }
+    /// Persisted history must not trigger live effects such as taking a new diff baseline.
+    fn replayed(&self, env: &ScopedEnvelope) {
+        self.scoped(env);
+    }
     fn registry(&self, root_thread: &str, workers: &[WorkerSummary]);
 }
 

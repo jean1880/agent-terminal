@@ -92,6 +92,7 @@ struct Row {
     name: gtk4::Label,
     task: gtk4::Label,
     now: gtk4::Label,
+    brand: gtk4::Image,
 }
 
 impl Row {
@@ -99,6 +100,9 @@ impl Row {
         let b = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         b.add_css_class("subagent-shelf-row");
         let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let brand = gtk4::Image::new();
+        brand.set_pixel_size(14);
+        top.append(&brand);
         let spinner = gtk4::Spinner::builder().spinning(true).build();
         spinner.add_css_class("thread-background");
         top.append(&spinner);
@@ -132,11 +136,13 @@ impl Row {
                 name,
                 task,
                 now,
+                brand,
             },
         )
     }
 
     fn set(&self, agent: &SubagentSummary, now: Option<&str>) {
+        super::subagents::set_brand(&self.brand, agent.driver);
         let running = agent.active();
         // The widget's own `visible`, not `is_visible()`: that is false for every row while the
         // card is collapsed, and a finished row would keep spinning once opened.
@@ -151,8 +157,9 @@ impl Row {
             .map(|s| format!("Last reported activity: {s}"))
             .unwrap_or_else(|| "Activity unavailable".to_owned());
         self.row.set_tooltip_text(Some(&format!(
-            "{}\n{}\n{now}\nOpen this worker",
+            "{}\n{}\n{}\n{now}\nOpen this worker",
             agent.name,
+            super::subagents::identity_text(agent),
             if agent.task.is_empty() {
                 "No task reported"
             } else {

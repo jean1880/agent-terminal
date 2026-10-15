@@ -3,6 +3,7 @@
 //! Blocking process and file I/O live here, never GTK: callers run the slow
 //! parts through `gio::spawn_blocking`. Redaction is in `agent-core`.
 
+pub mod delegation_config;
 pub mod diff;
 pub mod difftool;
 pub mod editdiff;

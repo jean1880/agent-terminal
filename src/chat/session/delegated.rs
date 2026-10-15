@@ -60,6 +60,12 @@ fn message_id(input: &DelegatedInput) -> Option<MessageId> {
 }
 
 impl ChatSession {
+    /// The exact provider-facing body, shared with receipt correlation. Rendering is pure and
+    /// never writes input or consumes a launch binding.
+    pub(crate) fn render_delegated_input(input: &DelegatedInput) -> String {
+        labelled_text(input)
+    }
+
     /// [`ChatSession::with_env`] with delegation hooks and, for a supervised child, its policy.
     #[allow(clippy::too_many_arguments)] // `with_env`'s seven, plus the options
     pub(crate) fn with_options(
@@ -159,7 +165,8 @@ impl Inner {
             (state.alive, state.running_turn)
         };
         // An unstaged restart would run without a token: a stopped worker is rebound first.
-        if self.rebinding.get() || self.stopping.get() || !alive {
+        if self.rebinding.get() || self.stopping.get() || !alive || self.starting.borrow().is_some()
+        {
             return DelegatedOutcome::Refused(ErrorCode::RuntimeUnavailable);
         }
         let live = matches!(

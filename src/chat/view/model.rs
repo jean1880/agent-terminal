@@ -202,6 +202,9 @@ pub struct SubagentSummary {
     pub lifecycle: Option<WorkerState>,
     /// Latest provider-reported activity, which is not necessarily still running.
     pub activity: Option<String>,
+    /// The provider is known independently of model/effort, which may remain unknown.
+    pub driver: Option<Driver>,
+    pub delegation: Option<agent_core::event::WorkerDelegation>,
 }
 
 impl SubagentSummary {
@@ -285,6 +288,11 @@ impl SubagentSummary {
                 .and_then(|i| i.get("worker_state"))
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
             activity: field("activity"),
+            driver: None,
+            delegation: streamed
+                .as_ref()
+                .and_then(|input| input.get("delegation"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
         }
     }
 }
@@ -662,6 +670,10 @@ impl Transcript {
         &self.order
     }
 
+    pub(super) fn all_item_ids(&self) -> Vec<String> {
+        self.items.keys().cloned().collect()
+    }
+
     /// User prompts in display order, for the composer's per-thread recall history.
     pub fn user_messages(&self) -> Vec<String> {
         self.order
@@ -822,6 +834,13 @@ impl Transcript {
                     out.push(SubagentSummary::of(item, tool));
                 }
             }
+        }
+        for worker in &mut out {
+            worker.driver = worker
+                .delegation
+                .as_ref()
+                .map(|delegation| delegation.driver)
+                .or(self.last_driver);
         }
         out
     }
@@ -1015,7 +1034,7 @@ impl Transcript {
                 kind: ItemKind::Subagent,
                 title: name.clone(),
                 input: Some(
-                    serde_json::json!({ "agent": name, "prompt": task, "worker_state": state, "activity": activity }),
+                    serde_json::json!({ "agent": name, "prompt": task, "worker_state": state, "activity": activity, "delegation": worker.delegation }),
                 ),
                 input_text: String::new(),
                 output: if matches!(state, WorkerState::Completed | WorkerState::Failed) {

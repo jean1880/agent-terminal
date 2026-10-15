@@ -30,6 +30,7 @@ check() {
     export CARGO_TARGET_DIR="$srcdir/target"
     # The pure crates only: the app's tests need a display.
     cargo test --release --locked -p agent-core -p agent-kit
+    make delegation-smoke DELEGATION_BINARY="$srcdir/target/release/agent-terminal"
 }
 
 package() {

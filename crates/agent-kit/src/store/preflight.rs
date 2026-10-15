@@ -78,6 +78,9 @@ pub(crate) struct Hooks {
     /// Called with the backup directory just before publication.
     #[cfg(test)]
     pub before_publish: Option<fn(&Path)>,
+    /// Another fresh creator commits between the initial version and contents inspection.
+    #[cfg(test)]
+    pub after_initial_version: Option<fn(&Path)>,
     /// `max_page_count` of the backup destination: a full disk.
     #[cfg(test)]
     pub backup_max_pages: Option<i64>,
@@ -569,7 +572,15 @@ pub(crate) fn run(db: &Path, hooks: &Hooks) -> Result<Outcome> {
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     expect_same(db, db_id, "the database")?;
+    // Fresh creators do not hold the preflight flock. Keep version and contents inspection
+    // in one snapshot so a creator committing between them cannot turn an empty database
+    // into apparent unknown data. A genuine unversioned database still refuses below.
+    conn.execute_batch("BEGIN DEFERRED")?;
     let version = read_version(&conn)?;
+    #[cfg(test)]
+    if let Some(after) = hooks.after_initial_version {
+        after(db);
+    }
     if version == 0 {
         if holds_nothing(&conn)? {
             return Ok(Outcome::Fresh);
@@ -591,6 +602,9 @@ pub(crate) fn run(db: &Path, hooks: &Hooks) -> Result<Outcome> {
             backup: recorded_backup(&conn)?,
         });
     }
+    // Upgrade reservation re-reads the version under its write lock. Release this read
+    // snapshot first rather than trying to promote it after another writer committed.
+    conn.execute_batch("ROLLBACK")?;
     // A table rebuild (v3) must not fire `ON DELETE` actions, and the pragma is a no-op inside a
     // transaction: off before the reservation. This connection is closed afterwards.
     conn.execute_batch("PRAGMA foreign_keys = OFF")?;
@@ -858,7 +872,37 @@ mod tests {
     }
 
     #[test]
-    fn v1_v2_and_v3_stores_migrate_to_v4_keeping_threads_events_and_refs() {
+    fn a_fresh_creator_committing_during_inspection_is_not_an_unknown_database() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        super::super::create_private_dir(db.parent().expect("parent")).expect("directory");
+        let conn = Connection::open(&db).expect("empty database");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            .expect("fresh creator's first step");
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).expect("mode");
+        drop(conn);
+        let hooks = Hooks {
+            after_initial_version: Some(|db| {
+                let creator = Connection::open(db).expect("concurrent creator");
+                migrate_with(&creator, true).expect("creator commits complete schema");
+            }),
+            ..Hooks::default()
+        };
+        assert!(matches!(run(&db, &hooks), Ok(Outcome::Fresh)));
+        assert_eq!(
+            read_version(&read_only(&db)).expect("committed version"),
+            SCHEMA_VERSION
+        );
+        assert!(matches!(
+            run(&db, &Hooks::default()),
+            Ok(Outcome::Current { .. })
+        ));
+    }
+
+    #[test]
+    fn older_stores_migrate_to_current_keeping_threads_events_and_refs() {
         for version in 1..SCHEMA_VERSION {
             let dir = tempfile::tempdir().expect("tmp");
             let db = db_in(&dir);
@@ -893,7 +937,7 @@ mod tests {
                 .query_row("PRAGMA journal_mode", [], |r| r.get(0))
                 .expect("journal");
             assert_eq!(journal, "delete", "a self-contained file");
-            assert!(!has_table(&b, "delegation_roots"));
+            assert_eq!(has_table(&b, "delegation_roots"), version >= 4);
         }
     }
 

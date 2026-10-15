@@ -150,6 +150,7 @@ impl IpcServer {
         Ok(server)
     }
 
+    #[cfg(test)]
     pub(crate) fn socket_path(&self) -> &Path {
         &self.path
     }
@@ -175,6 +176,7 @@ impl IpcServer {
     }
 
     /// (all connections, unauthenticated connections).
+    #[cfg(test)]
     pub(crate) fn counts(&self) -> (u32, u32) {
         let usage = self.usage();
         (usage.connections, usage.preauth_connections)
