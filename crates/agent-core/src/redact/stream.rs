@@ -44,7 +44,8 @@
 //!   snapshot). Up to `max_streams` refused keys are remembered; past that the sanitiser is
 //!   saturated ([`StreamSanitiser::saturated`]): every stream without state is withheld for the
 //!   rest of its life, since a refused stream it could not remember must never resume without
-//!   its context. Streams that already have state carry on.
+//!   its context. Saturation is noticed once; after that the withholding is silent. Streams
+//!   that already have state carry on.
 //! - **Cancel**: [`StreamSanitiser::cancel`] drops everything not yet published.
 //!
 //! Holding back is also conservative in timing only: a line with `Basic`/`Token` and no
@@ -60,14 +61,16 @@
 //! partial-character buffers; a line buffer grows only up to its budget, and one larger than
 //! [`KEEP_CAPACITY`] is freed at its newline. A stream with nothing pending is dropped, so a
 //! finished line costs no entry. Entries holding state are bounded by `max_streams`, and the
-//! refused-key set by `max_streams` too. Published text is the caller's output and is not
+//! refused-key set by `max_streams` too. Keys are never cloned or stored, only a 16-byte keyed
+//! digest of each, so a key's own size costs nothing past the call. Published text is the caller's output and is not
 //! bounded here.
 //!
 //! The detection limits are `redact`'s own: a credential with no recognisable shape, not
 //! assigned to a sensitive-looking name, gets through here exactly as it does there.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, RandomState};
+use std::marker::PhantomData;
 
 use super::{redact_line, PEM_BEGIN, PEM_CLOSE, PEM_END, PEM_MASK};
 
@@ -120,7 +123,8 @@ impl Default for Limits {
 }
 
 /// A placeholder stream identity: worker, process generation, item and stream. Any
-/// `Eq + Hash + Clone` key works; this one is the default until the runtime defines its own.
+/// `Hash` key works (it is reduced to a fixed-size digest, never stored); this one is the
+/// default until the runtime defines its own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct StreamKey {
     pub worker: String,
@@ -469,32 +473,49 @@ fn decode(mut carry: Vec<u8>, bytes: &[u8]) -> (String, Vec<u8>) {
 
 /// Publishes streamed text per stream, never ahead of what [`redact`] would mask. See the
 /// module documentation for the invariant and its conservative divergences.
+///
+/// Keys are never stored: each is reduced to a [`KeyId`], two 64-bit SipHashes under random
+/// per-sanitiser seeds, so a key of any size costs 16 bytes in either table. Two keys
+/// colliding on all 128 bits would share a stream; with seeds no caller sees, that is out of
+/// reach by construction rather than by chance alone.
 #[derive(Debug)]
 pub struct StreamSanitiser<K = StreamKey> {
-    streams: HashMap<K, Stream>,
+    streams: HashMap<KeyId, Stream>,
     /// Streams refused for want of an entry: withheld until finished, cancelled or replaced.
-    refused: HashSet<K>,
+    refused: HashSet<KeyId>,
     /// A refused stream could not be remembered: every stream without state is withheld.
     saturated: bool,
+    seeds: (RandomState, RandomState),
     limits: Limits,
     retained: usize,
+    key: PhantomData<fn(&K)>,
 }
 
-impl<K: Eq + Hash + Clone> Default for StreamSanitiser<K> {
+/// A fixed-size stand-in for a key: what the sanitiser stores instead of the key itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct KeyId(u64, u64);
+
+impl<K: Hash> Default for StreamSanitiser<K> {
     fn default() -> Self {
         Self::new(Limits::default())
     }
 }
 
-impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
+impl<K: Hash> StreamSanitiser<K> {
     pub fn new(limits: Limits) -> Self {
         Self {
             streams: HashMap::new(),
             refused: HashSet::new(),
             saturated: false,
+            seeds: (RandomState::new(), RandomState::new()),
             limits,
             retained: 0,
+            key: PhantomData,
         }
+    }
+
+    fn id(&self, key: &K) -> KeyId {
+        KeyId(self.seeds.0.hash_one(key), self.seeds.1.hash_one(key))
     }
 
     /// Bytes all streams retain now, by buffer capacity.
@@ -522,15 +543,16 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
         p: &mut Published,
         f: impl FnOnce(&mut Stream, usize, &mut Published),
     ) {
-        if self.refused.contains(key) {
+        let key = self.id(key);
+        if self.refused.contains(&key) {
             p.withheld_bytes += input_len;
             return;
         }
-        let existing = self.streams.remove(key);
+        let existing = self.streams.remove(&key);
         let had = existing.is_some();
         if !had && self.saturated {
+            // Noticed once, when it saturated; from then on the withholding is silent.
             p.withheld_bytes += input_len;
-            notice(p);
             return;
         }
         let mut stream = existing.unwrap_or_default();
@@ -546,20 +568,21 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
         }
         if !had && self.streams.len() >= self.limits.max_streams {
             p.withheld_bytes += stream.uncertain();
+            // The one notice for this key; saturating happens once, so its notice is once too.
             notice(p);
             if self.refused.len() < self.limits.max_streams {
-                self.refused.insert(key.clone());
+                self.refused.insert(key);
             } else {
                 self.saturated = true;
             }
             return;
         }
         self.retained += stream.retained();
-        self.streams.insert(key.clone(), stream);
+        self.streams.insert(key, stream);
     }
 
     fn take(&mut self, key: &K) -> Option<Stream> {
-        let stream = self.streams.remove(key)?;
+        let stream = self.streams.remove(&self.id(key))?;
         self.retained -= stream.retained();
         Some(stream)
     }
@@ -586,7 +609,7 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// Ends `key`'s stream: publishes the rest of its last line, redacted, and forgets it.
     pub fn finish(&mut self, key: &K) -> Published {
         let mut p = Published::default();
-        if self.refused.remove(key) {
+        if self.refused.remove(&self.id(key)) {
             return p;
         }
         if let Some(stream) = self.take(key) {
@@ -599,7 +622,7 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// what was dropped.
     pub fn cancel(&mut self, key: &K) -> Published {
         let mut p = Published::default();
-        self.refused.remove(key);
+        self.refused.remove(&self.id(key));
         if let Some(stream) = self.take(key) {
             p.withheld_bytes = stream.uncertain();
         }
@@ -610,7 +633,7 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// built from earlier deltas is dropped and `full_text` is pushed into a fresh stream. The
     /// result has `replace` set; its text is everything now published for the stream.
     pub fn replace_snapshot(&mut self, key: &K, full_text: &str) -> Published {
-        self.refused.remove(key);
+        self.refused.remove(&self.id(key));
         self.take(key);
         let mut p = self.push(key, full_text);
         p.replace = true;
@@ -1240,11 +1263,59 @@ mod tests {
         s.push(&5, "token: ");
         assert!(s.saturated());
         let p = s.push(&6, "a whole line\n");
-        assert!(p.overflowed && !p.text.contains("whole"));
+        assert_eq!((p.text.as_str(), p.withheld_bytes), ("", 13));
         // Streams with state carry on.
         let mut out = s.push(&0, "defghijklmnopqrstuvwxyz0123\n").text;
         out.push_str(&s.finish(&0).text);
         assert_eq!(out, "****0123\n");
+    }
+
+    /// Review finding: refused and open-stream tables cloned keys of any size.
+    #[test]
+    fn a_huge_key_is_remembered_by_digest_not_copied() {
+        let mut s: StreamSanitiser<StreamKey> = StreamSanitiser::new(Limits {
+            max_streams: 1,
+            ..Limits::default()
+        });
+        let a = StreamKey {
+            item: "a".into(),
+            ..StreamKey::default()
+        };
+        let huge = || StreamKey {
+            item: "b".repeat(100_000_000),
+            ..StreamKey::default()
+        };
+        assert_eq!(std::mem::size_of::<KeyId>(), 16);
+        s.push(&a, "ghp_abc");
+        let b = huge();
+        let p = s.push(&b, "ghp_def");
+        assert!(p.overflowed);
+        drop(b);
+        // Only the digest was kept, yet an equal key built afresh is still the refused stream.
+        let b = huge();
+        let p = s.push(&b, "ghijklmnopqrstuvwxyz0123\n");
+        assert_eq!((p.text.as_str(), p.withheld_bytes), ("", 25));
+        assert_eq!(s.finish(&b), Published::default());
+        assert_eq!(s.push(&b, "free again\n").text, "free again\n");
+        assert_eq!(s.open_streams(), 1);
+    }
+
+    /// Review finding: saturation republished the notice on every later call.
+    #[test]
+    fn saturation_is_noticed_once_then_silent() {
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(Limits {
+            max_streams: 0,
+            ..Limits::default()
+        });
+        let p = s.push(&0, "x");
+        assert!(s.saturated());
+        assert_eq!((p.text.as_str(), p.overflowed), (WITHHELD_NOTICE, true));
+        for key in [0, 0, 1, 2] {
+            assert_eq!(s.push(&key, ""), Published::default());
+            let p = s.push(&key, "more text\n");
+            assert_eq!((p.text.as_str(), p.withheld_bytes), ("", 10));
+            assert_eq!(s.push_bytes(&key, b"\xff").text, "");
+        }
     }
 
     /// Review finding: one huge chunk was copied whole before the limits applied.
