@@ -1714,6 +1714,7 @@ pub(crate) mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store.clone(),
             thread.clone(),

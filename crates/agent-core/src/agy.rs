@@ -1136,6 +1136,7 @@ mod tests {
             resume: Some("conv-1".into()),
             new_session_id: None,
             approval_hook: hook,
+            delegation: None,
         }
     }
 

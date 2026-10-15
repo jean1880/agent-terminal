@@ -4023,6 +4023,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -4179,6 +4180,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -4298,6 +4300,7 @@ mod tests {
             .expect("bind");
             let open = OpenSession {
                 approval_hook: false, // the session must not trust the caller's value
+                delegation: None,
                 ..fake_agy(tmp.path())
             };
             let session = ChatSession::new(
@@ -4351,6 +4354,7 @@ mod tests {
             let (sink, seen) = make_sink();
             let open = OpenSession {
                 approval_hook: true, // ignored: there is no socket to export
+                delegation: None,
                 ..fake_agy(tmp.path())
             };
             let session = ChatSession::new(
@@ -4804,6 +4808,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -4859,6 +4864,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -4943,6 +4949,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store,
             thread,
@@ -5063,6 +5070,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store.clone(),
                 thread.clone(),
@@ -5475,6 +5483,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store.clone(),
             thread.clone(),
@@ -5648,6 +5657,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -6551,6 +6561,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 "no-such-thread".into(),
@@ -6591,6 +6602,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store.clone(),
                 thread.clone(),
@@ -6629,6 +6641,7 @@ mod tests {
                     resume: Some("native-1".into()),
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -7949,6 +7962,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -8092,6 +8106,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store,
             thread,

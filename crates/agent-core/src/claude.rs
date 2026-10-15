@@ -3206,6 +3206,7 @@ mod tests {
             resume: Some("abc".into()),
             new_session_id: Some("zzz".into()),
             approval_hook: false,
+            delegation: None,
         };
         assert_eq!(
             a.argv(&s),
@@ -3610,6 +3611,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         };
         let argv = a.argv(&session);
         assert!(argv.windows(2).any(|w| w == ["--effort", "medium"]));
@@ -3673,6 +3675,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             };
             a.argv(&session);
             a.handshake();

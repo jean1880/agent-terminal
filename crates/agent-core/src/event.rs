@@ -10,6 +10,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::delegation::identity::ValueProvenance;
+use crate::delegation::ids::{MessageId, OperationId, ProfileId, RunId, WorkerId};
+use crate::delegation::mailbox::{DeliveryState, Direction, MessageKind};
+use crate::delegation::wire::{Controls, DelegationStatus};
+
 /// One canonical event plus the ids it belongs to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -236,6 +241,23 @@ pub enum Event {
     /// Text the CLI produced itself (local slash command output, synthetic messages).
     Notice {
         text: String,
+    },
+    /// A message between delegated workers. Delegated data: never a `UserMessage` item.
+    DelegatedMessage {
+        message_id: MessageId,
+        direction: Direction,
+        kind: MessageKind,
+        from: WorkerId,
+        to: WorkerId,
+        #[serde(default)]
+        reply_to: Option<MessageId>,
+        text: String,
+        delivery: DeliveryState,
+    },
+    /// An attested native call card (`Envelope::item`) started this worker.
+    WorkerLinked {
+        worker_id: WorkerId,
+        operation_id: OperationId,
     },
     /// The mode the user chose for the thread, which the running mode can differ from (agy without
     /// its hook cannot ask). Stored so a reopened thread, on whichever agent, starts from the
@@ -478,6 +500,30 @@ pub struct WorkerSnapshot {
     /// Latest reported activity or result; absence is unknown, never inferred from silence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// A worker agent-terminal supervises or links (cross-agent delegation). `None` for a
+    /// provider's own worker, and for every snapshot a v3 build stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<WorkerDelegation>,
+}
+
+/// What delegation knows about a worker (contract §2 `WorkerSummary`, cut to what the thread
+/// view shows).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerDelegation {
+    pub worker_id: WorkerId,
+    pub origin: WorkerOrigin,
+    pub driver: crate::adapter::Driver,
+    #[serde(default)]
+    pub profile_id: Option<ProfileId>,
+    #[serde(default)]
+    pub parent: Option<WorkerId>,
+    #[serde(default)]
+    pub run: Option<RunId>,
+    pub depth: u8,
+    pub model: ValueProvenance,
+    pub effort: ValueProvenance,
+    pub controls: Controls,
+    pub status: DelegationStatus,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,9 +537,24 @@ pub enum WorkerState {
     Stopped,
     /// Explicit shutdown/closed signal; a completed task leaves its worker open.
     Closed,
+    /// A stop was requested and its outcome is not in yet (delegation: a cancel or revocation
+    /// interrupted the run). Older builds read it as `Unknown`.
+    Stopping,
     #[default]
     #[serde(other)]
     Unknown,
+}
+
+/// Where a worker came from (delegation contract §2 `WorkerSummary.origin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerOrigin {
+    /// The user's own session.
+    Root,
+    /// A provider's own sub-agent, shown but not limited by agent-terminal.
+    Native,
+    /// Started through `cross_agent_spawn`.
+    Supervised,
 }
 
 /// What a background task runs. A kind this build does not know decodes as `Other`.
@@ -626,6 +687,126 @@ mod tests {
     fn event_tag_is_snake_case() {
         let json = serde_json::to_value(Event::Unknown).expect("serialize");
         assert_eq!(json["type"], "unknown");
+    }
+
+    #[test]
+    fn stopping_and_worker_origin_round_trip() {
+        let json = serde_json::to_value(WorkerState::Stopping).expect("ser");
+        assert_eq!(json, serde_json::json!("stopping"));
+        assert_eq!(
+            serde_json::from_value::<WorkerState>(json).expect("de"),
+            WorkerState::Stopping
+        );
+        for (origin, name) in [
+            (WorkerOrigin::Root, "root"),
+            (WorkerOrigin::Native, "native"),
+            (WorkerOrigin::Supervised, "supervised"),
+        ] {
+            let json = serde_json::to_value(origin).expect("ser");
+            assert_eq!(json, serde_json::json!(name));
+            assert_eq!(
+                serde_json::from_value::<WorkerOrigin>(json).expect("de"),
+                origin
+            );
+        }
+    }
+
+    #[test]
+    fn a_v3_worker_snapshot_without_delegation_still_decodes() {
+        let snap: WorkerSnapshot =
+            serde_json::from_str(r#"{"id":"a","name":"n","state":"running"}"#).expect("decode");
+        assert_eq!(snap.delegation, None);
+        assert_eq!(snap.state, WorkerState::Running);
+        let json = serde_json::to_value(&snap).expect("ser");
+        assert!(json.get("delegation").is_none(), "absent, as v3 wrote it");
+    }
+
+    #[test]
+    fn worker_delegation_round_trips() {
+        use crate::delegation::identity::{Provenance, ValueProvenance};
+        use crate::delegation::wire::{DelegationStatusCode, ThisRunSupport};
+        let w = |s: &str| WorkerId::parse(s).expect("valid");
+        let snap = WorkerSnapshot {
+            id: "w_childaaa".into(),
+            name: Some("reviewer".into()),
+            task: None,
+            state: WorkerState::Stopping,
+            activity: None,
+            delegation: Some(WorkerDelegation {
+                worker_id: w("w_childaaa"),
+                origin: WorkerOrigin::Supervised,
+                driver: crate::adapter::Driver::Codex,
+                profile_id: Some(ProfileId::parse("codex").expect("valid")),
+                parent: Some(w("w_rootroot")),
+                run: Some(RunId::parse("r_runrunru").expect("valid")),
+                depth: 1,
+                model: ValueProvenance {
+                    requested: Some("gpt-5".into()),
+                    effective: None,
+                    source: Provenance::ProviderAccepted,
+                },
+                effort: ValueProvenance::unknown(),
+                controls: Controls {
+                    send: true,
+                    this_run: ThisRunSupport::Strict,
+                    cancel: true,
+                    close: true,
+                },
+                status: DelegationStatus::new(DelegationStatusCode::Available),
+            }),
+        };
+        let json = serde_json::to_string(&snap).expect("ser");
+        let back: WorkerSnapshot = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, snap);
+    }
+
+    /// The `Event` shape of a build that predates delegation: same tag, no delegation
+    /// variants, `#[serde(other)]` catch-all.
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OlderEvent {
+        Notice {
+            text: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[test]
+    fn delegation_events_round_trip_and_older_builds_read_them_as_unknown() {
+        let w = |s: &str| WorkerId::parse(s).expect("valid");
+        let message = Envelope::new(Event::DelegatedMessage {
+            message_id: MessageId::parse("m_msgmsgms").expect("valid"),
+            direction: Direction::ChildToParent,
+            kind: MessageKind::Report,
+            from: w("w_childaaa"),
+            to: w("w_rootroot"),
+            reply_to: None,
+            text: "done".into(),
+            delivery: DeliveryState::ProviderConfirmed,
+        });
+        let linked = Envelope::new(Event::WorkerLinked {
+            worker_id: w("w_childaaa"),
+            operation_id: OperationId::parse("op_opopopop").expect("valid"),
+        })
+        .item("call-card-1");
+        for env in [message, linked] {
+            let json = serde_json::to_string(&env).expect("ser");
+            let back: Envelope = serde_json::from_str(&json).expect("de");
+            assert_eq!(back, env);
+            let event_json = serde_json::to_string(&env.event).expect("ser");
+            let older: OlderEvent = serde_json::from_str(&event_json).expect("older build");
+            assert_eq!(older, OlderEvent::Unknown);
+        }
+        let older: OlderEvent =
+            serde_json::from_str(r#"{"type":"notice","text":"t"}"#).expect("older notice");
+        assert_eq!(older, OlderEvent::Notice { text: "t".into() });
+        let json = serde_json::to_value(Event::WorkerLinked {
+            worker_id: w("w_childaaa"),
+            operation_id: OperationId::parse("op_opopopop").expect("valid"),
+        })
+        .expect("ser");
+        assert_eq!(json["type"], "worker_linked");
     }
 
     #[test]

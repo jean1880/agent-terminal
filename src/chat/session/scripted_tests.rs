@@ -58,6 +58,7 @@ impl Fixture {
                 .and_then(|provider| provider.native_id.clone()),
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 

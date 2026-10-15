@@ -209,7 +209,11 @@ impl SubagentSummary {
         match self.lifecycle {
             Some(state) => matches!(
                 state,
-                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+                // Stopping is still active: only an observed exit ends a worker.
+                WorkerState::Starting
+                    | WorkerState::Running
+                    | WorkerState::Waiting
+                    | WorkerState::Stopping
             ),
             None => self.status == ToolStatus::Running,
         }
@@ -232,6 +236,7 @@ impl SubagentSummary {
             Some(WorkerState::Failed) => "failed",
             Some(WorkerState::Stopped) => "stopped",
             Some(WorkerState::Closed) => "closed",
+            Some(WorkerState::Stopping) => "stopping",
             Some(WorkerState::Unknown) => "status unknown",
             None => match self.status {
                 ToolStatus::Running => "running",
@@ -998,9 +1003,10 @@ impl Transcript {
                 )
             });
             let status = match state {
-                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting => {
-                    ToolStatus::Running
-                }
+                WorkerState::Starting
+                | WorkerState::Running
+                | WorkerState::Waiting
+                | WorkerState::Stopping => ToolStatus::Running,
                 WorkerState::Completed | WorkerState::Closed => ToolStatus::Completed,
                 WorkerState::Failed => ToolStatus::Failed,
                 WorkerState::Stopped | WorkerState::Unknown => ToolStatus::Interrupted,
@@ -1984,6 +1990,8 @@ impl Transcript {
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
             Event::QuotaUpdated { .. } | Event::Unknown => {}
+            // Delegation events are not shown yet (no runtime emits them before P4).
+            Event::DelegatedMessage { .. } | Event::WorkerLinked { .. } => {}
         }
         out
     }
@@ -2698,6 +2706,7 @@ mod tests {
                 task: Some("Review the composer".into()),
                 state,
                 activity: Some("Inspecting controls".into()),
+                delegation: None,
             }],
             waiting_for: if waiting {
                 vec!["child-1".into()]
@@ -2848,6 +2857,7 @@ mod tests {
                         task: None,
                         state: WorkerState::Unknown,
                         activity: Some(String::new()),
+                        delegation: None,
                     }],
                     waiting_for: Vec::new(),
                 }),
@@ -2874,6 +2884,7 @@ mod tests {
                     task: Some("Review the new task".into()),
                     state: WorkerState::Running,
                     activity: None,
+                    delegation: None,
                 }],
                 waiting_for: Vec::new(),
             }),
@@ -2911,6 +2922,35 @@ mod tests {
         assert!(!t.subagents()[0].active());
         assert_eq!(t.subagents()[0].state_label(), "status unknown");
         assert_eq!(t.activity(false), Activity::Finished);
+    }
+
+    #[test]
+    fn a_stopping_worker_stays_active_until_its_exit_is_observed() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        t.apply(&worker_state(WorkerState::Stopping, false), Driver::Codex);
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+            Driver::Codex,
+        );
+        let worker = &t.subagents()[0];
+        assert_eq!(worker.lifecycle, Some(WorkerState::Stopping));
+        assert!(worker.active());
+        assert!(!worker.finished());
+        assert_eq!(worker.state_label(), "stopping");
+        assert_eq!(
+            t.activity(false),
+            Activity::Waiting {
+                tasks: vec!["Mira".into()]
+            }
+        );
+        t.apply(&worker_state(WorkerState::Stopped, false), Driver::Codex);
+        assert!(t.subagents()[0].finished());
     }
 
     #[test]
