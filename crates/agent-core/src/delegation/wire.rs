@@ -1336,8 +1336,7 @@ pub fn fit_summary(s: &mut WorkerSummary) {
         } else if let Some(a) = s.last_activity.as_mut().filter(|a| !a.is_empty()) {
             let half = a.len() / 2;
             cut(a, half);
-        } else if s.delegation.paths.pop().is_some() {
-        } else {
+        } else if s.delegation.paths.pop().is_none() {
             break;
         }
     }
@@ -1437,6 +1436,224 @@ pub fn truncate_capabilities(resp: &mut CapabilitiesResponse) {
     while cost_of(resp) > OUTPUT_BUDGET {
         if truncation_step(resp).is_none() {
             break;
+        }
+    }
+}
+
+/// Worst-case values at every field bound, for the output-budget tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use crate::delegation::identity::{Provenance, ValueProvenance};
+
+    /// `bytes` bytes of `c` (rounded down to whole characters).
+    pub(crate) fn text(c: char, bytes: usize) -> String {
+        std::iter::repeat_n(c, bytes / c.len_utf8()).collect()
+    }
+
+    fn vp(c: char, max: usize) -> ValueProvenance {
+        ValueProvenance {
+            requested: Some(text(c, max)),
+            effective: Some(text(c, max)),
+            source: Provenance::ProviderReported,
+        }
+    }
+
+    fn id<T>(prefix: &str, fill: char, parse: fn(&str) -> Result<T, IdError>) -> T {
+        match parse(&format!("{prefix}{}", fill.to_string().repeat(40))) {
+            Ok(v) => v,
+            Err(e) => panic!("fixture id: {e}"),
+        }
+    }
+
+    pub(crate) fn worker(fill: char) -> WorkerId {
+        id("w_", fill, WorkerId::parse)
+    }
+
+    pub(crate) fn run(fill: char) -> RunId {
+        id("r_", fill, RunId::parse)
+    }
+
+    pub(crate) fn message(fill: char) -> MessageId {
+        id("m_", fill, MessageId::parse)
+    }
+
+    pub(crate) fn operation() -> OperationId {
+        id("op_", 'O', OperationId::parse)
+    }
+
+    pub(crate) fn profile(n: usize) -> ProfileId {
+        match ProfileId::parse(&format!("{n:0>64}")) {
+            Ok(p) => p,
+            Err(e) => panic!("fixture profile: {e}"),
+        }
+    }
+
+    pub(crate) fn worst_identity(c: char) -> Identity {
+        Identity {
+            driver: Driver::Codex,
+            profile_id: profile(0),
+            model: vp(c, MAX_MODEL_BYTES),
+            effort: vp(c, MAX_EFFORT_BYTES),
+        }
+    }
+
+    pub(crate) fn worst_workspace(c: char) -> WorkspaceInfo {
+        WorkspaceInfo {
+            kind: WorkspaceKind::IsolatedWorktree,
+            path: Some(text(c, MAX_PATH_BYTES)),
+            base_commit: Some(text(c, MAX_BASE_COMMIT_BYTES)),
+        }
+    }
+
+    pub(crate) fn worst_summary(c: char) -> WorkerSummary {
+        WorkerSummary {
+            worker_id: worker('W'),
+            parent_id: Some(worker('P')),
+            name: std::iter::repeat_n(c, MAX_NAME_CHARS).collect(),
+            origin: WorkerOrigin::Supervised,
+            state: WorkerState::Stopping,
+            run_id: Some(run('R')),
+            run_state: Some(RunState::Interrupted),
+            identity: Some(worst_identity(c)),
+            depth: 2,
+            can_spawn: false,
+            controls: Controls {
+                send: true,
+                this_run: ThisRunSupport::BestEffort,
+                cancel: true,
+                close: true,
+            },
+            task_mode: Some(TaskMode::AcceptEdits),
+            workspace: worst_workspace(c),
+            delegation: DelegationStatus {
+                code: DelegationStatusCode::WorkspaceUntrusted,
+                reason: Some(text(c, MAX_STATUS_REASON_BYTES)),
+                paths: vec![text(c, MAX_STATUS_PATH_BYTES); MAX_STATUS_PATHS],
+            },
+            last_activity: Some(text(c, MAX_LAST_ACTIVITY_BYTES)),
+            updated_at: "2026-10-15T00:00:00.000000000+00:00".into(),
+        }
+    }
+
+    pub(crate) fn worst_receipt(c: char) -> MutationReceipt {
+        MutationReceipt {
+            api_version: 1,
+            operation_id: operation(),
+            authority_epoch: u64::MAX,
+            replayed: false,
+            dispatch: DispatchState::DispatchReserved,
+            warnings: vec![
+                Warning::new(
+                    &"w".repeat(MAX_WARNING_CODE_BYTES),
+                    &text(c, MAX_WARNING_MESSAGE_BYTES)
+                );
+                MAX_WARNINGS
+            ],
+        }
+    }
+
+    pub(crate) fn worst_ack(c: char) -> AckOutcome {
+        AckOutcome {
+            receipt: worst_receipt(c),
+            acknowledged: vec![message('A'); 100],
+            rejected: vec![
+                AckRejection {
+                    message_id: message('B'),
+                    code: ErrorCode::IdempotencyConflict,
+                };
+                100
+            ],
+        }
+    }
+
+    pub(crate) fn worst_message(seq: u64, c: char) -> PageMessage {
+        PageMessage {
+            seq,
+            message_id: message('M'),
+            from: worker('F'),
+            to: worker('T'),
+            kind: MessageKind::Question,
+            reply_to: Some(message('Q')),
+            text: text(c, 16 * 1024),
+            delivery: DeliveryState::QueuedNextTurn,
+            recipient_run_id: Some(run('X')),
+            acknowledged: false,
+            at: "2026-10-15T00:00:00.000000000+00:00".into(),
+        }
+    }
+
+    pub(crate) fn worst_spawn_receipt(c: char) -> SpawnReceipt {
+        SpawnReceipt {
+            receipt: worst_receipt(c),
+            worker_id: worker('W'),
+            run_id: Some(run('R')),
+            state: SpawnState::Starting,
+            identity: worst_identity(c),
+            authority: SpawnAuthority {
+                task_mode: TaskMode::AcceptEdits,
+                workspace: worst_workspace(c),
+                can_spawn: true,
+                depth: 2,
+            },
+        }
+    }
+
+    /// 32 profiles, 64 models each with 8 efforts, every string at its byte cap.
+    pub(crate) fn maximal_catalogue(c: char) -> CapabilitiesResponse {
+        let modes: Vec<ModeAdmission> = TaskMode::ALL
+            .into_iter()
+            .map(|task_mode| ModeAdmission {
+                task_mode,
+                route_status: RouteStatus::Unverified,
+                route_blockers: vec![text(c, 64); 16],
+                child_bridge: ChildBridge::WithoutBridge,
+            })
+            .collect();
+        let models: Vec<ModelInfo> = (0..64)
+            .map(|_| ModelInfo {
+                id: text(c, MAX_MODEL_BYTES),
+                efforts: vec![text(c, MAX_EFFORT_BYTES); 8],
+            })
+            .collect();
+        CapabilitiesResponse {
+            api_version: 1,
+            caller: Principal {
+                worker_id: worker('W'),
+                root_id: worker('R'),
+                driver: Driver::Claude,
+                depth: 0,
+                can_spawn: true,
+                task_mode_ceiling: TaskMode::ALL.to_vec(),
+            },
+            authority_epoch: u64::MAX,
+            delegation_scope: DELEGATION_SCOPE_SUPERVISED.into(),
+            profiles: (0..32)
+                .map(|i| ProfileCapabilities {
+                    profile_id: profile(i),
+                    name: std::iter::repeat_n(c, MAX_NAME_CHARS).collect(),
+                    driver: Driver::Codex,
+                    available: true,
+                    reason: Some(text(c, MAX_STATUS_REASON_BYTES)),
+                    modes: modes.clone(),
+                    models: models.clone(),
+                    workspaces: vec![
+                        WorkspaceKind::SharedReadOnly,
+                        WorkspaceKind::IsolatedWorktree,
+                    ],
+                    delivery: DeliverySupport {
+                        this_run: ThisRunSupport::Strict,
+                        next_turn: true,
+                    },
+                    controls: ProfileControls {
+                        cancel: true,
+                        close: true,
+                    },
+                })
+                .collect(),
+            limits: CapabilityLimits::from_limits(&Limits::default()),
+            truncated: false,
+            omitted: Omitted::default(),
         }
     }
 }
@@ -1877,6 +2094,287 @@ mod tests {
                 assert_eq!(req.is_mutating(), mutating_tool, "{tool:?}");
             }
         }
+    }
+
+    fn models(r: &CapabilitiesResponse) -> usize {
+        r.profiles.iter().map(|p| p.models.len()).sum()
+    }
+
+    /// The real MCP response: a JSON-RPC result carrying `structuredContent` and the same JSON
+    /// as a text block, under the largest allowed request id.
+    fn mcp_response_len(output: &Value) -> usize {
+        let text = serde_json::to_string(output).expect("ser");
+        let id = "i".repeat(MAX_REQUEST_ID_BYTES - 2);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": text}], "structuredContent": output, "isError": false}
+        });
+        serde_json::to_string(&response).expect("ser").len()
+    }
+
+    fn check_truncation(original: &CapabilitiesResponse, resp: &CapabilitiesResponse) {
+        let v = serde_json::to_value(resp).expect("ser");
+        assert!(transport_cost(&v) <= OUTPUT_BUDGET);
+        assert!(mcp_response_len(&v) < 1 << 20);
+        assert_eq!(
+            resp.omitted.profiles as usize,
+            original.profiles.len() - resp.profiles.len()
+        );
+        assert_eq!(
+            resp.omitted.models as usize,
+            models(original) - models(resp)
+        );
+        assert!(
+            !resp.profiles.is_empty(),
+            "the first profile is never removed"
+        );
+        let mut cut_seen = false;
+        for (i, p) in resp.profiles.iter().enumerate() {
+            let o = &original.profiles[i];
+            let mut same_identity = p.clone();
+            same_identity.models = o.models.clone();
+            assert_eq!(&same_identity, o, "identity and status fields intact");
+            assert_eq!(
+                p.models[..],
+                o.models[..p.models.len()],
+                "models are a prefix"
+            );
+            if cut_seen {
+                assert!(p.models.is_empty(), "models go from the last profile first");
+            }
+            if p.models.len() < o.models.len() {
+                cut_seen = true;
+            }
+        }
+        if resp.omitted.profiles > 0 {
+            assert_eq!(models(resp), 0, "models are removed before any profile");
+        }
+    }
+
+    #[test]
+    fn maximal_catalogue_is_truncated_to_the_budget() {
+        for c in ['a', '\u{1}'] {
+            let original = fixtures::maximal_catalogue(c);
+            let before = serde_json::to_value(&original).expect("ser");
+            assert!(transport_cost(&before) > OUTPUT_BUDGET, "{c:?}");
+            let mut resp = original.clone();
+            truncate_capabilities(&mut resp);
+            assert!(resp.truncated);
+            check_truncation(&original, &resp);
+            if c == '\u{1}' {
+                assert!(
+                    resp.omitted.profiles > 0,
+                    "six-fold escaping drops whole profiles"
+                );
+            }
+            // With profile_id: a single maximal profile, the same rule.
+            let mut single = original.clone();
+            single.profiles.truncate(1);
+            let single_original = single.clone();
+            truncate_capabilities(&mut single);
+            check_truncation(&single_original, &single);
+            assert_eq!(single.profiles.len(), 1);
+        }
+        // Under the budget: untouched.
+        let mut small = fixtures::maximal_catalogue('a');
+        small.profiles.truncate(2);
+        let copy = small.clone();
+        truncate_capabilities(&mut small);
+        assert_eq!(small, copy);
+        assert!(!small.truncated);
+    }
+
+    #[test]
+    fn worst_case_summaries_fit_their_bound() {
+        for c in ['a', '\u{1}', 'é', '😀'] {
+            let s = fixtures::worst_summary(c);
+            assert!(
+                serde_json::to_string(&s).expect("ser").len() <= MAX_SUMMARY_BYTES,
+                "{c:?}"
+            );
+        }
+        let mut over = fixtures::worst_summary('\u{1}');
+        over.name = "n".repeat(500);
+        over.workspace.path = Some(fixtures::text('\u{1}', 50_000));
+        over.last_activity = Some(fixtures::text('\u{1}', 50_000));
+        over.delegation.reason = Some("r".repeat(5_000));
+        over.delegation.paths = vec!["p".repeat(5_000); 40];
+        if let Some(id) = &mut over.identity {
+            id.model.requested = Some("m".repeat(5_000));
+        }
+        fit_summary(&mut over);
+        assert!(serde_json::to_string(&over).expect("ser").len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(over.name.chars().count(), MAX_NAME_CHARS);
+        let path = over.workspace.path.clone().unwrap_or_default();
+        assert!(path.len() <= MAX_PATH_BYTES);
+        assert!(path.contains('…'));
+        assert!(over
+            .last_activity
+            .as_deref()
+            .is_some_and(|a| a.len() <= 512));
+        assert_eq!(over.delegation.paths.len(), MAX_STATUS_PATHS);
+        assert!(over
+            .identity
+            .as_ref()
+            .and_then(|i| i.model.requested.as_deref())
+            .is_some_and(|m| m.len() <= MAX_MODEL_BYTES));
+        let mut short = "a/b".to_owned();
+        shorten_middle(&mut short, 1024);
+        assert_eq!(short, "a/b");
+        let mut long = format!("/home/{}/end", "x".repeat(2000));
+        shorten_middle(&mut long, 64);
+        assert!(long.len() <= 64 && long.starts_with("/home/") && long.ends_with("/end"));
+    }
+
+    #[test]
+    fn maximal_spawn_receipt_replays_as_delivery_unknown_within_bounds() {
+        use crate::delegation::ids::AuthorityEpoch;
+        use crate::delegation::operation::{
+            replay, CanonicalRequest, OperationKind, ReplayOutcome, Resolution, StoredOperation,
+        };
+        let receipt = fixtures::worst_spawn_receipt('\u{1}');
+        let receipt_json = serde_json::to_string(&receipt).expect("ser");
+        assert!(
+            receipt_json.len() <= MAX_RECEIPT_BYTES,
+            "{}",
+            receipt_json.len()
+        );
+        let ack = serde_json::to_string(&fixtures::worst_ack('\u{1}')).expect("ser");
+        assert!(ack.len() <= MAX_ACK_BYTES);
+        let op = StoredOperation {
+            id: fixtures::operation(),
+            kind: OperationKind::Spawn,
+            epoch: AuthorityEpoch(1),
+            canonical: CanonicalRequest::from_stored("{}".into()),
+            resolution: Resolution::default(),
+            receipt: Some(serde_json::from_str(&receipt_json).expect("value")),
+            dispatch: DispatchState::Unknown,
+            error: None,
+        };
+        let ReplayOutcome::DeliveryUnknown(err) = replay(&op, false) else {
+            panic!("delivery_unknown");
+        };
+        let details = err.details.clone().expect("details");
+        assert!(serde_json::to_string(&details).expect("ser").len() <= MAX_ERROR_DETAILS_BYTES);
+        assert_eq!(
+            details["operation_id"],
+            json!(fixtures::operation().as_str())
+        );
+        // Byte for byte against the stored receipt (`receipt_json` as the store holds it).
+        let stored = serde_json::to_string(&op.receipt).expect("ser");
+        assert!(
+            serde_json::to_string(&details["receipt"]).expect("ser") == stored,
+            "the original receipt, byte for byte"
+        );
+        let back: SpawnReceipt = serde_json::from_value(details["receipt"].clone()).expect("de");
+        assert_eq!(back, receipt);
+        let output = json!({ "error": err });
+        assert!(transport_cost(&output) <= OUTPUT_BUDGET);
+    }
+
+    #[test]
+    fn request_ids_are_bounded_when_encoded() {
+        let encoded = |v: Value| serde_json::to_string(&v).expect("ser");
+        let s256 = encoded(json!("s".repeat(254)));
+        assert_eq!(s256.len(), 256);
+        assert!(request_id_ok(&s256));
+        assert!(!request_id_ok(&encoded(json!("s".repeat(255)))));
+        // Escaped characters count as encoded: 42 × 6 + 2 quotes + 2 = 256.
+        let esc = encoded(json!(format!("{}ab", "\u{1}".repeat(42))));
+        assert_eq!(esc.len(), 256);
+        assert!(request_id_ok(&esc));
+        let esc257 = encoded(json!(format!("{}abc", "\u{1}".repeat(42))));
+        assert_eq!(esc257.len(), 257);
+        assert!(!request_id_ok(&esc257));
+        // A number id as received (any length of digits).
+        assert!(request_id_ok(&"9".repeat(256)));
+        assert!(!request_id_ok(&"9".repeat(257)));
+        assert!(request_id_ok(&encoded(json!(7))));
+    }
+
+    #[test]
+    fn guard_output_replaces_an_oversized_output_and_leaves_the_operation_alone() {
+        use crate::delegation::ids::AuthorityEpoch;
+        use crate::delegation::operation::{
+            replay, CanonicalRequest, OperationKind, ReplayOutcome, Resolution, StoredOperation,
+        };
+        let small = json!({"ok": true});
+        assert_eq!(guard_output(small.clone(), None), Ok(small));
+        let receipt = serde_json::to_value(fixtures::worst_spawn_receipt('a')).expect("ser");
+        let op = StoredOperation {
+            id: fixtures::operation(),
+            kind: OperationKind::Spawn,
+            epoch: AuthorityEpoch(1),
+            canonical: CanonicalRequest::from_stored("{}".into()),
+            resolution: Resolution::default(),
+            receipt: Some(receipt.clone()),
+            dispatch: DispatchState::Accepted,
+            error: None,
+        };
+        let stored_before = op.clone();
+        let huge = json!({"x": "y".repeat(OUTPUT_BUDGET)});
+        let err = guard_output(huge, Some(&op.id)).expect_err("over budget");
+        assert_eq!(err.code, ErrorCode::InternalError);
+        assert!(!err.retryable);
+        let d = err.details.expect("details");
+        assert_eq!(d["reason"], "output_budget");
+        assert_eq!(d["operation_id"], json!(op.id.as_str()));
+        assert_eq!(op, stored_before);
+        let ReplayOutcome::Receipt(r) = replay(&op, false) else {
+            panic!("replay");
+        };
+        assert_eq!(r["worker_id"], receipt["worker_id"]);
+        assert_eq!(r["replayed"], true);
+    }
+
+    #[test]
+    fn a_send_receipt_is_frozen_at_acceptance() {
+        use crate::delegation::ids::AuthorityEpoch;
+        use crate::delegation::mailbox::delivery_step;
+        use crate::delegation::operation::{
+            replay, CanonicalRequest, OperationKind, ReplayOutcome, Resolution, StoredOperation,
+        };
+        let target = fixtures::run('A');
+        let accepted = SendReceipt {
+            receipt: MutationReceipt {
+                api_version: 1,
+                operation_id: fixtures::operation(),
+                authority_epoch: 3,
+                replayed: false,
+                dispatch: DispatchState::Accepted,
+                warnings: vec![],
+            },
+            message_id: fixtures::message('M'),
+            delivery: DeliveryState::Submitted,
+            target_run_id: Some(target.clone()),
+        };
+        let mut op = StoredOperation {
+            id: fixtures::operation(),
+            kind: OperationKind::Send,
+            epoch: AuthorityEpoch(3),
+            canonical: CanonicalRequest::from_stored("{}".into()),
+            resolution: Resolution::default(),
+            receipt: Some(serde_json::to_value(&accepted).expect("ser")),
+            dispatch: DispatchState::Accepted,
+            error: None,
+        };
+        // The message later lands in another run: a fact on the message record only.
+        let record = delivery_step(DeliveryState::Submitted, DeliveryState::Misdelivered);
+        assert_eq!(record, Ok(DeliveryState::Misdelivered));
+        op.dispatch = DispatchState::Confirmed;
+        let ReplayOutcome::Receipt(r) = replay(&op, false) else {
+            panic!("replay");
+        };
+        let replayed: SendReceipt = serde_json::from_value(r).expect("de");
+        assert_eq!(replayed.target_run_id, Some(target));
+        assert_eq!(replayed.delivery, DeliveryState::Submitted);
+        assert!(replayed.receipt.replayed);
+        assert_eq!(replayed.receipt.dispatch, DispatchState::Confirmed);
+        let mut expected = accepted.clone();
+        expected.receipt.replayed = true;
+        expected.receipt.dispatch = DispatchState::Confirmed;
+        assert_eq!(replayed, expected);
     }
 
     #[test]

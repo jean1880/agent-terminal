@@ -192,6 +192,13 @@ checked_string!(
     Cursor,
     |s| bounded(s, MAX_CURSOR_BYTES, |b| (0x21..0x7f).contains(&b))
 );
+impl Cursor {
+    /// A cursor `page::encode_cursor` built: base64url, well under 256 bytes.
+    pub(crate) fn from_encoded(s: String) -> Self {
+        Self(s)
+    }
+}
+
 checked_string!(
     /// `^[A-Za-z0-9._:-]{1,128}$`.
     IdempotencyKey,
