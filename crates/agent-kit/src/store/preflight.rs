@@ -148,35 +148,87 @@ fn effective_uid() -> Option<u32> {
     fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
-/// Makes the store's directory trustworthy before anything in it is opened: it must be ours, and
-/// writable by no one else. A directory of ours that others may write to is tightened to `0700`
-/// first; one owned by someone else is refused, as nothing under it can be trusted to stay put.
+/// The process's effective (primary) gid, the group of `/proc/self`, when it can be read.
+fn effective_gid() -> Option<u32> {
+    fs::metadata("/proc/self").ok().map(|m| m.gid())
+}
+
+/// The name of the app's own state directory (`$XDG_STATE_HOME/agent-terminal`): the only
+/// directory the app tightens on its own. A store placed anywhere else is the user's layout.
+pub(crate) const APP_DIR_NAME: &str = "agent-terminal";
+
+/// Whether `dir` is the app's own state directory (by name), the one it may make private.
+pub(crate) fn is_app_dir(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == APP_DIR_NAME)
+}
+
+/// Makes the directory that actually holds the store trustworthy before anything in it is opened.
+/// `dir` is resolved (no symlink) and is never the directory a symlink to the store lives in.
+///
+/// - Another user's directory is refused.
+/// - The app's own `agent-terminal` directory, writable by group or others, is tightened to `0700`
+///   (a umask of 002 leaves it `0775` with the user's private group, and refusing would break
+///   upgrades).
+/// - Any other directory is the user's layout and is never changed: it is refused when others may
+///   write to it, or a group other than the user's own primary group. Group-writable by the
+///   user's own group (the umask-002 default) is accepted as it is.
+///
+/// The checks and the `chmod` go through one open descriptor (`fstat`/`fchmod`), whose identity is
+/// compared with the path's before and after. agent-kit has no `openat`/`O_NOFOLLOW` binding
+/// (std only, no libc dependency), hence the identity re-checks rather than descriptor-relative
+/// operations.
+///
+/// Threat model: a same-UID desktop app. Another local user racing the user's own state directory
+/// through a writable ancestor is out of scope; these checks keep what the app itself does correct
+/// and stop it from opening, or changing, anything it did not mean to.
 pub(crate) fn trust_dir(dir: &Path) -> Result<()> {
-    let meta = fs::metadata(dir)
+    let named = id_of_path(dir, "the store directory")?;
+    let handle = fs::File::open(dir)
+        .map_err(|e| StoreError::Upgrade(format!("open the store directory: {e}")))?;
+    let meta = handle
+        .metadata()
         .map_err(|e| StoreError::Upgrade(format!("stat the store directory: {e}")))?;
+    if FileId::of(&meta) != named {
+        return Err(StoreError::Upgrade(format!(
+            "the store directory {} was replaced while it was opened",
+            dir.display()
+        )));
+    }
     if !meta.is_dir() {
         return Err(StoreError::Upgrade(format!(
             "{} is not a directory",
             dir.display()
         )));
     }
-    let ours = effective_uid().is_none_or(|uid| uid == meta.uid());
-    if !ours {
+    if effective_uid().is_some_and(|uid| uid != meta.uid()) {
         return Err(StoreError::Upgrade(format!(
             "the store directory {} belongs to another user; move the store into a directory of \
              your own",
             dir.display()
         )));
     }
-    if meta.mode() & 0o022 != 0 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    // Group-writable by the user's own (primary, usually private) group is the umask-002 default
+    // and, in a same-UID threat model, not a foreign writer.
+    let own_group = effective_gid().is_some_and(|gid| gid == meta.gid());
+    let foreign_writers = meta.mode() & 0o002 != 0 || (meta.mode() & 0o020 != 0 && !own_group);
+    if foreign_writers && !is_app_dir(dir) {
+        return Err(StoreError::Upgrade(format!(
+            "the store directory {} is writable by other users; make it private (chmod go-w) or \
+             move the store into the app's own state directory",
+            dir.display()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 && is_app_dir(dir) {
+        handle
+            .set_permissions(fs::Permissions::from_mode(0o700))
             .map_err(|e| StoreError::Upgrade(format!("make the store directory private: {e}")))?;
     }
-    Ok(())
+    expect_same(dir, named, "the store directory")
 }
 
-/// Resolves an existing database path once, to an absolute path free of symlinks, and makes its
-/// real directory trustworthy ([`trust_dir`]). Everything after uses only this path.
+/// Resolves an existing database path once, to an absolute path free of symlinks, and makes the
+/// directory that really holds it trustworthy ([`trust_dir`]); the directory a symlink to it lives
+/// in is never touched. Everything after uses only this path.
 pub(crate) fn resolve(db: &Path) -> Result<PathBuf> {
     let real = fs::canonicalize(db)
         .map_err(|e| StoreError::Upgrade(format!("resolve {}: {e}", db.display())))?;
@@ -444,7 +496,7 @@ fn publish(tmp: &Path, published: &Path, hooks: &Hooks) -> Result<()> {
 fn holds_nothing(conn: &Connection) -> Result<bool> {
     let others: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master
-         WHERE name <> 'schema_version' AND name NOT LIKE 'sqlite_%'",
+         WHERE name <> 'schema_version' AND substr(name, 1, 7) <> 'sqlite_'",
         [],
         |r| r.get(0),
     )?;
@@ -676,7 +728,7 @@ mod tests {
     }
 
     fn db_in(dir: &tempfile::TempDir) -> PathBuf {
-        dir.path().join("state").join("threads.db")
+        dir.path().join(APP_DIR_NAME).join("threads.db")
     }
 
     fn read_only(path: &Path) -> Connection {
@@ -1181,6 +1233,75 @@ mod tests {
         Store::open_with(&db, &hooks).expect("open");
         assert_eq!(mode(parent), 0o700);
         assert!(trace.lock().expect("t").contains(&"migrate".to_owned()));
+    }
+
+    #[test]
+    fn a_group_writable_directory_the_user_chose_is_refused_and_left_as_it_was() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir.path().join("shared").join("threads.db");
+        fixture(&db, 3);
+        let parent = db.parent().expect("p");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o777)).expect("chmod");
+        let refused = Store::open(&db);
+        assert!(
+            matches!(&refused, Err(StoreError::Upgrade(why)) if why.contains("writable by other")),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(mode(parent), 0o777, "never changed");
+        assert_untouched(&db);
+        // Writable only by the user's own group (umask 002): accepted, and still never changed.
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o775)).expect("chmod");
+        drop(Store::open(&db).expect("open"));
+        assert_eq!(mode(parent), 0o775);
+        assert_preserved(&db);
+    }
+
+    #[test]
+    fn a_symlink_in_another_directory_of_the_users_leaves_that_directory_alone() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let real = db_in(&dir);
+        fixture(&real, 3);
+        let link_dir = dir.path().join("projects");
+        fs::create_dir(&link_dir).expect("dir");
+        fs::set_permissions(&link_dir, fs::Permissions::from_mode(0o775)).expect("chmod");
+        let link = link_dir.join("threads.db");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        drop(Store::open(&link).expect("open through the link"));
+        assert_eq!(
+            mode(&link_dir),
+            0o775,
+            "the symlink's directory is untouched"
+        );
+        assert!(!link_dir.join(BACKUP_DIR).exists());
+        assert!(!link_dir.join("threads.db.upgrade-lock").exists());
+        assert_preserved(&real);
+    }
+
+    #[test]
+    fn a_table_named_like_sqlite_but_not_reserved_is_data_not_an_empty_store() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(db.parent().expect("p"))
+            .expect("dir");
+        {
+            let c = Connection::open(&db).expect("open");
+            c.execute_batch(
+                "CREATE TABLE sqliteArchive (name TEXT); INSERT INTO sqliteArchive VALUES ('x');",
+            )
+            .expect("data");
+        }
+        let before = fs::read(&db).expect("bytes");
+        let refused = Store::open(&db);
+        assert!(
+            matches!(&refused, Err(StoreError::Upgrade(why)) if why.contains("Move it aside")),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(fs::read(&db).expect("bytes"), before);
     }
 
     #[test]

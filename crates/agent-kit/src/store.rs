@@ -501,15 +501,17 @@ impl Store {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         create_private_dir(parent)?;
-        // The directory is made trustworthy (ours, writable by no one else) before anything in
-        // it is opened, and an existing store is resolved once to its real, absolute path.
-        preflight::trust_dir(parent)?;
+        // An existing store is resolved first, once, to its real absolute path, and only the
+        // directory that really holds it is made trustworthy (`preflight::trust_dir`): never the
+        // directory a symlink to it lives in.
         let resolved;
         let path = if path.exists() {
             resolved = preflight::resolve(path)?;
             preflight::run(&resolved, hooks)?;
             resolved.as_path()
         } else {
+            let real_parent = std::fs::canonicalize(parent)?;
+            preflight::trust_dir(&real_parent)?;
             path
         };
         create_private_file(path)?;
@@ -1881,7 +1883,11 @@ fn tighten_permissions(path: &Path) -> Result<()> {
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let dir = std::fs::metadata(parent)?;
-        if dir.uid() == file.uid() && dir.permissions().mode() & 0o777 != 0o700 {
+        // Only the app's own state directory: a directory the user chose is never changed.
+        if preflight::is_app_dir(parent)
+            && dir.uid() == file.uid()
+            && dir.permissions().mode() & 0o777 != 0o700
+        {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
