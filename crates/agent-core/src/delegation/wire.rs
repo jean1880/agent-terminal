@@ -829,8 +829,11 @@ impl ToolRequest {
                     limits.page_bytes_max,
                 )?;
                 check_count("acknowledge", r.acknowledge.as_ref(), limits.ack_batch_max)?;
-                let acks = r.acknowledge.as_ref().is_some_and(|a| !a.is_empty());
-                match (acks, r.idempotency_key.is_some()) {
+                // Present means 1..=100 entries: `idempotency_key` is required iff it is.
+                if r.acknowledge.as_ref().is_some_and(Vec::is_empty) {
+                    return Err(ToolError::invalid("acknowledge", "empty"));
+                }
+                match (r.acknowledge.is_some(), r.idempotency_key.is_some()) {
                     (true, false) => Err(ToolError::invalid(
                         "idempotency_key",
                         "required_with_acknowledge",
@@ -871,7 +874,7 @@ impl ToolRequest {
     }
 
     /// Every omitted optional field with a documented default filled in (contract §2
-    /// canonical request). An empty `acknowledge` is the same as none.
+    /// canonical request).
     pub fn normalised(&self) -> ToolRequest {
         let mut out = self.clone();
         match &mut out {
@@ -883,9 +886,6 @@ impl ToolRequest {
             ToolRequest::Read(r) => {
                 r.max_events.get_or_insert(DEFAULT_PAGE_EVENTS);
                 r.max_bytes.get_or_insert(DEFAULT_PAGE_BYTES);
-                if r.acknowledge.as_ref().is_some_and(|a| a.is_empty()) {
-                    r.acknowledge = None;
-                }
             }
             ToolRequest::Wait(r) => {
                 r.mailbox.get_or_insert(true);
@@ -2050,7 +2050,17 @@ mod tests {
             json!({"idempotency_key": "k"}),
             "idempotency_key",
         );
-        assert!(parse(ToolName::CrossAgentRead, json!({"acknowledge": []})).is_ok());
+        // Present means 1..=100 entries, with or without a key.
+        assert_invalid(
+            ToolName::CrossAgentRead,
+            json!({"acknowledge": []}),
+            "acknowledge",
+        );
+        assert_invalid(
+            ToolName::CrossAgentRead,
+            json!({"acknowledge": [], "idempotency_key": "k"}),
+            "acknowledge",
+        );
     }
 
     #[test]

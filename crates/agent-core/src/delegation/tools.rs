@@ -301,7 +301,8 @@ fn input_schema_with(tool: ToolName, l: &Limits) -> Value {
                 "after": cursor(),
                 "max_events": page_events,
                 "max_bytes": page_bytes,
-                "acknowledge": {"type": "array", "items": handle("m_"), "maxItems": l.ack_batch_max},
+                "acknowledge": {"type": "array", "items": handle("m_"), "minItems": 1,
+                                "maxItems": l.ack_batch_max},
                 "idempotency_key": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$",
                                     "description": "Required if and only if acknowledge is given."},
                 "expected_authority_epoch": epoch()
@@ -616,6 +617,13 @@ mod tests {
                 assert!(s["properties"].get(name).is_some(), "{t:?} {name}");
             }
         }
+    }
+
+    #[test]
+    fn acknowledge_holds_one_to_a_hundred_ids() {
+        let ack = &ToolName::CrossAgentRead.input_schema()["properties"]["acknowledge"];
+        assert_eq!(ack["minItems"], 1);
+        assert_eq!(ack["maxItems"], 100);
     }
 
     #[test]
