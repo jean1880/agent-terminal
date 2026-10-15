@@ -62,13 +62,25 @@ pub(crate) enum Fault {
 }
 
 /// Test hooks of the preflight; empty (and free) outside tests.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Hooks {
     #[cfg(test)]
     pub fault: Option<Fault>,
     /// How long to hold the reservation before the backup (concurrency tests).
     #[cfg(test)]
     pub hold: std::time::Duration,
+    /// Records the durability-relevant steps in order (`sync parent`, `sync backups`, `migrate`).
+    #[cfg(test)]
+    pub trace: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    /// Called with the database path under the reservation, before the backup source is opened.
+    #[cfg(test)]
+    pub before_backup: Option<fn(&Path)>,
+    /// Called with the backup directory just before publication.
+    #[cfg(test)]
+    pub before_publish: Option<fn(&Path)>,
+    /// `max_page_count` of the backup destination: a full disk.
+    #[cfg(test)]
+    pub backup_max_pages: Option<i64>,
 }
 
 impl Hooks {
@@ -79,6 +91,108 @@ impl Hooks {
         }
         Ok(())
     }
+
+    /// Records one step for the ordering tests; nothing outside tests.
+    fn note(&self, _step: &str) {
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            if let Ok(mut t) = trace.lock() {
+                t.push(_step.to_owned());
+            }
+        }
+    }
+}
+
+/// A file's identity: (device, inode), stable whatever its name becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// The identity of what `path` names, refusing a symlink (never followed).
+fn id_of_path(path: &Path, what: &str) -> Result<FileId> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| StoreError::Upgrade(format!("stat {what} {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(StoreError::Upgrade(format!(
+            "{what} {} became a symlink; refusing to upgrade",
+            path.display()
+        )));
+    }
+    Ok(FileId::of(&meta))
+}
+
+/// `path` still names the object identified as `expected`; else the upgrade is refused.
+fn expect_same(path: &Path, expected: FileId, what: &str) -> Result<()> {
+    if id_of_path(path, what)? != expected {
+        return Err(StoreError::Upgrade(format!(
+            "{what} {} was replaced during the upgrade; refusing to continue",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The process's effective uid (the owner of `/proc/self`), when it can be read.
+fn effective_uid() -> Option<u32> {
+    fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+/// Makes the store's directory trustworthy before anything in it is opened: it must be ours, and
+/// writable by no one else. A directory of ours that others may write to is tightened to `0700`
+/// first; one owned by someone else is refused, as nothing under it can be trusted to stay put.
+pub(crate) fn trust_dir(dir: &Path) -> Result<()> {
+    let meta = fs::metadata(dir)
+        .map_err(|e| StoreError::Upgrade(format!("stat the store directory: {e}")))?;
+    if !meta.is_dir() {
+        return Err(StoreError::Upgrade(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let ours = effective_uid().is_none_or(|uid| uid == meta.uid());
+    if !ours {
+        return Err(StoreError::Upgrade(format!(
+            "the store directory {} belongs to another user; move the store into a directory of \
+             your own",
+            dir.display()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| StoreError::Upgrade(format!("make the store directory private: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Resolves an existing database path once, to an absolute path free of symlinks, and makes its
+/// real directory trustworthy ([`trust_dir`]). Everything after uses only this path.
+pub(crate) fn resolve(db: &Path) -> Result<PathBuf> {
+    let real = fs::canonicalize(db)
+        .map_err(|e| StoreError::Upgrade(format!("resolve {}: {e}", db.display())))?;
+    let meta = fs::symlink_metadata(&real)
+        .map_err(|e| StoreError::Upgrade(format!("stat {}: {e}", real.display())))?;
+    if !meta.is_file() {
+        return Err(StoreError::Upgrade(format!(
+            "{} is not a regular file",
+            real.display()
+        )));
+    }
+    let parent = real
+        .parent()
+        .ok_or_else(|| StoreError::Upgrade("the store has no directory".into()))?;
+    trust_dir(parent)?;
+    Ok(real)
 }
 
 /// `fail_at` outside tests: nothing.
@@ -159,45 +273,56 @@ fn nanos() -> u128 {
         .unwrap_or(0)
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+/// fsyncs a directory, so the entries created in it survive a power loss.
+fn sync_dir(dir: &Path, hooks: &Hooks, step: &str) -> Result<()> {
+    hooks.note(step);
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
-        .map_err(upgrade_err("sync the backup directory"))
+        .map_err(|e| StoreError::Upgrade(format!("sync {}: {e}", dir.display())))
 }
 
-/// The backup directory beside `db`: created `0700`, brought to `0700` when it is ours, and refused
-/// when it is not private (another owner, or a mode we could not set).
-fn private_backup_dir(db: &Path) -> Result<PathBuf> {
+/// The backup directory beside the (resolved) database: created `0700`, or an existing one of ours
+/// made `0700`. A symlink, a non-directory or another owner's directory is refused, never followed.
+/// The parent is fsynced whether or not the directory was just created, so its entry is durable
+/// before any migration relies on a backup inside it. Returns the directory and its identity.
+fn private_backup_dir(db: &Path, hooks: &Hooks) -> Result<(PathBuf, FileId)> {
     let parent = db
         .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .ok_or_else(|| StoreError::Upgrade("the store has no directory".into()))?;
     let dir = parent.join(BACKUP_DIR);
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(upgrade_err("create the backup directory"))?;
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(upgrade_err("create the backup directory")(e)),
+    }
     let meta = fs::symlink_metadata(&dir).map_err(upgrade_err("stat the backup directory"))?;
-    let owner = fs::metadata(db)
-        .map_err(upgrade_err("stat the database"))?
-        .uid();
-    if !meta.is_dir() || meta.uid() != owner {
-        return Err(StoreError::Upgrade(
-            "the backup directory is not a private directory of the store's owner".into(),
-        ));
+    let owner = effective_uid().unwrap_or_else(|| meta.uid());
+    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != owner {
+        return Err(StoreError::Upgrade(format!(
+            "{} is not a private directory of yours (a symlink, a file or another user's); move \
+             it aside and start the app again",
+            dir.display()
+        )));
     }
     if meta.mode() & 0o777 != 0o700 {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .map_err(upgrade_err("make the backup directory private"))?;
     }
-    Ok(dir)
+    sync_dir(parent, hooks, "sync parent")?;
+    Ok((dir, FileId::of(&meta)))
 }
 
 /// Backs the reserved, unmodified database up from a SEPARATE read-only connection into a private
-/// temporary file, and verifies it. Returns the verified temporary path; on any failure the
-/// temporary file is removed.
-fn backup_and_verify(db: &Path, dir: &Path, version: i64, hooks: &Hooks) -> Result<PathBuf> {
+/// temporary file, and verifies it. The source connection must open the very file the reservation
+/// holds (`db_id`). Returns the verified temporary path; on any failure the temporary file is
+/// removed.
+fn backup_and_verify(
+    db: &Path,
+    db_id: FileId,
+    dir: &Path,
+    version: i64,
+    hooks: &Hooks,
+) -> Result<PathBuf> {
     let tmp = dir.join(format!(".tmp-{}-{}.db", std::process::id(), nanos()));
     fs::OpenOptions::new()
         .write(true)
@@ -211,7 +336,15 @@ fn backup_and_verify(db: &Path, dir: &Path, version: i64, hooks: &Hooks) -> Resu
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         src.busy_timeout(BUSY_TIMEOUT)?;
+        // The source is the reserved file, not whatever the name points at now.
+        expect_same(db, db_id, "the database")?;
         let mut dst = Connection::open(&tmp)?;
+        #[cfg(test)]
+        if let Some(pages) = hooks.backup_max_pages {
+            let _: i64 = dst.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |r| {
+                r.get(0)
+            })?;
+        }
         // One read transaction pins the snapshot both the counts and the copy come from.
         src.execute_batch("BEGIN")?;
         let expected = counts(&src)?;
@@ -295,18 +428,43 @@ fn verify(path: &Path, version: i64, expected: (i64, i64, i64)) -> Result<()> {
     Ok(())
 }
 
-/// Publishes the verified temporary backup under `name` in its directory without ever replacing an
-/// existing file (`link(2)` fails with `EEXIST`), then drops the temporary name.
-pub(crate) fn publish(tmp: &Path, published: &Path) -> Result<()> {
+/// Publishes the verified temporary backup under `published` without ever replacing an existing
+/// file (`link(2)` fails with `EEXIST`), then drops the temporary name and fsyncs the directory.
+fn publish(tmp: &Path, published: &Path, hooks: &Hooks) -> Result<()> {
     fs::hard_link(tmp, published).map_err(upgrade_err("publish the backup"))?;
     fs::remove_file(tmp).map_err(upgrade_err("remove the temporary backup name"))?;
     if let Some(dir) = published.parent() {
-        sync_dir(dir)?;
+        sync_dir(dir, hooks, "sync backups")?;
     }
     Ok(())
 }
 
-/// Runs the preflight on an existing database file. See the module docs for the sequence.
+/// Whether a database without a schema version holds nothing at all: no table, index, view or
+/// trigger but an empty `schema_version` (which a fresh open creates before its migration).
+fn holds_nothing(conn: &Connection) -> Result<bool> {
+    let others: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE name <> 'schema_version' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if others > 0 {
+        return Ok(false);
+    }
+    let has_version_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_version_table {
+        return Ok(true);
+    }
+    let rows: i64 = conn.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))?;
+    Ok(rows == 0)
+}
+
+/// Runs the preflight on an existing database file, `db` already [`resolve`]d (absolute, no
+/// symlink, in a trusted directory). See the module docs for the sequence.
 pub(crate) fn run(db: &Path, hooks: &Hooks) -> Result<Outcome> {
     let lock = fs::OpenOptions::new()
         .read(true)
@@ -318,14 +476,30 @@ pub(crate) fn run(db: &Path, hooks: &Hooks) -> Result<Outcome> {
         .map_err(upgrade_err("open the upgrade lock"))?;
     lock.lock().map_err(upgrade_err("take the upgrade lock"))?;
     // The lock is released when `lock` is dropped (closing the descriptor releases the flock).
+    // The database's identity, bound by a held descriptor: every later open must reach this file.
+    let db_id = id_of_path(db, "the database")?;
+    let held = fs::File::open(db).map_err(upgrade_err("open the database"))?;
+    if FileId::of(&held.metadata()?) != db_id {
+        return Err(StoreError::Upgrade(
+            "the database was replaced while it was opened; refusing to upgrade".into(),
+        ));
+    }
     let conn = Connection::open_with_flags(
         db,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    expect_same(db, db_id, "the database")?;
     let version = read_version(&conn)?;
     if version == 0 {
-        return Ok(Outcome::Fresh);
+        if holds_nothing(&conn)? {
+            return Ok(Outcome::Fresh);
+        }
+        return Err(StoreError::Upgrade(format!(
+            "{} holds data but no schema version this app recognises; it was left untouched. \
+             Move it aside to start a new store, or restore a backup",
+            db.display()
+        )));
     }
     if version > SCHEMA_VERSION {
         return Err(StoreError::SchemaTooNew {
@@ -342,7 +516,7 @@ pub(crate) fn run(db: &Path, hooks: &Hooks) -> Result<Outcome> {
     // transaction: off before the reservation. This connection is closed afterwards.
     conn.execute_batch("PRAGMA foreign_keys = OFF")?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = reserved(&conn, db, hooks);
+    let result = reserved(&conn, db, db_id, hooks);
     let out = match result {
         Ok(outcome) => match conn.execute_batch("COMMIT") {
             Ok(()) => Ok(outcome),
@@ -359,12 +533,13 @@ pub(crate) fn run(db: &Path, hooks: &Hooks) -> Result<Outcome> {
         }
     };
     drop(conn);
+    drop(held);
     drop(lock);
     out
 }
 
 /// The body of [`run`] under the reservation: recheck, back up, publish, migrate.
-fn reserved(conn: &Connection, db: &Path, hooks: &Hooks) -> Result<Outcome> {
+fn reserved(conn: &Connection, db: &Path, db_id: FileId, hooks: &Hooks) -> Result<Outcome> {
     // Another opener may have upgraded while this one waited for the lock.
     let version = read_version(conn)?;
     if version == SCHEMA_VERSION {
@@ -380,8 +555,12 @@ fn reserved(conn: &Connection, db: &Path, hooks: &Hooks) -> Result<Outcome> {
     fail_at!(hooks, AfterReserve);
     #[cfg(test)]
     std::thread::sleep(hooks.hold);
-    let dir = private_backup_dir(db)?;
-    let tmp = backup_and_verify(db, &dir, version, hooks)?;
+    #[cfg(test)]
+    if let Some(swap) = hooks.before_backup {
+        swap(db);
+    }
+    let (dir, dir_id) = private_backup_dir(db, hooks)?;
+    let tmp = backup_and_verify(db, db_id, &dir, version, hooks)?;
     #[cfg(test)]
     if hooks.fault == Some(Fault::AfterVerify) {
         let _ = fs::remove_file(&tmp);
@@ -400,11 +579,23 @@ fn reserved(conn: &Connection, db: &Path, hooks: &Hooks) -> Result<Outcome> {
         std::process::id(),
         nanos()
     ));
-    if let Err(e) = publish(&tmp, &published) {
+    #[cfg(test)]
+    if let Some(swap) = hooks.before_publish {
+        swap(&dir);
+    }
+    // Publish only into the directory that was checked, never through a swapped-in one.
+    let published_ok = expect_same(&dir, dir_id, "the backup directory")
+        .and_then(|()| publish(&tmp, &published, hooks));
+    if let Err(e) = published_ok {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     // From here a failure leaves a valid, published orphan backup: retained, never deleted.
+    // Never migrate unless the backup's directory is still the checked one and the database is
+    // still the reserved file.
+    expect_same(&dir, dir_id, "the backup directory")?;
+    expect_same(db, db_id, "the database")?;
+    hooks.note("migrate");
     migrate_locked(conn, true)?;
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -751,8 +942,9 @@ mod tests {
         let target = dir.path().join("threads-v3-1.db");
         fs::write(&tmp, b"new").expect("tmp");
         fs::write(&target, b"kept").expect("target");
+        let hooks = Hooks::default();
         assert!(matches!(
-            publish(&tmp, &target),
+            publish(&tmp, &target, &hooks),
             Err(StoreError::Upgrade(_))
         ));
         assert_eq!(fs::read(&target).expect("read"), b"kept");
@@ -761,7 +953,7 @@ mod tests {
             "the source is left for the caller to clean up"
         );
         let fresh = dir.path().join("threads-v3-2.db");
-        publish(&tmp, &fresh).expect("publish");
+        publish(&tmp, &fresh, &hooks).expect("publish");
         assert_eq!(fs::read(&fresh).expect("read"), b"new");
         assert!(!tmp.exists());
     }
@@ -905,5 +1097,237 @@ mod tests {
         assert_eq!(done, vec![PathBuf::from(&recorded[0])]);
         assert!(tmp.is_empty());
         assert_preserved(&db);
+    }
+
+    fn traced() -> (Hooks, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hooks = Hooks {
+            trace: Some(trace.clone()),
+            ..Hooks::default()
+        };
+        (hooks, trace)
+    }
+
+    /// The schema is still the fixture's v3 and nothing was published.
+    fn assert_untouched(db: &Path) {
+        let c = read_only(db);
+        assert_eq!(read_version(&c).expect("v"), 3);
+        assert!(!has_table(&c, "delegation_roots"));
+        assert_eq!(counts(&c).expect("counts"), (2, 2, EVENTS));
+        let (done, tmp) = backups(db);
+        assert!(done.is_empty() && tmp.is_empty(), "{done:?} {tmp:?}");
+    }
+
+    #[test]
+    fn the_backup_directory_and_its_parent_are_synced_before_the_migration() {
+        for precreated in [false, true] {
+            let dir = tempfile::tempdir().expect("tmp");
+            let db = db_in(&dir);
+            fixture(&db, 3);
+            if precreated {
+                fs::create_dir(db.parent().expect("p").join(BACKUP_DIR)).expect("backups");
+            }
+            let (hooks, trace) = traced();
+            Store::open_with(&db, &hooks).expect("open");
+            let steps = trace.lock().expect("trace").clone();
+            assert_eq!(
+                steps,
+                vec!["sync parent", "sync backups", "migrate"],
+                "precreated={precreated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlinked_database_is_resolved_once_and_its_real_directory_holds_the_backup() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let real = db_in(&dir);
+        fixture(&real, 3);
+        let link_dir = dir.path().join("elsewhere");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&link_dir)
+            .expect("dir");
+        let link = link_dir.join("threads.db");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let s = Store::open(&link).expect("open through the link");
+        let recorded = PathBuf::from(s.meta(PRE_V4_BACKUP_KEY).expect("m").expect("set"));
+        assert!(recorded.is_absolute());
+        assert_eq!(
+            recorded.parent(),
+            Some(
+                fs::canonicalize(real.parent().expect("p"))
+                    .expect("c")
+                    .join(BACKUP_DIR)
+                    .as_path()
+            )
+        );
+        assert!(!link_dir.join(BACKUP_DIR).exists());
+        assert!(fs::symlink_metadata(&link)
+            .expect("l")
+            .file_type()
+            .is_symlink());
+        assert_preserved(&real);
+    }
+
+    #[test]
+    fn a_group_writable_store_directory_is_made_private_before_the_preflight() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 3);
+        let parent = db.parent().expect("p");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o770)).expect("chmod");
+        let (hooks, trace) = traced();
+        Store::open_with(&db, &hooks).expect("open");
+        assert_eq!(mode(parent), 0o700);
+        assert!(trace.lock().expect("t").contains(&"migrate".to_owned()));
+    }
+
+    #[test]
+    fn a_database_replaced_during_the_reservation_is_never_backed_up_or_migrated() {
+        fn swap(db: &Path) {
+            let aside = db.with_extension("reserved");
+            fs::rename(db, &aside).expect("move the reserved file aside");
+            fs::copy(&aside, db).expect("another file under the name");
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 3);
+        let hooks = Hooks {
+            before_backup: Some(swap),
+            ..Hooks::default()
+        };
+        let refused = Store::open_with(&db, &hooks);
+        assert!(
+            matches!(&refused, Err(StoreError::Upgrade(why)) if why.contains("replaced")),
+            "{:?}",
+            refused.err()
+        );
+        assert_untouched(&db.with_extension("reserved"));
+        assert_untouched(&db);
+    }
+
+    #[test]
+    fn a_swapped_backup_directory_is_refused_before_publication() {
+        fn swap(dir: &Path) {
+            let aside = dir.with_extension("checked");
+            fs::rename(dir, &aside).expect("move backups aside");
+            std::os::unix::fs::symlink(&aside, dir).expect("symlink in its place");
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 3);
+        let hooks = Hooks {
+            before_publish: Some(swap),
+            ..Hooks::default()
+        };
+        let refused = Store::open_with(&db, &hooks);
+        assert!(
+            matches!(&refused, Err(StoreError::Upgrade(why)) if why.contains("symlink")),
+            "{:?}",
+            refused.err()
+        );
+        let c = read_only(&db);
+        assert_eq!(read_version(&c).expect("v"), 3);
+        assert!(!has_table(&c, "delegation_roots"));
+        let aside = db.parent().expect("p").join("backups.checked");
+        let left: Vec<_> = fs::read_dir(aside).expect("dir").flatten().collect();
+        assert!(left.is_empty(), "nothing published: {left:?}");
+        // A symlinked backups/ stays refused on the next open, never followed.
+        assert!(matches!(Store::open(&db), Err(StoreError::Upgrade(_))));
+    }
+
+    #[test]
+    fn a_database_with_data_but_no_schema_version_is_refused_without_a_write() {
+        for with_empty_version_table in [false, true] {
+            let dir = tempfile::tempdir().expect("tmp");
+            let db = db_in(&dir);
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(db.parent().expect("p"))
+                .expect("dir");
+            {
+                let c = Connection::open(&db).expect("open");
+                c.execute_batch(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);
+                     INSERT INTO threads VALUES ('t1', 'someone else''s data');",
+                )
+                .expect("data");
+                if with_empty_version_table {
+                    c.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+                        .expect("empty version table");
+                }
+            }
+            let before = fs::read(&db).expect("bytes");
+            let refused = Store::open(&db);
+            assert!(
+                matches!(&refused, Err(StoreError::Upgrade(why)) if why.contains("Move it aside")),
+                "{:?}",
+                refused.err()
+            );
+            assert_eq!(fs::read(&db).expect("bytes"), before, "not a byte written");
+            let c = read_only(&db);
+            let journal: String = c
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .expect("journal");
+            assert_eq!(journal, "delete", "no WAL switch");
+            assert!(!has_table(&c, "provider_threads"));
+        }
+    }
+
+    #[test]
+    fn a_read_only_store_directory_refuses_the_upgrade_untouched() {
+        if effective_uid() == Some(0) {
+            return; // root writes through any mode
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 3);
+        let parent = db.parent().expect("p").to_owned();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).expect("chmod");
+        let refused = Store::open(&db);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod back");
+        assert!(refused.is_err());
+        assert_untouched(&db);
+        Store::open(&db).expect("a writable directory upgrades");
+    }
+
+    #[test]
+    fn a_full_disk_during_the_backup_refuses_the_upgrade_untouched() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 3);
+        let hooks = Hooks {
+            backup_max_pages: Some(1),
+            ..Hooks::default()
+        };
+        let refused = Store::open_with(&db, &hooks);
+        assert!(
+            matches!(&refused, Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)))
+                if f.code == rusqlite::ErrorCode::DiskFull),
+            "{:?}",
+            refused.err()
+        );
+        assert_untouched(&db);
+        assert_preserved(&db);
+    }
+
+    #[test]
+    fn a_relative_path_records_an_absolute_backup_path() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 3);
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(db.strip_prefix("/").expect("absolute"));
+        assert!(relative.is_relative());
+        let s = Store::open(&relative).expect("open");
+        let recorded = PathBuf::from(s.meta(PRE_V4_BACKUP_KEY).expect("m").expect("set"));
+        assert!(recorded.is_absolute(), "{}", recorded.display());
+        assert!(recorded.exists());
     }
 }

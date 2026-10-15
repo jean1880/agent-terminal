@@ -304,6 +304,9 @@ pub struct Store {
     /// Test hook: the `synchronous` switch this many switches from now fails.
     #[cfg(test)]
     fail_sync_switch_in: Cell<Option<u32>>,
+    /// Test hook: the next COMMIT of a transaction of its own (not a batch, not a savepoint) fails.
+    #[cfg(test)]
+    fail_next_txn_commit: Cell<bool>,
 }
 
 /// A unit of work that commits or rolls back as one: a transaction, or inside a
@@ -317,6 +320,13 @@ struct Scope<'a> {
 
 impl Scope<'_> {
     fn commit(mut self) -> Result<()> {
+        #[cfg(test)]
+        if !self.savepoint && self.store.fail_next_txn_commit.replace(false) {
+            // Dropped uncommitted: rolled back, as after a real COMMIT failure.
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected transaction commit failure",
+            )));
+        }
         let sql = if self.savepoint {
             "RELEASE op"
         } else {
@@ -486,12 +496,22 @@ impl Store {
     }
 
     fn open_with(path: &Path, hooks: &preflight::Hooks) -> Result<Self> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            create_private_dir(parent)?;
-        }
-        if path.exists() {
-            preflight::run(path, hooks)?;
-        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        create_private_dir(parent)?;
+        // The directory is made trustworthy (ours, writable by no one else) before anything in
+        // it is opened, and an existing store is resolved once to its real, absolute path.
+        preflight::trust_dir(parent)?;
+        let resolved;
+        let path = if path.exists() {
+            resolved = preflight::resolve(path)?;
+            preflight::run(&resolved, hooks)?;
+            resolved.as_path()
+        } else {
+            path
+        };
         create_private_file(path)?;
         tighten_permissions(path)?;
         let conn = Connection::open(path)?;
@@ -534,6 +554,8 @@ impl Store {
             heal_paths: Cell::new([0, 0]),
             #[cfg(test)]
             fail_sync_switch_in: Cell::new(None),
+            #[cfg(test)]
+            fail_next_txn_commit: Cell::new(false),
         })
     }
 
@@ -588,6 +610,12 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn fail_next_batch_commit(&self) {
         self.fail_next_commit.set(true);
+    }
+
+    /// Test hook: the next COMMIT of a transaction of its own (a durable write's) fails.
+    #[cfg(test)]
+    pub(crate) fn fail_next_txn_commit(&self) {
+        self.fail_next_txn_commit.set(true);
     }
 
     /// Runs `f` as one control transaction committed under `synchronous=FULL` (an fsync at
