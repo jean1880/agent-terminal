@@ -429,3 +429,120 @@ The next work is **P0 only**: create isolated fixtures, prove registration/paren
 - [MCP progress specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress): optional progress is not the authoritative child event log.
 - [Official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk): version/runtime/MSRV choice is D8.
 - [SQLite synchronous settings](https://www.sqlite.org/pragma.html#pragma_synchronous): NORMAL versus FULL informs durable dispatch receipts; external side effects still cannot be made exactly once by SQLite.
+
+## P0 amendments (2026-10-15)
+
+P0 is closed by `docs/delegation/contract-v1.md` (frozen candidate, revision 6) and `docs/delegation/p1-types.md`.
+Revisions 2 and 3 resolve two rounds of Codex and agy cross-harness reviews and the user decisions of 2026-10-15. The
+resolutions are in `docs/delegation/contract-v1-review.md`. Changes versus this plan:
+
+1. **agy is a parent in v1** (user decision). It uses a managed entry in `~/.gemini/config/mcp_config.json` and 8
+   explicit `mcp(agent_terminal/<tool>)` allow rules in `~/.gemini/antigravity-cli/settings.json`, both written by
+   Settings under §8.5–6. The coordinator adds the matching agent-config sync entry.
+2. **Capability placement per provider** (§6 refined), with a per-provider exposure matrix (contract §5):
+   - Claude: overlay server `env` in an ephemeral runtime file. It is created exclusively with `O_NOFOLLOW` and mode
+     `0600`, in a verified `0700` tmpfs directory, unlinked after exit and swept at startup. Never argv, never Claude's
+     env.
+   - Codex: thread `config` `env` table, resent on every `thread/start` and `thread/resume`, with
+     `default_tools_approval_mode="approve"`; never `env_vars`.
+   - agy: process env, behind contract §7.
+   - Provider-side persistence of the token is a route-blocking proof gate per provider (G-C3, G-X3, G-A3).
+3. **agy leak mitigation (contract §7).**
+   - **L2 is the primary and only preventive control.** It runs on the final argv and env and refuses:
+     - config-dir flags;
+     - `CONFIG_REDIRECT_VARS` and any `CASCADE_*`;
+     - a `HOME` other than the verified home;
+     - missing allow rules.
+   - L2 walks cwd up to the git toplevel, or up to `/` in a non-git tree. It scans each `.agents` recursively for MCP
+     and hook files, resolving symlinks and failing closed. It runs again at hello.
+   - L3 (peer and child census) and L4 (single use, a 30 s hello window, a second hello from another pid revokes) only
+     detect.
+   - Attestation is mandatory for agy.
+   - The residual race and same-UID risks are stated plainly.
+4. **Claude children** run `--restricted --strict-mcp-config` with an explicit `--tools` list, read back from
+   `system/init` (no `Task`/`Agent`, no other MCP server). Plan is enforced by the tool list, not Claude plan mode. Bash
+   depends on proof gate G-C1. Ask and AcceptEdits are refused without `--restricted`.
+5. **Codex children** must start no MCP server but ours (G-X1, a route blocker). The first mechanism is
+   `enabled=false` per server name. The fallback is a private per-child `CODEX_HOME`, for children only (user decision, 2026-10-15). Either
+   way, `mcpServer/startupStatus/updated` is read back and the child is stopped on any other name, including the
+   built-in `codex_apps`. Native delegation tools are G-X2.
+6. **agy children** need the proven hook in their actual worktree for every task_mode, Plan included, plus L2 on that
+   worktree. The hook denies other MCP servers and the sub-agent tools (`invoke_subagent`, `define_subagent`,
+   `manage_subagents`, `browser_subagent`; G-A1).
+7. **The guarantee is supervised delegation** (user decision, 2026-10-15). Depth and the mode ceiling bind
+   agents started through agent-terminal, and children cannot use native sub-agents. Roots keep theirs, shown but not
+   limited.
+8. **The supervisor is the only gate for the 8 bridge tools** across all providers. The ceiling is recomputed on every
+   call and applies to **every** parent→child delivery, whatever its kind. It is rechecked at dispatch. Spawning needs
+   no operator card inside the ceiling.
+9. **Revocation and rebind** (contract §6).
+   - Each root has one epoch per tree, and each bump is scoped to the root or a subtree. Every bump invalidates the
+     tree's unreserved operations.
+   - A restricted root keeps its token. Out-of-ceiling children are stopped and marked restricted.
+   - Rebind happens at an idle point: Claude by `--resume` with a fresh overlay, Codex by `thread/resume` with fresh
+     config, agy by relaunch and L2.
+10. **The bridge is stateless.** It answers `initialize` at once and sends hello eagerly. Welcome must arrive within
+    2 s of start, else degraded mode. It makes one reconnect, a sequential re-hello for Claude and Codex.
+    - The IPC is length-prefixed JSON (u32 BE, ≤1 MiB), decoded one frame at a time.
+    - It is bounded by a pre-auth cap, body and write deadlines, and a bounded outbound queue.
+    - Duplicate call ids and a second hello are protocol violations. The stdio input is bounded at 1 MiB per line.
+    - The server name is `agent_terminal`.
+11. **Attestation** (contract §4) replaces session matching. A call links to a native card only if its key, tool and
+    arguments match a call observed in that worker's own stream. It is mandatory for agy, and for Claude and Codex once
+    G-C5 and G-X5 pass.
+12. **Provenance** gains `provider_accepted`, which means "not refused", with `effective` left null. Effort is never
+    `provider_reported`. Claude's model is re-read on every turn.
+13. **Operations and delivery.**
+    - `expected_authority_epoch` is optional. Idempotency is unique per (principal, kind, key) across epochs, checked in
+      this order: epoch, then conflict.
+    - The canonical request is the syntax-normalised, scrubbed request. Its resolution is fixed at acceptance.
+    - Replay depends on the dispatch state: an uncertain dispatch replays as `delivery_unknown`.
+    - Every mutation returns one `MutationReceipt` envelope, with `warnings`.
+    - An unfenced cancel is bound at acceptance.
+    - `this_run` is an enum (user decision, 2026-10-15): Codex `strict`, Claude `best_effort`, agy `unsupported`.
+      Receipts are frozen at acceptance, with `target_run_id`. The message record later says `provider_confirmed`,
+      or `misdelivered` with the actual run: a new terminal `DeliveryState` (9 values). `ErrorCode::ALL` is 26 since revision 5 (`internal_error`).
+    - Pages share one `seq` order, and each `seq` is one indivisible unit. Cursors are filter-bound, and byte
+      accounting is combined. Pages always include the snapshot and at least one unit. ACK requires prior presentation.
+    - Cancel binds the target's run plus every active descendant run. Only an empty set is `idle`.
+    - Output budget: every response must satisfy `transport_cost` (structuredContent plus its escaped text block) ≤ 768 KiB. Capabilities truncates deterministically (models before profiles, `truncated` and `omitted` reported); pages and lists stop at the first unit that would exceed the budget. `WorkerSummary` is ≤48 KiB (revision 4).
+14. **Store (§5)**, from `sdk-and-store.md`:
+    - The single instance is the real guard, and v4 is strictly additive: no change to v3 tables, and hidden threads are
+      found by join.
+    - The preflight never writes before the lock.
+    - Backup uses one bounded `step(-1)`, never `run_to_completion`, with the destination set to `journal_mode=DELETE`.
+    - The backup path goes in `meta`, and an orphan backup is retained.
+    - rusqlite gains the `backup` feature.
+    - `durable_call` switches the pragma only outside a transaction.
+    - `delegation_operations` stores `canonical_request`, `resolution_json`, `receipt_json` (written once),
+      `dispatch_state` and `error_json` separately. Messages record `presented_at`, and workers record
+      `delegation_status`.
+15. **Limits** gain the IPC transport bounds, the bridge stdio and welcome bounds, the agy hello window, the attestation
+    and L2 scan bounds, and wait caps. Codex `tool_timeout_sec=60`.
+16. **Route table:** all 9 pairs are in scope but start `unverified`. The first route is still Claude→Codex, and **G-X1
+    is its first P5 proof gate**, then G-X2, G-X3 and G-C3. If G-X1 fails by both mechanisms, Codex children become
+    unsupported and the first route becomes Claude→Claude with plan children (G-C3 only). The agy routes also need
+    PR #44 (`fix/agy-workspace-plugin-hooks`) merged.
+17. **D8:** rmcp =3.5.1 with a current_thread tokio runtime confined to `--cross-agent-mcp`. The handler validates tool
+    names and arguments itself.
+18. **P2 is merged** with a concrete `redact::stream::StreamKey` (no generic key). `Scope::stream_key` builds it.
+19. **Revision 3 (second review round):**
+    - **Attestation** uses one un-scrubbed `attestation_arguments` helper for both the stream and the bridge. It keeps
+      the key and the epoch. For agy, all 8 tools need attestation, reads included.
+    - **Lineage.** The bridge says hello only if its grandparent is the app (`AGENT_TERMINAL_DELEGATION_APP_PID`).
+      A hello that fails L3 is refused without consuming the token. Only a second direct-child bridge is a compromise,
+      so a root's native sub-agents cannot kill it. The census matches the bridge argv, not the executable alone, so
+      the app's own approval hook is not counted.
+    - **L2** also treats `sidecars.json`, `sidecars`, `plugin.json`, `plugins.json` and `plugins.txt` as sources.
+    - **Route admission** is per (parent, child, task_mode, child bridge). The agy child has with-bridge and
+      `bridge_disabled` variants.
+    - **Delegation status** uses one 6-code set in the store, on the wire and in P1. `restricted` never rebinds
+      automatically.
+    - **Reconnect** has a fresh 2 s deadline.
+20. **Revision 5:**
+    - JSON-RPC request ids are at most 256 B encoded, and are never echoed when oversized.
+    - Receipts are at most 48 KiB and `details` at most 64 KiB, so a replayed maximal receipt fits.
+    - Page and list assembly reserve units with a conservative upper bound, then measure the real page (revision 6).
+      Over the budget, the last unit is dropped, but never the first. The minimum complete page, at most 642 KiB + 2 B
+      of cost, always fits.
+    - The final output guard returns the new `internal_error`, and leaves accepted operations replayable.
