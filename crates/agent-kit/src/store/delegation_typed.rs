@@ -561,6 +561,12 @@ impl Store {
     /// Creates a root and its root worker through the checked insert
     /// ([`Store::insert_delegation_root`]): the pair commits together or fails alone.
     pub fn create_delegation_root(&self, r: &NewRoot) -> Result<RootHandle> {
+        // A supervised child's hidden thread belongs to another root: it is never a root itself.
+        if self.is_hidden_child_thread(&r.thread)? {
+            return Err(StoreError::Failed(
+                "a child's hidden thread cannot be a delegation root".into(),
+            ));
+        }
         let now = self.now();
         let root = format!("dr_{}", self.handle_suffix()?);
         let worker = self.new_worker_id()?;
@@ -1031,6 +1037,7 @@ impl Store {
             presented_at: None,
             acknowledged_at: None,
             updated_at: now,
+            event_seq: None,
         };
         let full = SendReceipt {
             receipt,
@@ -1147,6 +1154,21 @@ impl Store {
             }
         }
         let bound = &a.resolution.bound_runs;
+        // The bound set may only name runs of the target's own subtree (same root).
+        let subtree = self.delegation_subtree(target)?;
+        for r in bound {
+            let owner = self
+                .delegation_run(r.as_str())?
+                .map(|row| row.worker_id)
+                .unwrap_or_default();
+            if !subtree.iter().any(|w| w.as_str() == owner) {
+                return Ok(Err(ToolError::invalid(
+                    "worker_id",
+                    "bound_run_outside_subtree",
+                )
+                .with_detail("run_id", r.as_str())));
+            }
+        }
         let run = active.filter(|r| bound.contains(r));
         let state = if bound.is_empty() {
             CancelState::Idle
@@ -1208,7 +1230,7 @@ impl Store {
         direction: Direction,
         kind: MessageKind,
     ) -> Result<i64> {
-        self.insert_delegation_message(row)?;
+        // The event first: the message row records its seq (its page unit), frozen at insert.
         let sender = self.worker_row(&worker_id(&row.sender_worker_id)?)?;
         let recipient = self.worker_row(&worker_id(&row.recipient_worker_id)?)?;
         let child = if direction == Direction::ParentToChild {
@@ -1241,7 +1263,7 @@ impl Store {
                 invocation: None,
             },
         ];
-        Ok(self
+        let seq = self
             .publish_in_txn(&PublishEvent {
                 thread,
                 provider_thread: None,
@@ -1251,7 +1273,11 @@ impl Store {
                 run_states: Vec::new(),
                 aliases: Vec::new(),
             })?
-            .seq)
+            .seq;
+        let mut row = row.clone();
+        row.event_seq = Some(seq);
+        self.insert_delegation_message(&row)?;
+        Ok(seq)
     }
 
     // ---- operation state ----
@@ -1515,6 +1541,11 @@ impl Store {
                 .ok_or_else(|| StoreError::NotFound(m.to_string()))?;
             let from: DeliveryState = parse_name("delivery state", &row.delivery_state)?;
             delivery_step(from, to).map_err(|_| illegal("delivery"))?;
+            // The observed run is a run of the message's recipient (hence of its root).
+            if let Some(r) = recipient_run {
+                let root = s.root_row(&row.root_id)?;
+                s.check_run_of(r, Some(&worker_id(&row.recipient_worker_id)?), &root)?;
+            }
             let observed = recipient_run.map(RunId::as_str);
             match to {
                 DeliveryState::Misdelivered => {
@@ -1574,6 +1605,21 @@ impl Store {
             if from.is_terminal() {
                 return Err(illegal("the run already ended"));
             }
+            // Bind the run and its worker to the event's root before anything is written: the
+            // terminal event must be linked to the run's own worker.
+            let worker = s.worker_row(&worker_id(&run.worker_id)?)?;
+            let linked = c.event.links.iter().any(|l| l.worker.as_str() == worker.id);
+            let same_root = match c.event.links.first() {
+                Some(l) => s.worker_row(&l.worker)?.root_id == worker.root_id,
+                None => false,
+            };
+            if !linked || !same_root {
+                return Err(StoreError::Failed(
+                    "a completion's event must belong to its run's worker and root".into(),
+                ));
+            }
+            // The event (fully validated before it writes) goes first, then the run's end.
+            let event = s.publish_in_txn(&c.event)?;
             let now = s.now();
             s.set_delegation_run_state(
                 c.run.as_str(),
@@ -1583,9 +1629,7 @@ impl Store {
                 c.usage_json.as_deref(),
                 now,
             )?;
-            let worker = s.worker_row(&worker_id(&run.worker_id)?)?;
             s.set_delegation_worker_state(&worker.id, &name_of(&c.worker_state), None, now)?;
-            let event = s.publish_in_txn(&c.event)?;
             let mut notification = None;
             if let (Some(result), Some(parent)) = (&c.result, &worker.parent_id) {
                 let message = s.new_message_id()?;
@@ -1608,6 +1652,7 @@ impl Store {
                     presented_at: None,
                     acknowledged_at: None,
                     updated_at: now,
+                    event_seq: None,
                 };
                 let seq = s.insert_message_and_event(
                     &row,
@@ -2102,9 +2147,9 @@ impl Store {
         let mut transport_sum = 0usize;
         {
             // Membership is decided in SQL, so every row returned is a unit: the scope's links,
-            // plus (mailbox) message links of the caller whose message it is the recipient of.
-            // Both halves walk the `(worker_id, event_seq)` index, and the LIMIT bounds what one
-            // page reads however long the root's unrelated history is.
+            // plus (mailbox) the caller's incoming messages. The mailbox half walks
+            // `delegation_messages_mailbox` (recipient, event_seq), so outgoing or unrelated
+            // history is never visited; the scope half walks the links' worker index.
             let mut stmt = self.conn.prepare(PAGE_SQL)?;
             let limit = i64::from(q.max_events).saturating_add(1);
             let mut rows = stmt.query(params![
@@ -2758,14 +2803,12 @@ struct Effect {
 /// A page's candidate seqs: `?1` root, `?2` last seq, `?3` the scope (JSON array), `?4` mailbox,
 /// `?5` the caller, `?6` the row limit.
 const PAGE_SQL: &str = "SELECT event_seq FROM delegation_event_links
+     INDEXED BY delegation_event_links_worker
      WHERE root_id = ?1 AND event_seq > ?2
        AND worker_id IN (SELECT value FROM json_each(?3))
      UNION
-     SELECT l.event_seq FROM delegation_event_links l
-     JOIN events e ON e.seq = l.event_seq
-     JOIN delegation_messages m ON m.id = json_extract(e.envelope_json, '$.event.message_id')
-     WHERE ?4 AND l.worker_id = ?5 AND l.event_seq > ?2 AND l.root_id = ?1
-       AND l.category = 'message' AND m.recipient_worker_id = ?5
+     SELECT event_seq FROM delegation_messages INDEXED BY delegation_messages_mailbox
+     WHERE ?4 AND recipient_worker_id = ?5 AND event_seq > ?2 AND root_id = ?1
      ORDER BY 1
      LIMIT ?6";
 
@@ -3318,6 +3361,7 @@ mod tests {
             presented_at: None,
             acknowledged_at: None,
             updated_at: 1,
+            event_seq: None,
         };
         assert!(f.s.insert_delegation_message(&m).is_err());
         m.delivery_policy = "next_turn".into();
@@ -4026,9 +4070,9 @@ mod tests {
             .s
             .record_delegation_delivery(&m, DeliveryState::Misdelivered, Some(&run))
             .is_err());
-        f.s.insert_delegation_run(&RunRow {
-            id: later.to_string(),
-            worker_id: f.root.worker.to_string(),
+        let later_row = |id: &RunId, worker: &WorkerId| RunRow {
+            id: id.to_string(),
+            worker_id: worker.to_string(),
             process_generation: 1,
             provider_thread_id: None,
             native_turn_id: None,
@@ -4038,8 +4082,27 @@ mod tests {
             usage_json: None,
             created_at: 1,
             updated_at: 1,
-        })
-        .expect("another run");
+        };
+        // A run of another worker (the sender's) is never the recipient's run, and nothing moves.
+        let senders = f.s.new_run_id().expect("id");
+        f.s.insert_delegation_run(&later_row(&senders, &f.root.worker))
+            .expect("the root's run");
+        assert!(f
+            .s
+            .record_delegation_delivery(&m, DeliveryState::Misdelivered, Some(&senders))
+            .is_err());
+        assert_eq!(
+            f.s.delegation_message(m.as_str())
+                .expect("q")
+                .expect("row")
+                .delivery_state,
+            "submitted"
+        );
+        // The child's next turn.
+        f.s.advance_delegation_run(&run, RunState::Completed, None)
+            .expect("the turn ended");
+        f.s.insert_delegation_run(&later_row(&later, &child))
+            .expect("another run");
         f.s.record_delegation_delivery(&m, DeliveryState::Misdelivered, Some(&later))
             .expect("misdelivered");
         let row = f.s.delegation_message(m.as_str()).expect("q").expect("row");
@@ -4726,5 +4789,249 @@ mod tests {
         for l in &links {
             assert!(l.contains("INDEX"), "a full scan of the links: {plan:?}");
         }
+    }
+
+    // ---- review round 2: completion and delivery ownership, recipient-selective mailbox ----
+
+    #[test]
+    fn a_completion_never_ends_another_roots_run() {
+        let f = fx();
+        let a = spawn(&f.s, &f.root.worker, "k1");
+        let a_worker = a.worker.clone().expect("w");
+        let (_b, _b_thread, b_child) = second_root(&f.s);
+        let (b_worker, b_run) = (
+            b_child.worker.clone().expect("w"),
+            b_child.run.clone().expect("r"),
+        );
+        let count =
+            |sql: &str| -> i64 { f.s.conn.query_row(sql, [], |r| r.get(0)).expect("count") };
+        let events = count("SELECT COUNT(*) FROM events");
+        let messages = count("SELECT COUNT(*) FROM delegation_messages");
+        // B's run with an otherwise valid event of A (linked to A's child, in A's root thread).
+        let completion = |run: RunId, links: Vec<LinkSpec>| Completion {
+            run,
+            state: RunState::Completed,
+            worker_state: WorkerState::Waiting,
+            reason: None,
+            usage_json: None,
+            result: Some("done".into()),
+            event: PublishEvent {
+                thread: f.root_thread.clone(),
+                provider_thread: None,
+                envelope: Envelope::new(Event::Notice { text: "end".into() }),
+                links,
+                worker_states: Vec::new(),
+                run_states: Vec::new(),
+                aliases: Vec::new(),
+            },
+        };
+        let a_link = LinkSpec {
+            worker: a_worker.clone(),
+            run: None,
+            category: EventCategory::Result,
+            invocation: None,
+        };
+        assert!(f
+            .s
+            .complete_delegation_run(&completion(b_run.clone(), vec![a_link.clone()]))
+            .is_err());
+        // A's own run with an event that does not name A's worker is refused too.
+        let root_link = LinkSpec {
+            worker: f.root.worker.clone(),
+            run: None,
+            category: EventCategory::Result,
+            invocation: None,
+        };
+        assert!(f
+            .s
+            .complete_delegation_run(&completion(a.run.clone().expect("r"), vec![root_link]))
+            .is_err());
+        // Both roots are left exactly as they were.
+        assert_eq!(count("SELECT COUNT(*) FROM events"), events);
+        assert_eq!(count("SELECT COUNT(*) FROM delegation_messages"), messages);
+        assert_eq!(
+            f.s.delegation_run(b_run.as_str())
+                .expect("q")
+                .expect("r")
+                .state,
+            "reserved"
+        );
+        assert_eq!(
+            f.s.delegation_worker(b_worker.as_str())
+                .expect("q")
+                .expect("w")
+                .state,
+            "starting"
+        );
+        let a_run =
+            f.s.delegation_run(a.run.expect("r").as_str())
+                .expect("q")
+                .expect("r");
+        assert_eq!(a_run.state, "reserved");
+        assert_eq!(
+            f.s.delegation_worker(a_worker.as_str())
+                .expect("q")
+                .expect("w")
+                .state,
+            "starting"
+        );
+    }
+
+    #[test]
+    fn a_delivery_fact_only_names_a_run_of_the_messages_recipient() {
+        let f = fx();
+        let a = spawn(&f.s, &f.root.worker, "k1");
+        let a_worker = a.worker.clone().expect("w");
+        let sibling = spawn(&f.s, &f.root.worker, "k2");
+        let (_b, _bt, b_child) = second_root(&f.s);
+        let sent = new_op(send(
+            &f.s,
+            &f.root.worker,
+            a_worker.as_str(),
+            "instruction",
+            "go",
+            "s1",
+        ));
+        let m = sent.message.clone().expect("m");
+        f.s.reserve_delegation_dispatch(&sent.operation)
+            .expect("s")
+            .expect("reserved");
+        f.s.record_delegation_dispatch(&sent.operation, &DispatchFact::Submitted)
+            .expect("sub");
+        for (what, run, to) in [
+            (
+                "another root's run",
+                b_child.run.clone().expect("r"),
+                DeliveryState::Misdelivered,
+            ),
+            (
+                "another root's run",
+                b_child.run.clone().expect("r"),
+                DeliveryState::ProviderConfirmed,
+            ),
+            (
+                "a sibling's run",
+                sibling.run.clone().expect("r"),
+                DeliveryState::Misdelivered,
+            ),
+            (
+                "a sibling's run",
+                sibling.run.clone().expect("r"),
+                DeliveryState::ProviderConfirmed,
+            ),
+        ] {
+            assert!(
+                f.s.record_delegation_delivery(&m, to, Some(&run)).is_err(),
+                "{what} {to:?}"
+            );
+        }
+        let row = f.s.delegation_message(m.as_str()).expect("q").expect("row");
+        assert_eq!(
+            (row.delivery_state.as_str(), row.recipient_run_id),
+            ("submitted", None)
+        );
+        // The recipient's own run is accepted.
+        f.s.record_delegation_delivery(&m, DeliveryState::ProviderConfirmed, a.run.as_ref())
+            .expect("its own run");
+    }
+
+    /// VM steps (SQLITE_STMTSTATUS_VM_STEP, the counter `sqlite3_progress_handler` ticks on)
+    /// and full-scan steps of one page query, run to completion.
+    fn page_cost(
+        s: &Store,
+        root: &str,
+        caller: &WorkerId,
+        scope: &str,
+        mailbox: bool,
+    ) -> (i32, i32) {
+        let mut stmt = s.conn.prepare(PAGE_SQL).expect("prepare");
+        let mut rows = stmt
+            .query(params![root, 0, scope, mailbox, caller.as_str(), 101])
+            .expect("query");
+        while rows.next().expect("row").is_some() {}
+        drop(rows);
+        (
+            stmt.get_status(rusqlite::StatementStatus::VmStep),
+            stmt.get_status(rusqlite::StatementStatus::FullscanStep),
+        )
+    }
+
+    #[test]
+    fn a_mailbox_read_does_work_independent_of_outgoing_history() {
+        let f = fx();
+        let a = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        // A's history is outgoing only: it has sent reports, never received anything.
+        for i in 0..10 {
+            new_op(send(&f.s, &a, "parent", "report", "r", &format!("r{i}")));
+        }
+        let (small, small_scans) = page_cost(&f.s, &f.root.root, &a, "[]", true);
+        for i in 10..1010 {
+            new_op(send(&f.s, &a, "parent", "report", "r", &format!("r{i}")));
+        }
+        let (large, large_scans) = page_cost(&f.s, &f.root.root, &a, "[]", true);
+        assert_eq!((small_scans, large_scans), (0, 0), "no full scan");
+        assert!(
+            large <= small + 8,
+            "VM steps grew with outgoing history: {small} -> {large}"
+        );
+        // The page itself is empty and cheap.
+        let mut q = query(&f.root.worker, &a, vec![], None);
+        q.max_events = 10;
+        let page = f.s.read_delegation_page(&q).expect("s").expect("page");
+        assert!(seqs(&page.page).is_empty());
+        // The root, the recipient of all 1010, still gets them through the same index.
+        let (_, root_scans) = page_cost(&f.s, &f.root.root, &f.root.worker, "[]", true);
+        assert_eq!(root_scans, 0);
+        let mut q = query(&f.root.worker, &f.root.worker, vec![], None);
+        q.max_events = 10;
+        let page = f.s.read_delegation_page(&q).expect("s").expect("page");
+        assert_eq!(page.page["messages"].as_array().expect("m").len(), 10);
+        assert!(page.truncated);
+    }
+
+    #[test]
+    fn a_cancel_binds_only_runs_of_its_targets_subtree_and_a_hidden_thread_is_never_a_root() {
+        let f = fx();
+        let a = spawn(&f.s, &f.root.worker, "k1");
+        let a_worker = a.worker.clone().expect("w");
+        let sibling = spawn(&f.s, &f.root.worker, "k2");
+        let (_b, _bt, b_child) = second_root(&f.s);
+        let cancel = |key: &str, bound: Vec<RunId>| {
+            accept(
+                &f.s,
+                &f.root.worker,
+                req(
+                    ToolName::CrossAgentCancel,
+                    json!({"worker_id": a_worker.as_str(), "idempotency_key": key}),
+                ),
+                Resolution {
+                    target: Some(a_worker.clone()),
+                    bound_runs: bound,
+                    base_commit: None,
+                },
+                AcceptPlan::Cancel,
+            )
+        };
+        for (key, run) in [("c1", b_child.run.clone()), ("c2", sibling.run.clone())] {
+            let r = cancel(key, vec![run.expect("r")]);
+            assert!(r.is_err(), "{key}: {r:?}");
+        }
+        let ok = new_op(cancel("c3", vec![a.run.clone().expect("r")]));
+        assert_eq!(ok.receipt["state"], json!("stopping"));
+        // A child's hidden thread cannot be made a root.
+        let hidden =
+            f.s.delegation_worker(a_worker.as_str())
+                .expect("q")
+                .expect("row")
+                .backing_thread_id
+                .expect("t");
+        let r = f.s.create_delegation_root(&NewRoot {
+            thread: hidden,
+            driver: Driver::Codex,
+            profile_id: ProfileId::parse("codex-default").expect("p"),
+            name: "x".into(),
+            policy_json: "{}".into(),
+        });
+        assert!(r.is_err());
     }
 }
