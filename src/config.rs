@@ -48,6 +48,12 @@ impl CliClient {
 /// `config.json` edit with no recompile.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Profile {
+    /// Stable opaque identity, `^[a-z0-9-]{1,64}$` (see [`new_profile_id`]). Unlike `name` it
+    /// survives a rename and a reorder, so anything that must keep pointing at this profile
+    /// refers to it by id. Absent in older files: migration assigns one, once, and persists it.
+    /// This is configuration identity, not a secret or a token.
+    #[serde(default)]
+    pub id: String,
     /// Shown in the settings dropdown and the new-tab menu. Also the key that
     /// `default_profile` refers to, so it must be unique.
     pub name: String,
@@ -122,6 +128,36 @@ pub struct Profile {
     pub disabled: bool,
 }
 
+/// Whether `id` has the profile-id shape: `^[a-z0-9-]{1,64}$`.
+pub fn is_valid_profile_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A fresh profile id: `p-` and 16 lowercase hex characters.
+///
+/// Only uniqueness matters, not secrecy: an id names a profile in the config and is never a
+/// credential. The bits come from `RandomState` (randomly keyed per process by the OS), mixed
+/// with the clock, the process id and a counter, so two ids made in one nanosecond still
+/// differ. The app has no RNG dependency and this adds none.
+pub fn new_profile_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    format!("p-{:016x}", hasher.finish())
+}
+
 /// The chat driver a profile's command runs, judged by the command's file
 /// name: `claude` or `agy`, wherever it is installed. Anything else (Gemini,
 /// a wrapper script) has no adapter and runs as a Terminal thread only.
@@ -140,6 +176,7 @@ pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> 
 pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
     let info = driver.info();
     let mut profile = Profile {
+        id: new_profile_id(),
         name: info.profile_name.to_string(),
         command: info.default_command.to_string(),
         ..Profile::default()
@@ -287,6 +324,16 @@ fn parse_toml_top_level_model(content: &str) -> Option<String> {
 }
 
 impl Profile {
+    /// A copy of this profile with a new id and `name`, for "duplicate". The copy must never
+    /// share the original's id, or the two would be one profile to anything that refers to ids.
+    pub fn duplicate(&self, name: impl Into<String>) -> Profile {
+        Profile {
+            id: new_profile_id(),
+            name: name.into(),
+            ..self.clone()
+        }
+    }
+
     /// The full argv to exec, command first.
     pub fn argv(&self) -> Vec<String> {
         let mut argv = Vec::with_capacity(1 + self.args.len());
@@ -425,6 +472,7 @@ fn default_profiles() -> Vec<Profile> {
                 name.to_lowercase()
             };
             let mut profile = Profile {
+                id: new_profile_id(),
                 name: (*name).to_string(),
                 command: cmd,
                 ..Profile::default()
@@ -677,6 +725,10 @@ pub struct TerminalConfig {
     /// file. Not persisted.
     #[serde(skip)]
     save_blocked: std::cell::Cell<bool>,
+    /// Set when [`Self::normalize`] gave a profile an id (a migration, or a repair), so the
+    /// loader persists the result once. Not persisted.
+    #[serde(skip)]
+    ids_assigned: std::cell::Cell<bool>,
 }
 
 /// The permission sources typed in Settings, `:`-separated like `PATH`: each an absolute path or
@@ -951,6 +1003,7 @@ impl Default for TerminalConfig {
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
+            ids_assigned: std::cell::Cell::default(),
         }
     }
 }
@@ -1178,6 +1231,8 @@ impl TerminalConfig {
             profile.name = unique;
         }
 
+        self.repair_profile_ids();
+
         // Profiles saved by an older release lack whatever came after it —
         // resume, the browser's title pointer, hand-off — so a persisted
         // Claude or Agy profile would otherwise never gain them.
@@ -1204,6 +1259,49 @@ impl TerminalConfig {
         }
 
         self
+    }
+
+    /// Gives every profile a valid, unique id. A missing (or malformed) id is assigned once; of
+    /// several profiles sharing an id the first keeps it and later ones get fresh ids. Never
+    /// fails the load. Marks `ids_assigned` when anything changed, so the loader saves it.
+    fn repair_profile_ids(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        for profile in &mut self.profiles {
+            if profile.id.is_empty() {
+                // A migration, not a fault: older files carry no ids.
+            } else if !is_valid_profile_id(&profile.id) {
+                warn!(
+                    "Profile '{}' has an invalid id '{}'; assigning a new one",
+                    profile.name, profile.id
+                );
+            } else if seen.insert(profile.id.clone()) {
+                continue;
+            } else {
+                warn!(
+                    "Profile '{}' repeats id '{}'; assigning a new one",
+                    profile.name, profile.id
+                );
+            }
+            let fresh = std::iter::repeat_with(new_profile_id)
+                .find(|id| !seen.contains(id))
+                .unwrap_or_else(new_profile_id);
+            seen.insert(fresh.clone());
+            profile.id = fresh;
+            self.ids_assigned.set(true);
+        }
+    }
+
+    /// Writes the config once if loading assigned ids, so a migrated id is the id from then on
+    /// rather than a new one every launch. Goes through the same atomic save as any other write.
+    fn persist_assigned_ids(&self, path: &Path) {
+        if self.ids_assigned.replace(false) {
+            self.save_to(path);
+        }
+    }
+
+    /// The profile with this id, if any.
+    pub fn profile_by_id(&self, id: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.id == id)
     }
 
     /// The position of the profile that defines `driver`'s chat agent: the
@@ -1245,6 +1343,7 @@ impl TerminalConfig {
             Ok(None) => return Self::default(),
             Ok(Some(config)) => {
                 config.disk_stamp.set(stamp);
+                config.persist_assigned_ids(path);
                 return config;
             }
             Err(problem) => problem,
@@ -1314,6 +1413,7 @@ impl TerminalConfig {
         match Self::read_config(path) {
             Ok(Some(config)) => {
                 config.disk_stamp.set(current);
+                config.persist_assigned_ids(path);
                 DiskChange::Updated(Box::new(config))
             }
             Ok(None) => DiskChange::Unchanged,
@@ -1822,6 +1922,7 @@ mod tests {
         let path = dir.path().join("config.json");
         let cfg = TerminalConfig {
             profiles: vec![Profile {
+                id: "p-0000000000000001".to_string(),
                 name: "Codex".to_string(),
                 command: "codex".to_string(),
                 args: vec!["--full-auto".to_string()],
@@ -2643,5 +2744,116 @@ mod tests {
             claude_profile.effective_default_model(Some(home)),
             Some("opus".to_string())
         );
+    }
+
+    fn write_config(dir: &Path, json: &str) -> PathBuf {
+        let path = dir.join("config.json");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn ids(config: &TerminalConfig) -> Vec<String> {
+        config.profiles.iter().map(|p| p.id.clone()).collect()
+    }
+
+    #[test]
+    fn profile_id_format_matches_the_contract() {
+        for _ in 0..200 {
+            let id = new_profile_id();
+            assert!(is_valid_profile_id(&id), "{id}");
+            assert_eq!(id.len(), 18);
+            assert!(id.starts_with("p-"));
+        }
+        assert!(!is_valid_profile_id(""));
+        assert!(!is_valid_profile_id("Upper"));
+        assert!(!is_valid_profile_id("has space"));
+        assert!(!is_valid_profile_id("under_score"));
+        assert!(!is_valid_profile_id(&"a".repeat(65)));
+        assert!(is_valid_profile_id(&"a".repeat(64)));
+        let unique: std::collections::HashSet<_> = (0..1000).map(|_| new_profile_id()).collect();
+        assert_eq!(unique.len(), 1000);
+    }
+
+    #[test]
+    fn migration_assigns_each_missing_id_once_and_persists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"profiles":[{"name":"Claude","command":"claude"},{"name":"Tool","command":"tool"}]}"#,
+        );
+        let first = TerminalConfig::load_from(&path);
+        assert!(first.profiles.iter().all(|p| is_valid_profile_id(&p.id)));
+        assert_ne!(first.profiles[0].id, first.profiles[1].id);
+        // Persisted at load: the file now carries the ids.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(&first.profiles[0].id));
+        // A second load assigns nothing and does not rewrite the file.
+        let second = TerminalConfig::load_from(&path);
+        assert_eq!(ids(&first), ids(&second));
+        assert!(!second.ids_assigned.get());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), on_disk);
+    }
+
+    #[test]
+    fn ids_survive_save_load_rename_and_reorder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = TerminalConfig::default();
+        let before = ids(&config);
+        config.profiles[0].name = "Renamed".to_string();
+        config.profiles.reverse();
+        config.save_to(&path);
+        let loaded = TerminalConfig::load_from(&path);
+        let mut expected = before.clone();
+        expected.reverse();
+        assert_eq!(ids(&loaded), expected);
+        assert_eq!(loaded.profile_by_id(&before[0]).unwrap().name, "Renamed");
+        assert!(loaded.profile_by_id("p-missing").is_none());
+    }
+
+    #[test]
+    fn duplicate_ids_are_repaired_first_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"{"profiles":[
+                {"id":"same","name":"A","command":"a"},
+                {"id":"same","name":"B","command":"b"},
+                {"id":"same","name":"C","command":"c"},
+                {"id":"BAD ID","name":"D","command":"d"}]}"#,
+        );
+        let config = TerminalConfig::load_from(&path);
+        assert_eq!(config.profiles[0].id, "same");
+        let all = ids(&config);
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert!(all.iter().all(|id| is_valid_profile_id(id)));
+        // Repaired on disk too, so the repair happens once.
+        let again = TerminalConfig::load_from(&path);
+        assert_eq!(ids(&again), all);
+    }
+
+    #[test]
+    fn a_duplicated_profile_gets_a_new_id() {
+        let original = new_agent_profile(agent_core::adapter::Driver::Claude);
+        let copy = original.duplicate("Claude copy");
+        assert_ne!(copy.id, original.id);
+        assert!(is_valid_profile_id(&copy.id));
+        assert_eq!(copy.name, "Claude copy");
+        assert_eq!(copy.command, original.command);
+        // The Preferences → Agents path (push a fresh agent profile) also never reuses one.
+        assert_ne!(
+            new_agent_profile(agent_core::adapter::Driver::Codex).id,
+            new_agent_profile(agent_core::adapter::Driver::Codex).id
+        );
+    }
+
+    #[test]
+    fn profile_ids_round_trip_through_json() {
+        let config = TerminalConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TerminalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(ids(&back), ids(&config));
+        assert!(ids(&back).iter().all(|id| is_valid_profile_id(id)));
     }
 }
