@@ -201,25 +201,34 @@ fn check_home_sources(home: &Path) -> Result<(), String> {
         match source {
             HomeHookSource::File(relative) => check_optional_hook(&home.join(relative))?,
             HomeHookSource::Plugins(relative) => {
-                let root = home.join(relative);
-                if !present(&root)? {
-                    continue;
-                }
-                let listing_error = |e| format!("{UNVERIFIED}cannot list {}: {e}", root.display());
-                for entry in std::fs::read_dir(&root).map_err(listing_error)? {
-                    let path = entry.map_err(listing_error)?.path();
-                    // Follow linked plugin directories; metadata errors must never hide a source.
-                    let metadata = std::fs::metadata(&path).map_err(|e| {
-                        format!("{UNVERIFIED}cannot inspect {}: {e}", path.display())
-                    })?;
-                    if metadata.is_dir() {
-                        check_optional_hook(&path.join("hooks.json"))?;
-                    }
+                for hook in plugin_hook_files(&home.join(relative))? {
+                    check_optional_hook(&hook)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// `<root>/<plugin>/hooks.json` for every plugin directory under `root`, present or not. A root
+/// that exists but cannot be listed (not a directory, dangling, permissions) fails closed, as
+/// does an entry whose type cannot be read.
+fn plugin_hook_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    if !present(root)? {
+        return Ok(Vec::new());
+    }
+    let listing_error = |e| format!("{UNVERIFIED}cannot list {}: {e}", root.display());
+    let mut hooks = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(listing_error)? {
+        let path = entry.map_err(listing_error)?.path();
+        // Follow linked plugin directories; metadata errors must never hide a source.
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| format!("{UNVERIFIED}cannot inspect {}: {e}", path.display()))?;
+        if metadata.is_dir() {
+            hooks.push(path.join("hooks.json"));
+        }
+    }
+    Ok(hooks)
 }
 
 fn check_optional_hook(path: &Path) -> Result<(), String> {
@@ -271,6 +280,16 @@ fn reject_workspace_hook(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The workspace sources agy reads in each searched directory: `.agents/hooks.json` and, as a
+/// live run showed (`d6-workspace-plugin-hook`), every `.agents/plugins/<plugin>/hooks.json`.
+fn reject_workspace_agents_hooks(dir: &Path) -> Result<(), String> {
+    reject_workspace_hook(&dir.join(".agents/hooks.json"))?;
+    for hook in plugin_hook_files(&dir.join(".agents/plugins"))? {
+        reject_workspace_hook(&hook)?;
+    }
+    Ok(())
+}
+
 fn hook_directories(cwd: &Path, toplevel: Option<&Path>) -> Vec<PathBuf> {
     match toplevel.filter(|root| cwd.starts_with(root)) {
         Some(root) => cwd
@@ -303,7 +322,7 @@ fn target_sources(target: &HookTarget) -> Result<(), String> {
             "{UNVERIFIED}the thread directory is not a plain absolute path"
         ));
     }
-    reject_workspace_hook(&cwd.join(".agents/hooks.json"))?;
+    reject_workspace_agents_hooks(cwd)?;
     reject_workspace_hook(&cwd.join("hooks/hooks.json"))?;
     // git returns the physical toplevel; resolve aliases before comparing the boundary. These
     // read-only, timed queries use agent-kit's cleaned git environment, on the check's worker.
@@ -319,7 +338,7 @@ fn target_sources(target: &HookTarget) -> Result<(), String> {
         .into_iter()
         .skip(1)
     {
-        reject_workspace_hook(&dir.join(".agents/hooks.json"))?;
+        reject_workspace_agents_hooks(&dir)?;
     }
     Ok(())
 }
@@ -881,6 +900,74 @@ mod tests {
         );
     }
 
+    fn assert_workspace_refused(target: &HookTarget, path: &Path) {
+        let why = check_target(target).expect_err("a workspace plugin hook must fail closed");
+        assert!(why.contains(&path.to_string_lossy().into_owned()), "{why}");
+        assert!(verification_refused(&why), "{why}");
+    }
+
+    #[test]
+    fn workspace_plugin_hooks_are_not_covered_by_a_home_proof() {
+        let home = installed_home();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let target = target(home.path(), Some(cwd.path()));
+        let plugins = cwd.path().join(".agents/plugins");
+        std::fs::create_dir_all(plugins.join("without-hooks")).expect("plugin");
+        std::fs::write(plugins.join("README.md"), "regular entry").expect("non-plugin");
+        assert!(check_target(&target).is_ok(), "plugins without hooks");
+        // Even a hook that gates every tool: its precedence over the home one is unproven.
+        let path = plugins.join("wplug/hooks.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("plugin");
+        for text in [GOOD, "{}", "not json"] {
+            std::fs::write(&path, text).expect("hook");
+            assert_workspace_refused(&target, &path);
+        }
+        std::fs::remove_file(&path).expect("remove");
+        std::os::unix::fs::symlink("absent.json", &path).expect("dangling hook");
+        assert_workspace_refused(&target, &path);
+        std::fs::remove_file(&path).expect("remove link");
+        assert!(check_target(&target).is_ok(), "plugin without hooks again");
+        let linked = tempfile::tempdir().expect("linked plugin");
+        std::fs::write(linked.path().join("hooks.json"), GOOD).expect("linked hook");
+        let alias = plugins.join("linked");
+        std::os::unix::fs::symlink(linked.path(), &alias).expect("linked directory");
+        assert_workspace_refused(&target, &alias.join("hooks.json"));
+        std::fs::remove_file(&alias).expect("remove alias");
+        let unknown = plugins.join("unknown");
+        std::os::unix::fs::symlink("absent-plugin", &unknown).expect("dangling plugin");
+        assert_workspace_refused(&target, &unknown);
+    }
+
+    #[test]
+    fn an_unlistable_workspace_plugins_dir_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = installed_home();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let target = target(home.path(), Some(cwd.path()));
+        let plugins = cwd.path().join(".agents/plugins");
+        std::fs::create_dir_all(plugins.parent().expect("parent")).expect("parent");
+        // Not a directory: a deterministic listing error, even for a privileged test runner.
+        std::fs::write(&plugins, "not a directory").expect("block listing");
+        assert_workspace_refused(&target, &plugins);
+        std::fs::remove_file(&plugins).expect("remove");
+        std::os::unix::fs::symlink("absent-plugins", &plugins).expect("dangling root");
+        assert_workspace_refused(&target, &plugins);
+        std::fs::remove_file(&plugins).expect("remove link");
+        std::fs::create_dir(&plugins).expect("plugins");
+        assert!(check_target(&target).is_ok(), "an empty plugins dir");
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o000))
+            .expect("deny listing");
+        let cannot_list = std::fs::read_dir(&plugins).is_err();
+        let verdict = check_target(&target);
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        if cannot_list {
+            let why = verdict.expect_err("permission errors must fail closed");
+            assert!(why.contains(".agents/plugins"), "{why}");
+        }
+    }
+
     #[test]
     fn a_hook_proof_without_a_thread_directory_fails_closed() {
         let home = installed_home();
@@ -1013,6 +1100,33 @@ mod tests {
             check_target(&self::target(home.path(), Some(&alias))).is_err(),
             "aliases cannot skip ancestors"
         );
+        std::fs::remove_file(&ancestor).expect("remove ancestor hook");
+        assert!(check_target(&target).is_ok());
+        // Plugin hooks are searched in the same directories, and stop at the same boundary.
+        let above_plugin = outer.path().join(".agents/plugins/p/hooks.json");
+        std::fs::create_dir_all(above_plugin.parent().expect("parent")).expect("mkdir");
+        std::fs::write(above_plugin, GOOD).expect("above plugin hook");
+        assert!(check_target(&target).is_ok(), "above the repository");
+        for dir in [repo.join("sub"), repo.clone()] {
+            let plugins = dir.join(".agents/plugins");
+            let plugin_hook = plugins.join("p/hooks.json");
+            std::fs::create_dir_all(plugin_hook.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&plugin_hook, GOOD).expect("ancestor plugin hook");
+            let why = check_target(&target).expect_err("ancestor plugin hook must fail closed");
+            assert!(
+                why.contains(&plugin_hook.to_string_lossy().into_owned()),
+                "{why}"
+            );
+            std::fs::remove_dir_all(&plugins).expect("remove plugins");
+            std::fs::write(&plugins, "not a directory").expect("block listing");
+            let why = check_target(&target).expect_err("an unlistable ancestor root fails");
+            assert!(
+                why.contains(&plugins.to_string_lossy().into_owned()),
+                "{why}"
+            );
+            std::fs::remove_file(&plugins).expect("remove blocker");
+            assert!(check_target(&target).is_ok());
+        }
         let outside = outer.path().join("outside/deeper");
         std::fs::create_dir_all(&outside).expect("outside");
         assert!(

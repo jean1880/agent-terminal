@@ -47,6 +47,7 @@ const SEEN_CAP: usize = 20_000;
 struct PendingApproval {
     tool_use_id: String,
     input: Value,
+    own_bridge: bool,
 }
 
 /// A content block opened by a `content_block_start` stream event.
@@ -115,6 +116,8 @@ pub struct ClaudeAdapter {
     mode: Option<Mode>,
     /// `--effort` of the running process (set by `argv`, which takes `&self`).
     current_effort: std::cell::RefCell<Option<String>>,
+    /// The prepared child binding owns the restricted permission/tool arguments.
+    child: bool,
 }
 
 impl Default for ClaudeAdapter {
@@ -159,6 +162,7 @@ impl ClaudeAdapter {
             outbox: Outbox::default(),
             mode: None,
             current_effort: std::cell::RefCell::new(None),
+            child: false,
         }
     }
 
@@ -826,6 +830,13 @@ impl ClaudeAdapter {
             PendingApproval {
                 tool_use_id: tool_use_id.clone(),
                 input: input.clone(),
+                own_bridge: tool.starts_with("mcp__agent_terminal__")
+                    && req.get("mcp_server").is_some_and(|server| {
+                        crate::delegation::launch::is_own_bridge_call(
+                            str_of(server, "name").unwrap_or(""),
+                            str_of(server, "source"),
+                        )
+                    }),
             },
         );
 
@@ -1097,6 +1108,12 @@ impl Adapter for ClaudeAdapter {
         ids
     }
 
+    fn is_own_bridge_approval(&self, request: &str) -> bool {
+        self.pending
+            .get(request)
+            .is_some_and(|pending| pending.own_bridge)
+    }
+
     fn argv(&self, session: &OpenSession) -> Vec<String> {
         let mut argv = vec![session.program.clone()];
         argv.extend(session.extra_args.iter().cloned());
@@ -1107,12 +1124,13 @@ impl Adapter for ClaudeAdapter {
                 "--verbose",
                 "--input-format",
                 "stream-json",
-                "--permission-prompt-tool",
-                "stdio",
-                "--include-partial-messages",
             ]
             .map(str::to_owned),
         );
+        if !self.child {
+            argv.extend(["--permission-prompt-tool", "stdio"].map(str::to_owned));
+        }
+        argv.push("--include-partial-messages".to_owned());
         if let Some(model) = &session.model {
             argv.push("--model".to_owned());
             argv.push(model.clone());
@@ -1123,8 +1141,9 @@ impl Adapter for ClaudeAdapter {
         }
         // The effort this process runs with, for `SetModel`'s respawn decision.
         *self.current_effort.borrow_mut() = session.effort.clone();
-        argv.push("--permission-mode".to_owned());
-        argv.push(mode_name(session.mode).to_owned());
+        if !self.child {
+            argv.extend(["--permission-mode", mode_name(session.mode)].map(str::to_owned));
+        }
         // Session flags take `=`; resuming wins over naming a new session.
         if let Some(id) = &session.resume {
             argv.push(format!("--resume={id}"));
@@ -1132,6 +1151,10 @@ impl Adapter for ClaudeAdapter {
             argv.push(format!("--session-id={id}"));
         }
         argv
+    }
+
+    fn supervise_as_child(&mut self) {
+        self.child = true;
     }
 
     fn handshake(&mut self) -> Vec<String> {
@@ -1158,6 +1181,13 @@ impl Adapter for ClaudeAdapter {
                 "parent_tool_use_id": null,
             })
             .to_string(),
+            // A strict steer pinned to a turn: Claude has no such guarantee (its live lines are
+            // best effort), so delegated live input goes as `Steer`.
+            Command::DelegatedSteer { .. } => {
+                return Err(AdapterError::Unsupported(
+                    "Claude cannot pin a message to a running turn",
+                ))
+            }
             Command::Interrupt => {
                 // Only an open turn can be interrupted; a stale flag would mislabel the next
                 // result or exit.
@@ -1741,6 +1771,19 @@ mod tests {
         assert!(matches!(
             refused.as_slice(),
             [e] if matches!(&e.event, Event::RateLimited { resets_at: Some(r), .. } if r == "1800000000")
+        ));
+    }
+
+    #[test]
+    fn a_pinned_delegated_steer_is_unsupported() {
+        let mut a = ClaudeAdapter::new();
+        assert!(matches!(
+            a.encode(Command::DelegatedSteer {
+                text: "x".into(),
+                turn: "t".into(),
+                tag: "op".into(),
+            }),
+            Err(AdapterError::Unsupported(_))
         ));
     }
 

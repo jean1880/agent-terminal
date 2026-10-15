@@ -192,6 +192,11 @@ const QUIET: &[&str] = &[
 #[derive(Debug, Clone)]
 enum Pending {
     Initialize,
+    /// Bound child startup waits for the effective MCP names, without exposing the config.
+    ChildConfig {
+        method: String,
+        params: Value,
+    },
     /// `thread/start` or `thread/resume`.
     ThreadStart,
     TurnStart(SubmittedModel),
@@ -200,6 +205,9 @@ enum Pending {
     /// `turn/steer` carrying this text: refused (the turn ended first), it starts a turn of its
     /// own instead.
     Steer(String),
+    /// A delegated `turn/steer` ([`Command::DelegatedSteer`]): its outcome is a
+    /// `ControlResult` for this tag, and a refusal starts nothing.
+    DelegatedSteer(String),
     /// `model/list`, answering the control with this id.
     Models(String),
 }
@@ -347,6 +355,8 @@ pub struct CodexAdapter {
     context: Option<(u64, Option<u64>)>,
     /// A `/compact` was requested, so the coming `contextCompaction` item is manual.
     compact_pending: bool,
+    /// A supervised delegation child: its policies come from [`child_mode_policy`].
+    child: bool,
 }
 
 impl Default for CodexAdapter {
@@ -402,6 +412,17 @@ impl CodexAdapter {
             usage_base: Usage::default(),
             context: None,
             compact_pending: false,
+            child: false,
+        }
+    }
+
+    /// The `(approvalPolicy, sandboxPolicy)` this adapter sends for `mode`: a root's
+    /// [`mode_policy`], or a supervised child's [`child_mode_policy`].
+    fn policy(&self, mode: Mode) -> (&'static str, Value) {
+        if self.child {
+            child_mode_policy(mode)
+        } else {
+            mode_policy(mode)
         }
     }
 
@@ -748,7 +769,7 @@ impl CodexAdapter {
         if self.effective_mode.is_none() {
             self.effective_mode = Some(self.mode);
         }
-        let (approval, sandbox) = mode_policy(self.mode);
+        let (approval, sandbox) = self.policy(self.mode);
         let mut params = Map::new();
         params.insert("threadId".into(), json!(thread));
         params.insert("input".into(), json!([{"type": "text", "text": text}]));
@@ -1984,7 +2005,10 @@ impl CodexAdapter {
         if self.startup_failed
             && matches!(
                 pending,
-                Pending::Initialize | Pending::ThreadStart | Pending::TurnStart(_)
+                Pending::Initialize
+                    | Pending::ChildConfig { .. }
+                    | Pending::ThreadStart
+                    | Pending::TurnStart(_)
             )
         {
             return;
@@ -1995,6 +2019,73 @@ impl CodexAdapter {
             .map(|e| s(e, "message").map_or_else(|| e.to_string(), str::to_owned));
         match (pending, result, error) {
             (Pending::Initialize, Some(_), _) => {}
+            (Pending::ChildConfig { method, mut params }, Some(result), _) => {
+                let names = result
+                    .get("config")
+                    .and_then(Value::as_object)
+                    .and_then(|config| match config.get("mcp_servers") {
+                        None | Some(Value::Null) => Some(Vec::new()),
+                        Some(Value::Object(servers)) => {
+                            Some(servers.keys().cloned().collect::<Vec<_>>())
+                        }
+                        _ => None,
+                    });
+                let Some(mut names) = names else {
+                    self.fail_startup(
+                        "Could not inspect Codex's effective MCP configuration.".into(),
+                        out,
+                    );
+                    return;
+                };
+                names.extend(
+                    crate::delegation::launch::CODEX_BUILTIN_SERVERS
+                        .iter()
+                        .map(|s| (*s).to_owned()),
+                );
+                if names.len() > 256
+                    || names.iter().any(|name| {
+                        name.is_empty()
+                            || name.len() > 128
+                            || !name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                    })
+                {
+                    self.fail_startup(
+                        "Codex's MCP server names cannot be isolated safely.".into(),
+                        out,
+                    );
+                    return;
+                }
+                let Some(config) = params.get_mut("config").and_then(Value::as_object_mut) else {
+                    self.fail_startup("Missing delegated Codex launch configuration.".into(), out);
+                    return;
+                };
+                for name in names
+                    .into_iter()
+                    .filter(|name| name != crate::delegation::SERVER_NAME)
+                {
+                    config.insert(format!("mcp_servers.{name}.enabled"), Value::Bool(false));
+                }
+                config.insert("features.multi_agent".into(), Value::Bool(false));
+                config.insert("features.collab".into(), Value::Bool(false));
+                if method == "thread/resume" {
+                    let mut fallback = params.clone();
+                    if let Some(map) = fallback.as_object_mut() {
+                        map.remove("threadId");
+                        map.remove("excludeTurns");
+                    }
+                    self.resume_fallback = Some(fallback);
+                }
+                let line = self.request(Pending::ThreadStart, &method, params);
+                self.write(line);
+            }
+            (Pending::ChildConfig { .. }, None, _) => {
+                self.fail_startup(
+                    "Could not inspect Codex's effective MCP configuration.".into(),
+                    out,
+                );
+            }
             (Pending::ThreadStart, Some(result), _) => {
                 self.resume_fallback = None;
                 self.on_thread_ready(result, out);
@@ -2084,6 +2175,22 @@ impl CodexAdapter {
                     message: error.unwrap_or_else(|| "request failed".to_owned()),
                 }));
             }
+            // A delegated steer never falls back to a new turn: the supervisor hears the outcome
+            // and decides (a strict `this_run` refusal is `stale_run`).
+            (Pending::DelegatedSteer(tag), Some(_), _) => out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: Some(json!({"steered": true})),
+                    error: None,
+                })
+                .request(tag),
+            ),
+            (Pending::DelegatedSteer(tag), None, error) => out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: None,
+                    error: Some(error.unwrap_or_else(|| "turn/steer failed".to_owned())),
+                })
+                .request(tag),
+            ),
             // Taken into the running turn: Codex reports it like any input of that turn.
             (Pending::Steer(_), Some(_), _) => {}
             // Refused: the turn ended (or another began) before it arrived. The message is not
@@ -2240,17 +2347,45 @@ impl Adapter for CodexAdapter {
             params.insert("model".into(), json!(model));
         }
         params.insert("approvalsReviewer".into(), json!("user"));
-        params.insert("config".into(), json!({"tools.update_plan.enabled": true}));
-        let resume = session.and_then(|s| s.resume);
-        let thread = match resume {
+        let mut config = Map::new();
+        config.insert("tools.update_plan.enabled".into(), Value::Bool(true));
+        let binding = session.as_ref().and_then(|s| s.delegation.as_ref());
+        if let Some(binding) = binding {
+            config.extend(binding.codex_thread_config(std::process::id()));
+        }
+        params.insert("config".into(), Value::Object(config));
+        if self.child {
+            // A supervised child asks for its policy on the thread too, so the thread's result
+            // reads back exactly what was requested (`readback::codex_requested`).
+            let (approval, sandbox) = child_mode_policy(self.mode);
+            params.insert("approvalPolicy".into(), json!(approval));
+            if let Some(name) = sandbox_mode_name(&sandbox) {
+                params.insert("sandbox".into(), json!(name));
+            }
+        }
+        let bound_child = self.child && binding.is_some();
+        let resume = session.as_ref().and_then(|s| s.resume.clone());
+        let method = match resume {
             Some(id) => {
                 self.resume_fallback = Some(Value::Object(params.clone()));
                 params.insert("threadId".into(), json!(id));
                 // The app keeps its own transcript; do not have the server send the history.
                 params.insert("excludeTurns".into(), json!(true));
-                self.request(Pending::ThreadStart, "thread/resume", Value::Object(params))
+                "thread/resume"
             }
-            None => self.request(Pending::ThreadStart, "thread/start", Value::Object(params)),
+            None => "thread/start",
+        };
+        let thread = if bound_child {
+            self.request(
+                Pending::ChildConfig {
+                    method: method.to_owned(),
+                    params: Value::Object(params),
+                },
+                "config/read",
+                json!({"includeLayers": false, "cwd": self.cwd}),
+            )
+        } else {
+            self.request(Pending::ThreadStart, method, Value::Object(params))
         };
         vec![init, initialized, thread]
     }
@@ -2308,6 +2443,25 @@ impl Adapter for CodexAdapter {
                 };
                 let line = self.request(
                     Pending::Steer(text.clone()),
+                    "turn/steer",
+                    json!({
+                        "threadId": thread,
+                        "expectedTurnId": turn,
+                        "input": [{"type": "text", "text": text}],
+                    }),
+                );
+                Ok(vec![Action::Write(vec![line])])
+            }
+            Command::DelegatedSteer { text, turn, tag } => {
+                // Pinned to `turn`, with no fallback: Codex refuses it unless `turn` is the
+                // active one, and the refusal is reported for `tag`, never sent as a new turn.
+                let Some(thread) = self.thread_id.clone() else {
+                    return Err(AdapterError::Invalid(
+                        "the Codex thread is not started yet".to_owned(),
+                    ));
+                };
+                let line = self.request(
+                    Pending::DelegatedSteer(tag),
                     "turn/steer",
                     json!({
                         "threadId": thread,
@@ -2637,8 +2791,16 @@ impl Adapter for CodexAdapter {
     /// turn gets): `workspaceWrite` lets Codex write, and so rename, inside the workspace.
     fn workspace_writable(&self) -> Option<bool> {
         let mode = self.effective_mode.unwrap_or(self.mode);
-        let sandbox = mode_policy(mode).1;
+        let sandbox = self.policy(mode).1;
         Some(sandbox["type"] == "workspaceWrite" || sandbox["type"] == "dangerFullAccess")
+    }
+
+    fn active_turn(&self) -> Option<String> {
+        self.turn_id.clone().filter(|_| self.turn_open)
+    }
+
+    fn supervise_as_child(&mut self) {
+        self.child = true;
     }
 }
 
@@ -2731,6 +2893,27 @@ pub fn mode_policy(mode: Mode) -> (&'static str, Value) {
         Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
         Mode::Plan => ("never", json!({"type": "readOnly"})),
         Mode::Bypass => ("never", json!({"type": "dangerFullAccess"})),
+    }
+}
+
+/// `approvalPolicy` and `sandboxPolicy` for a supervised delegation child (P4 §10.1). Unlike a
+/// root's Ask, a child's Ask and Accept edits write inside the sandbox (its cwd is its own
+/// worktree lease) while every write and command still asks (`untrusted`). Plan is read-only. A
+/// child never runs Bypass; asked anyway, it gets Plan's policy, never full access.
+pub fn child_mode_policy(mode: Mode) -> (&'static str, Value) {
+    match mode {
+        Mode::Ask | Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
+        Mode::Plan | Mode::Bypass => ("never", json!({"type": "readOnly"})),
+    }
+}
+
+/// The `thread/start` `sandbox` mode name of a `sandboxPolicy` (`readOnly` is `read-only`).
+fn sandbox_mode_name(policy: &Value) -> Option<&'static str> {
+    match policy.get("type").and_then(Value::as_str)? {
+        "readOnly" => Some("read-only"),
+        "workspaceWrite" => Some("workspace-write"),
+        "dangerFullAccess" => Some("danger-full-access"),
+        _ => None,
     }
 }
 
@@ -3440,6 +3623,250 @@ mod tests {
         assert_eq!(started.len(), 1, "{started:?}");
         assert_eq!(started[0]["method"], "turn/start");
         assert_eq!(started[0]["params"]["input"][0]["text"], "one more thing");
+    }
+
+    /// A delegated steer is pinned to the turn it names and never falls back: accepted, it is an
+    /// `ok` for its tag; refused, it is an `error` for its tag, and no turn is started.
+    #[test]
+    fn a_delegated_steer_reports_its_outcome_and_a_refusal_starts_no_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        assert_eq!(a.active_turn().as_deref(), Some("tu"));
+        let steer = one_write(
+            a.encode(Command::DelegatedSteer {
+                text: "from the parent".into(),
+                turn: "tu".into(),
+                tag: "op-1".into(),
+            })
+            .expect("steer"),
+        );
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "tu");
+        let out = a.feed(&json!({"id": steer["id"], "result": {"turnId": "tu"}}).to_string());
+        assert!(
+            out.iter().any(|e| e.request.as_deref() == Some("op-1")
+                && matches!(
+                    &e.event,
+                    Event::ControlResult {
+                        ok: Some(_),
+                        error: None
+                    }
+                )),
+            "{out:?}"
+        );
+
+        let refused = one_write(
+            a.encode(Command::DelegatedSteer {
+                text: "too late".into(),
+                turn: "an-old-turn".into(),
+                tag: "op-2".into(),
+            })
+            .expect("steer"),
+        );
+        let out = a.feed(
+            &json!({"id": refused["id"], "error": {"code": -32600, "message": "expected turn mismatch"}})
+                .to_string(),
+        );
+        assert!(
+            out.iter().any(|e| e.request.as_deref() == Some("op-2")
+                && matches!(
+                    &e.event,
+                    Event::ControlResult {
+                        ok: None,
+                        error: Some(_)
+                    }
+                )),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|e| matches!(e.event, Event::Notice { .. })),
+            "{out:?}"
+        );
+        assert!(
+            a.drain_outbox().actions.is_empty(),
+            "a refused delegated steer starts no turn"
+        );
+    }
+
+    #[test]
+    fn a_delegated_steer_before_the_thread_exists_is_refused() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        assert!(matches!(
+            a.encode(Command::DelegatedSteer {
+                text: "x".into(),
+                turn: "tu".into(),
+                tag: "op".into(),
+            }),
+            Err(AdapterError::Invalid(_))
+        ));
+    }
+
+    /// P4 §10.1: a supervised Ask or Accept-edits child writes inside its sandbox and still asks;
+    /// Plan is read-only, and Bypass never gives a child full access. Roots are unchanged.
+    #[test]
+    fn child_mode_policy_maps_ask_and_accept_edits_to_workspace_write() {
+        for mode in [Mode::Ask, Mode::AcceptEdits] {
+            assert_eq!(
+                child_mode_policy(mode),
+                ("untrusted", json!({"type": "workspaceWrite"}))
+            );
+        }
+        assert_eq!(
+            child_mode_policy(Mode::Plan),
+            ("never", json!({"type": "readOnly"}))
+        );
+        assert_eq!(
+            child_mode_policy(Mode::Bypass),
+            ("never", json!({"type": "readOnly"}))
+        );
+        assert_eq!(
+            mode_policy(Mode::Ask),
+            ("untrusted", json!({"type": "readOnly"}))
+        );
+    }
+
+    #[test]
+    fn a_supervised_child_requests_its_policy_at_thread_start_and_on_every_turn() {
+        let mut child = CodexAdapter::new();
+        child.supervise_as_child();
+        child.argv(&session(Mode::Ask, None));
+        let lines = child.handshake();
+        let start: Value = serde_json::from_str(&lines[2]).expect("thread/start");
+        assert_eq!(start["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(start["params"]["sandbox"], "workspace-write");
+        child.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let turn = one_write(
+            child
+                .encode(Command::Prompt {
+                    text: "task".into(),
+                })
+                .expect("prompt"),
+        );
+        assert_eq!(turn["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(child.workspace_writable(), Some(true));
+
+        // A root asks for nothing at thread start and keeps Ask read-only.
+        let mut root = CodexAdapter::new();
+        root.argv(&session(Mode::Ask, None));
+        let lines = root.handshake();
+        let start: Value = serde_json::from_str(&lines[2]).expect("thread/start");
+        assert!(start["params"].get("approvalPolicy").is_none());
+        assert!(start["params"].get("sandbox").is_none());
+        assert_eq!(root.workspace_writable(), Some(false));
+    }
+
+    fn bound_session(resume: Option<&str>) -> OpenSession {
+        let mut open = session(Mode::Ask, resume);
+        open.delegation = Some(crate::delegation::DelegationBinding {
+            command: "/usr/bin/agent-terminal".into(),
+            endpoint: "/run/user/1000/agent-terminal/delegation-42.sock".into(),
+            instance: crate::delegation::InstanceNonce::from_bytes([1; 16]),
+            token: crate::delegation::CapabilityToken::from_random([2; 32]),
+        });
+        open
+    }
+
+    #[test]
+    fn a_bound_child_disables_effective_ambient_servers_and_resends_overlay_on_resume() {
+        for resume in [None, Some("saved-thread")] {
+            let mut child = CodexAdapter::new();
+            child.supervise_as_child();
+            child.argv(&bound_session(resume));
+            let lines = child.handshake();
+            let query: Value = serde_json::from_str(&lines[2]).expect("config/read");
+            assert_eq!(query["method"], "config/read");
+            child.feed(
+                &json!({"id": query["id"], "result": {"config": {"mcp_servers": {
+                    "ambient": {"command": "other"}, "agent_terminal": {"command": "old"}
+                }}}})
+                .to_string(),
+            );
+            let start = one_write(child.drain_outbox().actions);
+            assert_eq!(
+                start["method"],
+                if resume.is_some() {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                }
+            );
+            let config = &start["params"]["config"];
+            assert_eq!(config["mcp_servers.ambient.enabled"], false);
+            assert_eq!(config["mcp_servers.codex_apps.enabled"], false);
+            assert!(config.get("mcp_servers.agent_terminal.enabled").is_none());
+            assert_eq!(
+                config["mcp_servers.agent_terminal.command"],
+                "/usr/bin/agent-terminal"
+            );
+            assert_eq!(
+                config["mcp_servers.agent_terminal.default_tools_approval_mode"],
+                "approve"
+            );
+            assert_eq!(config["features.multi_agent"], false);
+            assert_eq!(config["features.collab"], false);
+            assert_eq!(start["params"]["sandbox"], "workspace-write");
+            if resume.is_some() {
+                child.feed(&json!({"id":start["id"],"error":{"message":"no rollout found for thread id saved-thread"}}).to_string());
+                let fallback = one_write(child.drain_outbox().actions);
+                assert_eq!(fallback["method"], "thread/start");
+                assert_eq!(fallback["params"]["config"], *config);
+                assert!(fallback["params"].get("threadId").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_child_refuses_unreadable_or_malformed_effective_configuration() {
+        for response in [
+            json!({"error":{"message":"unsupported"}}),
+            json!({"result":{}}),
+            json!({"result":{"config":{"mcp_servers":[]}}}),
+        ] {
+            let mut child = CodexAdapter::new();
+            child.supervise_as_child();
+            child.argv(&bound_session(None));
+            let lines = child.handshake();
+            let query: Value = serde_json::from_str(&lines[2]).expect("query");
+            let mut response = response;
+            response["id"] = query["id"].clone();
+            let events = child.feed(&response.to_string());
+            assert!(events
+                .iter()
+                .any(|env| matches!(env.event, Event::Error { .. })));
+            assert!(child.drain_outbox().actions.is_empty());
+            assert!(child
+                .encode(Command::Prompt {
+                    text: "never run".into()
+                })
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn a_bound_root_keeps_ambient_servers_and_reapplies_its_bridge_on_resume() {
+        for resume in [None, Some("saved-thread")] {
+            let mut root = CodexAdapter::new();
+            root.argv(&bound_session(resume));
+            let lines = root.handshake();
+            let start: Value = serde_json::from_str(&lines[2]).expect("start");
+            assert_eq!(
+                start["method"],
+                if resume.is_some() {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                }
+            );
+            let config = &start["params"]["config"];
+            assert_eq!(
+                config["mcp_servers.agent_terminal.args"],
+                json!(["--cross-agent-mcp"])
+            );
+            assert!(config.get("mcp_servers.codex_apps.enabled").is_none());
+        }
     }
 
     #[test]
