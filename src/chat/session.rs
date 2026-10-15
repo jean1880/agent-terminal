@@ -93,6 +93,54 @@ pub type AdapterFactory = Rc<dyn Fn(Driver) -> Result<AgentLaunch, String>>;
 /// How long a state-changing tool step may run before its hook query must have arrived.
 const CANARY_GRACE: Duration = Duration::from_secs(8);
 
+/// Proves agy's approval hook for one launch ([`crate::hook_config::check_target`]); run off the
+/// main thread before every agy process that would get `--dangerously-skip-permissions`.
+pub(crate) type HookCheck =
+    std::sync::Arc<dyn Fn(&crate::hook_config::HookTarget) -> Result<(), String> + Send + Sync>;
+
+/// The real launch proof. Under test it accepts everything unless the test installed its own
+/// (as [`Inner::home`] reads no real home): a test session must never read this machine's
+/// `~/.gemini`. Tests of the proof itself install the real check with [`set_test_hook_check`].
+fn default_hook_check() -> HookCheck {
+    #[cfg(test)]
+    {
+        TEST_HOOK_CHECK
+            .with(|check| check.borrow().clone())
+            .unwrap_or_else(|| std::sync::Arc::new(|_| Ok(())))
+    }
+    #[cfg(not(test))]
+    {
+        std::sync::Arc::new(crate::hook_config::check_target)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Each test runs on its own thread, so this never leaks between tests.
+    static TEST_HOOK_CHECK: RefCell<Option<HookCheck>> = const { RefCell::new(None) };
+}
+
+/// The check every session this test thread creates from now on runs before a hooked agy start.
+#[cfg(test)]
+fn set_test_hook_check(check: HookCheck) {
+    TEST_HOOK_CHECK.with(|slot| *slot.borrow_mut() = Some(check));
+}
+
+/// An agy process waiting on its fresh hook proof: what was written to it meanwhile, in order.
+struct PendingStart {
+    generation: u64,
+    writes: Vec<String>,
+}
+
+/// What a refused fresh hook proof changed, to be said once its hookless process has spawned.
+struct RefusedHook {
+    /// The socket taken from the session, dropped (closed) with the announcement: closing it
+    /// may expire cards through the sink.
+    socket: Option<ApprovalHandle>,
+    mode_changed: Option<Mode>,
+    text: String,
+}
+
 /// The hooked tool names a started item of this kind can be. `None`: not watched (see
 /// [`Inner::watch_tool_step`]).
 fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
@@ -172,6 +220,10 @@ struct Inner {
     canary_grace: Cell<Duration>,
     /// Tool item ids that were cancelled, declined or failed before completion (not tripped by canary).
     canary_cancelled: RefCell<HashSet<String>>,
+    /// The fresh proof every hooked agy start waits on (see [`Inner::start_process`]).
+    hook_check: RefCell<HookCheck>,
+    /// The agy start waiting on that proof, if any.
+    starting: RefCell<Option<PendingStart>>,
     factory: RefCell<Option<AdapterFactory>>,
     launch_env: RefCell<LaunchEnv>,
     proc: RefCell<Option<AgentProcess>>,
@@ -352,13 +404,16 @@ fn effective_mode(hookless_agy: bool, wanted: Mode) -> Mode {
 /// before the first check finished). Not "not installed": that is not known yet.
 pub(crate) const HOOK_NOT_CHECKED: &str = "the approval hook has not been checked yet";
 
+/// What hookless agy still does, said in every notice about it.
+const HOOKLESS_STILL: &str = "It refuses shell commands, but applies file edits on its own in \
+                              every mode (in Plan it writes a plan first, then edits). Ask before \
+                              edits is not available.";
+
 /// The notice for agy running without its approval socket: why (`unbound`, when the hook is
 /// installed but the socket could not be used, or [`HOOK_NOT_CHECKED`]; else the hook is
 /// missing), and what it still does.
 fn hookless_text(unbound: Option<&str>) -> String {
-    const STILL: &str = "It refuses shell commands, but applies file edits on its own in every \
-                         mode (in Plan it writes a plan first, then edits). Ask before edits is \
-                         not available.";
+    const STILL: &str = HOOKLESS_STILL;
     match unbound {
         Some(HOOK_NOT_CHECKED) => format!(
             "Antigravity cannot ask you before acting yet: its approval hook has not been checked \
@@ -528,6 +583,8 @@ impl ChatSession {
             unbound: RefCell::new(unbound),
             canary_grace: Cell::new(CANARY_GRACE),
             canary_cancelled: RefCell::new(HashSet::new()),
+            hook_check: RefCell::new(default_hook_check()),
+            starting: RefCell::new(None),
             factory: RefCell::new(None),
             launch_env: RefCell::new(env),
             proc: RefCell::new(None),
@@ -1075,12 +1132,136 @@ impl Inner {
         }
     }
 
+    /// Starts the next process generation. An agy process that would get
+    /// `--dangerously-skip-permissions` first waits for a fresh proof of its hook sources, read
+    /// off the main thread just before the spawn: a proof cached earlier (which built the socket
+    /// and drives the UI) is never what passes the flag, since a hook file may have appeared
+    /// since. Meanwhile the session is starting (alive, no process) and writes to it are held.
+    /// A failed proof starts it hookless instead.
     fn start_process(self: &Rc<Self>) {
-        let spec = self.launch_spec();
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         self.clear_agy_read();
         self.canary_cancelled.borrow_mut().clear();
+        *self.starting.borrow_mut() = None;
+        if self.adapter.borrow().driver() != Driver::Agy || self.approval().is_none() {
+            self.spawn_generation(generation);
+            return;
+        }
+        let target = {
+            let open = self.open.borrow();
+            crate::hook_config::HookTarget::new(
+                &self.launch_env.borrow(),
+                Some(PathBuf::from(&open.cwd)).filter(|cwd| !cwd.as_os_str().is_empty()),
+            )
+        };
+        let check = self.hook_check.borrow().clone();
+        *self.starting.borrow_mut() = Some(PendingStart {
+            generation,
+            writes: Vec::new(),
+        });
+        self.state.borrow_mut().alive = true;
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let verdict = gtk4::gio::spawn_blocking(move || check(&target))
+                .await
+                .unwrap_or_else(|_| Err("the hook check panicked".to_owned()));
+            if let Some(inner) = weak.upgrade() {
+                inner.finish_proven_start(generation, verdict);
+            }
+        });
+    }
+
+    /// The fresh proof for start `generation` is in. A start that was stopped or replaced
+    /// meanwhile is dropped; otherwise the process spawns, with the skip flag only on `Ok`.
+    fn finish_proven_start(self: &Rc<Self>, generation: u64, verdict: Result<(), String>) {
+        if self.generation.get() != generation {
+            return;
+        }
+        let Some(pending) = self
+            .starting
+            .borrow_mut()
+            .take_if(|p| p.generation == generation)
+        else {
+            return;
+        };
+        // A sink can re-enter while the refusal is said (stop the session, or replace it with a
+        // new start whose own proof is still out). So the hookless launch is fixed before
+        // anything is emitted, and spawned only if this start is still the session's afterwards.
+        let spec = match verdict {
+            Ok(()) => self.launch_spec(),
+            Err(reason) => {
+                let refused = self.refuse_unproven_hook(reason);
+                let spec = self.launch_spec();
+                self.announce_refused_hook(generation, refused);
+                spec
+            }
+        };
+        if self.generation.get() != generation || self.stopping.get() {
+            return;
+        }
+        self.spawn_spec(generation, spec);
+        if self.generation.get() == generation && !pending.writes.is_empty() {
+            if let Some(proc) = self.proc.borrow().as_ref().filter(|p| p.is_alive()) {
+                for line in &pending.writes {
+                    proc.write_line(line);
+                }
+            }
+        }
+    }
+
+    /// The hook could not be proven right before a start: agy runs without the skip flag and
+    /// without its socket from now on, exactly as after a canary trip. Only changes state, and
+    /// never reaches the sink; [`Self::announce_refused_hook`] says it.
+    fn refuse_unproven_hook(&self, reason: String) -> RefusedHook {
+        warn!(%reason, "agy's approval hook could not be proven for this start; it runs hookless");
+        // Taken, not dropped here: closing the socket may expire cards through the sink.
+        let socket = self.approval.borrow_mut().take();
+        if self.wanted_mode.get() == Mode::Bypass {
+            self.wanted_mode.set(self.safe_mode.get());
+        }
+        let mode = effective_mode(true, self.open.borrow().mode.session_safe());
+        let changed = self.state.borrow().mode != mode;
+        self.open.borrow_mut().mode = mode;
+        self.state.borrow_mut().mode = mode;
+        let text = format!(
+            "Antigravity's approval hook was checked again just before it started, and could not \
+             be confirmed: {reason}. It runs without asking you first. {HOOKLESS_STILL}"
+        );
+        *self.unbound.borrow_mut() = Some(reason);
+        RefusedHook {
+            socket,
+            mode_changed: changed.then_some(mode),
+            text,
+        }
+    }
+
+    /// Says what [`Self::refuse_unproven_hook`] did, each event only while start `generation` is
+    /// still the session's (a sink handling one may stop or replace it).
+    fn announce_refused_hook(&self, generation: u64, refused: RefusedHook) {
+        let RefusedHook {
+            socket,
+            mode_changed,
+            text,
+        } = refused;
+        drop(socket); // closes it
+        if let Some(mode) = mode_changed {
+            if self.generation.get() != generation {
+                return;
+            }
+            self.emit(Envelope::new(Event::ModeChanged { mode }));
+        }
+        if self.generation.get() == generation {
+            self.emit(Envelope::new(Event::Notice { text }));
+        }
+    }
+
+    fn spawn_generation(self: &Rc<Self>, generation: u64) {
+        let spec = self.launch_spec();
+        self.spawn_spec(generation, spec);
+    }
+
+    fn spawn_spec(self: &Rc<Self>, generation: u64, spec: SpawnSpec) {
         let (w_out, w_err, w_exit) = (
             Rc::downgrade(self),
             Rc::downgrade(self),
@@ -1857,6 +2038,8 @@ impl Inner {
     /// open turn was interrupted, never failed.
     fn finish_process(&self, code: Option<i32>, deliberate: bool) {
         self.deferred_mode.set(None);
+        // A start still waiting on its hook proof never spawns, and what it held is dropped.
+        *self.starting.borrow_mut() = None;
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
         let mut envelopes = self.adapter.borrow_mut().on_exit(code);
@@ -2011,14 +2194,20 @@ impl Inner {
                 Action::Write(lines) => {
                     let written = {
                         let proc = self.proc.borrow();
-                        match proc.as_ref().filter(|p| p.is_alive()) {
-                            Some(p) => {
+                        let mut starting = self.starting.borrow_mut();
+                        match (proc.as_ref().filter(|p| p.is_alive()), starting.as_mut()) {
+                            (Some(p), _) => {
                                 for line in &lines {
                                     p.write_line(line);
                                 }
                                 true
                             }
-                            None => false,
+                            // Held until the start's hook proof is in, then written in order.
+                            (None, Some(pending)) => {
+                                pending.writes.extend(lines);
+                                true
+                            }
+                            (None, None) => false,
                         }
                     };
                     if !written {
@@ -2036,8 +2225,17 @@ impl Inner {
                     }
                 }
                 Action::Interrupt => {
-                    if let Some(p) = self.proc.borrow().as_ref() {
-                        p.interrupt();
+                    let interrupted = match self.proc.borrow().as_ref() {
+                        Some(p) => {
+                            p.interrupt();
+                            true
+                        }
+                        None => false,
+                    };
+                    // A start still waiting on its hook proof ends the way an interrupted agy
+                    // does (it exits): what it held is dropped, and the next prompt restarts it.
+                    if !interrupted && self.starting.borrow().is_some() {
+                        self.stop_current();
                     }
                 }
                 Action::SideProcess { id, argv } => self.spawn_side(id, argv),
@@ -4372,6 +4570,267 @@ mod tests {
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
             assert_eq!(lines(tmp.path().join("sock.log")), ["unset"]);
             assert_eq!(lines(tmp.path().join("hookbin.log")), ["unset"]);
+        });
+    }
+
+    /// A proof that was `Ok` when the socket was bound must not pass the skip flag to a later
+    /// process: a hook file planted after it (here a workspace plugin hook) is caught by the
+    /// fresh check every hooked agy start runs, and that process starts hookless.
+    #[test]
+    fn a_hook_planted_after_the_proof_keeps_the_next_agy_start_hookless() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let home = tempfile::tempdir().expect("home");
+            let config = home.path().join(".gemini/config");
+            std::fs::create_dir_all(&config).expect("mkdir");
+            std::fs::write(
+                config.join("hooks.json"),
+                crate::hook_config::install_entry_json(),
+            )
+            .expect("hook");
+            let env = LaunchEnv {
+                env: vec![("HOME".into(), home.path().to_string_lossy().into_owned())],
+                unset: Vec::new(),
+            };
+            let target = crate::hook_config::HookTarget::new(&env, Some(tmp.path().to_path_buf()));
+            assert_eq!(
+                crate::hook_config::check_target(&target),
+                Ok(()),
+                "proof Ok"
+            );
+            set_test_hook_check(std::sync::Arc::new(crate::hook_config::check_target));
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let handle = ApprovalHandle::bind(
+                &tmp.path().join("rt"),
+                "t1",
+                tmp.path(),
+                Mode::Ask,
+                Duration::from_secs(30),
+            )
+            .expect("bind");
+            let session = ChatSession::with_env(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store,
+                thread,
+                sink,
+                Ok(handle),
+                env,
+            );
+            session.send_prompt("go");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
+            let args = lines(tmp.path().join("args.log"));
+            assert!(
+                args[0].contains("--dangerously-skip-permissions"),
+                "{args:?}"
+            );
+
+            // Planted after the proof, before the next start (agy restarts for the next prompt).
+            let planted = tmp.path().join(".agents/plugins/p/hooks.json");
+            std::fs::create_dir_all(planted.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&planted, crate::hook_config::install_entry_json()).expect("plant");
+            session.send_prompt("again");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) == 2));
+            let args = lines(tmp.path().join("args.log"));
+            assert_eq!(args.len(), 2, "{args:?}");
+            assert!(
+                !args[1].contains("--dangerously-skip-permissions"),
+                "the skip flag shipped with an unchecked hook in force: {args:?}"
+            );
+            assert!(args[1].contains("--mode plan"), "{args:?}");
+            assert_eq!(lines(tmp.path().join("sock.log"))[1], "unset");
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::Notice { text } if text.contains(".agents/plugins/p/hooks.json")
+            )));
+            assert_eq!(session.status().mode, Mode::Plan);
+        });
+    }
+
+    /// A start waiting on its proof holds what is written to it, then writes it in order; a
+    /// failed proof still delivers the prompt, to the hookless process.
+    #[test]
+    fn a_start_waiting_on_its_hook_proof_holds_the_prompt() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let wait = std::sync::Mutex::new(wait);
+            set_test_hook_check(std::sync::Arc::new(move |_| {
+                let _ = wait
+                    .lock()
+                    .expect("lock")
+                    .recv_timeout(Duration::from_secs(10));
+                Err("planted for the test".to_owned())
+            }));
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = ApprovalHandle::bind(
+                &tmp.path().join("rt"),
+                "t1",
+                tmp.path(),
+                Mode::Ask,
+                Duration::from_secs(30),
+            )
+            .expect("bind");
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                fake_agy(tmp.path()),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.send_prompt("go");
+            assert!(!pump_until(ctx, 1, || tmp.path().join("args.log").exists()));
+            assert!(
+                session.inner.proc.borrow().is_none(),
+                "nothing spawns unproven"
+            );
+            release.send(()).expect("release");
+            assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
+            let args = lines(tmp.path().join("args.log"));
+            assert!(
+                !args[0].contains("--dangerously-skip-permissions"),
+                "{args:?}"
+            );
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::TurnCompleted {
+                    state: TurnState::Completed,
+                    ..
+                }
+            )));
+        });
+    }
+
+    const REFUSED_NOTICE: &str = "checked again just before it started";
+
+    /// A session whose sink runs `on_refusal` (once) when the refused-proof notice arrives, with
+    /// the session's inner state; the first hook check fails, later ones wait for `release`.
+    fn refusal_reentry(
+        on_refusal: impl Fn(&Rc<Inner>) + 'static,
+    ) -> (
+        tempfile::TempDir,
+        Rc<ChatSession>,
+        Seen,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        set_test_hook_check(std::sync::Arc::new(move |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err("refused for the test".to_owned());
+            }
+            let _ = wait
+                .lock()
+                .expect("lock")
+                .recv_timeout(Duration::from_secs(10));
+            Ok(())
+        }));
+        let slot: Rc<RefCell<Option<std::rc::Weak<Inner>>>> = Rc::default();
+        let seen: Seen = Rc::default();
+        let fired = Cell::new(false);
+        let sink: EnvelopeSink = {
+            let (slot, seen) = (slot.clone(), seen.clone());
+            Rc::new(move |e: &Envelope| {
+                seen.borrow_mut().push(e.clone());
+                let refusal =
+                    matches!(&e.event, Event::Notice { text } if text.contains(REFUSED_NOTICE));
+                if refusal && !fired.replace(true) {
+                    let inner = slot.borrow().as_ref().and_then(std::rc::Weak::upgrade);
+                    if let Some(inner) = inner {
+                        on_refusal(&inner);
+                    }
+                }
+            })
+        };
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, "/w");
+        let handle = ApprovalHandle::bind(
+            &tmp.path().join("rt"),
+            "t1",
+            tmp.path(),
+            Mode::Ask,
+            Duration::from_secs(30),
+        )
+        .expect("bind");
+        let session = ChatSession::new(
+            Box::new(AgyAdapter::new("agy")),
+            fake_agy(tmp.path()),
+            store,
+            thread,
+            sink,
+            Some(handle),
+        );
+        *slot.borrow_mut() = Some(Rc::downgrade(&session.inner));
+        (tmp, session, seen, release)
+    }
+
+    /// A sink that stops the session while the refused proof is being said: nothing spawns.
+    #[test]
+    fn a_stop_during_the_refused_hook_notice_spawns_nothing() {
+        in_loop(|ctx| {
+            let (tmp, session, seen, release) = refusal_reentry(|inner| inner.stop_current());
+            session.send_prompt("go");
+            assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+                e,
+                Event::Notice { text } if text.contains(REFUSED_NOTICE)
+            ))));
+            assert!(!pump_until(ctx, 1, || tmp.path().join("args.log").exists()));
+            assert!(session.inner.proc.borrow().is_none(), "nothing spawned");
+            assert!(!session.status().alive);
+            drop(release);
+        });
+    }
+
+    /// A sink that replaces the start with a hooked one whose own proof is still out: the
+    /// refused start spawns nothing, and nothing gets the skip flag before that proof is in.
+    #[test]
+    fn a_replacement_during_the_refused_hook_notice_waits_for_its_own_proof() {
+        in_loop(|ctx| {
+            let rt = tempfile::tempdir().expect("rt");
+            let replacement = ApprovalHandle::bind(
+                &rt.path().join("rt"),
+                "t2",
+                rt.path(),
+                Mode::Ask,
+                Duration::from_secs(30),
+            )
+            .expect("bind");
+            let (tmp, session, seen, release) = refusal_reentry(move |inner| {
+                // A hooked agy in Ask (Plan never takes the flag), like a fresh switch to it.
+                inner.stop_current();
+                *inner.approval.borrow_mut() = Some(replacement.clone());
+                inner.open.borrow_mut().mode = Mode::Ask;
+                inner.state.borrow_mut().mode = Mode::Ask;
+                inner.start_process();
+            });
+            session.send_prompt("go");
+            assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+                e,
+                Event::Notice { text } if text.contains(REFUSED_NOTICE)
+            ))));
+            assert!(!pump_until(ctx, 1, || tmp.path().join("args.log").exists()));
+            assert!(session.inner.proc.borrow().is_none(), "A spawned nothing");
+            assert!(
+                session.inner.starting.borrow().is_some(),
+                "B still waits on its proof"
+            );
+            // B's proof comes in: B alone spawns, with the flag it was proven for.
+            release.send(()).expect("release");
+            assert!(pump_until(ctx, 10, || tmp.path().join("args.log").exists()));
+            assert!(pump_until(ctx, 10, || !lines(tmp.path().join("args.log")).is_empty()));
+            let args = lines(tmp.path().join("args.log"));
+            assert_eq!(args.len(), 1, "{args:?}");
+            assert!(
+                args[0].contains("--dangerously-skip-permissions"),
+                "{args:?}"
+            );
         });
     }
 
