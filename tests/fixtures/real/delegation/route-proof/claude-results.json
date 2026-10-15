@@ -1,9 +1,9 @@
 {
   "G-C1": true,
   "G-C3": true,
-  "token_leak_paths": [],
-  "provider": "claude",
   "model_transport": "local fixture; no cloud inference",
-  "version": "2.1.300 (Claude Code)",
-  "passed": true
+  "passed": true,
+  "provider": "claude",
+  "token_leak_paths": [],
+  "version": "2.1.300"
 }

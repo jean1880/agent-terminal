@@ -26,6 +26,7 @@ class DelegationProofTests(unittest.TestCase):
                 {"dir":"stdout","at":103,"frame":{"result":{"config":{"features":{"multi_agent":False,"multi_agent_v2":False},"instructions":marker,"mcp_servers":{}}}}},
             ]
             (source/"codex.jsonl").write_text("\n".join(json.dumps(entry) for entry in entries))
+            (source/"codex-results.json").write_text(json.dumps({"provider":"codex","passed":False,"error":marker,"model_transport":marker}))
             proof.export_proof_fixtures(source,target)
             self.assertFalse(list(target.glob("*.jsonl")))
             saved = target/"codex.proof.json"
@@ -36,6 +37,9 @@ class DelegationProofTests(unittest.TestCase):
             self.assertEqual(len(payload["frames"]),1)
             self.assertFalse(payload["frames"][0]["frame"]["result"]["config"]["features"]["multi_agent"])
             self.assertNotIn(marker,saved.read_text())
+            result = (target/"codex-results.json").read_text()
+            self.assertNotIn(marker,result)
+            self.assertTrue(json.loads(result)["error_present"])
 
     def test_agy_recorded_attestation_requires_exact_arguments_identity_and_deadline(self):
         fixtures = Path(__file__).resolve().parents[1]/"fixtures/real/delegation/route-proof"

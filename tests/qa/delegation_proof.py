@@ -108,9 +108,11 @@ def export_proof_fixtures(source, destination):
         if entry.get("dir") == "stdin" and name.startswith("codex") and frame.get("method") in {"thread/start", "thread/resume"}:
             params = frame.get("params", {})
             config = params.get("config", {})
+            boolean_keys = {f"mcp_servers.{server}.enabled" for server in ("ambient", "agent_terminal", "codex_apps")}
+            boolean_keys.update({"features.multi_agent", "features.multi_agent_v2"})
             safe_config = {key: value for key, value in config.items()
-                           if (key.startswith("mcp_servers.") and key.endswith(".enabled")
-                               or key in {"features.multi_agent", "features.multi_agent_v2"}) and isinstance(value, bool)}
+                           if key in boolean_keys and isinstance(value, bool)
+                           or key in {"agents.max_depth", "agents.max_threads"} and type(value) is int}
             safe_params = {"config": safe_config}
             if params.get("approvalPolicy") in {"never", "untrusted", "on-request", "on-failure"}:
                 safe_params["approvalPolicy"] = params["approvalPolicy"]
@@ -178,12 +180,34 @@ def export_proof_fixtures(source, destination):
         payload = {"fixture_version": 1, "provider": name.split("-", 1)[0],
                    "evidence_kind": name, "frames": frames}
         (destination / f"{name}.proof.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    def result_projection(value):
+        result = {key: item for key, item in value.items()
+                  if key in {"G-C1", "G-C3", "G-X1", "G-X2", "G-X3", "G-A1", "G-A3", "G-A5"} and isinstance(item, bool)
+                  or key in {"passed", "overlay_start_and_fresh_resume", "disabled_builtin_without_transport_rejected",
+                             "native_started_while_disabled", "native_positive_control_started", "hook_own_queries",
+                             "hook_foreign_queries", "hook_native_queries"} and isinstance(item, (bool, int))}
+        if value.get("provider") in {"agy", "claude", "codex", "codex-parent"}:
+            result["provider"] = value["provider"]
+        version = re.search(r"\d+\.\d+\.\d+", str(value.get("version", "")))
+        if version:
+            result["version"] = version.group()
+        if value.get("model_transport") in {"local fixture; no cloud inference", "cloud model; isolated home; no credentials copied"}:
+            result["model_transport"] = value["model_transport"]
+        for key in ("disabled_tools", "enabled_native_tools"):
+            if key in value:
+                result[key] = [name for name in value[key] if isinstance(name, str)
+                               and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) and rec.redact(name) == name]
+        if "token_leak_paths" in value:
+            result["token_leak_paths"] = ["<REDACTED_PATH>"] if value["token_leak_paths"] else []
+        if "error" in value:
+            result["error_present"] = True  # Exception/provider prose stays in private QA output.
+        return result
+
     for path in source.glob("*-results.json"):
-        if path.resolve() != (destination / path.name).resolve():
-            shutil.copyfile(path, destination / path.name)
+        (destination / path.name).write_text(json.dumps(result_projection(json.loads(path.read_text())), indent=2, sort_keys=True) + "\n")
     aggregate = source / "results.json"
-    if aggregate.exists() and aggregate.resolve() != (destination / aggregate.name).resolve():
-        shutil.copyfile(aggregate, destination / aggregate.name)
+    if aggregate.exists():
+        (destination / aggregate.name).write_text(json.dumps([result_projection(value) for value in json.loads(aggregate.read_text())], indent=2, sort_keys=True) + "\n")
 
 
 def mcp_child():

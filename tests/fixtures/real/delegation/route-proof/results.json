@@ -1,15 +1,15 @@
 [
   {
-    "provider": "agy",
     "G-A1": true,
     "G-A3": true,
     "G-A5": true,
-    "token_leak_paths": [],
-    "hook_own_queries": 1,
     "hook_foreign_queries": 1,
     "hook_native_queries": 1,
+    "hook_own_queries": 1,
     "model_transport": "cloud model; isolated home; no credentials copied",
-    "version": "1.3.5",
-    "passed": true
+    "passed": true,
+    "provider": "agy",
+    "token_leak_paths": [],
+    "version": "1.3.5"
   }
 ]
