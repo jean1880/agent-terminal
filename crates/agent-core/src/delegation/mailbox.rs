@@ -584,6 +584,26 @@ mod tests {
         assert!(!b.reserve());
     }
 
+    /// `MessageKind::ALL` is hand-maintained: `next` has no wildcard, so a new kind does not
+    /// compile until it is chained in, and the walk must equal `ALL`.
+    #[test]
+    fn message_kind_all_lists_every_kind_once_in_order() {
+        use MessageKind::*;
+        fn next(k: MessageKind) -> Option<MessageKind> {
+            match k {
+                Instruction => Some(Report),
+                Report => Some(Question),
+                Question => Some(Reply),
+                Reply => None,
+            }
+        }
+        let mut walked = vec![Instruction];
+        while let Some(k) = next(*walked.last().expect("non-empty")) {
+            walked.push(k);
+        }
+        assert_eq!(walked, MessageKind::ALL);
+    }
+
     #[test]
     fn kinds_follow_the_direction_rules() {
         let allowed: Vec<(Direction, MessageKind)> =
