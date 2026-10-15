@@ -1174,6 +1174,19 @@ mod tests {
             let receipt = old.spawn_worker(&root, request.clone()).await.unwrap();
             let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
             pump_until(|| old.state.borrow().workers[&worker].pending.is_none()).await;
+            // The restart reconciles an operation still being dispatched to `unknown`, so
+            // the crash is simulated only once the spawn is durably confirmed.
+            let operation = receipt["operation_id"].as_str().unwrap().to_owned();
+            pump_until(|| {
+                old.services
+                    .handle
+                    .reader()
+                    .delegation_operation(&operation)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.dispatch_state == "confirmed")
+            })
+            .await;
             let watch = old.state.borrow().workers[&worker]
                 .generations
                 .values()

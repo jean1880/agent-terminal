@@ -1046,18 +1046,19 @@ for line in sys.stdin:
         )
         .is_err());
         let pid = fs::read_to_string(pidfile).unwrap();
-        let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
-        assert!(
-            stat.is_err()
-                || stat
-                    .unwrap()
-                    .rsplit_once(')')
-                    .unwrap()
-                    .1
-                    .split_whitespace()
-                    .next()
-                    == Some("Z"),
-            "diagnostic descendant is still running"
-        );
+        // SIGKILL is asynchronous: allow the kernel a moment to reap the group on a loaded
+        // runner before concluding the descendant survived.
+        let gone = || {
+            fs::read_to_string(format!("/proc/{}/stat", pid.trim())).map_or(true, |stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    == Some("Z")
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !gone() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone(), "diagnostic descendant is still running");
     }
 }
