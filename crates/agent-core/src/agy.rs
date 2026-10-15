@@ -44,6 +44,64 @@ static ADAPTER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The flag the adapter alone decides on (it is the hook's fail-safe, see [`Adapter::argv`]).
 const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
 
+/// Undocumented agy flags that move its whole configuration directory (hooks, MCP servers,
+/// settings) away from `$HOME/.gemini`, the one the app's hook proof reads. Verified live for
+/// `--gemini_dir=` (agy 1.3.5, `docs/qa/delegation-discovery/agy.md`, D2 and D6). Both take a
+/// value, inline (`=`) or as the next argument.
+const CONFIG_DIR_FLAGS: [&str; 2] = ["gemini_dir", "app_data_dir"];
+
+/// What a profile argument is to the adapter's launch decisions.
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileArg {
+    /// Passed through.
+    Keep,
+    /// Dropped on its own.
+    Drop,
+    /// Dropped together with the argument after it (its value).
+    DropWithValue,
+}
+
+/// agy is a Go binary: its flag parser takes one or two leading dashes and an optional
+/// `=value`. Names are compared with `-` and `_` treated alike, so near-spellings are caught too.
+fn classify_profile_arg(arg: &str) -> ProfileArg {
+    let Some(flag) = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) else {
+        return ProfileArg::Keep;
+    };
+    let (name, inline_value) = match flag.split_once('=') {
+        Some((name, _)) => (name, true),
+        None => (flag, false),
+    };
+    let name = name.replace('-', "_");
+    if name == SKIP_PERMISSIONS.trim_start_matches('-').replace('-', "_") {
+        // A boolean flag: it never consumes the next argument.
+        return ProfileArg::Drop;
+    }
+    if CONFIG_DIR_FLAGS.contains(&name.as_str()) {
+        return if inline_value {
+            ProfileArg::Drop
+        } else {
+            ProfileArg::DropWithValue
+        };
+    }
+    ProfileArg::Keep
+}
+
+/// The profile arguments with every launch decision the adapter owns removed.
+fn profile_args(extra_args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(extra_args.len());
+    let mut args = extra_args.iter();
+    while let Some(arg) = args.next() {
+        match classify_profile_arg(arg) {
+            ProfileArg::Keep => kept.push(arg.clone()),
+            ProfileArg::Drop => {}
+            ProfileArg::DropWithValue => {
+                args.next();
+            }
+        }
+    }
+    kept
+}
+
 /// Fragment of the error agy puts on a step the PreToolUse hook refused.
 const HOOK_DENIAL: &str = "denied by pre-tool hook";
 
@@ -499,8 +557,15 @@ impl Adapter for AgyAdapter {
     /// Fail-safe: `--dangerously-skip-permissions` makes the app's PreToolUse hook the ONLY gate,
     /// so it is passed solely when the hook is installed (`approval_hook`). Plan never needs it.
     /// For the same reason `session.extra_args` can never carry it
-    /// (`--dangerously-skip-permissions` or `--dangerously-skip-permissions=…`): those are dropped
-    /// silently (no I/O here) and the adapter alone decides.
+    /// (`--dangerously-skip-permissions` or `--dangerously-skip-permissions=…`, one dash or two):
+    /// those are dropped silently (no I/O here) and the adapter alone decides.
+    ///
+    /// The hook proof reads `$HOME/.gemini`, so `extra_args` cannot move agy's configuration
+    /// either: `--gemini_dir` and `--app_data_dir` (with their value, inline or next) are dropped
+    /// the same way. Dropping rather than refusing the skip flag keeps the launch what the session
+    /// believes it is: with the flag kept, agy would load other hook files while the session
+    /// treats the app's hook as the gate, and its Ask and Accept-edits modes would no longer mean
+    /// what they say.
     ///
     /// The mode is agy's own `--mode` flag. Without the hook, agy cannot ask before acting, so Ask
     /// is sent as `--mode plan` (the session normally never asks for it). Verified live: headless
@@ -508,16 +573,7 @@ impl Adapter for AgyAdapter {
     /// every mode, Plan included (it plans, then edits).
     fn argv(&self, session: &OpenSession) -> Vec<String> {
         let mut argv = vec![session.program.clone()];
-        argv.extend(
-            session
-                .extra_args
-                .iter()
-                .filter(|a| {
-                    a.as_str() != SKIP_PERMISSIONS
-                        && !a.starts_with(&format!("{SKIP_PERMISSIONS}="))
-                })
-                .cloned(),
-        );
+        argv.extend(profile_args(&session.extra_args));
         argv.extend(
             [
                 "--input-format",
@@ -1841,6 +1897,8 @@ mod tests {
         s.extra_args = vec![
             "--dangerously-skip-permissions".into(),
             "--dangerously-skip-permissions=true".into(),
+            "-dangerously-skip-permissions".into(),
+            "-dangerously-skip-permissions=1".into(),
             "--keep".into(),
         ];
         let argv = a.argv(&s);
@@ -1848,7 +1906,7 @@ mod tests {
         assert!(
             !argv
                 .iter()
-                .any(|x| x.starts_with("--dangerously-skip-permissions")),
+                .any(|x| x.trim_start_matches('-').starts_with("dangerously-skip")),
             "{argv:?}"
         );
         // With the hook the adapter adds exactly one itself.
@@ -1859,6 +1917,65 @@ mod tests {
             .filter(|x| x.starts_with("--dangerously-skip-permissions"))
             .count();
         assert_eq!(n, 1);
+    }
+
+    /// The hook proof reads `$HOME/.gemini`; a profile flag that moves agy's configuration would
+    /// make agy load hooks the proof never saw while the skip flag is passed.
+    #[test]
+    fn extra_args_cannot_move_the_config_dir_the_hook_proof_reads() {
+        let a = AgyAdapter::default();
+        for hook in [false, true] {
+            let mut s = session(Mode::Ask, hook);
+            s.extra_args = vec![
+                "--gemini_dir=/tmp/elsewhere".into(),
+                "--keep-1".into(),
+                "--gemini_dir".into(),
+                "/tmp/separate".into(),
+                "-gemini_dir=/tmp/one-dash".into(),
+                "-gemini_dir".into(),
+                "/tmp/one-dash-separate".into(),
+                "--gemini-dir=/tmp/hyphenated".into(),
+                "--app_data_dir=/tmp/app-data".into(),
+                "--app_data_dir".into(),
+                "/tmp/app-data-separate".into(),
+                "--keep-2".into(),
+                // Last: dropped alone, so it cannot swallow the adapter's own flags as its value.
+                "--gemini_dir".into(),
+            ];
+            let argv = a.argv(&s);
+            assert!(
+                argv.iter().all(|x| !x.contains("gemini")
+                    && !x.contains("app_data")
+                    && !x.starts_with("/tmp/")),
+                "{argv:?}"
+            );
+            assert_eq!(
+                &argv[1..5],
+                ["--keep-1", "--keep-2", "--input-format", "stream-json"]
+            );
+            assert_eq!(
+                argv.iter()
+                    .filter(|x| x.as_str() == SKIP_PERMISSIONS)
+                    .count(),
+                usize::from(hook),
+                "the skip flag stays the adapter's decision alone"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_args_keep_everything_the_adapter_does_not_own() {
+        let kept: Vec<String> = [
+            "--x",
+            "-",
+            "--",
+            "value",
+            "--gemini_dirt",
+            "--sandbox=gemini_dir",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(profile_args(&kept), kept);
     }
 
     #[test]

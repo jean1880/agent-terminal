@@ -142,7 +142,10 @@ Architectural mandates, standards, and workflows for this codebase.
   flag (Plan, Accept edits) and Ask is unavailable, because headless agy cannot ask. Never
   describe hookless agy as read-only: verified live, it refuses shell commands without the flag
   but applies file edits in every mode, Plan included. The adapter strips the flag from
-  profile arguments. The session's canary restarts agy without the flag if a tool step arrives
+  profile arguments, and with it `--gemini_dir`/`--app_data_dir` (which move every hook file
+  away from the `$HOME/.gemini` the proof reads). Any workspace `.agents/hooks.json` or
+  `.agents/plugins/<p>/hooks.json`, in the thread directory or an ancestor up to the repository
+  root, refuses the proof. The session's canary restarts agy without the flag if a tool step arrives
   without a hook query. Never add a path that sets the flag any other way.
 - **Dangerous permissive mode (`Mode::Bypass`) is confirmed, session-only and never a
   default**: picking it (dropdown or `/mode`) always shows the warning first, and Cancel changes
