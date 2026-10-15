@@ -209,7 +209,11 @@ impl SubagentSummary {
         match self.lifecycle {
             Some(state) => matches!(
                 state,
-                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+                // Stopping is still active: only an observed exit ends a worker.
+                WorkerState::Starting
+                    | WorkerState::Running
+                    | WorkerState::Waiting
+                    | WorkerState::Stopping
             ),
             None => self.status == ToolStatus::Running,
         }
@@ -2918,6 +2922,35 @@ mod tests {
         assert!(!t.subagents()[0].active());
         assert_eq!(t.subagents()[0].state_label(), "status unknown");
         assert_eq!(t.activity(false), Activity::Finished);
+    }
+
+    #[test]
+    fn a_stopping_worker_stays_active_until_its_exit_is_observed() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Codex);
+        t.apply(&worker_state(WorkerState::Stopping, false), Driver::Codex);
+        t.apply(
+            &ev(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }),
+            Driver::Codex,
+        );
+        let worker = &t.subagents()[0];
+        assert_eq!(worker.lifecycle, Some(WorkerState::Stopping));
+        assert!(worker.active());
+        assert!(!worker.finished());
+        assert_eq!(worker.state_label(), "stopping");
+        assert_eq!(
+            t.activity(false),
+            Activity::Waiting {
+                tasks: vec!["Mira".into()]
+            }
+        );
+        t.apply(&worker_state(WorkerState::Stopped, false), Driver::Codex);
+        assert!(t.subagents()[0].finished());
     }
 
     #[test]
