@@ -153,20 +153,47 @@ fn effective_gid() -> Option<u32> {
     fs::metadata("/proc/self").ok().map(|m| m.gid())
 }
 
-/// The name of the app's own state directory (`$XDG_STATE_HOME/agent-terminal`): the only
-/// directory the app tightens on its own. A store placed anywhere else is the user's layout.
-pub(crate) const APP_DIR_NAME: &str = "agent-terminal";
+/// The app's own state directory, canonicalised: the directory of [`super::default_path`] for this
+/// process's `XDG_STATE_HOME`/`HOME`. `None` when it cannot be worked out or does not exist.
+fn app_state_dir() -> Option<PathBuf> {
+    let xdg = std::env::var("XDG_STATE_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let db = super::default_path(xdg.as_deref(), home.as_deref())?;
+    fs::canonicalize(db.parent()?).ok()
+}
 
-/// Whether `dir` is the app's own state directory (by name), the one it may make private.
+/// Directories tests declare to be the app's own (unique temporary paths, so tests stay hermetic
+/// and never touch the real state directory).
+#[cfg(test)]
+static TEST_APP_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: `dir` counts as the app's own state directory.
+#[cfg(test)]
+pub(crate) fn treat_as_app_dir(dir: &Path) {
+    if let (Ok(real), Ok(mut dirs)) = (fs::canonicalize(dir), TEST_APP_DIRS.lock()) {
+        dirs.push(real);
+    }
+}
+
+/// Whether `dir` is exactly the app's own state directory (by canonical path, never by name): the
+/// only directory the app may make private. Any other directory is the user's and never changed.
 pub(crate) fn is_app_dir(dir: &Path) -> bool {
-    dir.file_name().is_some_and(|n| n == APP_DIR_NAME)
+    let Ok(real) = fs::canonicalize(dir) else {
+        return false;
+    };
+    #[cfg(test)]
+    if TEST_APP_DIRS.lock().is_ok_and(|dirs| dirs.contains(&real)) {
+        return true;
+    }
+    app_state_dir().is_some_and(|app| app == real)
 }
 
 /// Makes the directory that actually holds the store trustworthy before anything in it is opened.
 /// `dir` is resolved (no symlink) and is never the directory a symlink to the store lives in.
 ///
 /// - Another user's directory is refused.
-/// - The app's own `agent-terminal` directory, writable by group or others, is tightened to `0700`
+/// - The app's own state directory ([`is_app_dir`]: by exact path, never by name), writable by
+///   group or others, is tightened to `0700`
 ///   (a umask of 002 leaves it `0775` with the user's private group, and refusing would break
 ///   upgrades).
 /// - Any other directory is the user's layout and is never changed: it is refused when others may
@@ -728,7 +755,7 @@ mod tests {
     }
 
     fn db_in(dir: &tempfile::TempDir) -> PathBuf {
-        dir.path().join(APP_DIR_NAME).join("threads.db")
+        dir.path().join("agent-terminal").join("threads.db")
     }
 
     fn read_only(path: &Path) -> Connection {
@@ -1228,11 +1255,35 @@ mod tests {
         let db = db_in(&dir);
         fixture(&db, 3);
         let parent = db.parent().expect("p");
+        treat_as_app_dir(parent);
         fs::set_permissions(parent, fs::Permissions::from_mode(0o770)).expect("chmod");
         let (hooks, trace) = traced();
         Store::open_with(&db, &hooks).expect("open");
         assert_eq!(mode(parent), 0o700);
         assert!(trace.lock().expect("t").contains(&"migrate".to_owned()));
+    }
+
+    #[test]
+    fn an_unrelated_directory_named_agent_terminal_keeps_its_mode() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = dir
+            .path()
+            .join("projects")
+            .join("agent-terminal")
+            .join("threads.db");
+        fixture(&db, 3);
+        let parent = db.parent().expect("p");
+        assert!(
+            !is_app_dir(parent),
+            "a name is not the app's state directory"
+        );
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o775)).expect("chmod");
+        drop(Store::open(&db).expect("open"));
+        assert_eq!(mode(parent), 0o775, "never changed");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).expect("chmod");
+        drop(Store::open(&db).expect("reopen"));
+        assert_eq!(mode(parent), 0o755, "not tightened after the open either");
+        assert_preserved(&db);
     }
 
     #[test]

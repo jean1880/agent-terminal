@@ -2603,6 +2603,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let dir = tmp.path().join("agent-terminal");
         std::fs::create_dir(&dir).expect("dir");
+        // Only the app's own state directory is tightened: this one stands in for it.
+        preflight::treat_as_app_dir(&dir);
         let path = dir.join("threads.db");
         drop(Store::open(&path).expect("first"));
         let chmod = |p: &Path, m| {
