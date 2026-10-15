@@ -433,6 +433,7 @@ impl CodexAdapter {
                 task: None,
                 state: WorkerState::Unknown,
                 activity: None,
+                delegation: None,
             })
     }
 
@@ -3134,6 +3135,7 @@ mod tests {
             resume: resume.map(str::to_owned),
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -3583,6 +3585,7 @@ mod tests {
             task: None,
             state: WorkerState::Closed,
             activity: None,
+            delegation: None,
         };
         a.workers.insert(closed.id.clone(), closed.clone());
         a.handshake();

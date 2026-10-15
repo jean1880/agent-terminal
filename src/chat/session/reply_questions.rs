@@ -420,6 +420,7 @@ mod session_tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         };
         let session = ChatSession::new(adapter, open, store.clone(), thread.clone(), sink, None);
         assert!(pump_until(ctx, 10, || session.inner.state.borrow().alive));

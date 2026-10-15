@@ -7121,6 +7121,7 @@ mod tests {
                         task: Some("Check layout at enlarged text sizes".into()),
                         state: agent_core::event::WorkerState::Running,
                         activity: None,
+                        delegation: None,
                     },
                     agent_core::event::WorkerSnapshot {
                         id: "layout-unknown".into(),
@@ -7128,6 +7129,7 @@ mod tests {
                         task: None,
                         state: agent_core::event::WorkerState::Unknown,
                         activity: None,
+                        delegation: None,
                     },
                 ],
                 waiting_for: vec!["layout-worker".into()],

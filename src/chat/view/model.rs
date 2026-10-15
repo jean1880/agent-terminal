@@ -1986,6 +1986,8 @@ impl Transcript {
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
             Event::QuotaUpdated { .. } | Event::Unknown => {}
+            // Delegation events are not shown yet (no runtime emits them before P4).
+            Event::DelegatedMessage { .. } | Event::WorkerLinked { .. } => {}
         }
         out
     }
@@ -2700,6 +2702,7 @@ mod tests {
                 task: Some("Review the composer".into()),
                 state,
                 activity: Some("Inspecting controls".into()),
+                delegation: None,
             }],
             waiting_for: if waiting {
                 vec!["child-1".into()]
@@ -2850,6 +2853,7 @@ mod tests {
                         task: None,
                         state: WorkerState::Unknown,
                         activity: Some(String::new()),
+                        delegation: None,
                     }],
                     waiting_for: Vec::new(),
                 }),
@@ -2876,6 +2880,7 @@ mod tests {
                     task: Some("Review the new task".into()),
                     state: WorkerState::Running,
                     activity: None,
+                    delegation: None,
                 }],
                 waiting_for: Vec::new(),
             }),

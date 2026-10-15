@@ -1458,6 +1458,7 @@ fn codex_worker_script() -> Vec<Step> {
             task: Some("Review composer controls and spacing".into()),
             state: WorkerState::Running,
             activity: Some("Inspecting the file-change card".into()),
+            delegation: None,
         },
         WorkerSnapshot {
             id: "demo-accessibility".into(),
@@ -1465,6 +1466,7 @@ fn codex_worker_script() -> Vec<Step> {
             task: Some("Check keyboard focus and readable text".into()),
             state: WorkerState::Running,
             activity: None,
+            delegation: None,
         },
         WorkerSnapshot {
             id: "demo-engineer".into(),
@@ -1472,6 +1474,7 @@ fn codex_worker_script() -> Vec<Step> {
             task: Some("Trace Codex worker events".into()),
             state: WorkerState::Completed,
             activity: Some("Worker IDs and lifecycle verified".into()),
+            delegation: None,
         },
         WorkerSnapshot {
             id: "demo-closed".into(),
@@ -1479,6 +1482,7 @@ fn codex_worker_script() -> Vec<Step> {
             task: Some("Review the earlier implementation".into()),
             state: WorkerState::Closed,
             activity: None,
+            delegation: None,
         },
     ];
     vec![

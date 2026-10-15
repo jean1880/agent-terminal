@@ -3837,6 +3837,7 @@ impl AgentTerminalWindow {
                 .then(|| glib::uuid_string_random().to_string()),
             resume,
             approval_hook: false,
+            delegation: None,
         };
         let adapter = make_adapter(driver, &program);
         let clear = self.config.borrow().clear_env.clone();
