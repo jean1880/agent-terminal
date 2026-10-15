@@ -1,0 +1,7 @@
+version: 2
+
+secret:
+  # Fake values in real credential shapes: the redaction engine's tests need text that the
+  # detectors recognise. None is a live credential.
+  ignored_paths:
+    - crates/agent-core/src/redact/stream.rs
