@@ -22,6 +22,7 @@ mod claude_probe;
 mod codex_home;
 mod codex_probe;
 pub mod config;
+mod delegation;
 mod diff_tool;
 mod environment_review;
 mod freshness;
