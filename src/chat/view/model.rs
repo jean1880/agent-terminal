@@ -232,6 +232,7 @@ impl SubagentSummary {
             Some(WorkerState::Failed) => "failed",
             Some(WorkerState::Stopped) => "stopped",
             Some(WorkerState::Closed) => "closed",
+            Some(WorkerState::Stopping) => "stopping",
             Some(WorkerState::Unknown) => "status unknown",
             None => match self.status {
                 ToolStatus::Running => "running",
@@ -998,9 +999,10 @@ impl Transcript {
                 )
             });
             let status = match state {
-                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting => {
-                    ToolStatus::Running
-                }
+                WorkerState::Starting
+                | WorkerState::Running
+                | WorkerState::Waiting
+                | WorkerState::Stopping => ToolStatus::Running,
                 WorkerState::Completed | WorkerState::Closed => ToolStatus::Completed,
                 WorkerState::Failed => ToolStatus::Failed,
                 WorkerState::Stopped | WorkerState::Unknown => ToolStatus::Interrupted,

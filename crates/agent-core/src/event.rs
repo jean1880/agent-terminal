@@ -491,9 +491,24 @@ pub enum WorkerState {
     Stopped,
     /// Explicit shutdown/closed signal; a completed task leaves its worker open.
     Closed,
+    /// A stop was requested and its outcome is not in yet (delegation: a cancel or revocation
+    /// interrupted the run). Older builds read it as `Unknown`.
+    Stopping,
     #[default]
     #[serde(other)]
     Unknown,
+}
+
+/// Where a worker came from (delegation contract §2 `WorkerSummary.origin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerOrigin {
+    /// The user's own session.
+    Root,
+    /// A provider's own sub-agent, shown but not limited by agent-terminal.
+    Native,
+    /// Started through `cross_agent_spawn`.
+    Supervised,
 }
 
 /// What a background task runs. A kind this build does not know decodes as `Other`.
@@ -626,6 +641,28 @@ mod tests {
     fn event_tag_is_snake_case() {
         let json = serde_json::to_value(Event::Unknown).expect("serialize");
         assert_eq!(json["type"], "unknown");
+    }
+
+    #[test]
+    fn stopping_and_worker_origin_round_trip() {
+        let json = serde_json::to_value(WorkerState::Stopping).expect("ser");
+        assert_eq!(json, serde_json::json!("stopping"));
+        assert_eq!(
+            serde_json::from_value::<WorkerState>(json).expect("de"),
+            WorkerState::Stopping
+        );
+        for (origin, name) in [
+            (WorkerOrigin::Root, "root"),
+            (WorkerOrigin::Native, "native"),
+            (WorkerOrigin::Supervised, "supervised"),
+        ] {
+            let json = serde_json::to_value(origin).expect("ser");
+            assert_eq!(json, serde_json::json!(name));
+            assert_eq!(
+                serde_json::from_value::<WorkerOrigin>(json).expect("de"),
+                origin
+            );
+        }
     }
 
     #[test]
