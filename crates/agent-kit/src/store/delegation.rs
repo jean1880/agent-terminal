@@ -14,6 +14,8 @@
 //! is stored exactly as given). Free-text columns (names, bodies, reasons, activity) are masked
 //! again here with [`redact`], which leaves already-masked text as it is.
 
+use agent_core::delegation::operation::OperationKind;
+use agent_core::delegation::wire::Delivery;
 use agent_core::redact::redact;
 use rusqlite::{params, OptionalExtension, Row};
 
@@ -163,9 +165,12 @@ CREATE TABLE delegation_messages (
     confirmed_at INTEGER,
     presented_at INTEGER,
     acknowledged_at INTEGER,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    event_seq INTEGER UNIQUE REFERENCES events(seq)
 );
 CREATE INDEX delegation_messages_recipient ON delegation_messages(recipient_worker_id, queued_at);
+CREATE INDEX delegation_messages_mailbox
+    ON delegation_messages(recipient_worker_id, event_seq, root_id);
 CREATE INDEX delegation_messages_root ON delegation_messages(root_id, queued_at);
 CREATE INDEX delegation_messages_operation ON delegation_messages(operation_id);
 CREATE TRIGGER delegation_messages_frozen BEFORE UPDATE ON delegation_messages
@@ -176,6 +181,7 @@ WHEN NEW.id IS NOT OLD.id OR NEW.root_id IS NOT OLD.root_id
   OR NEW.reply_to IS NOT OLD.reply_to OR NEW.body IS NOT OLD.body
   OR NEW.delivery_policy IS NOT OLD.delivery_policy
   OR NEW.target_run_id IS NOT OLD.target_run_id OR NEW.queued_at IS NOT OLD.queued_at
+  OR NEW.event_seq IS NOT OLD.event_seq
   OR (OLD.recipient_run_id IS NOT NULL AND NEW.recipient_run_id IS NOT OLD.recipient_run_id)
   OR (OLD.presented_at IS NOT NULL AND NEW.presented_at IS NOT OLD.presented_at)
   OR (OLD.delivery_state IN ('provider_confirmed', 'misdelivered', 'failed', 'cancelled')
@@ -335,6 +341,9 @@ pub struct MessageRow {
     pub presented_at: Option<i64>,
     pub acknowledged_at: Option<i64>,
     pub updated_at: i64,
+    /// The seq of its `DelegatedMessage` event (its page unit), frozen at insert. Indexed with
+    /// the recipient, so a mailbox read walks only the caller's own incoming messages.
+    pub event_seq: Option<i64>,
 }
 
 /// One `delegation_event_links` row: event `event_seq` concerns `worker_id`.
@@ -371,7 +380,7 @@ const OPERATION_COLS: &str = "id, root_id, principal_worker_id, kind, idempotenc
     target_worker_id, run_id, created_at, updated_at";
 const MESSAGE_COLS: &str = "id, root_id, operation_id, sender_worker_id, recipient_worker_id,
     kind, reply_to, body, delivery_policy, target_run_id, delivery_state, recipient_run_id,
-    queued_at, submitted_at, confirmed_at, presented_at, acknowledged_at, updated_at";
+    queued_at, submitted_at, confirmed_at, presented_at, acknowledged_at, updated_at, event_seq";
 const LINK_COLS: &str = "event_seq, worker_id, root_id, run_id, category, invocation_id";
 
 fn root_row(r: &Row<'_>) -> rusqlite::Result<RootRow> {
@@ -472,6 +481,7 @@ fn message_row(r: &Row<'_>) -> rusqlite::Result<MessageRow> {
         presented_at: r.get(15)?,
         acknowledged_at: r.get(16)?,
         updated_at: r.get(17)?,
+        event_seq: r.get(18)?,
     })
 }
 
@@ -488,6 +498,15 @@ fn link_row(r: &Row<'_>) -> rusqlite::Result<EventLinkRow> {
 
 fn masked(text: Option<&str>) -> Option<String> {
     text.map(redact)
+}
+
+/// Refuses a value that is not one of the P1 enum's (`operations.kind` and
+/// `messages.delivery_policy` carry only length CHECKs in SQL, so a later rename never forces a
+/// table rebuild; the value set is enforced here, on write).
+fn known<T: serde::de::DeserializeOwned>(what: &str, value: &str) -> Result<()> {
+    serde_json::from_value::<T>(serde_json::Value::String(value.to_owned()))
+        .map(drop)
+        .map_err(|_| StoreError::Failed(format!("`{value}` is not a known {what}")))
 }
 
 impl Store {
@@ -756,6 +775,7 @@ impl Store {
     /// Inserts an accepted operation. The same (principal, kind, key) twice is a constraint error:
     /// look it up first with [`Store::delegation_operation_by_key`].
     pub fn insert_delegation_operation(&self, op: &OperationRow) -> Result<()> {
+        known::<OperationKind>("operation kind", &op.kind)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO delegation_operations ({OPERATION_COLS})
@@ -836,11 +856,12 @@ impl Store {
     // ---- messages ----
 
     pub fn insert_delegation_message(&self, m: &MessageRow) -> Result<()> {
+        known::<Delivery>("delivery policy", &m.delivery_policy)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO delegation_messages ({MESSAGE_COLS})
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                         ?17, ?18)"
+                         ?17, ?18, ?19)"
             ),
             params![
                 m.id,
@@ -860,7 +881,8 @@ impl Store {
                 m.confirmed_at,
                 m.presented_at,
                 m.acknowledged_at,
-                m.updated_at
+                m.updated_at,
+                m.event_seq
             ],
         )?;
         Ok(())
@@ -1281,6 +1303,7 @@ mod tests {
             presented_at: None,
             acknowledged_at: None,
             updated_at: 1,
+            event_seq: None,
         };
         s.insert_delegation_message(&m).expect("message");
         let stored = s.delegation_message("m_1").expect("q").expect("row");
