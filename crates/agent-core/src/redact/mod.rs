@@ -26,6 +26,8 @@ const TOKEN_PREFIXES: &[&str] = &[
     // AWS access key IDs, long-term and temporary.
     "AKIA",
     "ASIA",
+    // agent-terminal's own delegation capability (`delegation::token::CapabilityToken`).
+    "atdc_",
 ];
 
 /// Authorization schemes whose next word is a credential.
