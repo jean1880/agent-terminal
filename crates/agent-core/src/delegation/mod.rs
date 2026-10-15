@@ -5,6 +5,7 @@
 //! and `/proc` text. Nothing here exposes a tool or changes an adapter.
 
 pub mod authority;
+pub mod correlation;
 pub mod env;
 pub mod error;
 pub mod identity;
@@ -13,9 +14,11 @@ pub mod ipc;
 pub mod lifecycle;
 pub mod limits;
 pub mod mailbox;
+pub mod operation;
 pub mod route;
 pub mod scope;
 pub mod token;
+pub mod tools;
 pub mod wire;
 
 /// The control contract version (IPC hello negotiates `min..=max`; v1 accepts exactly 1).
