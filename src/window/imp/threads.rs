@@ -1356,7 +1356,9 @@ fn agent_launch_with(
             let verdict = cached_hook_verdict(&target);
             // A switch cannot await I/O. Its missing proof is checked explicitly for the next launch.
             if HOOK_VERDICTS.with(|cache| cache.borrow().needs_check(&target)) {
-                glib::MainContext::default().spawn_local(async move {
+                // The thread's own context (the default one on the app's main thread), so a test
+                // on its own loop never contends for the global default.
+                glib::spawn_future_local(async move {
                     let _ = check_hook(target).await;
                 });
             }
@@ -1464,8 +1466,10 @@ fn remember_hook_probe(
 }
 
 /// The last [`check_hook`] verdict. Fail-closed: before any check has finished it is an `Err`, so
-/// agy starts without the skip flag rather than guess. (A stale `Ok` is safe too: the session's
-/// canary stops agy and restarts it without the flag when a tool runs without a hook query.)
+/// agy starts without the skip flag rather than guess. An `Ok` only binds the socket and drives
+/// the UI: it never passes the flag by itself, because the session proves the hook sources again,
+/// off the main thread, right before every agy process it starts with the flag
+/// (`ChatSession`'s `start_process`), and starts it hookless if that fails.
 fn cached_hook_verdict(target: &crate::hook_config::HookTarget) -> Result<(), String> {
     HOOK_VERDICTS.with(|cache| cache.borrow().lookup(target))
 }
