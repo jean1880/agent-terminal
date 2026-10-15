@@ -1269,7 +1269,13 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(op.to_string()))?;
         let from: OperationState = parse_name("dispatch state", &row.dispatch_state)?;
         operation_step(from, to).map_err(|_| illegal("operation"))?;
-        let error_json = error.map(serde_json::to_string).transpose()?;
+        // Every stored error is scrubbed whole (message and every string of its nested details):
+        // it is replayed to callers verbatim.
+        let error_json = error
+            .map(scrub_tool_error)
+            .transpose()?
+            .map(|e| serde_json::to_string(&e))
+            .transpose()?;
         self.set_delegation_dispatch_state(
             op.as_str(),
             &name_of(&to),
@@ -1446,11 +1452,8 @@ impl Store {
                 ),
                 DispatchFact::Confirmed => (OperationState::Confirmed, None, None),
                 DispatchFact::Failed(e) => {
-                    let scrubbed = ToolError {
-                        message: redact(&e.message),
-                        ..e.clone()
-                    }
-                    .with_detail("operation_id", op.as_str());
+                    // Scrubbed whole when stored (`step_operation`).
+                    let scrubbed = e.clone().with_detail("operation_id", op.as_str());
                     (
                         OperationState::Failed,
                         Some(scrubbed),
@@ -1641,6 +1644,16 @@ impl Store {
             .filter(|r| r.root_worker_id == root_worker.as_str())
             .ok_or_else(|| StoreError::NotFound(root_worker.to_string()))?;
         let workers = self.delegation_workers_of_root(&root.id)?;
+        // Every target the event names must belong to this root, checked before any mutation:
+        // a foreign worker would otherwise be closed under another root's epoch bump.
+        if let RevocationEvent::Close(w) | RevocationEvent::GenerationExited(w) = event {
+            if !workers.iter().any(|r| r.id == w.as_str()) {
+                return Err(StoreError::Failed(format!(
+                    "worker {w} does not belong to root {}",
+                    root.id
+                )));
+            }
+        }
         let mut tree = Vec::with_capacity(workers.len());
         for w in &workers {
             tree.push((
@@ -1768,6 +1781,84 @@ impl Store {
         self.atomically(|s| s.publish_in_txn(e))
     }
 
+    /// Whether `thread` is this root's thread or the backing thread of one of its workers.
+    fn thread_in_root(&self, thread: &str, root: &RootRow) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT ?2 = ?3 OR EXISTS (SELECT 1 FROM delegation_workers
+                 WHERE root_id = ?1 AND backing_thread_id = ?2)",
+            params![root.id, thread, root.root_thread_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn provider_thread_in_root(&self, pt: &str, root: &RootRow) -> Result<bool> {
+        let thread: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM provider_threads WHERE id = ?1",
+                params![pt],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match thread {
+            Some(t) => self.thread_in_root(&t, root),
+            None => Ok(false),
+        }
+    }
+
+    fn event_in_root(&self, seq: i64, root: &RootRow) -> Result<bool> {
+        let thread: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM events WHERE seq = ?1",
+                params![seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match thread {
+            Some(t) => self.thread_in_root(&t, root),
+            None => Ok(false),
+        }
+    }
+
+    /// `run` exists, belongs to a worker of `root`, and (when given) to `worker` itself.
+    fn check_run_of(&self, run: &RunId, worker: Option<&WorkerId>, root: &RootRow) -> Result<()> {
+        let Some(row) = self.delegation_run(run.as_str())? else {
+            return Err(StoreError::NotFound(run.to_string()));
+        };
+        let owner = self.worker_row(&worker_id(&row.worker_id)?)?;
+        if owner.root_id != root.id {
+            return Err(StoreError::Failed(format!(
+                "run {run} does not belong to root {}",
+                root.id
+            )));
+        }
+        if let Some(w) = worker {
+            if owner.id != w.as_str() {
+                return Err(StoreError::Failed(format!(
+                    "run {run} does not belong to worker {w}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// An alias's worker and provider thread both belong to `root`.
+    fn check_alias(&self, a: &NewAlias, root: &RootRow) -> Result<()> {
+        if self.worker_row(&a.worker)?.root_id != root.id {
+            return Err(StoreError::Failed(format!(
+                "alias worker {} does not belong to root {}",
+                a.worker, root.id
+            )));
+        }
+        if !self.provider_thread_in_root(&a.provider_thread, root)? {
+            return Err(StoreError::Failed(
+                "an alias's provider thread is not this root's".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn publish_in_txn(&self, e: &PublishEvent) -> Result<Published> {
         let Some(first) = e.links.first() else {
             return Err(StoreError::Failed("a delegation event needs a link".into()));
@@ -1785,16 +1876,35 @@ impl Store {
                 ));
             }
         }
-        let owned: bool = self.conn.query_row(
-            "SELECT ?2 = ?3 OR EXISTS (SELECT 1 FROM delegation_workers
-                 WHERE root_id = ?1 AND backing_thread_id = ?2)",
-            params![root.id, e.thread, root.root_thread_id],
-            |r| r.get(0),
-        )?;
-        if !owned {
+        if !self.thread_in_root(&e.thread, &root)? {
             return Err(StoreError::Failed(
                 "the event's thread is not this root's".into(),
             ));
+        }
+        // Ownership, not just existence (foreign keys prove only that): everything the event
+        // names belongs to this root, checked before anything is written.
+        if let Some(pt) = &e.provider_thread {
+            if !self.provider_thread_in_root(pt, &root)? {
+                return Err(StoreError::Failed(
+                    "the event's provider thread is not this root's".into(),
+                ));
+            }
+        }
+        for l in &e.links {
+            if let Some(r) = &l.run {
+                self.check_run_of(r, Some(&l.worker), &root)?;
+            }
+        }
+        for (w, _, _) in &e.worker_states {
+            if self.worker_row(w)?.root_id != root.id {
+                return Err(StoreError::Failed("a state update for another root".into()));
+            }
+        }
+        for (r, _) in &e.run_states {
+            self.check_run_of(r, None, &root)?;
+        }
+        for a in &e.aliases {
+            self.check_alias(a, &root)?;
         }
         let seq = self.append_event(&e.thread, e.provider_thread.as_deref(), &e.envelope)?;
         #[cfg(test)]
@@ -1813,9 +1923,6 @@ impl Store {
         }
         let now = self.now();
         for (w, state, activity) in &e.worker_states {
-            if self.worker_row(w)?.root_id != root.id {
-                return Err(StoreError::Failed("a state update for another root".into()));
-            }
             self.set_delegation_worker_state(
                 w.as_str(),
                 &name_of(state),
@@ -1859,10 +1966,24 @@ impl Store {
                 .filter(|r| r.root_worker_id == root_worker.as_str())
                 .ok_or_else(|| StoreError::NotFound(root_worker.to_string()))?;
             let now = s.now();
+            // Every link, event, run and alias is checked before anything is written.
             for (seq, l) in links {
                 if s.worker_row(&l.worker)?.root_id != root.id {
                     return Err(StoreError::Failed("a relink for another root".into()));
                 }
+                if let Some(r) = &l.run {
+                    s.check_run_of(r, Some(&l.worker), &root)?;
+                }
+                if !s.event_in_root(*seq, &root)? {
+                    return Err(StoreError::Failed(
+                        "a relinked event is not in this root's threads".into(),
+                    ));
+                }
+            }
+            for a in aliases {
+                s.check_alias(a, &root)?;
+            }
+            for (seq, l) in links {
                 s.conn.execute(
                     "INSERT OR IGNORE INTO delegation_event_links
                          (event_seq, worker_id, root_id, run_id, category, invocation_id)
@@ -1980,17 +2101,24 @@ impl Store {
         let mut json_sum = q.snapshot.as_ref().map_or(0, json_len);
         let mut transport_sum = 0usize;
         {
-            let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT event_seq FROM delegation_event_links
-                 WHERE root_id = ?1 AND event_seq > ?2
-                   AND (worker_id IN (SELECT value FROM json_each(?3))
-                        OR (?4 AND category = 'message'))
-                 ORDER BY event_seq",
-            )?;
-            let mut rows =
-                stmt.query(params![root.id, i64_of(last), scope_json, q.filter.mailbox])?;
+            // Membership is decided in SQL, so every row returned is a unit: the scope's links,
+            // plus (mailbox) message links of the caller whose message it is the recipient of.
+            // Both halves walk the `(worker_id, event_seq)` index, and the LIMIT bounds what one
+            // page reads however long the root's unrelated history is.
+            let mut stmt = self.conn.prepare(PAGE_SQL)?;
+            let limit = i64::from(q.max_events).saturating_add(1);
+            let mut rows = stmt.query(params![
+                root.id,
+                i64_of(last),
+                scope_json,
+                q.filter.mailbox,
+                caller,
+                limit
+            ])?;
             while let Some(r) = rows.next()? {
                 let seq: i64 = r.get(0)?;
+                #[cfg(test)]
+                PAGE_ROWS.with(|c| c.set(c.get() + 1));
                 let Some(unit) = self.page_unit(seq, &scope_set, caller, q.filter.mailbox)? else {
                     continue;
                 };
@@ -2627,6 +2755,31 @@ struct Effect {
     complete_now: bool,
 }
 
+/// A page's candidate seqs: `?1` root, `?2` last seq, `?3` the scope (JSON array), `?4` mailbox,
+/// `?5` the caller, `?6` the row limit.
+const PAGE_SQL: &str = "SELECT event_seq FROM delegation_event_links
+     WHERE root_id = ?1 AND event_seq > ?2
+       AND worker_id IN (SELECT value FROM json_each(?3))
+     UNION
+     SELECT l.event_seq FROM delegation_event_links l
+     JOIN events e ON e.seq = l.event_seq
+     JOIN delegation_messages m ON m.id = json_extract(e.envelope_json, '$.event.message_id')
+     WHERE ?4 AND l.worker_id = ?5 AND l.event_seq > ?2 AND l.root_id = ?1
+       AND l.category = 'message' AND m.recipient_worker_id = ?5
+     ORDER BY 1
+     LIMIT ?6";
+
+/// A `ToolError` with every string in it scrubbed, recursively (message and nested details,
+/// sensitive keys masked whole), the way stored envelopes are.
+fn scrub_tool_error(e: &ToolError) -> Result<ToolError> {
+    let v = serde_json::to_value(e)?;
+    let mut scrubbed: ToolError = serde_json::from_value(super::scrub_value(None, v))?;
+    // The code and retryable flag are ours, never secret: kept exactly.
+    scrubbed.code = e.code;
+    scrubbed.retryable = e.retryable;
+    Ok(scrubbed)
+}
+
 fn json_len(v: &Value) -> usize {
     serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
 }
@@ -2696,6 +2849,8 @@ thread_local! {
     /// Test hook: runs inside a publication, after its event row and before its links.
     static BEFORE_LINKS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Test counter: candidate rows a page read examined.
+    static PAGE_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -4307,5 +4462,269 @@ mod tests {
             .expect("q")
             .is_none());
         let _ = writer.shutdown(Duration::from_secs(10));
+    }
+
+    // ---- review round 1: cross-root ownership, scrubbed errors, bounded mailbox reads ----
+
+    /// A second root in the same store, with one spawned child.
+    fn second_root(s: &Store) -> (RootHandle, String, AcceptedOp) {
+        let thread = s.create_thread("/v", Some("other root")).expect("thread");
+        let root = s
+            .create_delegation_root(&NewRoot {
+                thread: thread.clone(),
+                driver: Driver::Codex,
+                profile_id: ProfileId::parse("codex-default").expect("profile"),
+                name: "other".into(),
+                policy_json: "{}".into(),
+            })
+            .expect("root");
+        let child = spawn(s, &root.worker, "other-k1");
+        (root, thread, child)
+    }
+
+    fn epochs(s: &Store, root: &str) -> (i64, i64) {
+        let r = s.delegation_root(root).expect("q").expect("row");
+        (r.authority_epoch, r.stream_epoch)
+    }
+
+    #[test]
+    fn a_revocation_never_touches_a_worker_of_another_root() {
+        let f = fx();
+        spawn(&f.s, &f.root.worker, "k1");
+        let (b, _, b_child) = second_root(&f.s);
+        let foreign = b_child.worker.clone().expect("w");
+        for event in [
+            RevocationEvent::Close(foreign.clone()),
+            RevocationEvent::GenerationExited(foreign.clone()),
+        ] {
+            let r = f.s.revoke_delegation(&f.root.worker, &event);
+            assert!(r.is_err(), "{event:?}: {r:?}");
+        }
+        // Nothing moved in either root.
+        assert_eq!(epochs(&f.s, &f.root.root), (0, 0));
+        assert_eq!(epochs(&f.s, &b.root), (0, 0));
+        let w =
+            f.s.delegation_worker(foreign.as_str())
+                .expect("q")
+                .expect("row");
+        assert_eq!(w.state, "starting");
+        assert_eq!(op_state(&f.s, &b_child.operation), "accepted");
+        // Its own root may close it.
+        let r =
+            f.s.revoke_delegation(&b.worker, &RevocationEvent::Close(foreign.clone()))
+                .expect("own root");
+        assert_eq!(r.closed, vec![foreign]);
+    }
+
+    #[test]
+    fn a_publication_or_relink_never_reaches_another_roots_runs_workers_or_threads() {
+        let f = fx();
+        let a_child = spawn(&f.s, &f.root.worker, "k1");
+        let a_worker = a_child.worker.clone().expect("w");
+        let a_run = a_child.run.clone().expect("r");
+        let (b, b_thread, b_child) = second_root(&f.s);
+        let b_worker = b_child.worker.clone().expect("w");
+        let b_run = b_child.run.clone().expect("r");
+        let b_pt =
+            f.s.add_provider_thread(&b_thread, "codex", "gpt")
+                .expect("pt");
+        let a_pt =
+            f.s.add_provider_thread(&f.root_thread, "claude", "opus")
+                .expect("pt");
+        let events_before: i64 =
+            f.s.conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .expect("count");
+        let base = || child_event(&f.root_thread, &f.root.worker, "x");
+        let alias = |pt: &str, worker: &WorkerId| NewAlias {
+            provider_thread: pt.to_owned(),
+            process_generation: 1,
+            native_worker_id: "agent-1".into(),
+            worker: worker.clone(),
+        };
+        let mut cases: Vec<(&str, PublishEvent)> = Vec::new();
+        let mut e = base();
+        e.run_states = vec![(b_run.clone(), RunState::Running)];
+        cases.push(("a run of another root", e));
+        let mut e = base();
+        e.aliases = vec![alias(&a_pt, &b_worker)];
+        cases.push(("an alias to another root's worker", e));
+        let mut e = base();
+        e.aliases = vec![alias(&b_pt, &a_worker)];
+        cases.push(("an alias on another root's provider thread", e));
+        let mut e = base();
+        e.links[0].run = Some(b_run.clone());
+        cases.push(("a link to another root's run", e));
+        let mut e = base();
+        e.links[0].run = Some(a_run.clone());
+        cases.push(("a link to another worker's run", e));
+        let mut e = base();
+        e.provider_thread = Some(b_pt.clone());
+        cases.push(("another root's provider thread", e));
+        let mut e = base();
+        e.worker_states = vec![(b_worker.clone(), WorkerState::Closed, None)];
+        cases.push(("another root's worker state", e));
+        for (what, e) in cases {
+            assert!(f.s.publish_delegation_event(&e).is_err(), "{what}");
+        }
+        let events_after: i64 =
+            f.s.conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .expect("count");
+        assert_eq!(events_after, events_before, "no refused event was stored");
+        let run = f.s.delegation_run(b_run.as_str()).expect("q").expect("row");
+        assert_eq!(run.state, "reserved");
+        assert_eq!(
+            f.s.delegation_native_alias(&b_pt, 1, "agent-1").expect("q"),
+            None
+        );
+        assert_eq!(
+            f.s.delegation_native_alias(&a_pt, 1, "agent-1").expect("q"),
+            None
+        );
+
+        // Relink: a foreign alias, a foreign run or another root's event is refused, and the
+        // stream epoch does not move.
+        let b_event =
+            f.s.publish_delegation_event(&child_event(&b_thread, &b.worker, "b"))
+                .expect("b event");
+        let link = |run: Option<RunId>| LinkSpec {
+            worker: a_worker.clone(),
+            run,
+            category: EventCategory::Activity,
+            invocation: None,
+        };
+        let a_event =
+            f.s.publish_delegation_event(&child_event(&f.root_thread, &f.root.worker, "a"))
+                .expect("a event");
+        let refused = [
+            f.s.relink_delegation_history(&f.root.worker, &[], &[alias(&a_pt, &b_worker)]),
+            f.s.relink_delegation_history(&f.root.worker, &[], &[alias(&b_pt, &a_worker)]),
+            f.s.relink_delegation_history(
+                &f.root.worker,
+                &[(a_event.seq, link(Some(b_run.clone())))],
+                &[],
+            ),
+            f.s.relink_delegation_history(&f.root.worker, &[(b_event.seq, link(None))], &[]),
+        ];
+        for (i, r) in refused.iter().enumerate() {
+            assert!(r.is_err(), "relink case {i}: {r:?}");
+        }
+        assert_eq!(epochs(&f.s, &f.root.root).1, 0);
+        assert!(f.s.delegation_event_links(b_event.seq).expect("q").len() == 1);
+        // The legitimate relink still works.
+        f.s.relink_delegation_history(
+            &f.root.worker,
+            &[(a_event.seq, link(Some(a_run)))],
+            &[alias(&a_pt, &a_worker)],
+        )
+        .expect("own relink");
+    }
+
+    #[test]
+    fn a_stored_failure_is_scrubbed_through_its_nested_details() {
+        let f = fx();
+        let op = spawn(&f.s, &f.root.worker, "k1");
+        f.s.reserve_delegation_dispatch(&op.operation)
+            .expect("s")
+            .expect("reserved");
+        let token = format!("ghp_{}", "q".repeat(36));
+        let failure = ToolError::new(
+            ErrorCode::ProviderUnavailable,
+            format!("refused with {token}"),
+        )
+        .with_detail(
+            "nested",
+            json!({"deep": [format!("Bearer {token}"), {"password": "hunter2-hunter2"}],
+                   "note": format!("key={token}")}),
+        );
+        f.s.record_delegation_dispatch(&op.operation, &DispatchFact::Failed(failure))
+            .expect("failed");
+        let stored =
+            f.s.delegation_operation(op.operation.as_str())
+                .expect("q")
+                .expect("row")
+                .error_json
+                .expect("error");
+        for secret in [token.as_str(), "qqqqqqqqqqqq", "hunter2-hunter2"] {
+            assert!(!stored.contains(secret), "{secret} in {stored}");
+        }
+        let again = accept(
+            &f.s,
+            &f.root.worker,
+            spawn_req("k1", "review the parser"),
+            Resolution::default(),
+            AcceptPlan::Spawn(spawn_plan()),
+        );
+        let Ok(Accepted::Replay(ReplayOutcome::Error(e))) = again else {
+            panic!("{again:?}")
+        };
+        assert_eq!(
+            e.code,
+            ErrorCode::ProviderUnavailable,
+            "the code is kept exactly"
+        );
+        let replayed = serde_json::to_string(&e).expect("json");
+        assert!(!replayed.contains(&token), "{replayed}");
+        assert!(!replayed.contains("hunter2-hunter2"), "{replayed}");
+    }
+
+    #[test]
+    fn a_mailbox_read_never_scans_unrelated_message_history() {
+        let f = fx();
+        let a = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        let b = spawn(&f.s, &f.root.worker, "k2").worker.expect("w");
+        // A long history between the root and B that is none of A's business.
+        for i in 0..300 {
+            new_op(send(
+                &f.s,
+                &f.root.worker,
+                b.as_str(),
+                "instruction",
+                "work",
+                &format!("s{i}"),
+            ));
+            new_op(send(&f.s, &b, "parent", "report", "done", &format!("r{i}")));
+        }
+        let mut q = query(&f.root.worker, &a, vec![a.clone()], None);
+        q.max_events = 10;
+        PAGE_ROWS.with(|c| c.set(0));
+        let page = f.s.read_delegation_page(&q).expect("s").expect("page");
+        let rows = PAGE_ROWS.with(std::cell::Cell::get);
+        assert!(rows <= 11, "examined {rows} rows");
+        assert!(seqs(&page.page).len() <= 1, "only A's own spawn event");
+        // The root's own mailbox is still bounded by the page, not the history.
+        let mut q = query(&f.root.worker, &f.root.worker, vec![], None);
+        q.max_events = 10;
+        PAGE_ROWS.with(|c| c.set(0));
+        let page = f.s.read_delegation_page(&q).expect("s").expect("page");
+        assert_eq!(PAGE_ROWS.with(std::cell::Cell::get), 11);
+        assert!(page.truncated);
+        assert_eq!(page.page["messages"].as_array().expect("m").len(), 10);
+        assert!(page.page["messages"]
+            .as_array()
+            .expect("m")
+            .iter()
+            .all(|m| m["to"] == json!(f.root.worker.as_str())));
+        // Both halves of the query walk the (worker_id, event_seq) index, never the whole table.
+        let mut stmt =
+            f.s.conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {PAGE_SQL}"))
+                .expect("plan");
+        let plan: Vec<String> = stmt
+            .query_map(params![f.root.root, 0, "[]", true, a.as_str(), 11], |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("q")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        let links: Vec<&String> = plan
+            .iter()
+            .filter(|l| l.contains("delegation_event_links") || l.starts_with("SEARCH l"))
+            .collect();
+        assert!(!links.is_empty(), "{plan:?}");
+        for l in &links {
+            assert!(l.contains("INDEX"), "a full scan of the links: {plan:?}");
+        }
     }
 }
