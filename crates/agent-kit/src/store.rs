@@ -23,6 +23,7 @@ use serde_json::Value;
 use crate::heal_tail::HealTails;
 
 pub mod delegation;
+pub mod delegation_typed;
 mod preflight;
 
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
@@ -978,21 +979,36 @@ impl Store {
     ///
     /// The native sessions it held are remembered as dismissed ([`Store::native_dismissed`]), so
     /// listing the agents' recent sessions does not bring a deleted thread straight back.
+    ///
+    /// A delegation root's thread or a supervised child's hidden thread is refused while any
+    /// delegated worker it would take is live; close them first
+    /// ([`Store::close_and_revoke_for_delete`]). Its delegation rows then go with it, and so do the
+    /// hidden threads of its descendants (their native sessions dismissed too).
     pub fn delete_thread(&self, thread: &str) -> Result<()> {
         let tx = self.write_txn()?;
-        let natives: Vec<(String, String)> = self
-            .provider_threads(thread)?
-            .into_iter()
-            .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
+        let hidden = self.release_delegation_for_delete(thread)?;
+        let all: Vec<&str> = std::iter::once(thread)
+            .chain(hidden.iter().map(String::as_str))
             .collect();
-        self.add_dismissed(&natives)?;
-        self.delete_meta(&pending_prompt_key(thread))?;
-        let n = self
-            .conn
-            .execute("DELETE FROM threads WHERE id = ?1", params![thread])?;
-        require_row(n, thread)?;
+        for t in &all {
+            let natives: Vec<(String, String)> = self
+                .provider_threads(t)?
+                .into_iter()
+                .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
+                .collect();
+            self.add_dismissed(&natives)?;
+            self.delete_meta(&pending_prompt_key(t))?;
+            let n = self
+                .conn
+                .execute("DELETE FROM threads WHERE id = ?1", params![t])?;
+            if *t == thread {
+                require_row(n, thread)?;
+            }
+        }
         tx.commit()?;
-        self.tails.borrow_mut().clear_thread(thread);
+        for t in &all {
+            self.tails.borrow_mut().clear_thread(t);
+        }
         Ok(())
     }
 

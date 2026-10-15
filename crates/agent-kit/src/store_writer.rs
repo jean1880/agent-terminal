@@ -42,8 +42,15 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agent_core::delegation::authority::RevocationEvent;
+use agent_core::delegation::ids::{OperationId, WorkerId};
+use agent_core::delegation::operation::OperationState;
 use agent_core::event::{Envelope, Event};
 
+use crate::store::delegation_typed::{
+    Accept, Accepted, AckRequest, AckResult, Completed, Completion, DispatchFact, PublishEvent,
+    Published, Reconciled, Reserved, Revoked, Verdict,
+};
 use crate::store::{Batch, ProviderThreadId, Result, Store, StoreError, SLOW_WRITE};
 
 /// Past this many bytes of WAL the writer reports an error and turns SQLite's own checkpoints
@@ -489,6 +496,84 @@ impl StoreWriter {
             let _ = refused_tx.send(Err(e));
         }
         rx
+    }
+
+    // ---- typed delegation control writes (plan §5 write protocol) ----
+    //
+    // Each runs as one durable control write. Classify the answer with
+    // `DurableOutcome::from_answer`: only `Committed` may be dispatched; a "committed" durability
+    // error is `CommittedUnconfirmed` (refused, never re-dispatched).
+
+    /// Step 1: accept a mutation ([`Store::accept_delegation`]).
+    pub fn delegation_accept(&self, accept: Accept) -> Receiver<Result<Verdict<Accepted>>> {
+        self.durable_call("accept a delegated operation", move |s| {
+            s.accept_delegation(&accept)
+        })
+    }
+
+    /// Step 2: reserve a dispatch ([`Store::reserve_delegation_dispatch`]).
+    pub fn delegation_reserve(&self, op: OperationId) -> Receiver<Result<Verdict<Reserved>>> {
+        self.durable_call("reserve a delegated dispatch", move |s| {
+            s.reserve_delegation_dispatch(&op)
+        })
+    }
+
+    /// Step 4: record a dispatch fact ([`Store::record_delegation_dispatch`]).
+    pub fn delegation_record(
+        &self,
+        op: OperationId,
+        fact: DispatchFact,
+    ) -> Receiver<Result<OperationState>> {
+        self.durable_call("record a delegated dispatch", move |s| {
+            s.record_delegation_dispatch(&op, &fact)
+        })
+    }
+
+    /// Step 5: complete a run ([`Store::complete_delegation_run`]).
+    pub fn delegation_complete(&self, completion: Completion) -> Receiver<Result<Completed>> {
+        self.durable_call("complete a delegated run", move |s| {
+            s.complete_delegation_run(&completion)
+        })
+    }
+
+    /// Step 6: revoke ([`Store::revoke_delegation`]).
+    pub fn delegation_revoke(
+        &self,
+        root_worker: WorkerId,
+        event: RevocationEvent,
+    ) -> Receiver<Result<Revoked>> {
+        self.durable_call("revoke delegated authority", move |s| {
+            s.revoke_delegation(&root_worker, &event)
+        })
+    }
+
+    /// A mailbox ACK ([`Store::acknowledge_delegation_messages`]).
+    pub fn delegation_ack(&self, ack: AckRequest) -> Receiver<Result<Verdict<AckResult>>> {
+        self.durable_call("acknowledge delegated messages", move |s| {
+            s.acknowledge_delegation_messages(&ack)
+        })
+    }
+
+    /// Startup reconciliation ([`Store::reconcile_delegation_after_restart`]).
+    pub fn delegation_reconcile(&self) -> Receiver<Result<Reconciled>> {
+        self.durable_call("reconcile delegation after a restart", |s| {
+            s.reconcile_delegation_after_restart()
+        })
+    }
+
+    /// Closing a thread's delegation before its deletion ([`Store::close_and_revoke_for_delete`]).
+    pub fn delegation_close_for_delete(&self, thread: String) -> Receiver<Result<Option<Revoked>>> {
+        self.durable_call("close delegation for a deletion", move |s| {
+            s.close_and_revoke_for_delete(&thread)
+        })
+    }
+
+    /// Publishes one event with its links ([`Store::publish_delegation_event`]): an ordinary
+    /// (batched) write whose seq is handed back only once its batch committed.
+    pub fn delegation_publish(&self, event: PublishEvent) -> Receiver<Result<Published>> {
+        self.call_result("publish a delegated event", move |s| {
+            s.publish_delegation_event(&event)
+        })
     }
 
     /// Queues one event. An event of an item, or a turn's or session's end, is never refused:
