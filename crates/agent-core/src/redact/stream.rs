@@ -15,22 +15,36 @@
 //!    they arrive (never buffered), so a huge key cannot overflow anything.
 //! 2. **Lines**: the PEM output is collected into the current line. A complete line is
 //!    published as `redact` would write it. Before the newline, a prefix of the line ending in a
-//!    blank (space or tab) is published once no rule's decision reaches its end
-//!    (the open flag of the crate-private `redact_line`): no token, value, quote, header or option argument is still
-//!    open there, and no `Basic`/`Token` is waiting on a later `authorization`. Text appended
-//!    after such a prefix cannot change how the prefix is redacted, so what was published stays
-//!    a prefix of the final redaction. The whole line is kept as context until its newline.
+//!    blank (space or tab) is published once no rule's decision reaches its end (the open flag
+//!    of the crate-private `redact_line`): no token, value, quote, header or option argument is
+//!    still open there, and no `Basic`/`Token` is waiting on a later `authorization`. Text
+//!    appended after such a prefix cannot change how the prefix is redacted, so what was
+//!    published stays a prefix of the final redaction. The whole line is kept as context until
+//!    its newline.
+//!
+//! Input is consumed in pieces of at most [`PIECE_BYTES`], so however large one chunk is, the
+//! working copies are bounded by the piece size and the limits, not by the chunk.
 //!
 //! # The invariant
 //!
 //! For any input and any chunking, the concatenation of everything published is always a
 //! prefix of `redact(concat(input))`, and after [`StreamSanitiser::finish`] it is equal to it.
-//! Two deliberate, conservative divergences, both of which mask *more* than `redact`:
+//! Deliberate, conservative divergences, all of which withhold *more* than `redact`:
 //!
-//! - **Overflow**: a line (published context plus uncertain bytes) longer than the per-stream
-//!   bound, or one that would take the sanitiser past its aggregate bound, is cut: its
+//! - **Line overflow**: a line (published context plus uncertain bytes) that would not fit the
+//!   stream's budget (its per-stream bound, or what the aggregate bound leaves it) is cut: its
 //!   unpublished bytes and everything up to its newline are dropped and [`WITHHELD_NOTICE`] is
 //!   published in their place. No uncertain byte is ever flushed.
+//! - **Sealing**: if even the stream's few remaining bytes (a partial PEM marker, a partial
+//!   UTF-8 character) do not fit its budget, the stream is sealed: the notice is published and
+//!   everything until [`StreamSanitiser::finish`], [`StreamSanitiser::cancel`] or
+//!   [`StreamSanitiser::replace_snapshot`] is withheld.
+//! - **Too many streams**: a stream that needs state when [`Limits::max_streams`] streams
+//!   already hold some is refused the same way (notice, then withheld until finish, cancel or a
+//!   snapshot). Up to `max_streams` refused keys are remembered; past that the sanitiser is
+//!   saturated ([`StreamSanitiser::saturated`]): every stream without state is withheld for the
+//!   rest of its life, since a refused stream it could not remember must never resume without
+//!   its context. Streams that already have state carry on.
 //! - **Cancel**: [`StreamSanitiser::cancel`] drops everything not yet published.
 //!
 //! Holding back is also conservative in timing only: a line with `Basic`/`Token` and no
@@ -40,10 +54,19 @@
 //! Byte input ([`StreamSanitiser::push_bytes`]) is decoded like `String::from_utf8_lossy` of
 //! the whole byte stream, holding an incomplete trailing character until its next bytes come.
 //!
+//! # Memory
+//!
+//! A stream's retained bytes are the *capacities* of its line, partial-marker and
+//! partial-character buffers; a line buffer grows only up to its budget, and one larger than
+//! [`KEEP_CAPACITY`] is freed at its newline. A stream with nothing pending is dropped, so a
+//! finished line costs no entry. Entries holding state are bounded by `max_streams`, and the
+//! refused-key set by `max_streams` too. Published text is the caller's output and is not
+//! bounded here.
+//!
 //! The detection limits are `redact`'s own: a credential with no recognisable shape, not
 //! assigned to a sensitive-looking name, gets through here exactly as it does there.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use super::{redact_line, PEM_BEGIN, PEM_CLOSE, PEM_END, PEM_MASK};
@@ -51,14 +74,24 @@ use super::{redact_line, PEM_BEGIN, PEM_CLOSE, PEM_END, PEM_MASK};
 #[cfg(doc)]
 use super::redact;
 
-/// The default bound on one stream's retained line (published context plus uncertain bytes).
+/// The default bound on one stream's retained bytes (its line, published context plus
+/// uncertain bytes, and a partial marker or character).
 pub const DEFAULT_PER_STREAM_BYTES: usize = 64 * 1024;
 
 /// The default bound on what all streams together retain.
 pub const DEFAULT_AGGREGATE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Published in place of a line the sanitiser had to drop rather than check.
-pub const WITHHELD_NOTICE: &str = "[withheld: line too long to check for secrets]";
+/// The default bound on streams holding state at once.
+pub const DEFAULT_MAX_STREAMS: usize = 1024;
+
+/// Published in place of text the sanitiser had to drop rather than check.
+pub const WITHHELD_NOTICE: &str = "[withheld: text too long to check for secrets]";
+
+/// Input is consumed in pieces of at most this many bytes.
+pub const PIECE_BYTES: usize = 4096;
+
+/// A line buffer with more capacity than this is freed, not kept, when its line ends.
+pub const KEEP_CAPACITY: usize = 4096;
 
 /// Past this many bytes in a line, a prefix is judged again only once the line has grown by an
 /// eighth since the last judgement, so a long line costs amortised linear time, not quadratic.
@@ -68,10 +101,12 @@ const JUDGE_EVERY_PUSH_UP_TO: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Bytes one stream may retain: its current line (published context and uncertain bytes)
-    /// plus a partial PEM marker and a partial UTF-8 character.
+    /// plus a partial PEM marker and a partial UTF-8 character, counted by capacity.
     pub per_stream_bytes: usize,
     /// Bytes all streams together may retain.
     pub aggregate_bytes: usize,
+    /// Streams that may hold state at once.
+    pub max_streams: usize,
 }
 
 impl Default for Limits {
@@ -79,6 +114,7 @@ impl Default for Limits {
         Self {
             per_stream_bytes: DEFAULT_PER_STREAM_BYTES,
             aggregate_bytes: DEFAULT_AGGREGATE_BYTES,
+            max_streams: DEFAULT_MAX_STREAMS,
         }
     }
 }
@@ -101,11 +137,20 @@ pub struct Published {
     pub text: String,
     /// `text` replaces everything published before (a snapshot replaced the deltas).
     pub replace: bool,
-    /// Bytes dropped rather than published: an overflowing line, or a cancelled stream's
-    /// uncertain tail.
+    /// Bytes dropped rather than published: an overflowing line, a sealed or refused stream,
+    /// or a cancelled stream's uncertain tail.
     pub withheld_bytes: usize,
-    /// A line overflowed and [`WITHHELD_NOTICE`] is in `text`.
+    /// Text was withheld for want of room (overflow, sealing, refusal or saturation), and
+    /// [`WITHHELD_NOTICE`] marks the spot when it first happened.
     pub overflowed: bool,
+}
+
+/// Marks a withholding for want of room, once per spot.
+fn notice(p: &mut Published) {
+    if !p.text.ends_with(WITHHELD_NOTICE) {
+        p.text.push_str(WITHHELD_NOTICE);
+    }
+    p.overflowed = true;
 }
 
 /// Where the PEM stage is.
@@ -135,6 +180,8 @@ struct Stream {
     judged: usize,
     /// The current line overflowed: drop everything up to its newline.
     discarding: bool,
+    /// Out of room: withhold everything until the stream ends.
+    sealed: bool,
     /// An incomplete UTF-8 character from [`StreamSanitiser::push_bytes`].
     carry: Vec<u8>,
 }
@@ -148,9 +195,94 @@ fn partial_marker(text: &str, marker: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// `text` in pieces of at most [`PIECE_BYTES`], split on char boundaries.
+fn pieces(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut end = rest.len().min(PIECE_BYTES);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (piece, tail) = rest.split_at(end);
+        rest = tail;
+        Some(piece)
+    })
+}
+
 impl Stream {
+    /// What this stream holds, by capacity.
     fn retained(&self) -> usize {
-        self.pem_tail.len() + self.line.len() + self.carry.len()
+        self.pem_tail.capacity() + self.line.capacity() + self.carry.capacity()
+    }
+
+    /// Input bytes held and not yet published.
+    fn uncertain(&self) -> usize {
+        self.pem_tail.len() + self.line.len() - self.cut + self.carry.len()
+    }
+
+    /// Nothing pending: a fresh stream would behave the same, so the entry can go.
+    fn is_idle(&self) -> bool {
+        self.pem == Pem::Outside
+            && !self.discarding
+            && !self.sealed
+            && self.pem_tail.is_empty()
+            && self.line.is_empty()
+            && self.carry.is_empty()
+    }
+
+    fn feed_str(&mut self, text: &str, budget: usize, p: &mut Published) {
+        for piece in pieces(text) {
+            if self.sealed {
+                p.withheld_bytes += piece.len();
+                continue;
+            }
+            let out = self.pem_pass(piece);
+            self.lines(&out, budget, p);
+            self.enforce(budget, p);
+        }
+    }
+
+    fn feed_bytes(&mut self, bytes: &[u8], budget: usize, p: &mut Published) {
+        for piece in bytes.chunks(PIECE_BYTES) {
+            if self.sealed {
+                p.withheld_bytes += piece.len();
+                continue;
+            }
+            let (text, carry) = decode(std::mem::take(&mut self.carry), piece);
+            self.carry = carry;
+            let out = self.pem_pass(&text);
+            self.lines(&out, budget, p);
+            self.enforce(budget, p);
+        }
+    }
+
+    /// Keeps every buffer within `budget`: the line goes first, then the stream is sealed.
+    fn enforce(&mut self, budget: usize, p: &mut Published) {
+        if self.retained() <= budget {
+            return;
+        }
+        if !self.line.is_empty() {
+            self.overflow_line(0, p);
+        }
+        if self.retained() > budget {
+            p.withheld_bytes += self.uncertain();
+            notice(p);
+            *self = Stream {
+                sealed: true,
+                ..Stream::default()
+            };
+        }
+    }
+
+    /// Drops the current line's unpublished bytes (and `extra` more) and the rest of the line.
+    fn overflow_line(&mut self, extra: usize, p: &mut Published) {
+        p.withheld_bytes += self.line.len() - self.cut + extra;
+        notice(p);
+        self.reset_line();
+        self.discarding = true;
     }
 
     /// The PEM stage: `chunk`'s contribution to `redact_pem_blocks` of the whole stream.
@@ -202,6 +334,7 @@ impl Stream {
         self.publish_safe_prefix(p);
     }
 
+    /// Adds `segment` to the line, growing its buffer no further than the budget allows.
     fn append(&mut self, segment: &str, budget: usize, p: &mut Published) {
         if segment.is_empty() {
             return;
@@ -210,19 +343,25 @@ impl Stream {
             p.withheld_bytes += segment.len();
             return;
         }
-        if self.retained() + segment.len() > budget {
-            p.withheld_bytes += self.line.len() - self.cut + segment.len();
-            p.text.push_str(WITHHELD_NOTICE);
-            p.overflowed = true;
-            self.reset_line();
-            self.discarding = true;
+        let room = budget.saturating_sub(self.pem_tail.capacity() + self.carry.capacity());
+        let needed = self.line.len() + segment.len();
+        if needed > room {
+            self.overflow_line(segment.len(), p);
             return;
+        }
+        if needed > self.line.capacity() {
+            let target = needed.max(self.line.capacity().saturating_mul(2)).min(room);
+            self.line.reserve_exact(target - self.line.len());
         }
         self.line.push_str(segment);
     }
 
     fn reset_line(&mut self) {
-        self.line.clear();
+        if self.line.capacity() > KEEP_CAPACITY {
+            self.line = String::new();
+        } else {
+            self.line.clear();
+        }
         self.cut = 0;
         self.out_len = 0;
         self.judged = 0;
@@ -282,10 +421,14 @@ impl Stream {
     }
 
     /// Ends the stream: a partial character becomes U+FFFD, a partial PEM marker outside a
-    /// block is plain text, and the last line is published whole.
+    /// block is plain text, and the last line is published whole. A sealed stream publishes
+    /// nothing more.
     fn finish(mut self, p: &mut Published) {
+        if self.sealed {
+            return;
+        }
         if !self.carry.is_empty() {
-            self.carry.clear();
+            self.carry = Vec::new();
             let text = self.pem_pass("\u{FFFD}");
             self.lines(&text, usize::MAX, p);
         }
@@ -325,10 +468,14 @@ fn decode(mut carry: Vec<u8>, bytes: &[u8]) -> (String, Vec<u8>) {
 }
 
 /// Publishes streamed text per stream, never ahead of what [`redact`] would mask. See the
-/// module documentation for the invariant and its two conservative divergences.
+/// module documentation for the invariant and its conservative divergences.
 #[derive(Debug)]
 pub struct StreamSanitiser<K = StreamKey> {
     streams: HashMap<K, Stream>,
+    /// Streams refused for want of an entry: withheld until finished, cancelled or replaced.
+    refused: HashSet<K>,
+    /// A refused stream could not be remembered: every stream without state is withheld.
+    saturated: bool,
     limits: Limits,
     retained: usize,
 }
@@ -343,34 +490,72 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     pub fn new(limits: Limits) -> Self {
         Self {
             streams: HashMap::new(),
+            refused: HashSet::new(),
+            saturated: false,
             limits,
             retained: 0,
         }
     }
 
-    /// Bytes all streams retain now.
+    /// Bytes all streams retain now, by buffer capacity.
     pub fn retained_bytes(&self) -> usize {
         self.retained
     }
 
-    /// Streams with state (pushed to, not yet finished or cancelled).
+    /// Streams holding state (something pending, overflowed or sealed).
     pub fn open_streams(&self) -> usize {
         self.streams.len()
     }
 
-    /// Runs `f` on `key`'s stream (created if new) with its byte budget, keeping the
-    /// aggregate count right.
-    fn with_stream<R>(&mut self, key: &K, f: impl FnOnce(&mut Stream, usize) -> R) -> R {
-        let current = self.streams.get(key).map_or(0, Stream::retained);
-        let others = self.retained - current;
+    /// More streams were refused than could be remembered: from now on every stream without
+    /// state is withheld. Surface it as an error and start a new sanitiser for new work.
+    pub fn saturated(&self) -> bool {
+        self.saturated
+    }
+
+    /// Runs `f` on `key`'s stream with its byte budget; keeps the entry only if it holds
+    /// something, and refuses a new stream that needs an entry when none is free.
+    fn feed(
+        &mut self,
+        key: &K,
+        input_len: usize,
+        p: &mut Published,
+        f: impl FnOnce(&mut Stream, usize, &mut Published),
+    ) {
+        if self.refused.contains(key) {
+            p.withheld_bytes += input_len;
+            return;
+        }
+        let existing = self.streams.remove(key);
+        let had = existing.is_some();
+        if !had && self.saturated {
+            p.withheld_bytes += input_len;
+            notice(p);
+            return;
+        }
+        let mut stream = existing.unwrap_or_default();
+        let others = self.retained - stream.retained();
         let budget = self
             .limits
             .per_stream_bytes
             .min(self.limits.aggregate_bytes.saturating_sub(others));
-        let stream = self.streams.entry(key.clone()).or_default();
-        let r = f(stream, budget);
-        self.retained = others + stream.retained();
-        r
+        f(&mut stream, budget, p);
+        self.retained = others;
+        if stream.is_idle() {
+            return;
+        }
+        if !had && self.streams.len() >= self.limits.max_streams {
+            p.withheld_bytes += stream.uncertain();
+            notice(p);
+            if self.refused.len() < self.limits.max_streams {
+                self.refused.insert(key.clone());
+            } else {
+                self.saturated = true;
+            }
+            return;
+        }
+        self.retained += stream.retained();
+        self.streams.insert(key.clone(), stream);
     }
 
     fn take(&mut self, key: &K) -> Option<Stream> {
@@ -382,9 +567,8 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// Adds `chunk` to `key`'s stream; returns what became safe to publish.
     pub fn push(&mut self, key: &K, chunk: &str) -> Published {
         let mut p = Published::default();
-        self.with_stream(key, |s, budget| {
-            let text = s.pem_pass(chunk);
-            s.lines(&text, budget, &mut p);
+        self.feed(key, chunk.len(), &mut p, |s, budget, p| {
+            s.feed_str(chunk, budget, p)
         });
         p
     }
@@ -393,11 +577,8 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// be UTF-8 at all (decoded as `String::from_utf8_lossy` would decode the whole stream).
     pub fn push_bytes(&mut self, key: &K, chunk: &[u8]) -> Published {
         let mut p = Published::default();
-        self.with_stream(key, |s, budget| {
-            let (text, carry) = decode(std::mem::take(&mut s.carry), chunk);
-            s.carry = carry;
-            let text = s.pem_pass(&text);
-            s.lines(&text, budget, &mut p);
+        self.feed(key, chunk.len(), &mut p, |s, budget, p| {
+            s.feed_bytes(chunk, budget, p)
         });
         p
     }
@@ -405,6 +586,9 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// Ends `key`'s stream: publishes the rest of its last line, redacted, and forgets it.
     pub fn finish(&mut self, key: &K) -> Published {
         let mut p = Published::default();
+        if self.refused.remove(key) {
+            return p;
+        }
         if let Some(stream) = self.take(key) {
             stream.finish(&mut p);
         }
@@ -415,8 +599,9 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// what was dropped.
     pub fn cancel(&mut self, key: &K) -> Published {
         let mut p = Published::default();
+        self.refused.remove(key);
         if let Some(stream) = self.take(key) {
-            p.withheld_bytes = stream.retained() - stream.cut;
+            p.withheld_bytes = stream.uncertain();
         }
         p
     }
@@ -425,6 +610,7 @@ impl<K: Eq + Hash + Clone> StreamSanitiser<K> {
     /// built from earlier deltas is dropped and `full_text` is pushed into a fresh stream. The
     /// result has `replace` set; its text is everything now published for the stream.
     pub fn replace_snapshot(&mut self, key: &K, full_text: &str) -> Published {
+        self.refused.remove(key);
         self.take(key);
         let mut p = self.push(key, full_text);
         p.replace = true;
@@ -518,6 +704,72 @@ mod tests {
         ]
     }
 
+    /// CRLF and malformed UTF-8 around PEM markers and rule delimiters, as raw bytes.
+    const EXTRAS: &[&[u8]] = &[
+        b"API_KEY=supersecretvalue1234\r\nnext line\r\n",
+        b"-----BEGIN RSA PRIVATE KEY-----\r\nMIIEsecretbody\r\n-----END RSA PRIVATE KEY-----\r\nafter\r\n", // gitleaks:allow
+        b"Authorization: Bearer abcdefghijklmnop\r\nBasic dXNlcjpodW50ZXIyaHVudGVy\r\n",
+        b"curl -u alice:s3cr3tpass\r\n https://x",
+        b"\"api_key\":\"abc\r\ndefghijklmnop\"\r\n",
+        b"url https://user:pa\r\nss@host/x and https://u:pw123456@h/\r\n",
+        b"pre \xff-----BEGIN KEY-----\nMIIE\xfe\n-----END KEY-----\xc3 post",
+        b"password: \xe2\x82hunter2hunter2 \xff token=\xf0\x9f\x92supersecret99",
+        b"ghp_abcdefghijkl\xffmnopqrstuvwxyz0123 and Bearer abc\xc0defghijklmn",
+        b"-----BEG\xffIN KEY----- not a block; -----BEGIN \xffKEY\n-----END\xff -----END x----- tail",
+        b"Cookie: sid=\xff\xfeabcdef123456\r\nX-Api-Key:\t\xe6\x97k1234567890",
+    ];
+
+    /// `redact` of each of `fixtures()` then `EXTRAS` (lossily decoded), produced by the
+    /// pre-refactor `redact.rs` (master at cf63cc31, compiled standalone) and frozen here: an
+    /// independent check that neither `redact` nor the sanitiser drifted. Some entries record
+    /// `redact`'s known limits as they stand (a `\r` kept inside a masked value, `Basic` on a
+    /// line without "authorization", a token cut by an invalid byte).
+    const BASELINE: &[&str] = &[
+        "export GH=****0123 and",
+        "key ****efgh end",
+        "aws ****MPLE here",
+        "jwt ****dXJl done",
+        "Authorization: Bearer ****mnop rest",
+        "Basic ****dGVy is the authorization",
+        "token ****5678 then authorization: x",
+        "clone https://deploy:****w0rd@git.example.com/r.git now",
+        "tool --password ****orse --verbose",
+        "run --api-token '****aple' next",
+        "curl -u alice:****pass https://x",
+        "curl -s --user 'alice:****here' https://x",
+        "curl -H 'Cookie: ****3456' https://x",
+        "X-Api-Key: **** end",
+        "mysql -u root -p****pass db",
+        "sshpass -p ****cret ssh host",
+        "wget --password ****ret1 https://x",
+        "API_KEY=****1234 next",
+        "\"db_password\": \"****ter2\", \"x\": 1",
+        "before [REDACTED PEM BLOCK] after\nnext",
+        "key: ****CTED PEM BLOCK]",
+        "[REDACTED PEM BLOCK]",
+        "café TOKEN=****ééé€ ghp_ßßßßßßßßßßßß 日本語 password: ****dé!!",
+        "{\"api_key\": \"****78, \"secret\":\"****aces",
+        "API_KEY=****234\r\nnext line\r\n",
+        "[REDACTED PEM BLOCK]\r\nafter\r\n",
+        "Authorization: Bearer ****mnop\r\nBasic dXNlcjpodW50ZXIyaHVudGVy\r\n",
+        "curl -u alice:****ass\r\n https://x",
+        "\"api_key\":\"abc\r\ndefghijklmnop\"\r\n",
+        "url https://user:pa\r\nss@host/x and https://u:****3456@h/\r\n",
+        "pre \u{FFFD}[REDACTED PEM BLOCK]\u{FFFD} post",
+        "password: ****ter2 \u{FFFD} token=****et99",
+        "****ijkl\u{FFFD}mnopqrstuvwxyz0123 and Bearer abc\u{FFFD}defghijklmn",
+        "-----BEG\u{FFFD}IN KEY----- not a block; [REDACTED PEM BLOCK] tail",
+        "Cookie: ****456\r\nX-Api-Key:\t****7890",
+    ];
+
+    fn baseline_inputs() -> Vec<Vec<u8>> {
+        fixtures()
+            .into_iter()
+            .map(|(t, _)| t.into_bytes())
+            .chain(EXTRAS.iter().map(|b| b.to_vec()))
+            .collect()
+    }
+
     /// Pushes `chunks` into one stream, checking after every call that what is published is
     /// a prefix of `redact` of the whole, and returns everything published.
     fn run(chunks: &[&str]) -> String {
@@ -546,10 +798,49 @@ mod tests {
             .collect()
     }
 
+    fn limits(per_stream_bytes: usize, aggregate_bytes: usize) -> Limits {
+        Limits {
+            per_stream_bytes,
+            aggregate_bytes,
+            ..Limits::default()
+        }
+    }
+
     #[test]
     fn every_fixture_is_masked_by_redact_itself() {
         for (text, leaked) in fixtures() {
             assert!(!redact(&text).contains(leaked), "{text}: {}", redact(&text));
+        }
+    }
+
+    #[test]
+    fn redact_and_the_stream_match_the_frozen_pre_refactor_baseline() {
+        let inputs = baseline_inputs();
+        assert_eq!(inputs.len(), BASELINE.len());
+        for (bytes, expected) in inputs.iter().zip(BASELINE) {
+            assert_eq!(
+                redact(&String::from_utf8_lossy(bytes)),
+                *expected,
+                "{bytes:?}"
+            );
+            // Every single byte split, through the byte path.
+            for i in 0..=bytes.len() {
+                let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+                let mut out = s.push_bytes(&0, &bytes[..i]).text;
+                assert!(expected.starts_with(&out), "{i}: {out:?}");
+                out.push_str(&s.push_bytes(&0, &bytes[i..]).text);
+                assert!(expected.starts_with(&out), "{i}: {out:?}");
+                out.push_str(&s.finish(&0).text);
+                assert_eq!(out, *expected, "split at {i}: {bytes:?}");
+            }
+            // Byte by byte.
+            let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+            let mut out = String::new();
+            for b in bytes {
+                out.push_str(&s.push_bytes(&0, std::slice::from_ref(b)).text);
+            }
+            out.push_str(&s.finish(&0).text);
+            assert_eq!(out, *expected, "byte by byte: {bytes:?}");
         }
     }
 
@@ -612,6 +903,7 @@ mod tests {
             " ",
             "\t",
             "\n",
+            "\r\n",
             "'",
             "\"",
             "=",
@@ -662,6 +954,7 @@ mod tests {
             "日本",
             "😀",
             "ß",
+            "\u{FFFD}",
             "****",
             "x",
             "1234",
@@ -737,7 +1030,7 @@ mod tests {
             assert_eq!(published[k], redact(text));
             assert!(!published[k].contains(leaked));
         }
-        assert_eq!(s.retained_bytes(), 0);
+        assert_eq!((s.retained_bytes(), s.open_streams()), (0, 0));
     }
 
     #[test]
@@ -799,11 +1092,7 @@ mod tests {
 
     #[test]
     fn a_huge_unterminated_line_is_withheld_not_flushed() {
-        let limits = Limits {
-            per_stream_bytes: 256,
-            aggregate_bytes: 1 << 20,
-        };
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits);
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(256, 1 << 20));
         let line = format!("{}Basic {} ", "word ".repeat(30), "Z".repeat(300));
         let mut out = String::new();
         let mut overflowed = false;
@@ -834,11 +1123,7 @@ mod tests {
 
     #[test]
     fn a_huge_pem_block_is_dropped_as_it_streams() {
-        let limits = Limits {
-            per_stream_bytes: 128,
-            aggregate_bytes: 128,
-        };
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits);
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(128, 128));
         let mut out = s.push(&0, "key -----BEGIN RSA PRIVATE KEY-----\n").text;
         for _ in 0..1000 {
             out.push_str(&s.push(&0, "MIIEowIBAAKCAQEA0123456789\n").text);
@@ -851,19 +1136,146 @@ mod tests {
 
     #[test]
     fn the_aggregate_bound_withholds_the_stream_that_crosses_it() {
-        let limits = Limits {
-            per_stream_bytes: 1024,
-            aggregate_bytes: 1500,
-        };
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits);
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(1024, 1500));
         let held = "x".repeat(1000);
         assert!(!s.push(&0, &held).overflowed);
         let p = s.push(&1, &held);
         assert!(p.overflowed);
         assert_eq!(p.text, WITHHELD_NOTICE);
-        assert!(!p.text.contains('x'));
-        assert_eq!(s.retained_bytes(), 1000);
+        assert!(s.retained_bytes() >= 1000 && s.retained_bytes() <= 1500);
         assert_eq!(s.finish(&0).text, held);
+    }
+
+    /// Review finding: a partial PEM marker or UTF-8 character counted against no limit.
+    #[test]
+    fn partial_markers_and_characters_count_against_the_limits() {
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(0, 0));
+        let p = s.push(&0, "-----BEGIN");
+        assert!(p.overflowed);
+        assert_eq!((p.text.as_str(), p.withheld_bytes), (WITHHELD_NOTICE, 10));
+        assert_eq!(s.retained_bytes(), 0);
+        // Sealed: nothing more is published, key bytes included, until the stream ends.
+        let p = s.push(&0, " RSA KEY-----\nMIIE\n-----END RSA KEY-----\nafter\n");
+        assert_eq!(p.text, "");
+        assert_eq!(s.retained_bytes(), 0);
+        assert_eq!(s.finish(&0).text, "");
+        let p = s.push_bytes(&1, &[0xF0, 0x9F, 0x92]);
+        assert!(p.overflowed);
+        assert_eq!((p.text.as_str(), p.withheld_bytes), (WITHHELD_NOTICE, 3));
+        assert_eq!(s.retained_bytes(), 0);
+        assert_eq!(s.finish(&1).text, "");
+        // A fresh stream with room is unaffected.
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+        assert_eq!(s.push(&0, "a -----BEGIN").text, "a ");
+        assert!(s.retained_bytes() > 0);
+    }
+
+    /// Review finding: 64 full streams plus a partial marker on another key went past 4 MiB.
+    #[test]
+    fn the_aggregate_bound_holds_across_every_buffer() {
+        let mut s: StreamSanitiser<u32> = StreamSanitiser::default();
+        let full = "x".repeat(DEFAULT_PER_STREAM_BYTES);
+        for k in 0..64 {
+            assert!(!s.push(&k, &full).overflowed);
+            assert!(s.retained_bytes() <= DEFAULT_AGGREGATE_BYTES);
+        }
+        let p = s.push(&64, "-----BEGIN");
+        assert!(p.overflowed && !p.text.contains("-----"));
+        let p = s.push_bytes(&65, &[0xE6, 0x97]);
+        assert!(p.overflowed);
+        assert!(s.retained_bytes() <= DEFAULT_AGGREGATE_BYTES);
+        assert_eq!(s.finish(&3).text, full);
+    }
+
+    /// Review finding: finished lines kept their buffers and every key kept an entry.
+    #[test]
+    fn idle_streams_release_their_entry_and_buffer() {
+        // Far more keys than `max_streams`: none is refused, none keeps an entry.
+        let mut s: StreamSanitiser<u32> = StreamSanitiser::new(Limits {
+            max_streams: 4,
+            ..Limits::default()
+        });
+        let line = format!("{}\n", "x".repeat(65_000));
+        for k in 0..300 {
+            assert_eq!(s.push(&k, &line).text, line);
+            assert_eq!((s.retained_bytes(), s.open_streams()), (0, 0));
+        }
+        // An empty push creates nothing.
+        assert_eq!(s.push(&5000, ""), Published::default());
+        assert_eq!(s.open_streams(), 0);
+        // A long line's buffer is freed at its newline even while the stream stays open.
+        s.push(&1, &"y".repeat(60_000));
+        assert!(s.retained_bytes() >= 60_000);
+        s.push(&1, "\n-----BEGIN");
+        assert!(s.retained_bytes() < KEEP_CAPACITY);
+        assert_eq!(s.open_streams(), 1);
+    }
+
+    #[test]
+    fn streams_past_the_limit_are_refused_never_published() {
+        let mut s: StreamSanitiser<u32> = StreamSanitiser::new(Limits {
+            max_streams: 2,
+            ..Limits::default()
+        });
+        s.push(&0, "ghp_abc");
+        s.push(&1, "ghp_def");
+        assert_eq!(s.open_streams(), 2);
+        // A stream that needs no entry still flows.
+        assert_eq!(s.push(&2, "a whole line\n").text, "a whole line\n");
+        // One that would: its safe prefix goes out, its uncertain tail does not, ever.
+        let p = s.push(&2, "safe words then ghp_abcdefghijkl");
+        assert!(p.overflowed);
+        assert_eq!(p.text, format!("safe words then {WITHHELD_NOTICE}"));
+        assert_eq!(p.withheld_bytes, "ghp_abcdefghijkl".len());
+        let p = s.push(&2, "mnopqrstuvwx more\nnext line\n");
+        assert_eq!(p.text, "");
+        assert!(p.withheld_bytes > 0);
+        assert_eq!(s.finish(&2), Published::default());
+        // After finishing, the key starts fresh.
+        assert_eq!(s.push(&2, "new item\n").text, "new item\n");
+        // More refusals than can be remembered saturate: stateless streams are withheld.
+        s.push(&3, "token: ");
+        s.push(&4, "token: ");
+        assert!(!s.saturated());
+        s.push(&5, "token: ");
+        assert!(s.saturated());
+        let p = s.push(&6, "a whole line\n");
+        assert!(p.overflowed && !p.text.contains("whole"));
+        // Streams with state carry on.
+        let mut out = s.push(&0, "defghijklmnopqrstuvwxyz0123\n").text;
+        out.push_str(&s.finish(&0).text);
+        assert_eq!(out, "****0123\n");
+    }
+
+    /// Review finding: one huge chunk was copied whole before the limits applied.
+    #[test]
+    fn one_huge_chunk_is_consumed_in_bounded_pieces() {
+        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+        // 8 MiB of safe words with no newline: published up to the bound, then withheld.
+        let huge = "word ".repeat(8 * 1024 * 1024 / 5);
+        let p = s.push(&0, &huge);
+        assert!(p.overflowed);
+        assert!(p.text.ends_with(WITHHELD_NOTICE));
+        assert!(p.text.len() <= DEFAULT_PER_STREAM_BYTES + WITHHELD_NOTICE.len());
+        assert!(huge.starts_with(&p.text[..p.text.len() - WITHHELD_NOTICE.len()]));
+        assert!(s.retained_bytes() <= DEFAULT_PER_STREAM_BYTES);
+        assert_eq!(s.finish(&0).text, "");
+        // An 8 MiB PEM body in one push, and through the byte path.
+        let pem = format!(
+            "k -----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\nok\n", // gitleaks:allow
+            "A".repeat(8 * 1024 * 1024)
+        );
+        assert_eq!(s.push(&0, &pem).text, "k [REDACTED PEM BLOCK]\nok\n");
+        assert_eq!(
+            s.push_bytes(&1, pem.as_bytes()).text,
+            "k [REDACTED PEM BLOCK]\nok\n"
+        );
+        assert_eq!((s.retained_bytes(), s.open_streams()), (0, 0));
+        // Many short lines in one push are each published exactly.
+        let lines = "API_KEY=supersecretvalue1234 é\n".repeat(100_000);
+        let mut out = s.push(&0, &lines).text;
+        out.push_str(&s.finish(&0).text);
+        assert_eq!(out, redact(&lines));
     }
 
     #[test]
