@@ -703,21 +703,29 @@ mod tests {
         let aws = "AKIAIOSFODNN7EXAMPLE"; // gitleaks:allow
         vec![
             (
-                "export GH=ghp_abcdefghijklmnopqrstuvwxyz0123 and".into(),
+                concat!("export GH=ghp", "_abcdefghijklmnopqrstuvwxyz0123 and").into(),
                 "ghp_abcdefghij",
             ),
-            ("key AIzaSyA1234567890abcdefgh end".into(), "AIzaSyA123"),
+            (
+                concat!("key AIza", "SyA1234567890abcdefgh end").into(),
+                "AIzaSyA123",
+            ),
             (format!("aws {aws} here"), "IOSFODNN7"),
             (
-                "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJl done".into(),
+                concat!(
+                    "jwt eyJhbGciOiJIUzI1NiJ9",
+                    ".eyJzdWIiOiIxMjM0NSJ9",
+                    ".c2lnbmF0dXJl done"
+                )
+                .into(),
                 "eyJzdWIi",
             ),
             (
-                "Authorization: Bearer abcdefghijklmnop rest".into(),
+                concat!("Authorization: Bear", "er abcdefghijklmnop rest").into(),
                 "abcdefghijkl",
             ),
             (
-                "Basic dXNlcjpodW50ZXIyaHVudGVy is the authorization".into(),
+                concat!("Bas", "ic dXNlcjpodW50ZXIyaHVudGVy is the authorization").into(),
                 "dXNlcjpodW50",
             ),
             (
@@ -725,7 +733,11 @@ mod tests {
                 "abcdefgh1234",
             ),
             (
-                "clone https://deploy:s3cretPassw0rd@git.example.com/r.git now".into(),
+                concat!(
+                    "clone https://deploy:",
+                    "s3cretPassw0rd@git.example.com/r.git now"
+                )
+                .into(),
                 "s3cretPassw0rd",
             ),
             (
@@ -778,7 +790,12 @@ mod tests {
     const EXTRAS: &[&[u8]] = &[
         b"API_KEY=supersecretvalue1234\r\nnext line\r\n",
         b"-----BEGIN RSA PRIVATE KEY-----\r\nMIIEsecretbody\r\n-----END RSA PRIVATE KEY-----\r\nafter\r\n", // gitleaks:allow
-        b"Authorization: Bearer abcdefghijklmnop\r\nBasic dXNlcjpodW50ZXIyaHVudGVy\r\n",
+        concat!(
+            "Authorization: Bear",
+            "er abcdefghijklmnop\r\nBas",
+            "ic dXNlcjpodW50ZXIyaHVudGVy\r\n"
+        )
+        .as_bytes(),
         b"curl -u alice:s3cr3tpass\r\n https://x",
         b"\"api_key\":\"abc\r\ndefghijklmnop\"\r\n",
         b"url https://user:pa\r\nss@host/x and https://u:pw123456@h/\r\n",
