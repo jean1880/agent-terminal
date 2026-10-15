@@ -14,6 +14,8 @@
 //! is stored exactly as given). Free-text columns (names, bodies, reasons, activity) are masked
 //! again here with [`redact`], which leaves already-masked text as it is.
 
+use agent_core::delegation::operation::OperationKind;
+use agent_core::delegation::wire::Delivery;
 use agent_core::redact::redact;
 use rusqlite::{params, OptionalExtension, Row};
 
@@ -490,6 +492,15 @@ fn masked(text: Option<&str>) -> Option<String> {
     text.map(redact)
 }
 
+/// Refuses a value that is not one of the P1 enum's (`operations.kind` and
+/// `messages.delivery_policy` carry only length CHECKs in SQL, so a later rename never forces a
+/// table rebuild; the value set is enforced here, on write).
+fn known<T: serde::de::DeserializeOwned>(what: &str, value: &str) -> Result<()> {
+    serde_json::from_value::<T>(serde_json::Value::String(value.to_owned()))
+        .map(drop)
+        .map_err(|_| StoreError::Failed(format!("`{value}` is not a known {what}")))
+}
+
 impl Store {
     // ---- roots and workers ----
 
@@ -756,6 +767,7 @@ impl Store {
     /// Inserts an accepted operation. The same (principal, kind, key) twice is a constraint error:
     /// look it up first with [`Store::delegation_operation_by_key`].
     pub fn insert_delegation_operation(&self, op: &OperationRow) -> Result<()> {
+        known::<OperationKind>("operation kind", &op.kind)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO delegation_operations ({OPERATION_COLS})
@@ -836,6 +848,7 @@ impl Store {
     // ---- messages ----
 
     pub fn insert_delegation_message(&self, m: &MessageRow) -> Result<()> {
+        known::<Delivery>("delivery policy", &m.delivery_policy)?;
         self.conn.execute(
             &format!(
                 "INSERT INTO delegation_messages ({MESSAGE_COLS})
