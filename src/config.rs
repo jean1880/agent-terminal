@@ -46,7 +46,7 @@ impl CliClient {
 /// editing the enum, its `Display`, four arms of the detection function and two
 /// hand-maintained index↔variant mappings in the settings dialog; it is now a
 /// `config.json` edit with no recompile.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     /// Stable opaque identity, `^[a-z0-9-]{1,64}$` (see [`new_profile_id`]). Unlike `name` it
     /// survives a rename and a reorder, so anything that must keep pointing at this profile
@@ -128,6 +128,33 @@ pub struct Profile {
     pub disabled: bool,
 }
 
+/// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
+/// (Serde's default for an absent `id` is the empty string, not this: migration relies on
+/// seeing it empty.)
+impl Default for Profile {
+    fn default() -> Self {
+        Profile {
+            id: new_profile_id(),
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            dir: None,
+            env_file: None,
+            resume_args: None,
+            session_store: None,
+            session_title: None,
+            session_format: SessionFormat::default(),
+            session_id_args: None,
+            prompt_args: None,
+            limit_markers: None,
+            default_model: None,
+            default_mode: None,
+            default_effort: None,
+            disabled: false,
+        }
+    }
+}
+
 /// Whether `id` has the profile-id shape: `^[a-z0-9-]{1,64}$`.
 pub fn is_valid_profile_id(id: &str) -> bool {
     (1..=64).contains(&id.len())
@@ -176,7 +203,6 @@ pub fn profile_driver(profile: &Profile) -> Option<agent_core::adapter::Driver> 
 pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
     let info = driver.info();
     let mut profile = Profile {
-        id: new_profile_id(),
         name: info.profile_name.to_string(),
         command: info.default_command.to_string(),
         ..Profile::default()
@@ -472,7 +498,6 @@ fn default_profiles() -> Vec<Profile> {
                 name.to_lowercase()
             };
             let mut profile = Profile {
-                id: new_profile_id(),
                 name: (*name).to_string(),
                 command: cmd,
                 ..Profile::default()
@@ -1267,24 +1292,26 @@ impl TerminalConfig {
     fn repair_profile_ids(&mut self) {
         let mut seen = std::collections::HashSet::new();
         for profile in &mut self.profiles {
-            if profile.id.is_empty() {
-                // A migration, not a fault: older files carry no ids.
-            } else if !is_valid_profile_id(&profile.id) {
-                warn!(
-                    "Profile '{}' has an invalid id '{}'; assigning a new one",
-                    profile.name, profile.id
-                );
-            } else if seen.insert(profile.id.clone()) {
-                continue;
-            } else {
-                warn!(
-                    "Profile '{}' repeats id '{}'; assigning a new one",
-                    profile.name, profile.id
-                );
+            // An empty id is a migration, not a fault: older files carry none.
+            if !profile.id.is_empty() {
+                if !is_valid_profile_id(&profile.id) {
+                    warn!(
+                        "Profile '{}' has an invalid id '{}'; assigning a new one",
+                        profile.name, profile.id
+                    );
+                } else if seen.insert(profile.id.clone()) {
+                    continue;
+                } else {
+                    warn!(
+                        "Profile '{}' repeats id '{}'; assigning a new one",
+                        profile.name, profile.id
+                    );
+                }
             }
-            let fresh = std::iter::repeat_with(new_profile_id)
-                .find(|id| !seen.contains(id))
-                .unwrap_or_else(new_profile_id);
+            let mut fresh = new_profile_id();
+            while seen.contains(&fresh) {
+                fresh = new_profile_id();
+            }
             seen.insert(fresh.clone());
             profile.id = fresh;
             self.ids_assigned.set(true);
@@ -2846,6 +2873,53 @@ mod tests {
             new_agent_profile(agent_core::adapter::Driver::Codex).id,
             new_agent_profile(agent_core::adapter::Driver::Codex).id
         );
+    }
+
+    #[test]
+    fn a_default_profile_has_an_id_but_an_absent_one_reads_as_empty() {
+        let profile = Profile::default();
+        assert!(is_valid_profile_id(&profile.id));
+        assert_ne!(Profile::default().id, profile.id);
+        let parsed: Profile = serde_json::from_str(r#"{"name":"x","command":"x"}"#).unwrap();
+        assert!(parsed.id.is_empty());
+    }
+
+    #[test]
+    fn a_hand_edit_without_an_id_is_repaired_and_saved_once_without_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig::default();
+        config.save_to(&path);
+        let known = ids(&config);
+
+        let mut edited: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edited["profiles"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "Hand", "command": "hand"}));
+        std::fs::write(&path, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+
+        let DiskChange::Updated(updated) = config.check_disk_at(&path) else {
+            panic!("a valid hand edit should be picked up");
+        };
+        assert_eq!(updated.profiles.len(), known.len() + 1);
+        assert_eq!(ids(&updated)[..known.len()], known[..]);
+        let new_id = updated.profiles.last().unwrap().id.clone();
+        assert!(is_valid_profile_id(&new_id));
+        // Saved: the file carries the id, and nothing flags the file as changed since.
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&new_id));
+        assert!(matches!(
+            updated.check_disk_at(&path),
+            DiskChange::Unchanged
+        ));
+        assert!(!updated.ids_assigned.get());
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".external-"))
+            .count();
+        assert_eq!(backups, 0);
     }
 
     #[test]
