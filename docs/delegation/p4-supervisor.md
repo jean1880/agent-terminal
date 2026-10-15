@@ -1,7 +1,14 @@
-# P4: supervisor and authority (implementation design, revision 2)
+# P4: supervisor and authority (implementation design, revision 3)
 
-Status: revision 2, 2026-10-15. Revision 1 got CHANGES-REQUIRED from Codex: 6 blockers and 3 shoulds. This revision
-fixes all nine and applies the user decisions of 2026-10-15:
+Status: revision 3, 2026-10-15.
+
+Revision 3 has three changes:
+- §1.1 and §1.2 are now the compiled Wave 0 code, verbatim. Wave 0 is built, and the code is the source of truth.
+- Codex Ask children use a child-specific `workspaceWrite` mapping (§10.1).
+- A latched bootstrap violation is a failure (§3.3).
+
+Revision 1 got CHANGES-REQUIRED from Codex: 6 blockers and 3 shoulds. Revision 2 fixed all nine and applied the user
+decisions of 2026-10-15:
 - closing a root's page stops its children;
 - Always and session rules apply in children only inside the child's lease.
 
@@ -12,7 +19,7 @@ and the P0 amendments. Code: `feat/cross-agent-runtime` at `8397088e`, where P1 
 
 | Rev 1 finding | Fixed in |
 | --- | --- |
-| B1 Wave 0 seam incomplete | §1.1 is the compile-ready `seam.rs`; §1.2 lists every Wave 0 stub |
+| B1 Wave 0 seam incomplete | §1.1 and §1.2 are the compiled Wave 0 files, verbatim |
 | B2 deferred deliveries bypass reserve and E7 | §4.5: the supervisor owns every deferred queue; the session queue never holds delegated input |
 | B3 synthetic exit treated as observed | §7.1: one `ExitWatch` per generation; only `StopPhase::Exited` frees a slot or unlinks an overlay |
 | B4 Codex read-back incomplete | §3.3: sandbox, approvalPolicy and servers are checked, servers continuously; P4 owns it, and P5 owns only what is requested |
@@ -73,12 +80,13 @@ An event and its links commit in one writer job, with no new writer API:
 | `authority.rs`, `workspace.rs`, `agy_l2.rs`, `launch.rs`, `rundir.rs` | D | §5.1, §5.5, §6, L2 I/O |
 | `src/chat/session/delegated.rs` | 0 (stubs), then B | the `ChatSession` methods of §3.4 |
 
-### 1.1 `src/delegation/seam.rs` (Wave 0, compile-ready, frozen)
+### 1.1 `src/delegation/seam.rs` (Wave 0, compiled, frozen)
+
+This is the committed file verbatim (Wave 0 commit on `feat/cross-agent-p4-wave0`). A change needs the coordinator.
 
 ```rust
-//! The P4 cross-lane seam (docs/delegation/p4-supervisor.md §1.1). Frozen in Wave 0: lanes change
+//! The P4 cross-lane seam (`docs/delegation/p4-supervisor.md` §1.1). Frozen in Wave 0: lanes change
 //! bodies elsewhere, never these shapes. A change here needs the coordinator.
-#![allow(dead_code)] // filled in by lanes A–E
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -127,6 +135,7 @@ impl RuntimeDir {
     pub(crate) fn from_verified(path: PathBuf) -> Self {
         Self(path)
     }
+
     pub(crate) fn path(&self) -> &Path {
         &self.0
     }
@@ -134,7 +143,8 @@ impl RuntimeDir {
 
 // ---- launch bindings (D prepares off-thread, A stages, B consumes) ------------------------------
 
-/// What one process start of a session receives. Debug never prints values (agy's env holds the token).
+/// What one process start of a session receives. Debug never prints values (agy's env holds the
+/// token).
 #[derive(Clone, Default)]
 pub(crate) struct LaunchBinding {
     /// `OpenSession.delegation` (the Codex adapter's thread config overlay: P5).
@@ -149,7 +159,10 @@ impl std::fmt::Debug for LaunchBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaunchBinding")
             .field("open", &self.open.is_some())
-            .field("env", &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+            .field(
+                "env",
+                &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            )
             .field("argv_tail_len", &self.argv_tail.len())
             .finish()
     }
@@ -182,7 +195,8 @@ pub(crate) struct PreparedBinding {
     pub overlay: Option<PathBuf>,
 }
 
-/// A child profile resolved for launch (from the window's cached detection).
+/// A child profile resolved for launch (from the window's cached detection). `env.unset` already
+/// holds the profile's `clear_env`; the child factory adds `STRIP_ON_SPAWN` to it.
 #[derive(Clone)]
 pub(crate) struct ResolvedChild {
     pub program: String,
@@ -202,15 +216,19 @@ pub(crate) struct PeerFacts {
 
 /// What the IPC server asks of the supervisor. Every method runs on the main context.
 pub(crate) trait CallDispatcher {
-    fn authenticate(&self, conn: ConnId, hello: Hello, peer: PeerFacts)
-        -> LocalFuture<Result<Welcome, ToolError>>;
+    fn authenticate(
+        &self,
+        conn: ConnId,
+        hello: Hello,
+        peer: PeerFacts,
+    ) -> LocalFuture<Result<Welcome, ToolError>>;
     fn call(&self, conn: ConnId, call: Call) -> LocalFuture<CallOutcome>;
     fn cancel(&self, conn: ConnId, id: u64);
     /// The connection is gone: release its waits. Accepted mutations carry on.
     fn closed(&self, conn: ConnId);
 }
 
-/// `/proc` facts for L3 and the census. `RealProc` reads `/proc`; tests inject a fake.
+/// `/proc` facts for L3 and the census. `ipc::peer::RealProc` reads `/proc`; tests inject a fake.
 pub(crate) trait ProcFacts {
     fn stat(&self, pid: u32) -> Option<String>;
     fn exe_id(&self, pid: u32) -> Option<(u64, u64)>;
@@ -229,23 +247,29 @@ pub(crate) enum Effect {
     Network,
     Delegate,
     /// `own`: the call is to server `agent_terminal`.
-    Mcp { own: bool },
+    Mcp {
+        own: bool,
+    },
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateVerdict {
-    /// Nothing inherited forbids it: the existing policy (and rule filter) decides.
+    /// Nothing inherited forbids it: the existing policy (and the rule filter) decides.
     Defer,
     /// A human card, with no session or Always option, never auto-allowed.
-    AskOnly { reason: String },
-    Deny { reason: String },
+    AskOnly {
+        reason: String,
+    },
+    Deny {
+        reason: String,
+    },
 }
 
 /// The supervisor's live view of a child's authority, read on every judgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LiveAuthority {
-    /// Epoch current, tree not revoking, read-back passed (or not required yet: see `bootstrap`).
+    /// Epoch current, tree not revoking, read-back passed.
     pub valid: bool,
     /// Claude's inert bootstrap turn is running: every request is denied.
     pub bootstrap: bool,
@@ -253,10 +277,12 @@ pub(crate) struct LiveAuthority {
     pub parent_mode: Mode,
 }
 
-/// Inherited authority, applied before every auto-allow path (Bypass, Accept edits, session and Always rules).
+/// Inherited authority, applied before every auto-allow path (Bypass, Accept edits, session and
+/// Always rules).
 pub(crate) trait ApprovalGate {
     fn judge(&self, tool: &str, input: &Value, cwd: Option<&str>) -> GateVerdict;
-    /// Whether a session or Always rule may match `action` in this child, and whether a card may offer to keep one.
+    /// Whether a session or Always rule may match `action` in this child, and whether a card may
+    /// offer to keep one.
     fn rule_may_apply(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool;
 }
 
@@ -277,14 +303,18 @@ pub(crate) enum TurnBoundary<'a> {
     Ended { state: TurnState },
 }
 
-/// Installed in a root or child `ChatSession`. Called on the main thread with no `RefCell` borrow held.
+/// Installed in a root or child `ChatSession`. Called on the main thread with no `RefCell` borrow
+/// held.
 pub(crate) trait DelegationHooks {
-    /// Takes the binding staged for exactly this generation. Never blocks, never does I/O. `None`: no token.
+    /// Takes the binding staged for exactly this generation. Never blocks, never does I/O.
+    /// `None`: no token.
     fn binding(&self, driver: Driver, generation: ProcessGeneration) -> Option<LaunchBinding>;
-    /// After a successful spawn: the supervisor keeps `watch` until it reports `StopPhase::Exited`.
+    /// After a successful spawn: the supervisor keeps `watch` until it reports
+    /// `StopPhase::Exited`.
     fn process_started(&self, generation: ProcessGeneration, pid: Option<i32>, watch: ExitWatch);
-    /// The session closed this generation out (`finish_process`, which also runs for a deliberate stop). This
-    /// is NOT an observed exit: kill the token and end runs, but free no process slot and unlink nothing.
+    /// The session closed this generation out (`finish_process`, which also runs for a deliberate
+    /// stop). This is NOT an observed exit: kill the token and end runs, but free no process slot
+    /// and unlink nothing.
     fn process_stopping(&self, generation: ProcessGeneration);
     /// Every raw provider line, before the adapter. Memory only: never logged, never stored.
     fn line(&self, generation: ProcessGeneration, line: &str, stderr: bool);
@@ -294,7 +324,8 @@ pub(crate) trait DelegationHooks {
     fn mode_changed(&self, effective: Mode);
 }
 
-/// A child's publication boundary; replaces `store.append_event` in `Inner::emit` for that session.
+/// A child's publication boundary; replaces `store.append_event` in `Inner::emit` for that
+/// session.
 pub(crate) trait ChildPublish {
     fn publish(&self, generation: ProcessGeneration, env: Envelope) -> Option<Envelope>;
     fn persist(&self, thread: &str, provider: Option<&str>, env: &Envelope);
@@ -320,7 +351,10 @@ pub(crate) enum InputSource {
     Bootstrap,
     /// The spawn's task.
     Task,
-    Message { id: MessageId, kind: MessageKind },
+    Message {
+        id: MessageId,
+        kind: MessageKind,
+    },
 }
 
 /// One execution-driving delivery, already reserved durably and passed E7 by the caller.
@@ -344,7 +378,9 @@ pub(crate) enum DelegatedOutcome {
     /// Claude live user line queued to stdin.
     Written,
     /// Codex strict steer sent; its outcome arrives as `ControlResult { request = tag }`.
-    SteerSent { tag: String },
+    SteerSent {
+        tag: String,
+    },
     TurnStarted,
     Refused(ErrorCode),
 }
@@ -368,81 +404,742 @@ pub(crate) struct ChildStop {
 `always_allow::Action`, `agent_proc::{AgentEnv, ExitWatch}` and `hook_config::HookTarget` are already `pub`, in
 modules the crate root declares.
 
-### 1.2 Wave 0 stubs (frozen signatures; bodies fail closed; lanes replace the bodies only)
+### 1.2 Wave 0 stubs (compiled; signatures frozen; bodies fail closed)
+
+Each file below is committed verbatim. Lanes replace bodies, never signatures. The other Lane A modules (`attest.rs`, `capacity.rs`, `deferred.rs`, `ops.rs`, `publish.rs`, `reconcile.rs`, `waits.rs`) hold only a module comment. `src/main.rs` gains `mod delegation;` and `src/chat/session.rs` gains
+`mod delegated;`. `agent_core::codex::mode_policy` is now `pub` (signature unchanged).
+
+Notes on the compiled shapes:
+- `ChatSession::with_options` takes a concrete `SessionStore` (not `impl Into<SessionStore>`), so `child.rs` can
+  hold it as a `fn` pointer. It carries `#[allow(clippy::too_many_arguments)]`, like `terminal_stub.rs:184`.
+- `child.rs` references every frozen `ChatSession` method, so the stubs outside `src/delegation` are not dead code.
+  `#![allow(dead_code)]` is set in `src/delegation/mod.rs` only.
+- `services` and `supervisor` are `pub(crate)` modules, so Lane E reaches `RootTurnGate`, `RouteTable` and the
+  service type aliases through their paths.
+- `readback.rs` already holds the real Codex extraction and comparison, with tests on the recorded result shape
+  (`d6-sandbox-policy`): `codex_requested(&(approval, sandbox))` takes a `(&'static str, Value)` pair, as
+  `mode_policy` and Lane B's child mapping return it. `codex_policy_read_back` compares `approvalPolicy` and
+  `sandbox.type`; a missing field fails.
+- Human input to a child is only `Supervisor::submit_human` (§4.5). There is no `ChatSession` method for it.
+
+Gates at the Wave 0 commit: `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo test --workspace --no-run` and `cargo fmt --all --check` pass.
+
+`src/delegation/mod.rs`:
 
 ```rust
-// src/delegation/mod.rs
-pub(crate) mod seam; mod agy_l2; mod attest; mod authority; mod capacity; mod child; mod deferred;
-mod ipc; mod launch; mod publish; mod readback; mod reconcile; mod rundir; mod services; mod supervisor;
-mod waits; mod workspace; mod ops;
+//! The cross-agent delegation supervisor (`docs/delegation/p4-supervisor.md`).
+//!
+//! Wave 0: the frozen seam ([`seam`]) and a fail-closed stub for every module. Lanes A–D replace
+//! bodies, never the signatures listed in the design's §1.2. Nothing here is reachable from the
+//! app until Lane E wires it, so it ships dark.
+// Wave 0 stubs are not called yet; lanes A–E fill them in.
+#![allow(dead_code)]
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+pub(crate) mod seam;
+
+mod agy_l2;
+mod attest;
+mod authority;
+mod capacity;
+mod child;
+mod deferred;
+mod ipc;
+mod launch;
+mod ops;
+mod publish;
+mod readback;
+mod reconcile;
+mod rundir;
+pub(crate) mod services;
+pub(crate) mod supervisor;
+mod waits;
+mod workspace;
+
+pub(crate) use services::AppServices;
 pub(crate) use supervisor::Supervisor;
-pub(crate) fn supervisor() -> Option<std::rc::Rc<Supervisor>> { None }
-pub(crate) fn start(_services: services::AppServices) {}
-pub(crate) fn shutdown_all() -> Vec<seam::ChildStop> { Vec::new() }
+
+thread_local! {
+    /// The app's one supervisor, on the GTK main thread. No window holds it strongly.
+    static SUPERVISOR: RefCell<Option<Rc<Supervisor>>> = const { RefCell::new(None) };
+}
+
+/// The running supervisor; `None` before [`start`] finished or after shutdown.
+pub(crate) fn supervisor() -> Option<Rc<Supervisor>> {
+    SUPERVISOR.with(|s| s.borrow().clone())
+}
+
+/// Starts the supervisor on the main context (reconcile, sweep, bind). Wave 0: does nothing.
+pub(crate) fn start(_services: AppServices) {}
+
+/// The AppShutdown revocation row: every supervised process still to be seen exiting.
+pub(crate) fn shutdown_all() -> Vec<seam::ChildStop> {
+    Vec::new()
+}
+
+/// Removes the socket and the overlays of exited generations. Idempotent.
 pub(crate) fn final_cleanup() {}
+```
 
-// rundir.rs (D)
-pub(crate) fn verified() -> Result<RuntimeDir, String> { Err("not built".into()) }
-// launch.rs (D)
-pub(crate) fn prepare_binding(req: &BindingRequest) -> Result<PreparedBinding, String> { Err("not built".into()) }
-pub(crate) fn unlink_overlay(path: &Path) {}
-pub(crate) fn sweep_overlays(dir: &RuntimeDir, live_app_pid: &dyn Fn(u32) -> bool) {}
-// authority.rs (D)
-pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect { Effect::Unknown }
-pub(crate) struct ChildAuthority { params: AuthorityParams }
-impl ChildAuthority {
-    pub(crate) fn new(params: AuthorityParams) -> Self { Self { params } }
-    pub(crate) fn params(&self) -> &AuthorityParams { &self.params }
-}
-impl ApprovalGate for ChildAuthority {
-    fn judge(&self, _: &str, _: &Value, _: Option<&str>) -> GateVerdict { GateVerdict::Deny { reason: "not built".into() } }
-    fn rule_may_apply(&self, _: &crate::always_allow::Action, _: Option<&str>) -> bool { false }
-}
-// workspace.rs (D)  (types §6)
-pub(crate) fn plan_lease(caller_tree: &Path, base: &str, worker: &WorkerId, root: Option<&Path>) -> Result<LeasePlan, ToolError>;
-pub(crate) fn create_lease(plan: &LeasePlan) -> Result<WorktreeLease, ToolError>;
-pub(crate) fn verify_lease(lease: &WorktreeLease) -> Result<(), ToolError>;
-pub(crate) fn cleanup_if_clean(lease: &WorktreeLease, tab_open_in: bool) -> Result<Cleanup, String>;
-pub(crate) fn scope(lease: &WorktreeLease) -> WorkspaceScope;
-// (each stub: Err(ToolError::new(ErrorCode::InternalError, "not built")) / Retained / an empty Shared scope)
-// agy_l2.rs (D)
-pub(crate) struct L2Input { pub argv: Vec<String>, pub env: Vec<(String, String)>, pub physical_cwd: PathBuf,
-    pub verified_home: PathBuf, pub hookless: bool }
-pub(crate) fn scan(input: &L2Input, limits: &Limits) -> Result<(), L2Refusal> { Err(L2Refusal::DiscoveryFailed) }
+`src/delegation/services.rs`:
 
-// ipc.rs (C)
-pub(crate) struct IpcServer { /* private */ }
-impl IpcServer {
-    pub(crate) fn bind(dir: &RuntimeDir, app_pid: u32, limits: Limits, d: Rc<dyn CallDispatcher>) -> Result<Rc<Self>, String> { Err("not built".into()) }
-    pub(crate) fn socket_path(&self) -> &Path;
-    pub(crate) fn revoke(&self, conn: ConnId, error: ToolError);
-    pub(crate) fn close_all(&self, error: ToolError);
-    pub(crate) fn counts(&self) -> (u32, u32);
-}
-// ipc/peer.rs (C)
-pub(crate) struct RealProc;
-impl ProcFacts for RealProc { /* stubs: None / empty */ }
-pub(crate) fn census(p: &dyn ProcFacts, agy_pid: u32, bridge_exe: (u64, u64)) -> Vec<u32> { Vec::new() }
+```rust
+//! Lane A: what the supervisor needs from the app (§2.1). Wave 0 stub.
 
-// src/chat/session/delegated.rs (B; `mod delegated;` added to session.rs in Wave 0)
-impl ChatSession {
-    pub(crate) fn with_options(adapter: Box<dyn Adapter>, open: OpenSession, store: impl Into<SessionStore>,
-        thread: ThreadId, sink: EnvelopeSink, approval: Approval, env: LaunchEnv, opts: SessionOptions) -> Rc<Self>
-        { assert!(opts.child.is_none() && opts.hooks.is_none(), "not built"); Self::with_env(adapter, open, store, thread, sink, approval, env) }
-    pub(crate) fn deliver_delegated(&self, input: DelegatedInput) -> DelegatedOutcome { DelegatedOutcome::Refused(ErrorCode::InternalError) }
-    pub(crate) fn interrupt_run(&self) -> bool { false }
-    pub(crate) fn expire_approvals(&self, reason: &str) {}
-    pub(crate) fn rebind_stop(&self) -> Option<ExitWatch> { None }     // §5.4
-    pub(crate) fn rebind_start(&self) {}
-    pub(crate) fn effective_mode(&self) -> Mode;                         // status().mode
-    pub(crate) fn process_generation(&self) -> ProcessGeneration { ProcessGeneration(0) }
-    pub(crate) fn exit_watches(&self) -> Vec<ExitWatch> { Vec::new() }   // every unexited generation's watch
-    pub(crate) fn submit_human(&self, text: &str);                       // §4.5: P6 child input; stub: no-op
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use agent_core::adapter::{Adapter, Driver};
+use agent_core::delegation::{ErrorCode, ToolError};
+use agent_kit::store::Store;
+use agent_kit::store_writer::StoreHandle;
+
+use super::seam::{LocalFuture, ResolvedChild};
+use crate::config::Profile;
+use crate::hook_config::HookTarget;
+
+/// The narrow app services the supervisor holds (built by Lane E from `window::imp::threads`).
+pub(crate) struct AppServices {
+    pub handle: StoreHandle,
+    /// `None`: memory or test store; jobs run in place.
+    pub store_path: Option<PathBuf>,
+    pub app_pid: u32,
+    pub bridge_command: PathBuf,
+    pub profiles: Rc<dyn Fn() -> Vec<Profile>>,
+    pub resolve: Rc<ResolveChild>,
+    pub make_adapter: Rc<MakeAdapter>,
+    pub hook_check: Rc<HookCheck>,
+    pub tab_open_in: Rc<dyn Fn(&Path) -> bool>,
+    pub report: Rc<dyn Fn(&str)>,
+}
+
+/// `threads::cached_agent` plus `unset_list`, as a service.
+pub(crate) type ResolveChild = dyn Fn(&Profile) -> Option<ResolvedChild>;
+/// `threads::make_adapter`, as a service.
+pub(crate) type MakeAdapter = dyn Fn(Driver, &str) -> Box<dyn Adapter>;
+/// `threads::check_hook`, as a service.
+pub(crate) type HookCheck = dyn Fn(HookTarget) -> LocalFuture<Result<(), String>>;
+
+impl AppServices {
+    /// A read on its own connection, after the writer's barrier (`threads::store_job`).
+    pub(crate) async fn read<T: Send + 'static>(
+        &self,
+        _job: impl FnOnce(&Store) -> T + Send + 'static,
+    ) -> Option<T> {
+        None
+    }
+
+    /// A durable control write (`StoreWriter::durable_call`). Any failure is
+    /// `persistence_failed`, and the caller dispatches nothing.
+    pub(crate) async fn durable<T: Send + 'static>(
+        &self,
+        _what: &'static str,
+        _job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
+    ) -> Result<T, ToolError> {
+        Err(ToolError::new(
+            ErrorCode::PersistenceFailed,
+            "delegation is not built yet",
+        ))
+    }
+
+    /// An ordinary write (`StoreWriter::write_sized`).
+    pub(crate) fn write(
+        &self,
+        _what: &'static str,
+        _thread: Option<&str>,
+        _force: bool,
+        _job: impl FnOnce(&Store) -> agent_kit::store::Result<()> + Send + 'static,
+    ) {
+    }
 }
 ```
 
-The stub `assert!` in `with_options` is reached only by tests until Lane B lands. Routes are unverified, so production
-never builds a child.
+`src/delegation/supervisor.rs`:
+
+```rust
+//! Lane A: the supervisor (§1.3, §2, §5.4). Wave 0 stub: every entry point fails closed.
+
+use std::rc::{Rc, Weak};
+
+use agent_core::adapter::Driver;
+use agent_core::delegation::authority::RevocationEvent;
+use agent_core::delegation::route::{RouteQuery, RouteSpec};
+use agent_core::delegation::{admit_route, ErrorCode, Limits, ToolError, WorkerId};
+
+use super::seam::{ChildStop, DelegationHooks, WorkerSubscriber};
+use super::services::AppServices;
+use crate::chat::session::ChatSession;
+use crate::config::Profile;
+
+/// Which routes may be spawned. Production uses [`P1Routes`]; tests inject their own.
+pub(crate) trait RouteTable {
+    fn admit(&self, q: &RouteQuery) -> RouteSpec;
+}
+
+/// The P1 table: every route `Unverified` until P5/P8 flip it.
+pub(crate) struct P1Routes;
+
+impl RouteTable for P1Routes {
+    fn admit(&self, q: &RouteQuery) -> RouteSpec {
+        admit_route(q)
+    }
+}
+
+/// What `SessionSlot::send_prompt` does with a root prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootTurnGate {
+    Proceed,
+    /// A rebind runs first: queue the prompt; the supervisor dispatches it after `rebind_start`.
+    Deferred,
+}
+
+/// The app-owned supervisor (§2).
+pub(crate) struct Supervisor {
+    services: AppServices,
+    limits: Limits,
+    routes: Rc<dyn RouteTable>,
+}
+
+fn not_built() -> ToolError {
+    ToolError::new(ErrorCode::RuntimeUnavailable, "delegation is not built yet")
+}
+
+impl Supervisor {
+    pub(crate) async fn start(
+        _services: AppServices,
+        _limits: Limits,
+        _routes: Rc<dyn RouteTable>,
+    ) -> Result<Rc<Self>, String> {
+        Err("delegation is not built yet".to_owned())
+    }
+
+    /// Waits for the previous root generation's exit, then stages a binding (§2.3).
+    pub(crate) async fn prepare_root(
+        self: &Rc<Self>,
+        _thread: &str,
+        _profile: &Profile,
+        _driver: Driver,
+    ) -> Option<Rc<dyn DelegationHooks>> {
+        None
+    }
+
+    pub(crate) fn attach_root_session(&self, _thread: &str, _session: Weak<ChatSession>) {}
+
+    pub(crate) fn before_root_turn(self: &Rc<Self>, _thread: &str) -> RootTurnGate {
+        RootTurnGate::Proceed
+    }
+
+    pub(crate) fn on_root_turn_end(&self, _thread: &str) {}
+
+    pub(crate) fn root_stop(self: &Rc<Self>, _thread: &str) {}
+
+    /// Root Stop for a closing root page: every unexited descendant generation (§2.3).
+    pub(crate) fn root_closing(self: &Rc<Self>, _thread: &str) -> Vec<ChildStop> {
+        Vec::new()
+    }
+
+    pub(crate) fn root_busy(&self, _thread: &str) -> bool {
+        false
+    }
+
+    pub(crate) fn subscribe(&self, _root_thread: &str, _sub: Weak<dyn WorkerSubscriber>) {}
+
+    /// A child's session, for scoped approvals only (P6).
+    pub(crate) fn child_session(&self, _worker: &WorkerId) -> Option<Rc<ChatSession>> {
+        None
+    }
+
+    /// Human inspector input to a child: queued, reserved and E7-checked like any delivery (§4.5).
+    pub(crate) fn submit_human(self: &Rc<Self>, _worker: &WorkerId, _text: &str) {}
+
+    pub(crate) async fn revoke(
+        self: &Rc<Self>,
+        _root: &WorkerId,
+        _event: RevocationEvent,
+    ) -> Result<(), ToolError> {
+        Err(not_built())
+    }
+}
+```
+
+`src/delegation/child.rs`:
+
+```rust
+//! Lane A: the child session factory (§3.1). Wave 0: only the session API Lane B freezes, held
+//! here so it is reachable before Lane A calls it.
+
+use std::rc::Rc;
+
+use agent_core::adapter::{Adapter, OpenSession};
+use agent_kit::store::ThreadId;
+
+use super::seam::{DelegatedInput, DelegatedOutcome, SessionOptions};
+use crate::chat::session::{Approval, ChatSession, LaunchEnv, SessionStore};
+use crate::chat::EnvelopeSink;
+
+/// The constructor Lane A builds supervised children with (§3.4).
+pub(crate) type WithOptions = fn(
+    Box<dyn Adapter>,
+    OpenSession,
+    SessionStore,
+    ThreadId,
+    EnvelopeSink,
+    Approval,
+    LaunchEnv,
+    SessionOptions,
+) -> Rc<ChatSession>;
+
+pub(crate) const WITH_OPTIONS: WithOptions = ChatSession::with_options;
+
+/// Every other frozen `ChatSession` method of §1.2, in one place.
+pub(crate) fn session_api(session: &ChatSession, input: DelegatedInput) -> DelegatedOutcome {
+    let _ = session.interrupt_run();
+    let _ = session.effective_mode();
+    let _ = session.process_generation();
+    let _ = session.exit_watches();
+    let _ = session.rebind_stop();
+    session.expire_approvals("");
+    session.rebind_start();
+    session.deliver_delegated(input)
+}
+```
+
+`src/delegation/readback.rs`:
+
+```rust
+//! Lane A: child read-back (§3.2–§3.3). Wave 0 holds the Codex extraction and comparison, which
+//! the launch mapping (Lane B) and the checker (Lane A) must share.
+
+use serde_json::Value;
+
+/// What a Codex child's `thread/start` or `thread/resume` result must read back as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexRequested {
+    /// `approvalPolicy`, as sent.
+    pub approval_policy: String,
+    /// The sandbox policy's `type` (`readOnly`, `workspaceWrite`), as sent.
+    pub sandbox_type: String,
+}
+
+/// Extracts the read-back expectation from a Codex `(approvalPolicy, sandboxPolicy)` pair, as
+/// `agent_core::codex::mode_policy` (roots) or the child mapping (Lane B) returns it. `None` when
+/// the sandbox policy has no string `type`: nothing could be checked, so the child must not start.
+pub(crate) fn codex_requested(policy: &(&'static str, Value)) -> Option<CodexRequested> {
+    let (approval, sandbox) = policy;
+    let sandbox_type = sandbox.get("type")?.as_str()?;
+    Some(CodexRequested {
+        approval_policy: (*approval).to_owned(),
+        sandbox_type: sandbox_type.to_owned(),
+    })
+}
+
+/// Whether a `thread/start` or `thread/resume` `result` reads back exactly what was requested:
+/// `approvalPolicy` equal, and `sandbox.type` equal. A missing field fails.
+pub(crate) fn codex_policy_read_back(requested: &CodexRequested, result: &Value) -> bool {
+    let policy = result.get("approvalPolicy").and_then(Value::as_str);
+    let sandbox = result
+        .get("sandbox")
+        .and_then(|s| s.get("type"))
+        .and_then(Value::as_str);
+    policy == Some(requested.approval_policy.as_str())
+        && sandbox == Some(requested.sandbox_type.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::adapter::Mode;
+    use serde_json::json;
+
+    #[test]
+    fn plan_mapping_reads_back_from_the_recorded_result_shape() {
+        let requested = codex_requested(&agent_core::codex::mode_policy(Mode::Plan)).unwrap();
+        assert_eq!(requested.approval_policy, "never");
+        assert_eq!(requested.sandbox_type, "readOnly");
+        // The shape recorded in tests/fixtures/real/delegation/codex/d6-sandbox-policy.
+        let result = json!({"approvalPolicy": "never",
+                            "sandbox": {"type": "readOnly", "networkAccess": false}});
+        assert!(codex_policy_read_back(&requested, &result));
+    }
+
+    #[test]
+    fn a_mismatch_or_a_missing_field_fails() {
+        let requested = CodexRequested {
+            approval_policy: "untrusted".into(),
+            sandbox_type: "workspaceWrite".into(),
+        };
+        let wrong_sandbox = json!({"approvalPolicy": "untrusted", "sandbox": {"type": "readOnly"}});
+        let wrong_policy =
+            json!({"approvalPolicy": "never", "sandbox": {"type": "workspaceWrite"}});
+        let flat_sandbox = json!({"approvalPolicy": "untrusted", "sandbox": "workspace-write"});
+        let missing = json!({"sandbox": {"type": "workspaceWrite"}});
+        for result in [wrong_sandbox, wrong_policy, flat_sandbox, missing] {
+            assert!(!codex_policy_read_back(&requested, &result), "{result}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_without_a_type_gives_no_expectation() {
+        assert_eq!(codex_requested(&("never", json!({}))), None);
+        assert_eq!(codex_requested(&("never", json!({"type": 1}))), None);
+    }
+}
+```
+
+`src/delegation/authority.rs`:
+
+```rust
+//! Lane D: inherited authority for supervised children (§5.1–§5.3). Wave 0 stub: everything is
+//! denied.
+
+use agent_core::adapter::Driver;
+use serde_json::Value;
+
+use super::seam::{ApprovalGate, AuthorityParams, Effect, GateVerdict};
+
+/// What a provider tool call does (§5.1 table). Anything not listed is `Unknown`.
+pub(crate) fn effect(_driver: Driver, _tool: &str, _input: &Value) -> Effect {
+    Effect::Unknown
+}
+
+/// The gate a supervised child's approvals pass first.
+pub(crate) struct ChildAuthority {
+    params: AuthorityParams,
+}
+
+impl ChildAuthority {
+    pub(crate) fn new(params: AuthorityParams) -> Self {
+        Self { params }
+    }
+
+    pub(crate) fn params(&self) -> &AuthorityParams {
+        &self.params
+    }
+}
+
+impl ApprovalGate for ChildAuthority {
+    fn judge(&self, _tool: &str, _input: &Value, _cwd: Option<&str>) -> GateVerdict {
+        GateVerdict::Deny {
+            reason: "delegation is not built yet".to_owned(),
+        }
+    }
+
+    fn rule_may_apply(&self, _action: &crate::always_allow::Action, _cwd: Option<&str>) -> bool {
+        false
+    }
+}
+```
+
+`src/delegation/workspace.rs`:
+
+```rust
+//! Lane D: worktree leases for `isolated_worktree` children (§6). Wave 0 stub. Every function
+//! here blocks (git): run it in `gio::spawn_blocking`.
+
+use std::path::{Path, PathBuf};
+
+use agent_core::delegation::authority::WorkspaceScope;
+use agent_core::delegation::{ErrorCode, ToolError, WorkerId};
+
+/// What `plan_lease` resolved at acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeasePlan {
+    pub source_repo: PathBuf,
+    pub base_commit: String,
+    pub branch: String,
+    pub path: PathBuf,
+    /// The caller's tree had uncommitted changes (receipt warning `parent_changes_absent`).
+    pub dirty_parent: bool,
+}
+
+/// A created worktree, canonical and checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeLease {
+    pub source_repo: PathBuf,
+    pub worktree: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Cleanup {
+    Removed,
+    Retained(String),
+}
+
+fn not_built() -> ToolError {
+    ToolError::new(ErrorCode::InternalError, "delegation is not built yet")
+}
+
+pub(crate) fn plan_lease(
+    _caller_tree: &Path,
+    _base: &str,
+    _worker: &WorkerId,
+    _root: Option<&Path>,
+) -> Result<LeasePlan, ToolError> {
+    Err(not_built())
+}
+
+pub(crate) fn create_lease(_plan: &LeasePlan) -> Result<WorktreeLease, ToolError> {
+    Err(not_built())
+}
+
+pub(crate) fn verify_lease(_lease: &WorktreeLease) -> Result<(), ToolError> {
+    Err(not_built())
+}
+
+pub(crate) fn cleanup_if_clean(
+    _lease: &WorktreeLease,
+    _tab_open_in: bool,
+) -> Result<Cleanup, String> {
+    Ok(Cleanup::Retained("delegation is not built yet".to_owned()))
+}
+
+/// The lease as the authority scope it grants.
+pub(crate) fn scope(lease: &WorktreeLease) -> WorkspaceScope {
+    WorkspaceScope::Lease {
+        source_repo: lease.source_repo.to_string_lossy().into_owned(),
+        worktree: lease.worktree.to_string_lossy().into_owned(),
+        base_commit: lease.base_commit.clone(),
+        allowed_relative: Vec::new(),
+    }
+}
+```
+
+`src/delegation/agy_l2.rs`:
+
+```rust
+//! Lane D: contract §7 L2, the file-system part (the pure parts are `agent_core::delegation::
+//! agy_guard`). Wave 0 stub: always withholds. Blocking: run off the main thread.
+
+use std::path::PathBuf;
+
+use agent_core::delegation::agy_guard::L2Refusal;
+use agent_core::delegation::Limits;
+
+/// One agy launch, as L2 judges it: the final argv and environment and the physical cwd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct L2Input {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub physical_cwd: PathBuf,
+    pub verified_home: PathBuf,
+    /// No approval hook: the allow rules in `~/.gemini/antigravity-cli/settings.json` must exist.
+    pub hookless: bool,
+}
+
+/// `Ok` only when every L2 check passes; else why delegation is withheld.
+pub(crate) fn scan(_input: &L2Input, _limits: &Limits) -> Result<(), L2Refusal> {
+    Err(L2Refusal::DiscoveryFailed)
+}
+```
+
+`src/delegation/launch.rs`:
+
+```rust
+//! Lane D: per-generation launch bindings and Claude overlay files (§5.5). Wave 0 stub.
+
+use std::path::Path;
+
+use super::seam::{BindingRequest, PreparedBinding, RuntimeDir};
+
+/// Mints the token and, for Claude, writes the overlay (`O_EXCL|O_NOFOLLOW`, `0600`). Blocking:
+/// run in `gio::spawn_blocking`.
+pub(crate) fn prepare_binding(_req: &BindingRequest) -> Result<PreparedBinding, String> {
+    Err("delegation is not built yet".to_owned())
+}
+
+/// Removes an overlay after its generation's observed exit.
+pub(crate) fn unlink_overlay(_path: &Path) {}
+
+/// Startup: removes every `mcp-<pid>-*.json` whose app pid is not a live agent-terminal.
+pub(crate) fn sweep_overlays(_dir: &RuntimeDir, _live_app_pid: &dyn Fn(u32) -> bool) {}
+```
+
+`src/delegation/rundir.rs`:
+
+```rust
+//! Lane D: the verified runtime directory (§5.5). Wave 0 stub.
+
+use super::seam::RuntimeDir;
+
+/// `$XDG_RUNTIME_DIR/agent-terminal`, created `0700` if absent, then proven by `lstat`: a
+/// directory, not a symlink, owned by this uid, mode `0700`. Blocking: run off the main thread.
+pub(crate) fn verified() -> Result<RuntimeDir, String> {
+    Err("delegation is not built yet".to_owned())
+}
+```
+
+`src/delegation/ipc.rs`:
+
+```rust
+//! Lane C: the delegation IPC server (§4.1–§4.2): a GIO Unix socket on the main context. Wave 0
+//! stub: binding always fails, so delegation stays unavailable.
+
+mod conn;
+pub(crate) mod peer;
+
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use agent_core::delegation::{Limits, ToolError};
+
+use super::seam::{CallDispatcher, ConnId, RuntimeDir};
+
+/// The listener on `<rundir>/delegation-<app_pid>.sock` and its connections.
+pub(crate) struct IpcServer {
+    path: PathBuf,
+}
+
+impl IpcServer {
+    pub(crate) fn bind(
+        _dir: &RuntimeDir,
+        _app_pid: u32,
+        _limits: Limits,
+        _dispatcher: Rc<dyn CallDispatcher>,
+    ) -> Result<Rc<Self>, String> {
+        Err("delegation is not built yet".to_owned())
+    }
+
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Sends `revoked` with `error`, flushes (at most the write deadline), then closes.
+    pub(crate) fn revoke(&self, _conn: ConnId, _error: ToolError) {}
+
+    pub(crate) fn close_all(&self, _error: ToolError) {}
+
+    /// (all connections, unauthenticated connections).
+    pub(crate) fn counts(&self) -> (u32, u32) {
+        (0, 0)
+    }
+}
+```
+
+`src/delegation/ipc/peer.rs`:
+
+```rust
+//! Lane C: `/proc` facts for the agy L3 peer check and the census (§4.3). Wave 0 stub: knows
+//! nothing, so every agy hello fails L3.
+
+use crate::delegation::seam::ProcFacts;
+
+/// Reads `/proc`. A pid that vanished between scan and read is `None` (skipped).
+pub(crate) struct RealProc;
+
+impl ProcFacts for RealProc {
+    fn stat(&self, _pid: u32) -> Option<String> {
+        None
+    }
+
+    fn exe_id(&self, _pid: u32) -> Option<(u64, u64)> {
+        None
+    }
+
+    fn cmdline(&self, _pid: u32) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn children_of(&self, _ppid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+/// The pids that are direct children of `agy_pid`, run the bridge executable `bridge_exe`
+/// (`(dev, ino)`) and have a bridge argv.
+pub(crate) fn census(_p: &dyn ProcFacts, _agy_pid: u32, _bridge_exe: (u64, u64)) -> Vec<u32> {
+    Vec::new()
+}
+```
+
+`src/delegation/ipc/conn.rs`:
+
+```rust
+//! Lane C: one connection's state machine (§4.2): pre-auth deadline, bounded frame reads, the
+//! outbox and its write deadline. Wave 0: empty.
+```
+
+`src/chat/session/delegated.rs`:
+
+```rust
+//! Lane B: a session's typed delegated-input API (`docs/delegation/p4-supervisor.md` §3.4).
+//!
+//! Wave 0 stubs with frozen signatures. They fail closed: no delegated input is ever delivered,
+//! and a session cannot be built with hooks or a child policy until Lane B lands.
+
+use std::rc::Rc;
+
+use agent_core::adapter::{Adapter, Mode, OpenSession};
+use agent_core::delegation::{ErrorCode, ProcessGeneration};
+use agent_kit::store::ThreadId;
+
+use super::{Approval, ChatSession, LaunchEnv, SessionStore};
+use crate::agent_proc::ExitWatch;
+use crate::chat::{ChatBackend, EnvelopeSink};
+use crate::delegation::seam::{DelegatedInput, DelegatedOutcome, SessionOptions};
+
+impl ChatSession {
+    /// [`ChatSession::with_env`] with delegation hooks and, for a supervised child, its policy.
+    #[allow(clippy::too_many_arguments)] // `with_env`'s seven, plus the options
+    pub(crate) fn with_options(
+        adapter: Box<dyn Adapter>,
+        open: OpenSession,
+        store: SessionStore,
+        thread: ThreadId,
+        sink: EnvelopeSink,
+        approval: Approval,
+        env: LaunchEnv,
+        opts: SessionOptions,
+    ) -> Rc<Self> {
+        // Wave 0: refuse to run a child or a bound root without the seam behind it. Routes are
+        // all unverified, so nothing in the app reaches this with options set.
+        assert!(
+            opts.hooks.is_none() && opts.child.is_none(),
+            "delegated sessions are not built yet"
+        );
+        Self::with_env(adapter, open, store, thread, sink, approval, env)
+    }
+
+    /// Delivers one reserved, E7-checked input (`StartTurn`, `WriteLive` or `SteerNow`).
+    pub(crate) fn deliver_delegated(&self, _input: DelegatedInput) -> DelegatedOutcome {
+        DelegatedOutcome::Refused(ErrorCode::InternalError)
+    }
+
+    /// Interrupts the running turn; false when there is none.
+    pub(crate) fn interrupt_run(&self) -> bool {
+        false
+    }
+
+    /// Ends every pending approval (revocation): Claude and Codex deny, agy expires.
+    pub(crate) fn expire_approvals(&self, _reason: &str) {}
+
+    /// Stops the process for a rebind and returns that generation's watch; nothing restarts it
+    /// until [`Self::rebind_start`].
+    pub(crate) fn rebind_stop(&self) -> Option<ExitWatch> {
+        None
+    }
+
+    pub(crate) fn rebind_start(&self) {}
+
+    pub(crate) fn effective_mode(&self) -> Mode {
+        self.status().mode
+    }
+
+    /// The contract's process generation: bumped only when a process starts.
+    pub(crate) fn process_generation(&self) -> ProcessGeneration {
+        ProcessGeneration(0)
+    }
+
+    /// The watch of every generation not yet seen to exit.
+    pub(crate) fn exit_watches(&self) -> Vec<ExitWatch> {
+        self.exit_watch().into_iter().collect()
+    }
+}
+```
 
 ### 1.3 Lane A public API (for Lane E, P5, P6 and P7)
 
@@ -551,7 +1248,7 @@ impl Supervisor {
 | `store` | `SessionStore { handle, provider: Some(Some(provider_thread)) }`; the backing and provider threads are created in the spawn accept transaction |
 | `sink` | `move \|env\| sup.on_child_envelope(&worker, env)`, never a window (§3.6) |
 | `approval` | agy: `ApprovalHandle::bind_child(hook, thread, cwd, mode)` (Lane B), which wires the always rules **and** `set_gate`. Claude and Codex: `Err(None)` |
-| `env` | `LaunchEnv { env: resolved.env, unset: resolved.unset ∪ STRIP_ON_SPAWN }` |
+| `env` | `resolved.env` (an `AgentEnv`, which is `LaunchEnv`) with every `STRIP_ON_SPAWN` name added to its `unset` |
 | `opts` | `SessionOptions { hooks: Some(ChildHooks), child: Some(ChildPolicy { gate: Rc::new(ChildAuthority::new(params)), publish: ChildPublisher, mode }) }` |
 
 A child gets no adapter factory, tab, drawer, `SessionSlot` or view. The view never sends it a prompt directly:
@@ -561,46 +1258,60 @@ inspector input goes through `Supervisor::submit_human` (§4.5).
 
 ```rust
 pub(crate) enum ChildPhase { Launching, Bootstrap /* Claude */, ReadBack, Ready, Failed(ToolError) }
-pub(crate) struct ReadBack { driver: Driver, requested: Requested, phase: ChildPhase, codex: CodexReadBack }
-pub(crate) struct Requested { task_mode: TaskMode, tools: Vec<String> /* Claude list */,
-    sandbox: &'static str /* "readOnly" | "workspaceWrite" */, approval_policy: &'static str }
+pub(crate) struct ReadBack { driver: Driver, task_mode: TaskMode, codex: Option<CodexRequested> /* Wave 0 type */,
+    phase: ChildPhase, bootstrap_violated: bool }
 impl ReadBack {
     pub(crate) fn on_line(&mut self, line: &str) -> ReadBackStep;   // fed by DelegationHooks::line
+    pub(crate) fn on_tool_use(&mut self) -> ReadBackStep;            // Claude bootstrap: latches the violation
     pub(crate) fn on_turn_end(&mut self, state: TurnState) -> ReadBackStep;
 }
-pub(crate) enum ReadBackStep { Wait, SendBootstrap, SendTask, Stop(ToolError), Ok }
+pub(crate) enum ReadBackStep { Wait, SendBootstrap, Interrupt, SendTask, Stop(ToolError), Ok }
 ```
 
 - Lines are parsed as JSON and dropped at once. Nothing is stored or logged.
 - `LiveAuthority.valid` stays false until `Ready`, so every approval request before then is denied.
-- `requested.sandbox` and `requested.approval_policy` come from `agent_core::codex::mode_policy(task_mode.as_mode())`.
-  Lane B makes that function `pub` (`codex.rs:2727`). The launch and the read-back can therefore never disagree.
+- The Codex expectation is `readback::codex_requested(&agent_core::codex::child_mode_policy(task_mode.as_mode()))`.
+  - The child mapping, `child_mode_policy`, is a new `pub fn` from Lane B (§10.1). `mode_policy` is `pub` since Wave 0
+    and keeps serving roots.
+  - The Codex adapter uses that same child mapping to request the policy for a child, so the launch and the read-back
+    share one source.
+  - A `None` from `codex_requested` stops the child.
 
 ### 3.3 Read-back by provider (fail closed, owned by P4)
 
 **Claude (amendment A1: an inert bootstrap turn before the task).**
 1. With the process up, the supervisor sends `InputSource::Bootstrap` with the fixed text
    `"agent-terminal startup check: reply with exactly OK and do not use any tool."`.
-2. While `bootstrap == true`, every `can_use_tool` request is denied by the gate. Any `tool_use` the stream shows
-   sends `interrupt_run()`.
-3. On `system/init` (the fixture `d6_restricted/frames.ndjson` shows it arrives right after the first user frame,
-   lines 3–4), check `claude_child_init_ok(task_mode, init.tools, init.mcp_servers)`. Init's `model` is recorded for
-   diagnostics only; the contract says it is not evidence. The bootstrap turn's `assistant.message.model` becomes the
-   identity's `provider_reported` value.
-4. On the bootstrap turn's end:
-   - read-back passed: `SendTask`;
-   - failed, or init never arrived: `Stop(route_unverified)`, which runs `shutdown(true)`, sets the worker `failed`
-     and the operation `failed`;
-   - an unrecognised model: `provider_unavailable`.
-5. **Every** new Claude child generation (rebind, respawn) repeats steps 1–4 before its first real input.
+2. While `bootstrap == true`, every `can_use_tool` request is denied by the gate.
+3. **A violation is latched.** Any `tool_use` the stream shows in the bootstrap turn sets `bootstrap_violated = true`
+   and sends `interrupt_run()`. A latched violation never clears for that generation.
+4. On `system/init`, check `claude_child_init_ok(task_mode, init.tools, init.mcp_servers)`.
+   - The fixture `d6_restricted/frames.ndjson` shows init arrives right after the first user frame (lines 3–4).
+   - Init's `model` is recorded for diagnostics only; the contract says it is not evidence.
+   - The bootstrap turn's `assistant.message.model` becomes the identity's `provider_reported` value.
+5. On the bootstrap turn's end, `SendTask` happens **only if all** of these hold:
+   - the turn ended `TurnState::Completed` (not interrupted, not failed);
+   - `bootstrap_violated == false`;
+   - init was received and accepted;
+   - the model was recognised.
+
+   Otherwise:
+   - a tool use, an interruption, a failed completion, a rejected init, or no init: `Stop(route_unverified)`, which
+     runs `shutdown(true)` and sets the worker and the operation `failed`;
+   - an unrecognised model (Claude's `unrecognized_model`): `provider_unavailable`.
+
+   Nothing ever moves from a failed or latched bootstrap to `SendTask`.
+6. **Every** new Claude child generation (rebind, respawn) repeats steps 1–5 before its first real input.
 
 This costs one small turn per Claude child generation, about a system prompt plus "OK". It is visible in the child's
 transcript as a labelled startup check.
 
 **Codex.**
-1. Before any input, the `thread/start` or `thread/resume` response must have `result.sandbox.type ==
-   requested.sandbox` and `result.approvalPolicy == requested.approval_policy`. The recorded shape is
-   `d6-sandbox-policy.app-server.jsonl`. A missing field or a mismatch gives `Stop(route_unverified)`.
+1. Before any input, the `thread/start` or `thread/resume` `result` must pass
+   `readback::codex_policy_read_back(&requested, result)`: an equal `approvalPolicy` and an equal `sandbox.type`. The
+   recorded shape is `d6-sandbox-policy.app-server.jsonl`. A missing field or a mismatch gives
+   `Stop(route_unverified)`. For an Ask or Accept edits child, the expectation is `untrusted` + `workspaceWrite`
+   (§10.1).
 2. Every `mcpServer/startupStatus/updated` notification, **for the life of every generation**, must name
    `agent_terminal`. Any other name, including `codex_apps`, at any time:
    - `interrupt_run`;
@@ -1065,8 +1776,8 @@ holds names and sha256 values, never the token. IPC tests use an in-process `Uni
 | # | Test | Lane |
 | --- | --- | --- |
 | 1 | `spawn_fake_child_runs_task_records_run_and_result` | A |
-| 2 | `claude_bootstrap_precedes_task`, `claude_bootstrap_denies_every_can_use_tool`, `claude_init_with_task_tool_stops_route_unverified_task_never_sent`, `claude_rebind_repeats_bootstrap` | A+B |
-| 3 | `codex_sandbox_mismatch_stops_before_input`, `codex_policy_mismatch_stops`, `codex_missing_result_fields_stop`, `codex_foreign_server_at_start_stops`, `codex_foreign_server_mid_turn_stops_and_kills_token`, `codex_no_ready_in_10s_stops` | A |
+| 2 | `claude_bootstrap_precedes_task`, `claude_bootstrap_denies_every_can_use_tool`, `claude_init_with_task_tool_stops_route_unverified_task_never_sent`, `claude_valid_init_then_tool_use_latches_and_never_sends_task`, `claude_bootstrap_interrupted_completion_stops_route_unverified`, `claude_bootstrap_failed_completion_stops`, `claude_unrecognised_model_is_provider_unavailable`, `claude_rebind_repeats_bootstrap` | A+B |
+| 3 | `codex_ask_child_requests_and_reads_back_workspace_write` (Lane B mapping), `codex_root_ask_keeps_read_only`, `codex_sandbox_mismatch_stops_before_input`, `codex_policy_mismatch_stops`, `codex_missing_result_fields_stop`, `codex_foreign_server_at_start_stops`, `codex_foreign_server_mid_turn_stops_and_kills_token`, `codex_no_ready_in_10s_stops` | A |
 | 4 | `plan_denies_edit_exec_unknown_for_claude_codex_agy` (table-driven over §5.1), `unknown_tool_never_auto_in_ask`, `delegate_and_foreign_mcp_always_denied` | D (+B wiring) |
 | 5 | Rules: `always_edit_rule_inside_lease_auto_allows`, `always_rule_for_source_tree_path_never_applies`, `shell_and_mcp_rules_never_apply_in_child`, `session_folder_offered_only_inside_lease`, `restricted_parent_disables_edit_rules`, `rule_rechecked_at_keep` (all three providers) | B+D |
 | 6 | `edit_relative_in_lease_auto_in_accept_edits`; `absolute_into_source_tree_asks_without_grant_buttons`; `sensitive_in_worktree_asks`; `symlinked_dir_in_worktree_never_auto` | D |
@@ -1083,17 +1794,17 @@ holds names and sha256 values, never the token. IPC tests use an in-process `Uni
 
 ## 9. Lanes
 
-**Wave 0 (coordinator).**
-- Merge P3b.
-- Commit `seam.rs` (§1.1) verbatim.
-- Commit `delegation/mod.rs` and every stub of §1.2, plus `session/delegated.rs` with its stubs and `mod delegated;`
-  in `session.rs`.
-- Add `mod delegation;` to `main.rs`.
-- `cargo check` must pass.
+**Wave 0 (done on `feat/cross-agent-p4-wave0`).**
+- `seam.rs` (§1.1) and every stub of §1.2 are committed.
+- `session/delegated.rs` holds the session stubs; `mod delegated;` is in `session.rs` and `mod delegation;` in
+  `main.rs`.
+- `agent_core::codex::mode_policy` is `pub`.
+- check, clippy `-D warnings`, `test --no-run` and fmt all pass.
+- P3b still has to merge before Lane A's store work.
 
 | Lane | New files | Existing files it may edit | Depends on |
 | --- | --- | --- | --- |
-| **B: session seam** | `src/chat/session/tests/delegated_tests.rs` (fills `delegated.rs`) | **`src/chat/session.rs` (only this lane)**, `src/approval_server.rs` (`set_gate`, `bind_child`, the `serve` and `rules_allow`/`rule_options`/`remember` filter), `src/agent_proc.rs` (`pid()`), `crates/agent-core/src/adapter.rs` (`DelegatedSteer`), `crates/agent-core/src/codex.rs` (`DelegatedSteer` arm, `pub fn mode_policy`), `crates/agent-core/src/claude.rs` and `agy.rs` (one `Unsupported` arm each), `tests/support/scripted_codex.py` | Wave 0 |
+| **B: session seam** | `src/chat/session/tests/delegated_tests.rs` (fills `delegated.rs`) | **`src/chat/session.rs` (only this lane)**, `src/approval_server.rs` (`set_gate`, `bind_child`, the `serve` and `rules_allow`/`rule_options`/`remember` filter), `src/agent_proc.rs` (`pid()`), `crates/agent-core/src/adapter.rs` (`DelegatedSteer`), `crates/agent-core/src/codex.rs` (`DelegatedSteer` arm; `pub fn child_mode_policy` and its use for supervised children, §10.1), `crates/agent-core/src/claude.rs` and `agy.rs` (one `Unsupported` arm each), `tests/support/scripted_codex.py` | Wave 0 |
 | **C: IPC** | none (fills `ipc.rs`, `ipc/conn.rs`, `ipc/peer.rs`) | none | Wave 0 |
 | **D: authority, workspace, launch** | none (fills `authority.rs`, `workspace.rs`, `agy_l2.rs`, `launch.rs`, `rundir.rs`) | none | Wave 0 |
 | **A: supervisor core** | `tests/support/scripted_claude.py`, `tests/support/scripted_agy.py`, `tests/fixtures/delegation/**` (fills `mod.rs` and its own modules) | none | Wave 0, P3b. It compiles against the stubs, and its end-to-end tests turn green as B, C and D merge |
@@ -1110,14 +1821,28 @@ B, C, D and A run in parallel; E runs last. No existing file has two lanes. No n
 
 ## 10. Risks and open items
 
-1. **Codex Ask sandbox.** `mode_policy(Ask)` is `untrusted` + `readOnly` (`codex.rs:2729`), but contract §5 says
-   "workspace-write (ask, accept_edits)". The read-back compares against what the launch actually requests, which is
-   `mode_policy`. P5 decides whether a Codex Ask child needs `workspaceWrite`. Until then a Codex Ask child cannot
-   write without an escalation card.
+1. **Codex Ask child sandbox (coordinator decision: follow the contract).** Roots keep today's `mode_policy` (Ask is
+   `untrusted` + `readOnly`, `codex.rs:2729`). Supervised children use a child-specific mapping, which Lane B adds:
+   ```rust
+   pub fn child_mode_policy(mode: Mode) -> (&'static str, Value);
+   ```
+   | Mode | `approvalPolicy` | `sandboxPolicy` |
+   | --- | --- | --- |
+   | Ask | `untrusted` (today's Ask policy: writes and commands still ask) | `{"type": "workspaceWrite"}` |
+   | AcceptEdits | `untrusted` | `{"type": "workspaceWrite"}` |
+   | Plan | `never` | `{"type": "readOnly"}` |
+   | Bypass | never used: a child refuses Bypass | |
+
+   - The child's cwd is its lease worktree, so `workspaceWrite` is bounded to that worktree.
+   - The Codex adapter uses `child_mode_policy` when `OpenSession.delegation` marks a child launch. Roots are
+     unchanged.
+   - The read-back (§3.3) expects the same pair, through `readback::codex_requested`.
+   - **Codex Ask (and Accept edits) child routes stay `Unverified`** until `codex_ask_child_requests_and_reads_back_
+     workspace_write` passes against the scripted fixture and a recorded P5/P8 run confirms the read-back.
 2. **Claude bootstrap residual.** Init arrives before any assistant output in the fixture, and the model is told to
    use no tool. Read-only tools in `--tools` (`Read`, `Glob`, `Grep`) do not raise `can_use_tool`. In the worst case
-   the bootstrap turn reads files in its own worktree, which is plainly permitted. Any `tool_use` triggers an
-   interrupt.
+   the bootstrap turn reads files in its own worktree, which is plainly permitted. Any `tool_use` latches a violation:
+   an interrupt, then `route_unverified`, and the task is never sent.
 3. **Claude echo confirmation** needs P5's `--replay-user-messages`. Until then deliveries end `unknown`.
 4. **Unstaged agy and Claude restarts** degrade delegation until the next staged rebind. P6's banner must say so.
 5. **`queued` spawn state.** P1 `admit_spawn` refuses at 4 active runs (`limits.rs:172-196`), so `queued` is never
