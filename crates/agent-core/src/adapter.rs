@@ -243,6 +243,15 @@ pub enum Command {
     Steer {
         text: String,
     },
+    /// A delegated message for the running turn `turn` (the native turn id), with no fallback:
+    /// the outcome arrives as `Event::ControlResult` with `request == tag` (`ok` when the agent
+    /// took it, `error` when it refused it). A refusal never starts a turn. Codex only
+    /// (`turn/steer`, strict `this_run`); every other adapter refuses it.
+    DelegatedSteer {
+        text: String,
+        turn: String,
+        tag: String,
+    },
     Interrupt,
     /// Answer an approval the adapter raised itself (Claude `can_use_tool`).
     Approve {
@@ -409,6 +418,19 @@ pub trait Adapter {
     /// workspace without asking. `None`: this adapter does not know (the host assumes it can).
     fn workspace_writable(&self) -> Option<bool> {
         None
+    }
+    /// The native id of the turn that is running, when the agent names its turns (Codex).
+    fn active_turn(&self) -> Option<String> {
+        None
+    }
+    /// This adapter drives a supervised delegation child: it requests the child's policies
+    /// (Codex: [`crate::codex::child_mode_policy`]) instead of a root's. Set before the first
+    /// launch; the default ignores it.
+    fn supervise_as_child(&mut self) {}
+    /// The provider explicitly identifies this pending approval as our dynamically bound
+    /// bridge. The host must additionally prove that this generation received its binding.
+    fn is_own_bridge_approval(&self, _request: &str) -> bool {
+        false
     }
 }
 

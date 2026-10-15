@@ -33,6 +33,8 @@ use gtk4::glib;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::delegation::seam::{ApprovalGate, GateVerdict};
+
 /// Env var naming the absolute path of the running binary, so the hook entry never falls back to
 /// an installed (possibly older) `agent-terminal` on PATH.
 pub const ENV_HOOK_BIN: &str = "AGENT_TERMINAL_HOOK_BIN";
@@ -473,6 +475,8 @@ struct Pending {
     /// The folder the card offered for "Allow for session" ([`crate::always_allow::session_folder`]
     /// when it was built): the answer keeps a folder only if it is still this one.
     shown_folder: Option<PathBuf>,
+    /// A supervised child's gate forced this card (`GateVerdict::AskOnly`): no rule is kept.
+    ask_only: bool,
 }
 
 fn pending_denials<'a>(
@@ -517,6 +521,12 @@ struct ServerInner {
     session_rules: RefCell<SessionRules>,
     /// The unusable-rules-file notice was already shown by this server.
     blocked_noticed: Cell<bool>,
+    /// A supervised delegation child's server: every call is judged by `gate` first, and with
+    /// no gate (yet) every call is denied.
+    child: Cell<bool>,
+    /// The child's inherited authority (P4 §5.2–§5.3), applied before the mode policy and
+    /// before every rule.
+    gate: RefCell<Option<Rc<dyn ApprovalGate>>>,
 }
 
 impl Drop for ServerInner {
@@ -683,6 +693,8 @@ impl ApprovalHandle {
             always: RefCell::new(None),
             session_rules: RefCell::new(SessionRules::default()),
             blocked_noticed: Cell::new(false),
+            child: Cell::new(false),
+            gate: RefCell::new(None),
         });
         // From here `Drop` removes the file, including on the early return below.
         std::fs::set_permissions(&inner.path, std::fs::Permissions::from_mode(0o600))
@@ -772,6 +784,34 @@ impl ApprovalHandle {
         Self::bind_default(thread, workspace, mode)
     }
 
+    /// A supervised child's socket ([`Self::bind_checked`] for the child's own worktree `cwd`,
+    /// with the Always rules file). Fail closed: every call is denied until the session installs
+    /// the child's gate ([`Self::set_gate`], which `ChatSession::with_options` does). A child
+    /// never runs Bypass, so it is bound in Plan if asked for it.
+    #[cfg_attr(not(test), allow(dead_code))] // the child factory (Lane A) binds with it
+    pub(crate) fn bind_child(
+        hook: Result<(), String>,
+        thread: &str,
+        cwd: &Path,
+        mode: Mode,
+    ) -> Result<Self, String> {
+        let mode = if mode == Mode::Bypass {
+            Mode::Plan
+        } else {
+            mode
+        };
+        let handle = Self::bind_checked(hook, thread, cwd, mode)?;
+        handle.inner.child.set(true);
+        Ok(handle)
+    }
+
+    /// Makes this a supervised child's server, judged by `gate` before the mode policy, the
+    /// session and Always rules, and every grant button (P4 §5.3, amendment A4).
+    pub(crate) fn set_gate(&self, gate: Rc<dyn ApprovalGate>) {
+        self.inner.child.set(true);
+        *self.inner.gate.borrow_mut() = Some(gate);
+    }
+
     #[cfg_attr(not(test), allow(dead_code))] // exercised by tests; kept as API
     pub fn has_pending(&self, request: &str) -> bool {
         self.inner.pending.borrow().contains_key(request)
@@ -797,7 +837,7 @@ impl ApprovalHandle {
         custom_rule: Option<crate::always_allow::Rule>,
         done: impl FnOnce(Decision) + 'static,
     ) -> bool {
-        let Some(pending) = self.inner.pending.borrow_mut().remove(request) else {
+        let Some(mut pending) = self.inner.pending.borrow_mut().remove(request) else {
             return false;
         };
         if let Verdict::Deny(why) = policy_with_home(
@@ -814,6 +854,21 @@ impl ApprovalHandle {
                 .request(request),
             );
             return false;
+        }
+        // A child's authority can have narrowed (revoked, restricted) while the card waited.
+        match self.inner.judge(&pending.query) {
+            Some(GateVerdict::Deny { reason }) => {
+                deny(pending.conn, &reason);
+                self.inner.emit(
+                    Envelope::new(Event::ApprovalResolved {
+                        decision: Decision::Deny,
+                    })
+                    .request(request),
+                );
+                return false;
+            }
+            Some(GateVerdict::AskOnly { .. }) => pending.ask_only = true,
+            Some(GateVerdict::Defer) | None => {}
         }
         let remember_decision = decision;
         let mut decision = decision;
@@ -908,6 +963,22 @@ impl ServerInner {
         let ctx = self
             .context(pending.cwd.as_deref())
             .ok_or_else(|| "no workspace is available".to_owned())?;
+        // A4: a child keeps a rule only for a call its gate lets rules cover; a custom rule could
+        // reach further than the call, so a child never keeps one.
+        if self.child.get() {
+            let allowed = !pending.ask_only
+                && matches!(self.judge(&pending.query), Some(GateVerdict::Defer))
+                && custom.is_none()
+                && pending
+                    .action
+                    .as_ref()
+                    .is_some_and(|a| self.rule_may_apply(a, pending.cwd.as_deref()));
+            if !allowed {
+                return Err(
+                    "a delegated agent keeps rules only for files in its own worktree".to_owned(),
+                );
+            }
+        }
         crate::always_allow::decide_as_shown(
             pending.action.as_ref(),
             custom,
@@ -950,6 +1021,31 @@ impl ServerInner {
                 false
             }
         }
+    }
+
+    /// A supervised child's gate verdict on `query`; `None` for a server that is not a child's.
+    /// A child with no gate installed denies everything.
+    fn judge(&self, query: &ApprovalQuery) -> Option<GateVerdict> {
+        if !self.child.get() {
+            return None;
+        }
+        let gate = self.gate.borrow().clone();
+        Some(match gate {
+            Some(gate) => gate.judge(&query.tool, &query.args, query.cwd.as_deref()),
+            None => GateVerdict::Deny {
+                reason: "this delegated agent's authority is not set up".to_owned(),
+            },
+        })
+    }
+
+    /// Whether a session or Always rule may match `action` here: always for a root; for a child,
+    /// only where its gate allows (A4), and nowhere without a gate.
+    fn rule_may_apply(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool {
+        if !self.child.get() {
+            return true;
+        }
+        let gate = self.gate.borrow().clone();
+        gate.is_some_and(|g| g.rule_may_apply(action, cwd))
     }
 
     /// Whether a session rule (agy's own) or an Always rule allows `action`.
@@ -1181,12 +1277,20 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         .borrow_mut()
         .entry(query.tool.clone())
         .or_insert(0) += 1;
+    // A child's inherited authority first, before the mode policy and every rule (P4 §5.2).
+    let ask_only = match inner.judge(&query) {
+        Some(GateVerdict::Deny { reason }) => return deny(conn, &reason),
+        Some(GateVerdict::AskOnly { .. }) => true,
+        Some(GateVerdict::Defer) | None => false,
+    };
     match policy_with_home(
         inner.mode.get(),
         &query,
         &inner.workspaces,
         inner.home.as_deref(),
     ) {
+        // A card the gate forced is never answered by the mode's auto-allow.
+        Verdict::Allow if ask_only => {}
         Verdict::Allow => {
             return reply(
                 conn,
@@ -1202,9 +1306,15 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     // One matcher for every agent (`always_allow`): the call in canonical terms, judged by the
     // thread's session rules (agy's own) and the Always rules.
     let action = crate::always_allow::Action::of(&query.tool, &query.args);
-    if action
-        .as_ref()
-        .is_some_and(|a| inner.rules_allow(a, query.cwd.as_deref()))
+    // A4: in a child, a rule applies (and a card offers to keep one) only where its gate says.
+    let rules_apply = !ask_only
+        && action
+            .as_ref()
+            .is_some_and(|a| inner.rule_may_apply(a, query.cwd.as_deref()));
+    if rules_apply
+        && action
+            .as_ref()
+            .is_some_and(|a| inner.rules_allow(a, query.cwd.as_deref()))
     {
         info!(tool = %query.tool, "auto-approving a call a remembered rule matches");
         return reply(
@@ -1224,11 +1334,15 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
 
     let id = query.id.clone();
     let ctx = inner.context(query.cwd.as_deref());
-    let (options, remembers) = rule_options(
-        action.as_ref(),
-        ctx.as_ref(),
-        inner.always.borrow().is_some(),
-    );
+    let (options, remembers) = if rules_apply {
+        rule_options(
+            action.as_ref(),
+            ctx.as_ref(),
+            inner.always.borrow().is_some(),
+        )
+    } else {
+        rule_options(None, None, false)
+    };
     // The folder the card offered, pinned: the answer keeps it only if it is still the same.
     let shown_folder = match (&action, &ctx) {
         (Some(a), Some(c)) if options.contains(&Decision::AllowForSession) => {
@@ -1245,6 +1359,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
             action,
             cwd: query.cwd.clone(),
             shown_folder,
+            ask_only,
         },
     );
     let title = query
@@ -2223,6 +2338,46 @@ mod tests {
     fn with_id(mut query: ApprovalQuery, id: &str) -> ApprovalQuery {
         query.id = id.into();
         query
+    }
+
+    #[test]
+    fn a_child_requires_hook_proof_and_rechecks_authority_before_allow() {
+        struct Gate(Cell<bool>);
+        impl ApprovalGate for Gate {
+            fn judge(&self, _: &str, _: &Value, _: Option<&str>) -> GateVerdict {
+                if self.0.get() {
+                    GateVerdict::Defer
+                } else {
+                    GateVerdict::Deny {
+                        reason: "revoked".into(),
+                    }
+                }
+            }
+            fn rule_may_apply(&self, _: &crate::always_allow::Action, _: Option<&str>) -> bool {
+                false
+            }
+        }
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            assert!(ApprovalHandle::bind_child(
+                Err("not proven".into()),
+                "child",
+                tmp.path(),
+                Mode::Ask
+            )
+            .is_err());
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let gate = Rc::new(Gate(Cell::new(true)));
+            handle.set_gate(gate.clone());
+            let rx = client(
+                handle.socket_path().to_owned(),
+                with_id(cmd("touch a"), "child-ask"),
+            );
+            assert!(pump_until(ctx, 10, || request_id(&seen).is_some()));
+            gate.0.set(false);
+            assert!(!handle.respond("child-ask", Decision::Allow));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
+        });
     }
 
     #[test]
