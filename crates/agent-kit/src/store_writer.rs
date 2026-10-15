@@ -1802,6 +1802,31 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_durable_commit_rolls_back_restores_the_level_and_is_counted() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        writer
+            .call("inject", |s| s.fail_next_txn_commit())
+            .recv()
+            .expect("armed");
+        let got = writer
+            .durable_call("control", |s| s.set_meta("lost", "1"))
+            .recv()
+            .expect("answered");
+        assert!(matches!(got, Err(StoreError::Io(_))), "{got:?}");
+        assert_eq!(committed_meta(&path, "lost"), None, "rolled back");
+        assert_eq!(sync_level(&writer), 1, "NORMAL restored");
+        assert_eq!(writer.failures().0, 1);
+        // The next durable write commits normally.
+        writer
+            .durable_call("control", |s| s.set_meta("kept", "1"))
+            .recv()
+            .expect("answered")
+            .expect("committed");
+        assert_eq!(committed_meta(&path, "kept").as_deref(), Some("1"));
+    }
+
+    #[test]
     fn a_durable_jobs_own_error_goes_back_uncounted_and_leaves_nothing() {
         let (_dir, path, handle) = setup();
         let writer = handle.writer().expect("writer").clone();
