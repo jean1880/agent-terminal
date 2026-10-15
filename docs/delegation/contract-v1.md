@@ -1034,3 +1034,57 @@ Shared open items (UNVERIFIED, advisory, not blocking a route unless named above
 - whether agy honours `--effort` and the base model id;
 - G-C2 (Claude echoes an input `uuid`) and G-C4 (Claude reads the overlay only at startup);
 - G-C5 and G-X5 (attestation for Claude and Codex), which become mandatory when proven.
+
+## P4 amendments (2026-10-15, coordinator and user decisions)
+
+These four change the text above. The design is `docs/delegation/p4-supervisor.md` (revision 2). Everything else stands.
+
+**A1. Claude child read-back by an inert bootstrap turn** (replaces "stop the child before its first turn" in the §5
+child read-back row, for Claude).
+- **Why.** Claude emits `system/init` only after the first user frame
+  (`tests/fixtures/real/delegation/claude/d6_restricted/frames.ndjson`, lines 3–4). The `initialize` response carries
+  no tools or MCP servers.
+- **Bootstrap.** Every Claude child process generation therefore first receives a fixed, harmless bootstrap message,
+  which tells it to reply `OK` and use no tool:
+  - every `can_use_tool` request in that turn is denied;
+  - any `tool_use` in that turn triggers an interrupt.
+- **Read-back.** `system/init` `tools` and `mcp_servers` are read back as §5 requires. The model is taken from the
+  turn's `assistant.message.model`; init's model is diagnostic only.
+- **Outcomes.**
+  - On a pass, after the bootstrap turn ends, the task is sent, after the E7 recheck.
+  - On a failure, the child is stopped with `route_unverified`, and the task is never sent.
+  - An unrecognised model gives `provider_unavailable`.
+- **Gates.** G-C1, G-C3 and G-C5 still apply.
+- **Cost.** One small turn per Claude child generation, rebinds included. It is shown in the child's transcript as a
+  labelled startup check.
+
+**A2. Codex rebind by restart** (replaces "`thread/resume` with a fresh config overlay. The same app-server stays up"
+in §6 Rebind).
+- A Codex worker rebinds by stopping its app-server, then starting a new one that resumes the thread with
+  `thread/resume` and a fresh config and token. This is a new process generation.
+- The new generation starts only after the old generation's exit is **observed**. After 5 s it is killed, and its
+  exit is still awaited.
+- The restart loses Codex's session grants and pending permission requests: those cards expire and are asked again,
+  and the thread says so.
+- Fail closed: a restart the supervisor did not prepare gets no token, and the worker becomes `rebind_required`.
+
+**A3. Closing a root's page stops its descendants** (a §6 revocation row).
+- Closing a root thread's page, or a window holding it, is a **Root Stop**, and every descendant process is stopped.
+- The window waits for the observed exits of every descendant process generation. A single tab close does not wait,
+  but no process slot or overlay is released before the observed exit.
+- Moving a root to another window is a close followed by a reopen. The root principal (its root and root-worker
+  rows) is kept.
+- The reopened root's first token is issued only after the previous root generation's exit is observed. Two root
+  generations never hold live credentials at once.
+- Stopped children stay readable and can be sent work again, which is a rebind.
+
+**A4. Remembered rules in children** (refines E5).
+- Always rules and session rules apply in a supervised child, and its cards may offer to keep one, only when all of
+  these hold:
+  - the call is a file edit or read;
+  - every canonical target is inside the child's own worktree lease, or the shared root for a read, under the same
+    containment and sensitive-file checks as Accept edits;
+  - for an edit, the child's `task_mode` is a writing mode that is still inside the parent principal's live ceiling.
+- Shell and MCP rules never apply in a child.
+- `InheritedAuthority` is still judged first, before every rule, Accept edits and Bypass path. Unknown tools are never
+  auto-allowed, and they are denied in `plan`.
