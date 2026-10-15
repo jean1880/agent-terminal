@@ -166,6 +166,18 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// `details` within the contract bound: an object or null of at most
+/// `MAX_ERROR_DETAILS_BYTES` serialised.
+pub fn details_within_bound(details: &Value) -> bool {
+    matches!(details, Value::Object(_) | Value::Null)
+        && serde_json::to_string(details)
+            .is_ok_and(|s| s.len() <= super::wire::MAX_ERROR_DETAILS_BYTES)
+}
+
+fn details_marker(reason: &str) -> Value {
+    serde_json::json!({ "reason": reason })
+}
+
 impl ToolError {
     /// `retryable` comes from the code.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -179,18 +191,39 @@ impl ToolError {
         }
     }
 
+    /// Sets `details` (contract §2: an object or null, at most
+    /// [`MAX_ERROR_DETAILS_BYTES`](super::wire::MAX_ERROR_DETAILS_BYTES) serialised). `null`
+    /// clears it. Anything else that breaks the contract is never sent: it is replaced whole
+    /// (never cut) by `{"reason": "details_invalid" | "details_too_large"}`.
     pub fn with_details(mut self, details: Value) -> Self {
-        self.details = Some(details);
+        self.details = match details {
+            Value::Null => None,
+            Value::Object(_) if details_within_bound(&details) => Some(details),
+            Value::Object(_) => Some(details_marker("details_too_large")),
+            _ => Some(details_marker("details_invalid")),
+        };
         self
     }
 
-    /// Sets `details[key] = value`, making `details` an object if it was not one.
+    /// Sets `details[key] = value`, making `details` an object if it was not one. If the
+    /// value would take `details` past its bound, it is left out whole and
+    /// `details.omitted` names the key instead.
     pub fn with_detail(mut self, key: &str, value: impl Into<Value>) -> Self {
         let mut map = match self.details.take() {
             Some(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
-        map.insert(key.to_owned(), value.into());
+        let previous = map.insert(key.to_owned(), value.into());
+        if !details_within_bound(&Value::Object(map.clone())) {
+            match previous {
+                Some(p) => map.insert(key.to_owned(), p),
+                None => map.remove(key),
+            };
+            map.insert(
+                "omitted".to_owned(),
+                Value::String(truncate_bytes(key, 64).to_owned()),
+            );
+        }
         self.details = Some(Value::Object(map));
         self
     }
@@ -290,6 +323,46 @@ mod tests {
         );
         assert!(!ErrorCode::InternalError.retryable());
         assert!(!ErrorCode::DeliveryUnknown.retryable());
+    }
+
+    #[test]
+    fn details_are_an_object_or_null_within_64_kib() {
+        use crate::delegation::wire::MAX_ERROR_DETAILS_BYTES;
+        // `{"x":"…"}` is the payload plus 8 bytes.
+        let sized = |n: usize| serde_json::json!({ "x": "a".repeat(n - 8) });
+        let at = sized(MAX_ERROR_DETAILS_BYTES);
+        assert_eq!(
+            serde_json::to_string(&at).expect("ser").len(),
+            MAX_ERROR_DETAILS_BYTES
+        );
+        let e = ToolError::new(ErrorCode::NotFound, "x").with_details(at.clone());
+        assert_eq!(e.details, Some(at));
+        let over = ToolError::new(ErrorCode::NotFound, "x")
+            .with_details(sized(MAX_ERROR_DETAILS_BYTES + 1));
+        assert_eq!(
+            over.details,
+            Some(serde_json::json!({"reason": "details_too_large"}))
+        );
+        let not_object =
+            ToolError::new(ErrorCode::NotFound, "x").with_details(serde_json::json!([1]));
+        assert_eq!(
+            not_object.details,
+            Some(serde_json::json!({"reason": "details_invalid"}))
+        );
+        let cleared = ToolError::new(ErrorCode::NotFound, "x").with_details(Value::Null);
+        assert_eq!(cleared.details, None);
+        // with_detail: the key that would pass the bound is left out whole.
+        let base = ToolError::new(ErrorCode::NotFound, "x").with_detail("operation_id", "op_1");
+        let fits = base
+            .clone()
+            .with_detail("big", "b".repeat(MAX_ERROR_DETAILS_BYTES - 64));
+        assert!(fits.details.as_ref().and_then(|d| d.get("big")).is_some());
+        let omitted = base.with_detail("big", "b".repeat(MAX_ERROR_DETAILS_BYTES));
+        let d = omitted.details.expect("details");
+        assert!(d.get("big").is_none());
+        assert_eq!(d["omitted"], "big");
+        assert_eq!(d["operation_id"], "op_1");
+        assert!(details_within_bound(&d));
     }
 
     #[test]

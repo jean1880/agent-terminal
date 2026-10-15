@@ -214,6 +214,12 @@ pub fn replay(op: &StoredOperation, dispatching_now: bool) -> ReplayOutcome {
         OperationState::DispatchReserved if dispatching_now => ReplayOutcome::WaitForDispatch,
         OperationState::DispatchReserved | OperationState::Unknown => {
             let receipt = op.receipt.clone().unwrap_or(Value::Null);
+            // Every receipt is at most MAX_RECEIPT_BYTES by construction, so {operation_id,
+            // receipt} fits the details bound and the original is never cut or omitted.
+            debug_assert!(super::error::details_within_bound(&serde_json::json!({
+                "operation_id": op.id.as_str(),
+                "receipt": receipt,
+            })));
             ReplayOutcome::DeliveryUnknown(
                 ToolError::new(
                     ErrorCode::DeliveryUnknown,
