@@ -68,16 +68,19 @@ pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Equal-length comparison whose time depends only on the length.
+/// Equal-length comparison whose time depends only on the length. Best-effort constant time:
+/// the fold has no early exit, and `black_box` on the inputs and the accumulator keeps the
+/// optimiser from turning it into one, but Rust gives no hard timing guarantee.
 fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    use core::hint::black_box;
     if a.len() != b.len() {
         return false;
     }
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
+    for (x, y) in black_box(a).iter().zip(black_box(b)) {
+        diff = black_box(diff | (x ^ y));
     }
-    diff == 0
+    black_box(diff) == 0
 }
 
 /// `atdc_` + base64url(32 random bytes), no padding: 48 characters. One per principal and

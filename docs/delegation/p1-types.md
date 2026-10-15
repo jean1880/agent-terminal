@@ -362,8 +362,8 @@ pub enum InvocationKey { Claude { tool_use_id: String }, Codex { thread_id: Stri
 pub fn invocation_from_meta(meta: &serde_json::Map<String, Value>) -> Option<InvocationKey>; // whitelist only, ≤256 B each
 pub struct ObservedCalls { /* ≤ Limits::observed_calls per generation; oldest dropped first */ }
 impl ObservedCalls {
-    /// `salt`: 32 random bytes from the app, one per principal generation (P1 has no RNG).
-    pub fn new(salt: [u8; 32], cap: usize) -> Self;
+    /// `salt`: 16 random bytes from the app (the SipHash key), one per principal generation (P1 has no RNG).
+    pub fn new(salt: [u8; 16], cap: usize) -> Self;
     /// Both take the output of `attestation_arguments`; nothing else may be passed (one helper, both sides).
     pub fn record(&mut self, key: InvocationKey, tool: ToolName, attestation_args: &AttestationArgs);
     /// Consumes the match. Never grants authority: the caller only denies on Unattested.
@@ -376,8 +376,9 @@ pub enum Attestation { Attested, Unattested }
 /// Distinct from operation::canonical_request (scrubbed, key/epoch removed), which is for idempotency only.
 pub struct AttestationArgs(String);   // Debug prints only its length: it may hold un-redacted text
 pub fn attestation_arguments(tool: ToolName, raw: &Value, limits: &Limits) -> Result<AttestationArgs, ToolError>;
-// Kept only as a 128-bit digest: two std SipHash passes, each over (half the salt, the args), the same construction as
-// redact::stream's key digest. No new dependency; never persisted or logged (contract §8 item 8).
+// Kept only as a 128-bit digest: keyed SipHash-2-4-128 (hand-rolled to the reference specification and checked against
+// its 64- and 128-bit test vectors), key = the caller's 16-byte salt. No new dependency; never persisted or logged
+// (contract §8 item 8).
 pub fn attestation_required(driver: Driver, tool: ToolName, gate_passed: bool) -> bool; // agy: every tool; Claude/Codex: every tool once G-C5/G-X5 pass
 // (matches_session is removed: Claude keys carry no session; attestation against observed calls replaces it.)
 

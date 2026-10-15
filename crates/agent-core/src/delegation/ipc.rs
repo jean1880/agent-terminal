@@ -191,7 +191,8 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, FrameError> {
 
 /// A decoder that buffers at most one frame: a 4-byte header and one bounded body. The length
 /// is checked before anything is reserved; after an error it is poisoned (the caller closes).
-#[derive(Debug, Default)]
+/// Its `Debug` shows lengths and state only: a buffered body may be a hello holding the token.
+#[derive(Default)]
 pub struct FrameDecoder {
     header: [u8; HEADER],
     header_len: usize,
@@ -199,6 +200,17 @@ pub struct FrameDecoder {
     body_len: Option<usize>,
     body: Vec<u8>,
     poisoned: Option<FrameError>,
+}
+
+impl fmt::Debug for FrameDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameDecoder")
+            .field("header_len", &self.header_len)
+            .field("body_len", &self.body_len)
+            .field("buffered_body", &self.body.len())
+            .field("poisoned", &self.poisoned.is_some())
+            .finish()
+    }
 }
 
 impl FrameDecoder {
@@ -576,6 +588,30 @@ mod tests {
         let dbg = format!("{:?}", hello());
         assert!(!dbg.contains(&token().expose_secret()[5..]));
         assert!(dbg.contains("atdc_****"));
+    }
+
+    /// No representation of the token's bytes may appear: not the text, not the bytes as
+    /// decimal numbers.
+    fn leaks_token(dbg: &str) -> bool {
+        let secret = token();
+        let s = secret.expose_secret();
+        let decimal: Vec<String> = s.bytes().take(12).map(|b| b.to_string()).collect();
+        dbg.contains(&s[5..]) || dbg.contains(&decimal.join(", ")) || dbg.contains("atdc")
+    }
+
+    #[test]
+    fn decoder_debug_never_shows_a_buffered_hello() {
+        let bytes = encode_frame(&hello()).expect("encode");
+        let mut partial = FrameDecoder::new();
+        partial.push(&bytes[..bytes.len() - 3]).expect("push");
+        let dbg = format!("{partial:?}");
+        assert!(!leaks_token(&dbg), "{dbg}");
+        assert!(dbg.contains("buffered_body"));
+        let mut complete = FrameDecoder::new();
+        complete.push(&bytes).expect("push");
+        assert_eq!(complete.wants_bytes(), 0);
+        let dbg = format!("{complete:?}");
+        assert!(!leaks_token(&dbg), "{dbg}");
     }
 
     #[test]

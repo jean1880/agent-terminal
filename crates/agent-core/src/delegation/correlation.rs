@@ -6,7 +6,6 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::hash::{DefaultHasher, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -143,14 +142,92 @@ pub enum Attestation {
     Unattested,
 }
 
+const SIP_ROUNDS_C: usize = 2;
+const SIP_ROUNDS_D: usize = 4;
+
+#[inline]
+fn sip_round(v: &mut [u64; 4]) {
+    v[0] = v[0].wrapping_add(v[1]);
+    v[1] = v[1].rotate_left(13);
+    v[1] ^= v[0];
+    v[0] = v[0].rotate_left(32);
+    v[2] = v[2].wrapping_add(v[3]);
+    v[3] = v[3].rotate_left(16);
+    v[3] ^= v[2];
+    v[0] = v[0].wrapping_add(v[3]);
+    v[3] = v[3].rotate_left(21);
+    v[3] ^= v[0];
+    v[2] = v[2].wrapping_add(v[1]);
+    v[1] = v[1].rotate_left(17);
+    v[1] ^= v[2];
+    v[2] = v[2].rotate_left(32);
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    let mut word = [0u8; 8];
+    word[..bytes.len()].copy_from_slice(bytes);
+    u64::from_le_bytes(word)
+}
+
+/// Keyed SipHash-2-4 as in the reference implementation (Aumasson & Bernstein,
+/// `veorq/SipHash`), with a 64-bit (`out128 == false`) or 128-bit output, little-endian.
+fn siphash24(key: &[u8; 16], msg: &[u8], out128: bool) -> Vec<u8> {
+    let k0 = le_u64(&key[..8]);
+    let k1 = le_u64(&key[8..]);
+    let mut v = [
+        k0 ^ 0x736f_6d65_7073_6575,
+        k1 ^ 0x646f_7261_6e64_6f6d,
+        k0 ^ 0x6c79_6765_6e65_7261,
+        k1 ^ 0x7465_6462_7974_6573,
+    ];
+    if out128 {
+        v[1] ^= 0xee;
+    }
+    let (words, tail) = msg.as_chunks::<8>();
+    for word in words {
+        let m = u64::from_le_bytes(*word);
+        v[3] ^= m;
+        for _ in 0..SIP_ROUNDS_C {
+            sip_round(&mut v);
+        }
+        v[0] ^= m;
+    }
+    let b = ((msg.len() as u64) << 56) | le_u64(tail);
+    v[3] ^= b;
+    for _ in 0..SIP_ROUNDS_C {
+        sip_round(&mut v);
+    }
+    v[0] ^= b;
+    v[2] ^= if out128 { 0xee } else { 0xff };
+    for _ in 0..SIP_ROUNDS_D {
+        sip_round(&mut v);
+    }
+    let mut out = (v[0] ^ v[1] ^ v[2] ^ v[3]).to_le_bytes().to_vec();
+    if out128 {
+        v[1] ^= 0xdd;
+        for _ in 0..SIP_ROUNDS_D {
+            sip_round(&mut v);
+        }
+        out.extend_from_slice(&(v[0] ^ v[1] ^ v[2] ^ v[3]).to_le_bytes());
+    }
+    out
+}
+
+/// SipHash-2-4-128 of `msg` under `key`.
+pub(crate) fn siphash24_128(key: &[u8; 16], msg: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&siphash24(key, msg, true));
+    out
+}
+
 /// One principal generation's observed native calls to `agent_terminal`, newest last. Each
-/// keeps its key, its tool and a salted 128-bit digest of its attestation arguments: two
-/// std SipHash passes, each over half the salt and then the arguments (the same construction
-/// as `redact::stream`'s key digest, seeded from the salt). Never persisted or logged.
+/// keeps its key, its tool and a 128-bit digest of its attestation arguments: keyed
+/// SipHash-2-4-128 (hand-rolled to the reference specification), key = the caller's 16-byte
+/// salt. Never persisted or logged.
 pub struct ObservedCalls {
-    salt: [u8; 32],
+    salt: [u8; 16],
     cap: usize,
-    calls: VecDeque<(InvocationKey, ToolName, [u64; 2])>,
+    calls: VecDeque<(InvocationKey, ToolName, [u8; 16])>,
 }
 
 impl fmt::Debug for ObservedCalls {
@@ -163,8 +240,8 @@ impl fmt::Debug for ObservedCalls {
 }
 
 impl ObservedCalls {
-    /// `salt`: 32 random bytes from the app, one per principal generation.
-    pub fn new(salt: [u8; 32], cap: usize) -> Self {
+    /// `salt`: 16 random bytes from the app (the SipHash key), one per principal generation.
+    pub fn new(salt: [u8; 16], cap: usize) -> Self {
         Self {
             salt,
             cap: cap.max(1),
@@ -172,14 +249,8 @@ impl ObservedCalls {
         }
     }
 
-    fn digest(&self, args: &AttestationArgs) -> [u64; 2] {
-        let pass = |half: &[u8]| {
-            let mut h = DefaultHasher::new();
-            h.write(half);
-            h.write(args.0.as_bytes());
-            h.finish()
-        };
-        [pass(&self.salt[..16]), pass(&self.salt[16..])]
+    fn digest(&self, args: &AttestationArgs) -> [u8; 16] {
+        siphash24_128(&self.salt, args.0.as_bytes())
     }
 
     pub fn len(&self) -> usize {
@@ -451,7 +522,7 @@ mod tests {
             ToolName::CrossAgentSend,
             &send_args(json!({"idempotency_key": "k9"})),
         );
-        let mut o = ObservedCalls::new([3; 32], 4);
+        let mut o = ObservedCalls::new([3; 16], 4);
         o.record(key.clone(), ToolName::CrossAgentSend, &a);
         assert_eq!(
             o.attest(Some(&key), ToolName::CrossAgentCancel, &a),
@@ -475,7 +546,7 @@ mod tests {
             "consumed"
         );
         // Eviction: the oldest is dropped past the cap.
-        let mut o = ObservedCalls::new([3; 32], 2);
+        let mut o = ObservedCalls::new([3; 16], 2);
         let k = |n: u64| InvocationKey::Agy {
             conversation_id: "c".into(),
             step_index: n,
@@ -493,10 +564,61 @@ mod tests {
             Attestation::Attested
         );
         // A different salt gives a different digest of the same arguments.
-        let o1 = ObservedCalls::new([1; 32], 1);
-        let o2 = ObservedCalls::new([2; 32], 1);
+        let o1 = ObservedCalls::new([1; 16], 1);
+        let o2 = ObservedCalls::new([2; 16], 1);
         assert_ne!(o1.digest(&a), o2.digest(&a));
         assert!(!format!("{o1:?}").contains("salt"));
+    }
+
+    /// Reference vectors (`veorq/SipHash` `vectors.h`, also the paper's appendix): key
+    /// 00..0f, message 00..(n-1).
+    #[test]
+    fn siphash_matches_the_reference_vectors() {
+        let key: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let msg: Vec<u8> = (0u8..64).collect();
+        let sip64: [(usize, [u8; 8]); 6] = [
+            (0, [0x31, 0x0e, 0x0e, 0xdd, 0x47, 0xdb, 0x6f, 0x72]),
+            (1, [0xfd, 0x67, 0xdc, 0x93, 0xc5, 0x39, 0xf8, 0x74]),
+            (2, [0x5a, 0x4f, 0xa9, 0xd9, 0x09, 0x80, 0x6c, 0x0d]),
+            (3, [0x2d, 0x7e, 0xfb, 0xd7, 0x96, 0x66, 0x67, 0x85]),
+            // The paper prints this one as the u64 0xa129ca6149be45e5; vectors.h holds its
+            // little-endian bytes.
+            (15, [0xe5, 0x45, 0xbe, 0x49, 0x61, 0xca, 0x29, 0xa1]),
+            (63, [0x72, 0x45, 0x06, 0xeb, 0x4c, 0x32, 0x8a, 0x95]),
+        ];
+        for (n, expected) in sip64 {
+            assert_eq!(
+                siphash24(&key, &msg[..n], false),
+                expected.to_vec(),
+                "64-bit, n={n}"
+            );
+        }
+        let sip128: [(usize, [u8; 16]); 3] = [
+            (
+                0,
+                [
+                    0xa3, 0x81, 0x7f, 0x04, 0xba, 0x25, 0xa8, 0xe6, 0x6d, 0xf6, 0x72, 0x14, 0xc7,
+                    0x55, 0x02, 0x93,
+                ],
+            ),
+            (
+                1,
+                [
+                    0xda, 0x87, 0xc1, 0xd8, 0x6b, 0x99, 0xaf, 0x44, 0x34, 0x76, 0x59, 0x11, 0x9b,
+                    0x22, 0xfc, 0x45,
+                ],
+            ),
+            (
+                2,
+                [
+                    0x81, 0x77, 0x22, 0x8d, 0xa4, 0xa4, 0x5d, 0xc7, 0xfc, 0xa3, 0x8b, 0xde, 0xf6,
+                    0x0a, 0xff, 0xe4,
+                ],
+            ),
+        ];
+        for (n, expected) in sip128 {
+            assert_eq!(siphash24_128(&key, &msg[..n]), expected, "128-bit, n={n}");
+        }
     }
 
     #[test]
