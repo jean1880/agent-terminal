@@ -143,8 +143,8 @@ pub(crate) fn plan_lease(
 
 /// Creates the planned worktree on its new branch at the base commit, then proves it: canonical,
 /// no symlink on the way, outside the source tree, `HEAD == base_commit`, on its branch. A
-/// worktree that fails the proof after creation is removed again (never forced; the branch is
-/// kept).
+/// worktree that fails the proof after creation is never removed: the error carries its path
+/// (`retained_worktree`) and branch so the UI can show it as retained work.
 pub(crate) fn create_lease(plan: &LeasePlan) -> Result<WorktreeLease, ToolError> {
     check_location(&plan.source_repo, &plan.path)?;
     worktree::add(
@@ -166,10 +166,19 @@ pub(crate) fn create_lease(plan: &LeasePlan) -> Result<WorktreeLease, ToolError>
         Err(e) => Err(untrusted(e)),
     });
     if let Err(e) = proven {
-        if let Err(why) = worktree::remove(&lease.source_repo, &lease.worktree) {
-            tracing::warn!(error = %why, "a worktree that failed its checks was kept");
-        }
-        return Err(e);
+        // Never removed: an unproven worktree may hold output a checkout hook made (ignored files
+        // included), and its identity is in doubt. It is kept and reported as retained work.
+        tracing::warn!(
+            reason = %e.message,
+            path = %lease.worktree.display(),
+            "a new worktree failed its checks and was kept"
+        );
+        return Err(e
+            .with_detail(
+                "retained_worktree",
+                lease.worktree.to_string_lossy().into_owned(),
+            )
+            .with_detail("branch", lease.branch.clone()));
     }
     Ok(lease)
 }
@@ -444,6 +453,46 @@ mod tests {
         // A configured plain root is fine.
         let plan = plan_lease(&main, "HEAD", &worker(), Some(&real)).expect("plan");
         assert!(plan.path.starts_with(&real));
+    }
+
+    #[test]
+    fn an_unproven_worktree_is_kept_with_its_ignored_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((tmp, main)) = new_repo() else {
+            return;
+        };
+        // A checkout hook that makes ignored build output and moves the new worktree's branch,
+        // so the proof fails after `worktree add`.
+        let hooks = tmp.path().canonicalize().expect("canonical").join("hooks");
+        fs::create_dir_all(&hooks).expect("mkdir");
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nmkdir -p build\necho made > build/out\ngit symbolic-ref HEAD refs/heads/elsewhere\n",
+        )
+        .expect("write");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+        git(
+            &main,
+            &["config", "core.hooksPath", hooks.to_str().expect("utf8")],
+        );
+
+        let plan = plan_lease(&main, "HEAD", &worker(), None).expect("plan");
+        let err = create_lease(&plan).expect_err("the proof fails");
+        assert_eq!(err.code, ErrorCode::WorkspaceUntrusted);
+        let details = err.details.expect("details");
+        assert_eq!(
+            details.get("retained_worktree").and_then(|v| v.as_str()),
+            plan.path.to_str()
+        );
+        // Kept, with the hook's ignored output intact.
+        assert!(plan.path.is_dir());
+        assert_eq!(
+            fs::read_to_string(plan.path.join("build/out"))
+                .ok()
+                .as_deref(),
+            Some("made\n")
+        );
     }
 
     #[test]
