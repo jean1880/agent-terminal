@@ -61,16 +61,16 @@
 //! partial-character buffers; a line buffer grows only up to its budget, and one larger than
 //! [`KEEP_CAPACITY`] is freed at its newline. A stream with nothing pending is dropped, so a
 //! finished line costs no entry. Entries holding state are bounded by `max_streams`, and the
-//! refused-key set by `max_streams` too. Keys are never cloned or stored, only a 16-byte keyed
-//! digest of each, so a key's own size costs nothing past the call. Published text is the caller's output and is not
+//! refused-key set by `max_streams` too. A key is stored in a bounded encoding of at most
+//! about `3 × MAX_KEY_FIELD_BYTES` bytes, however long its fields, and compared by equality.
+//! Published text is the caller's output and is not
 //! bounded here.
 //!
 //! The detection limits are `redact`'s own: a credential with no recognisable shape, not
 //! assigned to a sensitive-looking name, gets through here exactly as it does there.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasher, Hash, RandomState};
-use std::marker::PhantomData;
+use std::hash::{BuildHasher, Hasher, RandomState};
 
 use super::{redact_line, PEM_BEGIN, PEM_CLOSE, PEM_END, PEM_MASK};
 
@@ -122,9 +122,8 @@ impl Default for Limits {
     }
 }
 
-/// A placeholder stream identity: worker, process generation, item and stream. Any
-/// `Hash` key works (it is reduced to a fixed-size digest, never stored); this one is the
-/// default until the runtime defines its own.
+/// A stream's identity: worker, process generation, item and stream. Fields of any length
+/// are accepted; the sanitiser stores a bounded encoding of each ([`MAX_KEY_FIELD_BYTES`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct StreamKey {
     pub worker: String,
@@ -474,34 +473,61 @@ fn decode(mut carry: Vec<u8>, bytes: &[u8]) -> (String, Vec<u8>) {
 /// Publishes streamed text per stream, never ahead of what [`redact`] would mask. See the
 /// module documentation for the invariant and its conservative divergences.
 ///
-/// Keys are never stored: each is reduced to a [`KeyId`], two 64-bit SipHashes under random
-/// per-sanitiser seeds, so a key of any size costs 16 bytes in either table. Two keys
-/// colliding on all 128 bits would share a stream; with seeds no caller sees, that is out of
-/// reach by construction rather than by chance alone.
+/// Stream identity is the sanitiser's own bounded copy of the [`StreamKey`], compared by equality in both
+/// tables (see [`MAX_KEY_FIELD_BYTES`]); a caller's `Hash` is never trusted to tell streams
+/// apart.
 #[derive(Debug)]
-pub struct StreamSanitiser<K = StreamKey> {
-    streams: HashMap<KeyId, Stream>,
+pub struct StreamSanitiser {
+    streams: HashMap<BoundedKey, Stream>,
     /// Streams refused for want of an entry: withheld until finished, cancelled or replaced.
-    refused: HashSet<KeyId>,
+    refused: HashSet<BoundedKey>,
     /// A refused stream could not be remembered: every stream without state is withheld.
     saturated: bool,
+    /// Seeds for the digest of an over-long key field.
     seeds: (RandomState, RandomState),
     limits: Limits,
     retained: usize,
-    key: PhantomData<fn(&K)>,
 }
 
-/// A fixed-size stand-in for a key: what the sanitiser stores instead of the key itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct KeyId(u64, u64);
+/// A key field up to this many bytes is stored as it is.
+///
+/// A longer one is stored as its first [`KEY_FIELD_PREFIX_BYTES`] bytes, its length, and a
+/// 128-bit digest of all its bytes (two SipHashes of the raw bytes under random seeds held by
+/// the sanitiser), so no stored key exceeds about three times this. Two distinct streams share
+/// state only if every field is equal under that encoding: for a long field, the same prefix,
+/// the same length and a collision of the seeded digest, which no caller can aim for.
+pub const MAX_KEY_FIELD_BYTES: usize = 256;
 
-impl<K: Hash> Default for StreamSanitiser<K> {
+/// The bytes of an over-long key field kept verbatim (see [`MAX_KEY_FIELD_BYTES`]).
+pub const KEY_FIELD_PREFIX_BYTES: usize = 192;
+
+/// One [`StreamKey`] field as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum KeyField {
+    Whole(Box<[u8]>),
+    Long {
+        prefix: Box<[u8]>,
+        len: usize,
+        digest: [u64; 2],
+    },
+}
+
+/// A [`StreamKey`] with every field bounded: what the sanitiser stores and compares.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BoundedKey {
+    worker: KeyField,
+    generation: u64,
+    item: KeyField,
+    stream: KeyField,
+}
+
+impl Default for StreamSanitiser {
     fn default() -> Self {
         Self::new(Limits::default())
     }
 }
 
-impl<K: Hash> StreamSanitiser<K> {
+impl StreamSanitiser {
     pub fn new(limits: Limits) -> Self {
         Self {
             streams: HashMap::new(),
@@ -510,12 +536,33 @@ impl<K: Hash> StreamSanitiser<K> {
             seeds: (RandomState::new(), RandomState::new()),
             limits,
             retained: 0,
-            key: PhantomData,
         }
     }
 
-    fn id(&self, key: &K) -> KeyId {
-        KeyId(self.seeds.0.hash_one(key), self.seeds.1.hash_one(key))
+    fn field(&self, raw: &str) -> KeyField {
+        let bytes = raw.as_bytes();
+        if bytes.len() <= MAX_KEY_FIELD_BYTES {
+            return KeyField::Whole(bytes.into());
+        }
+        let digest = |seed: &RandomState| {
+            let mut hasher = seed.build_hasher();
+            hasher.write(bytes);
+            hasher.finish()
+        };
+        KeyField::Long {
+            prefix: bytes[..KEY_FIELD_PREFIX_BYTES].into(),
+            len: bytes.len(),
+            digest: [digest(&self.seeds.0), digest(&self.seeds.1)],
+        }
+    }
+
+    fn id(&self, key: &StreamKey) -> BoundedKey {
+        BoundedKey {
+            worker: self.field(&key.worker),
+            generation: key.generation,
+            item: self.field(&key.item),
+            stream: self.field(&key.stream),
+        }
     }
 
     /// Bytes all streams retain now, by buffer capacity.
@@ -538,7 +585,7 @@ impl<K: Hash> StreamSanitiser<K> {
     /// something, and refuses a new stream that needs an entry when none is free.
     fn feed(
         &mut self,
-        key: &K,
+        key: &StreamKey,
         input_len: usize,
         p: &mut Published,
         f: impl FnOnce(&mut Stream, usize, &mut Published),
@@ -581,14 +628,14 @@ impl<K: Hash> StreamSanitiser<K> {
         self.streams.insert(key, stream);
     }
 
-    fn take(&mut self, key: &K) -> Option<Stream> {
+    fn take(&mut self, key: &StreamKey) -> Option<Stream> {
         let stream = self.streams.remove(&self.id(key))?;
         self.retained -= stream.retained();
         Some(stream)
     }
 
     /// Adds `chunk` to `key`'s stream; returns what became safe to publish.
-    pub fn push(&mut self, key: &K, chunk: &str) -> Published {
+    pub fn push(&mut self, key: &StreamKey, chunk: &str) -> Published {
         let mut p = Published::default();
         self.feed(key, chunk.len(), &mut p, |s, budget, p| {
             s.feed_str(chunk, budget, p)
@@ -598,7 +645,7 @@ impl<K: Hash> StreamSanitiser<K> {
 
     /// [`StreamSanitiser::push`] for raw bytes, which may split a character anywhere or not
     /// be UTF-8 at all (decoded as `String::from_utf8_lossy` would decode the whole stream).
-    pub fn push_bytes(&mut self, key: &K, chunk: &[u8]) -> Published {
+    pub fn push_bytes(&mut self, key: &StreamKey, chunk: &[u8]) -> Published {
         let mut p = Published::default();
         self.feed(key, chunk.len(), &mut p, |s, budget, p| {
             s.feed_bytes(chunk, budget, p)
@@ -607,7 +654,7 @@ impl<K: Hash> StreamSanitiser<K> {
     }
 
     /// Ends `key`'s stream: publishes the rest of its last line, redacted, and forgets it.
-    pub fn finish(&mut self, key: &K) -> Published {
+    pub fn finish(&mut self, key: &StreamKey) -> Published {
         let mut p = Published::default();
         if self.refused.remove(&self.id(key)) {
             return p;
@@ -620,7 +667,7 @@ impl<K: Hash> StreamSanitiser<K> {
 
     /// Abandons `key`'s stream: nothing not yet published ever is. `withheld_bytes` counts
     /// what was dropped.
-    pub fn cancel(&mut self, key: &K) -> Published {
+    pub fn cancel(&mut self, key: &StreamKey) -> Published {
         let mut p = Published::default();
         self.refused.remove(&self.id(key));
         if let Some(stream) = self.take(key) {
@@ -632,7 +679,7 @@ impl<K: Hash> StreamSanitiser<K> {
     /// Replaces `key`'s stream with a provider's snapshot of the whole item so far: the state
     /// built from earlier deltas is dropped and `full_text` is pushed into a fresh stream. The
     /// result has `replace` set; its text is everything now published for the stream.
-    pub fn replace_snapshot(&mut self, key: &K, full_text: &str) -> Published {
+    pub fn replace_snapshot(&mut self, key: &StreamKey, full_text: &str) -> Published {
         self.refused.remove(&self.id(key));
         self.take(key);
         let mut p = self.push(key, full_text);
@@ -798,10 +845,10 @@ mod tests {
     fn run(chunks: &[&str]) -> String {
         let whole: String = chunks.concat();
         let expected = redact(&whole);
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+        let mut s: StreamSanitiser = StreamSanitiser::default();
         let mut published = String::new();
         for chunk in chunks {
-            let p = s.push(&0, chunk);
+            let p = s.push(&sk(0), chunk);
             assert!(!p.replace && !p.overflowed);
             published.push_str(&p.text);
             assert!(
@@ -809,10 +856,18 @@ mod tests {
                 "published ahead of redact for {chunks:?}:\n{published:?}\n{expected:?}"
             );
         }
-        published.push_str(&s.finish(&0).text);
+        published.push_str(&s.finish(&sk(0)).text);
         assert_eq!(s.retained_bytes(), 0);
         assert_eq!(s.open_streams(), 0);
         published
+    }
+
+    /// A distinct stream key per number.
+    fn sk(n: u32) -> StreamKey {
+        StreamKey {
+            item: n.to_string(),
+            ..StreamKey::default()
+        }
     }
 
     fn boundaries(text: &str) -> Vec<usize> {
@@ -848,21 +903,21 @@ mod tests {
             );
             // Every single byte split, through the byte path.
             for i in 0..=bytes.len() {
-                let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
-                let mut out = s.push_bytes(&0, &bytes[..i]).text;
+                let mut s: StreamSanitiser = StreamSanitiser::default();
+                let mut out = s.push_bytes(&sk(0), &bytes[..i]).text;
                 assert!(expected.starts_with(&out), "{i}: {out:?}");
-                out.push_str(&s.push_bytes(&0, &bytes[i..]).text);
+                out.push_str(&s.push_bytes(&sk(0), &bytes[i..]).text);
                 assert!(expected.starts_with(&out), "{i}: {out:?}");
-                out.push_str(&s.finish(&0).text);
+                out.push_str(&s.finish(&sk(0)).text);
                 assert_eq!(out, *expected, "split at {i}: {bytes:?}");
             }
             // Byte by byte.
-            let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+            let mut s: StreamSanitiser = StreamSanitiser::default();
             let mut out = String::new();
             for b in bytes {
-                out.push_str(&s.push_bytes(&0, std::slice::from_ref(b)).text);
+                out.push_str(&s.push_bytes(&sk(0), std::slice::from_ref(b)).text);
             }
-            out.push_str(&s.finish(&0).text);
+            out.push_str(&s.finish(&sk(0)).text);
             assert_eq!(out, *expected, "byte by byte: {bytes:?}");
         }
     }
@@ -1008,26 +1063,32 @@ mod tests {
 
     #[test]
     fn safe_text_is_published_before_its_line_ends() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
-        assert_eq!(s.push(&0, "hello world, this ").text, "hello world, this ");
-        assert_eq!(s.push(&0, "is a te").text, "is a ");
-        assert_eq!(s.push(&0, "st and ").text, "test and ");
-        // A token prefix holds back only from its word on.
-        assert_eq!(s.push(&0, "ghp_abcdefghijkl").text, "");
-        assert_eq!(s.push(&0, "mnopqrstuvwxyz0123 ok ").text, "****0123 ok ");
-        // "Token" waits: a later "authorization" on the line would mask the next word.
-        assert_eq!(s.push(&0, "Token abcdefgh12345678 ").text, "");
+        let mut s: StreamSanitiser = StreamSanitiser::default();
         assert_eq!(
-            s.push(&0, "is fine\nnext ").text,
+            s.push(&sk(0), "hello world, this ").text,
+            "hello world, this "
+        );
+        assert_eq!(s.push(&sk(0), "is a te").text, "is a ");
+        assert_eq!(s.push(&sk(0), "st and ").text, "test and ");
+        // A token prefix holds back only from its word on.
+        assert_eq!(s.push(&sk(0), "ghp_abcdefghijkl").text, "");
+        assert_eq!(
+            s.push(&sk(0), "mnopqrstuvwxyz0123 ok ").text,
+            "****0123 ok "
+        );
+        // "Token" waits: a later "authorization" on the line would mask the next word.
+        assert_eq!(s.push(&sk(0), "Token abcdefgh12345678 ").text, "");
+        assert_eq!(
+            s.push(&sk(0), "is fine\nnext ").text,
             "Token abcdefgh12345678 is fine\nnext "
         );
-        assert_eq!(s.finish(&0).text, "");
+        assert_eq!(s.finish(&sk(0)).text, "");
     }
 
     #[test]
     fn interleaved_streams_keep_their_own_state() {
         let fx = fixtures();
-        let mut s: StreamSanitiser<StreamKey> = StreamSanitiser::default();
+        let mut s: StreamSanitiser = StreamSanitiser::default();
         let keys: Vec<StreamKey> = (0..fx.len())
             .map(|i| StreamKey {
                 worker: format!("w{}", i % 3),
@@ -1065,13 +1126,13 @@ mod tests {
         let expected = redact(&String::from_utf8_lossy(&bytes));
         for i in 0..=bytes.len() {
             for j in i..=bytes.len() {
-                let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+                let mut s: StreamSanitiser = StreamSanitiser::default();
                 let mut out = String::new();
                 for part in [&bytes[..i], &bytes[i..j], &bytes[j..]] {
-                    out.push_str(&s.push_bytes(&0, part).text);
+                    out.push_str(&s.push_bytes(&sk(0), part).text);
                     assert!(expected.starts_with(&out), "{i},{j}: {out:?}");
                 }
-                out.push_str(&s.finish(&0).text);
+                out.push_str(&s.finish(&sk(0)).text);
                 assert_eq!(out, expected, "{i},{j}");
             }
         }
@@ -1079,48 +1140,48 @@ mod tests {
 
     #[test]
     fn a_snapshot_replaces_the_deltas() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
-        assert_eq!(s.push(&0, "API_KEY=supers").text, "");
-        assert_eq!(s.push(&0, "ecretv").text, "");
-        let p = s.replace_snapshot(&0, "API_KEY=supersecretvalue1234 done and ");
+        let mut s: StreamSanitiser = StreamSanitiser::default();
+        assert_eq!(s.push(&sk(0), "API_KEY=supers").text, "");
+        assert_eq!(s.push(&sk(0), "ecretv").text, "");
+        let p = s.replace_snapshot(&sk(0), "API_KEY=supersecretvalue1234 done and ");
         assert!(p.replace);
         assert_eq!(p.text, "API_KEY=****1234 done and ");
         // Deltas after the snapshot continue it.
-        let mut rest = s.push(&0, "ghp_abcdefghijklmnop").text;
-        rest.push_str(&s.finish(&0).text);
+        let mut rest = s.push(&sk(0), "ghp_abcdefghijklmnop").text;
+        rest.push_str(&s.finish(&sk(0)).text);
         assert_eq!(rest, "****mnop");
         assert_eq!(s.retained_bytes(), 0);
         // A snapshot of a different text starts over from it.
-        s.push(&0, "Basic dXNlcjpodW50ZXIyaHVudGVy ");
-        let p = s.replace_snapshot(&0, "short\n");
+        s.push(&sk(0), "Basic dXNlcjpodW50ZXIyaHVudGVy ");
+        let p = s.replace_snapshot(&sk(0), "short\n");
         assert_eq!((p.text.as_str(), p.replace), ("short\n", true));
     }
 
     #[test]
     fn cancel_never_flushes_uncertain_bytes() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
-        let mut out = s.push(&0, "safe words ").text;
-        out.push_str(&s.push(&0, "then ghp_abcdefghij").text);
-        let p = s.cancel(&0);
+        let mut s: StreamSanitiser = StreamSanitiser::default();
+        let mut out = s.push(&sk(0), "safe words ").text;
+        out.push_str(&s.push(&sk(0), "then ghp_abcdefghij").text);
+        let p = s.cancel(&sk(0));
         assert_eq!(p.text, "");
         assert_eq!(p.withheld_bytes, "ghp_abcdefghij".len());
         assert_eq!(out, "safe words then ");
         assert_eq!((s.retained_bytes(), s.open_streams()), (0, 0));
         // A cancelled stream inside a PEM block, or an unknown one, publishes nothing.
-        s.push(&1, "x -----BEGIN KEY-----\nMIIE");
-        assert_eq!(s.cancel(&1).text, "");
-        assert_eq!(s.cancel(&9), Published::default());
-        assert_eq!(s.finish(&9), Published::default());
+        s.push(&sk(1), "x -----BEGIN KEY-----\nMIIE");
+        assert_eq!(s.cancel(&sk(1)).text, "");
+        assert_eq!(s.cancel(&sk(9)), Published::default());
+        assert_eq!(s.finish(&sk(9)), Published::default());
     }
 
     #[test]
     fn a_huge_unterminated_line_is_withheld_not_flushed() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(256, 1 << 20));
+        let mut s: StreamSanitiser = StreamSanitiser::new(limits(256, 1 << 20));
         let line = format!("{}Basic {} ", "word ".repeat(30), "Z".repeat(300));
         let mut out = String::new();
         let mut overflowed = false;
         for chunk in line.as_bytes().chunks(7) {
-            let p = s.push_bytes(&0, chunk);
+            let p = s.push_bytes(&sk(0), chunk);
             overflowed |= p.overflowed;
             out.push_str(&p.text);
             assert!(s.retained_bytes() <= 256);
@@ -1131,12 +1192,12 @@ mod tests {
         // The next line is checked normally.
         out.push_str(
             &s.push(
-                &0,
+                &sk(0),
                 " still dropped\nnext ghp_abcdefghijklmnopqrstuvwxyz0123",
             )
             .text,
         );
-        out.push_str(&s.finish(&0).text);
+        out.push_str(&s.finish(&sk(0)).text);
         assert!(
             out.ends_with(&format!("{WITHHELD_NOTICE}\nnext ****0123")),
             "{out}"
@@ -1146,206 +1207,274 @@ mod tests {
 
     #[test]
     fn a_huge_pem_block_is_dropped_as_it_streams() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(128, 128));
-        let mut out = s.push(&0, "key -----BEGIN RSA PRIVATE KEY-----\n").text;
+        let mut s: StreamSanitiser = StreamSanitiser::new(limits(128, 128));
+        let mut out = s.push(&sk(0), "key -----BEGIN RSA PRIVATE KEY-----\n").text;
         for _ in 0..1000 {
-            out.push_str(&s.push(&0, "MIIEowIBAAKCAQEA0123456789\n").text);
+            out.push_str(&s.push(&sk(0), "MIIEowIBAAKCAQEA0123456789\n").text);
             assert!(s.retained_bytes() < 128);
         }
-        out.push_str(&s.push(&0, "-----END RSA PRIVATE KEY----- done\n").text);
-        out.push_str(&s.finish(&0).text);
+        out.push_str(&s.push(&sk(0), "-----END RSA PRIVATE KEY----- done\n").text);
+        out.push_str(&s.finish(&sk(0)).text);
         assert_eq!(out, "key [REDACTED PEM BLOCK] done\n");
     }
 
     #[test]
     fn the_aggregate_bound_withholds_the_stream_that_crosses_it() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(1024, 1500));
+        let mut s: StreamSanitiser = StreamSanitiser::new(limits(1024, 1500));
         let held = "x".repeat(1000);
-        assert!(!s.push(&0, &held).overflowed);
-        let p = s.push(&1, &held);
+        assert!(!s.push(&sk(0), &held).overflowed);
+        let p = s.push(&sk(1), &held);
         assert!(p.overflowed);
         assert_eq!(p.text, WITHHELD_NOTICE);
         assert!(s.retained_bytes() >= 1000 && s.retained_bytes() <= 1500);
-        assert_eq!(s.finish(&0).text, held);
+        assert_eq!(s.finish(&sk(0)).text, held);
     }
 
     /// Review finding: a partial PEM marker or UTF-8 character counted against no limit.
     #[test]
     fn partial_markers_and_characters_count_against_the_limits() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(limits(0, 0));
-        let p = s.push(&0, "-----BEGIN");
+        let mut s: StreamSanitiser = StreamSanitiser::new(limits(0, 0));
+        let p = s.push(&sk(0), "-----BEGIN");
         assert!(p.overflowed);
         assert_eq!((p.text.as_str(), p.withheld_bytes), (WITHHELD_NOTICE, 10));
         assert_eq!(s.retained_bytes(), 0);
         // Sealed: nothing more is published, key bytes included, until the stream ends.
-        let p = s.push(&0, " RSA KEY-----\nMIIE\n-----END RSA KEY-----\nafter\n");
+        let p = s.push(
+            &sk(0),
+            " RSA KEY-----\nMIIE\n-----END RSA KEY-----\nafter\n",
+        );
         assert_eq!(p.text, "");
         assert_eq!(s.retained_bytes(), 0);
-        assert_eq!(s.finish(&0).text, "");
-        let p = s.push_bytes(&1, &[0xF0, 0x9F, 0x92]);
+        assert_eq!(s.finish(&sk(0)).text, "");
+        let p = s.push_bytes(&sk(1), &[0xF0, 0x9F, 0x92]);
         assert!(p.overflowed);
         assert_eq!((p.text.as_str(), p.withheld_bytes), (WITHHELD_NOTICE, 3));
         assert_eq!(s.retained_bytes(), 0);
-        assert_eq!(s.finish(&1).text, "");
+        assert_eq!(s.finish(&sk(1)).text, "");
         // A fresh stream with room is unaffected.
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
-        assert_eq!(s.push(&0, "a -----BEGIN").text, "a ");
+        let mut s: StreamSanitiser = StreamSanitiser::default();
+        assert_eq!(s.push(&sk(0), "a -----BEGIN").text, "a ");
         assert!(s.retained_bytes() > 0);
     }
 
     /// Review finding: 64 full streams plus a partial marker on another key went past 4 MiB.
     #[test]
     fn the_aggregate_bound_holds_across_every_buffer() {
-        let mut s: StreamSanitiser<u32> = StreamSanitiser::default();
+        let mut s: StreamSanitiser = StreamSanitiser::default();
         let full = "x".repeat(DEFAULT_PER_STREAM_BYTES);
         for k in 0..64 {
-            assert!(!s.push(&k, &full).overflowed);
+            assert!(!s.push(&sk(k), &full).overflowed);
             assert!(s.retained_bytes() <= DEFAULT_AGGREGATE_BYTES);
         }
-        let p = s.push(&64, "-----BEGIN");
+        let p = s.push(&sk(64), "-----BEGIN");
         assert!(p.overflowed && !p.text.contains("-----"));
-        let p = s.push_bytes(&65, &[0xE6, 0x97]);
+        let p = s.push_bytes(&sk(65), &[0xE6, 0x97]);
         assert!(p.overflowed);
         assert!(s.retained_bytes() <= DEFAULT_AGGREGATE_BYTES);
-        assert_eq!(s.finish(&3).text, full);
+        assert_eq!(s.finish(&sk(3)).text, full);
     }
 
     /// Review finding: finished lines kept their buffers and every key kept an entry.
     #[test]
     fn idle_streams_release_their_entry_and_buffer() {
         // Far more keys than `max_streams`: none is refused, none keeps an entry.
-        let mut s: StreamSanitiser<u32> = StreamSanitiser::new(Limits {
+        let mut s: StreamSanitiser = StreamSanitiser::new(Limits {
             max_streams: 4,
             ..Limits::default()
         });
         let line = format!("{}\n", "x".repeat(65_000));
         for k in 0..300 {
-            assert_eq!(s.push(&k, &line).text, line);
+            assert_eq!(s.push(&sk(k), &line).text, line);
             assert_eq!((s.retained_bytes(), s.open_streams()), (0, 0));
         }
         // An empty push creates nothing.
-        assert_eq!(s.push(&5000, ""), Published::default());
+        assert_eq!(s.push(&sk(5000), ""), Published::default());
         assert_eq!(s.open_streams(), 0);
         // A long line's buffer is freed at its newline even while the stream stays open.
-        s.push(&1, &"y".repeat(60_000));
+        s.push(&sk(1), &"y".repeat(60_000));
         assert!(s.retained_bytes() >= 60_000);
-        s.push(&1, "\n-----BEGIN");
+        s.push(&sk(1), "\n-----BEGIN");
         assert!(s.retained_bytes() < KEEP_CAPACITY);
         assert_eq!(s.open_streams(), 1);
     }
 
     #[test]
     fn streams_past_the_limit_are_refused_never_published() {
-        let mut s: StreamSanitiser<u32> = StreamSanitiser::new(Limits {
+        let mut s: StreamSanitiser = StreamSanitiser::new(Limits {
             max_streams: 2,
             ..Limits::default()
         });
-        s.push(&0, "ghp_abc");
-        s.push(&1, "ghp_def");
+        s.push(&sk(0), "ghp_abc");
+        s.push(&sk(1), "ghp_def");
         assert_eq!(s.open_streams(), 2);
         // A stream that needs no entry still flows.
-        assert_eq!(s.push(&2, "a whole line\n").text, "a whole line\n");
+        assert_eq!(s.push(&sk(2), "a whole line\n").text, "a whole line\n");
         // One that would: its safe prefix goes out, its uncertain tail does not, ever.
-        let p = s.push(&2, "safe words then ghp_abcdefghijkl");
+        let p = s.push(&sk(2), "safe words then ghp_abcdefghijkl");
         assert!(p.overflowed);
         assert_eq!(p.text, format!("safe words then {WITHHELD_NOTICE}"));
         assert_eq!(p.withheld_bytes, "ghp_abcdefghijkl".len());
-        let p = s.push(&2, "mnopqrstuvwx more\nnext line\n");
+        let p = s.push(&sk(2), "mnopqrstuvwx more\nnext line\n");
         assert_eq!(p.text, "");
         assert!(p.withheld_bytes > 0);
-        assert_eq!(s.finish(&2), Published::default());
+        assert_eq!(s.finish(&sk(2)), Published::default());
         // After finishing, the key starts fresh.
-        assert_eq!(s.push(&2, "new item\n").text, "new item\n");
+        assert_eq!(s.push(&sk(2), "new item\n").text, "new item\n");
         // More refusals than can be remembered saturate: stateless streams are withheld.
-        s.push(&3, "token: ");
-        s.push(&4, "token: ");
+        s.push(&sk(3), "token: ");
+        s.push(&sk(4), "token: ");
         assert!(!s.saturated());
-        s.push(&5, "token: ");
+        s.push(&sk(5), "token: ");
         assert!(s.saturated());
-        let p = s.push(&6, "a whole line\n");
+        let p = s.push(&sk(6), "a whole line\n");
         assert_eq!((p.text.as_str(), p.withheld_bytes), ("", 13));
         // Streams with state carry on.
-        let mut out = s.push(&0, "defghijklmnopqrstuvwxyz0123\n").text;
-        out.push_str(&s.finish(&0).text);
+        let mut out = s.push(&sk(0), "defghijklmnopqrstuvwxyz0123\n").text;
+        out.push_str(&s.finish(&sk(0)).text);
         assert_eq!(out, "****0123\n");
     }
 
     /// Review finding: refused and open-stream tables cloned keys of any size.
     #[test]
-    fn a_huge_key_is_remembered_by_digest_not_copied() {
-        let mut s: StreamSanitiser<StreamKey> = StreamSanitiser::new(Limits {
+    fn a_huge_key_is_stored_bounded() {
+        let mut s: StreamSanitiser = StreamSanitiser::new(Limits {
             max_streams: 1,
             ..Limits::default()
         });
-        let a = StreamKey {
-            item: "a".into(),
-            ..StreamKey::default()
-        };
         let huge = || StreamKey {
+            worker: "w".repeat(1000),
             item: "b".repeat(100_000_000),
             ..StreamKey::default()
         };
-        assert_eq!(std::mem::size_of::<KeyId>(), 16);
-        s.push(&a, "ghp_abc");
-        let b = huge();
-        let p = s.push(&b, "ghp_def");
-        assert!(p.overflowed);
-        drop(b);
-        // Only the digest was kept, yet an equal key built afresh is still the refused stream.
-        let b = huge();
-        let p = s.push(&b, "ghijklmnopqrstuvwxyz0123\n");
+        // A huge key that holds state, then one refused for want of an entry.
+        s.push(&huge(), "ghp_abc");
+        let mut other = huge();
+        other.generation = 1;
+        assert!(s.push(&other, "ghp_def").overflowed);
+        let stored: Vec<&BoundedKey> = s.streams.keys().chain(s.refused.iter()).collect();
+        assert_eq!(stored.len(), 2);
+        for key in stored {
+            assert!(stored_bytes(key) <= 3 * MAX_KEY_FIELD_BYTES, "{key:?}");
+        }
+        // Equal keys built afresh still find their streams.
+        let p = s.push(&other, "ghijklmnopqrstuvwxyz0123\n");
         assert_eq!((p.text.as_str(), p.withheld_bytes), ("", 25));
+        let mut out = s.push(&huge(), "defghijklmnopqrstuvwxyz0123\n").text;
+        out.push_str(&s.finish(&huge()).text);
+        assert_eq!(out, "****0123\n");
+        assert_eq!(s.finish(&other), Published::default());
+        assert_eq!(s.push(&other, "free again\n").text, "free again\n");
+    }
+
+    fn stored_bytes(key: &BoundedKey) -> usize {
+        let field = |f: &KeyField| match f {
+            KeyField::Whole(bytes) => bytes.len(),
+            KeyField::Long { prefix, .. } => prefix.len() + 24,
+        };
+        field(&key.worker) + field(&key.item) + field(&key.stream) + 8
+    }
+
+    /// Review finding: identity came from the caller's `Hash`, so keys could alias. Keys that
+    /// share everything a weak identity might look at (a long common prefix and the same
+    /// length) stay separate streams: one's cancel or seal never touches the other.
+    #[test]
+    fn keys_that_differ_only_late_never_share_state() {
+        let long = |last: char| StreamKey {
+            item: format!("{}{last}", "x".repeat(KEY_FIELD_PREFIX_BYTES + 500)),
+            ..StreamKey::default()
+        };
+        let (a, b) = (long('a'), long('b'));
+        // 18 bytes: A's 10 leave B too little for a partial PEM marker, yet A's line fits.
+        let mut s = StreamSanitiser::new(Limits {
+            aggregate_bytes: 18,
+            ..Limits::default()
+        });
+        assert_eq!(s.id(&a), s.id(&a.clone()));
+        assert_ne!(s.id(&a), s.id(&b));
+        // A holds a pending sensitive name; B is sealed by the aggregate bound A fills.
+        assert_eq!(s.push(&a, "password: ").text, "");
+        let p = s.push(&b, "-----BEGIN");
+        assert!(p.overflowed);
+        assert_eq!(s.open_streams(), 2);
+        // Cancelling or finishing B leaves A's context intact, so its value is still masked.
+        s.cancel(&b);
         assert_eq!(s.finish(&b), Published::default());
-        assert_eq!(s.push(&b, "free again\n").text, "free again\n");
-        assert_eq!(s.open_streams(), 1);
+        assert_eq!(s.push(&a, "hunter22\n").text, "password: ****er22\n");
+        // And the reverse: a sealed A does not seal or silence B.
+        let mut s = StreamSanitiser::new(Limits {
+            per_stream_bytes: 4,
+            ..Limits::default()
+        });
+        assert!(s.push(&a, "-----BEGIN").overflowed);
+        assert_eq!(s.push(&b, "ok\n").text, "ok\n");
+        assert_eq!(s.push(&a, "more\n").text, "");
+        // Short fields that differ in any one place are distinct too.
+        let base = sk(1);
+        for other in [
+            StreamKey {
+                worker: "w".into(),
+                ..sk(1)
+            },
+            StreamKey {
+                generation: 7,
+                ..sk(1)
+            },
+            StreamKey {
+                stream: "s".into(),
+                ..sk(1)
+            },
+            sk(2),
+        ] {
+            assert_ne!(s.id(&base), s.id(&other));
+        }
     }
 
     /// Review finding: saturation republished the notice on every later call.
     #[test]
     fn saturation_is_noticed_once_then_silent() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::new(Limits {
+        let mut s: StreamSanitiser = StreamSanitiser::new(Limits {
             max_streams: 0,
             ..Limits::default()
         });
-        let p = s.push(&0, "x");
+        let p = s.push(&sk(0), "x");
         assert!(s.saturated());
         assert_eq!((p.text.as_str(), p.overflowed), (WITHHELD_NOTICE, true));
         for key in [0, 0, 1, 2] {
-            assert_eq!(s.push(&key, ""), Published::default());
-            let p = s.push(&key, "more text\n");
+            assert_eq!(s.push(&sk(key), ""), Published::default());
+            let p = s.push(&sk(key), "more text\n");
             assert_eq!((p.text.as_str(), p.withheld_bytes), ("", 10));
-            assert_eq!(s.push_bytes(&key, b"\xff").text, "");
+            assert_eq!(s.push_bytes(&sk(key), b"\xff").text, "");
         }
     }
 
     /// Review finding: one huge chunk was copied whole before the limits applied.
     #[test]
     fn one_huge_chunk_is_consumed_in_bounded_pieces() {
-        let mut s: StreamSanitiser<u8> = StreamSanitiser::default();
+        let mut s: StreamSanitiser = StreamSanitiser::default();
         // 8 MiB of safe words with no newline: published up to the bound, then withheld.
         let huge = "word ".repeat(8 * 1024 * 1024 / 5);
-        let p = s.push(&0, &huge);
+        let p = s.push(&sk(0), &huge);
         assert!(p.overflowed);
         assert!(p.text.ends_with(WITHHELD_NOTICE));
         assert!(p.text.len() <= DEFAULT_PER_STREAM_BYTES + WITHHELD_NOTICE.len());
         assert!(huge.starts_with(&p.text[..p.text.len() - WITHHELD_NOTICE.len()]));
         assert!(s.retained_bytes() <= DEFAULT_PER_STREAM_BYTES);
-        assert_eq!(s.finish(&0).text, "");
+        assert_eq!(s.finish(&sk(0)).text, "");
         // An 8 MiB PEM body in one push, and through the byte path.
         let pem = format!(
             "k -----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\nok\n", // gitleaks:allow
             "A".repeat(8 * 1024 * 1024)
         );
-        assert_eq!(s.push(&0, &pem).text, "k [REDACTED PEM BLOCK]\nok\n");
+        assert_eq!(s.push(&sk(0), &pem).text, "k [REDACTED PEM BLOCK]\nok\n");
         assert_eq!(
-            s.push_bytes(&1, pem.as_bytes()).text,
+            s.push_bytes(&sk(1), pem.as_bytes()).text,
             "k [REDACTED PEM BLOCK]\nok\n"
         );
         assert_eq!((s.retained_bytes(), s.open_streams()), (0, 0));
         // Many short lines in one push are each published exactly.
         let lines = "API_KEY=supersecretvalue1234 é\n".repeat(100_000);
-        let mut out = s.push(&0, &lines).text;
-        out.push_str(&s.finish(&0).text);
+        let mut out = s.push(&sk(0), &lines).text;
+        out.push_str(&s.finish(&sk(0)).text);
         assert_eq!(out, redact(&lines));
     }
 
