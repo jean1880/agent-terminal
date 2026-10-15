@@ -2723,8 +2723,9 @@ fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
     }
 }
 
-/// `approvalPolicy` and `sandboxPolicy` for a mode (see the module's mode table).
-fn mode_policy(mode: Mode) -> (&'static str, Value) {
+/// `approvalPolicy` and `sandboxPolicy` for a mode (see the module's mode table). Public so the
+/// delegation read-back compares against exactly what a launch requests.
+pub fn mode_policy(mode: Mode) -> (&'static str, Value) {
     match mode {
         Mode::Ask => ("untrusted", json!({"type": "readOnly"})),
         Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),

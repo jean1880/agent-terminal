@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 
 mod agy_transcript;
 mod codex_policy;
+mod delegated;
 mod reply_questions;
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};

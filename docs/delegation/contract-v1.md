@@ -1047,13 +1047,21 @@ child read-back row, for Claude).
 - **Bootstrap.** Every Claude child process generation therefore first receives a fixed, harmless bootstrap message,
   which tells it to reply `OK` and use no tool:
   - every `can_use_tool` request in that turn is denied;
-  - any `tool_use` in that turn triggers an interrupt.
+  - any `tool_use` in that turn is a **latched violation**: it triggers an interrupt, and the bootstrap can no longer
+    pass.
 - **Read-back.** `system/init` `tools` and `mcp_servers` are read back as §5 requires. The model is taken from the
   turn's `assistant.message.model`; init's model is diagnostic only.
-- **Outcomes.**
-  - On a pass, after the bootstrap turn ends, the task is sent, after the E7 recheck.
-  - On a failure, the child is stopped with `route_unverified`, and the task is never sent.
-  - An unrecognised model gives `provider_unavailable`.
+- **Outcomes.** The task is sent, after the E7 recheck, **only if all** of these hold:
+  - the bootstrap turn completed successfully, not interrupted and not failed;
+  - no violation was latched;
+  - init was received and accepted;
+  - the model was recognised.
+
+  Otherwise the child is stopped and the task is never sent:
+  - a tool use, an interruption, a failed completion, or a missing or rejected init gives `route_unverified`;
+  - an unrecognised model gives `provider_unavailable`.
+
+  Nothing moves from a failed or violated bootstrap to the task.
 - **Gates.** G-C1, G-C3 and G-C5 still apply.
 - **Cost.** One small turn per Claude child generation, rebinds included. It is shown in the child's transcript as a
   labelled startup check.
