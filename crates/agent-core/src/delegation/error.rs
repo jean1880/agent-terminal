@@ -219,10 +219,16 @@ impl ToolError {
                 Some(p) => map.insert(key.to_owned(), p),
                 None => map.remove(key),
             };
-            map.insert(
+            // Name the omitted key only if the marker itself fits; otherwise the previous
+            // object stays exactly as it was.
+            let mut marked = map.clone();
+            marked.insert(
                 "omitted".to_owned(),
                 Value::String(truncate_bytes(key, 64).to_owned()),
             );
+            if details_within_bound(&Value::Object(marked.clone())) {
+                map = marked;
+            }
         }
         self.details = Some(Value::Object(map));
         self
@@ -363,6 +369,14 @@ mod tests {
         assert_eq!(d["omitted"], "big");
         assert_eq!(d["operation_id"], "op_1");
         assert!(details_within_bound(&d));
+        // A full object: neither the new key nor the marker fits, so it stays unchanged,
+        // whether the key is new or replaces an existing one.
+        let full = sized(MAX_ERROR_DETAILS_BYTES);
+        let base = ToolError::new(ErrorCode::NotFound, "x").with_details(full.clone());
+        let inserted = base.clone().with_detail("big", "b");
+        assert_eq!(inserted.details, Some(full.clone()));
+        let replaced = base.with_detail("x", "a".repeat(MAX_ERROR_DETAILS_BYTES));
+        assert_eq!(replaced.details, Some(full));
     }
 
     #[test]
