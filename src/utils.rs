@@ -215,6 +215,12 @@ where
 ///
 /// Failures are logged and yield nothing rather than blocking the session.
 pub fn load_env_file(path: &str) -> Vec<(String, String)> {
+    load_env_file_checked(path).unwrap_or_default()
+}
+
+/// Like `load_env_file`, but callers that must bind an exact profile can refuse a failed
+/// source instead of silently using the application's environment. Errors contain no values.
+pub fn load_env_file_checked(path: &str) -> Result<Vec<(String, String)>, String> {
     // Expanded here: the path is passed to the shell quoted, so a leading `~`
     // would otherwise be taken literally.
     let path = expand_tilde(path);
@@ -233,11 +239,11 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
         Ok(output) if output.status.success() => output,
         Ok(_) => {
             warn!("Env file {path} could not be sourced; ignoring it");
-            return Vec::new();
+            return Err("the selected environment file could not be sourced".into());
         }
         Err(reason) => {
             warn!("Reading env file {path} failed: {reason}; ignoring it");
-            return Vec::new();
+            return Err("the selected environment file could not be read".into());
         }
     };
 
@@ -248,7 +254,7 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
     // Only what the file actually added or changed is of any interest.
     let inherited: std::collections::HashMap<String, String> = std::env::vars().collect();
 
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .split('\0')
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| {
@@ -261,7 +267,7 @@ pub fn load_env_file(path: &str) -> Vec<(String, String)> {
             !SHELL_NOISE.contains(&key.as_str())
                 && inherited.get(key).map(String::as_str) != Some(value.as_str())
         })
-        .collect()
+        .collect())
 }
 
 /// Marks the line carrying the shell's `PATH`, so whatever an rc prints first is skipped.
@@ -941,6 +947,7 @@ mod tests {
     #[test]
     fn a_missing_env_file_is_ignored_rather_than_fatal() {
         assert!(load_env_file("/nonexistent/env.sh").is_empty());
+        assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
     }
 
     #[test]

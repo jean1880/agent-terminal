@@ -1,0 +1,9 @@
+{
+  "G-X3": true,
+  "model_transport": "local fixture; no cloud inference",
+  "overlay_start_and_fresh_resume": true,
+  "passed": true,
+  "provider": "codex-parent",
+  "token_leak_paths": [],
+  "version": "0.161.0"
+}

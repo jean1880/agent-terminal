@@ -161,6 +161,42 @@ mod mode_tests {
     }
 }
 
+#[cfg(test)]
+mod open_session_tests {
+    use super::{Mode, OpenSession};
+    use crate::delegation::launch::DelegationBinding;
+    use crate::delegation::token::{CapabilityToken, InstanceNonce};
+
+    #[test]
+    fn open_session_never_serialises_its_delegation_binding() {
+        let token = CapabilityToken::from_random([5; 32]);
+        let session = OpenSession {
+            program: "/usr/bin/claude".into(),
+            extra_args: vec![],
+            cwd: "/".into(),
+            model: None,
+            effort: None,
+            mode: Mode::Ask,
+            resume: None,
+            new_session_id: None,
+            approval_hook: false,
+            delegation: Some(DelegationBinding {
+                command: "/usr/bin/agent-terminal".into(),
+                endpoint: "/run/user/1000/agent-terminal/delegation-1.sock".into(),
+                instance: InstanceNonce::from_bytes([1; 16]),
+                token: token.clone(),
+            }),
+        };
+        let json = serde_json::to_string(&session).expect("ser");
+        assert!(!json.contains("atdc_"));
+        assert!(!json.contains(&token.expose_secret()[5..]));
+        assert!(!json.contains("delegation"));
+        let back: OpenSession = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.delegation, None);
+        assert!(!format!("{session:?}").contains(&token.expose_secret()[5..]));
+    }
+}
+
 /// Everything needed to start (or restart) an agent process for one provider thread.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenSession {
@@ -188,6 +224,10 @@ pub struct OpenSession {
     /// agy only: without it the adapter must not use `--dangerously-skip-permissions`.
     #[serde(default)]
     pub approval_hook: bool,
+    /// The cross-agent delegation binding for this process generation, set by the app per
+    /// spawn. Holds the capability token, so it is never serialised.
+    #[serde(skip)]
+    pub delegation: Option<crate::delegation::launch::DelegationBinding>,
 }
 
 /// What the app asks an adapter to do.
@@ -202,6 +242,15 @@ pub enum Command {
     /// `turn/steer`. An adapter that cannot refuses it; the host then queues it as before.
     Steer {
         text: String,
+    },
+    /// A delegated message for the running turn `turn` (the native turn id), with no fallback:
+    /// the outcome arrives as `Event::ControlResult` with `request == tag` (`ok` when the agent
+    /// took it, `error` when it refused it). A refusal never starts a turn. Codex only
+    /// (`turn/steer`, strict `this_run`); every other adapter refuses it.
+    DelegatedSteer {
+        text: String,
+        turn: String,
+        tag: String,
     },
     Interrupt,
     /// Answer an approval the adapter raised itself (Claude `can_use_tool`).
@@ -369,6 +418,19 @@ pub trait Adapter {
     /// workspace without asking. `None`: this adapter does not know (the host assumes it can).
     fn workspace_writable(&self) -> Option<bool> {
         None
+    }
+    /// The native id of the turn that is running, when the agent names its turns (Codex).
+    fn active_turn(&self) -> Option<String> {
+        None
+    }
+    /// This adapter drives a supervised delegation child: it requests the child's policies
+    /// (Codex: [`crate::codex::child_mode_policy`]) instead of a root's. Set before the first
+    /// launch; the default ignores it.
+    fn supervise_as_child(&mut self) {}
+    /// The provider explicitly identifies this pending approval as our dynamically bound
+    /// bridge. The host must additionally prove that this generation received its binding.
+    fn is_own_bridge_approval(&self, _request: &str) -> bool {
+        false
     }
 }
 

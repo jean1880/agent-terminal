@@ -17,6 +17,7 @@
 mod background;
 mod cards;
 mod composer;
+mod delegation;
 pub mod demo;
 mod difftext;
 mod form_card;
@@ -204,6 +205,9 @@ pub(crate) struct Inner {
     subagent_panel: RefCell<Option<Rc<subagents::SubagentPanel>>>,
     /// Sub-agent items (and their steps) changed since the last flush.
     subagent_changes: RefCell<Vec<String>>,
+    delegation: RefCell<delegation::Workers>,
+    worker_inspector: RefCell<Option<Rc<delegation::Inspector>>>,
+    worker_flush_queued: Cell<bool>,
     /// The thinking strip's list of background tasks.
     background_button: Rc<background::BackgroundButton>,
     /// The background shell task whose output is shown, while its dialog is open.
@@ -288,6 +292,9 @@ impl ChatView {
                 subagent_shelf,
                 subagent_panel: RefCell::new(None),
                 subagent_changes: RefCell::new(Vec::new()),
+                delegation: RefCell::new(delegation::Workers::default()),
+                worker_inspector: RefCell::new(None),
+                worker_flush_queued: Cell::new(false),
                 background_button,
                 task_panel: RefCell::new(None),
                 workspace: RefCell::new(None),
@@ -713,7 +720,18 @@ impl Inner {
     /// updating the `changed` ones), from the model.
     fn refresh_subagents(&self, changed: &[String]) {
         let model = self.model.borrow();
-        let agents = model.subagents();
+        let mut agents = model.subagents();
+        let supervised = self.delegation.borrow().summaries();
+        // Registry handles are canonical; a linked snapshot in the root stream must not
+        // create a second row for the same supervised worker.
+        agents.retain(|agent| {
+            !agent.delegation.as_ref().is_some_and(|delegation| {
+                supervised
+                    .iter()
+                    .any(|worker| worker.id == delegation.worker_id.as_str())
+            })
+        });
+        agents.extend(supervised);
         // Every sub-agent the thread started: the running ones first, then the finished ones
         // with how they ended (a replayed thread, or one whose sub-agents are all done, still
         // lists them).
@@ -810,6 +828,9 @@ impl Inner {
 
     /// Shows one sub-agent on its own, in a dialog that follows it until closed.
     fn open_subagent(self: &Rc<Self>, id: &str) {
+        if self.open_worker(id) {
+            return;
+        }
         let panel = subagents::SubagentPanel::new(id, self.row_sink.clone());
         {
             let model = self.model.borrow();
@@ -1714,6 +1735,7 @@ pub(crate) mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store.clone(),
             thread.clone(),
@@ -2727,6 +2749,7 @@ pub(crate) mod tests {
         subagent_shelf::tests::shelf_follows_running_subagents();
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
         subagents::tests::names_are_never_squeezed_into_a_column();
+        delegation::tests::ui_checks();
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });

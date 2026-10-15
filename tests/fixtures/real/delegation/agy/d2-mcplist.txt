@@ -1,0 +1,3 @@
+NAME   TYPE   STATUS   COMMAND/URL
+dup    stdio  enabled  /usr/bin/python3 $BIN/fake_mcp.py global-dup $LOGDIR
+gfake  stdio  enabled  /usr/bin/python3 $BIN/fake_mcp.py global $LOGDIR

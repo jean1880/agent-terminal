@@ -5,12 +5,13 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 dnf install -y --setopt=install_weak_deps=False \
-    curl gcc pkgconf-pkg-config tar rpm-build python3 \
+    curl gcc make pkgconf-pkg-config tar rpm-build python3 \
     gtk4-devel libadwaita-devel vte291-gtk4-devel gtksourceview5-devel glib2-devel
 
 ensure_rust
 stage_source
 cargo build --release --locked
+make delegation-smoke DELEGATION_BINARY=target/release/agent-terminal
 cargo install cargo-generate-rpm --locked
 # -o names a file unless the directory already exists.
 mkdir -p "$WORK/pkg"

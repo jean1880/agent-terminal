@@ -1,7 +1,10 @@
 //! Masking secrets in text headed for a file another program will read.
 //!
 //! Pure string logic: no I/O, no GTK. Every hand-off brief goes through
-//! [`redact`] before it is written.
+//! [`redact`] before it is written. Streamed text is published through
+//! [`stream::StreamSanitiser`], which applies these same rules incrementally.
+
+pub mod stream;
 
 /// Prefixes of well-known credential formats. A token starting with one, and
 /// long enough to be a real credential, is masked wherever it appears.
@@ -23,6 +26,8 @@ const TOKEN_PREFIXES: &[&str] = &[
     // AWS access key IDs, long-term and temporary.
     "AKIA",
     "ASIA",
+    // agent-terminal's own delegation capability (`delegation::token::CapabilityToken`).
+    "atdc_",
 ];
 
 /// Authorization schemes whose next word is a credential.
@@ -69,14 +74,28 @@ pub fn redact(text: &str) -> String {
         if i > 0 {
             out.push('\n');
         }
-        let line = redact_prefixed_tokens(line);
-        let line = redact_auth_schemes(&line);
-        let line = redact_url_credentials(&line);
-        let line = redact_flag_values(&line);
-        let line = redact_credential_options(&line);
-        out.push_str(&redact_assignments(&line));
+        out.push_str(&redact_line(line).0);
     }
     out
+}
+
+/// The per-line rules [`redact`] applies after PEM blocks are gone, in order. The flag is
+/// `true` when some rule's decision reached the end of `line` (a token, value, quote, header
+/// or option argument still open there), so text appended to the line could change the
+/// output for bytes already in it. [`stream`] publishes a line's prefix only when it is
+/// `false`; [`redact`] ignores it.
+pub(crate) fn redact_line(line: &str) -> (String, bool) {
+    let (line, mut open) = redact_prefixed_tokens(line);
+    let (line, o) = redact_auth_schemes(&line);
+    open |= o;
+    let (line, o) = redact_url_credentials(&line);
+    open |= o;
+    let (line, o) = redact_flag_values(&line);
+    open |= o;
+    let (line, o) = redact_credential_options(&line);
+    open |= o;
+    let (line, o) = redact_assignments(&line);
+    (line, open | o)
 }
 
 /// `mask`, but never revealing a short value whole: four characters or fewer become `****`.
@@ -137,11 +156,12 @@ fn open_quote_at(line: &str, pos: usize) -> Option<char> {
 /// Masks the value of a credential header (`Cookie: …`, `X-Api-Key: …`,
 /// `Proxy-Authorization: …`): to the close of the quotes the header sits in (so `Cookie:
 /// a="b c"` inside `'…'` is masked whole), else to the end of the line. The line is lowercased
-/// once.
-fn redact_header_values(line: &str) -> String {
+/// once. Open (see [`redact_line`]) when a header's value runs to the end of the line.
+fn redact_header_values(line: &str) -> (String, bool) {
     // ASCII lower-casing keeps byte positions, so offsets found there are char boundaries.
     let lower = line.to_ascii_lowercase();
     let mut edits = Vec::new();
+    let mut open = false;
     for header in CREDENTIAL_HEADERS {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(header) {
@@ -154,6 +174,7 @@ fn redact_header_values(line: &str) -> String {
                     .map_or(line.len(), |at| value_start + at),
                 None => line.len(),
             };
+            open |= value_end == line.len();
             let value = &line[value_start..value_end];
             if !value.is_empty() && !value.starts_with("****") {
                 edits.push((value_start, value_end, mask_any(value)));
@@ -161,12 +182,12 @@ fn redact_header_values(line: &str) -> String {
             from = value_end.max(start);
         }
     }
-    apply_edits(line, edits)
+    (apply_edits(line, edits), open)
 }
 
 /// The shell words of `line` as byte spans, quote-aware (`'a b'` and `"a b"` stay one word; no
-/// escapes).
-fn shell_word_spans(line: &str) -> Vec<(usize, usize)> {
+/// escapes). The flag is `true` when a quote is still open at the end of the line.
+fn shell_word_spans(line: &str) -> (Vec<(usize, usize)>, bool) {
     let mut spans = Vec::new();
     let mut start: Option<usize> = None;
     let mut quote: Option<char> = None;
@@ -196,7 +217,7 @@ fn shell_word_spans(line: &str) -> Vec<(usize, usize)> {
     if let Some(s) = start {
         spans.push((s, line.len()));
     }
-    spans
+    (spans, quote.is_some())
 }
 
 /// The bytes of `word` from `from` with one pair of surrounding quotes left out: the value's
@@ -226,11 +247,25 @@ const CURL_VALUE_LETTERS: &str = "bcCdDeEFHKmoPQrtTuUwxXyYz";
 /// `--password=`; and `sshpass -p`. The one parser behind both the live masking and the rule
 /// engine's refusal of such commands.
 pub fn credential_args(program: &str, words: &[&str]) -> Vec<(usize, usize, usize)> {
+    credential_args_reach(program, words).0
+}
+
+/// [`credential_args`], plus whether an option wanted a value word past the last of `words`
+/// (`curl -u` at the end): a word appended later would be a credential.
+fn credential_args_reach(program: &str, words: &[&str]) -> (Vec<(usize, usize, usize)>, bool) {
     let program = program.rsplit('/').next().unwrap_or(program);
     let mut hits = Vec::new();
+    let past_end = std::cell::Cell::new(false);
+    let word = |i: usize| {
+        let w = words.get(i);
+        if w.is_none() {
+            past_end.set(true);
+        }
+        w
+    };
     // The password after the first ':' of the value at (word, from).
     let after_colon = |i: usize, from: usize, hits: &mut Vec<(usize, usize, usize)>| {
-        let Some(w) = words.get(i) else { return };
+        let Some(w) = word(i) else { return };
         let (s, e) = value_range(w, from);
         if let Some(colon) = w[s..e].find(':') {
             let start = s + colon + 1;
@@ -240,14 +275,14 @@ pub fn credential_args(program: &str, words: &[&str]) -> Vec<(usize, usize, usiz
         }
     };
     let whole = |i: usize, from: usize, hits: &mut Vec<(usize, usize, usize)>| {
-        let Some(w) = words.get(i) else { return };
+        let Some(w) = word(i) else { return };
         let (s, e) = value_range(w, from);
         if s < e {
             hits.push((i, s, e));
         }
     };
     let header = |i: usize, from: usize, hits: &mut Vec<(usize, usize, usize)>| {
-        let Some(w) = words.get(i) else { return };
+        let Some(w) = word(i) else { return };
         let (s, e) = value_range(w, from);
         let value = &w[s..e];
         let lower = value.trim_start().to_ascii_lowercase();
@@ -329,7 +364,7 @@ pub fn credential_args(program: &str, words: &[&str]) -> Vec<(usize, usize, usiz
             _ => {}
         }
     }
-    hits
+    (hits, past_end.get())
 }
 
 /// Command words that end one command and start the next on the same line.
@@ -338,10 +373,12 @@ const COMMAND_SEPARATORS: &[&str] = &["|", "||", "&&", ";", "&"];
 /// Masks credentials that command-line options carry ([`credential_args`]): only in the words
 /// after a program that uses them (`curl`, `wget`, `mysql`/`mariadb`/`mysqldump`, `sshpass`),
 /// up to the next command separator, so `docker -u 1000:1000` or `mkdir -p dir` are left alone.
-/// Credential headers in any text are masked too ([`redact_header_values`]).
-fn redact_credential_options(line: &str) -> String {
-    let line = redact_header_values(line);
-    let spans = shell_word_spans(&line);
+/// Credential headers in any text are masked too ([`redact_header_values`]). Open (see
+/// [`redact_line`]) when a header value runs to the end, or a credential program's command does
+/// while a quote is open or an option still waits for its value word.
+fn redact_credential_options(line: &str) -> (String, bool) {
+    let (line, mut open) = redact_header_values(line);
+    let (spans, quote_open) = shell_word_spans(&line);
     let words: Vec<&str> = spans.iter().map(|&(s, e)| &line[s..e]).collect();
     let mut edits = Vec::new();
     for (p, program) in words.iter().enumerate() {
@@ -366,15 +403,18 @@ fn redact_credential_options(line: &str) -> String {
                 }
             })
             .unwrap_or(words.len());
-        for (i, s, e) in credential_args(name, &words[p + 1..end]) {
+        let (hits, past_end) = credential_args_reach(name, &words[p + 1..end]);
+        open |= end == words.len() && (quote_open || past_end);
+        for (i, s, e) in hits {
             let (word_start, _) = spans[p + 1 + i];
             let secret = &line[word_start + s..word_start + e];
+            open |= word_start + e == line.len();
             if !secret.starts_with("****") {
                 edits.push((word_start + s, word_start + e, mask_any(secret)));
             }
         }
     }
-    apply_edits(&line, edits)
+    (apply_edits(&line, edits), open)
 }
 
 /// Masks a structured value whose key is known: a string under a sensitive
@@ -395,24 +435,31 @@ pub fn redact_keyed(key: &str, value: &str) -> String {
     }
 }
 
+/// Opens a PEM block.
+pub(crate) const PEM_BEGIN: &str = "-----BEGIN ";
+/// Starts the line that closes a PEM block.
+pub(crate) const PEM_END: &str = "-----END ";
+/// Closes a PEM block: the first of these after [`PEM_END`].
+pub(crate) const PEM_CLOSE: &str = "-----";
+/// What a PEM block becomes.
+pub(crate) const PEM_MASK: &str = "[REDACTED PEM BLOCK]";
+
 fn redact_pem_blocks(text: &str) -> String {
-    const BEGIN: &str = "-----BEGIN ";
-    const END: &str = "-----END ";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(BEGIN) {
+    while let Some(start) = rest.find(PEM_BEGIN) {
         out.push_str(&rest[..start]);
         let after = &rest[start..];
         // The block runs to the end of the END line's closing dashes; an
         // unterminated block is masked to the end of the text.
         let end = after
-            .find(END)
+            .find(PEM_END)
             .and_then(|e| {
-                let closing = after[e + END.len()..].find("-----")?;
-                Some(e + END.len() + closing + "-----".len())
+                let closing = after[e + PEM_END.len()..].find(PEM_CLOSE)?;
+                Some(e + PEM_END.len() + closing + PEM_CLOSE.len())
             })
             .unwrap_or(after.len());
-        out.push_str("[REDACTED PEM BLOCK]");
+        out.push_str(PEM_MASK);
         rest = &after[end..];
     }
     out.push_str(rest);
@@ -420,11 +467,13 @@ fn redact_pem_blocks(text: &str) -> String {
 }
 
 /// Masks tokens that start with a known credential prefix. Every index used
-/// to slice sits next to an ASCII byte, so it is always a char boundary.
-fn redact_prefixed_tokens(line: &str) -> String {
+/// to slice sits next to an ASCII byte, so it is always a char boundary. Open (see
+/// [`redact_line`]) when a token runs to the end of the line.
+fn redact_prefixed_tokens(line: &str) -> (String, bool) {
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut copied = 0;
+    let mut open = false;
     let mut i = 0;
     while i < bytes.len() {
         let at_token_start = is_token_byte(bytes[i]) && (i == 0 || !is_token_byte(bytes[i - 1]));
@@ -441,6 +490,7 @@ fn redact_prefixed_tokens(line: &str) -> String {
                     end += 1;
                 }
             }
+            open |= end == bytes.len();
             let token = &line[i..end];
             let is_secret = (is_jwt && token.len() >= 20)
                 || TOKEN_PREFIXES
@@ -457,27 +507,42 @@ fn redact_prefixed_tokens(line: &str) -> String {
         }
     }
     out.push_str(&line[copied..]);
-    out
+    (out, open)
 }
 
 /// Masks the credential after an authorization scheme, in any letter case.
 ///
 /// `Bearer` is specific enough to act on anywhere. `Basic` and `Token` are
 /// ordinary words ("Basic functionality"), so they only count on a line that
-/// is about authorization.
-fn redact_auth_schemes(line: &str) -> String {
-    let about_auth = line.to_ascii_lowercase().contains("authorization");
-    AUTH_SCHEMES
+/// is about authorization. Open (see [`redact_line`]) when a scheme's value runs to the end,
+/// or when `Basic`/`Token` appear on a line that does not mention authorization yet: the word
+/// arriving later would bring them in.
+fn redact_auth_schemes(line: &str) -> (String, bool) {
+    let lower = line.to_ascii_lowercase();
+    let about_auth = lower.contains("authorization");
+    let mut open = !about_auth
+        && AUTH_SCHEMES
+            .iter()
+            .filter(|scheme| !scheme.eq_ignore_ascii_case("bearer "))
+            .any(|scheme| lower.contains(&scheme.to_ascii_lowercase()));
+    let out = AUTH_SCHEMES
         .iter()
         .filter(|scheme| about_auth || scheme.eq_ignore_ascii_case("bearer "))
-        .fold(line.to_string(), |text, scheme| redact_after(&text, scheme))
+        .fold(line.to_string(), |text, scheme| {
+            let (text, o) = redact_after(&text, scheme);
+            open |= o;
+            text
+        });
+    (out, open)
 }
 
-/// Masks the word following each occurrence of `marker`, ignoring ASCII case.
-fn redact_after(line: &str, marker: &str) -> String {
+/// Masks the word following each occurrence of `marker`, ignoring ASCII case. Open when a
+/// value runs to the end of the line.
+fn redact_after(line: &str, marker: &str) -> (String, bool) {
     let marker = marker.to_ascii_lowercase();
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
+    let mut open = false;
     // ASCII lower-casing keeps every byte where it was, so a position found
     // in the lowered copy is the same position — and a char boundary — in
     // the original.
@@ -489,6 +554,7 @@ fn redact_after(line: &str, marker: &str) -> String {
                 is_token_byte(*b) || *b == b'.' || *b == b'=' || *b == b'/' || *b == b'+'
             })
             .count();
+        open |= value_start + value_len == rest.len();
         let value = &rest[value_start..value_start + value_len];
         out.push_str(&rest[..value_start]);
         if value.len() >= MIN_SECRET_CHARS {
@@ -499,13 +565,15 @@ fn redact_after(line: &str, marker: &str) -> String {
         rest = &rest[value_start + value_len..];
     }
     out.push_str(rest);
-    out
+    (out, open)
 }
 
-/// Masks the password in `scheme://user:password@host`.
-fn redact_url_credentials(line: &str) -> String {
+/// Masks the password in `scheme://user:password@host`. Open (see [`redact_line`]) when an
+/// authority runs to the end of the line.
+fn redact_url_credentials(line: &str) -> (String, bool) {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
+    let mut open = false;
     while let Some(pos) = rest.find("://") {
         let authority_start = pos + "://".len();
         let authority = &rest[authority_start..];
@@ -514,6 +582,7 @@ fn redact_url_credentials(line: &str) -> String {
         let limit = authority
             .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
             .unwrap_or(authority.len());
+        open |= limit == authority.len();
         let masked = authority[..limit].rfind('@').and_then(|at| {
             let colon = authority[..at].find(':')?;
             let password = &authority[colon + 1..at];
@@ -532,16 +601,18 @@ fn redact_url_credentials(line: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    (out, open)
 }
 
 /// Masks the value in `--password value` / `--api-token value`: the
-/// space-separated flag form, which `redact_assignments` cannot see.
-fn redact_flag_values(line: &str) -> String {
+/// space-separated flag form, which `redact_assignments` cannot see. Open (see
+/// [`redact_line`]) when a flag's name, or a sensitive flag's value, runs to the end.
+fn redact_flag_values(line: &str) -> (String, bool) {
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut copied = 0;
     let mut i = 0;
+    let mut open = false;
     let blank = |b: u8| b == b' ' || b == b'\t';
     while i + 2 < bytes.len() {
         let at_flag = bytes[i] == b'-' && bytes[i + 1] == b'-' && (i == 0 || blank(bytes[i - 1]));
@@ -554,6 +625,7 @@ fn redact_flag_values(line: &str) -> String {
         while name_end < bytes.len() && is_name_byte(bytes[name_end]) {
             name_end += 1;
         }
+        open |= name_end >= bytes.len();
         if name_end >= bytes.len()
             || !blank(bytes[name_end])
             || !is_sensitive_name(&line[name_start..name_end])
@@ -585,6 +657,7 @@ fn redact_flag_values(line: &str) -> String {
             }
             value_end += 1;
         }
+        open |= value_end == bytes.len();
         let value = &line[value_start..value_end];
         // A value starting with '-' is the next flag, not this one's argument.
         if value.chars().count() >= MIN_SECRET_CHARS
@@ -598,7 +671,7 @@ fn redact_flag_values(line: &str) -> String {
         i = value_end.max(i + 1);
     }
     out.push_str(&line[copied..]);
-    out
+    (out, open)
 }
 
 fn is_sensitive_name(name: &str) -> bool {
@@ -607,13 +680,15 @@ fn is_sensitive_name(name: &str) -> bool {
 }
 
 /// Masks the value in `NAME=value`, `NAME: value` and `"name": "value"` when
-/// the name looks like it holds a secret.
-fn redact_assignments(line: &str) -> String {
+/// the name looks like it holds a secret. Open (see [`redact_line`]) when such a value runs to
+/// the end of the line.
+fn redact_assignments(line: &str) -> (String, bool) {
     let bytes = line.as_bytes();
     let len = bytes.len();
     let mut out = String::with_capacity(line.len());
     let mut copied = 0;
     let mut i = 0;
+    let mut open = false;
     while i < len {
         if bytes[i] != b'=' && bytes[i] != b':' {
             i += 1;
@@ -655,6 +730,7 @@ fn redact_assignments(line: &str) -> String {
             }
             value_end += 1;
         }
+        open |= value_end == len;
         let value = &line[value_start..value_end];
         if value.chars().count() >= MIN_SECRET_CHARS && !value.starts_with("****") {
             out.push_str(&line[copied..value_start]);
@@ -664,7 +740,7 @@ fn redact_assignments(line: &str) -> String {
         i = value_end.max(i + 1);
     }
     out.push_str(&line[copied..]);
-    out
+    (out, open)
 }
 
 #[cfg(test)]

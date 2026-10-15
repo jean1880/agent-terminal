@@ -57,6 +57,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = { version = "0.3", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Only the headless --cross-agent-mcp process runs Tokio; the GUI retains GIO.
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "io-std", "io-util", "net", "sync"] }
 
 [features]
 default = ["terminal", "journald"]

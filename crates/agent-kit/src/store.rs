@@ -22,6 +22,12 @@ use serde_json::Value;
 
 use crate::heal_tail::HealTails;
 
+pub mod delegation;
+pub mod delegation_typed;
+mod preflight;
+
+pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
+
 /// A store write (an append, a batch, a checkpoint) slower than this is logged as a warning with
 /// its kind and duration: one frame at 60 Hz.
 pub const SLOW_WRITE: Duration = Duration::from_millis(16);
@@ -34,8 +40,11 @@ pub type ProviderThreadId = String;
 /// How long a writer waits on another connection's lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Schema version this build writes. Bump it and add a step to [`migrate`].
-const SCHEMA_VERSION: i64 = 3;
+/// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
+/// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
+const SCHEMA_VERSION: i64 = 5;
+/// `PRAGMA synchronous = FULL`: a durable control write's level.
+const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
 /// `driver:native_id`).
 const DISMISSED_KEY: &str = "dismissed_natives";
@@ -68,6 +77,11 @@ pub enum StoreError {
     TransactionLost,
     /// A store job failed (its own error, as text): what the writer's batch saw of it.
     Failed(String),
+    /// The schema upgrade (its backup, lock or migration) was refused; the schema is untouched.
+    Upgrade(String),
+    /// A durable control write could not switch `synchronous` (to FULL before, or back after):
+    /// the operation is refused. "committed" in the text says the restore failed after the commit.
+    Durability(String),
 }
 
 impl fmt::Display for StoreError {
@@ -85,6 +99,8 @@ impl fmt::Display for StoreError {
             Self::Overloaded => write!(f, "the store writer is too far behind to take more"),
             Self::Behind => write!(f, "the store writer has not caught up yet"),
             Self::Failed(why) => write!(f, "{why}"),
+            Self::Upgrade(why) => write!(f, "the store upgrade was refused: {why}"),
+            Self::Durability(why) => write!(f, "a durable store write was refused: {why}"),
             Self::TransactionLost => {
                 write!(
                     f,
@@ -286,6 +302,12 @@ pub struct Store {
     /// Test record of which heal ran: `[tail, sql]`.
     #[cfg(test)]
     heal_paths: Cell<[u32; 2]>,
+    /// Test hook: the `synchronous` switch this many switches from now fails.
+    #[cfg(test)]
+    fail_sync_switch_in: Cell<Option<u32>>,
+    /// Test hook: the next COMMIT of a transaction of its own (not a batch, not a savepoint) fails.
+    #[cfg(test)]
+    fail_next_txn_commit: Cell<bool>,
 }
 
 /// A unit of work that commits or rolls back as one: a transaction, or inside a
@@ -299,6 +321,13 @@ struct Scope<'a> {
 
 impl Scope<'_> {
     fn commit(mut self) -> Result<()> {
+        #[cfg(test)]
+        if !self.savepoint && self.store.fail_next_txn_commit.replace(false) {
+            // Dropped uncommitted: rolled back, as after a real COMMIT failure.
+            return Err(StoreError::Io(std::io::Error::other(
+                "injected transaction commit failure",
+            )));
+        }
         let sql = if self.savepoint {
             "RELEASE op"
         } else {
@@ -459,10 +488,33 @@ pub struct CheckpointStats {
 impl Store {
     /// Opens (creating if needed) the database at `path`: parent directory
     /// `0700`, file `0600`, WAL mode, schema migrated.
+    ///
+    /// An existing file goes through the upgrade preflight first (`preflight::run`): an older
+    /// schema is backed up, verified and migrated under the upgrade lock before anything else
+    /// writes to it. Only a missing file (a fresh install) is created and migrated directly.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            create_private_dir(parent)?;
-        }
+        Self::open_with(path, &preflight::Hooks::default())
+    }
+
+    fn open_with(path: &Path, hooks: &preflight::Hooks) -> Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        create_private_dir(parent)?;
+        // An existing store is resolved first, once, to its real absolute path, and only the
+        // directory that really holds it is made trustworthy (`preflight::trust_dir`): never the
+        // directory a symlink to it lives in.
+        let resolved;
+        let path = if path.exists() {
+            resolved = preflight::resolve(path)?;
+            preflight::run(&resolved, hooks)?;
+            resolved.as_path()
+        } else {
+            let real_parent = std::fs::canonicalize(parent)?;
+            preflight::trust_dir(&real_parent)?;
+            path
+        };
         create_private_file(path)?;
         tighten_permissions(path)?;
         let conn = Connection::open(path)?;
@@ -473,18 +525,20 @@ impl Store {
         // commits at risk are those since the last one: on the store writer's connection that
         // is its checkpoint interval (`store_writer::Timing`).
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Self::init(conn)
+        // The preflight has upgraded any existing store: here only a fresh one is migrated, and
+        // an older schema that slipped past it is refused rather than upgraded unbacked.
+        Self::init(conn, false)
     }
 
     /// An in-memory store for tests.
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, true)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, allow_upgrade: bool) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        migrate(&conn)?;
+        migrate_with(&conn, allow_upgrade)?;
         let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
         Ok(Self {
             conn,
@@ -501,7 +555,110 @@ impl Store {
             fail_next_commit: Cell::new(false),
             #[cfg(test)]
             heal_paths: Cell::new([0, 0]),
+            #[cfg(test)]
+            fail_sync_switch_in: Cell::new(None),
+            #[cfg(test)]
+            fail_next_txn_commit: Cell::new(false),
         })
+    }
+
+    /// This connection's `PRAGMA synchronous` (0 OFF, 1 NORMAL, 2 FULL, 3 EXTRA).
+    pub fn synchronous(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))?)
+    }
+
+    /// Switches `synchronous` and reads it back. Only outside any transaction: SQLite refuses the
+    /// change inside one ("Safety level may not be changed inside a transaction").
+    fn set_synchronous(&self, level: i64) -> Result<()> {
+        if self.in_batch.get() || !self.conn.is_autocommit() {
+            return Err(StoreError::Durability(
+                "synchronous cannot be switched inside a transaction".into(),
+            ));
+        }
+        #[cfg(test)]
+        match self.fail_sync_switch_in.get() {
+            Some(0) => {
+                self.fail_sync_switch_in.set(None);
+                return Err(StoreError::Durability(format!(
+                    "injected failure switching synchronous to {level}"
+                )));
+            }
+            Some(n) => self.fail_sync_switch_in.set(Some(n - 1)),
+            None => {}
+        }
+        self.conn
+            .pragma_update(None, "synchronous", level)
+            .map_err(|e| StoreError::Durability(format!("set synchronous={level}: {e}")))?;
+        let got = self
+            .synchronous()
+            .map_err(|e| StoreError::Durability(format!("read synchronous back: {e}")))?;
+        if got != level {
+            return Err(StoreError::Durability(format!(
+                "synchronous reads {got} after setting {level}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Test hook: the `synchronous` switch `n` switches from now fails (0: the next one, the
+    /// switch to FULL of a durable write; 1: the one after, its restore).
+    #[cfg(test)]
+    pub(crate) fn fail_sync_switch_after(&self, n: u32) {
+        self.fail_sync_switch_in.set(Some(n));
+    }
+
+    /// Test hook: the next batch COMMIT fails.
+    #[cfg(test)]
+    pub(crate) fn fail_next_batch_commit(&self) {
+        self.fail_next_commit.set(true);
+    }
+
+    /// Test hook: the next COMMIT of a transaction of its own (a durable write's) fails.
+    #[cfg(test)]
+    pub(crate) fn fail_next_txn_commit(&self) {
+        self.fail_next_txn_commit.set(true);
+    }
+
+    /// Runs `f` as one control transaction committed under `synchronous=FULL` (an fsync at
+    /// COMMIT), then restores the previous level. Only outside any transaction, so the caller (the
+    /// store writer) commits its open batch first.
+    ///
+    /// Refused (`Durability`) when the switch to FULL fails or does not read back: `f` does not
+    /// run. When the restore fails after `f` committed, the result is still `Durability` (its text
+    /// says it committed): the caller must treat the operation as refused, never as delivered.
+    pub fn durably<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let previous = self
+            .synchronous()
+            .map_err(|e| StoreError::Durability(format!("read synchronous: {e}")))?;
+        if let Err(e) = self.set_synchronous(SYNC_FULL) {
+            if self.synchronous().ok() != Some(previous) {
+                let _ = self.set_synchronous(previous);
+            }
+            return Err(e);
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.atomically(f)));
+        let restored = self.set_synchronous(previous);
+        let result = match outcome {
+            Ok(result) => result,
+            Err(panic) => {
+                if let Err(e) = restored {
+                    tracing::error!(error = %e, "could not restore synchronous after a panic");
+                }
+                std::panic::resume_unwind(panic);
+            }
+        };
+        match (result, restored) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(e)) => Err(StoreError::Durability(format!(
+                "committed, but the previous level was not restored: {e}"
+            ))),
+            (Err(job), Ok(())) => Err(job),
+            (Err(job), Err(e)) => Err(StoreError::Durability(format!(
+                "{job}; and the previous level was not restored: {e}"
+            ))),
+        }
     }
 
     /// Whether heals may use the in-memory tails (on by default). Off, every heal scans the
@@ -782,6 +939,10 @@ impl Store {
 
     /// The thread (archived or not) that already holds `driver`'s native session `native_id`,
     /// so a session is never listed twice.
+    ///
+    /// A supervised child's hidden backing thread is deliberately found too: the native import
+    /// (`link_recent_sessions`) skips a held session, so a child's session is never imported as a
+    /// visible thread. Excluding hidden threads here would do the opposite and surface it.
     pub fn thread_with_native_id(&self, driver: &str, native_id: &str) -> Result<Option<ThreadId>> {
         Ok(self
             .conn
@@ -794,10 +955,12 @@ impl Store {
             .optional()?)
     }
 
-    /// Newest first (by `updated_at`).
+    /// Newest first (by `updated_at`). The hidden backing threads of supervised children are never
+    /// listed: this is the sidebar's list and the open-thread restoration's set of known threads.
     pub fn list_threads(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{SUMMARY_SQL} WHERE (?1 OR t.archived = 0) ORDER BY t.updated_at DESC, t.rowid DESC"
+            "{SUMMARY_SQL} WHERE (?1 OR t.archived = 0) AND {NOT_HIDDEN_CHILD}
+             ORDER BY t.updated_at DESC, t.rowid DESC"
         ))?;
         let rows = stmt.query_map(params![include_archived], summary_row)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -816,21 +979,36 @@ impl Store {
     ///
     /// The native sessions it held are remembered as dismissed ([`Store::native_dismissed`]), so
     /// listing the agents' recent sessions does not bring a deleted thread straight back.
+    ///
+    /// A delegation root's thread or a supervised child's hidden thread is refused while any
+    /// delegated worker it would take is live; close them first
+    /// ([`Store::close_and_revoke_for_delete`]). Its delegation rows then go with it, and so do the
+    /// hidden threads of its descendants (their native sessions dismissed too).
     pub fn delete_thread(&self, thread: &str) -> Result<()> {
         let tx = self.write_txn()?;
-        let natives: Vec<(String, String)> = self
-            .provider_threads(thread)?
-            .into_iter()
-            .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
+        let hidden = self.release_delegation_for_delete(thread)?;
+        let all: Vec<&str> = std::iter::once(thread)
+            .chain(hidden.iter().map(String::as_str))
             .collect();
-        self.add_dismissed(&natives)?;
-        self.delete_meta(&pending_prompt_key(thread))?;
-        let n = self
-            .conn
-            .execute("DELETE FROM threads WHERE id = ?1", params![thread])?;
-        require_row(n, thread)?;
+        for t in &all {
+            let natives: Vec<(String, String)> = self
+                .provider_threads(t)?
+                .into_iter()
+                .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
+                .collect();
+            self.add_dismissed(&natives)?;
+            self.delete_meta(&pending_prompt_key(t))?;
+            let n = self
+                .conn
+                .execute("DELETE FROM threads WHERE id = ?1", params![t])?;
+            if *t == thread {
+                require_row(n, thread)?;
+            }
+        }
         tx.commit()?;
-        self.tails.borrow_mut().clear_thread(thread);
+        for t in &all {
+            self.tails.borrow_mut().clear_thread(t);
+        }
         Ok(())
     }
 
@@ -1639,6 +1817,11 @@ const SUMMARY_SQL: &str = "SELECT t.id, t.title, t.cwd, t.updated_at,
          (SELECT id FROM provider_threads q WHERE q.thread_id = t.id
           ORDER BY q.created_at DESC, q.rowid DESC LIMIT 1))";
 
+/// Excludes the hidden backing thread of a supervised child (contract §8.1: by join, not by a new
+/// column on `threads`). Root threads stay visible: a root worker never has a backing thread.
+const NOT_HIDDEN_CHILD: &str =
+    "NOT EXISTS (SELECT 1 FROM delegation_workers w WHERE w.backing_thread_id = t.id)";
+
 fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
     Ok(ThreadSummary {
         id: r.get(0)?,
@@ -1716,7 +1899,11 @@ fn tighten_permissions(path: &Path) -> Result<()> {
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let dir = std::fs::metadata(parent)?;
-        if dir.uid() == file.uid() && dir.permissions().mode() & 0o777 != 0o700 {
+        // Only the app's own state directory: a directory the user chose is never changed.
+        if preflight::is_app_dir(parent)
+            && dir.uid() == file.uid()
+            && dir.permissions().mode() & 0o777 != 0o700
+        {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
@@ -1742,7 +1929,14 @@ fn create_private_file(path: &Path) -> Result<()> {
 /// `BEGIN IMMEDIATE` transaction that re-reads the version after taking the
 /// write lock, so two processes opening a fresh database cannot both create the
 /// tables, and calling this on an up-to-date database changes nothing.
+#[cfg(test)]
 fn migrate(conn: &Connection) -> Result<()> {
+    migrate_with(conn, true)
+}
+
+/// [`migrate`]; with `allow_upgrade` false only a fresh database (no schema yet) is migrated, and
+/// an older schema is refused: on disk, upgrades belong to the preflight and its backup.
+fn migrate_with(conn: &Connection, allow_upgrade: bool) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")?;
     if schema_version(conn)? == SCHEMA_VERSION {
         return Ok(()); // the common case takes no write lock
@@ -1753,16 +1947,16 @@ fn migrate(conn: &Connection) -> Result<()> {
     // `foreign_key_check` before it commits.
     let fk_was_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA foreign_keys = OFF")?;
-    let result = migrate_in_txn(conn);
+    let result = migrate_in_txn(conn, allow_upgrade);
     if fk_was_on {
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
     }
     result
 }
 
-fn migrate_in_txn(conn: &Connection) -> Result<()> {
+fn migrate_in_txn(conn: &Connection, allow_upgrade: bool) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    match migrate_locked(conn) {
+    match migrate_locked(conn, allow_upgrade) {
         Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -1786,13 +1980,27 @@ fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(current)
 }
 
-fn migrate_locked(conn: &Connection) -> Result<()> {
+/// Brings the schema to [`SCHEMA_VERSION`] inside the caller's reserved transaction (the
+/// preflight's, or [`migrate_in_txn`]'s). `allow_upgrade` false refuses a database already at an
+/// older version.
+fn migrate_locked(conn: &Connection, allow_upgrade: bool) -> Result<()> {
     // Another process may have migrated while this one waited for the lock.
     let current = schema_version(conn)?;
-    if current < 1 {
+    if !allow_upgrade && (1..SCHEMA_VERSION).contains(&current) {
+        return Err(StoreError::Upgrade(format!(
+            "schema v{current} must be upgraded by the preflight, after a backup"
+        )));
+    }
+    migrate_locked_to(conn, current, SCHEMA_VERSION)
+}
+
+/// The migration steps from `current` up to `target`, then the foreign-key check. Tests stop at
+/// an older `target` to build real v1/v2/v3 fixtures.
+fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()> {
+    if current < 1 && target >= 1 {
         conn.execute_batch(SCHEMA_V1)?;
     }
-    if current < 2 {
+    if current < 2 && target >= 2 {
         // Small app state that belongs with the threads (the open-thread list).
         conn.execute_batch(
             "CREATE TABLE meta (
@@ -1802,7 +2010,7 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
              INSERT INTO schema_version (version) VALUES (2);",
         )?;
     }
-    if current < 3 {
+    if current < 3 && target >= 3 {
         // SQLite cannot alter a CHECK constraint, so the table is rebuilt (the documented
         // create-new, copy, drop, rename sequence) to allow the 'codex' driver. Rows keep their
         // ids, so `events.provider_thread_id` and `threads.active_provider_thread` stay valid.
@@ -1825,19 +2033,35 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
              CREATE INDEX provider_threads_thread ON provider_threads(thread_id);
              INSERT INTO schema_version (version) VALUES (3);",
         )?;
-        let broken: Option<String> = conn
-            .query_row(
-                "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(table) = broken {
-            return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
-                Some(format!("schema v3 left a dangling foreign key in {table}")),
-            )));
-        }
+    }
+    if current < 4 && target >= 4 {
+        // Strictly additive (contract §8.1): new tables, indexes and triggers on them only.
+        conn.execute_batch(delegation::SCHEMA_V4)?;
+    }
+    if current < 5 && target >= 5 {
+        // Scope generation is independent of the run: bootstrap/rebind events can belong to
+        // a new generation while still referring to the last completed run. Legacy links
+        // remain explicitly unknown (0), rather than inventing their process generation.
+        conn.execute_batch(
+            "ALTER TABLE delegation_event_links ADD COLUMN process_generation INTEGER NOT NULL
+                 DEFAULT 0 CHECK (process_generation >= 0);
+             INSERT INTO schema_version (version) VALUES (5);",
+        )?;
+    }
+    let broken: Option<String> = conn
+        .query_row(
+            "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(table) = broken {
+        return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(format!(
+                "the migration to v{target} left a dangling foreign key in {table}"
+            )),
+        )));
     }
     Ok(())
 }
@@ -2405,6 +2629,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let dir = tmp.path().join("agent-terminal");
         std::fs::create_dir(&dir).expect("dir");
+        // Only the app's own state directory is tightened: this one stands in for it.
+        preflight::treat_as_app_dir(&dir);
         let path = dir.join("threads.db");
         drop(Store::open(&path).expect("first"));
         let chmod = |p: &Path, m| {
@@ -2661,7 +2887,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         let rows: Vec<(String, String, Option<String>)> = conn
             .prepare("SELECT id, driver, native_id FROM provider_threads ORDER BY id")
             .expect("prepare")

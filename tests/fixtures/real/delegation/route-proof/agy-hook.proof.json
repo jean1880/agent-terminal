@@ -1,0 +1,52 @@
+{
+  "evidence_kind": "agy-hook",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "at": 48.676052,
+      "payload": {
+        "conversationId": "proof-id-6",
+        "stepIdx": 2,
+        "toolCall": {
+          "args": {
+            "Arguments": {
+              "message": "OK"
+            },
+            "ServerName": "agent_terminal",
+            "ToolName": "echo"
+          },
+          "name": "call_mcp_tool"
+        }
+      }
+    },
+    {
+      "at": 51.543369,
+      "payload": {
+        "conversationId": "proof-id-6",
+        "stepIdx": 4,
+        "toolCall": {
+          "args": {
+            "Arguments": {
+              "message": "OK"
+            },
+            "ServerName": "other",
+            "ToolName": "echo"
+          },
+          "name": "call_mcp_tool"
+        }
+      }
+    },
+    {
+      "at": 56.020514,
+      "payload": {
+        "conversationId": "proof-id-6",
+        "stepIdx": 6,
+        "toolCall": {
+          "args": {},
+          "name": "invoke_subagent"
+        }
+      }
+    }
+  ],
+  "provider": "agy"
+}

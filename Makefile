@@ -125,6 +125,18 @@ test-display: $(TEST_HOME)
 test-qa:
 	python3 -m unittest discover -s tests/qa -p 'test_*.py'
 
+# Opt-in installed-provider proofs against local fixture models; never the user's workspace
+# or registration. The helper owns its isolated homes and bounded process groups.
+.PHONY: delegation-proof
+DELEGATION_PROOF_ARGS ?= $(PROOF_ARGS)
+delegation-proof:
+	python3 tests/qa/delegation_proof.py $(DELEGATION_PROOF_ARGS)
+
+.PHONY: delegation-smoke
+DELEGATION_BINARY ?= target/debug/agent-terminal
+delegation-smoke:
+	python3 tests/qa/delegation_smoke.py $(DELEGATION_BINARY)
+
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings

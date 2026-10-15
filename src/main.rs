@@ -22,6 +22,8 @@ mod claude_probe;
 mod codex_home;
 mod codex_probe;
 pub mod config;
+mod cross_agent_mcp;
+mod delegation;
 mod diff_tool;
 mod environment_review;
 mod freshness;
@@ -46,6 +48,16 @@ const APP_ID: &str = "ca.nuvek.AgentTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
+    // A stdio MCP server has no GTK, display or GApplication lifecycle.
+    if std::env::args().nth(1).as_deref() == Some(agent_core::delegation::BRIDGE_ARG) {
+        return match cross_agent_mcp::run() {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{}", agent_core::redact::redact(&message));
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
     // agy's PreToolUse gate: a short-lived blocking client, before logging or any GTK setup.
     if std::env::args().nth(1).as_deref() == Some("--approval-hook") {
         approval_hook::main();
@@ -219,6 +231,8 @@ fn main() -> glib::ExitCode {
     app.connect_shutdown(|_| {
         let started = std::time::Instant::now();
         diff_tool::remove_own();
+        let _ = delegation::shutdown_all();
+        delegation::final_cleanup();
         agent_proc::terminate_all();
         tracing::debug!(
             ms = started.elapsed().as_millis(),

@@ -22,14 +22,14 @@ case "$pkg" in
     *.deb)
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends "$pkg"
+        apt-get install -y --no-install-recommends "$pkg" python3
         ;;
     *.rpm)
-        dnf install -y --setopt=install_weak_deps=False "$pkg"
+        dnf install -y --setopt=install_weak_deps=False "$pkg" python3
         ;;
     *.pkg.tar.zst)
         # A full upgrade first: -Sy alone is a partial upgrade (new GTK on the image's old glib).
-        pacman -Syu --noconfirm
+        pacman -Syu --noconfirm --needed python
         pacman -U --noconfirm "$pkg"
         ;;
     *)
@@ -43,6 +43,7 @@ if ldd /usr/bin/agent-terminal | grep "not found"; then
     exit 1
 fi
 agent-terminal --help
+python3 tests/qa/delegation_smoke.py /usr/bin/agent-terminal
 test -f /usr/share/applications/ca.nuvek.AgentTerminal.desktop
 test -f /usr/share/icons/hicolor/scalable/apps/ca.nuvek.AgentTerminal.svg
 echo "smoke test passed: $(basename "$pkg")"

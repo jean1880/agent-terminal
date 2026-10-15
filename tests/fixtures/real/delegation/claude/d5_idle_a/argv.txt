@@ -1,0 +1,1 @@
+claude --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --include-partial-messages --mcp-config /REPO/target/delegation/claude/out/d5_idle_a/mcp-config.json --model haiku --session-id 6f1d2c3a-0000-4000-8000-00000000d5aa --strict-mcp-config --permission-mode bypassPermissions

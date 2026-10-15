@@ -1,0 +1,19 @@
+{
+  "evidence_kind": "agy-mcp",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "arguments": {
+        "message": "OK"
+      },
+      "at": 48.695033,
+      "event": "call",
+      "meta": {
+        "antigravity.google/conversation_id": "proof-id-6",
+        "progressToken": "proof-id-7:2"
+      },
+      "tool": "echo"
+    }
+  ],
+  "provider": "agy"
+}

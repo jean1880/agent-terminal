@@ -3,6 +3,15 @@
 Each prompt selects a deterministic scenario. Server requests block progress until
 the exact typed ID is answered; stdin/stdout are the real application transport.
 All frames are saved in the test's private directory for failure diagnostics.
+
+Delegation (P4) controls, as files in the test's directory:
+- `refuse-steer`: every `turn/steer` is refused (a strict steer that lost its turn);
+- `readback.json`: merged into the `thread/start`/`thread/resume` result, which otherwise
+  reads back the `approvalPolicy` and `sandbox` the request asked for;
+- `mcp-servers`: one name per line, each reported ready by `mcpServer/startupStatus/updated`
+  right after the thread starts.
+A delegated turn's last line selects `hold` (the turn stays open until interrupted) or
+`mcp:<name>` (that server reports in mid-turn, then the turn stays open).
 """
 
 import json
@@ -39,6 +48,15 @@ def notify(method, **params):
     emit({"method": method, "params": {"threadId": thread, **params}})
 
 
+SANDBOX_TYPES = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                 "danger-full-access": "dangerFullAccess"}
+
+
+def server_status(name):
+    emit({"method": "mcpServer/startupStatus/updated",
+          "params": {"name": name, "status": "ready"}})
+
+
 def complete(status="completed", error=None):
     global pending, ended
     pending = None
@@ -67,6 +85,14 @@ def request():
         method = "mcpServer/elicitation/request"
         params = {"threadId": thread, "turnId": turn, "serverName": "synthetic",
                   "message": "Synthetic form", **json.loads(scenario.split(":", 1)[1])}
+    elif scenario == "file-change":
+        # A patch inside the test's directory: the item names its changes, the request none.
+        notify("item/started", turnId=turn, item={
+            "id": params["itemId"], "type": "fileChange", "status": "inProgress",
+            "changes": [{"path": str(root / "synthetic.txt"), "kind": {"type": "add"},
+                         "diff": "synthetic\n"}]})
+        method = "item/fileChange/requestApproval"
+        params.update(reason="Synthetic patch")
     else:
         method = "item/commandExecution/requestApproval"
         params.update(command="printf synthetic", reason="Synthetic approval")
@@ -100,6 +126,10 @@ for line in sys.stdin:
         emit({"id": frame["id"], "result": {"userAgent": "synthetic-fixture"}})
     elif method == "initialized":
         pass
+    elif method == "config/read":
+        config_file = root / "effective-config.json"
+        effective = json.loads(config_file.read_text()) if config_file.exists() else {"mcp_servers": {}}
+        emit({"id": frame["id"], "result": {"config": effective}})
     elif method == "thread/resume" and frame["params"]["threadId"] == "stale-thread":
         # A thread that never completed a turn: Codex has no rollout to resume.
         emit({"id": frame["id"], "error": {
@@ -111,7 +141,20 @@ for line in sys.stdin:
         startup_model = root / "startup-model"
         if startup_model.exists():
             result["model"] = startup_model.read_text()
+        # Read back the policy asked for, as codex-cli 0.161.0 does (d6-sandbox-policy).
+        params = frame["params"]
+        if "approvalPolicy" in params:
+            result["approvalPolicy"] = params["approvalPolicy"]
+        if "sandbox" in params:
+            result["sandbox"] = {"type": SANDBOX_TYPES.get(params["sandbox"], params["sandbox"])}
+        readback = root / "readback.json"
+        if readback.exists():
+            result.update(json.loads(readback.read_text()))
         emit({"id": frame["id"], "result": result})
+        servers = root / "mcp-servers"
+        if servers.exists():
+            for name in servers.read_text().split():
+                server_status(name)
     elif method == "turn/start":
         turn_number += 1
         turn = f"connection-{connection}-turn-{turn_number}"
@@ -120,7 +163,12 @@ for line in sys.stdin:
         ended = False
         emit({"id": frame["id"], "result": {"turn": {"id": turn}}})
         notify("turn/started", turn={"id": turn, "status": "inProgress"})
-        if scenario in ("denied", "ssh-error"):
+        command = scenario.rsplit("\n", 1)[-1]
+        if command == "hold":
+            pass  # open until interrupted
+        elif command.startswith("mcp:"):
+            server_status(command.split(":", 1)[1])
+        elif scenario in ("denied", "ssh-error"):
             error = ("Permission denied: synthetic command" if scenario == "denied"
                      else "Bad owner or permissions on synthetic SSH configuration")
             complete("failed", error)
@@ -136,7 +184,8 @@ for line in sys.stdin:
     elif method == "turn/steer":
         # Accepted only into the active turn it names (codex-cli 0.161.0's precondition).
         params = frame["params"]
-        if turn is not None and not ended and params["expectedTurnId"] == turn:
+        refused = (root / "refuse-steer").exists()
+        if not refused and turn is not None and not ended and params["expectedTurnId"] == turn:
             with (root / "steered").open("a") as log:
                 log.write(params["input"][0]["text"] + "\n")
             emit({"id": frame["id"], "result": {"turnId": turn}})

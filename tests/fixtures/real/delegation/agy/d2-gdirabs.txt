@@ -1,0 +1,2 @@
+NAME     TYPE   STATUS   COMMAND/URL
+altfake  stdio  enabled  /usr/bin/python3 $BIN/fake_mcp.py alt $LOGDIR

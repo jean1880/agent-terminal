@@ -1,0 +1,10 @@
+{"t": 1792032974.667, "kind": "start", "label": "global", "cwd": "$WORKSPACE", "argv0": "fake_mcp.py", "env_names": ["AGENT_TERMINAL_DELEGATION_ENDPOINT", "DELEG_CANARY_PARENT", "FAKE_DECLARED_ENV", "HOME", "LANG", "PATH", "TERM"]}
+{"t": 1792032974.667, "kind": "in", "frame": {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": {"io.modelcontextprotocol/clientCapabilities": {"elicitation": {"form": {}, "url": {}}, "roots": {"listChanged": true}}, "io.modelcontextprotocol/clientInfo": {"name": "antigravity-client", "version": "v1.0.0"}, "io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}}
+{"t": 1792032974.667, "kind": "out", "frame": {"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "not found"}}}
+{"t": 1792032974.667, "kind": "in", "frame": {"jsonrpc": "2.0", "method": "notifications/roots/list_changed", "params": {}}}
+{"t": 1792032974.667, "kind": "in", "frame": {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"clientInfo": {"name": "antigravity-client", "version": "v1.0.0"}, "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {"form": {}, "url": {}}, "roots": {"listChanged": true}}}}}
+{"t": 1792032974.667, "kind": "out", "frame": {"jsonrpc": "2.0", "id": 2, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-global", "version": "0.0.1"}}}}
+{"t": 1792032974.668, "kind": "in", "frame": {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}}
+{"t": 1792032974.668, "kind": "in", "frame": {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}}
+{"t": 1792032974.668, "kind": "out", "frame": {"jsonrpc": "2.0", "id": 3, "result": {"tools": [{"name": "delegation_probe", "description": "Discovery probe tool from server global. Call it when asked to probe.", "inputSchema": {"type": "object", "properties": {"note": {"type": "string"}}}}]}}}
+{"t": 1792032976.71, "kind": "in", "frame": {"jsonrpc": "2.0", "method": "notifications/roots/list_changed", "params": {}}}

@@ -1,0 +1,9 @@
+{
+  "G-C1": true,
+  "G-C3": true,
+  "model_transport": "local fixture; no cloud inference",
+  "passed": true,
+  "provider": "claude",
+  "token_leak_paths": [],
+  "version": "2.1.300"
+}

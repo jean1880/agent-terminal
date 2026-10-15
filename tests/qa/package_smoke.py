@@ -15,6 +15,7 @@ import tempfile
 import tomllib
 
 import qa_env
+import delegation_smoke
 
 
 def verify_run(path, expected_commit):
@@ -68,6 +69,7 @@ def installed(directory, expected_commit):
             raise ValueError("installed executable failed prompt-less startup")
         if reported != [version]:
             raise ValueError("installed executable did not report the expected compiled version")
+        result["delegation_mcp"] = delegation_smoke.smoke(installed_binary)
         result["passed"] = True
         report.write_text(json.dumps(result, indent=2) + "\n")
     print(f"Installed startup passed: v{version}, source {expected_commit}")

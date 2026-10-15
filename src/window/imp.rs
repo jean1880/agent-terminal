@@ -2490,11 +2490,21 @@ impl AgentTerminalWindow {
                 imp.tabs.replace(staying);
                 for tab in &leaving {
                     if let Some(chat) = &tab.chat {
+                        chat.slot.invalidate_pending_switch();
                         imp.unregister_thread(&chat.thread);
                     }
                 }
 
                 if view.is_transferring_page() {
+                    for tab in &leaving {
+                        if let Some(chat) = &tab.chat {
+                            if let Some(supervisor) = crate::delegation::supervisor() {
+                                let _ = supervisor.root_transfer_stop(&chat.thread);
+                            } else if let Some(session) = chat.slot.get() {
+                                session.rebind_stop();
+                            }
+                        }
+                    }
                     TRANSFERRING.with(|parked| parked.borrow_mut().extend(leaving));
                     return;
                 }
@@ -2505,6 +2515,9 @@ impl AgentTerminalWindow {
                     // A closed thread page ends its session on purpose, so the stored history
                     // closes out (open items, approvals, the turn) instead of ending open.
                     if let Some(chat) = &tab.chat {
+                        if let Some(supervisor) = crate::delegation::supervisor() {
+                            let _ = supervisor.root_closing(&chat.thread);
+                        }
                         if let Some(session) = chat.slot.get() {
                             session.shutdown(!chat.unread);
                         }
@@ -2526,7 +2539,7 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             move |_, page, _| {
-                let adopted: Vec<TabState> = TRANSFERRING.with(|parked| {
+                let mut adopted: Vec<TabState> = TRANSFERRING.with(|parked| {
                     let (mine, others) = parked
                         .take()
                         .into_iter()
@@ -2536,12 +2549,18 @@ impl AgentTerminalWindow {
                 });
                 if !adopted.is_empty() {
                     debug!("Adopting a tab dragged in from another window");
-                    for tab in &adopted {
-                        if let Some(chat) = &tab.chat {
+                    for tab in &mut adopted {
+                        if let Some(chat) = &mut tab.chat {
+                            // Pending source-window build/start callbacks cannot adopt a page.
+                            // The destination re-resolves it behind its own store barrier.
+                            chat.reset_transfer_preparation();
                             obj.imp().register_thread(&chat.thread);
+                            obj.imp()
+                                .resume_transferred_thread(&chat.thread, &chat.slot);
                         }
                     }
                     obj.imp().tabs.borrow_mut().extend(adopted);
+                    obj.imp().start_transferred_threads();
                     obj.imp().for_each_window(|imp| imp.refresh_sidebar());
                 }
             }
@@ -7121,6 +7140,7 @@ mod tests {
                         task: Some("Check layout at enlarged text sizes".into()),
                         state: agent_core::event::WorkerState::Running,
                         activity: None,
+                        delegation: None,
                     },
                     agent_core::event::WorkerSnapshot {
                         id: "layout-unknown".into(),
@@ -7128,6 +7148,7 @@ mod tests {
                         task: None,
                         state: agent_core::event::WorkerState::Unknown,
                         activity: None,
+                        delegation: None,
                     },
                 ],
                 waiting_for: vec!["layout-worker".into()],

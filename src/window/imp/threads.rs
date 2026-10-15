@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod delegation;
+
 use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
 use agent_core::catalog::{model_notice, ModelNotice};
 use agent_core::event::{BackgroundTask, Decision, Envelope, Event, ItemKind};
@@ -221,6 +223,7 @@ impl ChatTab {
     /// (the row's X, archive, the window) decides; extend it for background work.
     pub(super) fn busy(&self) -> bool {
         is_busy(self.running, !self.background.is_empty(), self.approval)
+            || crate::delegation::supervisor().is_some_and(|s| s.root_busy(&self.thread))
     }
 }
 
@@ -285,6 +288,17 @@ pub(super) struct ChatTab {
     pub(super) diffs: Rc<ThreadDiffs>,
 }
 
+impl ChatTab {
+    pub(super) fn reset_transfer_preparation(&mut self) {
+        if self.view.is_none() {
+            self.building = false;
+        }
+        if self.slot.get().is_none() {
+            self.starting = false;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The backend the view is built with, before its session exists
 // ---------------------------------------------------------------------------------------------
@@ -292,6 +306,11 @@ pub(super) struct ChatTab {
 /// The view needs a backend at construction and the session needs the view's sink, so the view
 /// gets this slot, which forwards to the session once it is set.
 pub(super) struct SessionSlot {
+    thread: Option<String>,
+    switch_serial: Rc<std::cell::Cell<u64>>,
+    start_attempt: std::cell::Cell<u64>,
+    worker_subscriber: RefCell<Option<Rc<dyn crate::delegation::seam::WorkerSubscriber>>>,
+    worker_diffs: RefCell<HashMap<agent_core::delegation::scope::Scope, Rc<ThreadDiffs>>>,
     session: RefCell<Option<Rc<ChatSession>>>,
     /// The view, to tell the user when a prompt cannot go anywhere yet (the thread's agent is
     /// not Ready, so no session exists). Weak: the view owns this slot.
@@ -302,6 +321,10 @@ pub(super) struct SessionSlot {
 }
 
 impl SessionSlot {
+    pub(super) fn invalidate_pending_switch(&self) {
+        self.switch_serial
+            .set(self.switch_serial.get().wrapping_add(1));
+    }
     pub(super) fn get(&self) -> Option<Rc<ChatSession>> {
         self.session.borrow().clone()
     }
@@ -315,9 +338,42 @@ impl SessionSlot {
 }
 
 impl ChatBackend for SessionSlot {
+    fn worker_scope(
+        &self,
+        worker: &agent_core::delegation::WorkerId,
+    ) -> Option<agent_core::delegation::scope::Scope> {
+        crate::delegation::supervisor()?.worker_scope(self.thread.as_deref()?, worker)
+    }
+    fn worker_action(&self, action: crate::chat::WorkerAction) -> bool {
+        delegation::worker_action(self, action)
+    }
+    fn worker_diff_source(
+        &self,
+        scope: &agent_core::delegation::scope::Scope,
+    ) -> Option<Rc<dyn crate::chat::DiffSource>> {
+        self.worker_diffs
+            .borrow()
+            .get(scope)
+            .cloned()
+            .map(|source| source as Rc<dyn crate::chat::DiffSource>)
+    }
     fn send_prompt(&self, text: &str) {
         match self.get() {
-            Some(s) => s.send_prompt(text),
+            Some(s) => {
+                let deferred = self.thread.as_deref().is_some_and(|thread| {
+                    crate::delegation::supervisor().is_some_and(|supervisor| {
+                        matches!(
+                            supervisor.before_root_turn(thread),
+                            crate::delegation::supervisor::RootTurnGate::Deferred
+                        )
+                    })
+                });
+                if deferred {
+                    s.queue_prompt(text);
+                } else {
+                    s.send_prompt(text);
+                }
+            }
             None => {
                 warn!("a prompt arrived before the thread's session started");
                 let view = self.view.borrow().as_ref().and_then(|v| v.upgrade());
@@ -339,6 +395,13 @@ impl ChatBackend for SessionSlot {
         }
     }
     fn interrupt(&self) {
+        self.switch_serial
+            .set(self.switch_serial.get().wrapping_add(1));
+        if let Some((supervisor, thread)) =
+            crate::delegation::supervisor().zip(self.thread.as_deref())
+        {
+            supervisor.root_stop(thread);
+        }
         if let Some(s) = self.get() {
             s.interrupt();
         }
@@ -373,17 +436,24 @@ impl ChatBackend for SessionSlot {
             .is_some_and(|s| s.respond_form(request, action, content))
     }
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
-        if let Some(s) = self.get() {
-            s.switch(driver, model, effort);
-        }
+        delegation::switch(self, driver, model, effort);
     }
     fn reload_session(&self) {
         if let Some(s) = self.get() {
-            s.reload_session();
+            let status = s.status();
+            s.rebind_stop();
+            delegation::switch(self, status.driver, status.model, status.effort);
         }
     }
     fn set_mode(&self, mode: Mode) {
         if let Some(s) = self.get() {
+            let next = agent_core::delegation::authority::ceiling(mode.session_safe());
+            if agent_core::delegation::authority::ceiling(s.effective_mode())
+                .iter()
+                .any(|task_mode| !next.contains(task_mode))
+            {
+                self.invalidate_pending_switch();
+            }
             s.set_mode(mode);
         }
     }
@@ -424,6 +494,8 @@ pub(super) struct ResolvedAgent {
     /// `None`: not found by any probe (the command name is then tried as-is).
     pub(super) program: Option<String>,
     pub(super) env: Vec<(String, String)>,
+    /// Binding a delegation credential must never silently fall back after an env-file error.
+    pub(super) env_failed: bool,
 }
 
 thread_local! {
@@ -1258,12 +1330,17 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     let resolved = gtk4::gio::spawn_blocking(move || {
         let probe = crate::utils::SystemProbe::new(path, home, shell);
         let program = probe.locate(&command);
-        let env = env_file
+        let sourced = env_file
             .as_deref()
             .filter(|f| !f.trim().is_empty())
-            .map(crate::utils::load_env_file)
-            .unwrap_or_default();
-        ResolvedAgent { program, env }
+            .map(crate::utils::load_env_file_checked)
+            .unwrap_or_else(|| Ok(Vec::new()));
+        let env_failed = sourced.is_err();
+        ResolvedAgent {
+            program,
+            env: sourced.unwrap_or_default(),
+            env_failed,
+        }
     })
     .await
     .unwrap_or_else(|_| {
@@ -1282,7 +1359,7 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
 
 /// What the app removes from an agent's environment: the configured `clear_env` (a launching
 /// agent session's markers) and any inherited approval socket, which only the app may set.
-fn unset_list(patterns: &[String]) -> Vec<String> {
+pub(super) fn unset_list(patterns: &[String]) -> Vec<String> {
     // `vars_os`, lossy: one non-UTF-8 variable in the user's environment must not panic here.
     let mut env: Vec<String> = std::env::vars_os()
         .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
@@ -1292,6 +1369,11 @@ fn unset_list(patterns: &[String]) -> Vec<String> {
         agent_core::approval::ENV_SOCKET,
         crate::approval_server::ENV_HOOK_BIN,
     ] {
+        if !names.iter().any(|n| n == own) {
+            names.push(own.to_owned());
+        }
+    }
+    for own in agent_core::delegation::env::STRIP_ON_SPAWN {
         if !names.iter().any(|n| n == own) {
             names.push(own.to_owned());
         }
@@ -1683,6 +1765,7 @@ impl AgentTerminalWindow {
             dialog.present(Some(obj.upcast_ref::<gtk4::Widget>()));
             return;
         }
+        self.start_delegation();
         let split = adw::OverlaySplitView::new();
         split.set_vexpand(true);
         split.set_min_sidebar_width(240.0);
@@ -3368,6 +3451,11 @@ impl AgentTerminalWindow {
         ));
 
         let slot = Rc::new(SessionSlot {
+            thread: Some(summary.id.clone()),
+            switch_serial: Rc::new(std::cell::Cell::new(0)),
+            start_attempt: std::cell::Cell::new(0),
+            worker_subscriber: RefCell::new(None),
+            worker_diffs: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
             view: RefCell::new(None),
             driver,
@@ -3654,11 +3742,11 @@ impl AgentTerminalWindow {
         loading::reveal(&view);
         holder.append(&view);
         *slot.view.borrow_mut() = Some(view.downgrade());
+        self.attach_worker_view(&thread, &slot, &view);
 
-        let weak_obj = self.obj().downgrade();
         let thread_id = thread.clone();
         view.connect_action(move |action| {
-            if let Some(obj) = weak_obj.upgrade() {
+            if let Some(obj) = thread_owner(&thread_id) {
                 obj.imp().view_action(&thread_id, action);
             }
         });
@@ -3740,6 +3828,56 @@ impl AgentTerminalWindow {
 
     /// Starts the session of a thread whose view is built, and applies what was waiting for it.
     fn start_session(&self, page: &adw::TabPage, job: StartJob) {
+        if !job.profile.available_for_delegation || cfg!(test) {
+            self.start_session_bound(page, job, None);
+            return;
+        }
+        let weak = self.obj().downgrade();
+        let Some(slot) = self.slot_of(&job.thread) else {
+            return;
+        };
+        let pending = delegation::PendingStart::new(&slot);
+        let page = page.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let supervisor = crate::delegation::ready().await;
+            let current = || {
+                weak.upgrade()
+                    .is_some_and(|window| pending.current(window.imp(), &job.thread))
+            };
+            let clear_cancelled = || {
+                let Some(window) = weak.upgrade() else {
+                    return;
+                };
+                pending.clear_cancelled(window.imp(), &job.thread);
+            };
+            if !current() {
+                clear_cancelled();
+                return;
+            }
+            let hooks = match supervisor {
+                Some(ref supervisor) => {
+                    supervisor
+                        .prepare_root(&job.thread, &job.profile, job.driver)
+                        .await
+                }
+                None => None,
+            };
+            if !current() {
+                clear_cancelled();
+                return;
+            }
+            if let Some(obj) = weak.upgrade() {
+                obj.imp().start_session_bound(&page, job, hooks);
+            }
+        });
+    }
+
+    fn start_session_bound(
+        &self,
+        page: &adw::TabPage,
+        job: StartJob,
+        hooks: Option<Rc<dyn crate::delegation::seam::DelegationHooks>>,
+    ) {
         if !self.session_start_allowed() {
             return;
         }
@@ -3782,11 +3920,10 @@ impl AgentTerminalWindow {
         let thread_id = thread.to_owned();
         let view_sink = view.sink();
         let weak_slot = Rc::downgrade(&slot);
-        let weak_obj = self.obj().downgrade();
         let sink: EnvelopeSink = Rc::new(move |env: &Envelope| {
             view_sink(env);
             let driver = weak_slot.upgrade().map_or(driver, |s| s.driver());
-            if let Some(obj) = weak_obj.upgrade() {
+            if let Some(obj) = thread_owner(&thread_id) {
                 obj.imp().on_thread_envelope(&thread_id, driver, env);
             }
         });
@@ -3841,6 +3978,7 @@ impl AgentTerminalWindow {
                 .then(|| glib::uuid_string_random().to_string()),
             resume,
             approval_hook: false,
+            delegation: None,
         };
         let adapter = make_adapter(driver, &program);
         let clear = self.config.borrow().clear_env.clone();
@@ -3859,7 +3997,7 @@ impl AgentTerminalWindow {
             "Opening thread {thread} on {} in {dir}",
             driver_label(driver)
         );
-        let session = ChatSession::with_env(
+        let session = ChatSession::with_options(
             adapter,
             open,
             store,
@@ -3867,6 +4005,13 @@ impl AgentTerminalWindow {
             sink,
             approval,
             launch_env,
+            crate::delegation::seam::SessionOptions {
+                generation_base: crate::delegation::supervisor()
+                    .map(|s| s.root_generation_base(thread))
+                    .unwrap_or_default(),
+                hooks,
+                child: None,
+            },
         );
         if !self.session_start_allowed() {
             session.shutdown(true);
@@ -3875,6 +4020,9 @@ impl AgentTerminalWindow {
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
         *slot.session.borrow_mut() = Some(session.clone());
+        if let Some(supervisor) = crate::delegation::supervisor() {
+            supervisor.attach_root_session(thread, Rc::downgrade(&session));
+        }
         view.refresh_status();
         if let Some(moved) = &ported {
             session.note(retired_notice(moved));
@@ -3909,7 +4057,7 @@ impl AgentTerminalWindow {
             session.seed_handoff(handoff, &source);
         }
         if let Some((driver, model, effort)) = switch {
-            session.switch(driver, model, effort);
+            delegation::switch(&slot, driver, model, effort);
         }
         if let Some(prompt) = prompt.filter(|_| self.session_start_allowed()) {
             session.send_prompt(&prompt);
@@ -3933,6 +4081,11 @@ impl AgentTerminalWindow {
     // -----------------------------------------------------------------------------------------
 
     fn on_thread_envelope(&self, thread: &str, driver: Driver, env: &Envelope) {
+        if matches!(env.event, Event::TurnCompleted { .. }) {
+            if let Some(supervisor) = crate::delegation::supervisor() {
+                supervisor.on_root_turn_end(thread);
+            }
+        }
         // A model change (the user's pick, a port) may settle or raise a retirement question.
         if matches!(env.event, Event::ModelChanged { .. }) {
             let weak = self.obj().downgrade();
@@ -3944,6 +4097,7 @@ impl AgentTerminalWindow {
         }
         let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
         let focused = self.obj().is_active();
+        let delegated_work = crate::delegation::supervisor().is_some_and(|s| s.root_busy(thread));
         // Set by the arms below, acted on after the tab borrow is released.
         let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
         let mut withdraw_ask = false;
@@ -4009,7 +4163,8 @@ impl AgentTerminalWindow {
                         // With sub-agents or background commands still going the thread is not
                         // finished: no mark and no "finished" yet. Claude runs another turn to read
                         // their results, and that one finishes the thread.
-                        let finished = turn_finishes_thread(!chat.background.is_empty());
+                        let finished =
+                            turn_finishes_thread(!chat.background.is_empty() || delegated_work);
                         let r = react(
                             Attention::TurnDone,
                             in_view,
@@ -4034,8 +4189,11 @@ impl AgentTerminalWindow {
                 }
                 Event::BackgroundTasks { tasks } => {
                     chat.background = tasks.clone();
-                    if held_finish_due(chat.finish_held, chat.running, !chat.background.is_empty())
-                    {
+                    if held_finish_due(
+                        chat.finish_held,
+                        chat.running,
+                        !chat.background.is_empty() || delegated_work,
+                    ) {
                         // Released after this dispatch: an exiting session empties the list just
                         // before its SessionExited, which drops the hold (a close or a switch is
                         // not a finish).
@@ -4214,6 +4372,9 @@ impl AgentTerminalWindow {
     /// is gone and no turn followed: its unread mark and "Thread finished", as the turn's end
     /// would have given. Re-checked here, after the event that scheduled it.
     fn release_held_finish(&self, thread: &str) {
+        if crate::delegation::supervisor().is_some_and(|s| s.root_busy(thread)) {
+            return;
+        }
         let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
         let focused = self.obj().is_active();
         let page = {
@@ -4353,20 +4514,33 @@ impl AgentTerminalWindow {
             .iter()
             .filter_map(|t| t.chat.as_ref())
             .map(|c| {
+                c.slot
+                    .switch_serial
+                    .set(c.slot.switch_serial.get().wrapping_add(1));
                 let label = (driver_label(c.slot.driver()).to_owned(), c.title.clone());
                 ((c.slot.get(), !c.unread, label), c.thread.clone())
             })
             .unzip();
         let mut stopping = Vec::new();
+        if let Some(supervisor) = crate::delegation::supervisor() {
+            for thread in &threads {
+                stopping.extend(
+                    supervisor
+                        .root_closing(thread)
+                        .into_iter()
+                        .map(delegation::stop_target),
+                );
+            }
+        }
         for (session, keep_read, (agent, title)) in sessions {
             let Some(session) = session else { continue };
             // Before the shutdown, which drops the process (the watch outlives it).
-            let watch = session.exit_watch();
+            let watches = session.exit_watches();
             session.shutdown(keep_read);
-            if let Some(watch) = watch {
+            for watch in watches {
                 stopping.push(super::closing::StopTarget {
-                    agent,
-                    title,
+                    agent: agent.clone(),
+                    title: title.clone(),
                     watch,
                 });
             }
@@ -6371,6 +6545,7 @@ pub(super) mod tests {
                 ResolvedAgent {
                     program: Some("/usr/bin/python3".into()),
                     env: Vec::new(),
+                    env_failed: false,
                 },
             )
         });
@@ -6462,6 +6637,9 @@ pub(super) mod tests {
             "the prompt is stored"
         );
         assert!(!imp.row_is_busy(&RowKey::Thread(thread.clone())));
+
+        delegation::tests::cancelled_start_can_retry(window);
+        delegation::tests::transfer_keeps_live_view_routes(window, &thread, &slot);
 
         // An approval: the thread is busy and asks for the user, in its page and its row.
         slot.send_prompt("approve this");
@@ -6839,6 +7017,7 @@ pub(super) mod tests {
         let agent = |program: Option<String>| ResolvedAgent {
             program,
             env: Vec::new(),
+            env_failed: false,
         };
         RESOLVED.with(|r| {
             let mut r = r.borrow_mut();
@@ -6908,6 +7087,11 @@ pub(super) mod tests {
     #[test]
     fn an_unstarted_slot_reports_its_thread_agent() {
         let slot = SessionSlot {
+            thread: None,
+            switch_serial: Rc::new(std::cell::Cell::new(0)),
+            start_attempt: std::cell::Cell::new(0),
+            worker_subscriber: RefCell::new(None),
+            worker_diffs: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
             view: RefCell::new(None),
             driver: Driver::Agy,
@@ -6919,6 +7103,11 @@ pub(super) mod tests {
         assert!(!status.alive);
         assert_eq!(slot.control(Control::Usage), "ctl-unstarted");
         let codex = SessionSlot {
+            thread: None,
+            switch_serial: Rc::new(std::cell::Cell::new(0)),
+            start_attempt: std::cell::Cell::new(0),
+            worker_subscriber: RefCell::new(None),
+            worker_diffs: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
             view: RefCell::new(None),
             driver: Driver::Codex,
@@ -7440,6 +7629,7 @@ pub(super) mod tests {
                     ResolvedAgent {
                         program: Some("/fixture/agy".into()),
                         env: vec![("HOME".into(), "/fallback/home".into())],
+                        env_failed: false,
                     },
                 )
             });

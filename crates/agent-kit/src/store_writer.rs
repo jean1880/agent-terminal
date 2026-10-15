@@ -42,8 +42,15 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agent_core::delegation::authority::RevocationEvent;
+use agent_core::delegation::ids::{OperationId, WorkerId};
+use agent_core::delegation::operation::OperationState;
 use agent_core::event::{Envelope, Event};
 
+use crate::store::delegation_typed::{
+    Accept, Accepted, AckRequest, AckResult, Completed, Completion, DispatchFact, PublishEvent,
+    Published, Reconciled, Reserved, Revoked, Verdict,
+};
 use crate::store::{Batch, ProviderThreadId, Result, Store, StoreError, SLOW_WRITE};
 
 /// Past this many bytes of WAL the writer reports an error and turns SQLite's own checkpoints
@@ -130,8 +137,19 @@ enum Failure<'a> {
     Other(&'a str),
 }
 
+/// A control write ([`StoreWriter::durable_call`]): one transaction of its own, committed under
+/// `synchronous=FULL`, never batched with any other write.
+struct DurableWrite {
+    what: &'static str,
+    job: WriteJob,
+    /// Handed the outcome: `Ok` committed durably (and the level restored), else why not.
+    settle: Box<dyn FnOnce(Result<()>) + Send>,
+    cost: usize,
+}
+
 enum Op {
     Write(Write),
+    Durable(DurableWrite),
     Barrier(Sender<()>),
     Shutdown(Sender<()>),
 }
@@ -282,15 +300,29 @@ impl StoreWriter {
     }
 
     fn enqueue(&self, write: Write) -> Result<()> {
-        let (what, thread) = (write.what, write.thread.clone());
-        let cost = write.cost;
+        let (what, thread, cost, force) =
+            (write.what, write.thread.clone(), write.cost, write.force);
+        self.admit(what, thread, cost, force, Op::Write(write))
+    }
+
+    /// Queues `op` (a write or a durable write) under the queue's bounds; refused (and counted)
+    /// when the writer is gone or the queue is full and `force` is not set.
+    fn admit(
+        &self,
+        what: &'static str,
+        thread: Option<String>,
+        cost: usize,
+        force: bool,
+        op: Op,
+    ) -> Result<()> {
         let config = &self.shared.config;
         let refused = match self.shared.closed.lock() {
             Ok(closed) if !*closed => {
                 let pending = self.shared.pending.load(Ordering::SeqCst);
                 let bytes = self.shared.queued_bytes.load(Ordering::SeqCst);
-                let full = pending >= config.max_queued || bytes + cost > config.max_queued_bytes;
-                if full && write.force && !self.shared.over_bound.swap(true, Ordering::SeqCst) {
+                let full = pending >= config.max_queued
+                    || bytes.saturating_add(cost) > config.max_queued_bytes;
+                if full && force && !self.shared.over_bound.swap(true, Ordering::SeqCst) {
                     // By design: items already in flight are never cut short, so the queue
                     // grows past its bound while the writer is stalled. Said once per stall.
                     tracing::error!(
@@ -299,7 +331,7 @@ impl StoreWriter {
                         "the store writer is stalled; in-flight items go past the queue's bound"
                     );
                 }
-                if full && !write.force {
+                if full && !force {
                     self.shared.overloaded.fetch_add(1, Ordering::SeqCst);
                     Some((
                         StoreError::Overloaded,
@@ -311,7 +343,7 @@ impl StoreWriter {
                 } else {
                     self.shared.pending.fetch_add(1, Ordering::SeqCst);
                     self.shared.queued_bytes.fetch_add(cost, Ordering::SeqCst);
-                    if self.tx.send(Op::Write(write)).is_ok() {
+                    if self.tx.send(op).is_ok() {
                         None
                     } else {
                         self.shared.settle(cost);
@@ -375,6 +407,17 @@ impl StoreWriter {
         what: &'static str,
         job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Receiver<Result<T>> {
+        self.call_result_sized(what, DEFAULT_COST, job)
+    }
+
+    /// A commit receipt with the captured payload charged to the bounded write queue.
+    /// Like `call_result`, delivery occurs only after the whole batch commits.
+    pub fn call_result_sized<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        cost: usize,
+        job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> Receiver<Result<T>> {
         let (tx, rx) = mpsc::channel();
         let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
         let fill = slot.clone();
@@ -403,11 +446,156 @@ impl StoreWriter {
                 };
                 let _ = tx.send(answer);
             })),
-            cost: DEFAULT_COST,
+            cost,
             force: false,
             caller_reports: true,
         });
         rx
+    }
+
+    /// Runs `job` as a **durable control write** on this same writer, in order after everything
+    /// queued before it, and hands its result back once it is committed under
+    /// `synchronous=FULL` (plan §5, contract §8.4):
+    ///
+    /// 1. the writes batched before it are committed (and answered) first;
+    /// 2. `synchronous` is switched to FULL outside any transaction and read back;
+    /// 3. `job` runs in a transaction of its own, committed with an fsync;
+    /// 4. the previous level is restored and read back, before any later write is batched.
+    ///
+    /// It is never batched with another write, durable or not. An error at either switch refuses
+    /// the operation (`StoreError::Durability`) and is counted like any failed write, as are a
+    /// refused enqueue (writer gone, queue full), a failed commit and a panic. The job's own `Err`
+    /// is handed back as it was, for the caller to report (not counted), like
+    /// [`StoreWriter::call_result`]. The receiver always answers, a panic included.
+    pub fn durable_call<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> Receiver<Result<T>> {
+        self.durable_call_sized(what, DEFAULT_COST, job)
+    }
+
+    /// A durable control receipt whose retained capture is charged to the queue byte cap.
+    pub fn durable_call_sized<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        cost: usize,
+        job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+    ) -> Receiver<Result<T>> {
+        let (tx, rx) = mpsc::channel();
+        let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
+        let fill = slot.clone();
+        let refused_tx = tx.clone();
+        let write = DurableWrite {
+            what,
+            job: Box::new(move |store: &Store| {
+                let result = job(store);
+                let outcome = match &result {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(StoreError::Failed(e.to_string())),
+                };
+                if let Ok(mut slot) = fill.lock() {
+                    *slot = Some(result);
+                }
+                outcome
+            }),
+            settle: Box::new(move |outcome: Result<()>| {
+                let held = slot.lock().ok().and_then(|mut s| s.take());
+                let answer = match (outcome, held) {
+                    (Ok(()), Some(Ok(value))) => Ok(value),
+                    // The job's own error, its transaction rolled back.
+                    (Err(StoreError::Failed(_)), Some(Err(e))) => Err(e),
+                    (Err(e), _) => Err(e),
+                    (Ok(()), _) => Err(StoreError::Failed(
+                        "the durable write gave no answer".to_owned(),
+                    )),
+                };
+                let _ = tx.send(answer);
+            }),
+            cost,
+        };
+        if let Err(e) = self.admit(what, None, cost, false, Op::Durable(write)) {
+            let _ = refused_tx.send(Err(e));
+        }
+        rx
+    }
+
+    // ---- typed delegation control writes (plan §5 write protocol) ----
+    //
+    // Each runs as one durable control write. Classify the answer with
+    // `DurableOutcome::from_answer`: only `Committed` may be dispatched; a "committed" durability
+    // error is `CommittedUnconfirmed` (refused, never re-dispatched).
+
+    /// Step 1: accept a mutation ([`Store::accept_delegation`]).
+    pub fn delegation_accept(&self, accept: Accept) -> Receiver<Result<Verdict<Accepted>>> {
+        self.durable_call("accept a delegated operation", move |s| {
+            s.accept_delegation(&accept)
+        })
+    }
+
+    /// Step 2: reserve a dispatch ([`Store::reserve_delegation_dispatch`]).
+    pub fn delegation_reserve(&self, op: OperationId) -> Receiver<Result<Verdict<Reserved>>> {
+        self.durable_call("reserve a delegated dispatch", move |s| {
+            s.reserve_delegation_dispatch(&op)
+        })
+    }
+
+    /// Step 4: record a dispatch fact ([`Store::record_delegation_dispatch`]).
+    pub fn delegation_record(
+        &self,
+        op: OperationId,
+        fact: DispatchFact,
+    ) -> Receiver<Result<OperationState>> {
+        self.durable_call("record a delegated dispatch", move |s| {
+            s.record_delegation_dispatch(&op, &fact)
+        })
+    }
+
+    /// Step 5: complete a run ([`Store::complete_delegation_run`]).
+    pub fn delegation_complete(&self, completion: Completion) -> Receiver<Result<Completed>> {
+        self.durable_call("complete a delegated run", move |s| {
+            s.complete_delegation_run(&completion)
+        })
+    }
+
+    /// Step 6: revoke ([`Store::revoke_delegation`]).
+    pub fn delegation_revoke(
+        &self,
+        root_worker: WorkerId,
+        event: RevocationEvent,
+    ) -> Receiver<Result<Revoked>> {
+        self.durable_call("revoke delegated authority", move |s| {
+            s.revoke_delegation(&root_worker, &event)
+        })
+    }
+
+    /// A mailbox ACK ([`Store::acknowledge_delegation_messages`]).
+    pub fn delegation_ack(&self, ack: AckRequest) -> Receiver<Result<Verdict<AckResult>>> {
+        self.durable_call("acknowledge delegated messages", move |s| {
+            s.acknowledge_delegation_messages(&ack)
+        })
+    }
+
+    /// Startup reconciliation ([`Store::reconcile_delegation_after_restart`]).
+    pub fn delegation_reconcile(&self) -> Receiver<Result<Reconciled>> {
+        self.durable_call("reconcile delegation after a restart", |s| {
+            s.reconcile_delegation_after_restart()
+        })
+    }
+
+    /// Closing a thread's delegation before its deletion ([`Store::close_and_revoke_for_delete`]).
+    pub fn delegation_close_for_delete(&self, thread: String) -> Receiver<Result<Option<Revoked>>> {
+        self.durable_call("close delegation for a deletion", move |s| {
+            s.close_and_revoke_for_delete(&thread)
+        })
+    }
+
+    /// Publishes one event with its links ([`Store::publish_delegation_event`]): an ordinary
+    /// (batched) write whose seq is handed back only once its batch committed.
+    pub fn delegation_publish(&self, event: PublishEvent) -> Receiver<Result<Published>> {
+        self.call_result("publish a delegated event", move |s| {
+            s.publish_delegation_event(&event)
+        })
     }
 
     /// Queues one event. An event of an item, or a turn's or session's end, is never refused:
@@ -552,6 +740,13 @@ fn process(store: &Store, shared: &Shared, ops: Vec<Op>, stop: &mut Vec<Sender<(
     for op in ops {
         match op {
             Op::Write(w) => writes.push(w),
+            Op::Durable(d) => {
+                // The open batch is committed (and answered) first: a durable write never shares
+                // a transaction, or an unacknowledged batch, with any other.
+                commit(store, shared, &mut writes);
+                run_durable(store, shared, d);
+                wrote = true;
+            }
             Op::Barrier(done) => {
                 wrote |= commit(store, shared, &mut writes);
                 let _ = done.send(());
@@ -675,6 +870,48 @@ fn run_batch(store: &Store, shared: &Shared, writes: Vec<Write>) -> bool {
         );
     }
     true
+}
+
+/// Runs one durable write ([`Store::durably`]) and settles it: its own `Err` goes back to its
+/// caller uncounted; any other failure (a `synchronous` switch, the commit, a panic) is counted.
+fn run_durable(store: &Store, shared: &Shared, d: DurableWrite) {
+    let DurableWrite {
+        what,
+        job,
+        settle,
+        cost,
+    } = d;
+    let started = Instant::now();
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| store.durably(job)));
+    let took = started.elapsed();
+    if took > SLOW_WRITE {
+        tracing::debug!(
+            kind = what,
+            ms = took.as_secs_f64() * 1000.0,
+            "durable store write (fsync at commit)"
+        );
+    }
+    let outcome = match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(StoreError::Failed(error))) => {
+            tracing::warn!(
+                what,
+                error,
+                "a durable store job failed; its caller says so"
+            );
+            Err(StoreError::Failed(error))
+        }
+        Ok(Err(e)) => {
+            shared.fail(what, None, &e.to_string());
+            Err(e)
+        }
+        Err(_) => {
+            shared.fail(what, None, "the write panicked");
+            Err(StoreError::Failed("the durable write panicked".to_owned()))
+        }
+    };
+    settle(outcome);
+    shared.settle(cost);
 }
 
 fn do_checkpoint(store: &Store, wal_reported: &mut i64) {
@@ -1245,6 +1482,43 @@ mod tests {
         assert!(ok.recv().expect("answered").is_ok());
     }
 
+    #[test]
+    fn sized_receipt_refuses_oversized_capture_without_executing_it() {
+        let (_dir, path, handle) = setup_with(WriterConfig {
+            max_queued_bytes: 1024,
+            ..WriterConfig::default()
+        });
+        let writer = handle.writer().unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_ran = ran.clone();
+        let answer = writer.call_result_sized("oversized captured frame", usize::MAX, move |_| {
+            job_ran.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(answer.recv_timeout(Duration::from_secs(2)).is_err());
+        assert!(!ran.load(Ordering::SeqCst));
+        let job_ran = ran.clone();
+        let durable =
+            writer.durable_call_sized("oversized durable result", usize::MAX, move |_| {
+                job_ran.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+        assert!(matches!(
+            durable.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(StoreError::Overloaded)
+        ));
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(writer.flush(Duration::from_secs(2)));
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .list_threads(true)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
     /// Under a tiny bound, a stalled writer: every event of an item is stored (none refused),
     /// a turn's end too; events of no item may be refused, and are counted. Every split secret
     /// is healed, including one a fresh writer finds stored by an earlier run and whose item
@@ -1548,5 +1822,218 @@ mod tests {
                 .expect("events"),
             1
         );
+    }
+
+    /// `meta(key)` as another connection sees it: committed rows only.
+    fn committed_meta(path: &Path, key: &str) -> Option<String> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("read-only");
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .ok()
+    }
+
+    fn sync_level(writer: &StoreWriter) -> i64 {
+        writer
+            .call("read synchronous", |s| s.synchronous().expect("pragma"))
+            .recv()
+            .expect("answer")
+    }
+
+    #[test]
+    fn a_durable_call_commits_under_full_after_the_open_batch_and_restores_normal() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        assert_eq!(sync_level(&writer), 1, "the writer runs NORMAL");
+        // Queued together: a normal write, the durable one, another normal write.
+        writer
+            .write("before", None, |s| s.set_meta("before", "1"))
+            .expect("queued");
+        let probe = path.clone();
+        let durable = writer.durable_call("reserve a dispatch", move |s| {
+            // The batch before it is already committed (another connection sees it), and this
+            // runs in a transaction of its own, under FULL.
+            let seen_before = committed_meta(&probe, "before");
+            s.set_meta("durable", "1")?;
+            Ok((seen_before, s.synchronous()?))
+        });
+        writer
+            .write("after", None, |s| s.set_meta("after", "1"))
+            .expect("queued");
+        let (seen_before, level) = durable.recv().expect("answer").expect("durable");
+        assert_eq!(
+            seen_before.as_deref(),
+            Some("1"),
+            "the open batch committed first"
+        );
+        assert_eq!(level, 2, "FULL inside the control transaction");
+        assert_eq!(committed_meta(&path, "durable").as_deref(), Some("1"));
+        assert!(writer.flush(Duration::from_secs(10)));
+        assert_eq!(sync_level(&writer), 1, "NORMAL restored");
+        assert_eq!(committed_meta(&path, "after").as_deref(), Some("1"));
+        assert_eq!(writer.failures().0, 0);
+    }
+
+    #[test]
+    fn a_durable_write_never_shares_a_batch_with_normal_writes() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        // Hold the writer so all three land in one receive.
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .expect("queued");
+        writer
+            .write("before", None, |s| s.set_meta("before", "1"))
+            .expect("queued");
+        let durable = writer.durable_call("control", |s| s.set_meta("durable", "1"));
+        // The batch after it fails to commit: the durable write, already committed alone, stays.
+        writer
+            .write("after", None, |s| {
+                s.fail_next_batch_commit();
+                s.set_meta("after", "1")
+            })
+            .expect("queued");
+        durable.recv().expect("answer").expect("durable");
+        assert!(writer.flush(Duration::from_secs(10)));
+        assert_eq!(committed_meta(&path, "before").as_deref(), Some("1"));
+        assert_eq!(committed_meta(&path, "durable").as_deref(), Some("1"));
+        assert_eq!(committed_meta(&path, "after"), None, "its own batch failed");
+        assert_eq!(writer.failures().0, 1, "only the failed batch is counted");
+    }
+
+    #[test]
+    fn a_failed_synchronous_switch_refuses_the_durable_write_and_is_counted() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        // The switch to FULL fails: the job never runs.
+        writer
+            .call("inject", |s| s.fail_sync_switch_after(0))
+            .recv()
+            .expect("armed");
+        let refused = writer
+            .durable_call("control", |s| s.set_meta("first", "1"))
+            .recv()
+            .expect("answer");
+        assert!(
+            matches!(refused, Err(StoreError::Durability(_))),
+            "{refused:?}"
+        );
+        assert_eq!(committed_meta(&path, "first"), None);
+        assert_eq!(sync_level(&writer), 1, "still NORMAL");
+        assert_eq!(writer.failures().0, 1);
+
+        // The restore fails after the commit: still refused (and said to have committed).
+        writer
+            .call("inject", |s| s.fail_sync_switch_after(1))
+            .recv()
+            .expect("armed");
+        let refused = writer
+            .durable_call("control", |s| s.set_meta("second", "1"))
+            .recv()
+            .expect("answer");
+        assert!(
+            matches!(&refused, Err(StoreError::Durability(why)) if why.contains("committed")),
+            "{refused:?}"
+        );
+        assert_eq!(committed_meta(&path, "second").as_deref(), Some("1"));
+        assert_eq!(writer.failures().0, 2);
+        assert!(writer.failures().1.is_some_and(|l| l.contains("durable")));
+        // Never weaker than asked: the level stays FULL until a restore succeeds.
+        assert_eq!(sync_level(&writer), 2);
+    }
+
+    #[test]
+    fn a_failed_durable_commit_rolls_back_restores_the_level_and_is_counted() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        writer
+            .call("inject", |s| s.fail_next_txn_commit())
+            .recv()
+            .expect("armed");
+        let got = writer
+            .durable_call("control", |s| s.set_meta("lost", "1"))
+            .recv()
+            .expect("answered");
+        assert!(matches!(got, Err(StoreError::Io(_))), "{got:?}");
+        assert_eq!(committed_meta(&path, "lost"), None, "rolled back");
+        assert_eq!(sync_level(&writer), 1, "NORMAL restored");
+        assert_eq!(writer.failures().0, 1);
+        // The next durable write commits normally.
+        writer
+            .durable_call("control", |s| s.set_meta("kept", "1"))
+            .recv()
+            .expect("answered")
+            .expect("committed");
+        assert_eq!(committed_meta(&path, "kept").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_durable_jobs_own_error_goes_back_uncounted_and_leaves_nothing() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        let got = writer
+            .durable_call("control", |s| {
+                s.set_meta("partial", "1")?;
+                s.rename_thread("missing", "x")
+            })
+            .recv()
+            .expect("answer");
+        assert!(matches!(got, Err(StoreError::NotFound(_))), "{got:?}");
+        assert_eq!(committed_meta(&path, "partial"), None);
+        assert_eq!(writer.failures().0, 0, "its caller reports it");
+        assert_eq!(sync_level(&writer), 1, "NORMAL restored");
+        let panicked = writer
+            .durable_call("control", |_| -> Result<()> { panic!("a job that panics") })
+            .recv()
+            .expect("a panic still answers");
+        assert!(panicked.is_err());
+        assert_eq!(writer.failures().0, 1);
+        assert_eq!(sync_level(&writer), 1, "restored after a panic too");
+    }
+
+    #[test]
+    fn a_durable_call_on_a_full_queue_is_refused_at_once_and_counted() {
+        let config = WriterConfig {
+            max_queued: 2,
+            ..WriterConfig::default()
+        };
+        let (_dir, path, handle) = setup_with(config);
+        let writer = handle.writer().expect("writer").clone();
+        writer
+            .write("wait", None, |_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })
+            .expect("queued");
+        writer
+            .write("fill", None, |s| s.set_meta("fill", "1"))
+            .expect("queued");
+        let started = Instant::now();
+        let refused = writer
+            .durable_call("control", |s| s.set_meta("refused", "1"))
+            .recv()
+            .expect("answered at once");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "never blocks"
+        );
+        assert!(
+            matches!(refused, Err(StoreError::Overloaded)),
+            "{refused:?}"
+        );
+        assert_eq!(writer.overloaded(), 1);
+        assert_eq!(writer.failures().0, 1);
+        assert!(writer.flush(Duration::from_secs(10)));
+        assert_eq!(committed_meta(&path, "refused"), None);
+        writer.shutdown(Duration::from_secs(10));
+        let gone = writer
+            .durable_call("control", |s| s.set_meta("late", "1"))
+            .recv()
+            .expect("answered");
+        assert!(matches!(gone, Err(StoreError::WriterGone)), "{gone:?}");
+        assert_eq!(writer.failures().0, 2);
     }
 }

@@ -1,0 +1,104 @@
+{
+  "evidence_kind": "codex-native-control",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "dir": "stdin",
+      "frame": {
+        "method": "thread/start",
+        "params": {
+          "approvalPolicy": "never",
+          "config": {
+            "features.multi_agent": true,
+            "features.multi_agent_v2": false,
+            "mcp_servers.ambient.enabled": false,
+            "mcp_servers.codex_apps.enabled": false
+          },
+          "sandbox": "read-only"
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "result": {
+          "approvalPolicy": "never",
+          "sandbox": {
+            "networkAccess": false,
+            "type": "readOnly"
+          },
+          "thread": {
+            "id": "proof-id-3"
+          }
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {
+          "name": "agent_terminal",
+          "status": "starting"
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "mcpServer/startupStatus/updated",
+        "params": {
+          "name": "agent_terminal",
+          "status": "ready"
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "item/started",
+        "params": {
+          "item": {
+            "agentThreadId": "proof-id-4",
+            "kind": "started",
+            "type": "subAgentActivity"
+          }
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "item/completed",
+        "params": {
+          "item": {
+            "agentThreadId": "proof-id-4",
+            "kind": "started",
+            "type": "subAgentActivity"
+          }
+        }
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "completed": true,
+        "method": "turn/completed"
+      }
+    },
+    {
+      "dir": "stdout",
+      "frame": {
+        "method": "item/started",
+        "params": {
+          "item": {
+            "agentThreadId": "proof-id-4",
+            "kind": "completed",
+            "type": "subAgentActivity"
+          }
+        }
+      }
+    }
+  ],
+  "provider": "codex"
+}

@@ -37,11 +37,18 @@ use tracing::{debug, info, warn};
 
 mod agy_transcript;
 mod codex_policy;
+mod delegated;
 mod reply_questions;
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
-use crate::agent_proc::{run_side, AgentEnv, AgentProcess, SpawnSpec, AGY_TIMEOUT};
+use crate::agent_proc::{
+    run_side, AgentEnv, AgentProcess, ExitWatch, SpawnSpec, StopPhase, AGY_TIMEOUT,
+};
 use crate::approval_server::ApprovalHandle;
+use crate::delegation::seam::{
+    ChildPolicy, DelegationHooks, DelegationLaunchFacts, GateVerdict, SessionOptions, TurnBoundary,
+};
+use agent_core::delegation::ProcessGeneration;
 
 /// Process environment the adapter does not own: what the agent's profile adds (its env file)
 /// and what the app removes (`clear_env`, a launching agent session's markers).
@@ -130,6 +137,22 @@ fn set_test_hook_check(check: HookCheck) {
 struct PendingStart {
     generation: u64,
     writes: Vec<String>,
+}
+
+fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
+    use agent_core::delegation::agy_guard::{CONFIG_REDIRECT_VARS, REDIRECT_VAR_PREFIX};
+    let relevant =
+        |name: &str| CONFIG_REDIRECT_VARS.contains(&name) || name.starts_with(REDIRECT_VAR_PREFIX);
+    let mut names = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .filter(|name| relevant(name) && !spec.unset.contains(name))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (name, _) in &spec.env {
+        if relevant(name) {
+            names.insert(name.clone());
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// What a refused fresh hook proof changed, to be said once its hookless process has spawned.
@@ -278,6 +301,10 @@ struct Inner {
     rules_blocked_noticed: Cell<bool>,
     /// Queued user prompts submitted while a turn is already running.
     queued_prompts: RefCell<std::collections::VecDeque<QueuedPrompt>>,
+    /// Already published input held when a startup retry waits for root rebinding. Its text
+    /// already includes any handoff, so it must not enter the ordinary prompt builder again.
+    held_retries: RefCell<std::collections::VecDeque<Sent>>,
+    launch_facts: RefCell<Option<DelegationLaunchFacts>>,
     weak_self: RefCell<Option<std::rc::Weak<Inner>>>,
     prompt_in_flight: Cell<bool>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
@@ -315,6 +342,33 @@ struct Inner {
     codex_turn_grant_paths: RefCell<Vec<PathBuf>>,
     /// What the current turn said, for the quick replies offered when it completes.
     reply_turn: RefCell<reply_questions::ReplyTurn>,
+    // ---- delegation (P4 §3.4) ----
+    /// A bound root's or a supervised child's delegation hooks.
+    hooks: Option<Rc<dyn DelegationHooks>>,
+    /// A supervised child's gate, publication boundary and fixed task mode.
+    child: Option<ChildPolicy>,
+    /// The contract's process generation: bumped only when a process starts (unlike
+    /// `generation`, which a stop bumps too).
+    process_generation: Cell<u64>,
+    /// The last process generation closed out (`process_stopping` runs once per generation).
+    stopped_generation: Cell<u64>,
+    /// Every started generation's exit watch, dropped only once it reports `Exited`.
+    watches: RefCell<Vec<(u64, ExitWatch)>>,
+    /// A rebind stopped the process: nothing starts one until `rebind_start`.
+    rebinding: Cell<bool>,
+    /// The native id of the running turn (Codex), which a delegated steer is pinned to.
+    native_turn: RefCell<Option<String>>,
+    /// Open approval requests by the id the view knows them by, so revocation can end them.
+    open_approvals: RefCell<Vec<String>>,
+    /// Original tool/input for a final authority check immediately before answering a card.
+    approval_inputs: RefCell<HashMap<String, (String, serde_json::Value)>>,
+    /// Requests a child's gate let through only as a card with no grant (`AskOnly`).
+    ask_only: RefCell<HashSet<String>>,
+    /// The worker this session is (a root principal or a child), named by the supervisor; the
+    /// recipient of every delegated message it is given.
+    worker: RefCell<Option<agent_core::delegation::WorkerId>>,
+    /// This launch consumed a prepared binding; same-name user MCP servers confer no trust.
+    bound_generation: Cell<bool>,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -398,6 +452,20 @@ fn effective_mode(hookless_agy: bool, wanted: Mode) -> Mode {
     } else {
         wanted
     }
+}
+
+/// Whether `mode` is no wider than a supervised child's fixed task mode `ceiling`: Plan, then
+/// Ask, then Accept edits. Dangerous permissive mode is never within any child's.
+fn mode_within(mode: Mode, ceiling: Mode) -> bool {
+    fn rank(mode: Mode) -> u8 {
+        match mode {
+            Mode::Plan => 0,
+            Mode::Ask => 1,
+            Mode::AcceptEdits => 2,
+            Mode::Bypass => 3,
+        }
+    }
+    mode != Mode::Bypass && rank(mode) <= rank(ceiling)
 }
 
 /// Why agy has no approval socket when its hooks file has not been checked yet (a switch to agy
@@ -513,22 +581,57 @@ impl ChatSession {
     /// agy's approval as an [`Approval`] (so a socket that could not be bound says why).
     pub fn with_env(
         adapter: Box<dyn Adapter>,
-        mut open: OpenSession,
+        open: OpenSession,
         store: impl Into<SessionStore>,
         thread: ThreadId,
         sink: EnvelopeSink,
         approval: Approval,
         env: LaunchEnv,
     ) -> Rc<Self> {
+        Self::build(
+            adapter,
+            open,
+            store.into(),
+            thread,
+            sink,
+            approval,
+            env,
+            SessionOptions::default(),
+        )
+    }
+
+    /// [`Self::with_env`] with delegation options installed before the first process starts.
+    #[allow(clippy::too_many_arguments)] // `with_env`'s seven, plus the options
+    fn build(
+        mut adapter: Box<dyn Adapter>,
+        mut open: OpenSession,
+        store: SessionStore,
+        thread: ThreadId,
+        sink: EnvelopeSink,
+        approval: Approval,
+        env: LaunchEnv,
+        opts: SessionOptions,
+    ) -> Rc<Self> {
         let SessionStore {
             handle: store,
             provider: known_provider,
-        } = store.into();
+        } = store;
         let driver = adapter.driver();
         let (approval, unbound) = match approval {
             Ok(handle) => (Some(handle), None),
             Err(reason) => (None, reason),
         };
+        if let Some(child) = &opts.child {
+            // A child requests a child's policies, starts in no mode wider than its task's, and
+            // its approval socket judges every call by its gate first.
+            adapter.supervise_as_child();
+            if !mode_within(open.mode, child.mode) {
+                open.mode = child.mode;
+            }
+            if let Some(handle) = &approval {
+                handle.set_gate(child.gate.clone());
+            }
+        }
         open.approval_hook = approval.is_some();
         let hookless_agy = driver == Driver::Agy && approval.is_none();
         // No process starts in dangerous permissive mode, whatever asked for it (a stored
@@ -612,6 +715,8 @@ impl ChatSession {
             ),
             rules_blocked_noticed: Cell::new(false),
             queued_prompts: RefCell::new(std::collections::VecDeque::new()),
+            held_retries: RefCell::new(std::collections::VecDeque::new()),
+            launch_facts: RefCell::new(None),
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
             last_enriched_step: Cell::new(None),
@@ -629,6 +734,18 @@ impl ChatSession {
             codex_grant_paths: RefCell::new(Vec::new()),
             codex_turn_grant_paths: RefCell::new(Vec::new()),
             reply_turn: RefCell::default(),
+            hooks: opts.hooks,
+            child: opts.child,
+            process_generation: Cell::new(opts.generation_base.0),
+            stopped_generation: Cell::new(opts.generation_base.0),
+            watches: RefCell::new(Vec::new()),
+            rebinding: Cell::new(false),
+            native_turn: RefCell::new(None),
+            open_approvals: RefCell::new(Vec::new()),
+            approval_inputs: RefCell::new(HashMap::new()),
+            ask_only: RefCell::new(HashSet::new()),
+            worker: RefCell::new(None),
+            bound_generation: Cell::new(false),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -715,7 +832,10 @@ impl ChatSession {
     /// synchronously (a write queued for later may not finish before the process exits). A
     /// thread that really was unread stays unread.
     pub fn shutdown(&self, keep_read: bool) {
-        if !self.inner.state.borrow().alive && self.inner.proc.borrow().is_none() {
+        if !self.inner.state.borrow().alive
+            && self.inner.proc.borrow().is_none()
+            && self.inner.starting.borrow().is_none()
+        {
             return;
         }
         self.inner.stop_current();
@@ -737,6 +857,12 @@ impl ChatSession {
             .as_ref()
             .filter(|p| p.is_alive())
             .map(AgentProcess::exit_watch)
+    }
+
+    /// Safe facts of the last successfully spawned generation; never rebuilds a launch or
+    /// consumes its staged binding. No other environment values are retained here.
+    pub(crate) fn delegation_launch_facts(&self) -> Option<DelegationLaunchFacts> {
+        self.inner.launch_facts.borrow().clone()
     }
 
     #[cfg(test)]
@@ -789,14 +915,31 @@ impl Inner {
     fn emit(&self, env: Envelope) {
         let delivery = ScopedFlag::set(&self.delivering);
         let env = self.route_codex_permission(env);
+        // A supervised child's events cross its publication boundary first (P4 §3.5): what it
+        // withholds goes nowhere, and what it passes is the sanitised envelope.
+        let env = match &self.child {
+            Some(child) => {
+                let generation = ProcessGeneration(self.process_generation.get());
+                match child.publish.publish(generation, env) {
+                    Some(env) => env,
+                    None => return,
+                }
+            }
+            None => env,
+        };
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
         // A control reply answers a live request and replay drops it; storing it would also
         // write a polled background task's output to the store once a second.
         let transient = matches!(env.event, Event::ControlResult { .. });
         if !transient {
-            if let Err(e) = self.store.append_event(&self.thread, provider, &env) {
-                warn!(error = %e, "could not persist an event");
+            match &self.child {
+                Some(child) => child.publish.persist(&self.thread, provider, &env),
+                None => {
+                    if let Err(e) = self.store.append_event(&self.thread, provider, &env) {
+                        warn!(error = %e, "could not persist an event");
+                    }
+                }
             }
         }
         self.apply(&env);
@@ -880,11 +1023,28 @@ impl Inner {
                 }
                 self.state.borrow_mut().running_turn = true;
                 self.last_enriched_step.set(None);
+                let native = self.adapter.borrow().active_turn();
+                *self.native_turn.borrow_mut() = native.clone();
+                if let Some(hooks) = &self.hooks {
+                    hooks.turn(
+                        ProcessGeneration(self.process_generation.get()),
+                        TurnBoundary::Started {
+                            native_turn: native.as_deref(),
+                        },
+                    );
+                }
             }
             Event::TurnCompleted { state, .. } => {
                 self.prompt_in_flight.set(false);
                 self.state.borrow_mut().running_turn = false;
                 self.last_enriched_step.set(None);
+                *self.native_turn.borrow_mut() = None;
+                if let Some(hooks) = &self.hooks {
+                    hooks.turn(
+                        ProcessGeneration(self.process_generation.get()),
+                        TurnBoundary::Ended { state: *state },
+                    );
+                }
                 // Codex's turn-scoped permission grants ended with the turn.
                 self.codex_turn_grant_paths.borrow_mut().clear();
                 // A completed turn is the proof the new agent read the handoff it carried; any
@@ -970,15 +1130,32 @@ impl Inner {
                 if let Some(a) = self.approval() {
                     a.set_mode(*mode);
                 }
+                if let Some(hooks) = &self.hooks {
+                    hooks.mode_changed(*mode);
+                }
             }
             Event::CommandsChanged { commands } => {
                 self.state.borrow_mut().commands = commands.clone();
+            }
+            Event::ApprovalRequested { tool, input, .. } => {
+                if let Some(req) = &env.request {
+                    self.approval_inputs
+                        .borrow_mut()
+                        .insert(req.clone(), (tool.clone(), input.clone()));
+                    let mut open = self.open_approvals.borrow_mut();
+                    if !open.contains(req) {
+                        open.push(req.clone());
+                    }
+                }
             }
             Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
                 if let Some(req) = &env.request {
                     self.pending_rules.borrow_mut().remove(req);
                     self.codex_permissions.borrow_mut().remove(req);
                     self.held_permissions.borrow_mut().remove(req);
+                    self.open_approvals.borrow_mut().retain(|r| r != req);
+                    self.approval_inputs.borrow_mut().remove(req);
+                    self.ask_only.borrow_mut().remove(req);
                 }
             }
             _ => {}
@@ -1095,6 +1272,13 @@ impl Inner {
         // One source for the hook flag and the socket env var: both come from `approval`.
         let approval = self.approval();
         self.open.borrow_mut().approval_hook = approval.is_some();
+        // The delegation binding staged for exactly the next process generation; a start the
+        // supervisor did not stage takes none, so it gets no token (fail closed).
+        let driver = self.adapter.borrow().driver();
+        let next = ProcessGeneration(self.process_generation.get() + 1);
+        let binding = self.hooks.as_ref().and_then(|h| h.binding(driver, next));
+        self.bound_generation.set(binding.is_some());
+        self.open.borrow_mut().delegation = binding.as_ref().and_then(|b| b.open.clone());
         let open = self.open.borrow();
         let mut argv = self.adapter.borrow().argv(&open);
         // W3.2: Claude shares its thinking only with this hidden flag, so it goes only to a
@@ -1108,11 +1292,28 @@ impl Inner {
         self.thinking.passed.set(thinking);
         self.thinking.refused.set(false);
         self.thinking.init_seen.set(false);
+        if let Some(binding) = &binding {
+            if driver == Driver::Claude {
+                argv.push("--replay-user-messages".to_owned());
+            }
+            argv.extend(binding.argv_tail.iter().cloned());
+        }
         let launch = self.launch_env.borrow();
-        // The profile's environment first, so it can never override the approval socket.
+        // The profile's environment first, so it can never override the approval socket or the
+        // delegation binding.
         let mut env = launch.env.clone();
         env.extend(approval.as_ref().map(|a| a.env()).unwrap_or_default());
+        if let Some(binding) = binding {
+            env.extend(binding.env);
+        }
         let mut unset = launch.unset.clone();
+        // No inherited delegation credential or approval socket ever reaches an agent; its own
+        // values (above) are set after these are removed.
+        for name in agent_core::delegation::env::STRIP_ON_SPAWN {
+            if !unset.iter().any(|u| u == name) {
+                unset.push(name.to_owned());
+            }
+        }
         if approval.is_none() {
             if !unset.iter().any(|u| u == agent_core::approval::ENV_SOCKET) {
                 unset.push(agent_core::approval::ENV_SOCKET.to_owned());
@@ -1144,6 +1345,14 @@ impl Inner {
         self.clear_agy_read();
         self.canary_cancelled.borrow_mut().clear();
         *self.starting.borrow_mut() = None;
+        if self.child.is_some()
+            && self.adapter.borrow().driver() == Driver::Agy
+            && self.approval().is_none()
+        {
+            self.error("A delegated Antigravity agent requires a proven approval hook; it was not started.");
+            self.finish_process(Some(1), false);
+            return;
+        }
         if self.adapter.borrow().driver() != Driver::Agy || self.approval().is_none() {
             self.spawn_generation(generation);
             return;
@@ -1190,6 +1399,11 @@ impl Inner {
         // anything is emitted, and spawned only if this start is still the session's afterwards.
         let spec = match verdict {
             Ok(()) => self.launch_spec(),
+            Err(reason) if self.child.is_some() => {
+                self.error(format!("The delegated Antigravity agent's approval hook could not be proven: {reason}. It was not started."));
+                self.finish_process(Some(1), false);
+                return;
+            }
             Err(reason) => {
                 let refused = self.refuse_unproven_hook(reason);
                 let spec = self.launch_spec();
@@ -1200,14 +1414,7 @@ impl Inner {
         if self.generation.get() != generation || self.stopping.get() {
             return;
         }
-        self.spawn_spec(generation, spec);
-        if self.generation.get() == generation && !pending.writes.is_empty() {
-            if let Some(proc) = self.proc.borrow().as_ref().filter(|p| p.is_alive()) {
-                for line in &pending.writes {
-                    proc.write_line(line);
-                }
-            }
-        }
+        self.spawn_spec_with_writes(generation, spec, pending.writes);
     }
 
     /// The hook could not be proven right before a start: agy runs without the skip flag and
@@ -1262,6 +1469,150 @@ impl Inner {
     }
 
     fn spawn_spec(self: &Rc<Self>, generation: u64, spec: SpawnSpec) {
+        self.spawn_spec_with_writes(generation, spec, Vec::new());
+    }
+
+    fn spawn_spec_with_writes(
+        self: &Rc<Self>,
+        generation: u64,
+        mut spec: SpawnSpec,
+        writes: Vec<String>,
+    ) {
+        if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
+            self.spawn_spec_now(generation, spec, None);
+            self.flush_start_writes(generation, writes);
+            return;
+        }
+        let Some(hooks) = self.hooks.clone() else {
+            return;
+        };
+        use agent_core::delegation::agy_guard::CONFIG_REDIRECT_VARS;
+        let home = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| PathBuf::from(value))
+            .or_else(|| {
+                (!spec.unset.iter().any(|name| name == "HOME"))
+                    .then(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .flatten()
+            });
+        let redirects = delegation_redirect_names(&spec);
+        // Freeze inherited safety inputs across the asynchronous guard. Redirects are never
+        // allowed by a delegated launch, so absence is fixed explicitly in the final spec.
+        match &home {
+            Some(home) => spec
+                .env
+                .push(("HOME".into(), home.to_string_lossy().into_owned())),
+            None => spec.unset.push("HOME".into()),
+        }
+        for name in CONFIG_REDIRECT_VARS {
+            if !redirects.iter().any(|n| n == name) {
+                spec.unset.push(name.into());
+            }
+        }
+        let mut facts = DelegationLaunchFacts {
+            generation: ProcessGeneration(self.process_generation.get() + 1),
+            argv: spec.argv.clone(),
+            physical_cwd: PathBuf::new(),
+            effective_home: home,
+            config_redirect_vars: redirects,
+            hook_proven: self.approval().is_some()
+                && spec
+                    .argv
+                    .iter()
+                    .any(|arg| arg == "--dangerously-skip-permissions"),
+        };
+        *self.starting.borrow_mut() = Some(PendingStart { generation, writes });
+        self.state.borrow_mut().alive = true;
+        let cwd = spec.cwd.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let physical = gtk4::gio::spawn_blocking(move || {
+                let cwd = cwd
+                    .map(PathBuf::from)
+                    .map(Ok)
+                    .unwrap_or_else(std::env::current_dir)?;
+                std::fs::canonicalize(cwd)
+            })
+            .await;
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.generation.get() != generation
+                || inner
+                    .starting
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|p| p.generation != generation)
+            {
+                return;
+            }
+            let verdict = match physical {
+                Ok(Ok(cwd)) => {
+                    facts.physical_cwd = cwd.clone();
+                    match (
+                        cwd.to_str(),
+                        facts
+                            .effective_home
+                            .as_ref()
+                            .is_none_or(|h| h.to_str().is_some()),
+                    ) {
+                        (Some(cwd), true) => {
+                            spec.cwd = Some(cwd.to_owned());
+                            hooks.before_spawn(facts.clone()).await
+                        }
+                        _ => Err("the checked launch paths are not valid UTF-8".into()),
+                    }
+                }
+                _ => Err("the agent's physical working directory could not be checked".into()),
+            };
+            if inner.generation.get() != generation || inner.stopping.get() {
+                return;
+            }
+            let Some(pending) = inner
+                .starting
+                .borrow_mut()
+                .take_if(|p| p.generation == generation)
+            else {
+                return;
+            };
+            if let Err(reason) = verdict {
+                inner.error(format!(
+                    "The agent's final delegation launch was refused: {reason}"
+                ));
+                if inner.generation.get() == generation {
+                    inner.finish_process(Some(1), false);
+                }
+                return;
+            }
+            if delegation_redirect_names(&spec) != facts.config_redirect_vars {
+                inner.error("The agent's configuration redirect environment changed during its launch check; it was not started.");
+                if inner.generation.get() == generation {
+                    inner.finish_process(Some(1), false);
+                }
+                return;
+            }
+            inner.spawn_spec_now(generation, spec, Some(facts));
+            inner.flush_start_writes(generation, pending.writes);
+        });
+    }
+
+    fn flush_start_writes(&self, generation: u64, writes: Vec<String>) {
+        if self.generation.get() == generation {
+            if let Some(proc) = self.proc.borrow().as_ref().filter(|p| p.is_alive()) {
+                for line in &writes {
+                    proc.write_line(line);
+                }
+            }
+        }
+    }
+
+    fn spawn_spec_now(
+        self: &Rc<Self>,
+        generation: u64,
+        spec: SpawnSpec,
+        facts: Option<DelegationLaunchFacts>,
+    ) {
         let (w_out, w_err, w_exit) = (
             Rc::downgrade(self),
             Rc::downgrade(self),
@@ -1287,12 +1638,24 @@ impl Inner {
         );
         match spawned {
             Ok(proc) => {
+                let process_generation = self.process_generation.get() + 1;
+                self.process_generation.set(process_generation);
+                *self.launch_facts.borrow_mut() = facts;
+                let (pid, watch) = (proc.pid(), proc.exit_watch());
+                {
+                    let mut watches = self.watches.borrow_mut();
+                    watches.retain(|(_, w)| w.phase() != StopPhase::Exited);
+                    watches.push((process_generation, watch.clone()));
+                }
                 let handshake = self.adapter.borrow_mut().handshake();
                 for line in &handshake {
                     proc.write_line(line);
                 }
                 *self.proc.borrow_mut() = Some(proc);
                 self.state.borrow_mut().alive = true;
+                if let Some(hooks) = &self.hooks {
+                    hooks.process_started(ProcessGeneration(process_generation), pid, watch);
+                }
             }
             Err(e) => {
                 self.state.borrow_mut().alive = false;
@@ -1367,6 +1730,26 @@ impl Inner {
         if generation != self.generation.get() {
             return;
         }
+        // Every raw line, in arrival order, before agy's hold (read-back; memory only).
+        if let Some(hooks) = &self.hooks {
+            hooks.line(
+                ProcessGeneration(self.process_generation.get()),
+                line,
+                stderr,
+            );
+            if generation != self.generation.get() {
+                return; // the hook stopped this process
+            }
+        }
+        self.on_line_in_order(generation, line, stderr);
+    }
+
+    /// [`Self::on_line`] after the hooks saw it: a line held behind an agy transcript read
+    /// comes back here, so the hooks see each line once.
+    fn on_line_in_order(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
+        if generation != self.generation.get() {
+            return;
+        }
         match self.agy_reading.get() {
             Some(reading) if reading == generation => {
                 // A transcript read is in flight: keep the order the adapter must see.
@@ -1408,7 +1791,7 @@ impl Inner {
                             let Some((held, held_stderr)) = next else {
                                 break;
                             };
-                            me.on_line(generation, &held, held_stderr);
+                            me.on_line_in_order(generation, &held, held_stderr);
                         }
                         if me.agy_reading.get().is_none() {
                             if let Some((exit_gen, code)) = me.agy_deferred_exit.take() {
@@ -1500,11 +1883,18 @@ impl Inner {
             self.adapter.borrow_mut().feed(line)
         };
         for env in envelopes {
+            self.observe(&env);
+            if generation != self.generation.get() {
+                return; // a hook stopped the process
+            }
             let Some(env) = self.gate_form(env) else {
                 continue; // declined before it was shown; the notice is out
             };
             let Some(env) = self.hold_codex_permissions(generation, env) else {
                 continue; // shown once its targets are checked on disk
+            };
+            let Some(env) = self.gate_child_approval(env) else {
+                continue; // denied by the child's inherited authority; the card is resolved
             };
             let (env, auto) = self.gate_approval(env);
             let lost_resume = self.is_lost_codex_resume(&env);
@@ -1736,9 +2126,18 @@ impl Inner {
             cwd: cwd.as_deref(),
             home: home.as_deref(),
         };
-        let offer = action
-            .as_ref()
-            .is_some_and(|a| crate::always_allow::offerable(a, &ctx));
+        // A4: in a supervised child, a rule applies, and a card offers to keep one, only where
+        // its gate says (inside its own lease, a writing mode within the parent's ceiling); a
+        // card the gate forced (`AskOnly`) offers none.
+        let forced = self.ask_only.borrow().contains(&request);
+        let rule_ok = !forced
+            && action
+                .as_ref()
+                .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()));
+        let offer = rule_ok
+            && action
+                .as_ref()
+                .is_some_and(|a| crate::always_allow::offerable(a, &ctx));
         let always = offer
             && self.saved_rules.borrow().is_some()
             && action
@@ -1762,21 +2161,39 @@ impl Inner {
         let plain = driver != Driver::Codex || Self::codex_plain_request(tool, input);
         // Codex Accept edits runs on `untrusted` (D5): the app accepts edits whose every path is
         // in the workspace and not sensitive; anything else, and every shell command, asks.
+        // A child's Accept edits auto also needs every target to be one its rules may cover.
         let accept_edit = driver == Driver::Codex
             && tool == "file_change"
             && self.state.borrow().mode == Mode::AcceptEdits
-            && codex_edits_contained(input, &workspace, home.as_deref());
+            && !forced
+            && codex_edits_contained(input, &workspace, home.as_deref())
+            && (self.child.is_none()
+                || crate::always_allow::codex_change_targets(input).is_some_and(|targets| {
+                    targets.iter().all(|path| {
+                        let edit = crate::always_allow::Action::Edit {
+                            path: (*path).to_owned(),
+                        };
+                        self.rule_may_apply(&edit, cwd.as_deref())
+                    })
+                }));
         // Dangerous permissive mode: the agent's own bypass should leave nothing to ask, and
-        // whatever still arrives (escalations included) is approved, as the user agreed to.
-        let bypass = self.state.borrow().mode == Mode::Bypass;
+        // whatever still arrives (escalations included) is approved, as the user agreed to. A
+        // supervised child never runs it.
+        let bypass = self.state.borrow().mode == Mode::Bypass && self.child.is_none();
+        let bridge = self.bound_generation.get()
+            && !forced
+            && self.adapter.borrow().is_own_bridge_approval(&request);
         let auto = options.contains(&Decision::Allow)
-            && (bypass
+            && (bridge
+                || bypass
                 || plain
                     && (accept_edit
-                        || action.as_ref().is_some_and(|a| {
-                            let in_session = self.session_rules.borrow().matches_session(a, &ctx);
-                            in_session || self.saved_allow(a, &ctx)
-                        })));
+                        || rule_ok
+                            && action.as_ref().is_some_and(|a| {
+                                let in_session =
+                                    self.session_rules.borrow().matches_session(a, &ctx);
+                                in_session || self.saved_allow(a, &ctx)
+                            })));
         // The folder the card offered (pinned: the answer keeps it only if it is still the same).
         let shown = action
             .as_ref()
@@ -1849,7 +2266,7 @@ impl Inner {
         let Some(req) = env.request.clone() else {
             return;
         };
-        info!("auto-approving a call a remembered rule matches");
+        info!("auto-approving a call allowed by the session's policy");
         let weak = Rc::downgrade(self);
         glib::MainContext::ref_thread_default().invoke_local(move || {
             if let Some(inner) = weak.upgrade() {
@@ -1943,6 +2360,12 @@ impl Inner {
     /// The hook is not gating agy: stop it now and carry on without the skip flag (plan mode, no
     /// socket), so commands are refused again.
     fn trip_canary(self: &Rc<Self>) {
+        if self.child.is_some() {
+            self.error("The delegated Antigravity agent ran a tool without its approval hook; it was stopped.");
+            self.stop_current();
+            *self.approval.borrow_mut() = None;
+            return;
+        }
         warn!("agy ran a tool without a hook query; restarting it without the skip flag");
         self.error(
             "agy ran a tool without asking agent-terminal; the approval hook is not active \u{2014} restarting it in plan mode without --dangerously-skip-permissions (it refuses commands, but may still edit files)",
@@ -2028,7 +2451,10 @@ impl Inner {
         self.start_process();
         for sent in prompts {
             self.prompt_in_flight.set(true);
-            self.dispatch_sent_prompt(&sent.text, sent.handoff);
+            if !self.dispatch_sent_prompt(&sent.text, sent.handoff.clone()) {
+                self.prompt_in_flight.set(false);
+                self.held_retries.borrow_mut().push_back(sent);
+            }
         }
         true
     }
@@ -2042,6 +2468,16 @@ impl Inner {
         *self.starting.borrow_mut() = None;
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
+                    // Synthetic: `stop_current` gets here before the process is gone. The supervisor kills
+                    // the generation's token and ends its runs; only the exit watch reports the real exit.
+        let process_generation = self.process_generation.get();
+        let closing = self.stopped_generation.replace(process_generation) < process_generation;
+        if closing {
+            if let Some(hooks) = &self.hooks {
+                hooks.process_stopping(ProcessGeneration(process_generation));
+            }
+        }
+        *self.native_turn.borrow_mut() = None;
         let mut envelopes = self.adapter.borrow_mut().on_exit(code);
         if deliberate {
             envelopes.iter_mut().for_each(as_deliberate_stop);
@@ -2074,6 +2510,17 @@ impl Inner {
         if let Some(a) = self.approval() {
             a.expire_all("the agent exited");
         }
+        self.open_approvals.borrow_mut().clear();
+        self.approval_inputs.borrow_mut().clear();
+        self.ask_only.borrow_mut().clear();
+        self.bound_generation.set(false);
+        if closing {
+            if let Some(child) = &self.child {
+                child
+                    .publish
+                    .cancel_generation(ProcessGeneration(process_generation));
+            }
+        }
     }
 
     /// Forgets an in-flight agy transcript read, its held lines and a deferred exit: they belong
@@ -2096,7 +2543,9 @@ impl Inner {
 
     /// A dead process (agy after an interrupt) is restarted resuming its native session.
     fn ensure_alive(self: &Rc<Self>) {
-        if self.state.borrow().alive {
+        // A rebind owns the next start: it waits for the old generation's exit and a staged
+        // binding, then calls `rebind_start`.
+        if self.state.borrow().alive || self.rebinding.get() {
             return;
         }
         let native = self.state.borrow().native_id.clone();
@@ -2177,6 +2626,7 @@ impl Inner {
                 return;
             }
             for env in outbox.events {
+                self.observe(&env);
                 self.emit(env.clone());
                 self.watch_tool_step(&env);
             }
@@ -2401,6 +2851,9 @@ impl Inner {
     /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
     /// one, so it is never lost.
     fn steer_prompt(self: &Rc<Self>, text: &str) {
+        if !self.root_prompt_allowed() {
+            return self.queue_prompt(text);
+        }
         if !self.state.borrow().running_turn {
             return self.send_prompt(text);
         }
@@ -2435,9 +2888,11 @@ impl Inner {
             })
             .item(item.clone()),
         );
-        if self.command(Command::Steer {
-            text: text.to_owned(),
-        }) {
+        if self.root_prompt_allowed()
+            && self.command(Command::Steer {
+                text: text.to_owned(),
+            })
+        {
             self.remember_pre_init_prompt(text, None);
             return;
         }
@@ -2459,6 +2914,11 @@ impl Inner {
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
+        if self.rebinding.get() {
+            // Nothing runs until the rebind starts the next generation, which sends the queue.
+            self.queue_prompt(text);
+            return;
+        }
         if self.dispatching_queue.get()
             || self.delivering.get()
             || !self.state.borrow().running_turn && !self.queued_prompts.borrow().is_empty()
@@ -2472,17 +2932,21 @@ impl Inner {
 
     /// A confirmed switch's continuation opens its own turn before queued user input.
     fn send_prompt_now(self: &Rc<Self>, text: &str) {
+        if !self.root_prompt_allowed() {
+            self.queue_prompt(text);
+            return;
+        }
         if !self.state.borrow().running_turn && !self.apply_retired() {
             self.queue_prompt(text);
             return;
         }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let item = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => item,
+        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
+            Ok(item) => (item, true),
             Err(e) => {
                 warn!(error = %e, "could not persist the user message");
-                glib::uuid_string_random().to_string()
+                (glib::uuid_string_random().to_string(), false)
             }
         };
 
@@ -2510,7 +2974,7 @@ impl Inner {
                 stream: StreamKind::Assistant,
                 text: agent_core::redact::redact(text),
             })
-            .item(item),
+            .item(item.clone()),
         );
 
         let sent = match &handoff {
@@ -2518,11 +2982,47 @@ impl Inner {
             None => text.to_owned(),
         };
         self.prompt_in_flight.set(true);
-        self.dispatch_sent_prompt(&sent, handoff);
+        if !self.dispatch_sent_prompt(&sent, handoff) {
+            self.hold_queued_prompt(QueuedPrompt {
+                item_id: item,
+                text: text.to_owned(),
+                stored,
+            });
+        }
     }
 
-    fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) {
+    fn root_prompt_allowed(&self) -> bool {
+        self.child.is_some()
+            || self
+                .hooks
+                .as_ref()
+                .is_none_or(|hooks| hooks.before_root_prompt())
+    }
+
+    fn hold_queued_prompt(&self, queued: QueuedPrompt) {
+        let item = queued.item_id.clone();
+        self.queued_prompts.borrow_mut().push_front(queued);
+        self.prompt_in_flight.set(false);
+        self.deliver(
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: "queued".to_owned(),
+                input: Some(serde_json::json!({"queued": true})),
+                parent: None,
+            })
+            .item(item),
+        );
+    }
+
+    /// Sends `sent` as a prompt; true when the adapter took it.
+    fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+        if !self.root_prompt_allowed() {
+            return false;
+        }
         self.ensure_alive();
+        if !self.root_prompt_allowed() {
+            return false;
+        }
         // A submitted/queued inference is already work: the user must be able to stop it
         // while waiting for the backend's turn/started, not only after that reply arrives.
         let starts_turn =
@@ -2543,6 +3043,7 @@ impl Inner {
         if accepted && handoff.is_some() {
             self.handoff_in_flight.set(true);
         }
+        accepted
     }
 
     fn remember_pre_init_prompt(&self, text: &str, handoff: Option<Handoff>) {
@@ -2586,6 +3087,26 @@ impl Inner {
         let _dispatching = ScopedFlag::set(&self.dispatching_queue);
         // Each pass removes one queued item; an empty queue ends the synchronous drain.
         loop {
+            if self.queued_prompts.borrow().is_empty() && self.held_retries.borrow().is_empty() {
+                return;
+            }
+            if !self.root_prompt_allowed() {
+                return;
+            }
+            let retry = self.held_retries.borrow_mut().pop_front();
+            if let Some(retry) = retry {
+                self.prompt_in_flight.set(true);
+                if !self.dispatch_sent_prompt(&retry.text, retry.handoff.clone()) {
+                    self.prompt_in_flight.set(false);
+                    self.held_retries.borrow_mut().push_front(retry);
+                    return;
+                }
+                if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false)
+                {
+                    return;
+                }
+                continue;
+            }
             let queued = self.queued_prompts.borrow_mut().pop_front();
             let Some(queued) = queued else { return };
             if !self.apply_retired() {
@@ -2636,10 +3157,16 @@ impl Inner {
             };
             let sent = match &handoff {
                 Some(h) => provider_message_with_handoff(&h.summary, &h.fence, &queued.text),
-                None => queued.text,
+                None => queued.text.clone(),
             };
             self.prompt_in_flight.set(true);
-            self.dispatch_sent_prompt(&sent, handoff);
+            if !self.dispatch_sent_prompt(&sent, handoff) {
+                self.hold_queued_prompt(QueuedPrompt {
+                    stored: true,
+                    ..queued
+                });
+                return;
+            }
             // A local slash command can finish synchronously. Drain its next turn iteratively.
             if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false) {
                 return;
@@ -2696,6 +3223,9 @@ impl Inner {
         decision: Decision,
         custom_rule: Option<crate::always_allow::Rule>,
     ) {
+        // Authority may narrow while a human is reading a card. Re-check at the actual
+        // response boundary, including plain Allow; rule validation alone cannot protect it.
+        let decision = self.child_answer(request, decision);
         let permission = self.codex_permissions.borrow().get(request).cloned();
         if let Some(card) = permission {
             self.respond_codex_permissions(request, decision, &card, false);
@@ -2729,8 +3259,17 @@ impl Inner {
         // allow (Claude without `updatedPermissions`, Codex `accept`). No rule, no claim of one:
         // the card then says "Allowed".
         let pending = self.pending_rules.borrow_mut().remove(request);
-        let plan = matches!(decision, Decision::AllowAlways | Decision::AllowForSession)
-            .then(|| self.plan_rule(pending.as_ref(), decision, custom_rule));
+        let plan =
+            matches!(decision, Decision::AllowAlways | Decision::AllowForSession).then(|| {
+                // A4, re-checked at keep: a child keeps only a rule its gate lets cover this call,
+                // never a custom one (it could reach further than the call).
+                if self.child.is_some()
+                    && !self.child_may_keep(request, pending.as_ref(), &custom_rule)
+                {
+                    return Err(CHILD_RULE_REFUSED.to_owned());
+                }
+                self.plan_rule(pending.as_ref(), decision, custom_rule)
+            });
         let decision = match &plan {
             Some(Err(_)) => Decision::Allow,
             _ => decision,
@@ -2774,6 +3313,22 @@ impl Inner {
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
+        // A supervised child runs within its fixed task mode, and never in dangerous permissive
+        // mode, whoever asks.
+        if let Some(child) = &self.child {
+            if !mode_within(mode, child.mode) {
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!(
+                        "This delegated agent cannot leave its task's mode ({}); it stays in its \
+                         current mode.",
+                        mode_label(child.mode)
+                    ),
+                }));
+                let current = self.state.borrow().mode;
+                self.emit(Envelope::new(Event::ModeChanged { mode: current }));
+                return;
+            }
+        }
         // Dangerous permissive agy is its hook allowing everything: with no hook, there is
         // nothing to approve through, and the flag is never passed any other way.
         if mode == Mode::Bypass && self.ask_unavailable() {
@@ -3455,6 +4010,22 @@ impl Inner {
         let Some(request) = env.request.clone() else {
             return Some(Self::deny_only(env, None));
         };
+        // A child's inherited authority first: a denial is answered at once, and a forced card
+        // grants nothing for the session.
+        match self.gate_verdict(tool, input, None) {
+            Some(GateVerdict::Deny { reason }) => {
+                self.deny_by_gate(
+                    Self::deny_only(env, Some(reason.clone())),
+                    &request,
+                    &reason,
+                );
+                return None;
+            }
+            Some(GateVerdict::AskOnly { .. }) => {
+                self.ask_only.borrow_mut().insert(request.clone());
+            }
+            Some(GateVerdict::Defer) | None => {}
+        }
         let shown = self
             .codex_permissions
             .borrow()
@@ -3502,7 +4073,9 @@ impl Inner {
     }
 
     fn codex_permission_bypass(&self) -> bool {
-        self.wanted_mode.get() == Mode::Bypass && self.state.borrow().mode == Mode::Bypass
+        self.child.is_none()
+            && self.wanted_mode.get() == Mode::Bypass
+            && self.state.borrow().mode == Mode::Bypass
     }
 
     /// `env` with only Deny and Stop turn offered, marked unrenderable, with `warning`.
@@ -3585,7 +4158,11 @@ impl Inner {
                 };
                 (Self::deny_only(env, warning), card)
             }
-            (None, Some(verdict)) => {
+            (None, Some(mut verdict)) => {
+                // A card a child's gate forced grants nothing for the session.
+                if self.ask_only.borrow().contains(&wire) {
+                    verdict.session_allowed = false;
+                }
                 let warning = with_note(verdict.warning.clone());
                 if let Event::ApprovalRequested { input, options, .. } = &mut env.event {
                     options.retain(|d| match d {
@@ -3737,6 +4314,8 @@ impl Inner {
         decision: Decision,
         card: &PermissionCard,
     ) {
+        // The on-disk check awaited above; authority can change while it runs.
+        let decision = self.child_answer(shown, decision);
         let allow = matches!(decision, Decision::Allow | Decision::AllowForSession);
         let renames = (allow && !card.verdict.renames.is_empty()).then(|| {
             serde_json::Value::Object(
@@ -3864,6 +4443,149 @@ impl Inner {
         });
         self.emit(Envelope::new(Event::Notice { text }));
         None
+    }
+}
+
+// ---- delegation: hooks and a supervised child's inherited authority (P4 §3.4, §5.2–§5.3) ----
+
+/// Said when a supervised child's answer would keep a rule its gate does not allow (A4).
+const CHILD_RULE_REFUSED: &str = "a delegated agent keeps rules only for files in its own worktree";
+
+/// A mode as the picker names it, for notices.
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ask => "Ask before edits",
+        Mode::AcceptEdits => "Accept edits",
+        Mode::Plan => "Plan",
+        Mode::Bypass => "Dangerous permissive",
+    }
+}
+
+impl Inner {
+    /// Revalidates a pending grant without retaining any borrow across the live gate callback.
+    fn child_answer(&self, request: &str, decision: Decision) -> Decision {
+        if self.child.is_none()
+            || !matches!(
+                decision,
+                Decision::Allow | Decision::AllowForSession | Decision::AllowAlways
+            )
+        {
+            return decision;
+        }
+        let input = self.approval_inputs.borrow().get(request).cloned();
+        let Some((tool, input)) = input else {
+            return Decision::Deny;
+        };
+        let cwd = input.get("cwd").and_then(serde_json::Value::as_str);
+        match self.gate_verdict(&tool, &input, cwd) {
+            Some(GateVerdict::Deny { .. }) => Decision::Deny,
+            Some(GateVerdict::AskOnly { .. }) => {
+                self.ask_only.borrow_mut().insert(request.to_owned());
+                Decision::Allow
+            }
+            Some(GateVerdict::Defer) | None => decision,
+        }
+    }
+
+    /// Shows an adapter envelope to the delegation hooks, before masking and persistence.
+    fn observe(&self, env: &Envelope) {
+        if let Some(hooks) = &self.hooks {
+            hooks.observed(ProcessGeneration(self.process_generation.get()), env);
+        }
+    }
+
+    /// A supervised child's gate verdict on a tool call; `None` for a root.
+    fn gate_verdict(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        cwd: Option<&str>,
+    ) -> Option<GateVerdict> {
+        self.child
+            .as_ref()
+            .map(|child| child.gate.judge(tool, input, cwd))
+    }
+
+    /// Whether a session or Always rule may match `action` here (A4): always in a root; in a
+    /// child, only where its gate says.
+    fn rule_may_apply(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool {
+        self.child
+            .as_ref()
+            .is_none_or(|child| child.gate.rule_may_apply(action, cwd))
+    }
+
+    /// Whether a child may keep a rule for the request `request` (its gate allowed rules on the
+    /// call, the card was not forced, and no custom rule replaces the call's own).
+    fn child_may_keep(
+        &self,
+        request: &str,
+        pending: Option<&PendingRule>,
+        custom: &Option<crate::always_allow::Rule>,
+    ) -> bool {
+        custom.is_none()
+            && !self.ask_only.borrow().contains(request)
+            && pending.is_some_and(|(action, cwd, _)| self.rule_may_apply(action, cwd.as_deref()))
+    }
+
+    /// The child's inherited authority on a Claude or Codex approval, before every auto-allow
+    /// path (Bypass, Accept edits, session and Always rules): a denial is answered at once and
+    /// its card shown resolved (`None` returned); a forced card (`AskOnly`) goes on with no
+    /// grant to offer. A root's approvals pass unchanged.
+    fn gate_child_approval(self: &Rc<Self>, env: Envelope) -> Option<Envelope> {
+        if self.child.is_none() || self.adapter.borrow().driver() == Driver::Agy {
+            return Some(env); // agy's socket judges its own calls
+        }
+        let Event::ApprovalRequested { tool, input, .. } = &env.event else {
+            return Some(env);
+        };
+        if tool == agent_core::codex::PERMISSIONS_TOOL {
+            return Some(env); // judged by `hold_codex_permissions`
+        }
+        let Some(request) = env.request.clone() else {
+            return Some(env);
+        };
+        let cwd = input
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        match self.gate_verdict(tool, input, cwd.as_deref()) {
+            Some(GateVerdict::Deny { reason }) => {
+                self.deny_by_gate(env, &request, &reason);
+                None
+            }
+            Some(GateVerdict::AskOnly { .. }) => {
+                self.ask_only.borrow_mut().insert(request);
+                Some(env)
+            }
+            Some(GateVerdict::Defer) | None => Some(env),
+        }
+    }
+
+    /// Shows `card` and answers its request Deny at once, saying why.
+    fn deny_by_gate(self: &Rc<Self>, card: Envelope, request: &str, reason: &str) {
+        info!("a delegated agent's call was denied by its inherited authority");
+        let mut card = card;
+        if let Event::ApprovalRequested { options, .. } = &mut card.event {
+            options.retain(|d| matches!(d, Decision::Deny | Decision::Cancel));
+        }
+        self.emit(card);
+        let denied = self.command(Command::Approve {
+            request: request.to_owned(),
+            decision: Decision::Deny,
+            updated_input: None,
+            message: Some(format!("Denied by agent-terminal: {reason}")),
+        });
+        if denied {
+            self.emit(
+                Envelope::new(Event::ApprovalResolved {
+                    decision: Decision::Deny,
+                })
+                .request(request),
+            );
+        }
+        self.emit(Envelope::new(Event::Notice {
+            text: format!("Denied without asking: {reason}."),
+        }));
     }
 }
 
@@ -4138,6 +4860,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    mod delegated_tests;
     mod teardown_tests;
 
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
@@ -4221,6 +4944,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -4377,6 +5101,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -4496,6 +5221,7 @@ mod tests {
             .expect("bind");
             let open = OpenSession {
                 approval_hook: false, // the session must not trust the caller's value
+                delegation: None,
                 ..fake_agy(tmp.path())
             };
             let session = ChatSession::new(
@@ -4549,6 +5275,7 @@ mod tests {
             let (sink, seen) = make_sink();
             let open = OpenSession {
                 approval_hook: true, // ignored: there is no socket to export
+                delegation: None,
                 ..fake_agy(tmp.path())
             };
             let session = ChatSession::new(
@@ -5263,6 +5990,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -5318,6 +6046,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -5402,6 +6131,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store,
             thread,
@@ -5522,6 +6252,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store.clone(),
                 thread.clone(),
@@ -5934,6 +6665,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store.clone(),
             thread.clone(),
@@ -6107,6 +6839,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            delegation: None,
         }
     }
 
@@ -7010,6 +7743,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 "no-such-thread".into(),
@@ -7050,6 +7784,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store.clone(),
                 thread.clone(),
@@ -7088,6 +7823,7 @@ mod tests {
                     resume: Some("native-1".into()),
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -8408,6 +9144,7 @@ mod tests {
                     resume: None,
                     new_session_id: None,
                     approval_hook: false,
+                    delegation: None,
                 },
                 store,
                 thread,
@@ -8551,6 +9288,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                delegation: None,
             },
             store,
             thread,

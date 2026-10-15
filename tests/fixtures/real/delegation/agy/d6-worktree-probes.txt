@@ -1,0 +1,13 @@
+found	$TMP_HOME/.gemini/antigravity-cli/settings.json
+ENOENT	//etc/antigravity/admin_settings.json
+ENOENT	/$TMP_HOME/.antigravity/settings.json
+found	$TMP_HOME/.gemini/antigravity-cli/plugins/aplug/mcp_config.json
+ENOENT	$TMP_HOME/.gemini/antigravity-cli/plugins/aplug/hooks.json
+ENOENT	$TMP_HOME/.gemini/config/hooks.json
+found	$TMP_HOME/.gemini/config/plugins/hplug/mcp_config.json
+ENOENT	$TMP_HOME/.gemini/plugins/gplug/hooks.json
+ENOENT	$WORKTREE/.agents
+ENOENT	$WORKTREE/sub/.agents
+ENOENT	$TMP_HOME/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000008/.agents
+ENOENT	$TMP_HOME/.gemini/config/plugins/hplug/hooks.json
+found	$TMP_HOME/.gemini/config/mcp_config.json

@@ -20,6 +20,26 @@ pub mod workspace_files;
 /// What the view can ask of a thread. Results come back as envelopes through the sink given
 /// to the backend at construction (including `ControlResult` for `control`).
 pub trait ChatBackend {
+    /// Current canonical scope, including a queued worker before its first process event.
+    /// The view must not guess a process generation from a registry row.
+    fn worker_scope(
+        &self,
+        _worker: &agent_core::delegation::WorkerId,
+    ) -> Option<agent_core::delegation::scope::Scope> {
+        None
+    }
+    /// An operator action on a supervised worker. Backends must recheck the exact generation
+    /// and run before dispatch; a stale inspector never acts on a replacement process.
+    fn worker_action(&self, _action: WorkerAction) -> bool {
+        false
+    }
+    /// The child's own workspace and turn baseline. Never fall back to the root's diff source.
+    fn worker_diff_source(
+        &self,
+        _scope: &agent_core::delegation::scope::Scope,
+    ) -> Option<std::rc::Rc<dyn DiffSource>> {
+        None
+    }
     fn send_prompt(&self, text: &str);
     fn queue_prompt(&self, text: &str) {
         self.send_prompt(text);
@@ -72,6 +92,38 @@ pub trait ChatBackend {
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
         None
     }
+}
+
+/// Actions originating in a supervised worker inspector. Native request ids are recovered
+/// from the view's private scoped lookup, never accepted as an unscoped root request.
+pub enum WorkerAction {
+    Send {
+        scope: agent_core::delegation::scope::Scope,
+        text: String,
+    },
+    Cancel {
+        scope: agent_core::delegation::scope::Scope,
+    },
+    Close {
+        scope: agent_core::delegation::scope::Scope,
+    },
+    Approve {
+        scope: agent_core::delegation::scope::Scope,
+        request: String,
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+    },
+    Answer {
+        scope: agent_core::delegation::scope::Scope,
+        request: String,
+        answers: serde_json::Value,
+    },
+    Form {
+        scope: agent_core::delegation::scope::Scope,
+        request: String,
+        action: agent_core::form::FormAction,
+        content: Option<serde_json::Value>,
+    },
 }
 
 /// Where the model picker gets its rows: both agents' full model lists in one snapshot.

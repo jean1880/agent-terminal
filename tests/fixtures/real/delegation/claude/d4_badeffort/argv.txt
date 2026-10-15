@@ -1,0 +1,1 @@
+claude --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --include-partial-messages --mcp-config /REPO/target/delegation/claude/out/d4_badeffort/mcp-config.json --model haiku --effort bogus --strict-mcp-config --permission-mode bypassPermissions --no-session-persistence

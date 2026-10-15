@@ -282,6 +282,11 @@ impl AgentProcess {
         !self.shared.exited.get()
     }
 
+    /// The process id (also its process group id), when the spawn reported one.
+    pub fn pid(&self) -> Option<i32> {
+        self.shared.pid
+    }
+
     /// Queues one line for stdin (a newline is appended). Writes happen in call order.
     pub fn write_line(&self, line: &str) {
         let shared = &self.shared;
