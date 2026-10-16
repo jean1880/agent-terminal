@@ -650,6 +650,15 @@ impl Supervisor {
         operation: Option<agent_core::delegation::OperationId>,
         e: ToolError,
     ) {
+        // The failure is a lifecycle event on the worker's page, so its parent learns why
+        // without the journal; a worker never registered in memory has no page to show it on.
+        let notice = self.publication(
+            &worker,
+            agent_core::event::Envelope::new(agent_core::event::Event::Notice {
+                text: format!("worker failed: {}", e.message),
+            }),
+            Some(EventCategory::Lifecycle),
+        );
         let failed = self
             .services
             .durable("fail delegated worker", move |s| {
@@ -675,6 +684,9 @@ impl Supervisor {
                     .is_some_and(|w| w.state != "closed")
                 {
                     s.set_delegation_worker_state(worker.as_str(), "failed", Some(&e.message), at)?;
+                    if let Some(notice) = &notice {
+                        s.publish_delegation_event(notice)?;
+                    }
                 }
                 if let Some(operation) = operation {
                     s.record_delegation_dispatch(&operation, &DispatchFact::Failed(e))?;
@@ -692,6 +704,7 @@ impl Supervisor {
             state.workers.get_mut(worker).map(|w| {
                 w.row.state = "failed".into();
                 w.row.delegation_reason = Some(e.message.clone());
+                w.row.last_activity = Some(e.message.clone());
                 let run = w.run.take();
                 w.last_run = run.clone();
                 w.token = None;

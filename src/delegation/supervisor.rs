@@ -82,6 +82,13 @@ mod tests {
         }
     }
     fn harness() -> (tempfile::TempDir, Rc<Supervisor>, WorkerId) {
+        harness_with("claude", false)
+    }
+    /// `command` picks the fixture profile's driver; `hook_proven` is agy's approval hook.
+    fn harness_with(
+        command: &str,
+        hook_proven: bool,
+    ) -> (tempfile::TempDir, Rc<Supervisor>, WorkerId) {
         let dir = tempfile::tempdir().expect("private directory");
         {
             use std::os::unix::fs::PermissionsExt;
@@ -94,7 +101,7 @@ mod tests {
         let profile = Profile {
             id: "fixture".into(),
             name: "Fixture".into(),
-            command: "claude".into(),
+            command: command.into(),
             available_for_delegation: true,
             ..Default::default()
         };
@@ -137,7 +144,15 @@ mod tests {
                 })
             }),
             make_adapter: Rc::new(|_, _| Box::new(agent_core::claude::ClaudeAdapter::new())),
-            hook_check: Rc::new(|_| Box::pin(async { Err("not agy".into()) })),
+            hook_check: Rc::new(move |_| {
+                Box::pin(async move {
+                    if hook_proven {
+                        Ok(())
+                    } else {
+                        Err("not agy".into())
+                    }
+                })
+            }),
             tab_open_in: Rc::new(|_| false),
             report: Rc::new(|e| eprintln!("delegation test: {e}")),
         };
@@ -904,6 +919,77 @@ mod tests {
                 .code,
             ErrorCode::WorkspaceUntrusted
         );
+    }
+    #[test]
+    fn unregistered_agy_is_unavailable_and_a_refused_child_tells_its_parent_why() {
+        in_context(async {
+            let (dir, sup, root) = harness_with("agy", true);
+            connect(&sup, &root, ConnId(21)).await;
+            let caps = tool(
+                &sup,
+                ConnId(21),
+                1,
+                ToolRequest::Capabilities(Default::default()),
+            )
+            .await;
+            assert_eq!(caps["profiles"][0]["available"], false);
+            assert!(caps["profiles"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("registration"));
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("agy-unregistered"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "failed").await;
+            assert_eq!(
+                sup.state.borrow().workers[&worker].row.delegation_status,
+                "workspace_untrusted"
+            );
+            // A failed child revokes its root's authority; read once that has settled.
+            pump_until(|| !sup.state.borrow().roots[&root].revoking).await;
+            connect(&sup, &root, ConnId(22)).await;
+            // The parent's unfiltered page names the child, not the parent, and says why.
+            let start = Instant::now();
+            let mut id = 2;
+            let failure = loop {
+                let page = tool(&sup, ConnId(22), id, ToolRequest::Read(Default::default())).await;
+                id += 1;
+                if let Some(e) = page["events"].as_array().unwrap().iter().find(|e| {
+                    e["summary"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("worker failed:"))
+                }) {
+                    break e.clone();
+                }
+                assert!(start.elapsed() < Duration::from_secs(5), "no failure event");
+                glib::timeout_future(Duration::from_millis(10)).await;
+            };
+            assert_eq!(failure["worker_id"], worker.as_str());
+            assert!(failure["summary"]
+                .as_str()
+                .unwrap()
+                .contains("registration"));
+            let state = dir.path().join(".config/agent-terminal/delegation");
+            let preview = agent_kit::delegation_config::preview(
+                dir.path(),
+                &state,
+                &sup.services.bridge_command,
+                agent_kit::delegation_config::Action::Configure,
+            )
+            .unwrap();
+            agent_kit::delegation_config::apply(preview).unwrap();
+            let caps = tool(
+                &sup,
+                ConnId(22),
+                id,
+                ToolRequest::Capabilities(Default::default()),
+            )
+            .await;
+            assert_eq!(caps["profiles"][0]["available"], true);
+            stop(&sup).await;
+        });
     }
     #[test]
     fn authentication_binds_one_connection_and_rejects_stale_capabilities() {
