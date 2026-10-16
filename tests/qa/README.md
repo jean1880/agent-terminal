@@ -8,6 +8,7 @@ Everything runs through the Makefile, with standard tools: `cargo nextest` for t
 | `make test` | The suite, each test in its own process, in parallel (about 35 s) | You, while working |
 | `make check` | fmt, Clippy, the no-default-features build, the suite, the display tests, and these scripts' unit tests | CI on every push and PR (`gate / check`, required), and a release |
 | `make coverage` | The suite and the display tests instrumented; HTML and lcov in `target/qa-artifacts/coverage`; fails under `COVERAGE_FLOOR` (Makefile) | CI on every PR; a release requires it on the release commit |
+| `make test-one T=<name>` | The tests whose names contain `<name>`, display tests included, one at a time | You, rerunning one test |
 | `make hooks` | Opt in to a pre-commit hook: fmt and Clippy only | Your clone |
 
 Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
@@ -28,6 +29,54 @@ when coverage rises, never lower it to get a change through.
 Publish requires both to have passed on exactly the release commit, with nothing edited or
 generated in the tree during the run. The debian-maintainer beta task runs `make check` on
 the checkout it packages.
+
+## Environment variables
+
+You do not need to set any of these: every `make` test target sets the first group itself
+(`DISPLAY_ENV` in the Makefile). To change one for `make test-one`, copy `.env.example` to
+`.env` (git-ignored) and uncomment the line; `.env` is read on top of the defaults, and only by
+`make test-one`. Its format: `KEY=VALUE` per line, no quotes, no spaces in values, `#`
+comments, absolute paths (no `~` or `$HOME`).
+
+**Set by the Makefile for every test run**
+
+| Variable | Value | Why |
+|---|---|---|
+| `XDG_CONFIG_HOME` | `target/test-home/config` | `config.json` is read and written here, never in your `~/.config` |
+| `XDG_STATE_HOME` | `target/test-home/state` | The thread store, hand-off briefs and approval rules: never your real ones |
+| `XDG_CACHE_HOME` | `target/test-home/cache` | The model catalogue cache |
+| `XDG_DATA_HOME` | `target/test-home/data` | GLib and GTK's own user data |
+| `GSETTINGS_BACKEND` | `memory` | Nothing is written to your dconf database |
+| `GIT_CONFIG_NOSYSTEM` | `1` | Repository tests ignore the system git config… |
+| `GIT_CONFIG_GLOBAL` | `/dev/null` | …and yours, so they behave as on CI (which has no git identity) |
+| `GDK_BACKEND` | `x11` | The tests draw on the private Xvfb display `xvfb-run` starts |
+| `GTK_A11Y` | `test` | GTK's test accessibility backend: no AT-SPI bus needed |
+| `LANG` | `C.UTF-8` | Text measurement and sorting do not depend on your locale |
+| `AGENT_TERMINAL_QA_ARTIFACTS` | `target/qa-artifacts/screenshots` | Where layout tests save screenshots; unset, they take none |
+
+**Opt-in**
+
+| Variable | Effect |
+|---|---|
+| `RUST_LOG` | Log filter for the app's output in a failing test's stderr (`debug`, `agent_terminal::window=debug`, …) |
+| `AGENT_TERMINAL_BENCH_DB` | A scratch **copy** of a real `threads.db` for the store's append benchmark (`make test-one T=append_bench`). Never your live store |
+
+**Make variables** (on the command line: `make test NEXTEST_PROFILE=ci`)
+
+| Variable | Effect |
+|---|---|
+| `T` | `make test-one` only: the test name filter (required) |
+| `NEXTEST_PROFILE` | The `.config/nextest.toml` profile (`default`; CI uses `ci`) |
+| `COVERAGE_FLOOR` | `make coverage`'s minimum line coverage |
+
+**Never set these yourself.** The app sets them for the agent processes it starts, and tests
+check that it does: `AGENT_TERMINAL_APPROVAL_SOCKET` (agy's approval hook), `AGENT_TERMINAL_HOOK_BIN`
+(set from the running binary), `AGENT_TERMINAL_DELEGATION_ENDPOINT`, `_INSTANCE`, `_CAP` and
+`_APP_PID` (delegated workers), and `AGENT_TERMINAL_RESTART_FIXTURE` (a test re-running itself as
+a child process).
+
+The app's own runtime variables (demo mode, logging, where it keeps its files) are in the main
+README, under "Environment variables".
 
 ## Mutation testing
 
