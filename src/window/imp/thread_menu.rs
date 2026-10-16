@@ -507,15 +507,16 @@ impl AgentTerminalWindow {
             self.confirm_stop_then(thread, move |imp| imp.archive_now(&id));
             return;
         }
+        // Stored before the page closes: an archived thread is never discarded as blank.
+        self.store_archived(thread, archived);
         if archived {
             self.close_row_now(&key);
         }
-        self.store_archived(thread, archived);
     }
 
     fn archive_now(&self, thread: &str) {
-        self.close_row_now(&RowKey::Thread(thread.to_owned()));
         self.store_archived(thread, true);
+        self.close_row_now(&RowKey::Thread(thread.to_owned()));
     }
 
     fn store_archived(&self, thread: &str, archived: bool) {
@@ -558,7 +559,11 @@ impl AgentTerminalWindow {
     fn delete_thread_now(&self, thread: &str) {
         self.close_row_now(&RowKey::Thread(thread.to_owned()));
         let id = thread.to_owned();
-        self.write_store("delete the thread", move |s| s.delete_thread(&id));
+        // Closing a blank thread's page may have discarded it already: that is deleted too.
+        self.write_store("delete the thread", move |s| match s.delete_thread(&id) {
+            Err(agent_kit::store::StoreError::NotFound(_)) => Ok(()),
+            done => done,
+        });
         self.show_toast("Thread deleted");
     }
 
@@ -785,6 +790,10 @@ pub(super) mod tests {
 
         // Continue in, before anything was said: there is nothing to hand over, so no thread
         // is made.
+        // Counted once the blank pages left behind by earlier checks have been discarded.
+        for _ in 0..50 {
+            ctx.iteration(false);
+        }
         let pages = imp.tabs.borrow().len();
         imp.run_thread_action(ThreadAction::ContinueIn {
             thread: thread.clone(),

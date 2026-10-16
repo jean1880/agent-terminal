@@ -122,9 +122,11 @@ pub(super) mod tests {
         let target = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let dir = target.path().to_string_lossy().into_owned();
+        // Titled: left blank, it would be discarded once the next thread is shown.
         let source = imp
             .create_chat_thread(NewThread {
                 dir: Some(dir.clone()),
+                title: Some("source".into()),
                 ..NewThread::new(Driver::Claude)
             })
             .unwrap();

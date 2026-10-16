@@ -502,6 +502,12 @@ impl ChatView {
         }
     }
 
+    /// Whether the composer holds unsent text (a thread with one is not blank).
+    pub fn has_draft(&self) -> bool {
+        self.inner()
+            .is_some_and(|inner| !inner.composer.text().trim().is_empty())
+    }
+
     /// Stops the thread's agent process and starts it again on the same conversation (a
     /// recovery tool: Restart Agent in the window menu).
     pub fn restart_agent(&self) {

@@ -1163,6 +1163,8 @@ pub struct AgentTerminalWindow {
     show_archived: std::cell::Cell<bool>,
     /// A new thread asked for while agents were still being detected: (folder, prompt).
     pending_new_thread: RefCell<Option<(Option<String>, Option<String>)>>,
+    /// The thread page last in view: left blank, it is discarded when another page is shown.
+    shown_thread: RefCell<Option<String>>,
     /// The thread sidebar beside the pages.
     split_view: RefCell<Option<adw::OverlaySplitView>>,
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
@@ -2522,6 +2524,7 @@ impl AgentTerminalWindow {
                             session.shutdown(!chat.unread);
                         }
                         imp.withdraw_thread_notifications(&chat.thread);
+                        imp.discard_if_blank(chat);
                     }
                     imp.withdraw_quota_notification(tab.key);
                     if let Some(worktree) = &tab.worktree {

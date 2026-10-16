@@ -297,6 +297,17 @@ impl ChatTab {
             self.starting = false;
         }
     }
+
+    /// Nothing on the page the user would miss: no title, nothing waiting to be sent or applied,
+    /// no draft. The store has the last word ([`agent_kit::store::Store::delete_if_blank`]).
+    pub(super) fn looks_blank(&self) -> bool {
+        self.title.is_empty()
+            && self.title_item.is_none()
+            && self.pending_prompt.is_none()
+            && self.pending_handoff.is_none()
+            && self.pending_switch.is_none()
+            && !self.view.as_ref().is_some_and(ChatView::has_draft)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2942,6 +2953,7 @@ impl AgentTerminalWindow {
             obj,
             move |view| {
                 let imp = obj.imp();
+                imp.leave_shown_thread(view.selected_page().as_ref());
                 if let Some(page) = view.selected_page() {
                     imp.page_shown(&page);
                 }
@@ -2980,6 +2992,70 @@ impl AgentTerminalWindow {
                 imp.for_each_window(|window| window.refresh_sidebar());
             }
         ));
+    }
+
+    /// Another page (or none) came into view: the thread page that was shown, left blank, is
+    /// closed, and its page's detach discards it ([`Self::discard_if_blank`]).
+    fn leave_shown_thread(&self, now: Option<&adw::TabPage>) {
+        let now_thread = now.and_then(|page| {
+            self.tabs
+                .borrow()
+                .iter()
+                .find(|t| &t.page == page)
+                .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+        });
+        let Some(left) = self
+            .shown_thread
+            .replace(now_thread.clone())
+            .filter(|t| Some(t) != now_thread.as_ref())
+        else {
+            return;
+        };
+        if !self.thread_page_looks_blank(&left) {
+            return;
+        }
+        // Not from inside the selection change: once it has settled, and only if still blank
+        // and still not in view.
+        let obj = self.obj().downgrade();
+        glib::idle_add_local_once(move || {
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let key = RowKey::Thread(left.clone());
+            if imp.selected_row_key().as_ref() != Some(&key) && imp.thread_page_looks_blank(&left) {
+                debug!("Closing blank thread {left}");
+                imp.close_local_row_now(&key);
+            }
+        });
+    }
+
+    /// The thread has a page in this window that [`ChatTab::looks_blank`] and runs nothing.
+    fn thread_page_looks_blank(&self, thread: &str) -> bool {
+        // Pages reopened from the last session change the selection without the user leaving.
+        if self.is_closing() || self.restoring_threads.get() {
+            return false;
+        }
+        let blank = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .any(|c| c.thread == thread && c.looks_blank());
+        blank && !self.row_is_busy(&RowKey::Thread(thread.to_owned()))
+    }
+
+    /// A thread page that looked blank was closed: deletes the thread if the store agrees it
+    /// holds nothing (checked behind every write already queued for it).
+    pub(super) fn discard_if_blank(&self, chat: &ChatTab) {
+        if self.is_closing() || !chat.looks_blank() {
+            return;
+        }
+        let id = chat.thread.clone();
+        self.write_store("discard a blank thread", move |s| {
+            if s.delete_if_blank(&id)? {
+                info!("Discarded blank thread {id}");
+            }
+            Ok(())
+        });
     }
 
     /// Shows the open pages, or the empty state when there are none. While the last session's
@@ -3033,6 +3109,8 @@ impl AgentTerminalWindow {
                 (chat.thread.clone(), chat.title.clone(), dir)
             })
         };
+        // Also here: a first page is selected before it is registered, then shown directly.
+        *self.shown_thread.borrow_mut() = info.as_ref().map(|(thread, ..)| thread.clone());
         let Some((thread, title, dir)) = info else {
             // A terminal page: the 2.x handler puts its terminal title in the subtitle.
             if let Some(window_title) = self.window_title.borrow().as_ref() {
@@ -6089,11 +6167,15 @@ pub(super) mod tests {
             .borrow()
             .is_some()));
         CHAT_RESTORED.with(|done| done.set(true));
+        // Titled: a blank thread left for the next one would be discarded.
         let ids: Vec<_> = (0..2)
-            .map(|_| {
+            .map(|i| {
                 window
                     .imp()
-                    .create_chat_thread(NewThread::new(Driver::Claude))
+                    .create_chat_thread(NewThread {
+                        title: Some(format!("t{i}")),
+                        ..NewThread::new(Driver::Claude)
+                    })
                     .unwrap();
                 window.imp().current_thread().unwrap()
             })
@@ -6130,6 +6212,60 @@ pub(super) mod tests {
         window.destroy();
         crate::testutil::settle(&ctx);
         assert_eq!(read_layout(), before);
+    }
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn leaving_a_blank_thread_discards_it_and_a_titled_one_stays() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.BlankThreads")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        // Before the window: one built while the last session is restored discards nothing.
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        window.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        let store = app_store();
+        let exists = |id: &str| store.thread_summary(id).ok().flatten().is_some();
+
+        imp.create_chat_thread(NewThread::new(Driver::Claude))
+            .unwrap();
+        let blank = imp.current_thread().unwrap();
+        imp.create_chat_thread(NewThread {
+            title: Some("named".into()),
+            ..NewThread::new(Driver::Claude)
+        })
+        .unwrap();
+        let named = imp.current_thread().unwrap();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || !exists(&blank)),
+            "the blank thread left behind is deleted"
+        );
+        assert_eq!(imp.thread_pages(), 1, "and its page closed");
+
+        // Leaving a titled thread keeps it, page and all.
+        imp.create_chat_thread(NewThread::new(Driver::Claude))
+            .unwrap();
+        crate::testutil::settle(&ctx);
+        assert!(exists(&named));
+        assert_eq!(imp.thread_pages(), 2);
+        window.destroy();
+        crate::testutil::settle(&ctx);
     }
 
     #[test]

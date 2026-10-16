@@ -455,11 +455,22 @@ agent-terminal --resume <id> --dir ~/git/some-project
 
 | Variable | Effect |
 |---|---|
-| `RUST_LOG` | Log level and filters (default `info`). |
+| `RUST_LOG` | Log level and filters (default `info`), e.g. `debug` or `agent_terminal::window=debug`. |
 | `XDG_CONFIG_HOME` | Where `agent-terminal/config.json` lives (default `~/.config`). Point it at a scratch folder to run an isolated copy. |
 | `XDG_STATE_HOME` | Where the thread store, hand-off briefs and approval rules live (default `~/.local/state`). |
-| `AGENT_TERMINAL_HOOK_BIN` | The binary agy's approval hook runs (default `agent-terminal` on `PATH`). |
+| `XDG_CACHE_HOME` | Where the model catalogue is cached (default `~/.cache`). |
+| `XDG_RUNTIME_DIR` | Private runtime files: agy's approval socket, diff temp files, the delegation socket. Set by your login session; without it agy's approval hook and delegation are unavailable. |
 | `AGENT_TERMINAL_DEMO_THREADS` | Set to `1` for demo threads in place of yours (in memory, no agents run). |
+| `AGENT_TERMINAL_DEMO_SCENE` | Opens a demo on one scene. With `--chat-demo`: `diff`, `workers`, `usage`, `queue`, `requests` or `requests-risky`. With `AGENT_TERMINAL_DEMO_THREADS=1`: `closing` (the closing screen). |
+| `AGENT_TERMINAL_DEMO_CODEX_WORKERS` | With `--chat-demo`, `1` plays the Codex sub-agent script. |
+| `AGENT_TERMINAL_DEMO_STRESS` | With `--chat-demo`, preloads that many transcript items (a long-thread stress test). |
+
+The app sets these itself for the agent processes it starts. Never set them yourself:
+`AGENT_TERMINAL_HOOK_BIN` (the binary agy's approval hook runs, taken from the running app),
+`AGENT_TERMINAL_APPROVAL_SOCKET`, and the `AGENT_TERMINAL_DELEGATION_*` variables.
+
+The test runs have their own variables; see [`tests/qa/README.md`](tests/qa/README.md#environment-variables)
+and [`.env.example`](.env.example).
 
 ## Keyboard shortcuts
 
