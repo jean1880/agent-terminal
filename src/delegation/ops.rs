@@ -695,14 +695,19 @@ impl Supervisor {
             .map(|w| w.generation);
         let result = self.check_agy(worker).await;
         if let Err(e) = &result {
-            let live = self
+            let (current, live) = self
                 .state
                 .borrow()
                 .workers
                 .get(worker)
-                .is_some_and(|w| Some(w.generation) == generation && !w.generations.is_empty());
-            if live {
+                .filter(|w| Some(w.generation) == generation)
+                .map_or((false, false), |w| (true, !w.generations.is_empty()));
+            // A child refused before its first launch is failed by the launch path, but its
+            // status must still say why, never the `available` it was created with.
+            if current {
                 self.set_status(worker, "workspace_untrusted", &e.message);
+            }
+            if live {
                 self.fail_worker(worker, e.clone());
             }
         }
@@ -983,7 +988,7 @@ impl Supervisor {
             ));
         }
         match req {
-            ToolRequest::Capabilities(r) => self.capabilities(&worker, r),
+            ToolRequest::Capabilities(r) => self.capabilities(&worker, r).await,
             ToolRequest::List(r) => self.list_workers(&worker, r),
             ToolRequest::Read(r) => self.read_page(&worker, r).await,
             ToolRequest::Wait(r) => self.wait_page(conn, call.id, &worker, r).await,
@@ -993,7 +998,28 @@ impl Supervisor {
             ToolRequest::Close(r) => self.close_worker_call(&worker, r).await,
         }
     }
-    fn capabilities(
+    /// Whether an agy profile's managed MCP registration would let a child launch: the same
+    /// check `check_agy` makes before every agy spawn, run off the main thread.
+    async fn agy_registration(&self, profile: &str) -> Result<(), ToolError> {
+        let profile = (self.services.profiles)()
+            .into_iter()
+            .find(|p| p.id == profile)
+            .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "profile unavailable"))?;
+        let resolved = (self.services.resolve)(&profile)
+            .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "agent unavailable"))?;
+        let bridge = self.services.bridge_command.clone();
+        gio::spawn_blocking(move || {
+            managed_registration_ready(&agent_home(&resolved.env)?, &bridge)
+        })
+        .await
+        .map_err(|_| {
+            error(
+                ErrorCode::WorkspaceUntrusted,
+                "agy registration check failed",
+            )
+        })?
+    }
+    async fn capabilities(
         &self,
         worker: &WorkerId,
         request: CapabilitiesRequest,
@@ -1066,7 +1092,19 @@ impl Supervisor {
                     },
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // agy refuses every launch without its managed registration: say so here rather than
+        // accept a spawn that can only fail.
+        let mut profiles = profiles;
+        for p in profiles
+            .iter_mut()
+            .filter(|p| p.available && p.driver == Driver::Agy)
+        {
+            if let Err(e) = self.agy_registration(p.profile_id.as_str()).await {
+                p.available = false;
+                p.reason = Some(e.message);
+            }
+        }
         let mut response = CapabilitiesResponse {
             api_version: 1,
             caller,
@@ -1406,6 +1444,22 @@ impl Supervisor {
             });
     }
 }
+/// The home an agent launched with `env` sees, as `check_agy` derives it: the profile's own
+/// `HOME`, else the app's, unless the profile unsets it.
+fn agent_home(env: &crate::agent_proc::AgentEnv) -> Result<std::path::PathBuf, ToolError> {
+    env.env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "HOME")
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|_| !env.unset.iter().any(|k| k == "HOME"))
+        })
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| error(ErrorCode::WorkspaceUntrusted, "agent home unavailable"))
+}
 pub(super) fn managed_registration_ready(
     home: &std::path::Path,
     command: &std::path::Path,
@@ -1417,10 +1471,11 @@ pub(super) fn managed_registration_ready(
         command,
         agent_kit::delegation_config::Action::Configure,
     )
-    .map_err(|_| {
+    // `preview`'s messages name a condition, never file contents: safe to pass on.
+    .map_err(|e| {
         error(
             ErrorCode::WorkspaceUntrusted,
-            "agy managed MCP registration is missing or conflicting",
+            &format!("agy managed MCP registration is unusable: {e}"),
         )
     })?;
     if plan.changed() {

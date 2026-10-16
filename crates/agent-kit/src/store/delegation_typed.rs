@@ -2271,7 +2271,20 @@ impl Store {
         )?;
         let env: Envelope = serde_json::from_str(&json)?;
         let links = self.delegation_event_links(seq)?;
-        let in_scope = links.iter().find(|l| scope.contains(l.worker_id.as_str()));
+        // An event is linked to its worker and every ancestor; the page names the deepest
+        // in scope (the worker it came from), never whichever ancestor id sorts first.
+        let mut in_scope = None;
+        let mut deepest = -1;
+        for l in links
+            .iter()
+            .filter(|l| scope.contains(l.worker_id.as_str()))
+        {
+            let depth = self.delegation_worker(&l.worker_id)?.map_or(0, |w| w.depth);
+            if depth > deepest {
+                deepest = depth;
+                in_scope = Some(l);
+            }
+        }
         if let Event::DelegatedMessage { message_id: m, .. } = &env.event {
             let Some(row) = self.delegation_message(m.as_str())? else {
                 return Ok(None);
@@ -2881,8 +2894,14 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
                 ItemStatus::Declined => "declined",
                 ItemStatus::Interrupted => "interrupted",
             };
-            let detail = error.as_deref().or(output.as_deref()).unwrap_or("");
-            (format!("item {status}: {detail}"), None)
+            match error
+                .as_deref()
+                .or(output.as_deref())
+                .filter(|d| !d.is_empty())
+            {
+                Some(detail) => (format!("item {status}: {detail}"), None),
+                None => (format!("item {status}"), None),
+            }
         }
         Event::ApprovalRequested { tool, title, .. } => (
             format!("approval requested: {}", title.as_deref().unwrap_or(tool)),
