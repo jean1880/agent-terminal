@@ -1012,6 +1012,48 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes the thread only if it is still blank ([`Store::is_blank`]), checked and deleted
+    /// in one write transaction so a message stored just before cannot be lost. Returns whether
+    /// it was deleted.
+    pub fn delete_if_blank(&self, thread: &str) -> Result<bool> {
+        let tx = self.write_txn()?;
+        if !self.is_blank(thread)? {
+            return Ok(false);
+        }
+        self.delete_thread(thread)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Whether the thread holds nothing the user would miss: not archived, no title, no unsent first prompt,
+    /// and no stored event beyond the session's own bookkeeping (start, exit, models, modes,
+    /// usage). Any other event type, including one added later, counts as content.
+    pub fn is_blank(&self, thread: &str) -> Result<bool> {
+        let Some(summary) = self.thread_summary(thread)? else {
+            return Ok(false);
+        };
+        if !summary.title.is_empty() || summary.archived {
+            return Ok(false);
+        }
+        if self
+            .meta(&pending_prompt_key(thread))?
+            .is_some_and(|p| !p.is_empty())
+        {
+            return Ok(false);
+        }
+        let content: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE thread_id = ?1
+                AND COALESCE(json_extract(envelope_json, '$.event.type'), '') NOT IN (
+                    'session_started', 'session_exited', 'commands_changed', 'usage_updated',
+                    'quota_updated', 'rate_limited', 'model_changed', 'model_change_requested',
+                    'model_change_failed', 'mode_changed', 'mode_change_deferred', 'mode_chosen',
+                    'control_result', 'background_tasks', 'workers_updated', 'error'))",
+            params![thread],
+            |r| r.get(0),
+        )?;
+        Ok(!content)
+    }
+
     /// Remembers a native session as no longer the thread's to list again (its thread moved on
     /// to another session, e.g. a resume that started a new one).
     pub fn dismiss_native(&self, driver: &str, native_id: &str) -> Result<()> {
@@ -2159,6 +2201,53 @@ mod tests {
         s.set_pending_prompt(&t, "recover me").unwrap();
         s.delete_thread(&t).unwrap();
         assert_eq!(s.meta(&pending_prompt_key(&t)).unwrap(), None);
+    }
+
+    #[test]
+    fn only_a_blank_thread_is_deleted_if_blank() {
+        let s = store();
+        let bookkeeping = [
+            Event::SessionStarted {
+                native_id: "n".into(),
+                model: None,
+                cwd: None,
+            },
+            Event::UsageUpdated {
+                used: 1,
+                max: None,
+                auto_compact_at: None,
+            },
+        ];
+        let blank = s.create_thread("/w", None).unwrap();
+        for e in &bookkeeping {
+            s.append_event(&blank, None, &Envelope::new(e.clone()))
+                .unwrap();
+        }
+        assert!(s.delete_if_blank(&blank).unwrap());
+        assert!(s.thread_summary(&blank).unwrap().is_none());
+        // Gone already: nothing to delete, and no error.
+        assert!(!s.delete_if_blank(&blank).unwrap());
+
+        let named = s.create_thread("/w", Some("kept")).unwrap();
+        let archived = s.create_thread("/w", None).unwrap();
+        s.set_archived(&archived, true).unwrap();
+        let unsent = s.create_thread("/w", None).unwrap();
+        s.set_pending_prompt(&unsent, "first").unwrap();
+        let written = s.create_thread("/w", None).unwrap();
+        s.append_event(&written, None, &started("u1", ItemKind::UserMessage))
+            .unwrap();
+        // An event type outside the bookkeeping list is content, whatever it is.
+        let noticed = s.create_thread("/w", None).unwrap();
+        s.append_event(
+            &noticed,
+            None,
+            &Envelope::new(Event::Notice { text: "hi".into() }),
+        )
+        .unwrap();
+        for t in [&named, &archived, &unsent, &written, &noticed] {
+            assert!(!s.delete_if_blank(t).unwrap(), "{t} has content");
+            assert!(s.thread_summary(t).unwrap().is_some());
+        }
     }
 
     fn delta(item: &str, text: &str) -> Envelope {
