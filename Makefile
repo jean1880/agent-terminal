@@ -11,7 +11,7 @@ LOCAL_ICON_DIR = $(HOME)/.local/share/icons/hicolor/scalable/apps
 LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 
 .PHONY: all build start-local clean install uninstall package deps help bump-version bum-version release \
-	test check coverage hooks lint test-display test-one test-stress test-qa test-deps
+	test check coverage hooks lint test-display test-one test-stress test-qa test-deps bench
 
 # ---- Tests -----------------------------------------------------------------------------------
 # Tools: cargo-nextest and cargo-llvm-cov (`make test-deps`), plus xvfb-run and dbus-run-session.
@@ -28,7 +28,14 @@ DISPLAY_ENV = XDG_CONFIG_HOME=$(TEST_HOME)/config XDG_DATA_HOME=$(TEST_HOME)/dat
 	GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
 	AGENT_TERMINAL_QA_ARTIFACTS=$(QA_ARTIFACTS)/screenshots
 DISPLAY_RUN = env $(DISPLAY_ENV) xvfb-run -a dbus-run-session --
+# DISPLAY_RUN with .env (git-ignored, optional) on top: copy .env.example, which documents it.
+DOTENV_RUN = env $(DISPLAY_ENV) $$(if [ -f .env ]; then grep -v '^[[:space:]]*\#' .env; fi) \
+	xvfb-run -a dbus-run-session --
 NEXTEST_PROFILE ?= default
+# Extra cargo-nextest flags for test, test-display, test-one, test-stress and bench, e.g.
+# ARGS=--no-capture or ARGS='--retries 2'. (Not coverage, whose runs CI pins.)
+ARGS ?=
+NEXTEST = cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) $(ARGS)
 
 all: build
 
@@ -44,6 +51,8 @@ help:
 	@echo "  make test                 - Run the test suite (parallel, about 35 s)"
 	@echo "  make test-one T=<name>    - Tests matching <name>, display tests included (.env overrides: see .env.example)"
 	@echo "  make test-stress T=<name> [N=30] - Tests matching <name>, run N times under a display, to prove a flaky test fixed"
+	@echo "  make bench T=<name>       - Benchmarks/measurements matching <name>: optimised build, output shown"
+	@echo "  ARGS='<nextest flags>'    - Extra flags for test, test-display, test-one, test-stress, bench"
 	@echo "  make check                - Everything CI and a release run: lint, all tests, display tests"
 	@echo "  make coverage             - Instrumented run, HTML report, fails under COVERAGE_FLOOR ($(COVERAGE_FLOOR)%)"
 	@echo "  make hooks                - Opt in to the pre-commit hook (fmt and clippy)"
@@ -116,22 +125,28 @@ $(TEST_HOME):
 
 # The suite, each test in its own process (.config/nextest.toml).
 test: $(TEST_HOME)
-	$(DISPLAY_RUN) cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE)
+	$(DISPLAY_RUN) $(NEXTEST)
 
 # Tests that present windows and measure layout: #[ignore]d so `test` stays fast, run here one
 # at a time so none is measured while another loads the machine.
 test-display: $(TEST_HOME)
-	$(DISPLAY_RUN) cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
-		--run-ignored only --test-threads 1
+	$(DISPLAY_RUN) $(NEXTEST) --run-ignored only --test-threads 1
 
 # The tests whose names match T, display tests included, one at a time, in DISPLAY_ENV with
 # .env (git-ignored, optional) on top: copy .env.example, which documents every variable.
 test-one: $(TEST_HOME)
-	@test -n "$(T)" || { echo "usage: make test-one T=<test name>"; exit 2; }
-	env $(DISPLAY_ENV) $$(if [ -f .env ]; then grep -v '^[[:space:]]*#' .env; fi) \
-		xvfb-run -a dbus-run-session -- \
-		cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
-		--run-ignored all --test-threads 1 -E 'test($(T))'
+	@test -n "$(T)" || { echo "usage: make test-one T=<test name> [ARGS=<nextest flags>]"; exit 2; }
+	$(DOTENV_RUN) $(NEXTEST) --run-ignored all --test-threads 1 -E 'test($(T))'
+
+# test-one for benchmarks and measurements: optimised build, output shown (they print their
+# numbers), and the tests .config/nextest.toml's default-filter keeps out of every other run
+# included. --no-capture also runs them one at a time. BENCH_PROFILE is the cargo profile:
+# measure (Cargo.toml: release without LTO), release (exactly what ships, slow to build) or dev.
+BENCH_PROFILE ?= measure
+bench: $(TEST_HOME)
+	@test -n "$(T)" || { echo "usage: make bench T=<test name> [BENCH_PROFILE=dev]"; exit 2; }
+	$(DOTENV_RUN) $(NEXTEST) --cargo-profile $(BENCH_PROFILE) --no-capture --ignore-default-filter \
+		--run-ignored all -E 'test($(T))'
 
 # The tests whose names match T, run N times over (default 30) in DISPLAY_ENV, to prove a flaky
 # test fixed or catch one: no retries, every iteration reported, failures summarised at the end.
@@ -139,8 +154,7 @@ test-one: $(TEST_HOME)
 STRESS_COUNT ?= 30
 test-stress: $(TEST_HOME)
 	@test -n "$(T)" || { echo "usage: make test-stress T=<test name> [N=<runs>]"; exit 2; }
-	$(DISPLAY_RUN) cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
-		--retries 0 --no-fail-fast --stress-count $(or $(N),$(STRESS_COUNT)) \
+	$(DISPLAY_RUN) $(NEXTEST) --retries 0 --no-fail-fast --stress-count $(or $(N),$(STRESS_COUNT)) \
 		--hide-progress-bar --status-level fail --final-status-level fail -E 'test($(T))'
 
 # The QA scripts' own unit tests (package smoke, live-smoke checks): no network, no quota.

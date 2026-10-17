@@ -10,6 +10,7 @@ Everything runs through the Makefile, with standard tools: `cargo nextest` for t
 | `make coverage` | The suite and the display tests instrumented; HTML and lcov in `target/qa-artifacts/coverage`; fails under `COVERAGE_FLOOR` (Makefile) | CI on every PR; a release requires it on the release commit |
 | `make test-one T=<name>` | The tests whose names contain `<name>`, display tests included, one at a time | You, rerunning one test |
 | `make test-stress T=<name> [N=30]` | The tests whose names contain `<name>`, `N` times over, no retries, failures summarised at the end. Tests in each pass run in parallel, as in `make test`, so they load each other | You, proving a flaky test fixed (a fix needs a clean stress run, not one green CI) |
+| `make bench T=<name>` | The benchmarks and measurements whose names contain `<name>`, optimised build (`measure` profile: release without LTO), output shown, the `default-filter` exclusions included, one at a time | You, measuring a cost (`resize_cost`, `append_bench`, `stream_cost`) |
 | `make hooks` | Opt in to a pre-commit hook: fmt and Clippy only | Your clone |
 
 Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
@@ -34,9 +35,9 @@ the checkout it packages.
 ## Environment variables
 
 You do not need to set any of these: every `make` test target sets the first group itself
-(`DISPLAY_ENV` in the Makefile). To change one for `make test-one`, copy `.env.example` to
-`.env` (git-ignored) and uncomment the line; `.env` is read on top of the defaults, and only by
-`make test-one`. Its format: `KEY=VALUE` per line, no quotes, no spaces in values, `#`
+(`DISPLAY_ENV` in the Makefile). To change one for `make test-one` or `make bench`, copy
+`.env.example` to `.env` (git-ignored) and uncomment the line; `.env` is read on top of the
+defaults, and only by those two (never `make test-stress`, which must run as CI does). Its format: `KEY=VALUE` per line, no quotes, no spaces in values, `#`
 comments, absolute paths (no `~` or `$HOME`).
 
 **Set by the Makefile for every test run**
@@ -60,14 +61,16 @@ comments, absolute paths (no `~` or `$HOME`).
 | Variable | Effect |
 |---|---|
 | `RUST_LOG` | Log filter for the app's output in a failing test's stderr (`debug`, `agent_terminal::window=debug`, …) |
-| `AGENT_TERMINAL_BENCH_DB` | A scratch **copy** of a real `threads.db` for the store's append benchmark (`make test-one T=append_bench`). Never your live store |
+| `AGENT_TERMINAL_BENCH_DB` | A scratch **copy** of a real `threads.db` for the store's append benchmark (`make bench T=append_bench`). Never your live store |
 
 **Make variables** (on the command line: `make test NEXTEST_PROFILE=ci`)
 
 | Variable | Effect |
 |---|---|
-| `T` | `make test-one` and `make test-stress`: the test name filter (required) |
+| `T` | `make test-one`, `make test-stress` and `make bench`: the test name filter (required) |
 | `N` | `make test-stress`: how many times to run (default `STRESS_COUNT`, 30) |
+| `ARGS` | Extra `cargo nextest run` flags for `test`, `test-display`, `test-one`, `test-stress` and `bench` (`ARGS=--no-capture`, `ARGS='--retries 2'`); not `coverage` |
+| `BENCH_PROFILE` | `make bench`'s cargo profile: `measure` (default, release without LTO), `release` (exactly what ships, slow to build) or `dev` |
 | `NEXTEST_PROFILE` | The `.config/nextest.toml` profile (`default`; CI uses `ci`) |
 | `COVERAGE_FLOOR` | `make coverage`'s minimum line coverage |
 

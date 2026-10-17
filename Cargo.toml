@@ -85,6 +85,15 @@ lto = true
 strip = true
 codegen-units = 1
 
+# `make bench`: optimised like release, but without LTO's long single-unit builds, and with
+# symbols kept so a failing measurement's backtrace is readable.
+[profile.measure]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
+
 [package.metadata.deb]
 maintainer = "Jean-Luc Desroches <jean1880@users.noreply.github.com>"
 copyright = "2026, Jean-Luc Desroches"
