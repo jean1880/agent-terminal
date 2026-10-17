@@ -28,7 +28,7 @@ or read by the harness.
 | G-C1, restricted Bash | Passed | The local model emits a valid Bash `tool_use`; the installed CLI raises `can_use_tool`; a host deny prevents `touch proof-denied`. |
 | G-C3, Claude token persistence | Passed | A capability exists only in the MCP overlay's server environment; no exact canary appears in any generated provider-home file after the completed turn and process exit. |
 | G-X1, Codex ambient MCP isolation | Passed with a compatibility correction | Effective config contains an enabled `ambient` fixture server. Per-thread disabling prevents its process from starting, and every observed MCP startup status names only `agent_terminal`. Sandbox and approval policy read back exactly. |
-| G-X2, Codex native delegation | **Failed; Codex children cannot be admitted** | The actual outgoing Responses request advertises `collaboration.spawn_agent`; a valid invocation produces `subAgentActivity` with a new `agentThreadId`, despite both process and per-thread feature disables. An enabled positive control also starts a worker. |
+| G-X2, Codex native delegation | **Failed; Codex children admitted with a caveat (2026-10-16)** | The actual outgoing Responses request advertises `collaboration.spawn_agent`; a valid invocation produces `subAgentActivity` with a new `agentThreadId`, despite both process and per-thread feature disables. An enabled positive control also starts a worker. |
 | G-X3, Codex token persistence | Passed | No exact capability canary appears in the disposable provider home, including session rollouts and SQLite files. |
 | Codex root overlay on resume | Passed | A fresh app-server resumes the saved native thread with the overlay resent, starts a fresh MCP process and completes another turn through the local model fixture. |
 | G-A1, agy hook payload/enforcement | Passed | A real agy cloud turn calls the actual app approval-hook client. Its own MCP call is allowed, a foreign MCP call is denied, and a native sub-agent invocation is denied. Only the own MCP call reaches its server. |
@@ -39,15 +39,23 @@ G-X2 remains failed with `agents.max_depth=0` and `agents.max_threads=1`.
 `agents.max_threads=0` is rejected: the installed CLI requires at least one
 concurrent thread. Feature flags read back false, so their echo is explicitly
 insufficient evidence. The generated app-server schema has no per-turn built-in
-tool exclusion field. Codex **parent** routes can be admitted independently;
-Codex child routes must report their native-delegation blocker clearly.
+tool exclusion field. Codex **parent** routes can be admitted independently.
 
 Admission records each gate independently in `delegation/route.rs`. On
 2026-10-15, native Codex runtime and security reviews and an independent Claude
 source review passed the final implementation. The coordinator then admitted
 Claude and agy children **with a bridge** from Claude, Codex and agy parents in
-Plan, Ask and AcceptEdits. Codex children remain Unsupported, with
-`codex_native_delegation` as their sole measured blocker.
+Plan, Ask and AcceptEdits.
+
+On 2026-10-16 the owner admitted Codex children too, so that every agent can use every
+other as a sub-agent. G-X2 is still a failed, measured gate and is not cleared: it is
+now a **caveat**, not a blocker. A Codex child's route is Verified and carries
+`route_caveats: ["codex_native_workers_unsupervised"]` in `cross_agent_capabilities`
+(the tool schema explains it), and the settings say the same. Such a child's own
+built-in sub-agents run outside the app's depth, mode and worktree limits; the app
+shows them in the worker dock but cannot stop them starting. Every other Codex child
+gate (G-X1 MCP isolation, sandbox and approval read-back, G-X3) still applies at its
+start-up check. Revisit when a Codex release honours its native-delegation disables.
 
 The reviewed application gates cover managed entry/rules/source enforcement,
 full L2 workspace checks, L3/L4 caller binding, fresh hook proof and actual
@@ -96,8 +104,8 @@ make delegation-proof PROOF_ARGS=--provider=codex
 ```
 
 The last command currently exits non-zero because G-X2 is a measured failed
-gate. It still records independent passing gates; this failure is not hidden by
-the parent-only proof.
+gate (admitted as a caveat, above). It still records independent passing gates;
+this failure is not hidden by the parent-only proof.
 
 agy requires its cloud backend. A completely isolated home fails authentication
 before any inference (zero turns and tokens). The successful proof used an

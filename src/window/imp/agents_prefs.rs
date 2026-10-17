@@ -500,13 +500,13 @@ impl AgentTerminalWindow {
             .build();
         general.add(&self.default_agent_row());
         page.add(&general);
-        let (delegation, registration_row) = self.delegation_group(dialog);
+        let (delegation, switches) = self.delegation_group(dialog);
         page.add(&delegation);
 
         page.add(&self.permissions_group());
 
         for driver in Driver::ALL {
-            page.add(&self.agent_group(driver, dialog, &registration_row));
+            page.add(&self.agent_group(driver, dialog, &switches));
         }
         dialog.add(&page);
     }
@@ -1398,7 +1398,7 @@ impl AgentTerminalWindow {
         &self,
         driver: Driver,
         dialog: &adw::PreferencesDialog,
-        registration_row: &glib::WeakRef<adw::ActionRow>,
+        switches: &Rc<delegation::Switches>,
     ) -> adw::PreferencesGroup {
         let profile = self.agent_profile_now(driver);
         let group = adw::PreferencesGroup::builder()
@@ -1408,74 +1408,26 @@ impl AgentTerminalWindow {
         group.add(&self.agent_enabled_row(driver, dialog.upcast_ref()));
         group.add(&self.agent_account_row(driver, dialog.upcast_ref()));
         let subtitle = if driver == Driver::Agy {
-            "Allow this agent to delegate and receive work in Agent Terminal. Verified routes only; writing agents use isolated worktrees. Turning it on reviews Antigravity's managed registration; turning it off offers to remove it."
+            "This agent only (the switch under Cross-agent delegation sets every agent). Turning it on reviews Antigravity's managed registration; turning it off offers to remove it."
         } else {
-            "Allow this agent to delegate and receive work in Agent Terminal. Verified routes only; writing agents use isolated worktrees."
+            "This agent only (the switch under Cross-agent delegation sets every agent)."
         };
         let delegation = adw::SwitchRow::builder()
             .title("Available for delegation")
             .subtitle(subtitle)
             .active(profile.available_for_delegation)
             .build();
+        switches.add_agent(driver, &delegation);
         let obj = self.obj();
-        // Set while the switch is turned back off after a declined or failed setup.
-        let reverting = Rc::new(std::cell::Cell::new(false));
-        let weak_dialog = dialog.downgrade();
-        let registration_row = registration_row.clone();
+        let switches = switches.clone();
         delegation.connect_active_notify(glib::clone!(
             #[weak]
             obj,
             move |row| {
-                if reverting.get() {
-                    return;
+                if !switches.quiet() {
+                    obj.imp()
+                        .set_agent_delegation(driver, row.is_active(), &switches);
                 }
-                let on = row.is_active();
-                let imp = obj.imp();
-                if driver != Driver::Agy {
-                    imp.edit_agent_profile(driver, |p| p.available_for_delegation = on);
-                    return;
-                }
-                if !on {
-                    imp.edit_agent_profile(driver, |p| p.available_for_delegation = false);
-                    imp.review_delegation_registration(
-                        agent_kit::delegation_config::Action::Remove,
-                        weak_dialog.clone(),
-                        registration_row.clone(),
-                        |_| {},
-                    );
-                    return;
-                }
-                // Saved only once the registration is ready: an opted-in profile without one
-                // would start its threads unbound.
-                let (switch, window, reverting) =
-                    (row.downgrade(), obj.downgrade(), reverting.clone());
-                imp.review_delegation_registration(
-                    agent_kit::delegation_config::Action::Configure,
-                    weak_dialog.clone(),
-                    registration_row.clone(),
-                    move |review| {
-                        let (Some(switch), Some(window)) = (switch.upgrade(), window.upgrade())
-                        else {
-                            return;
-                        };
-                        match review {
-                            delegation::Review::Ready if switch.is_active() => {
-                                window.imp().edit_agent_profile(driver, |p| {
-                                    p.available_for_delegation = true
-                                });
-                            }
-                            delegation::Review::Ready => {}
-                            delegation::Review::Cancelled | delegation::Review::Failed(_) => {
-                                if let delegation::Review::Failed(error) = review {
-                                    window.imp().show_toast(&error);
-                                }
-                                reverting.set(true);
-                                switch.set_active(false);
-                                reverting.set(false);
-                            }
-                        }
-                    },
-                );
             }
         ));
         group.add(&delegation);
@@ -2638,6 +2590,76 @@ pub(super) mod tests {
     }
 
     /// Called by the window smoke test on GTK's thread.
+    /// The master switch turns every enabled agent's delegation on and off, and their own
+    /// switches follow it. Antigravity is disabled here, so no registration review opens.
+    pub(crate) fn the_master_switch_sets_every_enabled_agent(imp: &AgentTerminalWindow) {
+        let original = imp.config.borrow().profiles.clone();
+        imp.edit_agent_profile(Driver::Agy, |p| p.disabled = true);
+        for d in [Driver::Claude, Driver::Codex] {
+            imp.edit_agent_profile(d, |p| p.available_for_delegation = false);
+        }
+        let dialog = adw::PreferencesDialog::new();
+        let (group, switches) = imp.delegation_group(&dialog);
+        let agent_groups: Vec<_> = Driver::ALL
+            .into_iter()
+            .map(|d| imp.agent_group(d, &dialog, &switches))
+            .collect();
+        let switch_rows = |root: &gtk4::Widget| -> Vec<adw::SwitchRow> {
+            crate::testutil::descendants(root)
+                .into_iter()
+                .filter_map(|w| w.downcast::<adw::SwitchRow>().ok())
+                .collect()
+        };
+        let master = switch_rows(group.upcast_ref())
+            .into_iter()
+            .find(|r| r.title() == "Agents can use each other as sub-agents")
+            .expect("the master switch");
+        let own = |d: Driver| {
+            let i = Driver::ALL.iter().position(|x| *x == d).unwrap();
+            switch_rows(agent_groups[i].upcast_ref())
+                .into_iter()
+                .find(|r| r.title() == "Available for delegation")
+                .expect("the agent's own switch")
+        };
+        let available = |d: Driver| imp.agent_profile_now(d).available_for_delegation;
+        // The master switch moves on the next idle (see `refresh_master_switch`).
+        let settle = || {
+            let ctx = glib::MainContext::default();
+            while ctx.iteration(false) {}
+        };
+        settle();
+        assert!(!master.is_active());
+
+        master.set_active(true);
+        settle();
+        for d in [Driver::Claude, Driver::Codex] {
+            assert!(available(d), "{d:?} saved on");
+            assert!(own(d).is_active(), "{d:?}'s own switch follows");
+        }
+        assert!(!available(Driver::Agy), "a disabled agent is left alone");
+        assert!(master.is_active(), "every enabled agent is on");
+
+        // One agent off on its own: the master goes off and says who is on.
+        own(Driver::Codex).set_active(false);
+        settle();
+        assert!(!available(Driver::Codex));
+        assert!(!master.is_active());
+        assert!(master
+            .subtitle()
+            .is_some_and(|s| s.starts_with("Custom: on for Claude")));
+
+        master.set_active(true);
+        settle();
+        assert!(available(Driver::Codex) && master.is_active());
+        master.set_active(false);
+        settle();
+        for d in [Driver::Claude, Driver::Codex] {
+            assert!(!available(d), "{d:?} saved off");
+            assert!(!own(d).is_active());
+        }
+        imp.config.borrow_mut().profiles = original;
+    }
+
     pub(crate) fn pages_have_renderable_titles(imp: &AgentTerminalWindow) {
         let prefs = adw::PreferencesDialog::new();
         imp.add_agents_page(&prefs);

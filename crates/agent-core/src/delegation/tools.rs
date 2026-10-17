@@ -33,7 +33,8 @@ pub const DEGRADED_TOOLS: [ToolName; 1] = [ToolName::CrossAgentCapabilities];
 /// Contract §6: shown in Settings → Agents and as `capabilities.delegation_scope`'s
 /// explanation.
 pub const DELEGATION_SCOPE_TEXT: &str = "Depth and mode limits apply to agents started through agent-terminal. \
-    Delegated agents cannot start their own built-in sub-agents. Your own sessions keep their built-in sub-agents, \
+    Delegated agents cannot start their own built-in sub-agents, except Codex, whose built-in sub-agents run \
+    outside these limits (route_caveats says so). Your own sessions keep their built-in sub-agents, \
     which agent-terminal shows but does not limit.";
 
 impl ToolName {
@@ -574,6 +575,25 @@ fn page_output(wait: bool) -> Value {
     json!({"type": "object", "properties": props, "required": required})
 }
 
+/// Optional: absent when a route has none. Each name's meaning goes in the description, since
+/// the parent reads this schema rather than the app's source.
+fn route_caveats() -> Value {
+    use super::route::RouteCaveat;
+    let explained: Vec<String> = RouteCaveat::ALL
+        .iter()
+        .map(|c| format!("{}: {}", c.as_str(), c.explain()))
+        .collect();
+    json!({
+        "type": "array",
+        "maxItems": RouteCaveat::ALL.len(),
+        "items": {"type": "string", "enum": RouteCaveat::ALL.map(RouteCaveat::as_str)},
+        "description": format!(
+            "What this route allows but Agent Terminal cannot supervise. {}",
+            explained.join(" ")
+        ),
+    })
+}
+
 fn capabilities_output() -> Value {
     json!({
         "type": "object",
@@ -596,6 +616,7 @@ fn capabilities_output() -> Value {
                     "task_mode": task_mode(),
                     "route_status": {"type": "string", "enum": ["verified", "unverified", "unsupported"]},
                     "route_blockers": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+                    "route_caveats": route_caveats(),
                     "child_bridge": {"type": "string", "enum": ["with_bridge", "without_bridge"]}},
                     "required": ["task_mode", "route_status", "route_blockers", "child_bridge"]}},
                 "models": {"type": "array", "maxItems": 64, "items": {"type": "object", "properties": {

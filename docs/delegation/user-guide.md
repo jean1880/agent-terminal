@@ -56,9 +56,12 @@ After an app restart, unfinished work is uncertain. History remains available, b
 the app does not replay edits or signal recorded process IDs. Explicitly resume work
 when offered. Persisted and injected text passes through redaction and size limits.
 
-Codex 0.161.0 is supported as a parent. Its child role is **Unsupported** because the
-installed provider still starts native children despite its disable settings. The
-capabilities response names this blocker. Provider and route evidence, including
+Every agent can use every other as a sub-agent, Codex included. Codex 0.161.0 as a
+**sub-agent** comes with a caveat: it still starts its own built-in sub-agents despite
+its disable settings, and those run outside Agent Terminal's depth, mode and worktree
+limits (the worker dock shows them). The capabilities response reports it as
+`route_caveats: ["codex_native_workers_unsupervised"]`, and the settings say so where
+you turn delegation on. Provider and route evidence, including
 the distinction between local model fixtures and cloud runs, is recorded in
 [route evidence](../qa/delegation-route-evidence.md).
 
