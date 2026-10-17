@@ -22,6 +22,7 @@ pub mod demo;
 mod difftext;
 mod form_card;
 mod form_draft;
+mod git_card;
 mod header;
 mod interruption;
 pub(crate) mod markdown;
@@ -2750,6 +2751,8 @@ pub(crate) mod tests {
         form_card::tests::form_and_link_cards();
         cards::tests::click_targets_hold_no_selectable_labels();
         cards::tests::blocks_copy_and_long_output_shows_full();
+        git_card::tests::the_section_shows_the_reading_and_hides_for_anything_else();
+        cards::tests::a_git_approval_reads_as_its_operation();
         whole_view_has_no_dead_click_targets();
         approval_row_precedes_its_step();
         subagent_shelf::tests::shelf_follows_running_subagents();

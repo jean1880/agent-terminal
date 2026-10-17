@@ -16,6 +16,7 @@ use crate::diff_tool::DiffTools;
 use crate::git::{DiffOutcome, TabDiff};
 use crate::theme::DiffColours;
 use adw::prelude::*;
+use agent_kit::github::{PrOutcome, PrState, PushState};
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -123,6 +124,63 @@ fn file_view(text: &str, colours: &DiffColours) -> gtk4::TextView {
     view
 }
 
+/// What the "Open a PR" bar says and offers for a branch's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrWords {
+    /// The line beside the button: where the branch would go, and what is missing.
+    pub status: String,
+    pub button: &'static str,
+    /// Whether the button can be pressed.
+    pub enabled: bool,
+}
+
+/// The bar's words for `outcome` (the result of `agent_kit::github::pr_state`). Three states,
+/// never two: ready, not possible here (and why), and could not be read.
+pub fn pr_words(outcome: &Result<PrOutcome, String>) -> PrWords {
+    let off = |status: String| PrWords {
+        status,
+        button: "Open a PR",
+        enabled: false,
+    };
+    let state = match outcome {
+        Err(why) => return off(format!("Could not read the branch: {why}")),
+        Ok(PrOutcome::Unavailable(why)) => return off(why.clone()),
+        Ok(PrOutcome::Ready(state)) => state,
+    };
+    if state.github.is_none() {
+        return off(format!(
+            "{} is not a GitHub remote, so there is no pull request to open",
+            state.remote
+        ));
+    }
+    if state.on_base() {
+        return off(format!(
+            "On {}: switch to a feature branch to open a pull request",
+            state.branch
+        ));
+    }
+    let into = state.base.as_deref().unwrap_or("the default branch");
+    let mut status = format!("{} → {into}", state.branch);
+    match state.push {
+        PushState::NoUpstream => status.push_str(" · not pushed yet"),
+        PushState::Ahead(1) => status.push_str(" · 1 commit to push"),
+        PushState::Ahead(n) => status.push_str(&format!(" · {n} commits to push")),
+        PushState::UpToDate => {}
+    }
+    if state.uncommitted {
+        status.push_str(" · uncommitted changes are not included");
+    }
+    PrWords {
+        status,
+        button: if state.needs_push() {
+            "Push & Open PR"
+        } else {
+            "Open a PR"
+        },
+        enabled: true,
+    }
+}
+
 /// A file the user asked to open in the external diff tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFile {
@@ -135,6 +193,10 @@ pub struct OpenFile {
 }
 
 type OpenHandler = Rc<dyn Fn(OpenFile)>;
+type PrHandler = Rc<dyn Fn(PrState)>;
+type PopHandler = Rc<dyn Fn()>;
+/// A popped-out panel's parent window and its destroy handler.
+type ParentWatch = (glib::WeakRef<gtk4::Window>, glib::SignalHandlerId);
 
 /// The diff on show: its left side, and its right side when that is a checkpoint.
 type Sides = (String, Option<String>);
@@ -142,8 +204,23 @@ type Sides = (String, Option<String>);
 /// The panel's widgets. Cheap to clone: every field is a reference.
 #[derive(Clone)]
 pub struct DiffPanel {
-    /// The panel itself, placed beside the terminal.
+    /// The panel's place beside the thread. It stays there, and stays the panel's identity,
+    /// while the panel is popped out (then it is hidden and empty).
     pub root: gtk4::Box,
+    /// Everything the panel shows: in `root`, or in its own window when popped out.
+    content: gtk4::Box,
+    /// The window the panel is popped out into, if it is.
+    detached: Rc<RefCell<Option<adw::Window>>>,
+    /// The parent window's destroy handler while popped out, to drop on docking.
+    parent_watch: Rc<RefCell<Option<ParentWatch>>>,
+    pop: gtk4::Button,
+    pop_handler: Rc<RefCell<Option<PopHandler>>>,
+    /// The "Open a PR" bar under the diff.
+    pr_bar: gtk4::Box,
+    pr_status: gtk4::Label,
+    pr_button: gtk4::Button,
+    pr_state: Rc<RefCell<Option<PrState>>>,
+    pr_handler: Rc<RefCell<Option<PrHandler>>>,
     base: gtk4::DropDown,
     summary: gtk4::Label,
     refresh: gtk4::Button,
@@ -213,10 +290,46 @@ impl DiffPanel {
             .css_classes(["flat"])
             .visible(false)
             .build();
+        let pop = gtk4::Button::builder()
+            .icon_name(crate::icons::POP_OUT_ICON)
+            .css_classes(["flat"])
+            .build();
         header.append(&base);
         header.append(&summary);
         header.append(&undo);
         header.append(&refresh);
+        header.append(&pop);
+
+        // Under the diff: where the branch would go, and the button that opens its pull request
+        // on GitHub (pushing first, when it has to).
+        let pr_status = gtk4::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let pr_content = adw::ButtonContent::builder()
+            .icon_name(crate::icons::PULL_REQUEST_ICON)
+            .label("Open a PR")
+            .build();
+        let pr_button = gtk4::Button::builder()
+            .child(&pr_content)
+            .valign(gtk4::Align::Center)
+            .css_classes(["pill", "suggested-action", "diff-open-pr"])
+            .sensitive(false)
+            .build();
+        let pr_bar = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(8)
+            .margin_end(8)
+            .visible(false)
+            .build();
+        pr_bar.append(&pr_status);
+        pr_bar.append(&pr_button);
 
         let retry = gtk4::Button::builder()
             .label("Retry")
@@ -257,17 +370,40 @@ impl DiffPanel {
         stack.add_named(&status, Some("status"));
         stack.add_named(&diff_page, Some("diff"));
 
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        content.append(&header);
+        content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        content.append(&stack);
+        let pr_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        pr_bar
+            .bind_property("visible", &pr_separator, "visible")
+            .sync_create()
+            .build();
+        content.append(&pr_separator);
+        content.append(&pr_bar);
         // No width request: the paned lets the panel narrow in a small window. MIN_WIDTH is only
         // the floor for a width the user drags it to.
         let root = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .build();
-        root.append(&header);
-        root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        root.append(&stack);
+        root.append(&content);
 
         let panel = Self {
             root,
+            content,
+            detached: Rc::new(RefCell::new(None)),
+            parent_watch: Rc::new(RefCell::new(None)),
+            pop,
+            pop_handler: Rc::new(RefCell::new(None)),
+            pr_bar,
+            pr_status,
+            pr_button,
+            pr_state: Rc::new(RefCell::new(None)),
+            pr_handler: Rc::new(RefCell::new(None)),
             base,
             summary,
             refresh,
@@ -289,7 +425,190 @@ impl DiffPanel {
             placing: Rc::new(Cell::new(false)),
         };
         panel.set_colours(colours);
+        panel.show_pop_state();
+
+        let handler = Rc::clone(&panel.pr_handler);
+        let state = Rc::clone(&panel.pr_state);
+        panel.pr_button.connect_clicked(move |_| {
+            let (Some(handler), Some(state)) = (handler.borrow().clone(), state.borrow().clone())
+            else {
+                return;
+            };
+            handler(state);
+        });
+        let handler = Rc::clone(&panel.pop_handler);
+        panel.pop.connect_clicked(move |_| {
+            let handler = handler.borrow().clone();
+            if let Some(handler) = handler {
+                handler();
+            }
+        });
+        // A breakpoint that un-applies restores the place's visibility, which while popped out
+        // would show an empty place beside the thread: keep it hidden.
+        let detached = Rc::clone(&panel.detached);
+        panel.root.connect_visible_notify(move |root| {
+            if root.is_visible() && detached.borrow().is_some() {
+                let root = root.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(root) = root.upgrade() {
+                        root.set_visible(false);
+                    }
+                });
+            }
+        });
         panel
+    }
+
+    /// The pop-out button's icon and words for where the panel is.
+    fn show_pop_state(&self) {
+        let (icon, words) = if self.is_detached() {
+            ("at-sidebar-show-symbolic", "Put back beside the thread")
+        } else {
+            (crate::icons::POP_OUT_ICON, "Open in its own window")
+        };
+        self.pop.set_icon_name(icon);
+        self.pop.set_tooltip_text(Some(words));
+        self.pop
+            .update_property(&[gtk4::accessible::Property::Label(words)]);
+    }
+
+    /// Whether the panel is in its own window.
+    pub fn is_detached(&self) -> bool {
+        self.detached.borrow().is_some()
+    }
+
+    /// Whether the panel is on show: beside the thread, or in its own window.
+    pub fn is_shown(&self) -> bool {
+        self.root.is_visible() || self.is_detached()
+    }
+
+    /// Calls `pop` when the pop-out button is clicked (out, or back in when popped out).
+    pub fn connect_pop(&self, pop: impl Fn() + 'static) {
+        *self.pop_handler.borrow_mut() = Some(Rc::new(pop));
+    }
+
+    /// Moves the panel into a window of its own, titled after `title`, or brings that window to
+    /// the front if it is already out. Closing the window (or [`Self::dock`]) puts the panel
+    /// back; `parent` closing closes it too.
+    pub fn pop_out(&self, parent: &gtk4::Window, title: &str) {
+        if let Some(window) = self.detached.borrow().as_ref() {
+            window.present();
+            return;
+        }
+        self.root.remove(&self.content);
+        let header = adw::HeaderBar::new();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&self.content));
+        let window = adw::Window::builder()
+            .title(format!("Changes — {title}"))
+            .default_width(parent.width().clamp(MIN_WIDTH * 2, 640))
+            .default_height((parent.height() * 4 / 5).clamp(480, 900))
+            .content(&toolbar)
+            .build();
+        window.add_css_class("diff-window");
+        *self.detached.borrow_mut() = Some(window.clone());
+        self.root.set_visible(false);
+
+        let panel = self.clone();
+        window.connect_close_request(move |_| {
+            // The window is closing itself: take the panel back and let it go.
+            panel.take_back();
+            glib::Propagation::Proceed
+        });
+        let panel = self.clone();
+        // The thread's window closing takes the panel's window with it.
+        let watch = parent.connect_destroy(move |_| panel.dock());
+        *self.parent_watch.borrow_mut() = Some((parent.downgrade(), watch));
+        self.show_pop_state();
+        window.present();
+    }
+
+    /// Puts a popped-out panel back beside the thread, shown, and closes its window.
+    pub fn dock(&self) {
+        if let Some(window) = self.take_back() {
+            window.destroy();
+        }
+    }
+
+    /// Moves the content back beside the thread and returns the (now empty) window it was in.
+    fn take_back(&self) -> Option<adw::Window> {
+        let window = self.detached.borrow_mut().take()?;
+        if let Some((parent, watch)) = self.parent_watch.borrow_mut().take() {
+            if let Some(parent) = parent.upgrade() {
+                parent.disconnect(watch);
+            }
+        }
+        if let Some(toolbar) = window.content().and_downcast::<adw::ToolbarView>() {
+            toolbar.set_content(None::<&gtk4::Widget>);
+        }
+        self.root.append(&self.content);
+        self.show_pop_state();
+        self.set_shown(true);
+        Some(window)
+    }
+
+    /// Brings a popped-out panel's window to the front.
+    pub fn present(&self) {
+        if let Some(window) = self.detached.borrow().as_ref() {
+            window.present();
+        }
+    }
+
+    /// The widget dialogs about this panel are shown over: in whichever window it is in.
+    pub fn dialog_parent(&self) -> gtk4::Widget {
+        self.content.clone().upcast()
+    }
+
+    /// Calls `open` with the branch's state when "Open a PR" is clicked.
+    pub fn connect_open_pr(&self, open: impl Fn(PrState) + 'static) {
+        *self.pr_handler.borrow_mut() = Some(Rc::new(open));
+    }
+
+    /// Shows the branch's pull-request state from a refresh, unless a newer refresh has started.
+    /// `None`: not a repository, and no bar at all.
+    pub fn show_pr(&self, generation: u64, outcome: Option<Result<PrOutcome, String>>) {
+        if generation != self.generation.get() {
+            return;
+        }
+        let Some(outcome) = outcome else {
+            self.pr_bar.set_visible(false);
+            *self.pr_state.borrow_mut() = None;
+            return;
+        };
+        let words = pr_words(&outcome);
+        self.pr_status.set_text(&words.status);
+        self.pr_status.set_tooltip_text(Some(&words.status));
+        if let Some(content) = self.pr_button.child().and_downcast::<adw::ButtonContent>() {
+            content.set_label(words.button);
+        }
+        self.pr_button.set_sensitive(words.enabled);
+        self.pr_button.set_tooltip_text(Some(if words.enabled {
+            "Open this branch's pull request page on GitHub in the browser"
+        } else {
+            &words.status
+        }));
+        *self.pr_state.borrow_mut() = match outcome {
+            Ok(PrOutcome::Ready(state)) if words.enabled => Some(state),
+            _ => None,
+        };
+        self.pr_bar.set_visible(true);
+    }
+
+    /// The PR bar's status, button label and whether it can be pressed (tests).
+    #[cfg(test)]
+    pub fn pr_view(&self) -> Option<(String, String, bool)> {
+        self.pr_bar.is_visible().then(|| {
+            (
+                self.pr_status.text().to_string(),
+                self.pr_button
+                    .child()
+                    .and_downcast::<adw::ButtonContent>()
+                    .map(|c| c.label().to_string())
+                    .unwrap_or_default(),
+                self.pr_button.is_sensitive(),
+            )
+        })
     }
 
     /// Shows or hides the panel. A shown panel gets its saved width again at
@@ -648,5 +967,154 @@ impl DiffPanel {
             expander.set_child(Some(&child));
         });
         expander
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use agent_kit::github::GithubRepo;
+
+    fn state(push: PushState) -> PrState {
+        PrState {
+            branch: "feat/x".into(),
+            remote: "origin".into(),
+            remote_branch: "feat/x".into(),
+            base: Some("master".into()),
+            github: Some(GithubRepo {
+                host: "github.com".into(),
+                owner: "o".into(),
+                name: "r".into(),
+            }),
+            push,
+            uncommitted: false,
+        }
+    }
+
+    fn words(state: PrState) -> PrWords {
+        pr_words(&Ok(PrOutcome::Ready(state)))
+    }
+
+    #[test]
+    fn the_pr_bar_says_where_the_branch_goes_and_what_it_needs() {
+        let ready = words(state(PushState::UpToDate));
+        assert_eq!(ready.status, "feat/x → master");
+        assert_eq!(ready.button, "Open a PR");
+        assert!(ready.enabled);
+
+        let unpushed = words(state(PushState::NoUpstream));
+        assert_eq!(unpushed.status, "feat/x → master · not pushed yet");
+        assert_eq!(unpushed.button, "Push & Open PR");
+        assert_eq!(
+            words(state(PushState::Ahead(1))).status,
+            "feat/x → master · 1 commit to push"
+        );
+        assert_eq!(
+            words(state(PushState::Ahead(3))).status,
+            "feat/x → master · 3 commits to push"
+        );
+
+        let mut dirty = state(PushState::UpToDate);
+        dirty.uncommitted = true;
+        dirty.base = None;
+        assert_eq!(
+            words(dirty).status,
+            "feat/x → the default branch · uncommitted changes are not included"
+        );
+    }
+
+    #[test]
+    fn the_pr_bar_is_off_with_a_reason_and_an_unread_branch_is_its_own_state() {
+        let mut on_base = state(PushState::UpToDate);
+        on_base.branch = "master".into();
+        on_base.remote_branch = "master".into();
+        let off = words(on_base);
+        assert!(!off.enabled);
+        assert!(off.status.starts_with("On master"));
+
+        let mut local = state(PushState::UpToDate);
+        local.github = None;
+        let off = words(local);
+        assert!(!off.enabled);
+        assert!(off.status.contains("not a GitHub remote"));
+
+        let off = pr_words(&Ok(PrOutcome::Unavailable("No branch".into())));
+        assert_eq!((off.status.as_str(), off.enabled), ("No branch", false));
+        let unread = pr_words(&Err("git timed out".into()));
+        assert!(!unread.enabled);
+        assert_eq!(unread.status, "Could not read the branch: git timed out");
+    }
+
+    /// GTK: run from the window's construction test. The panel pops out into its own window,
+    /// keeps its place (hidden) beside the thread, and comes back shown; the PR bar follows the
+    /// branch and hands the clicked state over.
+    pub(crate) fn the_panel_pops_out_docks_and_offers_a_pr(parent: &gtk4::Window) {
+        let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        let slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        slot.append(&panel.root);
+        panel.set_shown(true);
+
+        panel.pop_out(parent, "My thread");
+        assert!(panel.is_detached());
+        assert!(panel.is_shown());
+        assert!(
+            !panel.root.is_visible(),
+            "the place beside the thread is hidden"
+        );
+        assert!(panel.root.first_child().is_none(), "and empty");
+        let window = panel
+            .content
+            .root()
+            .and_downcast::<adw::Window>()
+            .expect("the content is in its own window");
+        assert_eq!(window.title().as_deref(), Some("Changes — My thread"));
+        panel.pop_out(parent, "again");
+        assert_eq!(
+            panel.content.root().and_downcast::<adw::Window>(),
+            Some(window.clone()),
+            "a second pop-out brings the same window up"
+        );
+
+        // Closing the window docks the panel back, shown.
+        window.close();
+        assert!(!panel.is_detached());
+        assert!(panel.root.is_visible());
+        assert_eq!(
+            panel.root.first_child().as_ref(),
+            Some(panel.content.upcast_ref::<gtk4::Widget>())
+        );
+        panel.pop_out(parent, "My thread");
+        panel.dock();
+        assert!(!panel.is_detached());
+
+        let clicked = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&clicked);
+        panel.connect_open_pr(move |state| *seen.borrow_mut() = Some(state));
+        let generation = panel.begin();
+        panel.show_pr(
+            generation,
+            Some(Ok(PrOutcome::Ready(state(PushState::Ahead(2))))),
+        );
+        assert_eq!(
+            panel.pr_view(),
+            Some((
+                "feat/x → master · 2 commits to push".to_owned(),
+                "Push & Open PR".to_owned(),
+                true
+            ))
+        );
+        panel.pr_button.emit_clicked();
+        assert_eq!(
+            clicked.borrow().as_ref().map(|s| s.push.clone()),
+            Some(PushState::Ahead(2))
+        );
+        // A stale refresh changes nothing; no repository hides the bar.
+        panel.show_pr(generation.wrapping_sub(1), None);
+        assert!(panel.pr_view().is_some());
+        panel.show_pr(generation, None);
+        assert!(panel.pr_view().is_none());
+        let generation = panel.begin();
+        panel.show_pr(generation, Some(Err("boom".into())));
+        assert_eq!(panel.pr_view().map(|v| v.2), Some(false));
     }
 }

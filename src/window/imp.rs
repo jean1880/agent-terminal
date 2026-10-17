@@ -1007,6 +1007,57 @@ fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &st
     dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
 }
 
+/// A thread's subtitle: its folder, and the branch checked out when the repository's remote is
+/// on GitHub (`~/git/app · feat/x`), with a tooltip naming the repository. Anything else (not
+/// a repository, another host, a detached HEAD, git failing) is the folder alone.
+fn thread_subtitle(
+    folder: &str,
+    branch: Option<&Result<agent_kit::github::PrOutcome, String>>,
+) -> (String, Option<String>) {
+    let Some(Ok(agent_kit::github::PrOutcome::Ready(state))) = branch else {
+        return (folder.to_owned(), None);
+    };
+    let Some(repo) = &state.github else {
+        return (folder.to_owned(), None);
+    };
+    (
+        format!("{folder} · {}", state.branch),
+        Some(format!(
+            "On branch {} of {} on GitHub",
+            state.branch,
+            repo.slug()
+        )),
+    )
+}
+
+/// [`present_message`] over whichever window `parent` is in (a popped-out diff panel's, say).
+fn present_message_over(parent: &impl IsA<gtk4::Widget>, heading: &str, body: &str) {
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_response("ok", "OK");
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("ok");
+    dialog.present(Some(parent));
+}
+
+/// Opens `uri` in the user's browser, from the window `parent` is in. A failure is shown, since
+/// the user asked for it.
+fn launch_uri(parent: &gtk4::Widget, uri: &str) {
+    let window = parent.root().and_downcast::<gtk4::Window>();
+    let shown = parent.downgrade();
+    gtk4::UriLauncher::new(uri).launch(
+        window.as_ref(),
+        None::<&gtk4::gio::Cancellable>,
+        move |result| {
+            if let Err(err) = result {
+                warn!("Failed to open the pull request page: {err}");
+                if let Some(parent) = shown.upgrade() {
+                    present_message_over(&parent, "Could Not Open the Browser", &format!("{err}"));
+                }
+            }
+        },
+    );
+}
+
 thread_local! {
     /// The process's one copy of the settings. GTK is single-threaded, so
     /// thread-local is process-wide in practice.
@@ -2491,6 +2542,9 @@ impl AgentTerminalWindow {
                     imp.tabs.take().into_iter().partition(|t| &t.page == page);
                 imp.tabs.replace(staying);
                 for tab in &leaving {
+                    // A popped-out diff panel goes back into its place, which leaves (or
+                    // travels to another window) with the page.
+                    tab.diff_panel.dock();
                     if let Some(chat) = &tab.chat {
                         chat.slot.invalidate_pending_switch();
                         imp.unregister_thread(&chat.thread);
@@ -5571,6 +5625,39 @@ impl AgentTerminalWindow {
             }
         });
 
+        // Pop the panel out into its own window, or back in.
+        let root = panel.root.clone();
+        let popped = panel.clone();
+        panel.connect_pop(move || {
+            if popped.is_detached() {
+                // After the click: the button is in the window docking destroys, and GTK
+                // still finishes the click on it.
+                let popped = popped.clone();
+                glib::idle_add_local_once(move || popped.dock());
+                return;
+            }
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            let title = obj
+                .imp()
+                .tabs
+                .borrow()
+                .iter()
+                .find(|t| t.diff_panel.root == root)
+                .map(|t| t.page.title().to_string())
+                .unwrap_or_else(|| "Agent Terminal".to_owned());
+            popped.pop_out(obj.upcast_ref(), &title);
+        });
+
+        // "Open a PR": push first when the branch is not on the remote as it is here.
+        let root = panel.root.clone();
+        panel.connect_open_pr(move |state| {
+            if let Some(obj) = window_of(&root) {
+                obj.imp().open_pull_request(&root, state);
+            }
+        });
+
         // "Open in …" on a file row.
         let root = panel.root.clone();
         panel.connect_open(move |file| {
@@ -5654,6 +5741,11 @@ impl AgentTerminalWindow {
         else {
             return;
         };
+        // A panel in its own window is on show already: bring that window up.
+        if panel.is_detached() {
+            panel.present();
+            return;
+        }
         let visible = !panel.root.is_visible();
         // Placed by the paned's layout notifications once it has re-measured.
         panel.set_shown(visible);
@@ -5682,11 +5774,15 @@ impl AgentTerminalWindow {
         else {
             return;
         };
-        if !panel.root.is_visible() {
+        if !panel.is_shown() {
+            // No panel to read it for, but the subtitle still follows the branch.
+            self.refresh_branch(page);
             return;
         }
         let base = panel.base();
         let generation = panel.begin();
+        let obj = self.obj().downgrade();
+        let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
             let initial = gtk4::gio::spawn_blocking({
                 let dir = dir.clone();
@@ -5695,7 +5791,7 @@ impl AgentTerminalWindow {
             .await
             .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
 
-            let result = match (initial, thread_id) {
+            let (result, repo_dir) = match (initial, thread_id) {
                 (Ok(crate::git::DiffOutcome::NotRepo), Some(tid)) => {
                     let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
                         .await
@@ -5705,18 +5801,207 @@ impl AgentTerminalWindow {
                         &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
                     );
                     if let Some(repo_dir) = crate::diff::discover_enclosing_repo(&paths) {
-                        gtk4::gio::spawn_blocking(move || {
-                            crate::git::tab_diff(&repo_dir, key, base)
+                        let diffed = repo_dir.clone();
+                        let result = gtk4::gio::spawn_blocking(move || {
+                            crate::git::tab_diff(&diffed, key, base)
                         })
                         .await
-                        .unwrap_or_else(|_| Err("the diff thread panicked".to_string()))
+                        .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+                        (result, repo_dir)
                     } else {
-                        Ok(crate::git::DiffOutcome::NotRepo)
+                        (Ok(crate::git::DiffOutcome::NotRepo), dir.into())
                     }
                 }
-                (res, _) => res,
+                (res, _) => (res, dir.into()),
             };
+            let in_repo = !matches!(result, Ok(crate::git::DiffOutcome::NotRepo));
             panel.show(generation, result);
+            // The "Open a PR" bar follows the same repository, read after the diff (reads
+            // only; it never fetches).
+            let pr = if in_repo {
+                Some(
+                    gtk4::gio::spawn_blocking(move || agent_kit::github::pr_state(&repo_dir))
+                        .await
+                        .unwrap_or_else(|_| Err("reading the branch panicked".to_string())),
+                )
+            } else {
+                None
+            };
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().show_branch(&page, pr.as_ref());
+            }
+            panel.show_pr(generation, pr);
+        });
+    }
+
+    /// Reads `page`'s branch off the main thread and shows it in the subtitle, if `page` is a
+    /// thread still on show ([`thread_subtitle`]).
+    pub(super) fn refresh_branch(&self, page: &adw::TabPage) {
+        let Some(dir) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page && t.chat.is_some())
+            .map(|t| t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()))
+        else {
+            return;
+        };
+        let obj = self.obj().downgrade();
+        let page = page.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let read = gtk4::gio::spawn_blocking(move || {
+                agent_kit::github::pr_state(std::path::Path::new(&dir))
+            })
+            .await
+            .unwrap_or_else(|_| Err("reading the branch panicked".to_string()));
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().show_branch(&page, Some(&read));
+            }
+        });
+    }
+
+    /// Puts `branch` (a read of `page`'s repository; `None`: not in one) in the subtitle while
+    /// `page` is the thread on show.
+    fn show_branch(
+        &self,
+        page: &adw::TabPage,
+        branch: Option<&Result<agent_kit::github::PrOutcome, String>>,
+    ) {
+        let selected = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.selected_page());
+        if selected.as_ref() != Some(page) {
+            return;
+        }
+        let Some(dir) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page && t.chat.is_some())
+            .map(|t| t.dir.clone())
+        else {
+            return;
+        };
+        let home = env::var("HOME").unwrap_or_default();
+        let (subtitle, tooltip) = thread_subtitle(&crate::utils::tildify(&dir, &home), branch);
+        if let Some(window_title) = self.window_title.borrow().as_ref() {
+            window_title.set_subtitle(&subtitle);
+            window_title.set_tooltip_text(tooltip.as_deref());
+        }
+    }
+
+    /// "Open a PR" in a diff panel: opens GitHub's compare page for the branch in the browser.
+    /// A branch whose commits are not all on its remote is pushed first (never forced), once the
+    /// user confirms it; one never pushed can only be pushed, since its page would be empty.
+    fn open_pull_request(&self, panel_root: &gtk4::Box, state: agent_kit::github::PrState) {
+        let Some((page, dir, panel)) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.diff_panel.root == *panel_root)
+            .map(|t| {
+                (
+                    t.page.clone(),
+                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
+                    t.diff_panel.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        let Some(url) = state.compare_url() else {
+            self.show_toast("This branch's remote is not on GitHub");
+            return;
+        };
+        let parent = panel.dialog_parent();
+        if !state.needs_push() {
+            launch_uri(&parent, &url);
+            return;
+        }
+        use agent_kit::github::PushState;
+        let what = match state.push {
+            PushState::NoUpstream => format!(
+                "{} is not on {} yet. Push it there (it becomes the branch's upstream), then \
+                 open its pull request in the browser?",
+                state.branch, state.remote
+            ),
+            PushState::Ahead(1) => format!(
+                "{} has 1 commit that is not on {} yet. Push it, then open the pull request in \
+                 the browser?",
+                state.branch, state.remote
+            ),
+            PushState::Ahead(n) => format!(
+                "{} has {n} commits that are not on {} yet. Push them, then open the pull \
+                 request in the browser?",
+                state.branch, state.remote
+            ),
+            PushState::UpToDate => String::new(),
+        };
+        let body = format!(
+            "{what}\n\ngit push{} {} {}:{}\n\nThe push is never forced.{}",
+            if state.push == PushState::NoUpstream {
+                " --set-upstream"
+            } else {
+                ""
+            },
+            state.remote,
+            state.branch,
+            state.remote_branch,
+            if state.uncommitted {
+                " Uncommitted changes stay here and are not part of the pull request."
+            } else {
+                ""
+            }
+        );
+        let dialog = adw::AlertDialog::builder()
+            .heading("Push and Open a Pull Request?")
+            .body(body)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        // A branch the remote already has can open as it is there.
+        if state.push != PushState::NoUpstream {
+            dialog.add_response("open", "Open Without Pushing");
+        }
+        dialog.add_response("push", "Push & Open");
+        dialog.set_response_appearance("push", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let obj = self.obj().downgrade();
+        dialog.present(Some(&parent));
+        dialog.connect_response(None, move |_, response| match response {
+            "open" => launch_uri(&parent, &url),
+            "push" => {
+                let (obj, parent, url, state, dir, page) = (
+                    obj.clone(),
+                    parent.clone(),
+                    url.clone(),
+                    state.clone(),
+                    dir.clone(),
+                    page.clone(),
+                );
+                glib::MainContext::default().spawn_local(async move {
+                    let pushed = gtk4::gio::spawn_blocking(move || {
+                        agent_kit::github::push_branch(std::path::Path::new(&dir), &state)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("the push panicked".to_string()));
+                    let Some(obj) = obj.upgrade() else { return };
+                    match pushed {
+                        Ok(()) => {
+                            info!("pushed a branch for its pull request");
+                            launch_uri(&parent, &url);
+                        }
+                        Err(why) => {
+                            warn!("push for a pull request failed: {why}");
+                            present_message_over(&parent, "Could Not Push the Branch", &why);
+                        }
+                    }
+                    obj.imp().refresh_diff(&page);
+                });
+            }
+            _ => {}
         });
     }
 
@@ -6983,6 +7268,9 @@ mod tests {
         agents_prefs::tests::invalid_agent_drafts_are_not_saved(window.imp());
         agents_prefs::tests::pages_have_renderable_titles(window.imp());
         diff_panel_shows_each_outcome();
+        super::super::diff_panel::tests::the_panel_pops_out_docks_and_offers_a_pr(
+            window.upcast_ref(),
+        );
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
         crate::chat::view::tests::reasoning_ui_checks();
@@ -7438,6 +7726,50 @@ mod tests {
         thread_menu::tests::actions_carry_out_each_choice(window);
         threads::tests::a_thread_page_runs_a_real_session(window);
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
+    }
+
+    #[test]
+    fn a_thread_subtitle_names_its_branch_only_in_a_github_repository() {
+        use agent_kit::github::{GithubRepo, PrOutcome, PrState, PushState};
+        let mut state = PrState {
+            branch: "feat/x".into(),
+            remote: "origin".into(),
+            remote_branch: "feat/x".into(),
+            base: Some("master".into()),
+            github: Some(GithubRepo {
+                host: "github.com".into(),
+                owner: "o".into(),
+                name: "r".into(),
+            }),
+            push: PushState::NoUpstream,
+            uncommitted: true,
+        };
+        assert_eq!(
+            thread_subtitle("~/git/r", Some(&Ok(PrOutcome::Ready(state.clone())))),
+            (
+                "~/git/r · feat/x".to_owned(),
+                Some("On branch feat/x of o/r on GitHub".to_owned())
+            )
+        );
+        let folder = ("~/git/r".to_owned(), None);
+        assert_eq!(thread_subtitle("~/git/r", None), folder, "not a repository");
+        assert_eq!(
+            thread_subtitle(
+                "~/git/r",
+                Some(&Ok(PrOutcome::Unavailable("detached".into())))
+            ),
+            folder
+        );
+        assert_eq!(
+            thread_subtitle("~/git/r", Some(&Err("git failed".into()))),
+            folder
+        );
+        state.github = None;
+        assert_eq!(
+            thread_subtitle("~/git/r", Some(&Ok(PrOutcome::Ready(state)))),
+            folder,
+            "another host"
+        );
     }
 
     fn diff_panel_shows_each_outcome() {
