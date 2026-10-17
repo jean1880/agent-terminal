@@ -201,6 +201,43 @@ mod tests {
         }
         (dir, sup, root.worker)
     }
+    /// Another thread with its own delegation root, beside the harness's: (thread, root).
+    fn add_root(sup: &Rc<Supervisor>, dir: &std::path::Path) -> (String, WorkerId) {
+        let store = sup.services.handle.reader();
+        let thread = store
+            .create_thread(&dir.to_string_lossy(), Some("second root"))
+            .expect("thread");
+        let root = store
+            .create_delegation_root(&NewRoot {
+                thread: thread.clone(),
+                driver: Driver::Claude,
+                profile_id: ProfileId::parse("fixture").unwrap(),
+                name: "second root".into(),
+                policy_json: "{}".into(),
+            })
+            .expect("root");
+        let row = store.delegation_root(&root.root).unwrap().unwrap();
+        let worker = store
+            .delegation_worker(root.worker.as_str())
+            .unwrap()
+            .unwrap();
+        let mut rt = sup.worker_rt(worker, root.worker.clone(), dir.to_owned());
+        rt.mode = Mode::Ask;
+        let mut state = sup.state.borrow_mut();
+        state.roots.insert(
+            root.worker.clone(),
+            RootRt {
+                row,
+                revoking: false,
+                revision: 0,
+                closed: false,
+                transferring: false,
+            },
+        );
+        state.threads.insert(thread.clone(), root.worker.clone());
+        state.workers.insert(root.worker.clone(), rt);
+        (thread, root.worker)
+    }
     fn spawn_request(key: &str) -> SpawnRequest {
         SpawnRequest {
             profile_id: ProfileId::parse("fixture").unwrap(),
@@ -1551,6 +1588,86 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// Threads are fully isolated: two threads delegate at once, each to its own sub-agent, and
+    /// stopping one (what a confirmed agent switch does) ends only its own sub-agent. App close
+    /// then ends the rest.
+    #[test]
+    fn two_threads_delegate_at_once_and_stopping_one_never_touches_the_other() {
+        in_context(async {
+            let (dir, sup, root_a) = harness();
+            let thread_a = sup.state.borrow().roots[&root_a].row.root_thread_id.clone();
+            let (thread_b, root_b) = add_root(&sup, dir.path());
+            let hold = |key: &str| {
+                let mut request = spawn_request(key);
+                request.task = "hold".into();
+                request
+            };
+            let receipt_a = sup.spawn_worker(&root_a, hold("isolated-a")).await.unwrap();
+            let receipt_b = sup.spawn_worker(&root_b, hold("isolated-b")).await.unwrap();
+            let child = |r: &Value| WorkerId::parse(r["worker_id"].as_str().unwrap()).unwrap();
+            let (child_a, child_b) = (child(&receipt_a), child(&receipt_b));
+            pump_until(|| {
+                let state = sup.state.borrow();
+                [&child_a, &child_b].iter().all(|c| {
+                    state.workers[*c].pending.is_none() && !state.workers[*c].generations.is_empty()
+                })
+            })
+            .await;
+            assert_eq!(sup.state.borrow().workers[&child_a].root, root_a);
+            assert_eq!(sup.state.borrow().workers[&child_b].root, root_b);
+            assert!(sup.root_has_live_children(&thread_a));
+            assert!(sup.root_has_live_children(&thread_b));
+
+            sup.root_stop(&thread_a);
+            pump_until(|| sup.state.borrow().workers[&child_a].generations.is_empty()).await;
+            pump_until(|| !sup.root_has_live_children(&thread_a)).await;
+            {
+                let state = sup.state.borrow();
+                let b = &state.workers[&child_b];
+                assert!(
+                    !b.generations.is_empty(),
+                    "the other thread's sub-agent still runs"
+                );
+                assert!(b.run.is_some(), "and is still on its task");
+            }
+            assert!(sup.root_has_live_children(&thread_b));
+            let run_b = receipt_b["run_id"].as_str().unwrap();
+            assert!(sup
+                .services
+                .handle
+                .reader()
+                .delegation_run(run_b)
+                .unwrap()
+                .is_some_and(|r| !matches!(r.state.as_str(), "interrupted" | "failed")));
+
+            // App close: every thread's sub-agents end.
+            let stops = sup.shutdown();
+            for stop in stops {
+                super::super::capacity::wait_exit(&stop.watch).await;
+            }
+            pump_until(|| sup.state.borrow().workers[&child_b].generations.is_empty()).await;
+        });
+    }
+    /// A sub-agent that finished its task but is still up is not busy, yet an agent switch would
+    /// end it: it counts as live, so the switch warns.
+    #[test]
+    fn an_idle_sub_agent_is_live_though_not_busy() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            assert!(!sup.root_has_live_children(&thread), "no sub-agent yet");
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("idle-child"))
+                .await
+                .unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&child].run.is_none()).await;
+            assert!(!sup.state.borrow().workers[&child].generations.is_empty());
+            assert!(!sup.root_busy(&thread));
+            assert!(sup.root_has_live_children(&thread));
+            stop(&sup).await;
+        });
+    }
     /// The same gap through revocation: Stop on the root ends a child whose turn never opened.
     #[test]
     fn root_stop_ends_the_run_of_a_child_whose_turn_never_opened() {
@@ -2528,6 +2645,25 @@ impl Supervisor {
             &w.root == root
                 && w.row.parent_id.is_some()
                 && (w.run.is_some() || w.pending.is_some() || w.preparing || w.dispatching)
+        })
+    }
+    /// Whether the thread has a sub-agent still alive: working (as [`Self::root_busy`]) or
+    /// idle between turns with its process up. Changing the thread's agent ends every one, so
+    /// the switch warns first.
+    pub(crate) fn root_has_live_children(&self, thread: &str) -> bool {
+        let state = self.state.borrow();
+        let Some(root) = state.threads.get(thread) else {
+            return false;
+        };
+        state.workers.values().any(|w| {
+            &w.root == root
+                && w.row.parent_id.is_some()
+                && !matches!(w.row.state.as_str(), "closed" | "failed")
+                && (w.run.is_some()
+                    || w.pending.is_some()
+                    || w.preparing
+                    || w.dispatching
+                    || !w.generations.is_empty())
         })
     }
     pub(crate) fn subscribe(&self, thread: &str, sub: Weak<dyn WorkerSubscriber>) {

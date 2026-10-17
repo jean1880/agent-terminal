@@ -7266,6 +7266,7 @@ mod tests {
         // Here rather than in a test of its own: GTK belongs to the one
         // thread that initialised it, and tests run on several.
         agents_prefs::tests::invalid_agent_drafts_are_not_saved(window.imp());
+        agents_prefs::tests::the_master_switch_sets_every_enabled_agent(window.imp());
         agents_prefs::tests::pages_have_renderable_titles(window.imp());
         diff_panel_shows_each_outcome();
         super::super::diff_panel::tests::the_panel_pops_out_docks_and_offers_a_pr(

@@ -1089,6 +1089,10 @@ impl Supervisor {
                                     .into_iter()
                                     .map(|b| b.as_str().into())
                                     .collect(),
+                                route_caveats: agent_core::delegation::route::route_caveats(driver)
+                                    .iter()
+                                    .map(|c| c.as_str().into())
+                                    .collect(),
                                 child_bridge: ChildBridge::WithBridge,
                             }
                         })

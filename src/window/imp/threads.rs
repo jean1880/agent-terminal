@@ -207,6 +207,25 @@ const ACCOUNT_REFRESH: std::time::Duration = std::time::Duration::from_secs(600)
 /// side and push the thread out of view.
 pub(super) const SIDEBAR_COLLAPSE_SP: f64 = 720.0;
 
+/// The "stop and switch?" question: its heading and body, for a thread titled `title` moving to
+/// `driver` while work would be cut short.
+pub(super) fn switch_warning(title: &str, driver: Driver) -> (String, String) {
+    let agent = driver_label(driver);
+    let subject = if title.is_empty() {
+        "This thread".to_owned()
+    } else {
+        format!("“{title}”")
+    };
+    (
+        format!("Stop the Running Work and Switch to {agent}?"),
+        format!(
+            "{subject} is working, waiting for you, or has sub-agents running. Switching to \
+             {agent} stops the agent and every sub-agent of this thread before they finish; \
+             other threads are not touched. Edits already made stay on disk."
+        ),
+    )
+}
+
 /// The desktop notification id for a thread waiting on an approval or a question.
 fn approval_notification_id(thread: &str) -> String {
     format!("approval-{thread}")
@@ -260,6 +279,8 @@ pub(super) struct ChatTab {
     pub(super) unread: bool,
     /// A "stop and close?" question is already on screen for this thread.
     confirming_close: bool,
+    /// A "stop and switch?" question is already on screen for this thread.
+    confirming_switch: bool,
     /// The user message item awaiting its text, for the title of an untitled thread.
     title_item: Option<String>,
     /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
@@ -447,7 +468,19 @@ impl ChatBackend for SessionSlot {
             .is_some_and(|s| s.respond_form(request, action, content))
     }
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
-        delegation::switch(self, driver, model, effort);
+        // Another agent ends this thread's running work and its sub-agents: its window asks
+        // first. The same agent (another model or effort) never does.
+        let window = self
+            .thread
+            .as_deref()
+            .filter(|_| driver != self.status().driver)
+            .and_then(|thread| Some((thread_owner(thread)?, thread.to_owned())));
+        match window {
+            Some((window, thread)) => window
+                .imp()
+                .switch_agent_confirmed(&thread, driver, model, effort),
+            None => delegation::switch(self, driver, model, effort),
+        }
     }
     fn reload_session(&self) {
         if let Some(s) = self.get() {
@@ -2892,6 +2925,74 @@ impl AgentTerminalWindow {
         });
     }
 
+    /// Whether changing this thread's agent would cut something short: a turn, an approval, a
+    /// background task, or any of its sub-agents, working or idle (every one ends).
+    pub(super) fn switch_would_stop_work(&self, thread: &str) -> bool {
+        self.row_is_busy(&RowKey::Thread(thread.to_owned()))
+            || crate::delegation::supervisor().is_some_and(|s| s.root_has_live_children(thread))
+    }
+
+    /// Moves `thread` to `driver`. When that would cut work short, asks first: Stop and Switch
+    /// interrupts the turn and ends every sub-agent of this thread (no other thread's), then
+    /// switches; Cancel changes nothing. With nothing running it switches at once.
+    pub(super) fn switch_agent_confirmed(
+        &self,
+        thread: &str,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let Some(slot) = self.slot_of(thread) else {
+            return;
+        };
+        if !self.switch_would_stop_work(thread) {
+            delegation::switch(&slot, driver, model, effort);
+            return;
+        }
+        // At most one question per thread: another pick while it is open does nothing.
+        let first = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+            .is_some_and(|c| !std::mem::replace(&mut c.confirming_switch, true));
+        if !first {
+            return;
+        }
+        let (heading, body) = switch_warning(&self.thread_title_of(thread), driver);
+        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("stop", "Stop and Switch")]);
+        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let response = dialog
+                .choose_future(Some(window.upcast_ref::<gtk4::Widget>()))
+                .await;
+            if let Some(c) = window
+                .imp()
+                .tabs
+                .borrow_mut()
+                .iter_mut()
+                .filter_map(|t| t.chat.as_mut())
+                .find(|c| c.thread == thread)
+            {
+                c.confirming_switch = false;
+            }
+            if response != "stop" {
+                return;
+            }
+            // The slot again: the page may have closed while the question was open.
+            if let Some(slot) = window.imp().slot_of(&thread) {
+                slot.interrupt();
+                delegation::switch(&slot, driver, model, effort);
+            }
+        });
+    }
+
     /// Closes the row's page, asking first when that would cut a turn short.
     pub(super) fn close_row(&self, key: &RowKey) {
         if let RowKey::Thread(thread) = key {
@@ -3607,6 +3708,7 @@ impl AgentTerminalWindow {
                 // nothing to read.
                 unread: summary.unread && summary.updated_at > 0,
                 confirming_close: false,
+                confirming_switch: false,
                 title_item: None,
                 pending_prompt: None,
                 pending_handoff: None,
@@ -5998,6 +6100,18 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_warning_names_the_agent_and_promises_other_threads_are_untouched() {
+        let (heading, body) = switch_warning("Fix the build", Driver::Agy);
+        assert_eq!(heading, "Stop the Running Work and Switch to Antigravity?");
+        assert!(body.starts_with("“Fix the build” is working"), "{body}");
+        assert!(body.contains("every sub-agent of this thread"));
+        assert!(body.contains("other threads are not touched"));
+        let (_, untitled) = switch_warning("", Driver::Codex);
+        assert!(untitled.starts_with("This thread is working"), "{untitled}");
+        assert!(untitled.contains("Switching to Codex"));
+    }
 
     #[test]
     fn layout_bursts_save_the_latest_value_before_a_close_barrier() {

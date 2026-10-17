@@ -29,8 +29,6 @@ pub enum RouteBlocker {
     ClaudeTokenPersistence,
     /// G-X1.
     CodexAmbientMcp,
-    /// G-X2.
-    CodexNativeDelegation,
     /// G-X3.
     CodexTokenPersistence,
     /// The adapter resends the overlay on every resume.
@@ -56,11 +54,10 @@ pub enum RouteBlocker {
 }
 
 impl RouteBlocker {
-    pub const ALL: [RouteBlocker; 17] = [
+    pub const ALL: [RouteBlocker; 16] = [
         RouteBlocker::ClaudeBashUnderRestricted,
         RouteBlocker::ClaudeTokenPersistence,
         RouteBlocker::CodexAmbientMcp,
-        RouteBlocker::CodexNativeDelegation,
         RouteBlocker::CodexTokenPersistence,
         RouteBlocker::CodexOverlayOnResume,
         RouteBlocker::AgyHookProofFix,
@@ -82,7 +79,6 @@ impl RouteBlocker {
             RouteBlocker::ClaudeBashUnderRestricted => "claude_bash_under_restricted",
             RouteBlocker::ClaudeTokenPersistence => "claude_token_persistence",
             RouteBlocker::CodexAmbientMcp => "codex_ambient_mcp",
-            RouteBlocker::CodexNativeDelegation => "codex_native_delegation",
             RouteBlocker::CodexTokenPersistence => "codex_token_persistence",
             RouteBlocker::CodexOverlayOnResume => "codex_overlay_on_resume",
             RouteBlocker::AgyHookProofFix => "agy_hook_proof_fix",
@@ -113,7 +109,6 @@ pub fn blocker_scope(b: RouteBlocker) -> BlockerScope {
         RouteBlocker::ClaudeBashUnderRestricted => BlockerScope::WriterModes,
         RouteBlocker::ClaudeTokenPersistence
         | RouteBlocker::CodexAmbientMcp
-        | RouteBlocker::CodexNativeDelegation
         | RouteBlocker::CodexTokenPersistence
         | RouteBlocker::CodexOverlayOnResume
         | RouteBlocker::AgyHookProofFix
@@ -177,12 +172,7 @@ fn child_group(d: Driver, bridge: ChildBridge) -> &'static [RouteBlocker] {
     use RouteBlocker::*;
     match (d, bridge) {
         (Driver::Claude, _) => &[ClaudeTokenPersistence, ClaudeBashUnderRestricted],
-        (Driver::Codex, _) => &[
-            CodexAmbientMcp,
-            CodexNativeDelegation,
-            CodexTokenPersistence,
-            CodexOverlayOnResume,
-        ],
+        (Driver::Codex, _) => &[CodexAmbientMcp, CodexTokenPersistence, CodexOverlayOnResume],
         (Driver::Agy, ChildBridge::WithoutBridge) => &[
             AgyHookProofFix,
             AgyHookProofInWorktree,
@@ -232,8 +222,6 @@ pub fn gate_evidence(gate: RouteBlocker) -> GateEvidence {
         | AgyManagedEntry
         | AgyAllowRules
         | AgentSyncEntry => Passed,
-        // Codex 0.161.0 starts a native worker despite both process and thread disables.
-        CodexNativeDelegation => Unsupported,
         // Bundle admission remains route-specific; bridge-free AGY is not implemented.
         EvidenceBundle => PendingReview,
     }
@@ -241,23 +229,56 @@ pub fn gate_evidence(gate: RouteBlocker) -> GateEvidence {
 
 fn reviewed_bundle(q: &RouteQuery) -> bool {
     match (q.child, q.child_bridge) {
-        (Driver::Claude, _) | (Driver::Agy, ChildBridge::WithBridge) => true,
-        (Driver::Codex, _) | (Driver::Agy, ChildBridge::WithoutBridge) => false,
+        (Driver::Claude | Driver::Codex, _) | (Driver::Agy, ChildBridge::WithBridge) => true,
+        (Driver::Agy, ChildBridge::WithoutBridge) => false,
+    }
+}
+
+/// What a route allows but cannot supervise: admitted (the user chose it), and reported to the
+/// parent beside the route so it delegates knowing the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteCaveat {
+    /// G-X2: Codex 0.161.0 starts its own native workers despite both the process and the
+    /// thread disables. They run outside the app's depth, mode and worktree limits; the app
+    /// shows them in the worker dock but cannot stop them starting.
+    CodexNativeWorkersUnsupervised,
+}
+
+impl RouteCaveat {
+    pub const ALL: [RouteCaveat; 1] = [RouteCaveat::CodexNativeWorkersUnsupervised];
+
+    /// The snake_case name reported in `route_caveats` (at most 64 bytes).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteCaveat::CodexNativeWorkersUnsupervised => "codex_native_workers_unsupervised",
+        }
+    }
+
+    /// One line for a person: the setup screen and the capabilities response.
+    pub fn explain(self) -> &'static str {
+        match self {
+            RouteCaveat::CodexNativeWorkersUnsupervised => {
+                "Codex starts its own built-in sub-agents even as a delegated worker. They run \
+                 outside Agent Terminal's depth, mode and worktree limits."
+            }
+        }
+    }
+}
+
+/// The caveats of a route: properties of its child, whatever the parent or mode.
+pub fn route_caveats(child: Driver) -> &'static [RouteCaveat] {
+    match child {
+        Driver::Codex => &[RouteCaveat::CodexNativeWorkersUnsupervised],
+        Driver::Claude | Driver::Agy => &[],
     }
 }
 
 /// Contract §11 route admission: the parent group plus the child group (variant-specific for
 /// agy), mode-conditional blockers counted only for their modes, plus the evidence bundle.
-/// `child_bridge` is ignored for a non-agy child (it always has its bridge).
+/// `child_bridge` is ignored for a non-agy child (it always has its bridge). A child's
+/// unsupervised behaviour is a caveat ([`route_caveats`]), never a blocker.
 pub fn admit_route(q: &RouteQuery) -> RouteSpec {
-    // This measured provider limitation is independent of the parent. Do not bury its cause
-    // beneath unrelated pending gates or suggest another parent could make this child safe.
-    if q.child == Driver::Codex {
-        return RouteSpec {
-            status: RouteStatus::Unsupported,
-            blockers: vec![RouteBlocker::CodexNativeDelegation],
-        };
-    }
     let mut blockers: Vec<RouteBlocker> = Vec::new();
     let groups = parent_group(q.parent)
         .iter()
@@ -537,8 +558,7 @@ mod tests {
             match b {
                 ClaudeBashUnderRestricted => Some(ClaudeTokenPersistence),
                 ClaudeTokenPersistence => Some(CodexAmbientMcp),
-                CodexAmbientMcp => Some(CodexNativeDelegation),
-                CodexNativeDelegation => Some(CodexTokenPersistence),
+                CodexAmbientMcp => Some(CodexTokenPersistence),
                 CodexTokenPersistence => Some(CodexOverlayOnResume),
                 CodexOverlayOnResume => Some(AgyHookProofFix),
                 AgyHookProofFix => Some(AgyHookProofInWorktree),
@@ -580,11 +600,7 @@ mod tests {
                             task_mode,
                             child_bridge,
                         });
-                        if child == Driver::Codex {
-                            assert_eq!(spec.status, RouteStatus::Unsupported);
-                            assert_eq!(spec.blockers, vec![RouteBlocker::CodexNativeDelegation]);
-                        } else if child == Driver::Agy && child_bridge == ChildBridge::WithoutBridge
-                        {
+                        if child == Driver::Agy && child_bridge == ChildBridge::WithoutBridge {
                             assert_eq!(spec.status, RouteStatus::Unverified);
                             assert_eq!(spec.blockers, vec![RouteBlocker::EvidenceBundle]);
                         } else {
@@ -619,7 +635,6 @@ mod tests {
         use RouteBlocker::*;
         for gate in RouteBlocker::ALL {
             let expected = match gate {
-                CodexNativeDelegation => GateEvidence::Unsupported,
                 EvidenceBundle => GateEvidence::PendingReview,
                 _ => GateEvidence::Passed,
             };
@@ -627,13 +642,9 @@ mod tests {
         }
         for parent in Driver::ALL {
             for mode in TaskMode::ALL {
-                for child in [Driver::Claude, Driver::Agy] {
+                for child in Driver::ALL {
                     assert!(blockers(parent, child, mode, ChildBridge::WithBridge).is_empty());
                 }
-                assert_eq!(
-                    blockers(parent, Driver::Codex, mode, ChildBridge::WithBridge),
-                    vec![CodexNativeDelegation]
-                );
                 assert_eq!(
                     blockers(parent, Driver::Agy, mode, ChildBridge::WithoutBridge),
                     vec![EvidenceBundle]
@@ -645,6 +656,46 @@ mod tests {
             BlockerScope::WriterModes
         );
         assert_eq!(blocker_scope(EvidenceBundle), BlockerScope::AllModes);
+    }
+
+    /// Every agent can be every agent's sub-agent; Codex as a child carries its caveat, which
+    /// never turns into a blocker.
+    #[test]
+    fn every_agent_pair_is_admitted_and_only_codex_children_carry_a_caveat() {
+        for parent in Driver::ALL {
+            for child in Driver::ALL {
+                for task_mode in TaskMode::ALL {
+                    let spec = admit_route(&RouteQuery {
+                        parent,
+                        child,
+                        task_mode,
+                        child_bridge: ChildBridge::WithBridge,
+                    });
+                    assert_eq!(spec.status, RouteStatus::Verified, "{parent:?} → {child:?}");
+                }
+                let expected: &[RouteCaveat] = if child == Driver::Codex {
+                    &[RouteCaveat::CodexNativeWorkersUnsupervised]
+                } else {
+                    &[]
+                };
+                assert_eq!(route_caveats(child), expected);
+            }
+        }
+        // Adding a caveat stops this compiling until it is placed in `ALL`.
+        fn position(c: RouteCaveat) -> usize {
+            match c {
+                RouteCaveat::CodexNativeWorkersUnsupervised => 0,
+            }
+        }
+        for (i, c) in RouteCaveat::ALL.into_iter().enumerate() {
+            assert_eq!(position(c), i);
+            assert!(c.as_str().len() <= 64);
+            assert_eq!(
+                serde_json::to_value(c).expect("ser"),
+                serde_json::json!(c.as_str())
+            );
+            assert!(!c.explain().is_empty());
+        }
     }
 
     #[test]

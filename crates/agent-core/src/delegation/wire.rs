@@ -263,6 +263,10 @@ pub struct ModeAdmission {
     pub task_mode: TaskMode,
     pub route_status: RouteStatus,
     pub route_blockers: Vec<String>,
+    /// What the route admits but cannot supervise (`route::RouteCaveat` names). Absent when
+    /// empty, so a reader of the earlier shape sees nothing new.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_caveats: Vec<String>,
     pub child_bridge: ChildBridge,
 }
 
@@ -1607,6 +1611,10 @@ pub(crate) mod fixtures {
                 task_mode,
                 route_status: RouteStatus::Unverified,
                 route_blockers: vec![text(c, 64); 16],
+                // Every caveat at once: an enum, so its real names are its largest values.
+                route_caveats: super::super::route::RouteCaveat::ALL
+                    .map(|caveat| caveat.as_str().to_owned())
+                    .to_vec(),
                 child_bridge: ChildBridge::WithoutBridge,
             })
             .collect();

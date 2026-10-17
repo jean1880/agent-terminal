@@ -1,32 +1,247 @@
 //! Managed registration is previewed on a worker and applied only by its explicit dialog.
+//!
+//! One master switch ("agents can use each other as sub-agents") drives every agent's own
+//! "Available for delegation" switch; those stay, as the per-agent opt-out. [`Switches`] keeps
+//! them in step.
 
 use super::*;
 use agent_kit::delegation_config::{self, Action};
+use std::cell::Cell;
 use std::path::PathBuf;
 
+/// The master switch, each agent's switch and the registration row, so a change to one shows
+/// on the others. `quiet` is set while code moves a switch: its handler then does nothing.
+pub(super) struct Switches {
+    master: RefCell<Option<glib::WeakRef<adw::SwitchRow>>>,
+    agents: RefCell<Vec<(Driver, glib::WeakRef<adw::SwitchRow>)>>,
+    pub(super) registration_row: glib::WeakRef<adw::ActionRow>,
+    dialog: glib::WeakRef<adw::PreferencesDialog>,
+    quiet: Cell<bool>,
+    /// An Antigravity review is open: the master switch stays where the user put it until the
+    /// review ends, instead of flicking off while the registration is not yet saved.
+    reviewing: Cell<bool>,
+}
+
+impl Switches {
+    fn set_quietly(&self, row: &adw::SwitchRow, on: bool) {
+        if row.is_active() != on {
+            self.quiet.set(true);
+            row.set_active(on);
+            self.quiet.set(false);
+        }
+    }
+    fn agent_row(&self, driver: Driver) -> Option<adw::SwitchRow> {
+        self.agents
+            .borrow()
+            .iter()
+            .find(|(d, _)| *d == driver)
+            .and_then(|(_, row)| row.upgrade())
+    }
+    /// Registers `driver`'s own switch (built after the master one).
+    pub(super) fn add_agent(&self, driver: Driver, row: &adw::SwitchRow) {
+        self.agents.borrow_mut().push((driver, row.downgrade()));
+    }
+    /// Whether code is moving a switch right now (its handler should do nothing).
+    pub(super) fn quiet(&self) -> bool {
+        self.quiet.get()
+    }
+}
+
+/// The master switch's text, and whether it is on: on only when every enabled agent is
+/// available for delegation. Pure, so the mixed case is testable without GTK.
+pub(super) fn master_state(agents: &[(Driver, bool, bool)]) -> (bool, String) {
+    let label = |d: &Driver| d.info().long_label;
+    let enabled: Vec<_> = agents.iter().filter(|(_, disabled, _)| !disabled).collect();
+    let on: Vec<_> = enabled
+        .iter()
+        .filter(|(_, _, a)| *a)
+        .map(|(d, _, _)| label(d))
+        .collect();
+    let off: Vec<_> = enabled
+        .iter()
+        .filter(|(_, _, a)| !*a)
+        .map(|(d, _, _)| label(d))
+        .collect();
+    let caveat = agent_core::delegation::route::RouteCaveat::CodexNativeWorkersUnsupervised;
+    let base = format!(
+        "Every enabled agent can hand work to the others and take work from them, in any \
+         thread, whichever agent drives it. Each thread's sub-agents are its own. Antigravity \
+         needs a one-time registration, reviewed when you turn this on.\nCodex as a sub-agent: \
+         {}",
+        caveat.explain()
+    );
+    let all = !enabled.is_empty() && off.is_empty();
+    let text = if all || on.is_empty() {
+        base
+    } else {
+        format!(
+            "Custom: on for {}; off for {}. Turn this on to include every agent.\n{base}",
+            on.join(", "),
+            off.join(", ")
+        )
+    };
+    (all, text)
+}
+
 impl AgentTerminalWindow {
-    /// The delegation group, and its Antigravity registration row (which the agent groups'
-    /// "Available for delegation" switches report to).
+    /// The agents' delegation state now: `(driver, disabled, available_for_delegation)`.
+    fn delegation_agents(&self) -> Vec<(Driver, bool, bool)> {
+        Driver::ALL
+            .into_iter()
+            .map(|d| {
+                let p = self.agent_profile_now(d);
+                (d, p.disabled, p.available_for_delegation)
+            })
+            .collect()
+    }
+
+    /// Puts the master switch and its text in step with the saved settings. The switch itself
+    /// moves on the next idle, never from inside a switch's own change: GObject holds a nested
+    /// change's notification until the outer one ends, so it would arrive after `quiet` was
+    /// cleared and be taken for the user's click (turning every agent back off).
+    pub(super) fn refresh_master_switch(&self, switches: &Rc<Switches>) {
+        let Some(master) = switches.master.borrow().as_ref().and_then(|m| m.upgrade()) else {
+            return;
+        };
+        master.set_subtitle(&master_state(&self.delegation_agents()).1);
+        let (window, switches) = (self.obj().downgrade(), switches.clone());
+        glib::idle_add_local_once(move || {
+            let (Some(window), Some(master)) = (
+                window.upgrade(),
+                switches.master.borrow().as_ref().and_then(|m| m.upgrade()),
+            ) else {
+                return;
+            };
+            if switches.reviewing.get() {
+                return;
+            }
+            let (on, text) = master_state(&window.imp().delegation_agents());
+            switches.set_quietly(&master, on);
+            master.set_subtitle(&text);
+        });
+    }
+
+    /// Makes `driver` available for delegation or not, as its own switch or the master one
+    /// asked. Claude and Codex save at once. Antigravity is saved on only once its
+    /// registration review is applied (or found ready); declined or failed, it stays off, and
+    /// turning it off offers Remove. Both switches end in step with what was saved.
+    pub(super) fn set_agent_delegation(&self, driver: Driver, on: bool, switches: &Rc<Switches>) {
+        let settle = {
+            let (window, switches) = (self.obj().downgrade(), switches.clone());
+            move |on: bool| {
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                if driver == Driver::Agy {
+                    switches.reviewing.set(false);
+                }
+                if let Some(row) = switches.agent_row(driver) {
+                    switches.set_quietly(&row, on);
+                }
+                window.imp().refresh_master_switch(&switches);
+            }
+        };
+        if driver != Driver::Agy || !on {
+            self.edit_agent_profile(driver, |p| p.available_for_delegation = on);
+            settle(on);
+            if driver == Driver::Agy {
+                self.review_delegation_registration(
+                    Action::Remove,
+                    switches.dialog.clone(),
+                    switches.registration_row.clone(),
+                    |_| {},
+                );
+            }
+            return;
+        }
+        switches.reviewing.set(true);
+        let window = self.obj().downgrade();
+        self.review_delegation_registration(
+            Action::Configure,
+            switches.dialog.clone(),
+            switches.registration_row.clone(),
+            move |review| {
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                let ready = matches!(review, Review::Ready);
+                if let Review::Failed(error) = &review {
+                    window
+                        .imp()
+                        .show_toast(&format!("Antigravity was not set up: {error}"));
+                }
+                if ready {
+                    window
+                        .imp()
+                        .edit_agent_profile(driver, |p| p.available_for_delegation = true);
+                }
+                settle(ready);
+            },
+        );
+    }
+
+    /// "Agents can use each other as sub-agents": turns every enabled agent's delegation on or
+    /// off together (Antigravity through its review).
+    fn master_delegation_row(&self, switches: &Rc<Switches>) -> adw::SwitchRow {
+        let row = adw::SwitchRow::builder()
+            .title("Agents can use each other as sub-agents")
+            .subtitle_lines(0)
+            .build();
+        switches.master.replace(Some(row.downgrade()));
+        self.refresh_master_switch(switches);
+        let obj = self.obj();
+        let switches = switches.clone();
+        row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                if switches.quiet() {
+                    return;
+                }
+                let on = row.is_active();
+                let imp = obj.imp();
+                for (driver, disabled, available) in imp.delegation_agents() {
+                    // Turning on skips disabled agents; turning off includes them.
+                    if (on && disabled) || available == on {
+                        continue;
+                    }
+                    imp.set_agent_delegation(driver, on, &switches);
+                }
+                imp.refresh_master_switch(&switches);
+            }
+        ));
+        row
+    }
+
+    /// The delegation group, and the [`Switches`] the agent groups' own switches join.
     pub(super) fn delegation_group(
         &self,
         dialog: &adw::PreferencesDialog,
-    ) -> (adw::PreferencesGroup, glib::WeakRef<adw::ActionRow>) {
+    ) -> (adw::PreferencesGroup, Rc<Switches>) {
         let group = adw::PreferencesGroup::builder()
             .title("Cross-agent delegation")
             .description(agent_core::delegation::tools::DELEGATION_SCOPE_TEXT)
             .build();
+        let row = adw::ActionRow::builder().title("Antigravity registration")
+            .subtitle("Checking… Claude and Codex use temporary launch bindings; Antigravity needs a managed registration, set up when it is made available for delegation.")
+            .subtitle_lines(0).build();
+        let switches = Rc::new(Switches {
+            master: RefCell::new(None),
+            agents: RefCell::new(Vec::new()),
+            registration_row: row.downgrade(),
+            dialog: dialog.downgrade(),
+            quiet: Cell::new(false),
+            reviewing: Cell::new(false),
+        });
+        group.add(&self.master_delegation_row(&switches));
         let runtime = adw::ActionRow::builder().title("Application binding")
             .subtitle(if crate::delegation::supervisor().is_some() {
                 "Supervisor available. Each enabled thread receives its own binding when opened."
             } else { "Could not verify the supervisor. Delegation is unavailable until startup completes." })
             .build();
         group.add(&runtime);
-        let row = adw::ActionRow::builder().title("Antigravity registration")
-            .subtitle("Checking… Claude and Codex use temporary launch bindings; Antigravity needs a managed registration, set up when it is made available for delegation.")
-            .subtitle_lines(0).build();
         group.add(&row);
         self.check_delegation_registration(row.downgrade());
-        let registration_row = row.downgrade();
         for (title, action) in [
             ("Configure / Repair", Some(Action::Configure)),
             ("Remove", Some(Action::Remove)),
@@ -92,7 +307,7 @@ impl AgentTerminalWindow {
         undo_row.add_suffix(&undo);
         undo_row.set_activatable_widget(Some(&undo));
         group.add(&undo_row);
-        (group, registration_row)
+        (group, switches)
     }
 
     fn preview_delegation_registration(
@@ -293,4 +508,83 @@ async fn registration_context(
     let command = std::env::current_exe()
         .map_err(|_| "Cannot locate the installed Agent Terminal executable")?;
     Ok((home, state, command, launch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::master_state;
+    use agent_core::adapter::Driver::{Agy, Claude, Codex};
+
+    #[test]
+    fn the_master_switch_is_on_only_when_every_enabled_agent_is() {
+        // (driver, disabled, available)
+        assert!(
+            master_state(&[
+                (Claude, false, true),
+                (Codex, false, true),
+                (Agy, false, true)
+            ])
+            .0
+        );
+        assert!(
+            !master_state(&[
+                (Claude, false, true),
+                (Codex, false, true),
+                (Agy, false, false)
+            ])
+            .0
+        );
+        // A disabled agent neither holds it off nor counts for it.
+        assert!(
+            master_state(&[
+                (Claude, false, true),
+                (Codex, false, true),
+                (Agy, true, false)
+            ])
+            .0
+        );
+        // Nothing enabled: nothing to turn on.
+        assert!(
+            !master_state(&[
+                (Claude, true, true),
+                (Codex, true, false),
+                (Agy, true, false)
+            ])
+            .0
+        );
+    }
+
+    #[test]
+    fn a_mixed_state_names_who_is_on_and_off_and_the_codex_caveat_always_shows() {
+        let (on, text) = master_state(&[
+            (Claude, false, true),
+            (Codex, false, true),
+            (Agy, false, false),
+        ]);
+        assert!(!on);
+        assert!(
+            text.starts_with("Custom: on for Claude, Codex; off for Antigravity."),
+            "{text}"
+        );
+        let caveat = agent_core::delegation::route::RouteCaveat::CodexNativeWorkersUnsupervised;
+        for agents in [
+            [
+                (Claude, false, true),
+                (Codex, false, true),
+                (Agy, false, true),
+            ],
+            [
+                (Claude, false, false),
+                (Codex, false, false),
+                (Agy, false, false),
+            ],
+        ] {
+            let (_, text) = master_state(&agents);
+            assert!(
+                !text.starts_with("Custom"),
+                "all on or all off is not custom: {text}"
+            );
+            assert!(text.contains(caveat.explain()));
+        }
+    }
 }
