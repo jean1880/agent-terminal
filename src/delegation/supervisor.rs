@@ -1507,6 +1507,82 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// A descendant stopped after its task left `pending` but before its turn opened has no
+    /// turn to end as interrupted; its run must still reach a final state, not stay open.
+    #[test]
+    fn a_descendant_stopped_before_its_turn_opens_still_ends_its_run() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let parent_receipt = sup
+                .spawn_worker(&root, spawn_request("silent-parent"))
+                .await
+                .unwrap();
+            let parent = WorkerId::parse(parent_receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&parent].run.is_none()).await;
+            std::fs::write(dir.path().join("silent-task"), "").unwrap();
+            let receipt = sup
+                .spawn_worker(&parent, spawn_request("silent-grandchild"))
+                .await
+                .unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let run = receipt["run_id"].as_str().unwrap().to_owned();
+            pump_until(|| sup.state.borrow().workers[&child].pending.is_none()).await;
+            // Let the write reach the child, whose turn then never opens.
+            pump_until(|| {
+                std::fs::read_to_string(dir.path().join("frames.ndjson"))
+                    .is_ok_and(|log| log.contains("do the task"))
+            })
+            .await;
+            sup.fail_worker(
+                &parent,
+                error(ErrorCode::PersistenceFailed, "synthetic parent failure"),
+            );
+            pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(&run)
+                    .unwrap()
+                    .is_some_and(|r| matches!(r.state.as_str(), "interrupted" | "failed"))
+            })
+            .await;
+            assert!(sup.state.borrow().workers[&child].run.is_none());
+            stop(&sup).await;
+        });
+    }
+    /// The same gap through revocation: Stop on the root ends a child whose turn never opened.
+    #[test]
+    fn root_stop_ends_the_run_of_a_child_whose_turn_never_opened() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            std::fs::write(dir.path().join("silent-task"), "").unwrap();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("silent-child"))
+                .await
+                .unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let run = receipt["run_id"].as_str().unwrap().to_owned();
+            pump_until(|| {
+                std::fs::read_to_string(dir.path().join("frames.ndjson"))
+                    .is_ok_and(|log| log.contains("do the task"))
+            })
+            .await;
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            sup.root_stop(&thread);
+            pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(&run)
+                    .unwrap()
+                    .is_some_and(|r| r.state == "interrupted")
+            })
+            .await;
+            stop(&sup).await;
+        });
+    }
     #[test]
     fn root_stop_rolls_back_tentative_provider_identity_without_touching_newer_ticket() {
         in_context(async {
@@ -2706,7 +2782,7 @@ impl Supervisor {
             for id in &effect.stop_processes {
                 if let Some(w) = state.workers.get_mut(id) {
                     if let Some(s) = w.session() {
-                        sessions.push(s);
+                        sessions.push((id.clone(), s));
                     }
                 }
             }
@@ -2730,10 +2806,15 @@ impl Supervisor {
                 );
             }
         }
-        for s in sessions {
+        let mut stopped = Vec::with_capacity(sessions.len());
+        for (id, s) in sessions {
             s.expire_approvals("Delegation authority revoked");
             s.interrupt_run();
             s.shutdown(true);
+            stopped.push(id);
+        }
+        if let Some(sup) = self.weak.upgrade() {
+            sup.interrupt_open_runs(&stopped);
         }
     }
     pub(crate) async fn revoke(
