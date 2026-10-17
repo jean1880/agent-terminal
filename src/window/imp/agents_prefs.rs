@@ -500,12 +500,13 @@ impl AgentTerminalWindow {
             .build();
         general.add(&self.default_agent_row());
         page.add(&general);
-        page.add(&self.delegation_group(dialog));
+        let (delegation, registration_row) = self.delegation_group(dialog);
+        page.add(&delegation);
 
         page.add(&self.permissions_group());
 
         for driver in Driver::ALL {
-            page.add(&self.agent_group(driver, dialog));
+            page.add(&self.agent_group(driver, dialog, &registration_row));
         }
         dialog.add(&page);
     }
@@ -1397,6 +1398,7 @@ impl AgentTerminalWindow {
         &self,
         driver: Driver,
         dialog: &adw::PreferencesDialog,
+        registration_row: &glib::WeakRef<adw::ActionRow>,
     ) -> adw::PreferencesGroup {
         let profile = self.agent_profile_now(driver);
         let group = adw::PreferencesGroup::builder()
@@ -1405,18 +1407,75 @@ impl AgentTerminalWindow {
             .build();
         group.add(&self.agent_enabled_row(driver, dialog.upcast_ref()));
         group.add(&self.agent_account_row(driver, dialog.upcast_ref()));
+        let subtitle = if driver == Driver::Agy {
+            "Allow this agent to delegate and receive work in Agent Terminal. Verified routes only; writing agents use isolated worktrees. Turning it on reviews Antigravity's managed registration; turning it off offers to remove it."
+        } else {
+            "Allow this agent to delegate and receive work in Agent Terminal. Verified routes only; writing agents use isolated worktrees."
+        };
         let delegation = adw::SwitchRow::builder()
             .title("Available for delegation")
-            .subtitle("Allow this agent to delegate and receive work in Agent Terminal. Verified routes only; writing agents use isolated worktrees.")
+            .subtitle(subtitle)
             .active(profile.available_for_delegation)
             .build();
         let obj = self.obj();
+        // Set while the switch is turned back off after a declined or failed setup.
+        let reverting = Rc::new(std::cell::Cell::new(false));
+        let weak_dialog = dialog.downgrade();
+        let registration_row = registration_row.clone();
         delegation.connect_active_notify(glib::clone!(
             #[weak]
             obj,
             move |row| {
-                obj.imp()
-                    .edit_agent_profile(driver, |p| p.available_for_delegation = row.is_active());
+                if reverting.get() {
+                    return;
+                }
+                let on = row.is_active();
+                let imp = obj.imp();
+                if driver != Driver::Agy {
+                    imp.edit_agent_profile(driver, |p| p.available_for_delegation = on);
+                    return;
+                }
+                if !on {
+                    imp.edit_agent_profile(driver, |p| p.available_for_delegation = false);
+                    imp.review_delegation_registration(
+                        agent_kit::delegation_config::Action::Remove,
+                        weak_dialog.clone(),
+                        registration_row.clone(),
+                        |_| {},
+                    );
+                    return;
+                }
+                // Saved only once the registration is ready: an opted-in profile without one
+                // would start its threads unbound.
+                let (switch, window, reverting) =
+                    (row.downgrade(), obj.downgrade(), reverting.clone());
+                imp.review_delegation_registration(
+                    agent_kit::delegation_config::Action::Configure,
+                    weak_dialog.clone(),
+                    registration_row.clone(),
+                    move |review| {
+                        let (Some(switch), Some(window)) = (switch.upgrade(), window.upgrade())
+                        else {
+                            return;
+                        };
+                        match review {
+                            delegation::Review::Ready if switch.is_active() => {
+                                window.imp().edit_agent_profile(driver, |p| {
+                                    p.available_for_delegation = true
+                                });
+                            }
+                            delegation::Review::Ready => {}
+                            delegation::Review::Cancelled | delegation::Review::Failed(_) => {
+                                if let delegation::Review::Failed(error) = review {
+                                    window.imp().show_toast(&error);
+                                }
+                                reverting.set(true);
+                                switch.set_active(false);
+                                reverting.set(false);
+                            }
+                        }
+                    },
+                );
             }
         ));
         group.add(&delegation);

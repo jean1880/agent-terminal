@@ -7,7 +7,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use agent_core::delegation::agy_guard::ALLOW_RULES;
@@ -24,7 +24,7 @@ pub enum Action {
     Remove,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 struct Edit {
     path: PathBuf,
     before: Option<String>,
@@ -35,10 +35,13 @@ struct Edit {
 pub struct Preview {
     home: PathBuf,
     state: PathBuf,
+    command: PathBuf,
+    action: Action,
     edits: Vec<Edit>,
     added_rules: Vec<String>,
     previous_added_rules: Vec<String>,
     journal_before: Option<String>,
+    repairs: Vec<Repair>,
     summary: String,
 }
 
@@ -47,8 +50,13 @@ impl Preview {
     pub fn summary(&self) -> &str {
         &self.summary
     }
+    /// Whether applying it would change anything: a file edit or a permission repair.
     pub fn changed(&self) -> bool {
-        self.edits.iter().any(|e| e.before != e.after)
+        !self.repairs.is_empty() || self.edits.iter().any(|e| e.before != e.after)
+    }
+    /// The permission repairs applying it would make first (only from [`preview_repairing`]).
+    pub fn repairs(&self) -> &[Repair] {
+        &self.repairs
     }
 }
 
@@ -134,7 +142,38 @@ fn fail(message: impl Into<String>) -> String {
     message.into()
 }
 
+/// A group- or world-writable directory or file on a registration path that the user owns, and
+/// that is neither a symlink nor hard-linked: the one unsafe condition a review may repair.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Repair {
+    path: PathBuf,
+    mode: u32,
+}
+
+impl Repair {
+    /// The path and its permission change, e.g. `/home/u/.gemini: 775 → 755`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}: {:o} → {:o}",
+            self.path.display(),
+            self.mode & 0o7777,
+            self.mode & 0o7777 & !0o022
+        )
+    }
+}
+
 fn safe_path(home: &Path, path: &Path) -> Result<(), String> {
+    check_path(home, path, None)
+}
+
+/// Every component from `home` down to `path` must be owned, not a symlink, not hard-linked and
+/// not group- or world-writable. With `repairs`, a writable but otherwise safe component is
+/// recorded there instead of refused. Messages name the path, never its contents.
+fn check_path(
+    home: &Path,
+    path: &Path,
+    mut repairs: Option<&mut Vec<Repair>>,
+) -> Result<(), String> {
     if !path.starts_with(home)
         || path
             .components()
@@ -142,50 +181,105 @@ fn safe_path(home: &Path, path: &Path) -> Result<(), String> {
     {
         return Err(fail("registration path is outside the selected home"));
     }
-    let home_meta =
-        fs::symlink_metadata(home).map_err(|_| fail("cannot verify the selected home"))?;
     // SAFETY: geteuid has no preconditions.
     let owner = unsafe { libc::geteuid() };
-    if !home_meta.is_dir()
-        || home_meta.file_type().is_symlink()
-        || home_meta.uid() != owner
-        || home_meta.mode() & 0o022 != 0
-    {
-        return Err(fail(
-            "selected home must be an owned directory without group or world write permission",
-        ));
-    }
     let mut current = home.to_path_buf();
-    for part in path
+    let parts = path
         .strip_prefix(home)
         .map_err(|_| fail("invalid registration path"))?
-        .components()
-    {
-        current.push(part);
-        match fs::symlink_metadata(&current) {
-            Ok(meta)
-                if meta.file_type().is_symlink()
-                    || meta.uid() != owner
-                    || meta.mode() & 0o022 != 0
-                    || (meta.is_file() && meta.nlink() != 1) =>
-            {
-                return Err(fail(
-                    "registration path has an unsafe link, owner or write permission",
-                ));
+        .components();
+    for part in std::iter::once(None).chain(parts.map(Some)) {
+        if let Some(part) = part {
+            current.push(part);
+        }
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && part.is_some() => continue,
+            Err(_) => return Err(format!("cannot verify {}", current.display())),
+        };
+        let named = |why: &str| format!("{} {why}", current.display());
+        if meta.file_type().is_symlink() {
+            return Err(named("is a symbolic link"));
+        }
+        if meta.uid() != owner {
+            return Err(named("is not owned by you"));
+        }
+        if part.is_none() && !meta.is_dir() {
+            return Err(named("is not a directory"));
+        }
+        if !meta.is_dir() && !meta.is_file() {
+            return Err(named("is not a regular file or directory"));
+        }
+        if meta.is_file() && meta.nlink() != 1 {
+            return Err(named("has other hard links"));
+        }
+        if meta.mode() & 0o022 != 0 {
+            let repair = Repair {
+                path: current.clone(),
+                mode: meta.mode(),
+            };
+            match repairs.as_deref_mut() {
+                Some(list) => {
+                    if !list.contains(&repair) {
+                        list.push(repair);
+                    }
+                }
+                None => {
+                    return Err(named(
+                        "is writable by its group or others; remove that permission (chmod go-w)",
+                    ))
+                }
             }
-            Ok(meta) if !meta.is_dir() && !meta.is_file() => {
-                return Err(fail("registration path is not a regular file or directory"))
-            }
-            Ok(_) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(_) => return Err(fail("cannot verify a registration path")),
         }
     }
     Ok(())
 }
 
+/// Removes group and world write from each reviewed path, parents first, through a descriptor
+/// opened without following links. A path that is no longer the reviewed, owned file or
+/// directory with the reviewed mode is refused, not changed.
+fn repair(repairs: &[Repair]) -> Result<(), String> {
+    let mut ordered: Vec<_> = repairs.iter().collect();
+    ordered.sort_by_key(|r| r.path.components().count());
+    // SAFETY: geteuid has no preconditions.
+    let owner = unsafe { libc::geteuid() };
+    for r in ordered {
+        let changed = || {
+            format!(
+                "{} changed since the preview; preview it again",
+                r.path.display()
+            )
+        };
+        let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if r.mode & libc::S_IFMT == libc::S_IFDIR {
+            flags |= libc::O_DIRECTORY;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(&r.path)
+            .map_err(|_| changed())?;
+        let meta = file.metadata().map_err(|_| changed())?;
+        if meta.uid() != owner || meta.mode() != r.mode || (meta.is_file() && meta.nlink() != 1) {
+            return Err(changed());
+        }
+        file.set_permissions(fs::Permissions::from_mode(r.mode & 0o7777 & !0o022))
+            .map_err(|_| format!("cannot change the permissions of {}", r.path.display()))?;
+    }
+    Ok(())
+}
+
 fn read(home: &Path, path: &Path, limit: u64) -> Result<Option<String>, String> {
-    safe_path(home, path)?;
+    read_checked(home, path, limit, None)
+}
+
+fn read_checked(
+    home: &Path,
+    path: &Path,
+    limit: u64,
+    repairs: Option<&mut Vec<Repair>>,
+) -> Result<Option<String>, String> {
+    check_path(home, path, repairs)?;
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -248,11 +342,34 @@ fn subobject<'a>(
 }
 
 /// Plans only the managed server and exact allow rules; no directories or files are written.
+/// Any unsafe path refuses the plan.
 pub fn preview(
     home: &Path,
     state: &Path,
     command: &Path,
     action: Action,
+) -> Result<Preview, String> {
+    plan(home, state, command, action, false)
+}
+
+/// As [`preview`], but group- or world-writable paths that are otherwise safe are listed as
+/// repairs (see [`Preview::repairs`]) instead of refused. [`apply`] makes them first, then
+/// plans again strictly and refuses if that plan differs from this one.
+pub fn preview_repairing(
+    home: &Path,
+    state: &Path,
+    command: &Path,
+    action: Action,
+) -> Result<Preview, String> {
+    plan(home, state, command, action, true)
+}
+
+fn plan(
+    home: &Path,
+    state: &Path,
+    command: &Path,
+    action: Action,
+    repairing: bool,
 ) -> Result<Preview, String> {
     if !command.is_absolute() {
         return Err(fail(
@@ -265,8 +382,19 @@ pub fn preview(
     }
     let mcp_path = home.join(".gemini/config/mcp_config.json");
     let settings_path = home.join(".gemini/antigravity-cli/settings.json");
-    let mcp_before = read(&home, &mcp_path, MAX_FILE)?;
-    let settings_before = read(&home, &settings_path, MAX_FILE)?;
+    let mut repairs = Vec::new();
+    let mcp_before = read_checked(
+        &home,
+        &mcp_path,
+        MAX_FILE,
+        repairing.then_some(&mut repairs),
+    )?;
+    let settings_before = read_checked(
+        &home,
+        &settings_path,
+        MAX_FILE,
+        repairing.then_some(&mut repairs),
+    )?;
     let mut mcp = object(mcp_before.as_deref())?;
     let mut settings = object(settings_before.as_deref())?;
     let entry = json!({"command":command, "args":[BRIDGE_ARG]});
@@ -279,7 +407,12 @@ pub fn preview(
             "agent_terminal already names a different MCP registration; it was left unchanged",
         ));
     }
-    let journal_before = read(&home, &state.join(JOURNAL), 16 * MAX_FILE)?;
+    let journal_before = read_checked(
+        &home,
+        &state.join(JOURNAL),
+        16 * MAX_FILE,
+        repairing.then_some(&mut repairs),
+    )?;
     let previous: Option<Journal> = journal_before
         .as_ref()
         .map(|s| {
@@ -322,19 +455,34 @@ pub fn preview(
             format!("Selected home: {}\nFiles: {} and {}\nRemove only the managed agent_terminal registration and rules added by Agent Terminal. Preserve other settings and pre-existing allow rules.",home.display(),mcp_path.display(),settings_path.display())
         }
     };
-    let mcp_after = if mcp_before.is_none() && matches!(action, Action::Remove) {
-        None
-    } else {
-        Some(encode(&mcp)?)
+    // A file whose value does not change keeps its exact bytes: formatting alone is no change.
+    let after = |before: &Option<String>, value: &Value| -> Result<Option<String>, String> {
+        match before {
+            None if matches!(action, Action::Remove) => Ok(None),
+            Some(text) if object(Some(text))? == *value => Ok(Some(text.clone())),
+            _ => encode(value).map(Some),
+        }
     };
-    let settings_after = if settings_before.is_none() && matches!(action, Action::Remove) {
-        None
+    let mcp_after = after(&mcp_before, &mcp)?;
+    let settings_after = after(&settings_before, &settings)?;
+    let summary = if repairs.is_empty() {
+        summary
     } else {
-        Some(encode(&settings)?)
+        let list: Vec<_> = repairs
+            .iter()
+            .map(|r| format!("• {}", r.describe()))
+            .collect();
+        format!(
+            "First remove group and world write permission (unsafe for a registration):\n{}\n{summary}",
+            list.join("\n")
+        )
     };
     Ok(Preview {
         home,
         state: state.to_path_buf(),
+        command: command.to_path_buf(),
+        action,
+        repairs,
         edits: vec![
             Edit {
                 path: mcp_path,
@@ -440,7 +588,24 @@ fn replace(
 }
 
 /// Applies a reviewed preview. A crash or partial failure leaves the private journal for undo.
+/// Its permission repairs come first; the plan is then made again strictly and must match the
+/// reviewed one exactly.
 pub fn apply(plan: Preview) -> Result<(), String> {
+    let plan = if plan.repairs.is_empty() {
+        plan
+    } else {
+        repair(&plan.repairs)?;
+        let strict = preview(&plan.home, &plan.state, &plan.command, plan.action)?;
+        if strict.edits != plan.edits
+            || strict.journal_before != plan.journal_before
+            || strict.added_rules != plan.added_rules
+        {
+            return Err(fail(
+                "permissions repaired, but the configuration changed since the preview; preview it again",
+            ));
+        }
+        strict
+    };
     let _lock = lock(&plan.home, &plan.state)?;
     if read(&plan.home, &plan.state.join(JOURNAL), 16 * MAX_FILE)? != plan.journal_before {
         return Err(fail(
@@ -978,6 +1143,91 @@ mod tests {
         fs::set_permissions(&home, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(preview(&home, &state, command, Action::Configure).is_err());
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    /// A umask-002 layout: owned, but group-writable directory and file.
+    fn group_writable(home: &Path) -> (PathBuf, PathBuf) {
+        let gemini = home.join(".gemini");
+        let mcp = gemini.join("config/mcp_config.json");
+        put(
+            home,
+            &mcp,
+            Some("{\"mcpServers\":{\"other\":{\"command\":\"keep\"}}}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&gemini, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&mcp, fs::Permissions::from_mode(0o664)).unwrap();
+        (gemini, mcp)
+    }
+
+    #[test]
+    fn writable_paths_are_named_and_repaired_only_through_a_reviewed_apply() {
+        let (_tmp, home, state) = paths();
+        let command = Path::new("/usr/bin/agent-terminal");
+        let (gemini, mcp) = group_writable(&home);
+        let strict = preview(&home, &state, command, Action::Configure)
+            .err()
+            .unwrap();
+        assert!(strict.contains(&gemini.display().to_string()), "{strict}");
+        let plan = preview_repairing(&home, &state, command, Action::Configure).unwrap();
+        let listed: Vec<_> = plan.repairs().iter().map(Repair::describe).collect();
+        assert_eq!(
+            listed,
+            [
+                format!("{}: 775 → 755", gemini.display()),
+                format!("{}: 664 → 644", mcp.display()),
+            ]
+        );
+        assert!(plan.summary().contains("775 → 755"));
+        // Previewing changes nothing.
+        assert_eq!((mode(&gemini), mode(&mcp)), (0o775, 0o664));
+        apply(plan).unwrap();
+        assert_eq!(mode(&gemini), 0o755);
+        let plan = preview(&home, &state, command, Action::Configure).unwrap();
+        assert!(!plan.changed(), "configured and safe after one apply");
+        let config = object(read(&home, &mcp, MAX_FILE).unwrap().as_deref()).unwrap();
+        assert_eq!(config["mcpServers"]["other"]["command"], "keep");
+        assert!(config["mcpServers"][SERVER_NAME].is_object());
+    }
+
+    #[test]
+    fn a_repair_whose_path_changed_since_the_preview_is_refused() {
+        let (_tmp, home, state) = paths();
+        let command = Path::new("/usr/bin/agent-terminal");
+        let (gemini, mcp) = group_writable(&home);
+        let plan = preview_repairing(&home, &state, command, Action::Configure).unwrap();
+        fs::set_permissions(&mcp, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(apply(plan).is_err());
+        assert!(!state.join(JOURNAL).exists(), "nothing was registered");
+        // The parent was repaired before the changed file was refused; never widened.
+        assert_eq!((mode(&gemini), mode(&mcp)), (0o755, 0o666));
+    }
+
+    #[test]
+    fn links_and_foreign_paths_are_never_offered_as_repairs() {
+        let (_tmp, home, state) = paths();
+        let command = Path::new("/usr/bin/agent-terminal");
+        let (_, mcp) = group_writable(&home);
+        fs::remove_file(&mcp).unwrap();
+        symlink("/dev/null", &mcp).unwrap();
+        let error = preview_repairing(&home, &state, command, Action::Configure)
+            .err()
+            .unwrap();
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn formatting_alone_is_not_a_change() {
+        let (_tmp, home, state) = paths();
+        let command = Path::new("/usr/bin/agent-terminal");
+        let mcp = home.join(".gemini/config/mcp_config.json");
+        put(&home, &mcp, Some("{\"mcpServers\":{\"other\":{}}}")).unwrap();
+        let plan = preview(&home, &state, command, Action::Remove).unwrap();
+        assert!(!plan.changed(), "nothing to remove");
     }
 
     fn diagnostic_script(dir: &Path, body: &str) -> PathBuf {

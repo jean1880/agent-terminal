@@ -7,6 +7,15 @@ use crate::delegation::seam::{ChildStop, ResolvedChild};
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::WorkerSummary;
 
+/// The thread's notice when an opted-in Antigravity root starts unbound because its managed
+/// registration is unusable (`Supervisor::agy_root_problem`).
+pub(super) fn unbound_notice(reason: &str) -> String {
+    format!(
+        "Antigravity started without cross-agent delegation: {reason}. Set it up in Settings → \
+         Agents → Cross-agent delegation (Configure / Repair), then reopen this thread."
+    )
+}
+
 /// A preparation continuation belongs to one slot and one start attempt. Stop, transfer and
 /// a newer attempt invalidate it; clearing an old attempt must not clear a newer spinner.
 pub(super) struct PendingStart {
@@ -224,14 +233,19 @@ pub(super) fn switch(
     let chosen = serial.get().wrapping_add(1);
     serial.set(chosen);
     glib::MainContext::default().spawn_local(async move {
-        if !supervisor
-            .prepare_root_switch(&thread, &profile, driver)
-            .await
+        let problem = supervisor.agy_root_problem(&profile, driver).await;
+        if serial.get() != chosen
+            || !supervisor
+                .prepare_root_switch(&thread, &profile, driver, problem.is_none())
+                .await
             || serial.get() != chosen
         {
             return;
         }
         session.switch(driver, model, effort);
+        if let Some(reason) = problem {
+            session.note(unbound_notice(&reason));
+        }
         session.rebind_start();
     });
 }
@@ -278,16 +292,21 @@ impl AgentTerminalWindow {
         let serial = slot.switch_serial.clone();
         let chosen = serial.get();
         glib::MainContext::default().spawn_local(async move {
-            let prepared = match crate::delegation::supervisor() {
+            let (prepared, problem) = match crate::delegation::supervisor() {
                 Some(supervisor) => {
-                    supervisor
-                        .root_transfer_resume(&thread, &profile, driver)
-                        .await
+                    let problem = supervisor.agy_root_problem(&profile, driver).await;
+                    let prepared = supervisor
+                        .root_transfer_resume(&thread, &profile, driver, problem.is_none())
+                        .await;
+                    (prepared, problem)
                 }
-                None => true,
+                None => (true, None),
             };
             // Closing, Stop or a newer transfer invalidates this continuation.
             if prepared && serial.get() == chosen && thread_owner(&thread).is_some() {
+                if let Some(reason) = problem {
+                    session.note(unbound_notice(&reason));
+                }
                 session.rebind_start();
             }
         });

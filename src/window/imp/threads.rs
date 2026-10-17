@@ -3937,11 +3937,18 @@ impl AgentTerminalWindow {
                 clear_cancelled();
                 return;
             }
+            // An opted-in agy root whose registration is unusable starts unbound, and says why.
+            let mut problem = None;
             let hooks = match supervisor {
                 Some(ref supervisor) => {
-                    supervisor
-                        .prepare_root(&job.thread, &job.profile, job.driver)
-                        .await
+                    problem = supervisor.agy_root_problem(&job.profile, job.driver).await;
+                    if problem.is_some() || !current() {
+                        None
+                    } else {
+                        supervisor
+                            .prepare_root(&job.thread, &job.profile, job.driver)
+                            .await
+                    }
                 }
                 None => None,
             };
@@ -3951,6 +3958,9 @@ impl AgentTerminalWindow {
             }
             if let Some(obj) = weak.upgrade() {
                 obj.imp().start_session_bound(&page, job, hooks);
+                if let (Some(reason), Some(session)) = (problem, slot.get()) {
+                    session.note(delegation::unbound_notice(&reason));
+                }
             }
         });
     }

@@ -5,9 +5,17 @@ Settings → Agents and enable **Available for delegation** for each profile you
 to use as a parent or child. Reopen an existing thread to attach its bridge. Turning
 availability off revokes its delegation access and stops affected children.
 
-Claude and Codex use a temporary bridge configuration for each process. For agy,
-use **Configure / Repair** in the delegation settings, review the selected profile,
-home and files, then apply. The helper preserves other servers and permission rules.
+Claude and Codex use a temporary bridge configuration for each process. agy needs a
+managed registration: turning **Available for delegation** on for agy reviews it (the
+same as **Configure / Repair** in the delegation settings). Check the selected profile,
+home and files, then apply; the switch stays on only once the registration is ready.
+Group- or world-writable folders and files on its path are listed with their mode
+change and repaired as part of the apply. The helper preserves other servers and
+permission rules. Turning the switch off offers **Remove**. The registration row shows
+its state whenever the settings open, naming any path it refuses.
+
+If an opted-in agy thread starts while its registration is unusable, it starts without
+delegation (as if opted out) and its thread says why, rather than refusing to start.
 **Test** distinguishes registration and headless MCP startup from an authenticated
 thread binding. **Remove** removes only managed entries and rules. **Undo** restores
 the previous managed change only when the current files still match its recorded
