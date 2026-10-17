@@ -789,12 +789,17 @@ pub(super) mod tests {
         );
 
         // Continue in, before anything was said: there is nothing to hand over, so no thread
-        // is made.
-        // Counted once the blank pages left behind by earlier checks have been discarded.
-        for _ in 0..50 {
-            ctx.iteration(false);
-        }
-        let pages = imp.tabs.borrow().len();
+        // is made. Judged by which threads are open, not how many pages: blank pages left by
+        // earlier checks close on their own schedule (after their session settles), so a count
+        // taken around them is a race.
+        let open_threads = || -> std::collections::HashSet<String> {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+                .collect()
+        };
+        let before = open_threads();
         imp.run_thread_action(ThreadAction::ContinueIn {
             thread: thread.clone(),
             driver: Driver::Codex,
@@ -804,7 +809,10 @@ pub(super) mod tests {
         for _ in 0..50 {
             ctx.iteration(false);
         }
-        assert_eq!(imp.tabs.borrow().len(), pages, "no handoff, no new thread");
+        assert!(
+            open_threads().is_subset(&before),
+            "no handoff, no new thread"
+        );
 
         // With history it opens a NEW Codex thread in the same folder, titled after its
         // source, and leaves the source alone.
@@ -817,10 +825,13 @@ pub(super) mod tests {
             model: None,
             effort: None,
         });
-        settle(&|| imp.tabs.borrow().len() == pages + 1);
+        settle(&|| !open_threads().is_subset(&before));
         {
             let tabs = imp.tabs.borrow();
-            let new = tabs.last().expect("the new page");
+            let new = tabs
+                .iter()
+                .find(|t| t.chat.as_ref().is_some_and(|c| !before.contains(&c.thread)))
+                .expect("the new page");
             let chat = new.chat.as_ref().expect("a thread page");
             assert_ne!(chat.thread, thread);
             assert_eq!(chat.driver, Driver::Codex);
