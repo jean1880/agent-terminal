@@ -11,6 +11,7 @@ pub mod exec;
 pub mod filediff;
 pub mod fsutil;
 pub mod git;
+pub mod github;
 pub mod handoff;
 mod heal_tail;
 pub mod native;

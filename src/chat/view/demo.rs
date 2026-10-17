@@ -360,6 +360,8 @@ impl DemoBackend {
             diff_review_script()
         } else if scene == "queue" {
             queue_script()
+        } else if scene == "git" {
+            git_script()
         } else if scene == "requests" || scene == "requests-risky" {
             requests_script(scene == "requests-risky")
         } else if matches!(scene.as_str(), "workers" | "usage")
@@ -1437,6 +1439,53 @@ fn queue_script() -> Vec<Step> {
     s
 }
 
+/// `AGENT_TERMINAL_DEMO_SCENE=git`: a Claude turn stopped on git and GitHub CLI approvals, each
+/// read as its operation: a commit with a heredoc message, a plain push, a force push and a pull
+/// request.
+fn git_script() -> Vec<Step> {
+    let ask = |id: &str, command: &str| {
+        Step::Emit(
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command": command}),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::AllowAlways,
+                    Decision::Deny,
+                ],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request(id),
+        )
+    };
+    vec![
+        Step::Emit(started("git-user", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot(
+            "git-user",
+            StreamKind::Assistant,
+            "Commit the config fix, push it and open the pull request.",
+        )),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        ask(
+            "git-commit",
+            "git commit -m \"$(cat <<'EOF'\nfix(config): write settings atomically\n\nA crash \
+             mid-write left a truncated config.json.\nEOF\n)\"",
+        ),
+        ask("git-push", "git push -u origin fix/atomic-config"),
+        ask("git-force", "git push --force origin main"),
+        ask(
+            "gh-pr",
+            "gh pr create --title \"fix(config): write settings atomically\" --body \"Closes \
+             #42\" --base master --draft",
+        ),
+    ]
+}
+
 /// The queue scene's envelopes at once (tests).
 #[cfg(test)]
 pub fn queue_envelopes() -> Vec<Envelope> {
@@ -1692,6 +1741,31 @@ pub fn play_demo(backend: Rc<DemoBackend>, sink: EnvelopeSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every approval in the git scene gets a reading, and only the force push is warned about.
+    #[test]
+    fn the_git_scene_reads_every_command() {
+        use crate::chat::view::model::{Body, Transcript};
+        let mut t = Transcript::new();
+        for step in git_script() {
+            if let Step::Emit(env) = step {
+                t.apply(&env, Driver::Claude);
+            }
+        }
+        for (id, warned) in [
+            ("git-commit", false),
+            ("git-push", false),
+            ("git-force", true),
+            ("gh-pr", false),
+        ] {
+            let Body::Approval(a) = &t.get(&format!("approval:{id}")).expect(id).body else {
+                panic!("{id} is not an approval");
+            };
+            let reading =
+                crate::chat::view::git_card::reading(&a.tool, &a.input).expect("a reading");
+            assert_eq!(reading.destructive(), warned, "{id}");
+        }
+    }
 
     /// The request scenes leave a permission request, a form and a link open, all answerable,
     /// and the risky variant's unreadable request is still only refusable.

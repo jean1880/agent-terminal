@@ -48,13 +48,17 @@ Architectural mandates, standards, and workflows for this codebase.
     (secret masking applied to every hand-off brief, every injected handoff
     and every persisted event), `event` (the canonical provider-neutral event
     stream), `caps` (per-agent capability matrix), `adapter` (the sans-I/O
-    adapter contract) and the per-agent adapters and pure policies built on it.
+    adapter contract), `git_command` (a `git`/`gh` command line read as its operation for the
+    approval card: a reading aid, never a gate; the card still shows the command) and the
+    per-agent adapters and pure policies built on it.
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
     truncation), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
-    remove), `handoff` (hand-off briefs, session readers, quota detection),
+    remove), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
+    a thread's subtitle its branch, shown only for a repository on GitHub),
+    `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
     `paths` (`~` expansion) and `exec` (child processes with a timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
@@ -81,7 +85,9 @@ Architectural mandates, standards, and workflows for this codebase.
     150 ms it shows the closing screen, drawn by `window/imp/pack_animation.rs`),
     `window/imp/agents_prefs.rs` (Settings → Agents),
     `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
-    diff panel's widgets), `main.rs` (app setup + logging, and the `agent_kit`
+    diff panel's widgets and its "Open a PR" bar; it pops out into its own window, keeping its
+    place, hidden, as its identity, and docks back when that window closes or its page leaves),
+    `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).
   - Chat: `chat/session.rs` (one thread's backend: adapter, process, store,
     switching, handoff), `chat/view/` (the GTK view; it only talks to
@@ -183,7 +189,11 @@ Architectural mandates, standards, and workflows for this codebase.
   latest GitHub release, off the main thread, with a timeout. It runs once per process a few
   seconds after startup unless Settings → "Check for Updates at Startup" is off
   (`check_updates_on_startup`), and when the user picks "Check for Updates…". Tests never reach
-  it. Never add any other request.
+  it. Never add any other request. Two user actions reach GitHub without the app making a
+  request: the diff panel's "Open a PR" hands GitHub's compare URL (built from the remote,
+  credentials dropped: `agent_kit::github`) to the browser, and "Push & Open PR" runs one
+  `git push` (never forced, after a confirmation that shows the command) through the user's own
+  git and credentials. Neither runs unasked.
 - **Never block the main thread**: anything that shells out — CLI detection above
   all, which may run `$SHELL -ic` and source the user's rc — goes through
   `gio::spawn_blocking`. A frozen window cannot even repaint its own spinner.

@@ -14,6 +14,7 @@ use sourceview5::prelude::*;
 
 use super::difftext::{self, DiffText};
 use super::form_card::FormCardWidget;
+use super::git_card::{self, GitSummary};
 use super::markdown::{self, Block, TextKind};
 use super::model::{format_tokens, ApprovalState, Body, Item, QuestionState, Tone, ToolStatus};
 use super::payload;
@@ -1609,6 +1610,8 @@ pub struct ApprovalCard {
     remembers: gtk4::Label,
     /// A permission request's places, grouped, one per line (hidden for every other request).
     places: Rc<Places>,
+    /// A git or gh command's operation in words (hidden for every other request).
+    git: GitSummary,
     /// A permission request's warning, or why it can only be refused.
     warning: gtk4::Label,
     /// What the permission buttons last (dim, under the request).
@@ -1901,6 +1904,8 @@ impl ApprovalCard {
         root.append(&warning);
         let places = Places::new();
         root.append(&places.root);
+        let git = GitSummary::new();
+        root.append(&git.root);
         let input = mono("");
         let input_section = Section::new("Request", &input);
         root.append(input_section.widget());
@@ -1948,6 +1953,7 @@ impl ApprovalCard {
             raw_section,
             remembers,
             places,
+            git,
             warning,
             note,
             buttons,
@@ -1978,6 +1984,12 @@ impl ApprovalCard {
         a.request.clone_into(&mut self.request.borrow_mut());
         // A Codex permission request is read once, here: everything below follows it.
         let permission = (a.tool == permission::TOOL).then(|| permission::Request::parse(&a.input));
+        // A git or gh command is also said in words, above the command line itself.
+        let git = permission
+            .is_none()
+            .then(|| git_card::reading(&a.tool, &a.input))
+            .flatten();
+        self.git.set(git.as_ref());
         let title = a
             .title
             .clone()
@@ -1985,6 +1997,7 @@ impl ApprovalCard {
             // A permission request's title is shown only if it is plain text.
             .filter(|t| permission.is_none() || permission::plain(t))
             .or_else(|| permission.as_ref().map(permission::Request::title))
+            .or_else(|| git.as_ref().map(|g| format!("Allow {}?", g.tool.name())))
             .unwrap_or_else(|| format!("Allow {}?", a.tool));
         self.title.set_text(&title);
         let reason = a
@@ -2115,7 +2128,10 @@ impl ApprovalCard {
                 });
             }
             let rule_menu = permission.is_none();
-            let calm = permission.as_ref().is_none_or(|p| p.allow_is_calm());
+            // Allow is not the suggested button for a request warned about: a permission
+            // request's broad grant, or a git command that can lose work or rewrite history.
+            let calm = permission.as_ref().is_none_or(|p| p.allow_is_calm())
+                && git.as_ref().is_none_or(|g| !g.destructive());
             let extra = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
             extra.set_margin_top(6);
             extra.set_margin_bottom(6);
@@ -3177,6 +3193,61 @@ pub(crate) mod tests {
         let card = ApprovalCard::new(&sink);
         card.update(transcript.get("approval:c").expect("approval card"));
         (card, events)
+    }
+
+    /// A git command's approval says the operation in words above the command, keeps the
+    /// command line itself, and does not suggest Allow for one that can lose work.
+    pub(crate) fn a_git_approval_reads_as_its_operation() {
+        let allow = vec![Decision::Allow, Decision::Deny];
+        let suggested = |card: &ApprovalCard| {
+            row_buttons(&card.buttons)
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk4::Button>())
+                .any(|b| b.has_css_class("suggested-action"))
+        };
+        let (card, _) = codex_card(
+            "command_execution",
+            serde_json::json!({"command": "git commit -m \"feat(ui): add a PR button\"",
+                               "cwd": "/w"}),
+            allow.clone(),
+            None,
+        );
+        let (title, badges, details, warning) = card.git.shown().expect("a git reading");
+        assert_eq!(
+            title,
+            "Commit the staged changes: “feat(ui): add a PR button”"
+        );
+        assert_eq!(badges, "git · Changes this repository");
+        assert_eq!(details[0].1, "feat(ui): add a PR button");
+        assert!(warning.is_empty());
+        assert_eq!(card.title.text(), "Allow git?");
+        assert!(
+            card.input_section.full.borrow().contains("git commit"),
+            "the command line is still shown"
+        );
+        assert!(suggested(&card), "a plain commit keeps Allow suggested");
+
+        let (card, _) = codex_card(
+            "command_execution",
+            serde_json::json!({"command": "git reset --hard HEAD~3"}),
+            allow.clone(),
+            None,
+        );
+        assert!(card
+            .git
+            .shown()
+            .expect("reading")
+            .3
+            .starts_with("Hard reset"));
+        assert!(!suggested(&card), "a hard reset never suggests Allow");
+
+        let (card, _) = codex_card(
+            "command_execution",
+            serde_json::json!({"command": "cargo test"}),
+            allow,
+            None,
+        );
+        assert!(card.git.shown().is_none());
     }
 
     fn direct_labels(card: &ApprovalCard) -> Vec<String> {

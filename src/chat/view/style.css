@@ -298,6 +298,28 @@ textview.code-view, textview.code-view text {
     border-left: 3px solid @at_warning;
 }
 .approval-note { font-size: 0.88em; }
+/* a git or gh command's operation, above the command line */
+.git-summary {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background-color: @at_bg_deep;
+    border: 1px solid @at_surface_raised;
+}
+.git-summary .git-op-title { color: @at_fg_strong; font-weight: 700; }
+.git-summary .git-op-icon { color: @at_accent; }
+.git-badge {
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 0.82em;
+    font-weight: 600;
+    background-color: @at_surface_raised;
+    color: @at_fg_dim;
+}
+.git-badge.git-reach-read { color: @at_success; background-color: alpha(@at_success, 0.14); }
+.git-badge.git-reach-local { color: @at_accent; background-color: alpha(@at_accent, 0.14); }
+.git-badge.git-reach-remote { color: @at_warning; background-color: alpha(@at_warning, 0.16); }
+.git-detail-label { font-size: 0.9em; }
+.git-uncertain { font-size: 0.88em; }
 
 button.pill { padding: 6px 16px; border-radius: 999px; }
 .chat-view button.suggested-action {

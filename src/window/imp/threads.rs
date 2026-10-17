@@ -2973,6 +2973,7 @@ impl AgentTerminalWindow {
                         if let Some(title) = imp.window_title.borrow().as_ref() {
                             title.set_title("Agent Terminal");
                             title.set_subtitle("");
+                            title.set_tooltip_text(None);
                         }
                         obj.set_title(Some("Agent Terminal"));
                     }
@@ -3115,6 +3116,7 @@ impl AgentTerminalWindow {
             // A terminal page: the 2.x handler puts its terminal title in the subtitle.
             if let Some(window_title) = self.window_title.borrow().as_ref() {
                 window_title.set_title("Terminal");
+                window_title.set_tooltip_text(None);
             }
             return;
         };
@@ -3132,7 +3134,10 @@ impl AgentTerminalWindow {
                 &title
             });
             window_title.set_subtitle(&crate::utils::tildify(&dir, &home));
+            window_title.set_tooltip_text(None);
         }
+        // The branch joins the folder once read (in a repository on GitHub).
+        self.refresh_branch(page);
         self.ensure_built(page);
     }
 
@@ -4420,6 +4425,10 @@ impl AgentTerminalWindow {
             After::TurnDone { page, notify } => {
                 if self.config.borrow().checkpoints {
                     self.request_checkpoint(&page, false);
+                }
+                // The turn may have switched branches.
+                if in_view {
+                    self.refresh_branch(&page);
                 }
                 // The turn's events moved the thread in the list (and unread); read it again.
                 // Only looking at it reads it: in an unfocused window the mark stays until
