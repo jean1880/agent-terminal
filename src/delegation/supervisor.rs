@@ -220,14 +220,24 @@ mod tests {
             .with_thread_default(|| context.block_on(f))
             .expect("main context");
     }
-    async fn pump_until(mut check: impl FnMut() -> bool) {
-        let start = Instant::now();
-        while !check() {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "condition timed out"
-            );
-            glib::timeout_future(Duration::from_millis(10)).await;
+    /// Waits for `check`, failing with the caller's line if it never holds. The budget is twice
+    /// the agent stop path's own worst case: many checks wait for a stop, and one that took the
+    /// SIGTERM-then-SIGKILL fallback (seen on loaded CI runners) is slow, not hung.
+    #[track_caller]
+    fn pump_until(mut check: impl FnMut() -> bool) -> impl std::future::Future<Output = ()> {
+        let at = std::panic::Location::caller();
+        let budget = crate::agent_proc::STOP_WORST_CASE * 2;
+        async move {
+            let start = Instant::now();
+            while !check() {
+                assert!(
+                    start.elapsed() < budget,
+                    "condition at {}:{} did not hold within {budget:?}",
+                    at.file(),
+                    at.line()
+                );
+                glib::timeout_future(Duration::from_millis(10)).await;
+            }
         }
     }
     async fn stop(sup: &Rc<Supervisor>) {
