@@ -30,6 +30,12 @@ const TERM_GRACE: Duration = Duration::from_secs(3);
 const EXIT_DRAIN: Duration = Duration::from_secs(2);
 /// How long quitting the app waits for its agents to leave after SIGTERM.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// The longest a stopped agent can take to be reported gone, by design: it ignores SIGTERM for
+/// the whole [`TERM_GRACE`] before SIGKILL, then its pipes take the whole [`EXIT_DRAIN`]. A test
+/// that waits for a stop must allow more than this, or the designed fallback reads as a hang.
+#[cfg(test)]
+pub(crate) const STOP_WORST_CASE: Duration =
+    Duration::from_secs(TERM_GRACE.as_secs() + EXIT_DRAIN.as_secs());
 
 thread_local! {
     /// Process groups of the agents not yet seen to exit, for [`terminate_all`].
