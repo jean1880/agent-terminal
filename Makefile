@@ -32,8 +32,8 @@ DISPLAY_RUN = env $(DISPLAY_ENV) xvfb-run -a dbus-run-session --
 DOTENV_RUN = env $(DISPLAY_ENV) $$(if [ -f .env ]; then grep -v '^[[:space:]]*\#' .env; fi) \
 	xvfb-run -a dbus-run-session --
 NEXTEST_PROFILE ?= default
-# Extra cargo-nextest flags for every test target, e.g. ARGS=--no-capture,
-# ARGS='--cargo-profile release' (timings) or ARGS='--retries 2'.
+# Extra cargo-nextest flags for test, test-display, test-one, test-stress and bench, e.g.
+# ARGS=--no-capture or ARGS='--retries 2'. (Not coverage, whose runs CI pins.)
 ARGS ?=
 NEXTEST = cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) $(ARGS)
 
@@ -51,8 +51,8 @@ help:
 	@echo "  make test                 - Run the test suite (parallel, about 35 s)"
 	@echo "  make test-one T=<name>    - Tests matching <name>, display tests included (.env overrides: see .env.example)"
 	@echo "  make test-stress T=<name> [N=30] - Tests matching <name>, run N times under a display, to prove a flaky test fixed"
-	@echo "  make bench T=<name>       - Timing tests matching <name>: release build, output shown"
-	@echo "  ARGS='<nextest flags>'    - Extra flags for any test target (e.g. ARGS=--no-capture)"
+	@echo "  make bench T=<name>       - Benchmarks/measurements matching <name>: optimised build, output shown"
+	@echo "  ARGS='<nextest flags>'    - Extra flags for test, test-display, test-one, test-stress, bench"
 	@echo "  make check                - Everything CI and a release run: lint, all tests, display tests"
 	@echo "  make coverage             - Instrumented run, HTML report, fails under COVERAGE_FLOOR ($(COVERAGE_FLOOR)%)"
 	@echo "  make hooks                - Opt in to the pre-commit hook (fmt and clippy)"
@@ -140,8 +140,9 @@ test-one: $(TEST_HOME)
 
 # test-one for benchmarks and measurements: optimised build, output shown (they print their
 # numbers), and the tests .config/nextest.toml's default-filter keeps out of every other run
-# included. --no-capture also runs them one at a time. BENCH_PROFILE=dev measures the debug build.
-BENCH_PROFILE ?= release
+# included. --no-capture also runs them one at a time. BENCH_PROFILE is the cargo profile:
+# measure (Cargo.toml: release without LTO), release (exactly what ships, slow to build) or dev.
+BENCH_PROFILE ?= measure
 bench: $(TEST_HOME)
 	@test -n "$(T)" || { echo "usage: make bench T=<test name> [BENCH_PROFILE=dev]"; exit 2; }
 	$(DOTENV_RUN) $(NEXTEST) --cargo-profile $(BENCH_PROFILE) --no-capture --ignore-default-filter \
@@ -153,7 +154,7 @@ bench: $(TEST_HOME)
 STRESS_COUNT ?= 30
 test-stress: $(TEST_HOME)
 	@test -n "$(T)" || { echo "usage: make test-stress T=<test name> [N=<runs>]"; exit 2; }
-	$(DOTENV_RUN) $(NEXTEST) --retries 0 --no-fail-fast --stress-count $(or $(N),$(STRESS_COUNT)) \
+	$(DISPLAY_RUN) $(NEXTEST) --retries 0 --no-fail-fast --stress-count $(or $(N),$(STRESS_COUNT)) \
 		--hide-progress-bar --status-level fail --final-status-level fail -E 'test($(T))'
 
 # The QA scripts' own unit tests (package smoke, live-smoke checks): no network, no quota.

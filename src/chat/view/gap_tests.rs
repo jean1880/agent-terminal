@@ -2,7 +2,7 @@
 //! context gauge. They build real views, so they are `#[ignore]`d and run under a display by
 //! `make test-display` (part of `make check`).
 
-use super::tests::status_of;
+use super::tests::{native_init as init, pump_until, status_of};
 use super::*;
 use agent_core::event::{Decision, ItemKind};
 use std::time::{Duration, Instant};
@@ -46,28 +46,6 @@ impl ChatBackend for RecordingBackend {
     fn status(&self) -> SessionStatus {
         self.status.clone()
     }
-}
-
-fn init() -> glib::MainContext {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    glib::MainContext::default()
-}
-
-/// Iterates the main loop until `cond` holds; false on timeout.
-fn pump_until(ctx: &glib::MainContext, cond: impl Fn() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !cond() {
-        if Instant::now() > deadline {
-            return false;
-        }
-        if !ctx.iteration(false) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    true
 }
 
 #[test]

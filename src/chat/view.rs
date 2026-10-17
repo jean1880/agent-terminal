@@ -1619,6 +1619,30 @@ pub(crate) mod tests {
     use super::*;
     use agent_core::event::Decision;
 
+    /// GTK, libadwaita, the bundled icons and the stylesheet, as the app sets them up: for the
+    /// native tests that present windows.
+    pub(super) fn native_init() -> glib::MainContext {
+        gtk4::init().expect("GTK must be available for the native gate");
+        adw::init().expect("libadwaita init");
+        crate::icons::register();
+        crate::load_css();
+        glib::MainContext::default()
+    }
+
+    /// Iterates the main loop until `cond` holds; false after 5 s.
+    pub(super) fn pump_until(ctx: &glib::MainContext, cond: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            if !ctx.iteration(false) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        true
+    }
+
     pub(super) fn status_of(driver: Driver) -> SessionStatus {
         SessionStatus {
             driver,

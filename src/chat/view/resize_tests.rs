@@ -2,53 +2,20 @@
 //! render nodes, at widths new to GTK's caches, by how many rows are materialised and how many
 //! other threads are open. `make bench T=resize_cost`.
 //!
-//! Measured 2026-10-17 (release, Xvfb): a first layout of 150 rows costs ~50 ms, all of it one-off
-//! style and shaping work; once laid out, a resize of 150 rows costs ~1–3 ms, and hidden threads
-//! add nothing (`AdwTabView` lays out only the visible page).
+//! Measured 2026-10-17 (Xvfb): before a thread's rows have ever been laid out, a layout of 150 rows
+//! costs ~50 ms, all of it one-off style and shaping work. Once shown, a resize of 150 rows costs
+//! ~1–7 ms of layout and ~1 ms more for its render nodes. Hidden threads (each shown once first, as
+//! in the app) add nothing: `AdwTabView` lays out only the visible page.
 
-use super::tests::status_of;
+use super::tests::{native_init, pump_until, status_of, SwitchableBackend};
 use super::*;
 use agent_core::event::{ItemKind, ItemStatus, StreamKind};
 use std::time::{Duration, Instant};
 
-struct Quiet(SessionStatus);
-
-impl ChatBackend for Quiet {
-    fn send_prompt(&self, _: &str) {}
-    fn interrupt(&self) {}
-    fn respond_approval(&self, _: &str, _: agent_core::event::Decision) {}
-    fn answer_questions(&self, _: &str, _: serde_json::Value) {}
-    fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
-    fn reload_session(&self) {}
-    fn set_mode(&self, _: Mode) {}
-    fn control(&self, _: Control) -> String {
-        String::new()
-    }
-    fn status(&self) -> SessionStatus {
-        self.0.clone()
-    }
-}
-
-fn init() -> glib::MainContext {
-    gtk4::init().expect("GTK");
-    adw::init().expect("adw");
-    crate::icons::register();
-    crate::load_css();
-    glib::MainContext::default()
-}
-
-/// Iterates the main loop until `cond` holds; false on timeout.
-fn pump_until(ctx: &glib::MainContext, cond: impl Fn() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !cond() {
-        if Instant::now() > deadline {
-            return false;
-        }
-        if !ctx.iteration(false) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-    true
+/// Iterates the main loop for `ms`: idle fills and the window's own frames run.
+fn pump_for(ctx: &glib::MainContext, ms: u64) {
+    let until = Instant::now() + Duration::from_millis(ms);
+    pump_until(ctx, || Instant::now() > until);
 }
 
 const PARA: &str = "The transcript keeps every materialised row as a real widget, so a width \
@@ -97,7 +64,9 @@ fn history(n: usize) -> Vec<Envelope> {
 }
 
 fn chat(n: usize) -> ChatView {
-    let view = ChatView::new(Rc::new(Quiet(status_of(Driver::Claude))));
+    let view = ChatView::new(Rc::new(SwitchableBackend {
+        status: RefCell::new(status_of(Driver::Claude)),
+    }));
     view.replay(&history(n));
     view
 }
@@ -115,7 +84,8 @@ fn layout_cost(content: &gtk4::Widget, widths: &[i32]) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0 / widths.len() as f64
 }
 
-/// Sweeps a run can make from one base; each gets widths no other sweep used.
+/// Sweeps from one base before widths repeat. GTK caches only a few sizes per widget, so a width
+/// last used a whole cycle (160 layouts) ago is a miss again: any number of sweeps is fine.
 const SWEEPS: i32 = 16;
 
 thread_local! {
@@ -123,11 +93,10 @@ thread_local! {
     static WIDE: Cell<i32> = const { Cell::new(0) };
 }
 
-/// 10 widths from `base`, interleaved with every other sweep's, so none is in any widget's
+/// 10 widths from `base`, interleaved with the other sweeps', so none is in any widget's
 /// measure cache (as during a drag).
 fn fresh(base: i32, sweep: &'static std::thread::LocalKey<Cell<i32>>) -> Vec<i32> {
-    let k = sweep.with(|s| s.replace(s.get() + 1));
-    assert!(k < SWEEPS, "raise SWEEPS");
+    let k = sweep.with(|s| s.replace(s.get() + 1)) % SWEEPS;
     (0..10).map(|i| base + i * SWEEPS + k).collect()
 }
 
@@ -172,7 +141,19 @@ fn report(label: &str, content: &impl IsA<gtk4::Widget>) {
 #[ignore = "a measurement: prints costs, asserts nothing (make bench T=resize_cost)"]
 fn resize_cost_of_long_threads() {
     use adw::prelude::AdwWindowExt;
-    let ctx = init();
+    let ctx = native_init();
+    // The window of rows built and laid out at least once, as a thread the user has looked at.
+    let shown = |view: &ChatView, n: usize| {
+        let inner = view.inner().expect("inner");
+        let want = n.min(transcript::WINDOW);
+        assert!(
+            pump_until(&ctx, || view.is_mapped()
+                && inner.transcript.materialised() == want),
+            "{n} items: the window never filled"
+        );
+        pump_for(&ctx, 500);
+        want
+    };
     for n in [0usize, 30, 150, 400] {
         let tabs = adw::TabView::new();
         let window = adw::Window::new();
@@ -181,20 +162,19 @@ fn resize_cost_of_long_threads() {
         window.present();
         let view = chat(n);
         tabs.append(&view);
-        let inner = view.inner().expect("inner");
-        let want = n.min(transcript::WINDOW);
-        assert!(pump_until(&ctx, || inner.transcript.materialised() == want));
-        report(&format!("{n} items, {want} rows"), &tabs);
+        let rows = shown(&view, n);
+        report(&format!("{n} items, {rows} rows"), &tabs);
         if n == 150 {
-            let settled = Instant::now() + Duration::from_millis(1500);
-            pump_until(&ctx, || Instant::now() > settled);
-            // Laid out once by now, as during a drag: GTK's style and Pango's shaping are cached.
+            // Laid out at these widths' neighbours by now: GTK's style and Pango's shaping are
+            // cached, as during a drag. The baseline for the hidden threads below.
             report("150 rows, laid out before", &tabs);
             for hidden in 1..=3 {
-                tabs.append(&chat(150));
+                let other = chat(150);
+                let page = tabs.append(&other);
+                tabs.set_selected_page(&page);
+                shown(&other, 150);
                 tabs.set_selected_page(&tabs.nth_page(0));
-                let settled = Instant::now() + Duration::from_millis(1500);
-                pump_until(&ctx, || Instant::now() > settled);
+                pump_for(&ctx, 300);
                 report(&format!("150 rows + {hidden} hidden thread(s)"), &tabs);
             }
         }
