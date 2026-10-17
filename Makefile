@@ -11,7 +11,7 @@ LOCAL_ICON_DIR = $(HOME)/.local/share/icons/hicolor/scalable/apps
 LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 
 .PHONY: all build start-local clean install uninstall package deps help bump-version bum-version release \
-	test check coverage hooks lint test-display test-one test-qa test-deps
+	test check coverage hooks lint test-display test-one test-stress test-qa test-deps
 
 # ---- Tests -----------------------------------------------------------------------------------
 # Tools: cargo-nextest and cargo-llvm-cov (`make test-deps`), plus xvfb-run and dbus-run-session.
@@ -43,6 +43,7 @@ help:
 	@echo "  make clean                - Remove build artifacts"
 	@echo "  make test                 - Run the test suite (parallel, about 35 s)"
 	@echo "  make test-one T=<name>    - Tests matching <name>, display tests included (.env overrides: see .env.example)"
+	@echo "  make test-stress T=<name> [N=30] - Tests matching <name>, run N times under a display, to prove a flaky test fixed"
 	@echo "  make check                - Everything CI and a release run: lint, all tests, display tests"
 	@echo "  make coverage             - Instrumented run, HTML report, fails under COVERAGE_FLOOR ($(COVERAGE_FLOOR)%)"
 	@echo "  make hooks                - Opt in to the pre-commit hook (fmt and clippy)"
@@ -131,6 +132,16 @@ test-one: $(TEST_HOME)
 		xvfb-run -a dbus-run-session -- \
 		cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
 		--run-ignored all --test-threads 1 -E 'test($(T))'
+
+# The tests whose names match T, run N times over (default 30) in DISPLAY_ENV, to prove a flaky
+# test fixed or catch one: no retries, every iteration reported, failures summarised at the end.
+# Tests in one iteration still run in parallel, as `test` runs them, so they load each other.
+STRESS_COUNT ?= 30
+test-stress: $(TEST_HOME)
+	@test -n "$(T)" || { echo "usage: make test-stress T=<test name> [N=<runs>]"; exit 2; }
+	$(DISPLAY_RUN) cargo nextest run --locked --workspace --all-targets --profile $(NEXTEST_PROFILE) \
+		--retries 0 --no-fail-fast --stress-count $(or $(N),$(STRESS_COUNT)) \
+		--hide-progress-bar --status-level fail --final-status-level fail -E 'test($(T))'
 
 # The QA scripts' own unit tests (package smoke, live-smoke checks): no network, no quota.
 test-qa:

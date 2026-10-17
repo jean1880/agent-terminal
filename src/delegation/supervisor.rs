@@ -725,6 +725,62 @@ mod tests {
         });
     }
     #[test]
+    fn an_unusable_agy_registration_starts_the_root_unbound_and_unavailable() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let profile = (sup.services.profiles)().remove(0);
+            assert!(opted_in(&profile));
+            // Never configured: an opted-in agy root cannot be bound, and says why.
+            let problem = sup.agy_root_problem(&profile, Driver::Agy).await.unwrap();
+            assert!(problem.contains("registration"), "{problem}");
+            assert_eq!(sup.agy_root_problem(&profile, Driver::Claude).await, None);
+            {
+                let mut state = sup.state.borrow_mut();
+                let w = state.workers.get_mut(&root).unwrap();
+                w.driver = Driver::Agy;
+                w.token = None;
+                w.row.profile_id = profile.id.clone();
+            }
+            let facts = super::super::seam::DelegationLaunchFacts {
+                generation: ProcessGeneration(1),
+                argv: vec!["agy".into()],
+                physical_cwd: dir.path().to_owned(),
+                effective_home: None,
+                config_redirect_vars: vec![],
+                hook_proven: false,
+            };
+            let hooks = super::super::attest::Hooks {
+                supervisor: Rc::downgrade(&sup),
+                worker: root.clone(),
+            };
+            assert!(sup.profile_available(&root));
+            assert!(hooks.before_spawn(facts.clone()).await.is_err());
+            sup.state
+                .borrow_mut()
+                .workers
+                .get_mut(&root)
+                .unwrap()
+                .registration_off = true;
+            // Unbound: it launches, but is not offered for delegation and is never rebound.
+            assert!(!sup.profile_available(&root));
+            assert!(hooks.before_spawn(facts).await.is_ok());
+            assert!(hooks.before_root_prompt());
+            let recovery = dir.path().join(".config/agent-terminal/delegation");
+            agent_kit::delegation_config::apply(
+                agent_kit::delegation_config::preview(
+                    dir.path(),
+                    &recovery,
+                    &sup.services.bridge_command,
+                    agent_kit::delegation_config::Action::Configure,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sup.agy_root_problem(&profile, Driver::Agy).await, None);
+            stop(&sup).await;
+        });
+    }
+    #[test]
     fn agy_live_checks_use_successful_actual_launch_facts_after_profile_resolution_changes() {
         in_context(async {
             let (dir, sup, root) = harness();
@@ -1451,6 +1507,82 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// A descendant stopped after its task left `pending` but before its turn opened has no
+    /// turn to end as interrupted; its run must still reach a final state, not stay open.
+    #[test]
+    fn a_descendant_stopped_before_its_turn_opens_still_ends_its_run() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let parent_receipt = sup
+                .spawn_worker(&root, spawn_request("silent-parent"))
+                .await
+                .unwrap();
+            let parent = WorkerId::parse(parent_receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&parent].run.is_none()).await;
+            std::fs::write(dir.path().join("silent-task"), "").unwrap();
+            let receipt = sup
+                .spawn_worker(&parent, spawn_request("silent-grandchild"))
+                .await
+                .unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let run = receipt["run_id"].as_str().unwrap().to_owned();
+            pump_until(|| sup.state.borrow().workers[&child].pending.is_none()).await;
+            // Let the write reach the child, whose turn then never opens.
+            pump_until(|| {
+                std::fs::read_to_string(dir.path().join("frames.ndjson"))
+                    .is_ok_and(|log| log.contains("do the task"))
+            })
+            .await;
+            sup.fail_worker(
+                &parent,
+                error(ErrorCode::PersistenceFailed, "synthetic parent failure"),
+            );
+            pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(&run)
+                    .unwrap()
+                    .is_some_and(|r| matches!(r.state.as_str(), "interrupted" | "failed"))
+            })
+            .await;
+            assert!(sup.state.borrow().workers[&child].run.is_none());
+            stop(&sup).await;
+        });
+    }
+    /// The same gap through revocation: Stop on the root ends a child whose turn never opened.
+    #[test]
+    fn root_stop_ends_the_run_of_a_child_whose_turn_never_opened() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            std::fs::write(dir.path().join("silent-task"), "").unwrap();
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("silent-child"))
+                .await
+                .unwrap();
+            let child = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            let run = receipt["run_id"].as_str().unwrap().to_owned();
+            pump_until(|| {
+                std::fs::read_to_string(dir.path().join("frames.ndjson"))
+                    .is_ok_and(|log| log.contains("do the task"))
+            })
+            .await;
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            sup.root_stop(&thread);
+            pump_until(|| sup.state.borrow().workers[&child].generations.is_empty()).await;
+            pump_until(|| {
+                sup.services
+                    .handle
+                    .reader()
+                    .delegation_run(&run)
+                    .unwrap()
+                    .is_some_and(|r| r.state == "interrupted")
+            })
+            .await;
+            stop(&sup).await;
+        });
+    }
     #[test]
     fn root_stop_rolls_back_tentative_provider_identity_without_touching_newer_ticket() {
         in_context(async {
@@ -1461,14 +1593,20 @@ mod tests {
                 let w = state.workers.get_mut(&root).unwrap();
                 w.switch_revision = 8;
                 w.switch_original = Some((8, Driver::Claude, "fixture".into()));
+                w.switch_registration_off = true;
                 w.driver = Driver::Codex;
                 w.row.driver = "codex".into();
                 w.row.profile_id = "new-profile".into();
             }
             sup.rollback_root_switch(&root, Some(7));
             assert_eq!(sup.state.borrow().workers[&root].driver, Driver::Codex);
+            assert!(!sup.state.borrow().workers[&root].registration_off);
             sup.root_stop(&thread);
             assert_eq!(sup.state.borrow().workers[&root].driver, Driver::Claude);
+            assert!(
+                sup.state.borrow().workers[&root].registration_off,
+                "a rolled-back switch restores the unbound flag with the profile"
+            );
             assert_eq!(sup.state.borrow().workers[&root].row.profile_id, "fixture");
             assert!(sup.state.borrow().workers[&root].switch_original.is_none());
             let stored = sup
@@ -1576,8 +1714,13 @@ pub(super) struct WorkerRt {
     pub generation: ProcessGeneration,
     pub rotating_generation: Option<ProcessGeneration>,
     pub preparing: bool,
+    /// An opted-in agy root started unbound because its managed registration was unusable:
+    /// treated as opted out (no staging, no rebind each turn) until it is next prepared.
+    pub registration_off: bool,
     pub switch_revision: u64,
     pub switch_original: Option<(u64, Driver, String)>,
+    /// `registration_off` as it was before the pending switch, restored with `switch_original`.
+    pub switch_registration_off: bool,
     pub session: Option<Rc<ChatSession>>,
     pub root_session: Weak<ChatSession>,
     pub staged: Option<PreparedBinding>,
@@ -1667,6 +1810,7 @@ impl Supervisor {
         thread: &str,
         profile: &Profile,
         driver: Driver,
+        bind: bool,
     ) -> bool {
         let root = self.state.borrow().threads.get(thread).cloned();
         let Some(root) = root else {
@@ -1684,13 +1828,17 @@ impl Supervisor {
             r.transferring = false;
             r.closed = false;
         }
-        self.prepare_root_switch(thread, profile, driver).await
+        self.prepare_root_switch(thread, profile, driver, bind)
+            .await
     }
+    /// Moves a thread's root to `profile`. With `bind` false (see [`Self::agy_root_problem`])
+    /// an opted-in profile is treated as opted out for this root: it starts unbound.
     pub(crate) async fn prepare_root_switch(
         self: &Rc<Self>,
         thread: &str,
         profile: &Profile,
         driver: Driver,
+        bind: bool,
     ) -> bool {
         let data = {
             let state = self.state.borrow();
@@ -1713,6 +1861,7 @@ impl Supervisor {
             };
             w.switch_revision = w.switch_revision.wrapping_add(1);
             w.switch_original = Some((w.switch_revision, w.driver, w.row.profile_id.clone()));
+            w.switch_registration_off = w.registration_off;
             w.switch_revision
         };
         let same_policy = {
@@ -1769,8 +1918,9 @@ impl Supervisor {
             w.driver = driver;
             w.row.driver = enum_value(&driver);
             w.row.profile_id = profile.id.clone();
+            w.registration_off = opted_in(profile) && !bind;
         }
-        if !opted_in(profile) {
+        if !opted_in(profile) || !bind {
             if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
                 w.switch_original = None;
             }
@@ -1817,6 +1967,7 @@ impl Supervisor {
             w.driver = driver;
             w.row.driver = enum_value(&driver);
             w.row.profile_id = profile.clone();
+            w.registration_off = w.switch_registration_off;
             w.row.identity_json = None;
             let overlay = w.staged.take().and_then(|b| b.overlay);
             (driver, profile, overlay)
@@ -1895,6 +2046,7 @@ impl Supervisor {
             .borrow()
             .workers
             .get(worker)
+            .filter(|w| !w.registration_off)
             .map(|w| w.row.profile_id.clone());
         profile.is_some_and(|id| {
             (self.services.profiles)()
@@ -2085,6 +2237,7 @@ impl Supervisor {
                 w.row = worker;
                 w.driver = driver;
                 w.cwd = PathBuf::from(cwd);
+                w.registration_off = false;
             } else {
                 state.workers.insert(
                     id.clone(),
@@ -2128,8 +2281,10 @@ impl Supervisor {
             generation: ProcessGeneration(0),
             rotating_generation: None,
             preparing: false,
+            registration_off: false,
             switch_revision: 0,
             switch_original: None,
+            switch_registration_off: false,
             session: None,
             root_session: Weak::new(),
             staged: None,
@@ -2277,6 +2432,7 @@ impl Supervisor {
             }
             if (w.token.is_some() && w.row.delegation_status != "rebind_required")
                 || w.staged.is_some()
+                || w.registration_off
             {
                 return RootTurnGate::Proceed;
             }
@@ -2626,7 +2782,7 @@ impl Supervisor {
             for id in &effect.stop_processes {
                 if let Some(w) = state.workers.get_mut(id) {
                     if let Some(s) = w.session() {
-                        sessions.push(s);
+                        sessions.push((id.clone(), s));
                     }
                 }
             }
@@ -2650,10 +2806,15 @@ impl Supervisor {
                 );
             }
         }
-        for s in sessions {
+        let mut stopped = Vec::with_capacity(sessions.len());
+        for (id, s) in sessions {
             s.expire_approvals("Delegation authority revoked");
             s.interrupt_run();
             s.shutdown(true);
+            stopped.push(id);
+        }
+        if let Some(sup) = self.weak.upgrade() {
+            sup.interrupt_open_runs(&stopped);
         }
     }
     pub(crate) async fn revoke(

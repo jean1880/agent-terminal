@@ -35,6 +35,9 @@ for line in sys.stdin:
         turn += 1
         text = frame.get("message", {}).get("content", "")
         bootstrap = "startup check" in text
+        if not bootstrap and (root / "silent-task").exists():
+            # The task was written but its turn never opens: a stop now finds no turn to end.
+            continue
         init_tools = tools + (["Agent"] if (root / "bad-init").exists() else [])
         emit({"type": "system", "subtype": "init", "session_id": "synthetic-session",
               "model": model, "cwd": str(root), "tools": init_tools,

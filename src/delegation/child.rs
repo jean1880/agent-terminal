@@ -698,6 +698,58 @@ impl Supervisor {
             (self.services.report)("Delegated worker stopped, but its failure state could not be committed. Its durable outcome remains unknown.");
         }
     }
+    /// Ends the open run of each stopped worker as interrupted, unless it already ended. Call
+    /// after their sessions shut down: a turn in flight was ended as interrupted then, but a stop
+    /// that landed after the task was dispatched and before its turn opened had no turn to end,
+    /// and would leave the run open for good (a parent waiting on it would wait out its
+    /// deadline). In the writer's order, so whichever ending comes first wins.
+    pub(super) fn interrupt_open_runs(self: &Rc<Self>, workers: &[WorkerId]) {
+        let runs: Vec<_> = {
+            let mut state = self.state.borrow_mut();
+            workers
+                .iter()
+                .filter_map(|id| {
+                    let w = state.workers.get_mut(id)?;
+                    let run = w.run.take()?;
+                    w.last_run = Some(run.clone());
+                    Some(run)
+                })
+                .collect()
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let sup = self.clone();
+        gtk4::glib::spawn_future_local(async move {
+            let ended = sup
+                .services
+                .durable("interrupt stopped delegated runs", move |s| {
+                    let at = super::supervisor::now();
+                    for run in &runs {
+                        if s.delegation_run(run.as_str())?.is_some_and(|r| {
+                            !matches!(
+                                r.state.as_str(),
+                                "completed" | "interrupted" | "failed" | "unknown"
+                            )
+                        }) {
+                            s.set_delegation_run_state(
+                                run.as_str(),
+                                "interrupted",
+                                None,
+                                Some("stopped"),
+                                None,
+                                at,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+            if ended.is_err() {
+                (sup.services.report)("Delegated workers stopped, but their runs could not be closed. Their durable outcome remains unknown.");
+            }
+        });
+    }
     pub(super) fn fail_worker(self: &Rc<Self>, worker: &WorkerId, e: ToolError) {
         let data = {
             let mut state = self.state.borrow_mut();
@@ -718,7 +770,7 @@ impl Supervisor {
                     .workers
                     .iter()
                     .filter(|(id, _)| self.visible(worker, id, true))
-                    .filter_map(|(_, w)| w.session())
+                    .filter_map(|(id, w)| Some((id.clone(), w.session()?)))
                     .collect::<Vec<_>>()
             };
             self.begin_revoke(
@@ -727,10 +779,13 @@ impl Supervisor {
                     worker.clone(),
                 ),
             );
-            for session in sessions {
+            let mut stopped = Vec::with_capacity(sessions.len());
+            for (id, session) in sessions {
                 session.expire_approvals("Delegated worker failed");
                 session.shutdown(true);
+                stopped.push(id);
             }
+            self.interrupt_open_runs(&stopped);
             let operation = pending.as_ref().map(|p| p.operation.clone());
             if let Some(input) = pending {
                 self.state.borrow_mut().dispatching.remove(&input.operation);

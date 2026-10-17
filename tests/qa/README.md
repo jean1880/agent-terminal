@@ -9,6 +9,7 @@ Everything runs through the Makefile, with standard tools: `cargo nextest` for t
 | `make check` | fmt, Clippy, the no-default-features build, the suite, the display tests, and these scripts' unit tests | CI on every push and PR (`gate / check`, required), and a release |
 | `make coverage` | The suite and the display tests instrumented; HTML and lcov in `target/qa-artifacts/coverage`; fails under `COVERAGE_FLOOR` (Makefile) | CI on every PR; a release requires it on the release commit |
 | `make test-one T=<name>` | The tests whose names contain `<name>`, display tests included, one at a time | You, rerunning one test |
+| `make test-stress T=<name> [N=30]` | The tests whose names contain `<name>`, `N` times over, no retries, failures summarised at the end. Tests in each pass run in parallel, as in `make test`, so they load each other | You, proving a flaky test fixed (a fix needs a clean stress run, not one green CI) |
 | `make hooks` | Opt in to a pre-commit hook: fmt and Clippy only | Your clone |
 
 Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
@@ -65,7 +66,8 @@ comments, absolute paths (no `~` or `$HOME`).
 
 | Variable | Effect |
 |---|---|
-| `T` | `make test-one` only: the test name filter (required) |
+| `T` | `make test-one` and `make test-stress`: the test name filter (required) |
+| `N` | `make test-stress`: how many times to run (default `STRESS_COUNT`, 30) |
 | `NEXTEST_PROFILE` | The `.config/nextest.toml` profile (`default`; CI uses `ci`) |
 | `COVERAGE_FLOOR` | `make coverage`'s minimum line coverage |
 

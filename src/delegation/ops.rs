@@ -1019,6 +1019,22 @@ impl Supervisor {
             )
         })?
     }
+    /// Why an opted-in Antigravity root could not be bound now (its managed registration is
+    /// missing or unsafe), or `None` when it can, or when the profile is not an opted-in agy one.
+    /// Such a root starts unbound, like an opted-out one, rather than not at all.
+    pub(crate) async fn agy_root_problem(
+        &self,
+        profile: &crate::config::Profile,
+        driver: Driver,
+    ) -> Option<String> {
+        if driver != Driver::Agy || !opted_in(profile) {
+            return None;
+        }
+        self.agy_registration(&profile.id)
+            .await
+            .err()
+            .map(|e| e.message)
+    }
     async fn capabilities(
         &self,
         worker: &WorkerId,
