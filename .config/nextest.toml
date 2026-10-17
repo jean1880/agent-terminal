@@ -15,10 +15,12 @@ not (
     test(=update::tests::live_latest_release_of_this_repository)
     | test(=store::tests::append_bench)
     | test(=chat::view::tests::stream_cost_of_a_long_thinking_block)
+    | test(=chat::view::resize_tests::resize_cost_of_long_threads)
 )
 """
-# The three above: the live GitHub release API (network), a benchmark that needs a scratch copy
-# of a real store, and a measurement that prints costs and asserts nothing.
+# The four above: the live GitHub release API (network), a benchmark that needs a scratch copy
+# of a real store, and two measurements that print costs and assert nothing. `make bench T=<name>`
+# runs any of them.
 # A test that hangs is a failure, not a stalled run: warn every 60 s, kill after 5 minutes.
 slow-timeout = { period = "60s", terminate-after = 5 }
 

@@ -41,6 +41,8 @@ pub mod usage;
 #[cfg(test)]
 mod gap_tests;
 #[cfg(test)]
+mod resize_tests;
+#[cfg(test)]
 mod ux_tests;
 
 use std::cell::{Cell, RefCell};
