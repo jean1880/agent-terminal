@@ -42,13 +42,30 @@ pub struct Preview {
     previous_added_rules: Vec<String>,
     journal_before: Option<String>,
     repairs: Vec<Repair>,
+    changes: Vec<Change>,
     summary: String,
 }
 
+/// One row of a review: a file or folder, and what applying does to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub target: PathBuf,
+    pub change: String,
+}
+
 impl Preview {
-    /// Safe to show: names and intended edits only, no existing file contents.
+    /// Safe to show: names and intended edits only, no existing file contents. One line per
+    /// [`Self::changes`] row.
     pub fn summary(&self) -> &str {
         &self.summary
+    }
+    /// What applying does, target by target, in the order it does it. Safe to show.
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+    /// The home the plan was made for.
+    pub fn home(&self) -> &Path {
+        &self.home
     }
     /// Whether applying it would change anything: a file edit or a permission repair.
     pub fn changed(&self) -> bool {
@@ -435,7 +452,8 @@ fn plan(
         .map(|j| j.added_rules.clone())
         .unwrap_or_default();
     let previous_added_rules = added_rules.clone();
-    let summary = match action {
+    let rules_before = allow.len();
+    let (server_change, rules_change) = match action {
         Action::Configure => {
             servers.insert(SERVER_NAME.into(), entry);
             for rule in ALLOW_RULES {
@@ -446,13 +464,29 @@ fn plan(
                     }
                 }
             }
-            format!("Configure agent_terminal to run {} {}.\nSelected home: {}\nFiles: {} and {}\nAdd the eight exact delegation allow rules.\nPreserve unrelated MCP servers and settings. Save a private recovery journal before applying.", command.display(), BRIDGE_ARG,home.display(),mcp_path.display(),settings_path.display())
+            let added = allow.len() - rules_before;
+            (
+                format!(
+                    "Add the {SERVER_NAME} MCP server ({} {BRIDGE_ARG}). Other servers are kept.",
+                    command.display()
+                ),
+                format!(
+                    "Add {added} of the {} delegation allow rules. Existing rules are kept.",
+                    ALLOW_RULES.len()
+                ),
+            )
         }
         Action::Remove => {
             servers.remove(SERVER_NAME);
             allow.retain(|v| !added_rules.iter().any(|r| v.as_str() == Some(r.as_str())));
             added_rules.clear();
-            format!("Selected home: {}\nFiles: {} and {}\nRemove only the managed agent_terminal registration and rules added by Agent Terminal. Preserve other settings and pre-existing allow rules.",home.display(),mcp_path.display(),settings_path.display())
+            let removed = rules_before - allow.len();
+            (
+                format!("Remove the {SERVER_NAME} MCP server. Other servers are kept."),
+                format!(
+                    "Remove the {removed} allow rules Agent Terminal added. Your own rules are kept."
+                ),
+            )
         }
     };
     // A file whose value does not change keeps its exact bytes: formatting alone is no change.
@@ -465,18 +499,57 @@ fn plan(
     };
     let mcp_after = after(&mcp_before, &mcp)?;
     let settings_after = after(&settings_before, &settings)?;
-    let summary = if repairs.is_empty() {
-        summary
+    // In the order apply makes them; a file that does not change gets no row.
+    let mut changes: Vec<Change> = repairs
+        .iter()
+        .map(|r| Change {
+            target: r.path.clone(),
+            change: format!(
+                "Remove group and other write permission ({:o} → {:o}).",
+                r.mode & 0o7777,
+                r.mode & 0o7777 & !0o022
+            ),
+        })
+        .collect();
+    for (path, before, after, what) in [
+        (&mcp_path, &mcp_before, &mcp_after, server_change),
+        (
+            &settings_path,
+            &settings_before,
+            &settings_after,
+            rules_change,
+        ),
+    ] {
+        if before != after {
+            let what = match (before, after) {
+                (None, Some(_)) => format!("Create. {what}"),
+                (Some(_), None) => "Delete (it held only Agent Terminal's entries).".into(),
+                _ => what,
+            };
+            // One row per target: a file that is also repaired says both, a line each, in order.
+            match changes.iter_mut().find(|c| &c.target == path) {
+                Some(row) => row.change = format!("{}\n{what}", row.change),
+                None => changes.push(Change {
+                    target: path.clone(),
+                    change: what,
+                }),
+            }
+        }
+    }
+    if repairs.is_empty() && mcp_before == mcp_after && settings_before == settings_after {
+        // Nothing to apply: no journal either.
     } else {
-        let list: Vec<_> = repairs
-            .iter()
-            .map(|r| format!("• {}", r.describe()))
-            .collect();
-        format!(
-            "First remove group and world write permission (unsafe for a registration):\n{}\n{summary}",
-            list.join("\n")
-        )
-    };
+        changes.push(Change {
+            target: state.join(JOURNAL),
+            change: "Save a private recovery journal first, so Undo can restore these files."
+                .into(),
+        });
+    }
+    let summary = changes
+        .iter()
+        .map(|c| format!("{}: {}", c.target.display(), c.change.replace('\n', " ")))
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(Preview {
         home,
         state: state.to_path_buf(),
@@ -498,6 +571,7 @@ fn plan(
         added_rules,
         previous_added_rules,
         journal_before,
+        changes,
         summary,
     })
 }
@@ -1192,6 +1266,54 @@ mod tests {
         let config = object(read(&home, &mcp, MAX_FILE).unwrap().as_deref()).unwrap();
         assert_eq!(config["mcpServers"]["other"]["command"], "keep");
         assert!(config["mcpServers"][SERVER_NAME].is_object());
+    }
+
+    #[test]
+    fn the_review_lists_each_target_and_its_change_in_apply_order() {
+        let (_tmp, home, state) = paths();
+        let command = Path::new("/usr/bin/agent-terminal");
+        let (gemini, mcp) = group_writable(&home);
+        let settings = home.join(".gemini/antigravity-cli/settings.json");
+        let plan = preview_repairing(&home, &state, command, Action::Configure).unwrap();
+        let targets: Vec<_> = plan.changes().iter().map(|c| c.target.clone()).collect();
+        assert_eq!(
+            targets,
+            [gemini, mcp.clone(), settings.clone(), state.join(JOURNAL)]
+        );
+        let change = |i: usize| plan.changes()[i].change.clone();
+        assert!(change(0).contains("775 → 755"), "{}", change(0));
+        // Repaired and edited: one row, saying both.
+        assert!(change(1).contains("664 → 644"), "{}", change(1));
+        assert!(
+            change(1).contains("Add the agent_terminal MCP server"),
+            "{}",
+            change(1)
+        );
+        assert!(change(1).contains("/usr/bin/agent-terminal --cross-agent-mcp"));
+        assert!(
+            change(2).starts_with("Create. Add 8 of the 8"),
+            "{}",
+            change(2)
+        );
+        assert_eq!(plan.summary().lines().count(), plan.changes().len());
+        apply(plan).unwrap();
+
+        // Nothing left to do: no rows, not even the journal.
+        assert!(preview(&home, &state, command, Action::Configure)
+            .unwrap()
+            .changes()
+            .is_empty());
+
+        let remove = preview(&home, &state, command, Action::Remove).unwrap();
+        let rows: Vec<_> = remove.changes().iter().map(|c| c.change.as_str()).collect();
+        assert_eq!(remove.changes()[0].target, mcp);
+        assert!(rows[0].starts_with("Remove the agent_terminal MCP server"));
+        assert_eq!(remove.changes()[1].target, settings);
+        assert!(
+            rows[1].starts_with("Remove the 8 allow rules"),
+            "{}",
+            rows[1]
+        );
     }
 
     #[test]

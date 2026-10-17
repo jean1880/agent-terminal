@@ -430,14 +430,9 @@ impl AgentTerminalWindow {
                 done(Review::Cancelled);
                 return;
             };
-            let summary = format!("Profile: {profile_name}\n{}", plan.summary());
-            let confirm =
-                adw::AlertDialog::new(Some("Review Delegation Registration"), Some(&summary));
-            confirm.add_responses(&[("cancel", "Cancel"), ("apply", "Apply")]);
-            confirm.set_default_response(Some("cancel"));
-            confirm.set_close_response("cancel");
-            confirm.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
-            if confirm.choose_future(Some(&parent)).await != "apply" {
+            let (confirm, answer) = review_dialog(&plan, &profile_name, action);
+            confirm.present(Some(&parent));
+            if answer.await != Ok(true) {
                 finish(&row, "Registration left unchanged.");
                 done(Review::Cancelled);
                 return;
@@ -458,6 +453,151 @@ impl AgentTerminalWindow {
             done(review);
         });
     }
+}
+
+/// `path` with the home folder written as `~`, for a narrow table column.
+pub(super) fn tilde(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// The review of a registration plan: a Target | Change table, one row per file or folder in
+/// the order Apply changes them, then Cancel and Apply. The receiver gets `true` only for
+/// Apply; Cancel, Escape and closing the dialog all mean no.
+fn review_dialog(
+    plan: &delegation_config::Preview,
+    profile_name: &str,
+    action: Action,
+) -> (adw::Dialog, tokio::sync::oneshot::Receiver<bool>) {
+    let title = match action {
+        Action::Configure => "Set Up Antigravity Delegation",
+        Action::Remove => "Remove Antigravity Delegation",
+    };
+    let dialog = adw::Dialog::builder()
+        .title(title)
+        .content_width(680)
+        .build();
+    let intro = gtk4::Label::builder()
+        .label(format!(
+            "Profile “{profile_name}” · home {}\nApply makes these changes, in this order. \
+             Nothing changes until you choose Apply. A folder or file others can write to is \
+             unsafe for a registration, so its permission is narrowed first.",
+            plan.home().display()
+        ))
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+
+    let grid = gtk4::Grid::builder()
+        .column_spacing(18)
+        .row_spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    for (column, heading) in ["Target", "Change"].into_iter().enumerate() {
+        let label = gtk4::Label::builder()
+            .label(heading)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        grid.attach(&label, column as i32, 0, 1, 1);
+    }
+    for (i, change) in plan.changes().iter().enumerate() {
+        let row = 2 * i as i32 + 1;
+        grid.attach(
+            &gtk4::Separator::new(gtk4::Orientation::Horizontal),
+            0,
+            row,
+            2,
+            1,
+        );
+        let target = gtk4::Label::builder()
+            .label(tilde(&change.target, plan.home()))
+            .tooltip_text(change.target.display().to_string())
+            .xalign(0.0)
+            .yalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::Char)
+            .max_width_chars(30)
+            .selectable(true)
+            .css_classes(["monospace"])
+            .build();
+        // A path broken across lines must not gain a hyphen that reads as part of its name.
+        let no_hyphens = gtk4::pango::AttrList::new();
+        no_hyphens.insert(gtk4::pango::AttrInt::new_insert_hyphens(false));
+        target.set_attributes(Some(&no_hyphens));
+        let what = gtk4::Label::builder()
+            .label(&change.change)
+            .xalign(0.0)
+            .yalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .build();
+        grid.attach(&target, 0, row + 1, 1, 1);
+        grid.attach(&what, 1, row + 1, 1, 1);
+    }
+    let table = gtk4::Frame::builder().child(&grid).build();
+    let scrolled = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(420)
+        .child(&table)
+        .build();
+
+    let cancel = gtk4::Button::with_label("Cancel");
+    let apply = gtk4::Button::builder()
+        .label("Apply")
+        .css_classes(["suggested-action"])
+        .build();
+    let buttons = gtk4::Box::builder()
+        .spacing(12)
+        .halign(gtk4::Align::End)
+        .build();
+    buttons.append(&cancel);
+    buttons.append(&apply);
+
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(6)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    content.append(&intro);
+    content.append(&scrolled);
+    content.append(&buttons);
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&content));
+    dialog.set_child(Some(&view));
+    dialog.set_default_widget(Some(&cancel));
+    dialog.set_focus(Some(&cancel));
+
+    let (send, answer) = tokio::sync::oneshot::channel();
+    let send = Rc::new(RefCell::new(Some(send)));
+    let reply = |send: &Rc<RefCell<Option<tokio::sync::oneshot::Sender<bool>>>>, yes: bool| {
+        if let Some(send) = send.borrow_mut().take() {
+            let _ = send.send(yes);
+        }
+    };
+    for (button, yes) in [(&cancel, false), (&apply, true)] {
+        let (send, dialog) = (send.clone(), dialog.downgrade());
+        button.connect_clicked(move |_| {
+            reply(&send, yes);
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        });
+    }
+    dialog.connect_closed(move |_| reply(&send, false));
+    (dialog, answer)
 }
 
 /// How a registration review ended.
