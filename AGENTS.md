@@ -181,6 +181,20 @@ Architectural mandates, standards, and workflows for this codebase.
   answer keeps the folder only if it is the one the card showed (`decide_as_shown`), and
   "Always allow" keeps one file. `always_allow::tests::session_edit_keeps_its_folder_and_nothing_more`
   proves each of these.
+- **An idle thread out of sight is suspended, never ended**: after `idle_suspend_minutes`
+  (default 15, 0 never; Settings → Behaviour) unseen and unheard from, the window's minute sweep
+  (`suspend_idle_threads`) asks `ChatSession::suspend_if_idle`, which stops the agent process
+  only when nothing would be lost (`Inner::suspend_blocker`: no turn, queue, approval, permission
+  card, model change, handoff, rebind, Codex session grants, unresumable Codex thread, no
+  conversation yet, Bypass, delegated worker; the window adds background work, delegated runs and
+  pending sends). A delegation root suspends only with its hooks' consent
+  (`DelegationHooks::suspending`): a planned rotation (`rotate_before_stop`), so nothing is
+  revoked, and the rebind around its resume posts no notice; it also refuses while sub-agents are
+  alive. "A conversation" means a resumed start or a turn completed after a prompt (Claude's
+  prompt-less init turn names no transcript). The stop is silent: no exit reaches the view or the
+  store. A mode or same-agent model picked while suspended is kept for the resume (never Bypass);
+  other controls say, unstored, that the agent is paused. The next prompt resumes the same native
+  session (`ensure_alive`).
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
   env file, then the approval socket.

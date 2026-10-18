@@ -677,6 +677,10 @@ pub struct TerminalConfig {
     /// out; one found marks the window menu. On by default (an older config opts in); off, the
     /// app connects to nothing unless "Check for Updates…" is picked.
     pub check_updates_on_startup: bool,
+    /// Minutes a thread out of sight may sit idle before its agent process is stopped to free
+    /// its memory (an agent holds hundreds of MB); its conversation resumes with the next
+    /// prompt. 0 never stops one.
+    pub idle_suspend_minutes: u32,
     /// Reopen the previous window's tabs on launch. Off by default: a restored
     /// tab gets its directory and profile back but starts a fresh conversation,
     /// so by default it only multiplies blank sessions.
@@ -1012,6 +1016,7 @@ impl Default for TerminalConfig {
             notify_on_bell: false,
             notify_on_quota: true,
             check_updates_on_startup: true,
+            idle_suspend_minutes: 15,
             restore_session: false,
             checkpoints: true,
             diff_panel_visible: false,
@@ -1789,6 +1794,8 @@ mod tests {
             TerminalConfig::default().scrollback_lines
         );
         assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
+        // An older config gets idle suspension at its default, not 0 (never).
+        assert_eq!(loaded.idle_suspend_minutes, 15);
     }
 
     #[test]
