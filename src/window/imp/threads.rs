@@ -405,7 +405,10 @@ pub(super) struct ChatTab {
     /// The thread's pre-turn baselines and the source of its file-change cards' diffs.
     pub(super) diffs: Rc<ThreadDiffs>,
     /// When the thread was last shown, left or heard from: idle suspension counts from here.
-    last_seen: std::time::Instant,
+    /// A cell, so the selection handlers stamp it under a shared borrow of the registry: a
+    /// mutable one there can meet a borrow held up the stack, and panicking in a signal
+    /// handler aborts the app.
+    last_seen: std::cell::Cell<std::time::Instant>,
 }
 
 impl ChatTab {
@@ -2067,7 +2070,7 @@ impl AgentTerminalWindow {
             .filter(|c| {
                 suspension_due(
                     minutes,
-                    now.saturating_duration_since(c.last_seen),
+                    now.saturating_duration_since(c.last_seen.get()),
                     shown.as_deref() == Some(c.thread.as_str()),
                     c.holds_suspension(),
                 )
@@ -3264,15 +3267,16 @@ impl AgentTerminalWindow {
         else {
             return;
         };
-        // Idle suspension counts from the moment it went out of sight.
+        // Idle suspension counts from the moment it went out of sight. A shared borrow: this
+        // runs inside the selection change, which a caller holding the registry can trigger.
         if let Some(chat) = self
             .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
             .find(|c| c.thread == left)
         {
-            chat.last_seen = std::time::Instant::now();
+            chat.last_seen.set(std::time::Instant::now());
         }
         if !self.thread_page_looks_blank(&left) {
             return;
@@ -3369,7 +3373,7 @@ impl AgentTerminalWindow {
             let dir = tab.dir.clone();
             tab.chat.as_mut().map(|chat| {
                 chat.unread = false;
-                chat.last_seen = std::time::Instant::now();
+                chat.last_seen.set(std::time::Instant::now());
                 (chat.thread.clone(), chat.title.clone(), dir)
             })
         };
@@ -3889,7 +3893,7 @@ impl AgentTerminalWindow {
                 unavailable: false,
                 starting: false,
                 diffs,
-                last_seen: std::time::Instant::now(),
+                last_seen: std::cell::Cell::new(std::time::Instant::now()),
             }),
             discovered_repo: None,
         });
@@ -4490,7 +4494,7 @@ impl AgentTerminalWindow {
             let switched = chat.driver != driver;
             chat.driver = driver;
             // Heard from: idle suspension counts from the thread's last event too.
-            chat.last_seen = std::time::Instant::now();
+            chat.last_seen.set(std::time::Instant::now());
             if chat.rate_limited && limit_over(&env.event) {
                 chat.rate_limited = false;
                 chat.rate_banner.set_revealed(false);
