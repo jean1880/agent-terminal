@@ -179,6 +179,92 @@ fn window_layout(
     (!closing || !any_live_window).then(|| serde_json::json!({"open": open, "selected": selected}))
 }
 
+/// Shows only the selected page's content. `AdwTabView` merely unmaps an unselected page, and
+/// GTK still restyles unmapped widgets on every window-wide change (focus in and out, a monitor
+/// or scale change while resizing); invisible ones it skips. Profiled on a resize: 74% of the
+/// main thread restyling every open thread's widgets. Measured on focus changes with 8 threads:
+/// 35 ms a frame, 16 ms with the hidden ones invisible (`idle_cost_of_open_threads`).
+///
+/// An invisible page also measures nothing, so the window's minimum size is the shown page's,
+/// not the largest of every open page's.
+fn show_only_selected(view: &adw::TabView) {
+    let selected = view.selected_page();
+    for i in 0..view.n_pages() {
+        let page = view.nth_page(i);
+        page.child().set_visible(selected.as_ref() == Some(&page));
+    }
+}
+
+/// Each page's focused widget when it was last left, for [`wire_page_visibility`].
+type LastFocus = Rc<RefCell<Vec<(glib::WeakRef<adw::TabPage>, glib::WeakRef<gtk4::Widget>)>>>;
+
+/// Whether `widget` is `page`'s content or inside it.
+fn in_page(widget: &gtk4::Widget, page: &adw::TabPage) -> bool {
+    let child = page.child();
+    widget == &child || widget.is_ancestor(&child)
+}
+
+/// Keeps only the selected page visible ([`show_only_selected`]): on selection, and on a page
+/// attached (new, or dragged in from another window, hidden there as an unselected page).
+///
+/// It also does what `AdwTabView` does for focus, which a hidden page defeats. `AdwTabView`
+/// moves focus into a newly selected page before it notifies the selection, while that page is
+/// still invisible, so the move fails; hiding the page left then drops its focus, and GTK moves
+/// it to the window's first focusable widget (a header button, the sidebar). So when focus was
+/// in the page left, it is remembered for that page, and the page shown gets back the widget it
+/// last had (or its first focusable one) once laid out. A page that refocuses itself on show (a
+/// thread's composer) is left alone, as is focus outside the pages (the sidebar a page was
+/// picked from).
+fn wire_page_visibility(tab_view: &adw::TabView) {
+    tab_view.connect_page_attached(|view, _, _| show_only_selected(view));
+    let memory = LastFocus::default();
+    tab_view.connect_selected_page_notify(move |view| {
+        let selected = view.selected_page();
+        let before = view.root().and_then(|root| root.focus());
+        let left = before.as_ref().and_then(|focus| {
+            (0..view.n_pages())
+                .map(|i| view.nth_page(i))
+                .find(|page| Some(page) != selected.as_ref() && in_page(focus, page))
+        });
+        {
+            let mut memory = memory.borrow_mut();
+            memory.retain(|(page, _)| page.upgrade().is_some());
+            if let (Some(page), Some(focus)) = (&left, &before) {
+                memory.retain(|(p, _)| p.upgrade().as_ref() != Some(page));
+                memory.push((page.downgrade(), focus.downgrade()));
+            }
+        }
+        show_only_selected(view);
+        let (Some(page), Some(_)) = (selected, left) else {
+            return;
+        };
+        let target = memory
+            .borrow()
+            .iter()
+            .find(|(p, _)| p.upgrade().as_ref() == Some(&page))
+            .and_then(|(_, w)| w.upgrade())
+            .filter(|w| in_page(w, &page));
+        let page = page.downgrade();
+        // After the page's first layout: the focus chain skips widgets with no allocation.
+        glib::idle_add_local_once(move || {
+            let Some(page) = page.upgrade() else {
+                return;
+            };
+            let child = page.child();
+            if !child.is_mapped() {
+                return;
+            }
+            let focus = child.root().and_then(|root| root.focus());
+            if focus.is_some_and(|f| in_page(&f, &page)) {
+                return;
+            }
+            if !target.is_some_and(|w| w.grab_focus()) {
+                child.child_focus(gtk4::DirectionType::TabForward);
+            }
+        });
+    });
+}
+
 /// Both shapes are written so an older build can still reopen every thread.
 fn saved_open_threads(
     windows: &[serde_json::Value],
@@ -3049,6 +3135,8 @@ impl AgentTerminalWindow {
     /// Selection, removal and the empty state, for every page kind.
     fn wire_thread_pages(&self, tab_view: &adw::TabView) {
         let obj = self.obj();
+        // First, so a page is visible before anything below builds or focuses it.
+        wire_page_visibility(tab_view);
         tab_view.connect_selected_page_notify(glib::clone!(
             #[weak]
             obj,
@@ -3546,8 +3634,16 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .vexpand(true)
             .build();
-        // Its only child until `build_thread` puts the view in its place.
-        holder.append(&loading::chat());
+        // Its only child until `build_thread` puts the view in its place. Still until the page is
+        // first shown: nothing loads before then (`ensure_built` starts the pulse). An infinite
+        // CSS animation anywhere in the window makes GTK walk every style node of the window on
+        // every frame, so each restored thread not yet looked at kept the whole window ticking
+        // (profiled: 31% of an idle main thread in `gtk_css_node_invalidate_timestamp`). Not
+        // left to `show_only_selected` hiding the page: a pulse with nothing loading should not
+        // run at all, and the walk it triggers covers the whole window, visible or not.
+        let skeleton = loading::chat();
+        loading::settle(&skeleton);
+        holder.append(&skeleton);
         let drawer_paned = gtk4::Paned::builder()
             .orientation(Orientation::Vertical)
             .start_child(&holder)
@@ -6345,6 +6441,199 @@ pub(super) mod tests {
         window.destroy();
         crate::testutil::settle(&ctx);
         assert_eq!(read_layout(), before);
+    }
+
+    /// Only the selected page's content is visible, so window-wide restyles (focus, a monitor
+    /// change while resizing) skip every other open thread; switching flips it.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn only_the_selected_page_is_visible() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.OnlySelectedVisible")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        window.present();
+        let imp = window.imp();
+        for i in 0..3 {
+            imp.create_chat_thread(NewThread {
+                title: Some(format!("t{i}")),
+                ..NewThread::new(Driver::Claude)
+            })
+            .unwrap();
+        }
+        let view = imp.tab_view.borrow().clone().unwrap();
+        let visible = || -> Vec<bool> {
+            (0..view.n_pages())
+                .map(|i| view.nth_page(i).child().is_visible())
+                .collect()
+        };
+        let selected = |i: i32| view.selected_page() == Some(view.nth_page(i));
+        assert_eq!(view.n_pages(), 3);
+        assert_eq!(visible(), (0..3).map(selected).collect::<Vec<_>>());
+        assert_eq!(visible().iter().filter(|v| **v).count(), 1);
+        view.set_selected_page(&view.nth_page(0));
+        assert_eq!(visible(), vec![true, false, false]);
+        view.set_selected_page(&view.nth_page(2));
+        assert_eq!(visible(), vec![false, false, true]);
+        // Closing the shown page shows the one selected next.
+        view.close_page(&view.nth_page(2));
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.n_pages() == 2));
+        assert_eq!(visible().iter().filter(|v| **v).count(), 1);
+        assert!(view.selected_page().unwrap().child().is_visible());
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// Focus follows a page switch into the page shown, and back to the widget a page had:
+    /// hiding the page left drops its focus, and GTK would move it to the window's first
+    /// focusable widget (here an entry outside the pages, standing in for the header and
+    /// sidebar). A terminal page has nothing else to put focus back (a thread refocuses its
+    /// composer itself).
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn focus_follows_a_page_switch_into_the_shown_page() {
+        use adw::prelude::AdwWindowExt;
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let ctx = glib::MainContext::default();
+        let view = adw::TabView::new();
+        view.set_vexpand(true);
+        wire_page_visibility(&view);
+        // Two entries a page: the second is where focus was, and must come back to.
+        let pages: Vec<[gtk4::Entry; 2]> = (0..2)
+            .map(|_| [gtk4::Entry::new(), gtk4::Entry::new()])
+            .collect();
+        for [a, b] in &pages {
+            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            content.append(a);
+            content.append(b);
+            view.append(&content);
+        }
+        let outside = gtk4::Entry::new();
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&outside);
+        layout.append(&view);
+        let window = adw::Window::new();
+        window.set_default_size(400, 300);
+        window.set_content(Some(&layout));
+        window.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || pages[0][1].is_mapped()));
+        assert!(
+            !pages[1][0].upcast_ref::<gtk4::Widget>().is_mapped(),
+            "the unselected page is hidden"
+        );
+        let focused = |entry: &gtk4::Entry| {
+            gtk4::prelude::RootExt::focus(&window)
+                .is_some_and(|f| &f == entry.upcast_ref::<gtk4::Widget>() || f.is_ancestor(entry))
+        };
+        assert!(pages[0][1].grab_focus());
+        view.set_selected_page(&view.nth_page(1));
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || focused(&pages[1][0])),
+            "focus left the pages on a switch"
+        );
+        view.set_selected_page(&view.nth_page(0));
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || focused(&pages[0][1])),
+            "the page did not get back the widget it last had"
+        );
+        // Focus outside the pages (a page picked from the sidebar) stays there.
+        assert!(outside.grab_focus());
+        view.set_selected_page(&view.nth_page(1));
+        crate::testutil::settle(&ctx);
+        assert!(focused(&outside), "focus outside the pages was moved");
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A thread page not yet shown holds a still skeleton: an infinite pulse on a hidden page
+    /// made GTK walk the window's every style node each frame. Showing it starts the pulse
+    /// while it loads.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn an_unshown_thread_page_keeps_its_skeleton_still() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.StillSkeleton")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        window.present();
+        let imp = window.imp();
+        let ids: Vec<_> = (0..2)
+            .map(|i| {
+                imp.create_chat_thread(NewThread {
+                    title: Some(format!("t{i}")),
+                    ..NewThread::new(Driver::Claude)
+                })
+                .unwrap();
+                imp.current_thread().unwrap()
+            })
+            .collect();
+        let view = imp.tab_view.borrow().clone().unwrap();
+        let page_of = |id: &str| {
+            imp.tabs.borrow().iter().find_map(|t| {
+                t.chat
+                    .as_ref()
+                    .filter(|c| c.thread == id)
+                    .map(|_| t.page.clone())
+            })
+        };
+        // Closed, then reopened without being shown: a page that was never built.
+        view.close_page(&page_of(&ids[1]).unwrap());
+        imp.reload_summaries();
+        assert!(crate::testutil::pump_until(&ctx, 5, || page_of(&ids[1])
+            .is_none()
+            && imp.summary_of(&ids[1]).is_some()));
+        imp.open_thread(&ids[1], false).expect("reopened");
+        let skeleton = || {
+            imp.tabs.borrow().iter().find_map(|t| {
+                t.chat
+                    .as_ref()
+                    .filter(|c| c.thread == ids[1])
+                    .and_then(|c| c.holder.first_child())
+            })
+        };
+        let first = skeleton().expect("an unbuilt page holds its skeleton");
+        assert!(
+            first.has_css_class("skeleton-idle"),
+            "a page not shown must not pulse"
+        );
+        imp.open_thread(&ids[1], true).expect("shown");
+        assert!(
+            skeleton().is_none_or(|w| !w.has_css_class("skeleton-idle")),
+            "loading a shown page pulses"
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
     }
 
     #[test]

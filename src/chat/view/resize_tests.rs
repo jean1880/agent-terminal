@@ -181,3 +181,171 @@ fn resize_cost_of_long_threads() {
         window.close();
     }
 }
+
+/// Nanoseconds the calling thread has run on a CPU (`/proc/thread-self/schedstat`'s first
+/// field): the test thread, which is the one GTK runs on here. 0 when unreadable.
+fn gtk_thread_cpu_ns() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// How long (ms) the first frame after `action` took, from before-paint to after-paint: style
+/// validation, layout and snapshot of whatever `action` invalidated.
+fn frame_after(ctx: &glib::MainContext, window: &gtk4::Window, action: impl FnOnce()) -> f64 {
+    let clock = window.frame_clock().expect("mapped");
+    let started = Rc::new(Cell::new(None::<Instant>));
+    let took = Rc::new(Cell::new(None::<Duration>));
+    let s = started.clone();
+    let before = clock.connect_before_paint(move |_| s.set(Some(Instant::now())));
+    let (s, t) = (started.clone(), took.clone());
+    let after = clock.connect_after_paint(move |_| {
+        if let (Some(at), None) = (s.get(), t.get()) {
+            t.set(Some(at.elapsed()));
+        }
+    });
+    action();
+    window.queue_draw();
+    pump_until(ctx, || took.get().is_some());
+    clock.disconnect(before);
+    clock.disconnect(after);
+    took.get().map_or(f64::NAN, |d| d.as_secs_f64() * 1000.0)
+}
+
+/// Mean ms per frame spent in each frame-clock phase over `ms` of idling: (update — ticks and
+/// style —, layout, paint). Each handler is connected after GTK's own, so it runs at the end of
+/// its phase.
+fn idle_phases(ctx: &glib::MainContext, window: &gtk4::Window, ms: u64) -> (f64, f64, f64, u64) {
+    let clock = window.frame_clock().expect("mapped");
+    let marks = Rc::new(RefCell::new((None::<Instant>, [Duration::ZERO; 3], 0u64)));
+    let start = {
+        let m = marks.clone();
+        clock.connect_before_paint(move |_| m.borrow_mut().0 = Some(Instant::now()))
+    };
+    let phase = |i: usize| {
+        let m = marks.clone();
+        move |_: &gtk4::gdk::FrameClock| {
+            let mut m = m.borrow_mut();
+            if let Some(at) = m.0 {
+                let now = Instant::now();
+                m.1[i] += now - at;
+                m.0 = Some(now);
+                if i == 2 {
+                    m.2 += 1;
+                    m.0 = None;
+                }
+            }
+        }
+    };
+    let ids = [
+        clock.connect_update(phase(0)),
+        clock.connect_layout(phase(1)),
+        clock.connect_paint(phase(2)),
+    ];
+    pump_for(ctx, ms);
+    clock.disconnect(start);
+    for id in ids {
+        clock.disconnect(id);
+    }
+    let (_, spent, frames) = *marks.borrow();
+    let per = |d: Duration| d.as_secs_f64() * 1000.0 / frames.max(1) as f64;
+    (per(spent[0]), per(spent[1]), per(spent[2]), frames)
+}
+
+/// What open threads cost while nothing happens in them, and when the window's style changes
+/// (focus in and out restyles every widget that tracks `:backdrop`).
+#[test]
+#[ignore = "a measurement: prints costs, asserts nothing (make bench T=idle_cost)"]
+fn idle_cost_of_open_threads() {
+    use adw::prelude::AdwWindowExt;
+    let ctx = native_init();
+    // 1 again last: a cost that stays is the run's (earlier windows), not the threads'.
+    for threads in [1usize, 4, 8, 1] {
+        let tabs = adw::TabView::new();
+        let window = adw::Window::new();
+        window.set_default_size(900, 800);
+        window.set_content(Some(&tabs));
+        window.present();
+        let mut views = Vec::new();
+        for _ in 0..threads {
+            let view = chat(150);
+            let page = tabs.append(&view);
+            tabs.set_selected_page(&page);
+            let inner = view.inner().expect("inner");
+            assert!(pump_until(&ctx, || view.is_mapped()
+                && inner.transcript.materialised() == transcript::WINDOW));
+            views.push((view, inner));
+        }
+        tabs.set_selected_page(&tabs.nth_page(0));
+        pump_for(&ctx, 500);
+
+        let hidden_ticks = || -> u64 {
+            views[1..]
+                .iter()
+                .map(|(_, inner)| inner.transcript.tick_count())
+                .sum()
+        };
+        // (settles, moves) of the shown thread's transcript and of all the hidden ones.
+        let settles = || {
+            let of = |v: &[(ChatView, Rc<Inner>)]| {
+                v.iter().fold((0, 0), |(s, m), (_, inner)| {
+                    let (s2, m2) = inner.transcript.settle_counts();
+                    (s + s2, m + m2)
+                })
+            };
+            (of(&views[..1]), of(&views[1..]))
+        };
+        let clock = window.frame_clock().expect("mapped");
+        let (ticks0, frames0, cpu0) = (hidden_ticks(), clock.frame_counter(), gtk_thread_cpu_ns());
+        let settles0 = settles();
+        let idle = Instant::now();
+        pump_for(&ctx, 2000);
+        let secs = idle.elapsed().as_secs_f64();
+        let frames = (clock.frame_counter() - frames0) as f64 / secs;
+        let ticks = (hidden_ticks() - ticks0) as f64 / secs;
+        let cpu = gtk_thread_cpu_ns().saturating_sub(cpu0) as f64 / 1e9 / secs * 100.0;
+        let (shown1, hidden1) = settles();
+        let rate = |a: u64, b: u64| (a - b) as f64 / secs;
+        eprintln!(
+            "{threads} thread(s): shown settles {:.0}/s moves {:.0}/s | hidden settles {:.0}/s moves {:.0}/s",
+            rate(shown1.0, settles0.0 .0),
+            rate(shown1.1, settles0.0 .1),
+            rate(hidden1.0, settles0.1 .0),
+            rate(hidden1.1, settles0.1 .1),
+        );
+        let (update, layout, paint, phase_frames) = idle_phases(&ctx, window.upcast_ref(), 1000);
+        eprintln!(
+            "{threads} thread(s): per idle frame ({phase_frames} frames) update {update:.2} ms, \
+             layout {layout:.2} ms, paint {paint:.2} ms"
+        );
+
+        let w = window.upcast_ref::<gtk4::Window>();
+        let backdrop = frame_after(&ctx, w, || {
+            window.set_state_flags(gtk4::StateFlags::BACKDROP, false)
+        });
+        let focus = frame_after(&ctx, w, || {
+            window.unset_state_flags(gtk4::StateFlags::BACKDROP)
+        });
+        eprintln!(
+            "{threads} thread(s) open, 1 shown: idle {frames:5.1} frames/s, hidden ticks {ticks:6.1}/s, \
+             main thread {cpu:5.1}% CPU | backdrop frame {backdrop:6.2} ms, refocus frame {focus:6.2} ms"
+        );
+        // The same style change with the hidden threads' views invisible, not just unmapped.
+        for (view, _) in &views[1..] {
+            view.set_visible(false);
+        }
+        pump_for(&ctx, 300);
+        let backdrop = frame_after(&ctx, w, || {
+            window.set_state_flags(gtk4::StateFlags::BACKDROP, false)
+        });
+        let focus = frame_after(&ctx, w, || {
+            window.unset_state_flags(gtk4::StateFlags::BACKDROP)
+        });
+        eprintln!(
+            "{:>40} hidden views invisible: backdrop frame {backdrop:6.2} ms, refocus frame {focus:6.2} ms",
+            ""
+        );
+        window.close();
+    }
+}
