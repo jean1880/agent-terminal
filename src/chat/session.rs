@@ -369,6 +369,18 @@ struct Inner {
     worker: RefCell<Option<agent_core::delegation::WorkerId>>,
     /// This launch consumed a prepared binding; same-name user MCP servers confer no trust.
     bound_generation: Cell<bool>,
+    /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
+    /// adapter's exit envelopes reach neither the view nor the store.
+    quiet_exit: Cell<bool>,
+    /// The process was suspended and nothing has started since: the next start is a resume the
+    /// user did not ask for, so a delegation rebind around it says nothing.
+    suspended: Cell<bool>,
+    /// The native session has a conversation an agent can resume: this process was started
+    /// resuming one, or a turn completed on it after a prompt was sent to it. A session id alone
+    /// (a fresh start, Claude's prompt-less init turn) may name no transcript yet.
+    has_conversation: Cell<bool>,
+    /// The running process has taken a prompt (reset by every start).
+    prompted: Cell<bool>,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -746,6 +758,10 @@ impl ChatSession {
             ask_only: RefCell::new(HashSet::new()),
             worker: RefCell::new(None),
             bound_generation: Cell::new(false),
+            quiet_exit: Cell::new(false),
+            suspended: Cell::new(false),
+            has_conversation: Cell::new(false),
+            prompted: Cell::new(false),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -848,6 +864,13 @@ impl ChatSession {
         self.inner.store.forget_thread(&self.inner.thread);
     }
 
+    /// Stops the agent process if the thread is idle in every way that matters, keeping the
+    /// conversation: the next prompt starts it again, resuming the same native session. Nothing
+    /// is said to the view or stored. Whether it stopped.
+    pub fn suspend_if_idle(&self) -> bool {
+        self.inner.suspend()
+    }
+
     /// A watch on the running agent process, if one is alive: taken before [`Self::shutdown`],
     /// it follows the process out (closing the window waits on it).
     pub fn exit_watch(&self) -> Option<crate::agent_proc::ExitWatch> {
@@ -914,6 +937,10 @@ impl Inner {
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
         let delivery = ScopedFlag::set(&self.delivering);
+        // A prompted turn ran on this native session: there is a conversation to resume.
+        if self.prompted.get() && matches!(env.event, Event::TurnCompleted { .. }) {
+            self.has_conversation.set(true);
+        }
         let env = self.route_codex_permission(env);
         // A supervised child's events cross its publication boundary first (P4 §3.5): what it
         // withholds goes nowhere, and what it passes is the sanitised envelope.
@@ -1342,6 +1369,12 @@ impl Inner {
     fn start_process(self: &Rc<Self>) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        self.suspended.set(false);
+        // A fresh native session (no resume: a new thread, a switch) has nothing to resume yet,
+        // whatever the previous one had.
+        self.has_conversation
+            .set(self.open.borrow().resume.is_some());
+        self.prompted.set(false);
         self.clear_agy_read();
         self.canary_cancelled.borrow_mut().clear();
         *self.starting.borrow_mut() = None;
@@ -2502,8 +2535,10 @@ impl Inner {
         self.codex_grants.borrow_mut().clear();
         self.codex_grant_paths.borrow_mut().clear();
         self.codex_turn_grant_paths.borrow_mut().clear();
-        for env in envelopes {
-            self.emit(env);
+        if !self.quiet_exit.get() {
+            for env in envelopes {
+                self.emit(env);
+            }
         }
         // After the expiries above, which still need the ids cards were shown again under.
         self.codex_shown.borrow_mut().clear();
@@ -2539,6 +2574,89 @@ impl Inner {
         self.clear_agy_read();
         self.adapter.borrow_mut().discard_queued_prompts();
         self.finish_process(None, true);
+    }
+
+    /// What stops [`Self::suspend`] now, if anything (the first reason found). The process can
+    /// be stopped and resumed later with nothing lost only when it is alive, has a conversation
+    /// to resume (a native id, and a turn on it or a resumed start), and holds no work,
+    /// question or state that lives only in the process or in flight. Never a delegated worker,
+    /// never dangerous permissive mode (session-only: a resume would not re-enter it), and
+    /// never with session grants Codex's own process holds (they would end unannounced).
+    fn suspend_blocker(&self) -> Option<&'static str> {
+        let state = self.state.borrow();
+        let checks = [
+            (!state.alive, "not running"),
+            (state.running_turn, "a turn is running"),
+            (state.mode == Mode::Bypass, "dangerous permissive mode"),
+            (state.native_id.is_none(), "no session id to resume"),
+            (
+                !self.has_conversation.get(),
+                "no conversation yet to resume",
+            ),
+            (
+                !self.codex_grants.borrow().is_empty(),
+                "Codex session grants",
+            ),
+            (self.child.is_some(), "a delegated worker"),
+            (
+                !self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()),
+                "no live process",
+            ),
+            (self.starting.borrow().is_some(), "starting"),
+            (self.stopping.get(), "stopping"),
+            (self.rebinding.get(), "rebinding"),
+            (self.delivering.get(), "delivering"),
+            (self.dispatching_queue.get(), "dispatching the queue"),
+            (self.queued_dispatch_pending.get(), "a queued dispatch"),
+            (self.prompt_in_flight.get(), "a prompt in flight"),
+            (self.handoff_in_flight.get(), "a handoff in flight"),
+            (!self.queued_prompts.borrow().is_empty(), "queued prompts"),
+            (!self.held_retries.borrow().is_empty(), "held retries"),
+            (
+                !self.pre_init_prompts.borrow().is_empty(),
+                "input before init",
+            ),
+            (self.pending_model.borrow().is_some(), "a model change"),
+            (self.deferred_mode.get().is_some(), "a deferred mode"),
+            (self.rollback.borrow().is_some(), "a switch not confirmed"),
+            (
+                self.provisional_native.borrow().is_some(),
+                "a Codex thread not yet resumable",
+            ),
+            (!self.open_approvals.borrow().is_empty(), "an open approval"),
+            (!self.pending_rules.borrow().is_empty(), "a pending rule"),
+            (
+                !self.codex_permissions.borrow().is_empty()
+                    || !self.held_permissions.borrow().is_empty(),
+                "an open permission request",
+            ),
+            (self.agy_reading.get().is_some(), "a transcript read"),
+        ];
+        checks
+            .into_iter()
+            .find_map(|(blocked, why)| blocked.then_some(why))
+    }
+
+    /// Stops an idle agent process to free its memory, keeping its native session so the next
+    /// prompt resumes it ([`Self::ensure_alive`]). Silent: no exit reaches the view or the
+    /// store, since nothing ended for the user. A delegation root's stop is a planned rotation
+    /// its hooks agree to (nothing revoked; the next prompt rebinds quietly). False, doing
+    /// nothing, while [`Self::suspend_blocker`] names a reason or the hooks refuse.
+    fn suspend(&self) -> bool {
+        if let Some(why) = self.suspend_blocker() {
+            tracing::debug!(thread = %self.thread, why, "idle agent not suspended");
+            return false;
+        }
+        let generation = ProcessGeneration(self.process_generation.get());
+        if let Some(hooks) = &self.hooks {
+            if !hooks.suspending(generation) {
+                return false;
+            }
+        }
+        let _quiet = ScopedFlag::set(&self.quiet_exit);
+        self.stop_current();
+        self.suspended.set(true);
+        true
     }
 
     /// A dead process (agy after an interrupt) is restarted resuming its native session.
@@ -2661,14 +2779,28 @@ impl Inner {
                         }
                     };
                     if !written {
+                        // Suspension is not a failure: say what it is, and how to resume.
+                        let paused = self.suspended.get();
                         if let Some(id) = control {
+                            let error = if paused {
+                                "The agent is paused to save memory; send a message to resume it."
+                            } else {
+                                "The agent is not running; send a message to start it again."
+                            };
                             self.emit(
                                 Envelope::new(Event::ControlResult {
                                     ok: None,
-                                    error: Some("The agent is not running; send a message to start it again.".to_owned()),
+                                    error: Some(error.to_owned()),
                                 })
                                 .request(id),
                             );
+                        } else if paused {
+                            // Said, not stored: a pause is not part of the thread's history.
+                            self.deliver(&Envelope::new(Event::Notice {
+                                text: "The agent is paused to save memory; send a message to \
+                                       resume it."
+                                    .to_owned(),
+                            }));
                         } else {
                             self.error("The agent is not running.");
                         }
@@ -3035,6 +3167,7 @@ impl Inner {
             text: sent.to_owned(),
         });
         if accepted {
+            self.prompted.set(true);
             self.remember_pre_init_prompt(sent, handoff.clone());
         }
         if !accepted && starts_turn {
@@ -3362,6 +3495,24 @@ impl Inner {
                 }));
             }
         }
+        // Suspended: there is no process to tell. The mode is kept for the resume, which starts
+        // in it (as any restart does), and the picker shows it now. Never dangerous permissive
+        // mode: it is entered on a running agent only, through its own path.
+        if self.suspended.get() {
+            if mode == Mode::Bypass {
+                self.deliver(&Envelope::new(Event::Notice {
+                    text: "The agent is paused to save memory; send a message to resume it \
+                           before choosing dangerous permissive mode."
+                        .to_owned(),
+                }));
+                let current = self.state.borrow().mode;
+                self.deliver(&Envelope::new(Event::ModeChanged { mode: current }));
+                return;
+            }
+            self.choose_mode(mode);
+            self.emit(Envelope::new(Event::ModeChanged { mode }));
+            return;
+        }
         let restarts = self.adapter.borrow().capabilities().mode_change_restarts;
         let running = self.state.borrow().running_turn;
         // Hookless agy's busy change was confirmed by the view. Carry the unfinished task
@@ -3550,6 +3701,26 @@ impl Inner {
                 self.arm_handoff(handoff);
             }
             self.continue_after_switch(driver);
+            return;
+        }
+        // Suspended, same agent: no process to tell, and starting one here would skip a
+        // delegation root's rebind. The choice is kept for the resume, which launches with it
+        // (as any restart does), and shown now. Another agent starts its own process below.
+        if self.suspended.get() && same_driver {
+            {
+                let mut open = self.open.borrow_mut();
+                if !target_model.is_empty() {
+                    open.model = Some(target_model.clone());
+                }
+                open.effort.clone_from(&effort);
+            }
+            self.state.borrow_mut().effort.clone_from(&effort);
+            if !target_model.is_empty() {
+                *self.selected.borrow_mut() = Some(target_model.clone());
+                self.emit(Envelope::new(Event::ModelChanged {
+                    model: target_model,
+                }));
+            }
             return;
         }
         match transition {
@@ -5076,6 +5247,192 @@ mod tests {
                 args[1].contains(&format!("--conversation {CONVERSATION}")),
                 "{args:?}"
             );
+        });
+    }
+
+    /// A Claude "agent" that takes the handshake, reports session `s1` (Claude's init opens a
+    /// turn) and ends that turn, then logs every line it is sent for as long as it runs,
+    /// completing a turn for each prompt.
+    fn idle_claude(dir: &Path) -> OpenSession {
+        scripted(
+            dir,
+            "IFS= read -r handshake\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
+             case \"$line\" in *'\"type\":\"user\"'*) \
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
+        )
+    }
+
+    /// Idle suspension stops the agent process without a word to the view or the store, and
+    /// the next prompt starts it again resuming the same native session.
+    #[test]
+    fn an_idle_session_suspends_silently_and_the_next_prompt_resumes_it() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                idle_claude(tmp.path()),
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            let turns_done = |seen: &Seen| {
+                seen.borrow()
+                    .iter()
+                    .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
+                    .count()
+            };
+            session.reload_session();
+            assert!(
+                pump_until(ctx, 10, || has(&seen, |e| matches!(
+                    e,
+                    Event::SessionStarted { native_id, .. } if native_id == "s1"
+                )) && turns_done(&seen) == 1),
+                "the agent never reported its session and ended its init turn"
+            );
+            assert_eq!(
+                session.inner.suspend_blocker(),
+                Some("no conversation yet to resume"),
+                "Claude's prompt-less init turn leaves no transcript to resume"
+            );
+            session.send_prompt("first");
+            assert!(pump_until(ctx, 10, || turns_done(&seen) == 2));
+            assert!(session.status().alive);
+            let before = seen.borrow().len();
+            let stored = || {
+                session
+                    .inner
+                    .store
+                    .read(|s| s.events(&thread, None, 1000))
+                    .expect("read")
+                    .expect("events")
+                    .into_iter()
+                    .map(|(_, e)| e.event)
+                    .collect::<Vec<_>>()
+            };
+            let stored_before = stored();
+
+            assert_eq!(session.inner.suspend_blocker(), None);
+            assert!(session.suspend_if_idle(), "an idle session suspends");
+            assert!(!session.status().alive);
+            assert!(
+                !session.suspend_if_idle(),
+                "a suspended one has nothing to stop"
+            );
+            pump_until(ctx, 1, || false);
+            assert_eq!(seen.borrow().len(), before, "nothing reached the view");
+            assert_eq!(stored(), stored_before, "nothing about it was stored");
+
+            // A mode picked while paused is kept for the resume, not refused for a dead process;
+            // dangerous permissive mode is not, and nothing about it is stored.
+            session.set_mode(Mode::Plan);
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::ModeChanged { mode: Mode::Plan }
+            )));
+            session.set_mode(Mode::Bypass);
+            assert_eq!(
+                session.status().mode,
+                Mode::Plan,
+                "Bypass refused while paused"
+            );
+            // So is a model picked on the same agent, without starting anything.
+            session.switch(Driver::Claude, Some("opus".into()), None);
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::ModelChanged { model } if model == "opus"
+            )));
+            assert_eq!(
+                lines(tmp.path().join("args.log")).len(),
+                1,
+                "nothing started"
+            );
+            assert!(!has(&seen, |e| matches!(e, Event::Error { .. })));
+            assert!(
+                !stored().iter().any(|e| matches!(e, Event::Notice { .. })),
+                "the paused notice is not stored"
+            );
+
+            session.send_prompt("after a pause");
+            assert!(
+                pump_until(ctx, 10, || lines(tmp.path().join("prompts.log"))
+                    .iter()
+                    .any(|l| l.contains("after a pause"))),
+                "the prompt never reached a resumed agent"
+            );
+            let launches = lines(tmp.path().join("args.log"));
+            assert_eq!(launches.len(), 2, "{launches:?}");
+            assert!(!launches[0].contains("--resume"), "{launches:?}");
+            assert!(launches[1].contains("--resume=s1"), "{launches:?}");
+            assert!(
+                launches[1].contains("--permission-mode plan"),
+                "the resume starts in the mode picked while paused: {launches:?}"
+            );
+            assert!(
+                launches[1].contains("--model opus"),
+                "the resume starts with the model picked while paused: {launches:?}"
+            );
+        });
+    }
+
+    /// Suspension waits for anything a stopped process would lose: no session id yet, a turn
+    /// running, dangerous permissive mode (session-only), a delegated worker's process.
+    #[test]
+    fn a_session_with_anything_going_on_is_not_suspended() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                idle_claude(tmp.path()),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            assert!(!session.suspend_if_idle(), "nothing is running yet");
+            session.reload_session();
+            assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+                e,
+                Event::TurnCompleted { .. }
+            ))));
+            // A session id with no prompted turn on it may name no transcript to resume.
+            assert_eq!(
+                session.inner.suspend_blocker(),
+                Some("no conversation yet to resume")
+            );
+            session.send_prompt("first");
+            assert!(pump_until(ctx, 10, || session.inner.has_conversation.get()
+                && !session.status().running_turn));
+            assert_eq!(session.inner.suspend_blocker(), None, "idle now");
+            // Codex's own session grants would end unannounced.
+            session
+                .inner
+                .codex_grants
+                .borrow_mut()
+                .push("Network access".into());
+            assert_eq!(
+                session.inner.suspend_blocker(),
+                Some("Codex session grants")
+            );
+            session.inner.codex_grants.borrow_mut().clear();
+            session.inner.state.borrow_mut().mode = Mode::Bypass;
+            assert!(
+                !session.suspend_if_idle(),
+                "Bypass would not survive a resume"
+            );
+            session.inner.state.borrow_mut().mode = Mode::Ask;
+            session.send_prompt("a turn that never ends");
+            assert!(!session.suspend_if_idle(), "a turn is running");
+            assert!(session.status().alive, "refusals stop nothing");
         });
     }
 

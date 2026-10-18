@@ -323,6 +323,17 @@ fn turn_notification_id(thread: &str) -> String {
     format!("turn-{thread}")
 }
 
+/// Whether the idle sweep stops a thread's agent now: suspension on (`minutes` > 0), the
+/// thread out of sight, nothing holding it ([`ChatTab::holds_suspension`]), and unseen and
+/// unheard from for at least `minutes`. The session still has the last word
+/// ([`ChatSession::suspend_if_idle`]).
+fn suspension_due(minutes: u32, idle: std::time::Duration, shown: bool, held: bool) -> bool {
+    minutes > 0
+        && !shown
+        && !held
+        && idle >= std::time::Duration::from_secs(u64::from(minutes) * 60)
+}
+
 impl ChatTab {
     /// Whether closing this thread would cut work short. The one place the close question
     /// (the row's X, archive, the window) decides; extend it for background work.
@@ -393,9 +404,29 @@ pub(super) struct ChatTab {
     starting: bool,
     /// The thread's pre-turn baselines and the source of its file-change cards' diffs.
     pub(super) diffs: Rc<ThreadDiffs>,
+    /// When the thread was last shown, left or heard from: idle suspension counts from here.
+    /// A cell, so the selection handlers stamp it under a shared borrow of the registry: a
+    /// mutable one there can meet a borrow held up the stack, and panicking in a signal
+    /// handler aborts the app.
+    last_seen: std::cell::Cell<std::time::Instant>,
 }
 
 impl ChatTab {
+    /// Whether stopping the agent to free its memory must wait: [`Self::busy`] (a turn,
+    /// background work, a question, delegated workers), or anything about to happen (a build or
+    /// start, a close or switch question on screen, something waiting to be sent or applied).
+    fn holds_suspension(&self) -> bool {
+        self.busy()
+            || self.finish_held
+            || self.building
+            || self.starting
+            || self.confirming_close
+            || self.confirming_switch
+            || self.pending_prompt.is_some()
+            || self.pending_handoff.is_some()
+            || self.pending_switch.is_some()
+    }
+
     pub(super) fn reset_transfer_preparation(&mut self) {
         if self.view.is_none() {
             self.building = false;
@@ -2000,7 +2031,8 @@ impl AgentTerminalWindow {
         self.refresh_sidebar();
         // Relative times age; a minute is their resolution. Nobody sees them while the window is
         // hidden or minimised; a visible window keeps them current even unfocused, and regaining
-        // focus refreshes once (`watch_availability`).
+        // focus refreshes once (`watch_availability`). Idle agents are stopped on the same minute,
+        // hidden window or not.
         glib::timeout_add_seconds_local(
             60,
             glib::clone!(
@@ -2012,10 +2044,44 @@ impl AgentTerminalWindow {
                     if obj.is_mapped() {
                         obj.imp().refresh_sidebar();
                     }
+                    obj.imp().suspend_idle_threads();
                     glib::ControlFlow::Continue
                 }
             ),
         );
+    }
+
+    /// Stops the agent of every thread here that has been out of sight and idle for
+    /// `idle_suspend_minutes`, to free its memory (hundreds of MB each). Its conversation
+    /// resumes with the next prompt; nothing changes on its page.
+    pub(super) fn suspend_idle_threads(&self) {
+        let minutes = self.config.borrow().idle_suspend_minutes;
+        if minutes == 0 || self.is_closing() {
+            return;
+        }
+        let shown = self.shown_thread.borrow().clone();
+        let now = std::time::Instant::now();
+        // Collected first: a session stopping must not find the registry borrowed.
+        let due: Vec<(String, Rc<ChatSession>)> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .filter(|c| {
+                suspension_due(
+                    minutes,
+                    now.saturating_duration_since(c.last_seen.get()),
+                    shown.as_deref() == Some(c.thread.as_str()),
+                    c.holds_suspension(),
+                )
+            })
+            .filter_map(|c| c.slot.get().map(|s| (c.thread.clone(), s)))
+            .collect();
+        for (thread, session) in due {
+            if session.suspend_if_idle() {
+                info!("Stopped the idle agent of thread {thread} ({minutes} min out of sight); it resumes with the next prompt");
+            }
+        }
     }
 
     fn remember_sidebar(&self, shown: bool) {
@@ -3201,6 +3267,17 @@ impl AgentTerminalWindow {
         else {
             return;
         };
+        // Idle suspension counts from the moment it went out of sight. A shared borrow: this
+        // runs inside the selection change, which a caller holding the registry can trigger.
+        if let Some(chat) = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == left)
+        {
+            chat.last_seen.set(std::time::Instant::now());
+        }
         if !self.thread_page_looks_blank(&left) {
             return;
         }
@@ -3296,6 +3373,7 @@ impl AgentTerminalWindow {
             let dir = tab.dir.clone();
             tab.chat.as_mut().map(|chat| {
                 chat.unread = false;
+                chat.last_seen.set(std::time::Instant::now());
                 (chat.thread.clone(), chat.title.clone(), dir)
             })
         };
@@ -3815,6 +3893,7 @@ impl AgentTerminalWindow {
                 unavailable: false,
                 starting: false,
                 diffs,
+                last_seen: std::cell::Cell::new(std::time::Instant::now()),
             }),
             discovered_repo: None,
         });
@@ -4414,6 +4493,8 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
+            // Heard from: idle suspension counts from the thread's last event too.
+            chat.last_seen.set(std::time::Instant::now());
             if chat.rate_limited && limit_over(&env.event) {
                 chat.rate_limited = false;
                 chat.rate_banner.set_revealed(false);
@@ -6196,6 +6277,23 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// The idle sweep stops an agent only with suspension on, the thread out of sight, nothing
+    /// holding it, and at least the configured minutes unseen.
+    #[test]
+    fn an_agent_is_suspended_only_when_out_of_sight_idle_and_long_enough() {
+        use std::time::Duration;
+        let min = |m: u64| Duration::from_secs(m * 60);
+        assert!(suspension_due(15, min(15), false, false));
+        assert!(suspension_due(15, min(90), false, false));
+        assert!(!suspension_due(15, min(14), false, false), "not yet");
+        assert!(!suspension_due(15, min(90), true, false), "on show");
+        assert!(
+            !suspension_due(15, min(90), false, true),
+            "something holds it"
+        );
+        assert!(!suspension_due(0, min(9999), false, false), "0 is never");
+    }
 
     #[test]
     fn the_switch_warning_names_the_agent_and_promises_other_threads_are_untouched() {

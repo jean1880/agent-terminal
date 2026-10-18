@@ -4085,6 +4085,26 @@ impl AgentTerminalWindow {
             .build();
         scrollback_row.add_suffix(&scroll_spin);
 
+        let suspend_spin = gtk4::SpinButton::builder()
+            .adjustment(&gtk4::Adjustment::new(
+                f64::from(config.idle_suspend_minutes),
+                0.0,
+                1440.0,
+                5.0,
+                15.0,
+                0.0,
+            ))
+            .valign(gtk4::Align::Center)
+            .build();
+        let suspend_row = adw::ActionRow::builder()
+            .title("Pause Idle Agents After (Minutes)")
+            .subtitle(
+                "A thread out of sight and idle this long stops its agent to free memory; \
+                 it picks up the same conversation when you send. 0 never pauses",
+            )
+            .build();
+        suspend_row.add_suffix(&suspend_spin);
+
         // Built from the configured profiles. Index 0 is auto-detection, so the
         // list is one longer than the profile list and every later index is
         // offset by one — see AUTO_INDEX below, which is the only place that
@@ -4342,6 +4362,7 @@ impl AgentTerminalWindow {
         let behaviour = adw::PreferencesGroup::builder().title("Behaviour").build();
         behaviour.add(&cli_client_row);
         behaviour.add(&scrollback_row);
+        behaviour.add(&suspend_row);
         terminal.add(&behaviour);
         dialog.add(&terminal);
 
@@ -4520,6 +4541,16 @@ impl AgentTerminalWindow {
                 obj.imp().for_each_terminal_everywhere(|term| {
                     term.set_scrollback_lines(i64::from(lines))
                 });
+                obj.imp().schedule_config_save();
+            }
+        ));
+
+        suspend_spin.connect_value_changed(glib::clone!(
+            #[weak]
+            obj,
+            move |spin| {
+                // Read by the minute's sweep (`suspend_idle_threads`); nothing to apply now.
+                obj.imp().config.borrow_mut().idle_suspend_minutes = spin.value() as u32;
                 obj.imp().schedule_config_save();
             }
         ));

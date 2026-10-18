@@ -118,6 +118,12 @@ impl ChatSession {
         watch
     }
 
+    /// The process was stopped by idle suspension and has not started since: a rebind now is
+    /// that resume, which the user did not ask for and has nothing to be told about.
+    pub(crate) fn resumes_from_suspension(&self) -> bool {
+        self.inner.suspended.get()
+    }
+
     /// Ends a rebind: starts the next generation (which takes the staged binding) and sends
     /// what was queued meanwhile.
     pub(crate) fn rebind_start(&self) {

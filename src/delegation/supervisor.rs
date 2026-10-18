@@ -2576,7 +2576,11 @@ impl Supervisor {
                 super::capacity::wait_exit(&watch).await;
             }
             if sup.root_session_current(&needed.0, &session) && sup.epoch(&needed.0).is_ok() {
-                session.note("Delegation was rebound; previous permission cards and session grants have expired.");
+                // A thread resuming from idle suspension had no cards or Codex grants to lose
+                // (suspension waits for them), so there is nothing to say.
+                if !session.resumes_from_suspension() {
+                    session.note("Delegation was rebound; previous permission cards and session grants have expired.");
+                }
                 session.rebind_start();
             }
         });

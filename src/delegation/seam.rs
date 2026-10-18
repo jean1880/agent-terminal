@@ -248,6 +248,13 @@ pub(crate) trait DelegationHooks {
     /// stop). This is NOT an observed exit: kill the token and end runs, but free no process slot
     /// and unlink nothing.
     fn process_stopping(&self, generation: ProcessGeneration);
+    /// The session wants to stop this idle root generation to free memory (idle suspension),
+    /// resuming it later. True: the stop is a planned rotation (the token ends, nothing is
+    /// revoked) and the next prompt rebinds quietly. False (the default, and with any delegated
+    /// work live): the session does not suspend.
+    fn suspending(&self, _generation: ProcessGeneration) -> bool {
+        false
+    }
     /// Every raw provider line, before the adapter. Memory only: never logged, never stored.
     fn line(&self, generation: ProcessGeneration, line: &str, stderr: bool);
     /// Every adapter envelope before masking and persistence.

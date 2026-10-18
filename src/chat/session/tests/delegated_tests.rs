@@ -110,6 +110,9 @@ struct TestHooks {
     observed: Cell<usize>,
     turns: RefCell<Vec<String>>,
     modes: RefCell<Vec<Mode>>,
+    /// What `suspending` answers, and each generation it was asked about.
+    allow_suspend: Cell<bool>,
+    suspend_asks: RefCell<Vec<u64>>,
 }
 
 impl DelegationHooks for TestHooks {
@@ -165,6 +168,11 @@ impl DelegationHooks for TestHooks {
             .find(|(g, _, _)| *g == generation.0)
             .map(|(_, _, w)| w.phase());
         self.stopping.borrow_mut().push((generation.0, phase));
+    }
+
+    fn suspending(&self, generation: ProcessGeneration) -> bool {
+        self.suspend_asks.borrow_mut().push(generation.0);
+        self.allow_suspend.get()
     }
 
     fn line(&self, _generation: ProcessGeneration, line: &str, _stderr: bool) {
@@ -1432,5 +1440,67 @@ fn hooks_see_raw_lines_and_turn_boundaries_with_the_native_turn() {
             .iter()
             .any(|t| t.starts_with("1 ended"))));
         child.session.shutdown(false);
+    });
+}
+
+/// A delegation root is suspended only with its hooks' consent (a planned rotation, nothing
+/// revoked), and the start that follows is known as that resume, then forgotten.
+#[test]
+fn a_delegation_root_suspends_only_with_its_hooks_consent() {
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        session.reload_session();
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        ))));
+        // A prompted turn, so there is a conversation to resume.
+        session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || session.inner.has_conversation.get()
+            && !session.status().running_turn));
+        let generation = session.process_generation().0;
+
+        assert!(!session.suspend_if_idle(), "the hooks refused");
+        assert_eq!(*hooks.suspend_asks.borrow(), vec![generation]);
+        assert!(session.status().alive, "a refusal stops nothing");
+        assert!(!session.resumes_from_suspension());
+
+        hooks.allow_suspend.set(true);
+        assert!(session.suspend_if_idle(), "the hooks agreed");
+        assert!(!session.status().alive);
+        assert!(session.resumes_from_suspension());
+        assert!(
+            hooks
+                .stopping
+                .borrow()
+                .iter()
+                .any(|(g, _)| *g == generation),
+            "the generation was closed out (as a rotation, by the supervisor's consent)"
+        );
+
+        session.send_prompt("back again");
+        assert!(pump_until(ctx, 10, || session.status().alive));
+        assert!(
+            !session.resumes_from_suspension(),
+            "a started process is no longer that resume"
+        );
     });
 }

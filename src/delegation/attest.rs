@@ -111,6 +111,35 @@ impl DelegationHooks for Hooks {
             sup.before_root_turn(&thread) == super::supervisor::RootTurnGate::Proceed
         })
     }
+    fn suspending(&self, generation: ProcessGeneration) -> bool {
+        let Some(sup) = self.supervisor.upgrade() else {
+            return false;
+        };
+        // Roots only, and only with nothing delegated live: a rotation must not cut work short.
+        let thread = {
+            let state = sup.state.borrow();
+            let Some(w) = state.workers.get(&self.worker) else {
+                return false;
+            };
+            if w.row.parent_id.is_some() || w.generation != generation {
+                return false;
+            }
+            state
+                .roots
+                .get(&w.root)
+                .map(|r| r.row.root_thread_id.clone())
+        };
+        let Some(thread) = thread else {
+            return false;
+        };
+        // Busy work, and also idle sub-agents whose processes are up: a rotation cuts the
+        // root's live link to them.
+        if sup.root_busy(&thread) || sup.root_has_live_children(&thread) {
+            return false;
+        }
+        sup.rotate_before_stop(&self.worker, generation);
+        true
+    }
     fn binding(&self, driver: Driver, generation: ProcessGeneration) -> Option<LaunchBinding> {
         let sup = self.supervisor.upgrade()?;
         let epoch = sup.epoch(&self.worker).ok()?;
