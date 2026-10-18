@@ -1450,17 +1450,17 @@ impl Rule {
 /// What the approval rule dialog starts from for a request (`tool` and `input` as the agent sent
 /// them): the bare command (a strict `zsh -lc '…'` wrapper unwrapped by
 /// [`unwrap_shell_wrapper`], the same function matching uses, so the saved rule matches this
-/// request again), the one edited path, or `server/tool`. Anything else falls back to
-/// `remembers`, what the card says Always keeps.
-pub fn dialog_prefill(tool: &str, input: &Value, remembers: Option<&str>) -> String {
+/// request again), the one edited or read path, or `server/tool`. Anything else is empty: the
+/// card's note (`remembers`) is a sentence for the user, never a pattern.
+pub fn dialog_prefill(tool: &str, input: &Value) -> String {
     match Action::of(tool, input) {
         Some(Action::Shell { command }) => unwrap_shell_wrapper(&command).unwrap_or(command),
         // Without a trailing `/`: the agent's path must never prefill a folder rule (`/home/u/`
         // would be a grant over the whole home); a folder is only ever the user's own typing.
         Some(Action::Edit { path }) if path.len() > 1 => path.trim_end_matches('/').to_owned(),
-        Some(Action::Edit { path }) => path,
+        Some(Action::Edit { path } | Action::Read { path }) => path,
         Some(Action::Mcp { server, tool }) => format!("{server}/{tool}"),
-        Some(Action::Read { .. }) | None => remembers.unwrap_or_default().to_owned(),
+        None => String::new(),
     }
 }
 
@@ -4212,7 +4212,7 @@ mod tests {
             assert_eq!(command_tokens(refused), None, "{refused:?}");
         }
         let input = serde_json::json!({"command": "/usr/bin/zsh -lc 'printf %s =sh'"});
-        let prefill = dialog_prefill("command_execution", &input, None);
+        let prefill = dialog_prefill("command_execution", &input);
         assert_eq!(
             prefill, "/usr/bin/zsh -lc 'printf %s =sh'",
             "never unwrapped"
@@ -4222,7 +4222,18 @@ mod tests {
             .complete(&c)
             .is_err());
         let plain = serde_json::json!({"command": "/usr/bin/zsh -lc 'ls -la'"});
-        assert_eq!(dialog_prefill("command_execution", &plain, None), "ls -la");
+        assert_eq!(dialog_prefill("command_execution", &plain), "ls -la");
+    }
+
+    /// A read prefills its path, never the card's note: the dialog once opened on
+    /// "“Always allow” saves: /…/ci.yml", a pattern no rule can hold.
+    #[test]
+    fn read_prefills_its_path_not_the_card_note() {
+        let path = "/home/u/git/p/.github/workflows/ci.yml";
+        let prefill = dialog_prefill("Read", &serde_json::json!({ "file_path": path }));
+        assert_eq!(prefill, path);
+        assert!(Rule::new("", "Read", &prefill).is_ok());
+        assert_eq!(dialog_prefill("NoSuchTool", &serde_json::json!({})), "");
     }
 
     /// U2 as warnings, through the shared re-check: Always keeps an edit wherever it is (outside
@@ -4445,7 +4456,6 @@ mod tests {
         let prefill = dialog_prefill(
             "Edit",
             &serde_json::json!({"file_path": format!("{}/", home.display())}),
-            None,
         );
         assert_eq!(prefill, home.to_string_lossy(), "the path, without its `/`");
 

@@ -2160,11 +2160,7 @@ impl ApprovalCard {
                 if rule_menu && matches!(d, Decision::AllowAlways | Decision::AllowForSession) {
                     let tool = a.tool.clone();
                     let input_val = a.input.clone();
-                    let initial_cmd = crate::always_allow::dialog_prefill(
-                        &tool,
-                        &input_val,
-                        a.remembers.as_deref(),
-                    );
+                    let initial_cmd = crate::always_allow::dialog_prefill(&tool, &input_val);
                     let cwd_str = input_val
                         .get("Cwd")
                         .or_else(|| input_val.get("cwd"))
@@ -3467,9 +3463,7 @@ pub(crate) mod tests {
             .expect("W0 frame")["frame"]["params"]
             .clone();
         assert_eq!(params["command"], "/usr/bin/zsh -lc 'ls -la'");
-        let footer = "`/usr/bin/zsh -lc 'ls -la'` in /tmp/w0-sandbox";
-        let prefill =
-            crate::always_allow::dialog_prefill("command_execution", &params, Some(footer));
+        let prefill = crate::always_allow::dialog_prefill("command_execution", &params);
         assert_eq!(prefill, "ls -la");
         for decision in [Decision::AllowAlways, Decision::AllowForSession] {
             let (_, entry, global) = rule_dialog("command_execution", &prefill, decision);
@@ -3764,7 +3758,7 @@ pub(crate) mod tests {
 
         // No rule: the dialog has nothing to prefill, and the session grant is sent straight.
         assert_eq!(
-            crate::always_allow::dialog_prefill(permission::TOOL, &input, None),
+            crate::always_allow::dialog_prefill(permission::TOOL, &input),
             ""
         );
         assert!(card.press("Allow for this session"));
