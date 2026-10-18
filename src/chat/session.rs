@@ -9122,7 +9122,7 @@ mod tests {
             feed(&session, &frame(0, "item-a").to_string());
             let (request, tool, input) = card(&seen, "item-a");
             assert!(offered(&seen, &request).contains(&Decision::AllowAlways));
-            let prefill = crate::always_allow::dialog_prefill(&tool, &input, None);
+            let prefill = crate::always_allow::dialog_prefill(&tool, &input);
             assert_eq!(prefill, "ls -la");
             let rule = crate::always_allow::Rule::new("", tool, prefill).expect("rule");
             session.respond_approval_with_rule(&request, Decision::AllowAlways, Some(rule));
