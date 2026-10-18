@@ -99,9 +99,18 @@ pub struct TranscriptView {
     settle_queued: Cell<bool>,
     /// The mapped frame clock's post-layout handler; disconnected on unmap.
     layout_handler: RefCell<Option<(gtk4::gdk::FrameClock, glib::SignalHandlerId)>>,
+    /// The per-frame backstop tick, only while mapped: GTK runs a tick callback for as long as
+    /// its widget is realised, and a thread's hidden page stays realised, so every open thread
+    /// ticked at the display's refresh rate (measured: `idle_cost_of_open_threads`).
+    tick: RefCell<Option<gtk4::TickCallbackId>>,
     /// Frames the tick callback has seen (tests read it).
     #[cfg(test)]
     ticks: Cell<u64>,
+    /// Times `settle` and `move_to` ran (measurements read them).
+    #[cfg(test)]
+    settles: Cell<u64>,
+    #[cfg(test)]
+    moves: Cell<u64>,
     sink: RowSink,
     empty: gtk4::Box,
     /// The model the rows are built from (set by `connect_load_older`), for the fill steps.
@@ -208,8 +217,13 @@ impl TranscriptView {
             restore_to: Cell::new(None),
             settle_queued: Cell::new(false),
             layout_handler: RefCell::new(None),
+            tick: RefCell::new(None),
             #[cfg(test)]
             ticks: Cell::new(0),
+            #[cfg(test)]
+            settles: Cell::new(0),
+            #[cfg(test)]
+            moves: Cell::new(0),
             sink,
             empty,
             model: RefCell::new(Weak::new()),
@@ -266,6 +280,18 @@ impl TranscriptView {
         self.scroller
             .frame_clock()
             .map_or(0, |c| u64::try_from(c.frame_counter()).unwrap_or(0))
+    }
+
+    /// Times the frame tick has run, for tests and measurements.
+    #[cfg(test)]
+    pub fn tick_count(&self) -> u64 {
+        self.ticks.get()
+    }
+
+    /// Times `settle` and `move_to` have run, for measurements.
+    #[cfg(test)]
+    pub fn settle_counts(&self) -> (u64, u64) {
+        (self.settles.get(), self.moves.get())
     }
 
     /// The numbers behind [`Self::last_row_overflow`], for a test to print.
@@ -330,6 +356,8 @@ impl TranscriptView {
     /// Moves the view itself (pinning, anchoring). Marked as its own, so it is never read as the
     /// user scrolling.
     fn move_to(&self, value: f64) {
+        #[cfg(test)]
+        self.moves.set(self.moves.get() + 1);
         let adj = self.scroller.vadjustment();
         self.own_move.set(true);
         adj.set_value(value);
@@ -349,6 +377,8 @@ impl TranscriptView {
     /// summary sat below the fold until the user scrolled up and back down (measured on
     /// Broadway: value 3133 with the list drawn at -2911, the previous value, for seconds).
     fn settle(&self) {
+        #[cfg(test)]
+        self.settles.set(self.settles.get() + 1);
         let adj = self.scroller.vadjustment();
         let pending = self.jump_to.borrow().clone();
         if let Some(id) = pending {
@@ -449,30 +479,24 @@ impl TranscriptView {
         // during continuous growth. Settle after GTK's layout handler; adjustment changes
         // request another layout pass in this frame, before painting the newest row.
         let weak = Rc::downgrade(self);
-        self.scroller.connect_map(move |scroller| {
-            let Some(view) = weak.upgrade() else {
-                return;
-            };
-            if view.layout_handler.borrow().is_some() {
-                return;
+        self.scroller.connect_map(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.on_mapped();
             }
-            let Some(clock) = scroller.frame_clock() else {
-                return;
-            };
-            let weak = Rc::downgrade(&view);
-            let handler = clock.connect_local("layout", true, move |_| {
-                if let Some(view) = weak.upgrade() {
-                    view.settle();
-                }
-                None
-            });
-            *view.layout_handler.borrow_mut() = Some((clock, handler));
         });
+        // Wired from `new`, before the scroller has a parent; a scroller already on show would
+        // never see `map`, and so never get its tick or layout handler.
+        if self.scroller.is_mapped() {
+            self.on_mapped();
+        }
         let weak = Rc::downgrade(self);
         self.scroller.connect_unmap(move |_| {
             if let Some(view) = weak.upgrade() {
                 if let Some((clock, handler)) = view.layout_handler.borrow_mut().take() {
                     clock.disconnect(handler);
+                }
+                if let Some(tick) = view.tick.borrow_mut().take() {
+                    tick.remove();
                 }
             }
         });
@@ -510,17 +534,6 @@ impl TranscriptView {
                 view.jump.set_visible(false);
             }
         });
-        // Every frame too, as a backstop for content that settles without a size notification.
-        let weak = Rc::downgrade(self);
-        self.scroller.add_tick_callback(move |_, _| {
-            let Some(view) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            #[cfg(test)]
-            view.ticks.set(view.ticks.get() + 1);
-            view.settle();
-            glib::ControlFlow::Continue
-        });
         let weak = Rc::downgrade(self);
         let on_size = move |adj: &gtk4::Adjustment| {
             let Some(view) = weak.upgrade() else {
@@ -547,6 +560,42 @@ impl TranscriptView {
                 view.scroll_to_end();
             }
         });
+    }
+
+    /// The scroller came on show: the backstop tick and the post-layout settle, each once.
+    fn on_mapped(self: &Rc<Self>) {
+        if self.tick.borrow().is_none() {
+            *self.tick.borrow_mut() = Some(self.add_tick());
+        }
+        if self.layout_handler.borrow().is_some() {
+            return;
+        }
+        let Some(clock) = self.scroller.frame_clock() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let handler = clock.connect_local("layout", true, move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.settle();
+            }
+            None
+        });
+        *self.layout_handler.borrow_mut() = Some((clock, handler));
+    }
+
+    /// Every frame while mapped, as a backstop for content that settles without a size
+    /// notification. Added on map and removed on unmap (see [`Self::tick`]).
+    fn add_tick(self: &Rc<Self>) -> gtk4::TickCallbackId {
+        let weak = Rc::downgrade(self);
+        self.scroller.add_tick_callback(move |_, _| {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            #[cfg(test)]
+            view.ticks.set(view.ticks.get() + 1);
+            view.settle();
+            glib::ControlFlow::Continue
+        })
     }
 
     /// Connects the "scrolled to the top" edge to loading older rows. Separate from `new` because
