@@ -11,7 +11,7 @@ LOCAL_ICON_DIR = $(HOME)/.local/share/icons/hicolor/scalable/apps
 LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 
 .PHONY: all build start-local clean install uninstall package deps help bump-version bum-version release \
-	test check coverage hooks lint test-display test-one test-stress test-qa test-deps bench
+	test check coverage hooks lint test-display test-one test-stress test-qa test-deps bench test-gdb
 
 # ---- Tests -----------------------------------------------------------------------------------
 # Tools: cargo-nextest and cargo-llvm-cov (`make test-deps`), plus xvfb-run and dbus-run-session.
@@ -120,7 +120,11 @@ test-deps:
 	rustup component add llvm-tools-preview
 	cargo install --locked cargo-nextest cargo-llvm-cov
 
+# Emptied before every run: target/ is cached in CI, and a test home left by an earlier run (a
+# thread store, config, model cache) must never carry into the next.
+.PHONY: $(TEST_HOME)
 $(TEST_HOME):
+	rm -rf $(TEST_HOME)
 	mkdir -p -m 700 $(TEST_HOME)/config $(TEST_HOME)/data $(TEST_HOME)/state $(TEST_HOME)/cache
 
 # The suite, each test in its own process (.config/nextest.toml).
@@ -137,6 +141,15 @@ test-display: $(TEST_HOME)
 test-one: $(TEST_HOME)
 	@test -n "$(T)" || { echo "usage: make test-one T=<test name> [ARGS=<nextest flags>]"; exit 2; }
 	$(DOTENV_RUN) $(NEXTEST) --run-ignored all --test-threads 1 -E 'test($(T))'
+
+# The one test whose name matches T, under gdb in batch mode: on a crash (SIGILL, SIGSEGV) it
+# prints the backtrace, the faulting instructions and what holds them (a library, or nothing: JIT
+# code). GSK_DEBUG=renderer names the renderer GTK chose. CI runs it when a gate run crashes.
+test-gdb: $(TEST_HOME)
+	@test -n "$(T)" || { echo "usage: make test-gdb T=<test name>"; exit 2; }
+	env GSK_DEBUG=renderer $(DISPLAY_RUN) $(NEXTEST) --run-ignored all -E 'test($(T))' \
+		--debugger "gdb -batch -return-child-result -ex 'handle SIGPIPE nostop noprint' -ex run \
+		-ex bt -ex 'x/4i \$$pc' -ex 'info symbol \$$pc' -ex 'info sharedlibrary' --args"
 
 # test-one for benchmarks and measurements: optimised build, output shown (they print their
 # numbers), and the tests .config/nextest.toml's default-filter keeps out of every other run

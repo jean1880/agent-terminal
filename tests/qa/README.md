@@ -11,10 +11,12 @@ Everything runs through the Makefile, with standard tools: `cargo nextest` for t
 | `make test-one T=<name>` | The tests whose names contain `<name>`, display tests included, one at a time | You, rerunning one test |
 | `make test-stress T=<name> [N=30]` | The tests whose names contain `<name>`, `N` times over, no retries, failures summarised at the end. Tests in each pass run in parallel, as in `make test`, so they load each other | You, proving a flaky test fixed (a fix needs a clean stress run, not one green CI) |
 | `make bench T=<name>` | The benchmarks and measurements whose names contain `<name>`, optimised build (`measure` profile: release without LTO), output shown, the `default-filter` exclusions included, one at a time | You, measuring a cost (`resize_cost`, `append_bench`, `stream_cost`) |
+| `make test-gdb T=<name>` | The test whose name contains `<name>` under gdb in batch mode: on a crash, the backtrace, the faulting instructions and the library (or JIT code) holding them, with the GTK renderer named | CI, when a gate or coverage run fails; you, when a test dies by a signal with no panic text |
 | `make hooks` | Opt in to a pre-commit hook: fmt and Clippy only | Your clone |
 
 Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
-private XDG directories under `target/test-home`, in-memory GSettings and no global or
+private XDG directories under `target/test-home` (emptied before every run, since CI caches
+`target/`), in-memory GSettings and no global or
 system git config, so no test touches your settings, thread store or keyring.
 
 **Display tests** present windows and measure layout. They are `#[ignore]`d so `make test`
@@ -67,7 +69,7 @@ comments, absolute paths (no `~` or `$HOME`).
 
 | Variable | Effect |
 |---|---|
-| `T` | `make test-one`, `make test-stress` and `make bench`: the test name filter (required) |
+| `T` | `make test-one`, `make test-stress`, `make bench` and `make test-gdb`: the test name filter (required) |
 | `N` | `make test-stress`: how many times to run (default `STRESS_COUNT`, 30) |
 | `ARGS` | Extra `cargo nextest run` flags for `test`, `test-display`, `test-one`, `test-stress` and `bench` (`ARGS=--no-capture`, `ARGS='--retries 2'`); not `coverage` |
 | `BENCH_PROFILE` | `make bench`'s cargo profile: `measure` (default, release without LTO), `release` (exactly what ships, slow to build) or `dev` |
