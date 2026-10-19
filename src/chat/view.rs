@@ -2192,6 +2192,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// Live, your message and the first row after it fade in, and later rows just appear;
+    /// opening the thread again (a replay) builds every row without an entrance.
+    fn live_rows_make_an_entrance_and_replayed_rows_do_not() {
+        use agent_core::event::{Event, ItemKind};
+        let started = |id: &str, kind: ItemKind| {
+            Envelope::new(Event::ItemStarted {
+                kind,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item(id)
+        };
+        let envs = [
+            started("u1", ItemKind::UserMessage),
+            started("t1", ItemKind::Command),
+            started("t2", ItemKind::Command),
+        ];
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let entering = |view: &ChatView, id: &str| {
+            view.inner()
+                .and_then(|i| {
+                    i.transcript
+                        .with_row(id, |r| r.widget().has_css_class("row-enter"))
+                })
+                .unwrap_or(false)
+        };
+        let live = ChatView::new(backend.clone());
+        for env in &envs {
+            live.apply(env);
+        }
+        assert!(entering(&live, "u1"), "your message fades in");
+        assert!(entering(&live, "t1"), "so does the reply's first row");
+        assert!(!entering(&live, "t2"), "the rest of the turn just appears");
+        let replayed = ChatView::new(backend);
+        replayed.replay(&envs);
+        for id in ["u1", "t1", "t2"] {
+            assert!(!entering(&replayed, id), "{id} replayed with an entrance");
+        }
+    }
+
     /// An approval's card sits right above the command it let run (whose card started first),
     /// so the command's result reads after "Allowed", not before it.
     fn approval_row_precedes_its_step() {
@@ -2818,6 +2861,7 @@ pub(crate) mod tests {
         cards::tests::a_git_approval_reads_as_its_operation();
         whole_view_has_no_dead_click_targets();
         approval_row_precedes_its_step();
+        live_rows_make_an_entrance_and_replayed_rows_do_not();
         subagent_shelf::tests::shelf_follows_running_subagents();
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
         subagents::tests::names_are_never_squeezed_into_a_column();

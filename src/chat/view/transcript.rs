@@ -52,7 +52,23 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use super::cards::{Row, RowSink};
-use super::model::{ItemId, Transcript};
+use super::model::{Body, ItemId, Transcript};
+
+/// How long a live row keeps its entrance class: longer than its animation, so a row moved
+/// later (a trim, a reload) does not play it again.
+const ENTRANCE_MS: u64 = 600;
+
+/// The entrance a row arriving live makes, by what it is and what comes before it: a message of
+/// yours, or the first row of the reply after it, fades in (`row-enter`); an agent switch's
+/// divider settles into place (`divider-settle`). Everything else, and every replayed row,
+/// simply appears: in a fast stream more motion would only flicker.
+fn entrance(this: &Body, before: Option<&Body>) -> Option<&'static str> {
+    match (this, before) {
+        (Body::Switch { .. }, _) => Some("divider-settle"),
+        (Body::User { .. }, _) | (_, Some(Body::User { .. })) => Some("row-enter"),
+        _ => None,
+    }
+}
 
 /// Top-level rows kept as widgets when the user is at the bottom.
 pub const WINDOW: usize = 150;
@@ -977,6 +993,23 @@ impl TranscriptView {
                     return;
                 }
                 if let Some(w) = self.build_tree(model, id) {
+                    let before = pos
+                        .checked_sub(1)
+                        .and_then(|p| order.get(p))
+                        .and_then(|p| model.get(p))
+                        .map(|p| &p.body);
+                    if let Some(class) = entrance(&item.body, before) {
+                        w.add_css_class(class);
+                        let row = w.downgrade();
+                        glib::timeout_add_local_once(
+                            Duration::from_millis(ENTRANCE_MS),
+                            move || {
+                                if let Some(row) = row.upgrade() {
+                                    row.remove_css_class(class);
+                                }
+                            },
+                        );
+                    }
                     self.place(&self.list, order, id, &w);
                 }
                 if self.stick.get() {
@@ -1064,5 +1097,46 @@ impl TranscriptView {
             child = c.next_sibling();
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_core::adapter::Driver;
+
+    use super::super::model::{Body, Tone};
+    use super::entrance;
+
+    /// A live message of yours and the reply's first row fade in; a switch's divider settles;
+    /// the rest of a turn (tool steps, the reply's later rows) just appears.
+    #[test]
+    fn only_a_turns_first_rows_and_a_switch_make_an_entrance() {
+        let user = Body::User {
+            text: "hi".into(),
+            queued: false,
+        };
+        let reply = Body::Assistant {
+            text: String::new(),
+            driver: Driver::Claude,
+            streaming: true,
+        };
+        let notice = Body::Notice {
+            text: "note".into(),
+            tone: Tone::Info,
+        };
+        let switch = Body::Switch {
+            driver: Driver::Agy,
+            model: None,
+            agent_changed: true,
+            returned: false,
+        };
+        assert_eq!(entrance(&user, None), Some("row-enter"));
+        assert_eq!(entrance(&user, Some(&reply)), Some("row-enter"));
+        assert_eq!(entrance(&reply, Some(&user)), Some("row-enter"));
+        assert_eq!(entrance(&notice, Some(&user)), Some("row-enter"));
+        assert_eq!(entrance(&switch, Some(&reply)), Some("divider-settle"));
+        assert_eq!(entrance(&reply, Some(&notice)), None);
+        assert_eq!(entrance(&notice, Some(&reply)), None);
+        assert_eq!(entrance(&reply, None), None);
     }
 }
