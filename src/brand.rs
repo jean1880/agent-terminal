@@ -215,9 +215,14 @@ mod tests {
                 "{driver:?} needed no shade"
             );
             assert!(contrast(shade, white) >= MIN_CONTRAST, "{driver:?}");
-            // One step lighter would fall short: darkened only as far as needed.
-            let lighter = (shade.0 / 0.99, shade.1 / 0.99, shade.2 / 0.99);
-            assert!(contrast(lighter, white) < MIN_CONTRAST + 0.1, "{driver:?}");
+            // One step (1%) lighter would fall short: darkened only as far as needed.
+            let keep = shade.0 / accent.0;
+            let lighter = (
+                accent.0 * (keep + 0.01),
+                accent.1 * (keep + 0.01),
+                accent.2 * (keep + 0.01),
+            );
+            assert!(contrast(lighter, white) < MIN_CONTRAST, "{driver:?}");
             // The same hue: every channel scaled alike.
             let ratio = shade.0 / accent.0;
             assert!((shade.2 / accent.2 - ratio).abs() < 1e-9, "{driver:?}");
