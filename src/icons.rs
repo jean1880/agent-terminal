@@ -289,7 +289,14 @@ mod tests {
             3,
             "the icon has three cursor dots"
         );
-        for (cx, fill) in [(64, "#e8846b"), (80, "#5b9cf6"), (96, "#4cc38a")] {
+        use agent_core::adapter::Driver;
+        // In slot order, the agents' own colours (agent-core is their one source).
+        let accent = |driver: Driver| driver.info().accent_hex;
+        for (cx, fill) in [
+            (64, accent(Driver::Claude)),
+            (80, accent(Driver::Agy)),
+            (96, accent(Driver::Codex)),
+        ] {
             assert!(
                 ART.contains(&format!(
                     "<circle cx=\"{cx}\" cy=\"66\" r=\"5.5\" fill=\"{fill}\"/>"

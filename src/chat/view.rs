@@ -114,6 +114,7 @@ fn load_style() {
     let Some(display) = gdk::Display::default() else {
         return;
     };
+    crate::brand::install();
     let provider = gtk4::CssProvider::new();
     provider.load_from_data(STYLE);
     gtk4::style_context_add_provider_for_display(

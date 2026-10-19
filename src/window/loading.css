@@ -53,17 +53,17 @@
     border-radius: 9999px;
 }
 .splash-dot.dot-claude {
-    background-color: #e8846b;
+    background-color: @brand_claude;
     animation: splash-dot-pop 300ms ease-out 700ms both,
                splash-dot-bounce 1800ms ease-in-out 1100ms infinite;
 }
 .splash-dot.dot-agy {
-    background-color: #5b9cf6;
+    background-color: @brand_agy;
     animation: splash-dot-pop 300ms ease-out 800ms both,
                splash-dot-bounce 1800ms ease-in-out 1250ms infinite;
 }
 .splash-dot.dot-codex {
-    background-color: #4cc38a;
+    background-color: @brand_codex;
     animation: splash-dot-pop 300ms ease-out 900ms both,
                splash-dot-bounce 1800ms ease-in-out 1400ms infinite;
 }
