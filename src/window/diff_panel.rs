@@ -219,6 +219,11 @@ pub struct DiffPanel {
     pr_bar: gtk4::Box,
     pr_status: gtk4::Label,
     pr_button: gtk4::Button,
+    pr_content: adw::ButtonContent,
+    pr_face: gtk4::Stack,
+    pr_spinner: gtk4::Spinner,
+    /// A push for the pull request is running (`set_pushing`).
+    pr_pushing: Rc<Cell<bool>>,
     pr_state: Rc<RefCell<Option<PrState>>>,
     pr_handler: Rc<RefCell<Option<PrHandler>>>,
     base: gtk4::DropDown,
@@ -313,8 +318,22 @@ impl DiffPanel {
             .icon_name(crate::icons::PULL_REQUEST_ICON)
             .label("Open a PR")
             .build();
+        // The button's face: its label, or a spinner while its push runs (`set_pushing`).
+        let pr_busy = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk4::Align::Center)
+            .build();
+        let pr_spinner = gtk4::Spinner::new();
+        pr_busy.append(&pr_spinner);
+        pr_busy.append(&gtk4::Label::new(Some("Pushing…")));
+        let pr_face = gtk4::Stack::builder()
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .build();
+        pr_face.add_named(&pr_content, Some("idle"));
+        pr_face.add_named(&pr_busy, Some("busy"));
         let pr_button = gtk4::Button::builder()
-            .child(&pr_content)
+            .child(&pr_face)
             .valign(gtk4::Align::Center)
             .css_classes(["pill", "suggested-action", "diff-open-pr"])
             .sensitive(false)
@@ -404,6 +423,10 @@ impl DiffPanel {
             pr_bar,
             pr_status,
             pr_button,
+            pr_content,
+            pr_face,
+            pr_spinner,
+            pr_pushing: Rc::new(Cell::new(false)),
             pr_state: Rc::new(RefCell::new(None)),
             pr_handler: Rc::new(RefCell::new(None)),
             base,
@@ -581,10 +604,10 @@ impl DiffPanel {
         let words = pr_words(&outcome);
         self.pr_status.set_text(&words.status);
         self.pr_status.set_tooltip_text(Some(&words.status));
-        if let Some(content) = self.pr_button.child().and_downcast::<adw::ButtonContent>() {
-            content.set_label(words.button);
-        }
-        self.pr_button.set_sensitive(words.enabled);
+        self.pr_content.set_label(words.button);
+        // A refresh landing mid-push keeps the button busy: only the push's end frees it.
+        self.pr_button
+            .set_sensitive(words.enabled && !self.pr_pushing.get());
         self.pr_button.set_tooltip_text(Some(if words.enabled {
             "Open this branch's pull request page on GitHub in the browser"
         } else {
@@ -597,17 +620,36 @@ impl DiffPanel {
         self.pr_bar.set_visible(true);
     }
 
+    /// While the push behind "Push & Open PR" runs, the button spins and says so, and cannot be
+    /// pressed again, whatever refreshes land meanwhile. Its end gives the button back as the
+    /// last refresh left it (pressable only with a branch ready to open).
+    pub fn set_pushing(&self, pushing: bool) {
+        self.pr_pushing.set(pushing);
+        self.pr_face
+            .set_visible_child_name(if pushing { "busy" } else { "idle" });
+        if pushing {
+            self.pr_spinner.start();
+            self.pr_button.set_sensitive(false);
+        } else {
+            self.pr_spinner.stop();
+            self.pr_button
+                .set_sensitive(self.pr_state.borrow().is_some());
+        }
+    }
+
+    /// Whether the PR button shows a push in flight (tests).
+    #[cfg(test)]
+    pub fn is_pushing(&self) -> bool {
+        self.pr_face.visible_child_name().as_deref() == Some("busy")
+    }
+
     /// The PR bar's status, button label and whether it can be pressed (tests).
     #[cfg(test)]
     pub fn pr_view(&self) -> Option<(String, String, bool)> {
         self.pr_bar.is_visible().then(|| {
             (
                 self.pr_status.text().to_string(),
-                self.pr_button
-                    .child()
-                    .and_downcast::<adw::ButtonContent>()
-                    .map(|c| c.label().to_string())
-                    .unwrap_or_default(),
+                self.pr_content.label().to_string(),
                 self.pr_button.is_sensitive(),
             )
         })
@@ -1110,6 +1152,22 @@ pub(crate) mod tests {
             clicked.borrow().as_ref().map(|s| s.push.clone()),
             Some(PushState::Ahead(2))
         );
+        // The push in flight: the button spins and cannot be pressed twice; the refresh after
+        // it draws the bar afresh.
+        panel.set_pushing(true);
+        assert!(panel.is_pushing());
+        assert_eq!(panel.pr_view().map(|v| v.2), Some(false));
+        // A refresh landing mid-push (a turn ending, say) leaves it busy: no second push.
+        panel.show_pr(
+            generation,
+            Some(Ok(PrOutcome::Ready(state(PushState::UpToDate)))),
+        );
+        assert!(panel.is_pushing());
+        assert_eq!(panel.pr_view().map(|v| v.2), Some(false));
+        // Its end gives the button back as that refresh left it.
+        panel.set_pushing(false);
+        assert!(!panel.is_pushing());
+        assert_eq!(panel.pr_view().map(|v| v.2), Some(true));
         // A stale refresh changes nothing; no repository hides the bar.
         panel.show_pr(generation.wrapping_sub(1), None);
         assert!(panel.pr_view().is_some());

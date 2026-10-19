@@ -2875,6 +2875,13 @@ impl AgentTerminalWindow {
     fn check_for_updates(&self, action: gtk4::gio::SimpleAction) {
         let obj = self.obj().downgrade();
         let slug = agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY"));
+        // The menu closes at once and the answer can take seconds: say the check runs, until
+        // its answer replaces this.
+        let checking = adw::Toast::builder()
+            .title("Checking for updates…")
+            .timeout(0)
+            .build();
+        self.add_toast(checking.clone());
         glib::MainContext::default().spawn_local(async move {
             let result = match slug {
                 Some(slug) => gtk4::gio::spawn_blocking(move || {
@@ -2887,6 +2894,7 @@ impl AgentTerminalWindow {
                 .unwrap_or_else(|_| Err("The update check stopped unexpectedly.".to_owned())),
                 None => Err("This build names no GitHub repository to check.".to_owned()),
             };
+            checking.dismiss();
             action.set_enabled(true);
             // A newer release found by hand marks the menus too, as one found at startup does.
             if let Ok(release) = &result {
@@ -6016,24 +6024,31 @@ impl AgentTerminalWindow {
         dialog.connect_response(None, move |_, response| match response {
             "open" => launch_uri(&parent, &url),
             "push" => {
-                let (obj, parent, url, state, dir, page) = (
+                let (obj, parent, url, state, dir, page, panel) = (
                     obj.clone(),
                     parent.clone(),
                     url.clone(),
                     state.clone(),
                     dir.clone(),
                     page.clone(),
+                    panel.clone(),
                 );
+                // A push can take a while (a slow remote, a credential helper): say it runs.
+                panel.set_pushing(true);
                 glib::MainContext::default().spawn_local(async move {
+                    let branch = state.branch.clone();
                     let pushed = gtk4::gio::spawn_blocking(move || {
                         agent_kit::github::push_branch(std::path::Path::new(&dir), &state)
                     })
                     .await
                     .unwrap_or_else(|_| Err("the push panicked".to_string()));
+                    panel.set_pushing(false);
                     let Some(obj) = obj.upgrade() else { return };
                     match pushed {
                         Ok(()) => {
                             info!("pushed a branch for its pull request");
+                            obj.imp()
+                                .show_toast(&format!("Pushed {branch}; opening its pull request"));
                             launch_uri(&parent, &url);
                         }
                         Err(why) => {
@@ -6600,9 +6615,16 @@ impl AgentTerminalWindow {
                 }
 
                 let pinned = plan.pinned.commit.clone();
+                // The confirmation is gone and a large tree takes a moment: say it runs.
+                let undoing = adw::Toast::builder()
+                    .title("Undoing changes…")
+                    .timeout(0)
+                    .build();
+                obj.imp().add_toast(undoing.clone());
                 let done = gtk4::gio::spawn_blocking(move || crate::restore::apply(&repo, &plan))
                     .await
                     .unwrap_or_else(|_| Err("the undo panicked".to_string()));
+                undoing.dismiss();
                 let imp = obj.imp();
                 match done {
                     Ok(done) if done.mismatched.is_empty() && done.refused.is_empty() => {
