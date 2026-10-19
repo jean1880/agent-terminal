@@ -1346,10 +1346,21 @@ pub(crate) mod tests {
             move |_| closed.set(true)
         });
         let search = find::<gtk4::SearchEntry>(picker.upcast_ref()).expect("a search field");
-        // What GTK's Escape binding on a search entry does.
-        search.emit_by_name::<()>("stop-search", &[]);
+        let context = glib::MainContext::default();
+        // Libadwaita 1.5 ignores a close that lands while the sheet is still opening (CI's
+        // Ubuntu 24.04; a user never presses Escape that soon), so let it open first, and press
+        // again as a user would if one is still swallowed.
+        assert!(crate::testutil::pump_until(&context, 5, || picker.is_mapped()));
+        crate::testutil::settle(&context);
         assert!(
-            crate::testutil::pump_until(&glib::MainContext::default(), 5, || closed.get()),
+            crate::testutil::pump_until(&context, 10, || {
+                if closed.get() {
+                    return true;
+                }
+                // What GTK's Escape binding on a search entry does.
+                search.emit_by_name::<()>("stop-search", &[]);
+                crate::testutil::pump_until(&context, 1, || closed.get())
+            }),
             "Escape in the search field closes the picker"
         );
     }
