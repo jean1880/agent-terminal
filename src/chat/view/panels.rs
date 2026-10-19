@@ -139,7 +139,10 @@ fn dialog(title: &str, width: i32, height: i32) -> (adw::Dialog, gtk4::Stack) {
     spinner.set_halign(gtk4::Align::Center);
     spinner.set_valign(gtk4::Align::Center);
     stack.add_named(&spinner, Some("loading"));
-    toolbar.set_content(Some(&stack));
+    // Every panel can toast; `toasts` finds the overlay from the stack.
+    let overlay = adw::ToastOverlay::new();
+    overlay.set_child(Some(&stack));
+    toolbar.set_content(Some(&overlay));
     d.set_child(Some(&toolbar));
     (d, stack)
 }
@@ -150,6 +153,13 @@ fn show_error(stack: &gtk4::Stack, message: &str) {
     page.set_title("Could not load this panel");
     page.set_description(Some(&glib::markup_escape_text(message)));
     replace_page(stack, "error", &page);
+}
+
+/// The panel's toast overlay: the stack's nearest `ToastOverlay` ancestor.
+fn toasts(stack: &gtk4::Stack) -> Option<adw::ToastOverlay> {
+    stack
+        .ancestor(adw::ToastOverlay::static_type())
+        .and_downcast()
 }
 
 fn replace_page(stack: &gtk4::Stack, name: &str, widget: &impl IsA<gtk4::Widget>) {
@@ -486,13 +496,21 @@ pub fn model_picker(ctx: &PanelCtx) {
     search.set_margin_end(18);
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     outer.append(&search);
-    // The stack moves from the toolbar into `outer`, under the search entry.
-    if let Some(toolbar) = d.child().and_downcast::<adw::ToolbarView>() {
-        toolbar.set_content(None::<&gtk4::Widget>);
+    // The stack moves from the toast overlay into `outer`, under the search entry.
+    if let Some(overlay) = toasts(&stack) {
+        overlay.set_child(None::<&gtk4::Widget>);
         outer.append(&stack);
-        toolbar.set_content(Some(&outer));
+        overlay.set_child(Some(&outer));
     }
     stack.set_vexpand(true);
+    // A search entry keeps Escape for itself (`stop-search`); in a dialog it means close.
+    search.connect_stop_search(glib::clone!(
+        #[weak]
+        d,
+        move |_| {
+            d.close();
+        }
+    ));
 
     let models: Rc<RefCell<Vec<CatalogModel>>> = Rc::default();
     let pick: Pick = {
@@ -653,19 +671,36 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                     reconnect.connect_clicked(glib::clone!(
                         #[weak]
                         stack,
+                        #[weak]
+                        row,
+                        #[weak]
+                        dot,
                         move |b| {
-                            b.set_sensitive(false);
+                            show_reconnecting(b, &row, &dot);
+                            let started = std::time::Instant::now();
                             let ctx4 = ctx3.clone();
+                            let server = name.clone();
+                            let stack = stack.downgrade();
                             ctx3.requests.ask(
                                 ctx3.backend.as_ref(),
                                 Control::McpReconnect {
                                     server: name.clone(),
                                 },
-                                glib::clone!(
-                                    #[weak]
-                                    stack,
-                                    move |_| load_mcp(&ctx4, &stack)
-                                ),
+                                move |result| {
+                                    // A fast answer still shows the spinner long enough to see.
+                                    glib::spawn_future_local(async move {
+                                        let left =
+                                            RECONNECT_MIN_SPIN.saturating_sub(started.elapsed());
+                                        glib::timeout_future(left).await;
+                                        let Some(stack) = stack.upgrade() else {
+                                            return;
+                                        };
+                                        if let Some(overlay) = toasts(&stack) {
+                                            overlay.add_toast(reconnect_toast(&server, &result));
+                                        }
+                                        load_mcp(&ctx4, &stack);
+                                    });
+                                },
                             );
                         }
                     ));
@@ -707,6 +742,39 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
             }
         ),
     );
+}
+
+/// The least time a reconnect's spinner stays up, so a quick answer is still seen to happen.
+const RECONNECT_MIN_SPIN: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// The row while its reconnect is in flight: a spinner in place of the button's icon, a pulsing
+/// pending dot and a subtitle that says so. The list reload that follows draws it afresh.
+fn show_reconnecting(button: &gtk4::Button, row: &adw::ActionRow, dot: &gtk4::Label) {
+    button.set_sensitive(false);
+    let spinner = gtk4::Spinner::new();
+    spinner.start();
+    button.set_child(Some(&spinner));
+    button.set_tooltip_text(Some("Reconnecting…"));
+    for class in ["mcp-ok", "mcp-off", "mcp-bad"] {
+        dot.remove_css_class(class);
+    }
+    dot.add_css_class("mcp-pending");
+    dot.add_css_class("mcp-reconnecting");
+    row.set_subtitle("reconnecting…");
+}
+
+fn reconnect_message(server: &str, result: &Result<Value, String>) -> String {
+    match result {
+        Ok(_) => format!("Reconnected {server}"),
+        Err(e) => format!("Could not reconnect {server}: {e}"),
+    }
+}
+
+fn reconnect_toast(server: &str, result: &Result<Value, String>) -> adw::Toast {
+    let toast = adw::Toast::new(&reconnect_message(server, result));
+    // Server names and errors are not markup.
+    toast.set_use_markup(false);
+    toast
 }
 
 fn status_class(status: &str) -> &'static str {
@@ -1221,5 +1289,68 @@ pub(crate) mod tests {
         assert_eq!(status_class("disabled"), "off");
         assert_eq!(status_class("needs-auth"), "pending");
         assert_eq!(status_class("failed"), "bad");
+    }
+
+    #[test]
+    fn a_reconnect_says_how_it_went() {
+        assert_eq!(
+            reconnect_message("git", &Ok(Value::Null)),
+            "Reconnected git"
+        );
+        assert_eq!(
+            reconnect_message("git", &Err("timed out".into())),
+            "Could not reconnect git: timed out"
+        );
+    }
+
+    /// A reconnect in flight shows itself on the row: a spinner, a pulsing pending dot and the
+    /// word, with the button off until the list reloads.
+    pub(crate) fn a_reconnect_in_flight_shows_on_its_row() {
+        let button = gtk4::Button::from_icon_name("at-view-refresh-symbolic");
+        let row = adw::ActionRow::new();
+        row.set_subtitle("connected");
+        let dot = label("●", &["mcp-dot", "mcp-ok"]);
+        show_reconnecting(&button, &row, &dot);
+        assert!(!button.is_sensitive());
+        assert!(button
+            .child()
+            .and_downcast::<gtk4::Spinner>()
+            .is_some_and(|s| s.is_spinning()));
+        assert!(!dot.has_css_class("mcp-ok"));
+        assert!(dot.has_css_class("mcp-pending") && dot.has_css_class("mcp-reconnecting"));
+        assert_eq!(row.subtitle().as_deref(), Some("reconnecting…"));
+    }
+
+    /// Escape in the model picker's search field closes the picker: a `SearchEntry` keeps the key
+    /// for its own `stop-search`, so the dialog never saw it.
+    pub(crate) fn escape_in_the_pickers_search_closes_it(ctx: &PanelCtx) {
+        fn find<T: IsA<gtk4::Widget>>(widget: &gtk4::Widget) -> Option<T> {
+            if let Some(found) = widget.downcast_ref::<T>() {
+                return Some(found.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                if let Some(found) = find::<T>(&w) {
+                    return Some(found);
+                }
+                child = w.next_sibling();
+            }
+            None
+        }
+        model_picker(ctx);
+        let root = ctx.parent.root().expect("the view is in a window");
+        let picker = find::<adw::Dialog>(root.upcast_ref()).expect("the picker is presented");
+        let closed = Rc::new(Cell::new(false));
+        picker.connect_closed({
+            let closed = closed.clone();
+            move |_| closed.set(true)
+        });
+        let search = find::<gtk4::SearchEntry>(picker.upcast_ref()).expect("a search field");
+        // What GTK's Escape binding on a search entry does.
+        search.emit_by_name::<()>("stop-search", &[]);
+        assert!(
+            crate::testutil::pump_until(&glib::MainContext::default(), 5, || closed.get()),
+            "Escape in the search field closes the picker"
+        );
     }
 }
