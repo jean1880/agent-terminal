@@ -1025,6 +1025,7 @@ impl Inner {
             status.driver,
             model.as_deref(),
             status.pending_model.as_deref(),
+            status.effort.as_deref(),
         );
         // A new thread's empty transcript lights its agent's dot; a switch moves the light.
         self.transcript.set_agent(status.driver);
@@ -2401,13 +2402,19 @@ pub(crate) mod tests {
             let mut status = backend.status.borrow_mut();
             status.model = Some("opus".into());
             status.pending_model = None;
+            status.effort = Some("high".into());
         }
         view.sink()(&Envelope::new(Event::ModelChanged {
             model: "opus".into(),
         }));
-        assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+        assert_eq!(
+            tooltip(),
+            "Claude · opus · high · Switch model or agent (/model)",
+            "the chip names the effort, which has no other place to show"
+        );
         assert!(!chip.has_css_class("pending"), "a settled switch rests");
 
+        backend.status.borrow_mut().effort = None;
         backend.status.borrow_mut().pending_model = Some("unavailable".into());
         view.sink()(&Envelope::new(Event::ModelChangeRequested {
             model: "unavailable".into(),
