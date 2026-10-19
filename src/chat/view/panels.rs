@@ -321,14 +321,25 @@ fn model_list(
                 row.add_suffix(&tag);
             }
             // The effort shown on the row; `touched` once the user has picked one here.
-            let effort: Rc<RefCell<Option<String>>> =
-                Rc::new(RefCell::new(initial_effort(m, &status)));
+            let initial = initial_effort(m, &status);
+            let effort: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(initial.clone()));
             let touched = Rc::new(Cell::new(false));
+            // A changed effort is staged, and says so: Apply commits it, as choosing the row
+            // does. Without it, a new effort on the current model is lost to Escape unseen.
+            let apply = gtk4::Button::with_label("Apply");
+            apply.add_css_class("suggested-action");
+            apply.add_css_class("effort-apply");
+            apply.set_valign(gtk4::Align::Center);
+            apply.set_visible(false);
+            let current = is_current(m, &status);
             if !m.efforts.is_empty() {
                 let efforts: Vec<&str> = m.efforts.iter().map(String::as_str).collect();
                 let dropdown = gtk4::DropDown::from_strings(&efforts);
                 dropdown.set_valign(gtk4::Align::Center);
-                dropdown.set_tooltip_text(Some("Effort; applied when you choose this model"));
+                dropdown.set_tooltip_text(Some(
+                    "Effort. It takes effect when you choose this model (or press Apply)",
+                ));
+                dropdown.update_property(&[gtk4::accessible::Property::Label("Effort")]);
                 let at = effort
                     .borrow()
                     .as_deref()
@@ -338,28 +349,43 @@ fn model_list(
                 // hand the thread to it before the user activates the row.
                 dropdown.connect_selected_notify({
                     let (m, effort, touched) = (m.clone(), effort.clone(), touched.clone());
+                    let apply = apply.downgrade();
+                    let initial = initial.clone();
                     move |dd| {
                         let chosen = m.efforts.get(dd.selected() as usize).cloned();
                         if *effort.borrow() == chosen {
                             return;
                         }
+                        // On the current model, its own effort again is nothing to apply.
+                        let offer = !current || chosen != initial;
                         *effort.borrow_mut() = chosen;
                         touched.set(true);
+                        if let Some(apply) = apply.upgrade() {
+                            apply.set_visible(offer);
+                        }
                     }
                 });
                 row.add_suffix(&dropdown);
+                row.add_suffix(&apply);
             }
-            if is_current(m, &status) {
+            if current {
                 row.add_css_class("current-model");
                 let check = gtk4::Image::from_icon_name("at-object-select-symbolic");
                 check.add_css_class("accent");
                 row.add_suffix(&check);
             }
-            let (pick, m, status) = (pick.clone(), m.clone(), status.clone());
-            row.connect_activated(move |_| {
-                let (id, e) = choice(&m, effort.borrow().as_deref(), touched.get(), &status);
-                pick(m.driver, id, e);
+            let commit: Rc<dyn Fn()> = {
+                let (pick, m, status) = (pick.clone(), m.clone(), status.clone());
+                Rc::new(move || {
+                    let (id, e) = choice(&m, effort.borrow().as_deref(), touched.get(), &status);
+                    pick(m.driver, id, e);
+                })
+            };
+            apply.connect_clicked({
+                let commit = commit.clone();
+                move |_| commit()
             });
+            row.connect_activated(move |_| commit());
             list.append(&row);
         }
         column.append(&list);
@@ -496,6 +522,17 @@ pub fn model_picker(ctx: &PanelCtx) {
     search.set_margin_end(18);
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     outer.append(&search);
+    // How a choice is made: nothing in a list of rows says a click commits.
+    let hint = label(
+        "Click a model to switch to it. Set its effort first; a model of the other agent \
+         continues this thread there from a summary.",
+        &["dim-label", "model-picker-hint"],
+    );
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    hint.set_margin_start(18);
+    hint.set_margin_end(18);
+    outer.append(&hint);
     // The stack moves from the toast overlay into `outer`, under the search entry.
     if let Some(overlay) = toasts(&stack) {
         overlay.set_child(None::<&gtk4::Widget>);
@@ -1115,19 +1152,68 @@ pub(crate) mod tests {
         }
         let row = find::<adw::ActionRow>(&list).expect("model row");
         let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        fn find_apply(widget: &gtk4::Widget) -> Option<gtk4::Button> {
+            if widget.has_css_class("effort-apply") {
+                return widget.clone().downcast().ok();
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                if let Some(found) = find_apply(&w) {
+                    return Some(found);
+                }
+                child = w.next_sibling();
+            }
+            None
+        }
+        let apply = find_apply(row.upcast_ref()).expect("apply button");
+        assert!(!apply.is_visible(), "nothing staged, nothing to apply");
         dropdown.set_selected(1);
         assert!(
             picks.borrow().is_empty(),
             "browsing effort does not select another provider"
         );
+        assert!(apply.is_visible(), "a staged effort offers Apply");
+        let want = (
+            Driver::Codex,
+            "codex-other".to_owned(),
+            Some("high".to_owned()),
+        );
         row.emit_by_name::<()>("activated", &[]);
+        assert_eq!(*picks.borrow(), std::slice::from_ref(&want));
+        apply.emit_clicked();
         assert_eq!(
             *picks.borrow(),
-            [(
-                Driver::Codex,
-                "codex-other".to_owned(),
-                Some("high".to_owned())
-            )]
+            [want.clone(), want],
+            "Apply commits as the row does"
+        );
+
+        // On the current model, Apply shows only while the effort differs from its own.
+        let picks = Rc::new(RefCell::new(Vec::new()));
+        let picked = picks.clone();
+        let pick: Pick =
+            Rc::new(move |driver, model, effort| picked.borrow_mut().push((driver, model, effort)));
+        let models = [model(Driver::Claude, "opus", &["low", "high"])];
+        let mut on_opus = status(Driver::Claude, Some("opus"));
+        on_opus.effort = Some("low".to_owned());
+        let list = model_list(&models, "", &on_opus, &pick);
+        let row = find::<adw::ActionRow>(&list).expect("model row");
+        let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
+        let apply = find_apply(row.upcast_ref()).expect("apply button");
+        dropdown.set_selected(1);
+        assert!(
+            apply.is_visible(),
+            "a new effort for the current model offers Apply"
+        );
+        dropdown.set_selected(0);
+        assert!(
+            !apply.is_visible(),
+            "its own effort again has nothing to apply"
+        );
+        dropdown.set_selected(1);
+        apply.emit_clicked();
+        assert_eq!(
+            *picks.borrow(),
+            [(Driver::Claude, "opus".to_owned(), Some("high".to_owned()))]
         );
     }
 

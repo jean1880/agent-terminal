@@ -201,6 +201,14 @@ fn fit_height(bin: &adw::BreakpointBin, root: &gtk4::Box) {
     }
 }
 
+/// The effort the chip adds after the model, if any: not when the model's id already ends with
+/// it (agy composes `<base>-<effort>`), nor when there is none.
+fn chip_effort<'a>(model_text: &str, effort: Option<&'a str>) -> Option<&'a str> {
+    let effort = effort.filter(|e| !e.is_empty())?;
+    let base = model_text.trim_end_matches(" (pending)");
+    (!base.ends_with(&format!("-{effort}"))).then_some(effort)
+}
+
 fn set_mode_names(mode: &gtk4::DropDown, guard: &Cell<bool>, names: &[&str]) {
     let selected = mode.selected();
     guard.set(true);
@@ -469,7 +477,13 @@ impl Header {
         self.fit_height();
     }
 
-    pub fn set_agent(&self, driver: Driver, model: Option<&str>, pending: Option<&str>) {
+    pub fn set_agent(
+        &self,
+        driver: Driver,
+        model: Option<&str>,
+        pending: Option<&str>,
+        effort: Option<&str>,
+    ) {
         if let Some(prev) = self.last_driver.get() {
             self.chip.remove_css_class(accent_class(prev));
         }
@@ -478,7 +492,7 @@ impl Header {
         self.brand
             .set_from_gicon(&crate::icons::driver_icon(driver));
         self.agent.set_text(driver_name(driver));
-        let model_text = match pending {
+        let mut model_text = match pending {
             Some(target) => match model {
                 Some(previous) => format!("{previous} → {target} (pending)"),
                 None => format!("{target} (pending)"),
@@ -489,6 +503,10 @@ impl Header {
                     .unwrap_or_else(|| "default model".to_owned()),
             },
         };
+        if let Some(effort) = chip_effort(&model_text, effort) {
+            model_text.push_str(" · ");
+            model_text.push_str(effort);
+        }
         self.model.set_text(&model_text);
         // The class starts the chip's pulse; adding it again while pending does not restart it.
         if pending.is_some() {
@@ -720,6 +738,23 @@ mod tests {
         assert_eq!(SHORT_NAMES.len(), MODES.len());
         // The divider sets the dangerous mode apart from the others: it must stay last.
         assert_eq!(MODES.last(), Some(&Mode::Bypass));
+    }
+
+    #[test]
+    fn the_chip_names_an_effort_once() {
+        assert_eq!(chip_effort("opus", Some("high")), Some("high"));
+        assert_eq!(
+            chip_effort("opus → sonnet (pending)", Some("low")),
+            Some("low")
+        );
+        // agy's id already carries it.
+        assert_eq!(chip_effort("gemini-3-pro-high", Some("high")), None);
+        assert_eq!(
+            chip_effort("gemini-3-pro-high (pending)", Some("high")),
+            None
+        );
+        assert_eq!(chip_effort("opus", None), None);
+        assert_eq!(chip_effort("opus", Some("")), None);
     }
 
     #[test]

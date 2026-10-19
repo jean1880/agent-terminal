@@ -160,6 +160,16 @@ levelbar.context-level block.empty { background-color: transparent; }
     border-radius: 18px 18px 6px 18px;
     border: 1px solid alpha(@at_accent, 0.25);
 }
+/* the prompt a busy switch sent for the user: a marker, not their bubble */
+.user-row.switch-continuation { margin-left: 0; }
+.continuation-marker {
+    color: @at_fg_dim;
+    font-size: 0.92em;
+    font-style: italic;
+    padding: 4px 12px;
+    border-radius: 999px;
+    border: 1px dashed alpha(@at_accent, 0.35);
+}
 .user-row.queued .user-bubble {
     background-image: linear-gradient(135deg, alpha(@at_surface_strong, 0.6), alpha(@at_surface, 0.8));
     color: @at_fg_dim;

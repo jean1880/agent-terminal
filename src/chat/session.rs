@@ -3792,12 +3792,7 @@ impl Inner {
         if self.adapter.borrow().driver() != driver || !self.state.borrow().alive {
             return;
         }
-        self.send_prompt_now(
-            "Continue the unfinished task after the model switch. Review the existing context \
-             and current workspace state, then proceed from where the interrupted turn left \
-             off. Do not repeat completed actions. Any unanswered approval or question was \
-             cancelled by the switch; ask again if it is still needed.",
-        );
+        self.send_prompt_now(super::SWITCH_CONTINUATION);
     }
 
     fn create_with_handoff(

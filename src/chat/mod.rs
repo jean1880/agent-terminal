@@ -17,6 +17,13 @@ pub mod session;
 pub mod view;
 pub mod workspace_files;
 
+/// The prompt a confirmed busy switch sends for the user. Stored as a user message (it is part
+/// of the conversation), but the view shows it as a marker, never as words the user wrote.
+pub const SWITCH_CONTINUATION: &str = "Continue the unfinished task after the model switch. \
+    Review the existing context and current workspace state, then proceed from where the \
+    interrupted turn left off. Do not repeat completed actions. Any unanswered approval or \
+    question was cancelled by the switch; ask again if it is still needed.";
+
 /// What the view can ask of a thread. Results come back as envelopes through the sink given
 /// to the backend at construction (including `ControlResult` for `control`).
 pub trait ChatBackend {

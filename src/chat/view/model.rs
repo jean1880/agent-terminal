@@ -674,13 +674,16 @@ impl Transcript {
         self.items.keys().cloned().collect()
     }
 
-    /// User prompts in display order, for the composer's per-thread recall history.
+    /// User prompts in display order, for the composer's per-thread recall history. The prompt a
+    /// busy switch sent for the user is not theirs, so it is left out.
     pub fn user_messages(&self) -> Vec<String> {
         self.order
             .iter()
             .filter_map(|id| self.items.get(id))
             .filter_map(|item| match &item.body {
-                Body::User { text, .. } if !text.is_empty() => Some(text.clone()),
+                Body::User { text, .. } if !text.is_empty() && !is_switch_continuation(text) => {
+                    Some(text.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -2202,6 +2205,11 @@ fn rate_limit_notice(resets_at: Option<&str>, now: i64) -> String {
 }
 
 /// Compact token count for the gauge and the compaction divider: `950`, `21k`, `1.2M`.
+/// Whether a user message is the prompt a busy switch sent for the user.
+pub fn is_switch_continuation(text: &str) -> bool {
+    text == crate::chat::SWITCH_CONTINUATION
+}
+
 pub fn format_tokens(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -2246,6 +2254,41 @@ mod tests {
         assert_eq!(t.gauge, before);
         assert!(!changes.contains(&Change::Gauge));
         assert_eq!(t.last_model.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn the_prompt_a_switch_sent_is_not_recalled_as_the_users() {
+        let mut t = Transcript::new();
+        for (id, text) in [
+            ("u1", "fix the build"),
+            ("u2", crate::chat::SWITCH_CONTINUATION),
+        ] {
+            t.apply(
+                &ev(Event::ItemStarted {
+                    kind: ItemKind::UserMessage,
+                    title: String::new(),
+                    input: None,
+                    parent: None,
+                })
+                .item(id),
+                Driver::Claude,
+            );
+            t.apply(
+                &ev(Event::ContentSnapshot {
+                    stream: StreamKind::Assistant,
+                    text: agent_core::redact::redact(text),
+                })
+                .item(id),
+                Driver::Claude,
+            );
+        }
+        assert_eq!(t.user_messages(), ["fix the build"]);
+        assert!(
+            is_switch_continuation(&agent_core::redact::redact(
+                crate::chat::SWITCH_CONTINUATION
+            )),
+            "redaction leaves the marker's text as sent"
+        );
     }
 
     #[test]

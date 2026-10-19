@@ -621,7 +621,40 @@ impl Row {
     pub fn update(&self, item: &Item) {
         match (self, &item.body) {
             (Self::User { root, text: l }, Body::User { text, queued }) => {
-                l.set_text(text);
+                // The prompt a busy switch sent for the user is a marker, not their bubble; the
+                // tooltip keeps what the agent was told.
+                let continuation = super::model::is_switch_continuation(text);
+                l.set_text(if continuation {
+                    CONTINUATION_MARKER
+                } else {
+                    text
+                });
+                l.set_tooltip_text(
+                    continuation
+                        .then_some(SENT_FOR_YOU)
+                        .map(|why| format!("{why}\n\n{}", crate::chat::SWITCH_CONTINUATION))
+                        .as_deref(),
+                );
+                for (widget, class) in [
+                    (root.upcast_ref::<gtk4::Widget>(), "switch-continuation"),
+                    (l.upcast_ref(), "continuation-marker"),
+                ] {
+                    if continuation {
+                        widget.add_css_class(class);
+                    } else {
+                        widget.remove_css_class(class);
+                    }
+                }
+                if continuation {
+                    l.remove_css_class("user-bubble");
+                } else {
+                    l.add_css_class("user-bubble");
+                }
+                root.set_halign(if continuation {
+                    gtk4::Align::Center
+                } else {
+                    gtk4::Align::End
+                });
                 if *queued {
                     root.add_css_class("queued");
                 } else {
@@ -715,6 +748,10 @@ pub fn compaction_text(manual: bool, before: u64, after: Option<u64>) -> String 
 
 /// The divider's text. Back on an agent the thread used before, it says the session is new (from
 /// a summary): the earlier session is not resumed, and "Continued in" read as if it were.
+/// What the transcript shows in place of [`crate::chat::SWITCH_CONTINUATION`].
+pub const CONTINUATION_MARKER: &str = "↻ Continuing the interrupted task after the switch";
+const SENT_FOR_YOU: &str = "Sent for you after the switch. The agent was told:";
+
 pub fn switch_text(
     driver: Driver,
     model: Option<&str>,
