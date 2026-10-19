@@ -10,10 +10,9 @@ use std::time::Instant;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use super::model::Activity;
+use agent_core::adapter::Driver;
 
-/// The agent accents the dots are drawn in, as in the app icon.
-const DOTS: [&str; 3] = ["claude", "agy", "codex"];
+use super::model::Activity;
 
 struct StripInner {
     revealer: gtk4::Revealer,
@@ -44,6 +43,8 @@ impl Drop for StripInner {
 pub struct ThinkingStrip {
     pub revealer: gtk4::Revealer,
     row: gtk4::Box,
+    /// The icon's dots, the agent at work lit and leading the wave (`brand::set_lead`).
+    dots: gtk4::Box,
     inner: Rc<StripInner>,
 }
 
@@ -51,15 +52,12 @@ impl ThinkingStrip {
     pub fn new() -> Self {
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
         row.add_css_class("thinking-strip");
-        let dots = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
-        dots.set_valign(gtk4::Align::Center);
+        let dots = crate::brand::dots();
         dots.add_css_class("thinking-dots");
-        for agent in DOTS {
-            let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            dot.add_css_class("thinking-dot");
-            dot.add_css_class(&format!("dot-{agent}"));
-            dot.set_valign(gtk4::Align::Center);
-            dots.append(&dot);
+        let mut dot = dots.first_child();
+        while let Some(d) = dot {
+            d.add_css_class("thinking-dot");
+            dot = d.next_sibling();
         }
         row.append(&dots);
         let label = gtk4::Label::new(None);
@@ -88,6 +86,7 @@ impl ThinkingStrip {
         Self {
             revealer,
             row,
+            dots,
             inner,
         }
     }
@@ -98,8 +97,10 @@ impl ThinkingStrip {
     }
 
     /// Follows the thread: shown while its turn runs or background work it waits on does,
-    /// hidden once it settles. `agent`: the name of the agent at work.
-    pub fn set(&self, activity: &Activity, agent: &str) {
+    /// hidden once it settles. `driver`: the agent at work, whose dot leads.
+    pub fn set(&self, activity: &Activity, driver: Driver) {
+        let agent = super::cards::driver_name(driver);
+        crate::brand::set_lead(&self.dots, Some(driver));
         *self.inner.current_activity.borrow_mut() = activity.clone();
         *self.inner.current_agent.borrow_mut() = agent.to_owned();
 
@@ -151,6 +152,24 @@ impl ThinkingStrip {
         self.revealer
             .reveals_child()
             .then(|| self.inner.label.text().to_string())
+    }
+
+    /// Each dot's classes beyond its colour: `lead`, `dimmed` or none (tests).
+    #[cfg(test)]
+    pub fn dot_states(&self) -> Vec<&'static str> {
+        let mut states = Vec::new();
+        let mut dot = self.dots.first_child();
+        while let Some(d) = dot {
+            states.push(if d.has_css_class("lead") {
+                "lead"
+            } else if d.has_css_class("dimmed") {
+                "dimmed"
+            } else {
+                ""
+            });
+            dot = d.next_sibling();
+        }
+        states
     }
 }
 

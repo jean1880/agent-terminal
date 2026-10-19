@@ -997,8 +997,7 @@ impl Inner {
             agent_core::caps::Feature::InterruptKeepsProcess,
             cards::driver_name(status.driver),
         );
-        self.thinking
-            .set(&activity, cards::driver_name(status.driver));
+        self.thinking.set(&activity, status.driver);
         self.refresh_background();
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
@@ -1027,6 +1026,8 @@ impl Inner {
             model.as_deref(),
             status.pending_model.as_deref(),
         );
+        // A new thread's empty transcript lights its agent's dot; a switch moves the light.
+        self.transcript.set_agent(status.driver);
         // The composer's hint names the agent too: it must follow a switch, which arrives as
         // events and never goes through `refresh_status` (that only runs on running changes).
         self.composer.refresh_placeholder();
@@ -2297,14 +2298,27 @@ pub(crate) mod tests {
         let backend = Rc::new(SwitchableBackend {
             status: RefCell::new(status_of(Driver::Claude)),
         });
-        let view = ChatView::new(backend);
+        let view = ChatView::new(backend.clone());
         let inner = view.inner().expect("a built view");
         assert_eq!(inner.thinking.shown(), None, "a new thread shows nothing");
+        // The empty transcript's dots light the thread's agent, and follow a switch.
+        assert_eq!(inner.transcript.empty_lead().as_deref(), Some("claude"));
+        backend.switch(Driver::Codex, None, None);
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "gpt-5-codex".into(),
+        }));
+        assert_eq!(inner.transcript.empty_lead().as_deref(), Some("codex"));
+        backend.switch(Driver::Claude, None, None);
+        view.sink()(&Envelope::new(Event::ModelChanged {
+            model: "opus".into(),
+        }));
         view.apply(&Envelope::new(Event::TurnStarted { model: None }));
         assert_eq!(
             inner.thinking.shown().as_deref(),
             Some("Claude is working…")
         );
+        // The agent at work leads the wave; the other two keep it company, dimmed.
+        assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "dimmed"]);
         view.apply(&Envelope::new(Event::TurnCompleted {
             state: TurnState::Completed,
             usage: None,
