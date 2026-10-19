@@ -13,6 +13,33 @@
     color: @at_fg;
 }
 
+/* ---------------------------------------------------------------- motion */
+/* Hover and state changes ease rather than snap: colour and opacity only, never size or spacing,
+   so nothing relays out mid-transition (the transcript's stick-to-bottom reads the layout). GTK
+   drops every CSS transition and animation when the desktop turns animations off. */
+.chat-view button,
+.chat-view .tool-card,
+.chat-view .approval-card,
+.chat-view .question-card,
+.chat-view .form-card,
+.chat-view .composer,
+.chat-view textview.composer-view,
+.chat-panel button,
+.chat-panel list.boxed-list row {
+    transition-property: background-color, border-color, color, opacity, box-shadow;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+}
+/* Something still settling (a reconnect, a switch waiting for its turn). */
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.35; }
+    100% { opacity: 1; }
+}
+/* A pending switch can wait a whole turn: it pulses a few times to be noticed, then rests. */
+.agent-chip.pending .chip-model,
+.pending-mode { animation: pulse 1400ms ease-in-out 3; }
+
 /* ---------------------------------------------------------------- header strip */
 
 .chat-header {
@@ -615,12 +642,7 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel .mcp-off { color: @at_fg_faint; }
 .chat-panel .mcp-bad { color: @at_danger; }
 /* A reconnect in flight (panels.rs `show_reconnecting`): the dot pulses until the list reloads. */
-@keyframes mcp-pulse {
-    0% { opacity: 1; }
-    50% { opacity: 0.25; }
-    100% { opacity: 1; }
-}
-.chat-panel .mcp-reconnecting { animation: mcp-pulse 900ms ease-in-out infinite; }
+.chat-panel .mcp-reconnecting { animation: pulse 900ms ease-in-out infinite; }
 .chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: @at_fg_strong; font-family: monospace; }
 .chat-panel .json-row .subtitle { font-family: monospace; }
 

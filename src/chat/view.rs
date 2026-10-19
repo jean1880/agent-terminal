@@ -1709,6 +1709,32 @@ pub(crate) mod tests {
         window.close();
     }
 
+    /// Transitions ease colour and opacity only: a transitioned size or spacing would relayout the
+    /// transcript every frame and fight its stick-to-bottom. Every animation names a keyframes
+    /// block that exists.
+    #[test]
+    fn motion_never_animates_layout() {
+        let mut eased = 0;
+        for (at, _) in STYLE.match_indices("transition-property:") {
+            eased += 1;
+            let list = &STYLE[at..STYLE[at..].find(';').map_or(STYLE.len(), |end| at + end)];
+            for layout in ["height", "width", "margin", "padding", "all"] {
+                assert!(!list.contains(layout), "a transition on layout: {list}");
+            }
+        }
+        assert!(eased > 0, "hover and state changes ease");
+        for (at, _) in STYLE.match_indices("animation: ") {
+            let name: String = STYLE[at + "animation: ".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            assert!(
+                STYLE.contains(&format!("@keyframes {name} ")),
+                "no @keyframes {name}"
+            );
+        }
+    }
+
     /// Every custom-drawn button class has a keyboard focus ring in the stylesheet.
     #[test]
     fn custom_buttons_have_a_focus_ring() {
@@ -2284,6 +2310,7 @@ pub(crate) mod tests {
             tooltip(),
             "Claude · sonnet → opus (pending) · Switch model or agent (/model)"
         );
+        assert!(chip.has_css_class("pending"), "a pending switch pulses");
         {
             let mut status = backend.status.borrow_mut();
             status.model = Some("opus".into());
@@ -2293,6 +2320,7 @@ pub(crate) mod tests {
             model: "opus".into(),
         }));
         assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+        assert!(!chip.has_css_class("pending"), "a settled switch rests");
 
         backend.status.borrow_mut().pending_model = Some("unavailable".into());
         view.sink()(&Envelope::new(Event::ModelChangeRequested {
