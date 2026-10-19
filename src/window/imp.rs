@@ -4980,6 +4980,14 @@ impl AgentTerminalWindow {
             list,
             move |_| list.invalidate_filter()
         ));
+        // A search entry keeps Escape for itself (`stop-search`); in a dialog it means close.
+        search.connect_stop_search(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+            }
+        ));
         // Enter resumes the top match, so type-then-Enter works without a mouse.
         search.connect_activate(glib::clone!(
             #[weak]

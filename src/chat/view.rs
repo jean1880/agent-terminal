@@ -2761,6 +2761,26 @@ pub(crate) mod tests {
         assert!(landed(after), "the view moved off s60: {after:?}");
     }
 
+    /// The model picker in a real window (a libadwaita one, so the dialog sits in its host).
+    fn escape_closes_the_model_picker() {
+        let backend = Rc::new(SwitchableBackend {
+            status: RefCell::new(status_of(Driver::Claude)),
+        });
+        let view = ChatView::new(backend);
+        let window = adw::Window::new();
+        window.set_default_size(560, 700);
+        adw::prelude::AdwWindowExt::set_content(&window, Some(&view));
+        window.present();
+        let context = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&context, 5, || view.is_mapped()));
+        let ctx = view
+            .inner()
+            .and_then(|i| i.panel_ctx())
+            .expect("a built view");
+        panels::tests::escape_in_the_pickers_search_closes_it(&ctx);
+        window.destroy();
+    }
+
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
         all_subagent_cards_toggle_together();
@@ -2772,6 +2792,8 @@ pub(crate) mod tests {
         thinking_strip_follows_the_turn();
         composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
         panels::tests::changing_effort_does_not_switch_until_row_activation();
+        panels::tests::a_reconnect_in_flight_shows_on_its_row();
+        escape_closes_the_model_picker();
         usage::tests::compact_scope_does_not_filter_provider_comparison();
         cards::tests::file_changes_and_permission_details_have_distinct_actions();
         form_card::tests::form_and_link_cards();

@@ -614,6 +614,13 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel .mcp-pending { color: @at_warning; }
 .chat-panel .mcp-off { color: @at_fg_faint; }
 .chat-panel .mcp-bad { color: @at_danger; }
+/* A reconnect in flight (panels.rs `show_reconnecting`): the dot pulses until the list reloads. */
+@keyframes mcp-pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.25; }
+    100% { opacity: 1; }
+}
+.chat-panel .mcp-reconnecting { animation: mcp-pulse 900ms ease-in-out infinite; }
 .chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: @at_fg_strong; font-family: monospace; }
 .chat-panel .json-row .subtitle { font-family: monospace; }
 
