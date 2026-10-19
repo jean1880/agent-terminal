@@ -1743,6 +1743,12 @@ fn cached_agy_hook_target(
     ))
 }
 
+/// Whether a switch to agy in `cwd` would get its approval hook now, from the cached proof the
+/// switch itself uses. Only for saying so beforehand: no check runs and nothing is bound.
+fn agy_hook_ready(cwd: &str) -> bool {
+    cached_agy_hook_target(Some(cwd.into())).is_some_and(|t| cached_hook_verdict(&t).is_ok())
+}
+
 /// Resolves the profile off the main thread before a refresh or Settings checks its hook.
 pub(super) async fn agy_hook_target(
     cwd: Option<std::path::PathBuf>,
@@ -4393,6 +4399,8 @@ impl AgentTerminalWindow {
         }
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
+        let dir_for = dir.to_owned();
+        session.set_agy_can_ask(Rc::new(move || agy_hook_ready(&dir_for)));
         *slot.session.borrow_mut() = Some(session.clone());
         if let Some(supervisor) = crate::delegation::supervisor() {
             supervisor.attach_root_session(thread, Rc::downgrade(&session));

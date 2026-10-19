@@ -248,6 +248,9 @@ struct Inner {
     /// The agy start waiting on that proof, if any.
     starting: RefCell<Option<PendingStart>>,
     factory: RefCell<Option<AdapterFactory>>,
+    /// Whether a switch to agy now would get its approval hook (the window's cached proof). Only
+    /// says so before the switch; the launch itself proves the hook as always.
+    agy_can_ask: RefCell<Option<Rc<dyn Fn() -> bool>>>,
     launch_env: RefCell<LaunchEnv>,
     proc: RefCell<Option<AgentProcess>>,
     state: RefCell<State>,
@@ -701,6 +704,7 @@ impl ChatSession {
             hook_check: RefCell::new(default_hook_check()),
             starting: RefCell::new(None),
             factory: RefCell::new(None),
+            agy_can_ask: RefCell::new(None),
             launch_env: RefCell::new(env),
             proc: RefCell::new(None),
             state: RefCell::new(state),
@@ -779,6 +783,12 @@ impl ChatSession {
     /// Lets `switch` build an adapter for the other driver (needed for `CreateWithHandoff`).
     pub fn set_adapter_factory(&self, factory: AdapterFactory) {
         *self.inner.factory.borrow_mut() = Some(factory);
+    }
+
+    /// Lets the picker say, before a switch to agy, whether it could ask first
+    /// ([`ChatBackend::switch_caveats`]). Without it, agy is assumed unable to.
+    pub fn set_agy_can_ask(&self, can_ask: Rc<dyn Fn() -> bool>) {
+        *self.inner.agy_can_ask.borrow_mut() = Some(can_ask);
     }
 
     /// The current launch environment, including any cross-agent switch since the thread opened.
@@ -3602,6 +3612,33 @@ impl Inner {
 
     // ---- switching ----
 
+    /// What a switch to `to` would cost, said before it happens: nothing for the same agent.
+    fn switch_caveats(&self, to: Driver) -> Vec<String> {
+        if to == self.adapter.borrow().driver() {
+            return Vec::new();
+        }
+        let mut out = vec![format!(
+            "Continues this thread in {} from a summary of it: reasoning and tool state stay \
+             behind.",
+            driver_label(to)
+        )];
+        let rules = self.session_rules.borrow().rules.len();
+        if rules > 0 {
+            out.push(session_rules_end(rules));
+        }
+        if self.wanted_mode.get() == Mode::Bypass {
+            out.push("Dangerous permissive mode ends.".to_owned());
+        }
+        let can_ask = self.agy_can_ask.borrow().as_ref().is_some_and(|f| f());
+        if to == Driver::Agy && !can_ask {
+            out.push(format!(
+                "Antigravity cannot ask you before acting here: its approval hook is not ready. \
+                 {HOOKLESS_STILL}"
+            ));
+        }
+        out
+    }
+
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
         let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();
@@ -4836,6 +4873,14 @@ fn session_rules_ended(n: usize) -> String {
     format!("Session approvals ({n}) ended.")
 }
 
+/// [`session_rules_ended`], said before the switch.
+fn session_rules_end(n: usize) -> String {
+    match n {
+        1 => "Your session approval ends.".to_owned(),
+        n => format!("Your {n} session approvals end."),
+    }
+}
+
 /// What a handoff carried, said plainly: all of the thread, or how much of it (the budget keeps
 /// the first request and the most recent work), and what never travels. `place` reads after
 /// "Continuing": "in Codex", "from “title”".
@@ -4978,6 +5023,10 @@ impl ChatBackend for ChatSession {
 
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
         self.inner.switch(driver, model, effort);
+    }
+
+    fn switch_caveats(&self, to: Driver) -> Vec<String> {
+        self.inner.switch_caveats(to)
     }
 
     fn reload_session(&self) {
@@ -9260,6 +9309,28 @@ mod tests {
                 2,
                 "a same-agent model switch keeps them"
             );
+
+            // Said before the switch, in the picker: nothing for the same agent.
+            assert!(session.switch_caveats(Driver::Claude).is_empty());
+            let said = session.switch_caveats(Driver::Agy);
+            assert!(
+                said[0].starts_with("Continues this thread in Antigravity from a summary"),
+                "{said:?}"
+            );
+            assert!(
+                said.contains(&"Your 2 session approvals end.".to_owned()),
+                "{said:?}"
+            );
+            let cannot_ask = |said: &[String]| {
+                said.iter()
+                    .any(|c| c.starts_with("Antigravity cannot ask you before acting"))
+            };
+            assert!(
+                cannot_ask(&said),
+                "no proof of the hook: say agy cannot ask"
+            );
+            session.set_agy_can_ask(Rc::new(|| true));
+            assert!(!cannot_ask(&session.switch_caveats(Driver::Agy)));
 
             session.switch(Driver::Agy, None, None);
             assert!(has(&seen, |e| matches!(e, Event::Notice { text }
