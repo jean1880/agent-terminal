@@ -65,7 +65,8 @@ const ENTRANCE_MS: u64 = 600;
 fn entrance(this: &Body, before: Option<&Body>) -> Option<&'static str> {
     match (this, before) {
         (Body::Switch { .. }, _) => Some("divider-settle"),
-        (Body::User { .. }, _) | (_, Some(Body::User { .. })) => Some("row-enter"),
+        // A queued message waits for the turn running now: what follows it is not its reply.
+        (Body::User { .. }, _) | (_, Some(Body::User { queued: false, .. })) => Some("row-enter"),
         _ => None,
     }
 }
@@ -1138,5 +1139,15 @@ mod tests {
         assert_eq!(entrance(&reply, Some(&notice)), None);
         assert_eq!(entrance(&notice, Some(&reply)), None);
         assert_eq!(entrance(&reply, None), None);
+        let queued = Body::User {
+            text: "next".into(),
+            queued: true,
+        };
+        assert_eq!(entrance(&queued, Some(&reply)), Some("row-enter"));
+        assert_eq!(
+            entrance(&notice, Some(&queued)),
+            None,
+            "a queued message is not answered by what follows it"
+        );
     }
 }
