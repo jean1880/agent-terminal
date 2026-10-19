@@ -1709,6 +1709,60 @@ pub(crate) mod tests {
         window.close();
     }
 
+    /// Transitions ease colour and opacity only: a transitioned size or spacing would relayout the
+    /// transcript every frame and fight its stick-to-bottom. Every animation names a keyframes
+    /// block that exists.
+    #[test]
+    fn motion_never_animates_layout() {
+        // The value of every `property:` declaration, split into its comma-separated entries.
+        let values = |property: &str| -> Vec<Vec<Vec<String>>> {
+            let key = format!("{property}:");
+            STYLE
+                .match_indices(&key)
+                // `transition:` must not also match inside `-transition:`-style longer names.
+                .filter(|(at, _)| {
+                    !STYLE[..*at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+                })
+                .map(|(at, _)| {
+                    let start = at + key.len();
+                    let end = STYLE[start..].find(';').map_or(STYLE.len(), |e| start + e);
+                    STYLE[start..end]
+                        .split(',')
+                        .map(|entry| entry.split_whitespace().map(str::to_owned).collect())
+                        .collect()
+                })
+                .collect()
+        };
+        let mut eased = 0;
+        for property in ["transition-property", "transition"] {
+            for entries in values(property) {
+                eased += 1;
+                for entry in &entries {
+                    let animated = entry.first().map(String::as_str).unwrap_or("");
+                    assert!(
+                        animated != "all"
+                            && !["height", "width", "margin", "padding"]
+                                .iter()
+                                .any(|layout| animated.contains(layout)),
+                        "{property} on layout: {entry:?}"
+                    );
+                }
+            }
+        }
+        assert!(eased > 0, "hover and state changes ease");
+        for property in ["animation", "animation-name"] {
+            for entries in values(property) {
+                for entry in &entries {
+                    let name = entry.first().map(String::as_str).unwrap_or("");
+                    assert!(
+                        STYLE.contains(&format!("@keyframes {name} ")),
+                        "{property}: no @keyframes {name}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Every custom-drawn button class has a keyboard focus ring in the stylesheet.
     #[test]
     fn custom_buttons_have_a_focus_ring() {
@@ -2284,6 +2338,7 @@ pub(crate) mod tests {
             tooltip(),
             "Claude · sonnet → opus (pending) · Switch model or agent (/model)"
         );
+        assert!(chip.has_css_class("pending"), "a pending switch pulses");
         {
             let mut status = backend.status.borrow_mut();
             status.model = Some("opus".into());
@@ -2293,6 +2348,7 @@ pub(crate) mod tests {
             model: "opus".into(),
         }));
         assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+        assert!(!chip.has_css_class("pending"), "a settled switch rests");
 
         backend.status.borrow_mut().pending_model = Some("unavailable".into());
         view.sink()(&Envelope::new(Event::ModelChangeRequested {

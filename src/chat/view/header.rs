@@ -490,6 +490,12 @@ impl Header {
             },
         };
         self.model.set_text(&model_text);
+        // The class starts the chip's pulse; adding it again while pending does not restart it.
+        if pending.is_some() {
+            self.chip.add_css_class("pending");
+        } else {
+            self.chip.remove_css_class("pending");
+        }
         let name = format!("{} · {}", driver_name(driver), model_text);
         self.chip
             .update_property(&[gtk4::accessible::Property::Label(&name)]);
@@ -535,6 +541,12 @@ impl Header {
         let effective_hint = format!("{} (/mode)", mode_label(effective));
         self.pending_mode.set_text(hint.as_deref().unwrap_or(""));
         self.pending_mode.set_visible(pending.is_some());
+        // The class starts its pulse, so it comes and goes with the hint.
+        if pending.is_some() {
+            self.pending_mode.add_css_class("pending-mode");
+        } else {
+            self.pending_mode.remove_css_class("pending-mode");
+        }
         self.mode
             .set_tooltip_text(hint.as_deref().or(Some(&effective_hint)));
         self.mode
