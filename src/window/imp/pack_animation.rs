@@ -21,6 +21,8 @@ use gtk4::cairo;
 use gtk4::glib;
 use gtk4::prelude::*;
 
+use crate::brand::animations_enabled;
+
 /// One loop, in seconds.
 pub const LOOP_SECS: f64 = 1.8;
 
@@ -451,11 +453,6 @@ pub fn draw_frame(cr: &cairo::Context, width: f64, height: f64, frame: &Frame) {
 /// The natural size: the bubble at 128 px, the icon's own size, where it is crisp.
 const NATURAL_WIDTH: i32 = WIDTH as i32;
 const NATURAL_HEIGHT: i32 = ((BOTTOM - TOP) * NATURAL_WIDTH as f64 / WIDTH) as i32;
-
-/// Whether the desktop wants animations (`gtk-enable-animations`).
-fn animations_enabled() -> bool {
-    gtk4::Settings::default().is_none_or(|s| s.is_gtk_enable_animations())
-}
 
 /// The drawing area that plays the animation while it is mapped, at the display's frame rate.
 pub struct PackAnimation {

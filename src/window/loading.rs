@@ -19,7 +19,7 @@ pub(super) const SKELETON_AFTER_MS: u64 = 2200;
 /// window is ready sooner; the `skip_load_animation` setting drops it.
 pub(super) const SPLASH_MIN_MS: u64 = 2000;
 /// Every loading-to-loaded swap crossfades for this long.
-pub(super) const CROSSFADE_MS: u32 = 220;
+pub(super) const CROSSFADE_MS: u32 = crate::brand::CROSSFADE_MS;
 
 /// The app icon's size on the splash. Its cursor dots are laid over it in its own units.
 const ICON_PX: i32 = 128;
