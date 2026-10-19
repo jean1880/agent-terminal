@@ -87,6 +87,12 @@ pub trait ChatBackend {
     /// For agy the effort is already part of `model` (the composed id); Claude takes it
     /// separately, and a changed effort restarts its process.
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>);
+    /// What switching to `to` would cost, one sentence each, for the picker to say before the
+    /// user chooses (a summary handoff, approvals that end, an agy that cannot ask). Empty for
+    /// the current agent, and for a backend that cannot tell.
+    fn switch_caveats(&self, _to: Driver) -> Vec<String> {
+        Vec::new()
+    }
     /// Restarts the agent process while keeping this thread's provider conversation and settings.
     /// A running turn, if any, is deliberately interrupted first.
     fn reload_session(&self);

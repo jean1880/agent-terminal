@@ -263,17 +263,23 @@ fn choice(
     }
 }
 
-/// `pick(driver, model value, effort)`.
-type Pick = Rc<dyn Fn(Driver, String, Option<String>)>;
+/// `pick(driver, model value, effort, unchanged)`: `unchanged` when the choice is what the
+/// thread already runs (the current model at its own effort), so there is nothing to switch.
+type Pick = Rc<dyn Fn(Driver, String, Option<String>, bool)>;
+
+/// What a switch to an agent would cost ([`crate::chat::ChatBackend::switch_caveats`]).
+type Caveats<'a> = &'a dyn Fn(Driver) -> Vec<String>;
 
 /// The grouped, filtered rows for `query`. Every row has the same UX for both agents: the name
 /// and, when the model offers efforts, an effort dropdown. Effort is staged; activating the
-/// row calls `pick` with that choice.
+/// row calls `pick` with that choice. The other agent's group says first what a switch to it
+/// costs (`caveats`).
 fn model_list(
     models: &[CatalogModel],
     query: &str,
     status: &SessionStatus,
     pick: &Pick,
+    caveats: Caveats,
 ) -> gtk4::Widget {
     let groups = group_for_picker(models, query, Some(status.driver));
     if groups.is_empty() {
@@ -304,6 +310,15 @@ fn model_list(
         heading.append(&brand_image(driver));
         heading.append(&heading_text);
         column.append(&heading);
+        let notes = caveats(driver);
+        if !notes.is_empty() {
+            let note = label(&notes.join(" "), &["dim-label", "switch-caveats"]);
+            note.set_wrap(true);
+            note.set_xalign(0.0);
+            note.set_margin_start(6);
+            note.set_margin_end(6);
+            column.append(&note);
+        }
         let list = boxed_list();
         for m in rows {
             let row = adw::ActionRow::new();
@@ -377,8 +392,9 @@ fn model_list(
             let commit: Rc<dyn Fn()> = {
                 let (pick, m, status) = (pick.clone(), m.clone(), status.clone());
                 Rc::new(move || {
+                    let unchanged = current && *effort.borrow() == initial;
                     let (id, e) = choice(&m, effort.borrow().as_deref(), touched.get(), &status);
-                    pick(m.driver, id, e);
+                    pick(m.driver, id, e, unchanged);
                 })
             };
             apply.connect_clicked({
@@ -449,22 +465,54 @@ fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<g
     Some(footer)
 }
 
-/// Asks before a switch that would stop `from`'s running turn (and any approval or question
-/// waiting in it); `then` runs only on "Switch and Continue". Cancel is the default.
-fn confirm_busy_switch(parent: &adw::Dialog, from: Driver, to: Driver, then: impl Fn() + 'static) {
-    let (from, to) = (from.info().label, to.info().label);
-    let dialog = adw::AlertDialog::new(
-        Some(&format!("Switch to {to} now?")),
-        Some(&format!(
-            "{from} is still working. Switching interrupts this turn and continues the \
-             unfinished task with the selected model. Any approval or question waiting for \
-             your answer is cancelled; the new turn can ask again."
-        )),
+/// The busy-switch dialog's title, body and confirm label. The same agent keeps its own session
+/// (a model or effort change); another agent continues from a summary, and says what else ends.
+fn busy_switch_text(
+    from: Driver,
+    to: Driver,
+    caveats: &[String],
+) -> (String, String, &'static str) {
+    const CANCELLED: &str =
+        "Any approval or question waiting for your answer is cancelled; the new turn can ask again.";
+    let from_name = from.info().label;
+    if from == to {
+        return (
+            "Change Model Now?".to_owned(),
+            format!(
+                "{from_name} is still working. Changing the model or effort interrupts this turn \
+                 and continues the unfinished task with your new choice. {CANCELLED}"
+            ),
+            "Change and Continue",
+        );
+    }
+    let to_name = to.info().label;
+    let mut body = format!(
+        "{from_name} is still working. Switching interrupts this turn and continues the \
+         unfinished task in {to_name}. {CANCELLED}"
     );
-    dialog.add_responses(&[
-        ("cancel", "Keep Waiting"),
-        ("switch", "Switch and Continue"),
-    ]);
+    for caveat in caveats {
+        body.push_str("\n\n");
+        body.push_str(caveat);
+    }
+    (
+        format!("Switch to {to_name} Now?"),
+        body,
+        "Switch and Continue",
+    )
+}
+
+/// Asks before a switch that would stop `from`'s running turn (and any approval or question
+/// waiting in it); `then` runs only on the confirm response. Cancel is the default.
+fn confirm_busy_switch(
+    parent: &adw::Dialog,
+    from: Driver,
+    to: Driver,
+    caveats: &[String],
+    then: impl Fn() + 'static,
+) {
+    let (title, body, confirm) = busy_switch_text(from, to, caveats);
+    let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
+    dialog.add_responses(&[("cancel", "Keep Waiting"), ("switch", confirm)]);
     dialog.set_response_appearance("switch", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
@@ -524,8 +572,8 @@ pub fn model_picker(ctx: &PanelCtx) {
     outer.append(&search);
     // How a choice is made: nothing in a list of rows says a click commits.
     let hint = label(
-        "Click a model to switch to it. Set its effort first; a model of the other agent \
-         continues this thread there from a summary.",
+        "Click a model to switch to it. Set its effort first, or press Apply to change only \
+         the effort.",
         &["dim-label", "model-picker-hint"],
     );
     hint.set_wrap(true);
@@ -553,8 +601,15 @@ pub fn model_picker(ctx: &PanelCtx) {
     let pick: Pick = {
         let backend = ctx.backend.clone();
         let d = d.downgrade();
-        Rc::new(move |driver, id, effort| {
+        Rc::new(move |driver, id, effort, unchanged| {
             let status = backend.status();
+            // The thread already runs this: nothing to switch, and nothing to interrupt.
+            if unchanged {
+                if let Some(d) = d.upgrade() {
+                    d.close();
+                }
+                return;
+            }
             if !status.running_turn {
                 backend.switch(driver, Some(id), effort);
                 if let Some(d) = d.upgrade() {
@@ -564,7 +619,8 @@ pub fn model_picker(ctx: &PanelCtx) {
             }
             // Mid-turn, a switch stops the turn (and any approval or question in it): ask first.
             let Some(picker) = d.upgrade() else { return };
-            confirm_busy_switch(&picker, status.driver, driver, {
+            let caveats = backend.switch_caveats(driver);
+            confirm_busy_switch(&picker, status.driver, driver, &caveats, {
                 let (backend, d) = (backend.clone(), d.clone());
                 move || {
                     backend.switch(driver, Some(id.clone()), effort.clone());
@@ -582,7 +638,14 @@ pub fn model_picker(ctx: &PanelCtx) {
             let (Some(stack), Some(search)) = (stack.upgrade(), search.upgrade()) else {
                 return;
             };
-            let list = model_list(&models.borrow(), &search.text(), &backend.status(), &pick);
+            let caveats = |to| backend.switch_caveats(to);
+            let list = model_list(
+                &models.borrow(),
+                &search.text(),
+                &backend.status(),
+                &pick,
+                &caveats,
+            );
             replace_page(&stack, "models", &scrolled(&padded(&list)));
         })
     };
@@ -1131,10 +1194,18 @@ pub(crate) mod tests {
     pub(crate) fn changing_effort_does_not_switch_until_row_activation() {
         let picks = Rc::new(RefCell::new(Vec::new()));
         let picked = picks.clone();
-        let pick: Pick =
-            Rc::new(move |driver, model, effort| picked.borrow_mut().push((driver, model, effort)));
+        let pick: Pick = Rc::new(move |driver, model, effort, unchanged| {
+            picked.borrow_mut().push((driver, model, effort, unchanged))
+        });
         let models = [model(Driver::Codex, "codex-other", &["low", "high"])];
-        let list = model_list(&models, "", &status(Driver::Claude, Some("opus")), &pick);
+        let caveats = |to: Driver| vec![format!("costs of {}", to.info().label)];
+        let list = model_list(
+            &models,
+            "",
+            &status(Driver::Claude, Some("opus")),
+            &pick,
+            &caveats,
+        );
         fn find<T: IsA<gtk4::Widget> + glib::types::StaticType + Clone>(
             widget: &gtk4::Widget,
         ) -> Option<T> {
@@ -1152,19 +1223,26 @@ pub(crate) mod tests {
         }
         let row = find::<adw::ActionRow>(&list).expect("model row");
         let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
-        fn find_apply(widget: &gtk4::Widget) -> Option<gtk4::Button> {
-            if widget.has_css_class("effort-apply") {
-                return widget.clone().downcast().ok();
+        fn find_class(widget: &gtk4::Widget, class: &str) -> Option<gtk4::Widget> {
+            if widget.has_css_class(class) {
+                return Some(widget.clone());
             }
             let mut child = widget.first_child();
             while let Some(w) = child {
-                if let Some(found) = find_apply(&w) {
+                if let Some(found) = find_class(&w, class) {
                     return Some(found);
                 }
                 child = w.next_sibling();
             }
             None
         }
+        let find_apply = |w: &gtk4::Widget| {
+            find_class(w, "effort-apply").and_then(|b| b.downcast::<gtk4::Button>().ok())
+        };
+        let note = find_class(&list, "switch-caveats")
+            .and_then(|l| l.downcast::<gtk4::Label>().ok())
+            .expect("the other agent's group says what a switch costs");
+        assert_eq!(note.text(), "costs of Codex");
         let apply = find_apply(row.upcast_ref()).expect("apply button");
         assert!(!apply.is_visible(), "nothing staged, nothing to apply");
         dropdown.set_selected(1);
@@ -1177,6 +1255,7 @@ pub(crate) mod tests {
             Driver::Codex,
             "codex-other".to_owned(),
             Some("high".to_owned()),
+            false,
         );
         row.emit_by_name::<()>("activated", &[]);
         assert_eq!(*picks.borrow(), std::slice::from_ref(&want));
@@ -1190,15 +1269,28 @@ pub(crate) mod tests {
         // On the current model, Apply shows only while the effort differs from its own.
         let picks = Rc::new(RefCell::new(Vec::new()));
         let picked = picks.clone();
-        let pick: Pick =
-            Rc::new(move |driver, model, effort| picked.borrow_mut().push((driver, model, effort)));
+        let pick: Pick = Rc::new(move |driver, model, effort, unchanged| {
+            picked.borrow_mut().push((driver, model, effort, unchanged))
+        });
         let models = [model(Driver::Claude, "opus", &["low", "high"])];
         let mut on_opus = status(Driver::Claude, Some("opus"));
         on_opus.effort = Some("low".to_owned());
-        let list = model_list(&models, "", &on_opus, &pick);
+        let no_caveats = |_| Vec::new();
+        let list = model_list(&models, "", &on_opus, &pick, &no_caveats);
+        assert!(
+            find_class(&list, "switch-caveats").is_none(),
+            "the current agent's group has nothing to warn of"
+        );
         let row = find::<adw::ActionRow>(&list).expect("model row");
         let dropdown = find::<gtk4::DropDown>(row.upcast_ref()).expect("effort choice");
         let apply = find_apply(row.upcast_ref()).expect("apply button");
+        row.emit_by_name::<()>("activated", &[]);
+        assert_eq!(
+            picks.borrow().last().map(|p| p.3),
+            Some(true),
+            "the current model at its own effort changes nothing (no interrupt to ask about)"
+        );
+        picks.borrow_mut().clear();
         dropdown.set_selected(1);
         assert!(
             apply.is_visible(),
@@ -1213,8 +1305,32 @@ pub(crate) mod tests {
         apply.emit_clicked();
         assert_eq!(
             *picks.borrow(),
-            [(Driver::Claude, "opus".to_owned(), Some("high".to_owned()))]
+            [(
+                Driver::Claude,
+                "opus".to_owned(),
+                Some("high".to_owned()),
+                false
+            )]
         );
+    }
+
+    #[test]
+    fn the_busy_switch_dialog_names_what_it_changes() {
+        let (title, body, confirm) = busy_switch_text(Driver::Claude, Driver::Claude, &[]);
+        assert_eq!(title, "Change Model Now?");
+        assert_eq!(confirm, "Change and Continue");
+        assert!(body.contains("model or effort"), "{body}");
+        assert!(
+            !body.contains("Switch"),
+            "a model change is not an agent switch: {body}"
+        );
+
+        let caveats = ["Continues this thread in Antigravity from a summary.".to_owned()];
+        let (title, body, confirm) = busy_switch_text(Driver::Claude, Driver::Agy, &caveats);
+        assert_eq!(title, "Switch to Antigravity Now?");
+        assert_eq!(confirm, "Switch and Continue");
+        assert!(body.contains("in Antigravity"), "{body}");
+        assert!(body.ends_with(&caveats[0]), "the costs come last: {body}");
     }
 
     fn status(driver: Driver, model: Option<&str>) -> SessionStatus {

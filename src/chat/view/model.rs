@@ -642,6 +642,9 @@ pub struct Transcript {
     /// Every agent the thread has been on, so a switch back can say it is not a resume.
     seen_drivers: Vec<Driver>,
     last_model: Option<String>,
+    /// An agent-switch divider drawn before the new agent named its model (its switch notices
+    /// come first): the next model it reports goes in it.
+    unnamed_switch: Option<ItemId>,
     /// The assistant/reasoning item that item-less deltas belong to.
     open_text: Option<ItemId>,
     /// What the user allowed Codex for the rest of its session (permission requests answered
@@ -1430,23 +1433,32 @@ impl Transcript {
     /// does not carry it); it colours assistant rows and detects provider switches.
     pub fn apply(&mut self, env: &Envelope, driver: Driver) -> Vec<Change> {
         let mut out = Vec::new();
+        // A switch says what it carried (and what ended) as the new agent, before that agent's
+        // session starts. The divider goes first, so those notices read under it; the session's
+        // start then names the model in it.
+        let entering = self.last_driver.is_some_and(|d| d != driver);
+        if entering && !matches!(env.event, Event::SessionStarted { .. }) {
+            out.extend(self.enter_agent(driver, None));
+            self.unnamed_switch = out.iter().find_map(|c| match c {
+                Change::Added(id) => Some(id.clone()),
+                _ => None,
+            });
+            self.last_model = None;
+        }
         match &env.event {
             Event::SessionStarted { model, .. } => {
                 // A new process knows nothing of what the last one was allowed.
                 self.extra_access.clear();
-                let agent_changed = self.last_driver.is_some_and(|d| d != driver);
-                if agent_changed && self.settle_workers() {
-                    out.push(Change::Workers);
-                    out.push(Change::Running);
-                }
-                let model_changed = model.is_some()
-                    && self.last_model.is_some()
-                    && model.as_deref() != self.last_model.as_deref();
-                if agent_changed || model_changed {
-                    self.gauge = None;
-                    let returned = agent_changed && self.seen_drivers.contains(&driver);
-                    out.extend(self.push_switch(driver, model.clone(), agent_changed, returned));
-                    out.push(Change::Gauge);
+                if entering {
+                    out.extend(self.enter_agent(driver, model.clone()));
+                } else if let Some(m) = model {
+                    if self.unnamed_switch.is_some() {
+                        out.extend(self.name_switch(m));
+                    } else if self.last_model.as_deref().is_some_and(|last| last != m) {
+                        self.gauge = None;
+                        out.extend(self.push_switch(driver, Some(m.clone()), false, false));
+                        out.push(Change::Gauge);
+                    }
                 }
                 self.on_driver(driver);
                 if model.is_some() {
@@ -1502,7 +1514,9 @@ impl Transcript {
                     self.on_driver(driver);
                 }
                 if let Some(m) = model {
-                    if self.last_model.as_deref().is_some_and(|last| last != m) {
+                    if self.unnamed_switch.is_some() {
+                        out.extend(self.name_switch(m));
+                    } else if self.last_model.as_deref().is_some_and(|last| last != m) {
                         out.extend(self.push_switch(driver, Some(m.clone()), false, false));
                     }
                     self.last_model = Some(m.clone());
@@ -1893,7 +1907,10 @@ impl Transcript {
                 out.extend(self.push_notice(text, Tone::Warning));
             }
             Event::ModelChanged { model } => {
-                if self.last_model.as_deref() != Some(model.as_str()) {
+                if self.unnamed_switch.is_some() {
+                    out.extend(self.name_switch(model));
+                    self.last_model = Some(model.clone());
+                } else if self.last_model.as_deref() != Some(model.as_str()) {
                     if self.last_model.is_some() {
                         out.extend(self.push_switch(driver, Some(model.clone()), false, false));
                         self.gauge = None;
@@ -2023,6 +2040,36 @@ impl Transcript {
         self.last_driver = Some(driver);
         if !self.seen_drivers.contains(&driver) {
             self.seen_drivers.push(driver);
+        }
+    }
+
+    /// The thread moved to `driver`: the old agent's workers are done, its gauge means nothing,
+    /// and a divider says where the thread went (and whether it was there before).
+    fn enter_agent(&mut self, driver: Driver, model: Option<String>) -> Vec<Change> {
+        let mut out = Vec::new();
+        if self.settle_workers() {
+            out.push(Change::Workers);
+            out.push(Change::Running);
+        }
+        self.gauge = None;
+        let returned = self.seen_drivers.contains(&driver);
+        out.extend(self.push_switch(driver, model, true, returned));
+        out.push(Change::Gauge);
+        self.on_driver(driver);
+        out
+    }
+
+    /// Puts the model the new agent reported into the divider drawn before it named one.
+    fn name_switch(&mut self, reported: &str) -> Vec<Change> {
+        let Some(id) = self.unnamed_switch.take() else {
+            return Vec::new();
+        };
+        match self.items.get_mut(&id).map(|i| &mut i.body) {
+            Some(Body::Switch { model, .. }) => {
+                *model = Some(reported.to_owned());
+                vec![Change::Updated(id)]
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -4008,6 +4055,79 @@ mod tests {
             flat.apply(env, Driver::Agy);
         }
         assert_ne!(credits(&flat), credits(&live));
+    }
+
+    #[test]
+    fn a_switchs_notices_read_under_its_divider_which_then_names_the_model() {
+        let start = |m: &str| {
+            ev(Event::SessionStarted {
+                native_id: "n".into(),
+                model: Some(m.into()),
+                cwd: None,
+            })
+        };
+        let mut t = Transcript::new();
+        t.apply(&start("opus"), Driver::Claude);
+        t.apply(
+            &started("c1", ItemKind::AssistantMessage, None),
+            Driver::Claude,
+        );
+        // What the session says as it switches, as the new agent, before that agent starts.
+        let notice = ev(Event::Notice {
+            text: "Continuing in Antigravity with all 2 earlier messages.".into(),
+        });
+        let changes = t.apply(&notice, Driver::Agy);
+        assert!(matches!(changes.first(), Some(Change::Added(id)) if id.starts_with("switch")));
+        let kinds: Vec<&str> = t
+            .order()
+            .iter()
+            .filter_map(|id| t.get(id))
+            .map(|i| match &i.body {
+                Body::Switch { .. } => "switch",
+                Body::Notice { .. } => "notice",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["other", "switch", "notice"],
+            "the divider comes first"
+        );
+
+        let changes = t.apply(&start("gemini"), Driver::Agy);
+        let Some(Change::Updated(id)) = changes.first() else {
+            panic!("the start names the model in the same divider: {changes:?}")
+        };
+        match &t.get(id).expect("divider").body {
+            Body::Switch {
+                driver,
+                model,
+                agent_changed,
+                ..
+            } => {
+                assert_eq!(*driver, Driver::Agy);
+                assert_eq!(model.as_deref(), Some("gemini"));
+                assert!(agent_changed);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            t.order()
+                .iter()
+                .filter(|id| id.starts_with("switch"))
+                .count(),
+            1,
+            "one divider, not a second for the model"
+        );
+        assert_eq!(t.current_model(), Some("gemini"));
+        // A later model change on the new agent is a model switch as before.
+        let changes = t.apply(
+            &ev(Event::ModelChanged {
+                model: "gemini-flash".into(),
+            }),
+            Driver::Agy,
+        );
+        assert!(matches!(changes.first(), Some(Change::Added(_))));
     }
 
     #[test]

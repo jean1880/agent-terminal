@@ -461,6 +461,11 @@ pub enum Row {
     Reasoning(ReasoningRow),
     Tool(ToolCard),
     Static(gtk4::Widget),
+    /// An agent or model switch divider: its words change when the new agent names its model.
+    Switch {
+        root: gtk4::Widget,
+        words: gtk4::Label,
+    },
     Approval(ApprovalCard),
     Question(QuestionCardWidget),
     Form(FormCardWidget),
@@ -525,7 +530,8 @@ impl Row {
                 returned,
             } => {
                 let text = switch_text(*driver, model.as_deref(), *agent_changed, *returned);
-                Self::Static(divider(&text, "switch-divider", Some(*driver)))
+                let (root, words) = divider_parts(&text, "switch-divider", Some(*driver));
+                Self::Switch { root, words }
             }
             Body::Approval(_) => Self::Approval(ApprovalCard::new(sink)),
             Body::Question(q) => Self::Question(QuestionCardWidget::new(q, sink)),
@@ -569,7 +575,7 @@ impl Row {
             Self::User { root, .. } | Self::Assistant { root, .. } => root.clone().upcast(),
             Self::Reasoning(r) => r.root.clone().upcast(),
             Self::Tool(t) => t.root.clone().upcast(),
-            Self::Static(w) => w.clone(),
+            Self::Static(w) | Self::Switch { root: w, .. } => w.clone(),
             Self::Approval(a) => a.root.clone().upcast(),
             Self::Question(q) => q.root.clone().upcast(),
             Self::Form(f) => f.root().clone().upcast(),
@@ -682,6 +688,20 @@ impl Row {
                 let view = super::model::reasoning_view(text, *streaming, *state, *label);
                 r.update(text, &view, item.expanded);
             }
+            (
+                Self::Switch { words, .. },
+                Body::Switch {
+                    driver,
+                    model,
+                    agent_changed,
+                    returned,
+                },
+            ) => words.set_text(&switch_text(
+                *driver,
+                model.as_deref(),
+                *agent_changed,
+                *returned,
+            )),
             (Self::Tool(t), Body::Tool(_)) => t.update(item),
             (Self::Approval(a), Body::Approval(_)) => a.update(item),
             (Self::Question(q), Body::Question(card)) => q.update(card.state),
@@ -814,6 +834,11 @@ fn error_row(message: &str) -> gtk4::Box {
 
 /// A centred label between two rules.
 fn divider(text: &str, class: &str, driver: Option<Driver>) -> gtk4::Widget {
+    divider_parts(text, class, driver).0
+}
+
+/// [`divider`] and its words, for a divider whose text can change (a switch named later).
+fn divider_parts(text: &str, class: &str, driver: Option<Driver>) -> (gtk4::Widget, gtk4::Label) {
     let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     root.add_css_class("divider");
     root.add_css_class(class);
@@ -841,7 +866,7 @@ fn divider(text: &str, class: &str, driver: Option<Driver>) -> gtk4::Widget {
     root.append(&left);
     root.append(&pill);
     root.append(&right);
-    root.upcast()
+    (root.upcast(), words)
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -3346,7 +3346,7 @@ pub(crate) mod tests {
                         }
                         s.statics.push((id.clone(), format!("reply by {name}")));
                     }
-                    cards::Row::Static(w) => {
+                    cards::Row::Static(w) | cards::Row::Switch { root: w, .. } => {
                         // Dividers and notices: the text they show.
                         let mut texts = Vec::new();
                         let mut stack = vec![w.clone()];
