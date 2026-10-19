@@ -346,6 +346,23 @@ pub fn reading_text(snap: &Snapshot, now: i64) -> Option<String> {
     })
 }
 
+/// Whether the agent's usage is drawn loading: a probe of it runs and there is nothing to show
+/// (never read, no window, or too old to show). Old data that can still be shown stays shown
+/// while it refreshes; a signed-out agent says so instead.
+pub fn is_loading(snap: &Snapshot, now: i64) -> bool {
+    snap.probing
+        && !snap.signed_out
+        && (snap.windows.is_empty() || reading_freshness(snap, now) == Freshness::Expired)
+}
+
+/// The loading meter's text.
+const LOADING_TEXT: &str = "Checking…";
+
+/// The loading meter's tooltip.
+pub fn loading_tooltip(agent: &str) -> String {
+    format!("{agent} · Checking usage…")
+}
+
 /// The "Unknown" meter's tooltip: always says why there is nothing to show.
 pub fn unknown_tooltip(agent: &str, read: Option<&str>) -> String {
     match read {
@@ -364,10 +381,18 @@ fn shown_class(used: f64, aging: bool) -> &'static str {
 
 /// Accent dot + one thin row per window kind, labelled by its length, with a bar and percentage.
 /// Only a Fresh reading is drawn as is; an Aging one is muted (never green) with when it was
-/// read; an Expired one is the could-not-read state ("Unknown").
+/// read; an Expired one is the could-not-read state ("Unknown"), unless a probe is fetching one,
+/// which draws the agent's dot spinning ([`is_loading`]).
 fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     b.add_css_class(accent_class(driver));
+    if is_loading(snap, now) {
+        b.add_css_class("usage-loading");
+        b.append(&crate::brand::drip(driver));
+        b.append(&label(LOADING_TEXT, &["usage-text"]));
+        b.set_tooltip_text(Some(&loading_tooltip(driver_name(driver))));
+        return b;
+    }
     b.append(&brand_image(driver));
     if snap.signed_out {
         b.append(&label("signed out", &["usage-text", "usage-crit"]));
@@ -460,7 +485,13 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     } else {
         &snap.windows
     };
-    if windows.is_empty() {
+    if is_loading(snap, now) {
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        row.add_css_class("usage-loading");
+        row.append(&crate::brand::drip(driver));
+        row.append(&label("Checking usage…", &["dim-label"]));
+        section.append(&row);
+    } else if windows.is_empty() {
         let l = label("No usage data yet", &["dim-label"]);
         l.set_halign(gtk4::Align::Start);
         section.append(&l);
@@ -716,6 +747,99 @@ pub(crate) mod tests {
         );
         assert!(reading_text(&snap(Some(7 * ACCOUNT_TTL), false), now)
             .is_some_and(|t| t.starts_with("Could not read recently")));
+    }
+
+    /// Loading is a probe fetching what is not there to show; shown data, a signed-out agent and
+    /// a probe that ended are never drawn loading.
+    #[test]
+    fn only_a_probe_with_nothing_to_show_is_drawn_loading() {
+        let now = 1_800_000_000;
+        let snap = |windows: Vec<QuotaWindow>, age: Option<i64>, probing, signed_out| Snapshot {
+            windows,
+            read_at: age.map(|a| now - a),
+            probing,
+            signed_out,
+            ..Snapshot::default()
+        };
+        let five = || vec![named("5-hour", 0.4)];
+        assert!(
+            is_loading(&snap(vec![], None, true, false), now),
+            "never read"
+        );
+        assert!(
+            is_loading(&snap(five(), Some(7 * ACCOUNT_TTL), true, false), now),
+            "too old to show"
+        );
+        assert!(
+            is_loading(&snap(vec![], Some(60), true, false), now),
+            "read, but no window"
+        );
+        assert!(
+            !is_loading(&snap(five(), Some(60), true, false), now),
+            "fresh data stays shown"
+        );
+        assert!(
+            !is_loading(&snap(five(), Some(3 * ACCOUNT_TTL), true, false), now),
+            "aging data stays shown, muted"
+        );
+        assert!(
+            !is_loading(&snap(vec![], None, false, false), now),
+            "no probe: Unknown"
+        );
+        assert!(
+            !is_loading(&snap(vec![], None, true, true), now),
+            "signed out says so"
+        );
+        assert_eq!(loading_tooltip("Codex"), "Codex · Checking usage…");
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_a_loading_agent_spins_its_own_dot() {
+        gtk4::init().expect("GTK init");
+        let snap = Snapshot {
+            probing: true,
+            ..Snapshot::default()
+        };
+        for driver in Driver::ALL {
+            let form = compact_form(driver, &snap, now_epoch());
+            assert!(form.has_css_class("usage-loading"));
+            let drip = form
+                .first_child()
+                .and_downcast::<gtk4::Overlay>()
+                .expect("the drip leads");
+            assert!(drip.has_css_class("brand-drip"));
+            let dot = format!("dot-{}", driver.info().key);
+            assert!(drip.child().is_none(), "no dot in the middle");
+            let (mut orbits, mut falls, mut ripples) = (0, 0, 0);
+            let mut child = drip.first_child();
+            while let Some(part) = child {
+                if part.has_css_class("drip-orbit") {
+                    let drop = part.first_child().expect("a drop");
+                    assert!(drop.has_css_class(&dot) && drop.has_css_class("drip-drop"));
+                    orbits += 1;
+                } else if part.has_css_class("drip-fall") {
+                    falls += 1;
+                } else if part.has_css_class("drip-ripple") {
+                    ripples += 1;
+                }
+                assert!(
+                    part.has_css_class(&dot) || part.has_css_class("drip-orbit"),
+                    "{driver:?}'s own colour"
+                );
+                child = part.next_sibling();
+            }
+            // One droplet: the loop's and the falling one hand over, never shown together.
+            assert_eq!((orbits, falls, ripples), (1, 1, 1));
+            let text = form
+                .last_child()
+                .and_downcast::<gtk4::Label>()
+                .expect("text");
+            assert_eq!(text.text(), LOADING_TEXT);
+        }
+        // The probe ended with nothing read: the could-not-read state.
+        let form = compact_form(Driver::Claude, &Snapshot::default(), now_epoch());
+        assert!(!form.has_css_class("usage-loading"));
     }
 
     #[test]

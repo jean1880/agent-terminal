@@ -43,6 +43,9 @@ pub struct Snapshot {
     pub read_at: Option<i64>,
     /// The last probe failed (an error or a timeout): old data says it could not refresh.
     pub refresh_failed: bool,
+    /// A probe of this agent is running: with nothing to show yet, the indicator says it is
+    /// loading rather than that it could not read.
+    pub probing: bool,
 }
 
 /// Merges an update in: a new account replaces the old one (`None` keeps it), and windows are
@@ -217,6 +220,23 @@ impl AccountStatus {
         self.tried_at.set(tried);
     }
 
+    /// Records whether a probe of `driver` is running; listeners hear of a change. Only the
+    /// probes themselves (and the demo's loading scene) set it.
+    pub(crate) fn set_probing(&self, driver: Driver, probing: bool) {
+        let changed =
+            std::mem::replace(&mut self.slot(driver).borrow_mut().probing, probing) != probing;
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// `driver`'s probe ended at `now`, answered or not: its clock restarts and it is no longer
+    /// loading.
+    fn probe_finished(&self, driver: Driver, now: i64) {
+        self.mark_tried(driver, now);
+        self.set_probing(driver, false);
+    }
+
     /// Whether a background check at `now` should probe `driver`: the user asked to check it, or
     /// its last reading (or failed attempt) is [`ACCOUNT_TTL`] old, or there was none.
     pub fn is_due(&self, driver: Driver, now: i64) -> bool {
@@ -312,8 +332,8 @@ impl AccountStatus {
             return;
         }
         self.refreshing.set(true);
-        // An agent whose reading has aged is redrawn muted while its probe runs.
-        self.notify();
+        // `run` notifies as each probe starts: an agent whose reading has aged is redrawn muted
+        // while its probe runs, and one with nothing to show is drawn loading.
         self.run(targets, |d| due.contains(&d));
     }
 
@@ -340,6 +360,11 @@ impl AccountStatus {
             self.refreshing.set(false);
             return; // nothing is ready: nothing is spawned
         }
+        // Every probed agent is loading until its probe ends; one repaint says so for all.
+        for (driver, _) in &jobs {
+            self.slot(*driver).borrow_mut().probing = true;
+        }
+        self.notify();
         let finish = {
             let me = self.clone();
             join_n(jobs.len() as u8, move || {
@@ -362,7 +387,7 @@ impl AccountStatus {
                             }
                             Err(_) => me.probe_failed(driver),
                         }
-                        me.mark_tried(driver, now_epoch());
+                        me.probe_finished(driver, now_epoch());
                         done();
                     });
                 }
@@ -375,7 +400,7 @@ impl AccountStatus {
                             }
                             Err(_) => me.probe_failed(driver),
                         }
-                        me.mark_tried(driver, now_epoch());
+                        me.probe_finished(driver, now_epoch());
                         done();
                     });
                 }
@@ -401,7 +426,7 @@ impl AccountStatus {
                         if agy_signed_out(&side.stderr) || agy_signed_out(&out) {
                             warn!("agy is not signed in");
                             me.set_signed_out(Driver::Agy, true);
-                            me.mark_tried(Driver::Agy, now_epoch());
+                            me.probe_finished(Driver::Agy, now_epoch());
                             done();
                             return;
                         }
@@ -410,7 +435,7 @@ impl AccountStatus {
                             // and the reading's clock does not restart.
                             warn!("agy /usage failed or timed out");
                             me.probe_failed(Driver::Agy);
-                            me.mark_tried(Driver::Agy, now_epoch());
+                            me.probe_finished(Driver::Agy, now_epoch());
                             done();
                             return;
                         }
@@ -432,7 +457,7 @@ impl AccountStatus {
                             None => None,
                         };
                         me.update(Driver::Agy, account, windows);
-                        me.mark_tried(Driver::Agy, now_epoch());
+                        me.probe_finished(Driver::Agy, now_epoch());
                         done();
                     });
                 }
@@ -691,6 +716,39 @@ mod tests {
             assert!(pump_until(ctx, 30, || !st.refreshing.get()));
             assert!(mark.exists());
             assert!(!st.is_rechecking(Driver::Agy), "answered");
+        });
+    }
+
+    /// An agent is loading from the moment its probe starts (listeners hear of it) until that
+    /// probe ends, failed included; an agent not probed never is.
+    #[test]
+    fn an_agent_is_loading_only_while_its_probe_runs() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (all, _mark) = marking_targets(dir.path());
+        let claude_only = ProbeTargets::new(vec![(
+            Driver::Claude,
+            all.get(Driver::Claude).cloned().expect("claude target"),
+        )]);
+        in_loop(|ctx| {
+            let st = Rc::new(AccountStatus::new());
+            let seen = Rc::new(Cell::new(false));
+            let (s, w) = (seen.clone(), Rc::downgrade(&st));
+            st.connect_changed(move || {
+                if w.upgrade()
+                    .is_some_and(|st| st.snapshot(Driver::Claude).probing)
+                {
+                    s.set(true);
+                }
+            });
+            st.refresh(&claude_only);
+            assert!(st.snapshot(Driver::Claude).probing);
+            assert!(seen.get(), "the indicator was told");
+            assert!(!st.snapshot(Driver::Codex).probing, "no target, no probe");
+            assert!(pump_until(ctx, 30, || !st.refreshing.get()));
+            let snap = st.snapshot(Driver::Claude);
+            assert!(!snap.probing, "the failed probe ended it");
+            assert!(snap.refresh_failed);
         });
     }
 
