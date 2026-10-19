@@ -155,6 +155,48 @@ pub fn dots() -> gtk4::Box {
     row
 }
 
+/// The loading mark for one agent, in its colour (CSS `brand-drip`): one droplet, never two. It
+/// goes once round a loop counter-clockwise to the top, hangs there, falls through the loop and
+/// lands low in it as a flattened ripple, whose spread edge just meets the bottom of the mark;
+/// once the ripple fades a new droplet forms at the top. The droplet that loops and the one that
+/// falls are two widgets handing over at the top, never shown together. Decorative: the label
+/// beside it says what is loading. With animations off the droplet rests at the top.
+pub fn drip(driver: Driver) -> gtk4::Overlay {
+    let dot_class = format!("dot-{}", driver.info().key);
+    let drop = |extra: &str| {
+        let drop = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        for class in ["brand-dot", dot_class.as_str(), "drip-drop", extra] {
+            drop.add_css_class(class);
+        }
+        drop.set_halign(gtk4::Align::Center);
+        drop.set_valign(gtk4::Align::Start);
+        drop
+    };
+    let overlay = gtk4::Overlay::builder()
+        .accessible_role(gtk4::AccessibleRole::Presentation)
+        .valign(gtk4::Align::Center)
+        .build();
+    overlay.add_css_class("brand-drip");
+    // The droplet on its loop: it rides a box turned about its centre.
+    let orbit = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    orbit.add_css_class("drip-orbit");
+    orbit.set_halign(gtk4::Align::Center);
+    orbit.set_valign(gtk4::Align::Start);
+    orbit.append(&drop(""));
+    overlay.add_overlay(&orbit);
+    // The same droplet falling: it takes over at the top as the loop's one goes out.
+    overlay.add_overlay(&drop("drip-fall"));
+    // The ripple where it lands: a ring in the agent's colour, squashed flat as water seen at an
+    // angle. Centred here; the stylesheet lowers it.
+    let ripple = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    ripple.add_css_class("drip-ripple");
+    ripple.add_css_class(&dot_class);
+    ripple.set_halign(gtk4::Align::Center);
+    ripple.set_valign(gtk4::Align::Center);
+    overlay.add_overlay(&ripple);
+    overlay
+}
+
 /// Lights `lead`'s dot in a [`dots`] row and dims the other two; `None` shows all three alike.
 /// The dots ease between the two (CSS), so a switch of agent reads as the light moving.
 pub fn set_lead(dots: &gtk4::Box, lead: Option<Driver>) {

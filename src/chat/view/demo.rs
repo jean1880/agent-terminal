@@ -192,10 +192,14 @@ impl ModelSource for DemoModels {
     fn disconnect(&self, _id: u64) {}
 }
 
-/// Static account and quota data for `--chat-demo`: one agent in the amber, one in the red.
+/// Static account and quota data for `--chat-demo`: one agent in the amber, one in the red. The
+/// `usage` scene also shows Codex still loading, its probe never ending.
 pub fn demo_account_status() -> Rc<AccountStatus> {
     let status = Rc::new(AccountStatus::new());
     observe_demo_quota(&status);
+    if std::env::var("AGENT_TERMINAL_DEMO_SCENE").as_deref() == Ok("usage") {
+        status.set_probing(Driver::Codex, true);
+    }
     status
 }
 
@@ -1598,6 +1602,14 @@ pub fn run() -> glib::ExitCode {
         // The app's own colours (and dark scheme), as a window gets them, so the demo looks
         // like the app it stands in for.
         crate::palette::apply(crate::config::ThemeChoice::default());
+        // Every agent installed, as the scripted threads assume: the usage indicator lists only
+        // ready agents, and would otherwise stay empty.
+        for driver in Driver::ALL {
+            crate::availability::AgentAvailability::shared().set(
+                driver,
+                crate::availability::Availability::Ready("/usr/bin/agent".into()),
+            );
+        }
         let backend = demo_backend();
         let view = ChatView::new(backend.clone());
         backend.connect(view.sink());

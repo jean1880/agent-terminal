@@ -524,6 +524,72 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     100% { transform: none; }
 }
 .thinking-dot.lead { animation-name: thinking-bounce-lead; }
+/* Usage still loading (brand.rs `drip`): one droplet, never two, on one 1800 ms beat.
+     0-4 %   it forms at the top of the loop;
+     4-54 %  it goes once round counter-clockwise, easing out of and into the top;
+     54 %    it hands over, in place, to the falling droplet (the loop's goes out);
+     54-60 % it hangs at the top;
+     60-74 % it falls as under gravity (distance ∝ time²), stretching as it speeds up;
+     74-77 % it breaks the surface and is gone;
+     75-97 % the ripple, a ring squashed flat (a circle seen in perspective, like water), spreads
+             and fades; only then does the next droplet form.
+   The ripple sits low: fully spread (8 × 1.1 by 8 × 0.42 = 8.8 × 3.36 px) its bottom edge meets
+   the bottom of the 14 px mark, so its centre is 12.3 px down, 5.3 px below the middle. Each
+   phase is written out as keyframes (linear between them; the loop's easing is a smoothstep
+   sampled at fifths). A transform is drawn, not laid out. */
+@keyframes drip-spin {
+    0% { opacity: 0; transform: rotate(0deg); }
+    4% { opacity: 1; transform: rotate(0deg); }
+    14% { opacity: 1; transform: rotate(-37.4deg); }
+    24% { opacity: 1; transform: rotate(-126.7deg); }
+    34% { opacity: 1; transform: rotate(-233.3deg); }
+    44% { opacity: 1; transform: rotate(-322.6deg); }
+    54% { opacity: 1; transform: rotate(-360deg); }
+    54.5% { opacity: 0; transform: rotate(-360deg); }
+    100% { opacity: 0; transform: rotate(-360deg); }
+}
+@keyframes drip-fall {
+    0% { opacity: 0; transform: translateY(0) scale(1, 1); }
+    54% { opacity: 0; transform: translateY(0) scale(1, 1); }
+    54.5% { opacity: 1; transform: translateY(0) scale(1, 1); }
+    60% { opacity: 1; transform: translateY(0) scale(1, 1); }
+    64.9% { opacity: 1; transform: translateY(1.3px) scale(0.9, 1.15); }
+    69.1% { opacity: 1; transform: translateY(4.6px) scale(0.85, 1.25); }
+    71.9% { opacity: 1; transform: translateY(7.8px) scale(0.8, 1.35); }
+    74% { opacity: 1; transform: translateY(10.8px) scale(0.8, 1.35); }
+    77% { opacity: 0; transform: translateY(10.8px) scale(1.6, 0.4); }
+    100% { opacity: 0; transform: translateY(10.8px) scale(1.6, 0.4); }
+}
+@keyframes drip-ripple {
+    0% { opacity: 0; transform: translateY(5.3px) scale(0.15, 0.06); }
+    74% { opacity: 0; transform: translateY(5.3px) scale(0.15, 0.06); }
+    75% { opacity: 1; transform: translateY(5.3px) scale(0.25, 0.1); }
+    97% { opacity: 0; transform: translateY(5.3px) scale(1.1, 0.42); }
+    100% { opacity: 0; transform: translateY(5.3px) scale(1.1, 0.42); }
+}
+.brand-drip { min-width: 14px; min-height: 14px; }
+.brand-drip .drip-orbit {
+    min-width: 14px;
+    min-height: 14px;
+    animation: drip-spin 1800ms linear infinite;
+}
+.brand-drip .drip-drop { min-width: 3px; min-height: 3px; }
+/* At rest (animations off) only the loop's droplet shows, at the top. */
+.brand-drip .drip-fall {
+    opacity: 0;
+    animation: drip-fall 1800ms linear infinite;
+}
+.drip-ripple {
+    min-width: 8px;
+    min-height: 8px;
+    border: 1.5px solid;
+    border-radius: 9999px;
+    opacity: 0;
+    animation: drip-ripple 1800ms linear infinite;
+}
+.drip-ripple.dot-claude { border-color: @brand_claude; }
+.drip-ripple.dot-agy { border-color: @brand_agy; }
+.drip-ripple.dot-codex { border-color: @brand_codex; }
 /* A new thread's empty transcript: the dots at rest, the thread's agent lit. */
 .transcript-empty .brand-dots { margin-bottom: 6px; }
 .transcript-empty .brand-dot { min-width: 10px; min-height: 10px; }
