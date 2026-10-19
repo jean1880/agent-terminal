@@ -222,6 +222,8 @@ pub struct DiffPanel {
     pr_content: adw::ButtonContent,
     pr_face: gtk4::Stack,
     pr_spinner: gtk4::Spinner,
+    /// A push for the pull request is running (`set_pushing`).
+    pr_pushing: Rc<Cell<bool>>,
     pr_state: Rc<RefCell<Option<PrState>>>,
     pr_handler: Rc<RefCell<Option<PrHandler>>>,
     base: gtk4::DropDown,
@@ -422,6 +424,7 @@ impl DiffPanel {
             pr_content,
             pr_face,
             pr_spinner,
+            pr_pushing: Rc::new(Cell::new(false)),
             pr_state: Rc::new(RefCell::new(None)),
             pr_handler: Rc::new(RefCell::new(None)),
             base,
@@ -600,8 +603,9 @@ impl DiffPanel {
         self.pr_status.set_text(&words.status);
         self.pr_status.set_tooltip_text(Some(&words.status));
         self.pr_content.set_label(words.button);
-        self.set_pushing(false);
-        self.pr_button.set_sensitive(words.enabled);
+        // A refresh landing mid-push keeps the button busy: only the push's end frees it.
+        self.pr_button
+            .set_sensitive(words.enabled && !self.pr_pushing.get());
         self.pr_button.set_tooltip_text(Some(if words.enabled {
             "Open this branch's pull request page on GitHub in the browser"
         } else {
@@ -615,8 +619,10 @@ impl DiffPanel {
     }
 
     /// While the push behind "Push & Open PR" runs, the button spins and says so, and cannot be
-    /// pressed again. The refresh that follows the push draws the bar afresh (and ends this).
+    /// pressed again, whatever refreshes land meanwhile. Its end gives the button back as the
+    /// last refresh left it (pressable only with a branch ready to open).
     pub fn set_pushing(&self, pushing: bool) {
+        self.pr_pushing.set(pushing);
         self.pr_face
             .set_visible_child_name(if pushing { "busy" } else { "idle" });
         if pushing {
@@ -624,6 +630,8 @@ impl DiffPanel {
             self.pr_button.set_sensitive(false);
         } else {
             self.pr_spinner.stop();
+            self.pr_button
+                .set_sensitive(self.pr_state.borrow().is_some());
         }
     }
 
@@ -1147,11 +1155,17 @@ pub(crate) mod tests {
         panel.set_pushing(true);
         assert!(panel.is_pushing());
         assert_eq!(panel.pr_view().map(|v| v.2), Some(false));
+        // A refresh landing mid-push (a turn ending, say) leaves it busy: no second push.
         panel.show_pr(
             generation,
             Some(Ok(PrOutcome::Ready(state(PushState::UpToDate)))),
         );
+        assert!(panel.is_pushing());
+        assert_eq!(panel.pr_view().map(|v| v.2), Some(false));
+        // Its end gives the button back as that refresh left it.
+        panel.set_pushing(false);
         assert!(!panel.is_pushing());
+        assert_eq!(panel.pr_view().map(|v| v.2), Some(true));
         // A stale refresh changes nothing; no repository hides the bar.
         panel.show_pr(generation.wrapping_sub(1), None);
         assert!(panel.pr_view().is_some());
