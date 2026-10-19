@@ -4,7 +4,7 @@
  * selected theme restyles the chat too. The agent colours are not themed, because they
  * identify the agent in every theme: @brand_claude, @brand_agy and @brand_codex, defined by
  * src/brand.rs from DriverInfo::accent_hex in agent-core (the app icon's dots). Text tints
- * are the accent mixed 40% toward white: claude #f1b5a6, agy #9dc4f9.
+ * are the accent mixed 40% toward white: mix(@brand_claude, white, 0.4).
  */
 
 .chat-view {
@@ -469,15 +469,37 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     100% { transform: none; }
 }
 .thinking-strip { padding: 2px 6px 0 6px; min-height: 22px; }
+/* The app icon's dots (brand.rs `dots`): each in its agent's colour; `set_lead` lights the agent
+   at work and dims the others, easing between the two so a switch reads as the light moving. */
+.brand-dot {
+    border-radius: 9999px;
+    transition-property: opacity;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+}
+.brand-dot.dot-claude { background-color: @brand_claude; }
+.brand-dot.dot-agy { background-color: @brand_agy; }
+.brand-dot.dot-codex { background-color: @brand_codex; }
+.brand-dot.dimmed { opacity: 0.3; }
 .thinking-dot {
     min-width: 7px;
     min-height: 7px;
-    border-radius: 9999px;
     animation: thinking-bounce 1800ms ease-in-out infinite;
 }
-.thinking-dot.dot-claude { background-color: @brand_claude; }
-.thinking-dot.dot-agy { background-color: @brand_agy; animation-delay: 150ms; }
-.thinking-dot.dot-codex { background-color: @brand_codex; animation-delay: 300ms; }
+.thinking-dot.dot-agy { animation-delay: 150ms; }
+.thinking-dot.dot-codex { animation-delay: 300ms; }
+/* The agent at work hops a little higher than the two keeping it company. */
+@keyframes thinking-bounce-lead {
+    0% { transform: none; }
+    15% { transform: translateY(-7px) scale(1.18, 0.9); }
+    30% { transform: translateY(1px) scale(0.92, 1.08); }
+    40% { transform: none; }
+    100% { transform: none; }
+}
+.thinking-dot.lead { animation-name: thinking-bounce-lead; }
+/* A new thread's empty transcript: the dots at rest, the thread's agent lit. */
+.transcript-empty .brand-dots { margin-bottom: 6px; }
+.transcript-empty .brand-dot { min-width: 10px; min-height: 10px; }
 .thinking-text { color: mix(@at_fg_soft, @at_fg_dim, 0.5); font-size: 0.9em; }
 
 .plan-card {
@@ -586,7 +608,7 @@ popover.typeahead > contents {
     min-width: 34px;
 }
 .badge-app { background-color: alpha(@at_accent, 0.18); color: @at_accent_hover; }
-.badge-agent { background-color: alpha(@brand_claude, 0.18); color: #f1b5a6; }
+.badge-agent { background-color: alpha(@brand_claude, 0.18); color: mix(@brand_claude, white, 0.4); }
 .badge-skill { background-color: alpha(@at_success, 0.16); color: @at_success_soft; }
 .badge-file { background-color: alpha(@at_info, 0.16); color: mix(@at_info, @at_fg_strong, 0.4); }
 

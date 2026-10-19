@@ -113,6 +113,8 @@ pub struct TranscriptView {
     moves: Cell<u64>,
     sink: RowSink,
     empty: gtk4::Box,
+    /// The app icon's dots over the empty transcript, the thread's agent lit (`set_agent`).
+    empty_dots: gtk4::Box,
     /// The model the rows are built from (set by `connect_load_older`), for the fill steps.
     model: RefCell<Weak<RefCell<Transcript>>>,
     /// The pending fill of the window after a reset (see [`FIRST_PAINT`]).
@@ -178,6 +180,9 @@ impl TranscriptView {
         ));
         hint.add_css_class("empty-hint");
         hint.set_selectable(true);
+        let empty_dots = crate::brand::dots();
+        empty_dots.set_halign(gtk4::Align::Center);
+        empty.append(&empty_dots);
         empty.append(&title);
         empty.append(&hint);
         empty.set_can_target(false);
@@ -226,6 +231,7 @@ impl TranscriptView {
             moves: Cell::new(0),
             sink,
             empty,
+            empty_dots,
             model: RefCell::new(Weak::new()),
             fill: RefCell::new(None),
             jump_to: RefCell::new(None),
@@ -233,6 +239,28 @@ impl TranscriptView {
         });
         view.connect_scrolling();
         view
+    }
+
+    /// Lights `driver`'s dot over the empty transcript. A switch of agent before the first
+    /// prompt fades the light across; the dots never loop (nothing is at work yet).
+    pub fn set_agent(&self, driver: agent_core::adapter::Driver) {
+        crate::brand::set_lead(&self.empty_dots, Some(driver));
+    }
+
+    /// Which dot over the empty transcript is lit (tests).
+    #[cfg(test)]
+    pub fn empty_lead(&self) -> Option<String> {
+        let mut dot = self.empty_dots.first_child();
+        while let Some(d) = dot {
+            if d.has_css_class("lead") {
+                return d
+                    .css_classes()
+                    .iter()
+                    .find_map(|c| c.strip_prefix("dot-").map(str::to_owned));
+            }
+            dot = d.next_sibling();
+        }
+        None
     }
 
     /// Whether the viewport scrolls to keyboard focus (tests: it must not).
