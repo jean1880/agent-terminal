@@ -112,6 +112,12 @@ pub fn build_animated_menu_button(menu_model: &impl IsA<gio::MenuModel>) -> gtk4
         let last_frame_time = last_frame_time.clone();
 
         move || {
+            // Animations off: jump straight to the new shape.
+            if !crate::brand::animations_enabled() {
+                progress.set(target.get());
+                area.queue_draw();
+                return;
+            }
             if animating.get() {
                 return;
             }

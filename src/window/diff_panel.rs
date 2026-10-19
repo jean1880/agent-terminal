@@ -367,6 +367,8 @@ impl DiffPanel {
             .build();
 
         let stack = gtk4::Stack::new();
+        stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+        stack.set_transition_duration(crate::brand::CROSSFADE_MS);
         stack.add_named(&status, Some("status"));
         stack.add_named(&diff_page, Some("diff"));
 

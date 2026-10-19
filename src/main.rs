@@ -17,6 +17,7 @@ mod always_allow;
 mod approval_hook;
 mod approval_server;
 mod availability;
+mod brand;
 mod chat;
 mod claude_probe;
 mod codex_home;

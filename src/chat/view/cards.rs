@@ -1171,6 +1171,9 @@ impl ToolCard {
         header.add_css_class("card-header");
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
         let status = gtk4::Stack::new();
+        // A finished step's icon fades in over its spinner rather than flicking.
+        status.set_transition_type(gtk4::StackTransitionType::Crossfade);
+        status.set_transition_duration(crate::brand::FAST_MS);
         let spinner = gtk4::Spinner::new();
         let status_icon = gtk4::Image::new();
         status_icon.add_css_class("status-icon");

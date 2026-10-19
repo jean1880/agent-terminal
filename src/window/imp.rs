@@ -4929,7 +4929,11 @@ impl AgentTerminalWindow {
             .build();
         crate::icons::set_status_icon(&empty, "at-document-open-recent-symbolic");
 
-        let pages = Stack::builder().vexpand(true).build();
+        let pages = Stack::builder()
+            .vexpand(true)
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .transition_duration(loading::CROSSFADE_MS)
+            .build();
         pages.add_named(&spinner, Some("loading"));
         pages.add_named(&scrolled, Some("list"));
         pages.add_named(&empty, Some("empty"));

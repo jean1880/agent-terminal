@@ -3688,7 +3688,11 @@ impl AgentTerminalWindow {
             .unwrap_or_default();
 
         let terminal = Terminal::new();
-        let stack = Stack::builder().vexpand(true).build();
+        let stack = Stack::builder()
+            .vexpand(true)
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .transition_duration(loading::CROSSFADE_MS)
+            .build();
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
