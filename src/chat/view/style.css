@@ -26,7 +26,7 @@
 .chat-view textview.composer-view,
 .chat-panel button,
 .chat-panel list.boxed-list row {
-    transition-property: background-color, border-color, color, opacity, box-shadow;
+    transition-property: background-color, border-color, color, opacity, box-shadow, outline-color;
     transition-duration: 150ms;
     transition-timing-function: ease-out;
 }

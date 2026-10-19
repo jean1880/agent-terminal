@@ -490,13 +490,11 @@ impl Header {
             },
         };
         self.model.set_text(&model_text);
-        // Restart the pulse only when the switch becomes pending, not on every refresh.
-        if pending.is_some() != self.chip.has_css_class("pending") {
-            if pending.is_some() {
-                self.chip.add_css_class("pending");
-            } else {
-                self.chip.remove_css_class("pending");
-            }
+        // The class starts the chip's pulse; adding it again while pending does not restart it.
+        if pending.is_some() {
+            self.chip.add_css_class("pending");
+        } else {
+            self.chip.remove_css_class("pending");
         }
         let name = format!("{} · {}", driver_name(driver), model_text);
         self.chip
