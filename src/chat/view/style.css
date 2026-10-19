@@ -1,11 +1,10 @@
 /* agent-terminal chat view.
  *
  * Colours are the theme's named colours (the at_ names, defined per theme in src/palette.rs), so the
- * selected theme restyles the chat too. The agent colours alone stay literal, because they
- * identify the agent in every theme:
- *   claude #e8846b   agy #5b9cf6   codex #4cc38a
- *   (they match the app-icon dots and DriverInfo::accent_hex in agent-core; text tints
- *   are the accent mixed 40% toward white: claude #f1b5a6, agy #9dc4f9)
+ * selected theme restyles the chat too. The agent colours are not themed, because they
+ * identify the agent in every theme: @brand_claude, @brand_agy and @brand_codex, defined by
+ * src/brand.rs from DriverInfo::accent_hex in agent-core (the app icon's dots). Text tints
+ * are the accent mixed 40% toward white: claude #f1b5a6, agy #9dc4f9.
  */
 
 .chat-view {
@@ -35,12 +34,12 @@
 .agent-chip .chip-model { color: @at_fg_dim; font-family: monospace; font-size: 0.9em; }
 
 .accent-dot { font-size: 0.8em; color: @at_accent; }
-.accent-claude .accent-dot { color: #e8846b; }
-.accent-agy .accent-dot { color: #5b9cf6; }
-.agent-chip.accent-claude { border-color: alpha(#e8846b, 0.45); }
-.agent-chip.accent-agy { border-color: alpha(#5b9cf6, 0.45); }
-.accent-codex .accent-dot { color: #4cc38a; }
-.agent-chip.accent-codex { border-color: alpha(#4cc38a, 0.45); }
+.accent-claude .accent-dot { color: @brand_claude; }
+.accent-agy .accent-dot { color: @brand_agy; }
+.agent-chip.accent-claude { border-color: alpha(@brand_claude, 0.45); }
+.agent-chip.accent-agy { border-color: alpha(@brand_agy, 0.45); }
+.accent-codex .accent-dot { color: @brand_codex; }
+.agent-chip.accent-codex { border-color: alpha(@brand_codex, 0.45); }
 
 .mode-dropdown > button {
     border-radius: 999px;
@@ -146,14 +145,14 @@ levelbar.context-level block.empty { background-color: transparent; }
     padding: 2px 0 2px 16px;
     border-left: 2px solid alpha(@at_accent, 0.6);
 }
-.assistant-row.accent-claude { border-left-color: alpha(#e8846b, 0.75); }
-.assistant-row.accent-agy { border-left-color: alpha(#5b9cf6, 0.75); }
-.assistant-row.accent-codex { border-left-color: alpha(#4cc38a, 0.75); }
+.assistant-row.accent-claude { border-left-color: alpha(@brand_claude, 0.75); }
+.assistant-row.accent-agy { border-left-color: alpha(@brand_agy, 0.75); }
+.assistant-row.accent-codex { border-left-color: alpha(@brand_codex, 0.75); }
 .assistant-head .agent-name { color: @at_fg_dim; font-weight: 700; font-size: 0.85em; letter-spacing: 0.02em; }
 .stream-caret { color: @at_accent; }
-.accent-claude .stream-caret { color: #e8846b; }
-.accent-agy .stream-caret { color: #5b9cf6; }
-.accent-codex .stream-caret { color: #4cc38a; }
+.accent-claude .stream-caret { color: @brand_claude; }
+.accent-agy .stream-caret { color: @brand_agy; }
+.accent-codex .stream-caret { color: @brand_codex; }
 
 .md-text { color: mix(@at_fg_strong, @at_fg, 0.4); line-height: 1.45; }
 .md-heading { color: @at_fg_strong; margin-top: 4px; }
@@ -444,12 +443,12 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     background-color: mix(@at_bg_sunken, @at_surface, 0.5);
 }
 .divider-text { color: @at_fg_dim; font-size: 0.85em; }
-.switch-divider.accent-claude .divider-pill { border-color: alpha(#e8846b, 0.6); background-color: alpha(#e8846b, 0.08); }
-.switch-divider.accent-agy .divider-pill { border-color: alpha(#5b9cf6, 0.6); background-color: alpha(#5b9cf6, 0.08); }
-.switch-divider.accent-claude separator { background-color: alpha(#e8846b, 0.35); }
-.switch-divider.accent-agy separator { background-color: alpha(#5b9cf6, 0.35); }
-.switch-divider.accent-codex .divider-pill { border-color: alpha(#4cc38a, 0.6); background-color: alpha(#4cc38a, 0.08); }
-.switch-divider.accent-codex separator { background-color: alpha(#4cc38a, 0.35); }
+.switch-divider.accent-claude .divider-pill { border-color: alpha(@brand_claude, 0.6); background-color: alpha(@brand_claude, 0.08); }
+.switch-divider.accent-agy .divider-pill { border-color: alpha(@brand_agy, 0.6); background-color: alpha(@brand_agy, 0.08); }
+.switch-divider.accent-claude separator { background-color: alpha(@brand_claude, 0.35); }
+.switch-divider.accent-agy separator { background-color: alpha(@brand_agy, 0.35); }
+.switch-divider.accent-codex .divider-pill { border-color: alpha(@brand_codex, 0.6); background-color: alpha(@brand_codex, 0.08); }
+.switch-divider.accent-codex separator { background-color: alpha(@brand_codex, 0.35); }
 .switch-divider .divider-text { color: @at_fg_strong; font-weight: 600; }
 .compaction-divider .divider-text { font-style: italic; }
 
@@ -476,9 +475,9 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     border-radius: 9999px;
     animation: thinking-bounce 1800ms ease-in-out infinite;
 }
-.thinking-dot.dot-claude { background-color: #e8846b; }
-.thinking-dot.dot-agy { background-color: #5b9cf6; animation-delay: 150ms; }
-.thinking-dot.dot-codex { background-color: #4cc38a; animation-delay: 300ms; }
+.thinking-dot.dot-claude { background-color: @brand_claude; }
+.thinking-dot.dot-agy { background-color: @brand_agy; animation-delay: 150ms; }
+.thinking-dot.dot-codex { background-color: @brand_codex; animation-delay: 300ms; }
 .thinking-text { color: mix(@at_fg_soft, @at_fg_dim, 0.5); font-size: 0.9em; }
 
 .plan-card {
@@ -587,7 +586,7 @@ popover.typeahead > contents {
     min-width: 34px;
 }
 .badge-app { background-color: alpha(@at_accent, 0.18); color: @at_accent_hover; }
-.badge-agent { background-color: alpha(#e8846b, 0.18); color: #f1b5a6; }
+.badge-agent { background-color: alpha(@brand_claude, 0.18); color: #f1b5a6; }
 .badge-skill { background-color: alpha(@at_success, 0.16); color: @at_success_soft; }
 .badge-file { background-color: alpha(@at_info, 0.16); color: mix(@at_info, @at_fg_strong, 0.4); }
 

@@ -432,6 +432,8 @@ fn install_panic_hook() {
 fn load_css() {
     // Until a window applies the configured theme: the app's own, so a name never misses.
     palette::apply(config::ThemeChoice::default());
+    // The agents' colours (`@brand_claude`…), which no theme changes.
+    brand::install();
     let provider = CssProvider::new();
     provider.load_from_data(
         "
@@ -563,9 +565,9 @@ fn load_css() {
             font-weight: bold;
         }
         /* The agents' own colours: not themed, they say which agent it is. */
-        .thread-dot.dot-claude { color: #e8846b; }
-        .thread-dot.dot-agy { color: #5b9cf6; }
-        .thread-dot.dot-codex { color: #4cc38a; }
+        .thread-dot.dot-claude { color: @brand_claude; }
+        .thread-dot.dot-agy { color: @brand_agy; }
+        .thread-dot.dot-codex { color: @brand_codex; }
         .thread-term { color: @at_fg_soft; }
         .thread-badge.badge-approval { color: @at_warning; }
         /* A thread waiting for approval while you are elsewhere glows until you look at it. */

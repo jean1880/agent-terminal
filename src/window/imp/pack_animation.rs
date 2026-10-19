@@ -47,24 +47,6 @@ const SLOT_X: [f64; 3] = [64.0, 80.0, 96.0];
 /// How late in a hop the sideways move happens (`u^SIDEWAYS`): up beside the bubble first, then
 /// across over its top.
 const SIDEWAYS: f64 = 2.0;
-/// The icon's agent accents, in slot order.
-const DOT_RGB: [(f64, f64, f64); 3] = [
-    (
-        0xe8 as f64 / 255.0,
-        0x84 as f64 / 255.0,
-        0x6b as f64 / 255.0,
-    ),
-    (
-        0x5b as f64 / 255.0,
-        0x9c as f64 / 255.0,
-        0xf6 as f64 / 255.0,
-    ),
-    (
-        0x4c as f64 / 255.0,
-        0xc3 as f64 / 255.0,
-        0x8a as f64 / 255.0,
-    ),
-];
 
 /// The screen (the bubble's dark face) and the bubble's top edge.
 const SCREEN: (f64, f64, f64, f64) = (18.0, 20.0, 92.0, 72.0);
@@ -312,7 +294,11 @@ fn draw_dot(cr: &cairo::Context, i: usize, pose: &DotPose) {
     if pose.scale <= 0.001 || pose.place == DotPlace::Hidden {
         return;
     }
-    let (r, g, b) = DOT_RGB[i];
+    // The icon's agent accents, in slot order (Claude, agy, Codex: `Driver::ALL`).
+    let Some(&driver) = agent_core::adapter::Driver::ALL.get(i) else {
+        return;
+    };
+    let (r, g, b) = crate::brand::rgb(driver);
     let _ = cr.save();
     cr.translate(pose.x, pose.y);
     cr.scale(pose.sx * pose.scale, pose.sy * pose.scale);
