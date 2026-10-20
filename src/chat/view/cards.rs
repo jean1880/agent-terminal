@@ -2234,8 +2234,8 @@ impl ApprovalCard {
                     let b_clone = b.clone();
                     b.connect_clicked(move |_| {
                         popover.popdown();
-                        let confirm = !cfg!(test)
-                            && crate::config::TerminalConfig::load().confirm_rule_modification;
+                        let confirm =
+                            !cfg!(test) && crate::always_allow::confirm_rule_modification();
                         if confirm && !initial_cmd.is_empty() {
                             confirm_approval_rule(
                                 &b_clone,

@@ -921,6 +921,15 @@ pub fn mirror_quick_replies(on: bool) {
     QUICK_REPLIES.with(|c| c.set(on));
 }
 
+/// Hands the approval switches to the gates that read them without a window.
+///
+/// The policy is process-wide and last-writer-wins: each window sets it from its own config
+/// on load and on change, and the settings file monitor keeps the windows in step.
+pub fn mirror_approval_policy(config: &TerminalConfig) {
+    crate::always_allow::set_saved_rules_enabled(config.pattern_auto_approval);
+    crate::always_allow::set_confirm_rule_modification(config.confirm_rule_modification);
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -1495,25 +1504,31 @@ impl TerminalConfig {
         self.save_to(&Self::config_path());
     }
 
-    /// Serializes and writes the config to an explicit path, logging on failure.
+    /// Like [`Self::save`], and says whether the settings reached the disk.
+    pub fn save_checked(&self) -> bool {
+        self.save_to(&Self::config_path())
+    }
+
+    /// Serializes and writes the config to an explicit path, logging on failure. Returns whether
+    /// the file was written.
     ///
     /// The write goes to a sibling temporary file which is then renamed over the
     /// target. Rename within a directory is atomic on Linux, so an interrupted
     /// save leaves either the previous config or the new one — never the
     /// half-written file a plain `fs::write` would produce.
-    fn save_to(&self, path: &Path) {
+    fn save_to(&self, path: &Path) -> bool {
         if self.save_blocked.get() {
             warn!(
                 "Not saving settings to {}: the file there is unusable and has no other copy",
                 path.display()
             );
-            return;
+            return false;
         }
         let content = match serde_json::to_string_pretty(self) {
             Ok(content) => content,
             Err(e) => {
                 warn!("Failed to serialize config: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -1537,9 +1552,10 @@ impl TerminalConfig {
                 path.display(),
                 e
             );
-            return;
+            return false;
         }
         self.disk_stamp.set(disk_stamp(path));
+        true
     }
 
     /// Replaces `path` through the one shared atomic writer: a uniquely named `0600` sibling,
