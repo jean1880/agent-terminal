@@ -46,11 +46,17 @@ impl AgentTerminalWindow {
         }
         info!("No settings file at launch: offering the setup walkthrough");
         FIRST_RUN_SETUP_OPEN.with(|f| f.set(true));
-        self.show_setup();
+        self.present_setup(true);
     }
 
-    /// Shows the walkthrough.
+    /// Shows the walkthrough (a re-run from Settings; it holds nothing back).
     pub(super) fn show_setup(&self) {
+        self.present_setup(false);
+    }
+
+    /// Shows the walkthrough. `holds_update_check`: it is the first-run one, which alone releases
+    /// the startup update check when it closes.
+    fn present_setup(&self, holds_update_check: bool) {
         let obj = self.obj();
         let dialog = adw::Dialog::builder()
             .title("Set Up Agent Terminal")
@@ -77,10 +83,13 @@ impl AgentTerminalWindow {
                     );
                 }
                 // A first run held back the startup update check until now; it reads the switch
-                // as set here. (A later window, or a re-run from Settings, finds it done.)
-                FIRST_RUN_SETUP_OPEN.with(|f| f.set(false));
-                SETUP_FINISHED.with(|f| f.set(true));
-                imp.check_updates_on_startup();
+                // as set here. Only the dialog that took the hold releases it: another window's
+                // re-run closing meanwhile must not.
+                if holds_update_check {
+                    FIRST_RUN_SETUP_OPEN.with(|f| f.set(false));
+                    SETUP_FINISHED.with(|f| f.set(true));
+                    imp.check_updates_on_startup();
+                }
                 // The welcome screen is up when no CLI was found; an agent switched on or set up
                 // meanwhile shows on a fresh check.
                 if imp.no_cli.get() {

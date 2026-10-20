@@ -595,6 +595,13 @@ impl AgentTerminalWindow {
         default_row
     }
 
+    /// Writes an approval switch now, and says so if the settings could not be saved.
+    fn save_approval_switch(&self) {
+        if !self.save_config_now() {
+            self.show_toast("Your settings could not be saved. The change lasts until you quit.");
+        }
+    }
+
     /// "Automatic Pattern Approvals": whether saved Always-allow rules approve matching requests.
     /// Shared by Settings → Agents and setup; applies on change.
     pub(super) fn pattern_approval_row(&self) -> adw::SwitchRow {
@@ -603,7 +610,8 @@ impl AgentTerminalWindow {
             .title("Automatic Pattern Approvals")
             .subtitle(
                 "Saved Always-allow rules approve matching requests without asking. Off: every \
-                 request asks, except what you allow for this session.",
+                 request asks, except what you allow for this session. Rules exported to an \
+                 agent's own settings are that agent's to apply.",
             )
             .active(self.config.borrow().pattern_auto_approval)
             .build();
@@ -614,8 +622,11 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 let active = row.is_active();
                 if imp.config.borrow().pattern_auto_approval != active {
+                    // The config is shared by every window, so this is the one copy. A security
+                    // switch is written at once, not debounced, so a stale read or a crash in
+                    // the debounce cannot bring it back on.
                     imp.config.borrow_mut().pattern_auto_approval = active;
-                    imp.schedule_config_save();
+                    imp.save_approval_switch();
                 }
                 // Process-wide, last writer wins; the settings file monitor keeps windows in step.
                 crate::always_allow::set_saved_rules_enabled(active);
@@ -642,7 +653,7 @@ impl AgentTerminalWindow {
                 let active = row.is_active();
                 if imp.config.borrow().confirm_rule_modification != active {
                     imp.config.borrow_mut().confirm_rule_modification = active;
-                    imp.schedule_config_save();
+                    imp.save_approval_switch();
                 }
                 // Process-wide, last writer wins; the settings file monitor keeps windows in step.
                 crate::always_allow::set_confirm_rule_modification(active);
