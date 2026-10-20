@@ -47,6 +47,8 @@ pub struct DriverInfo {
     pub profile_name: &'static str,
     /// What to tell the user when the binary is missing.
     pub install_hint: &'static str,
+    /// Where to get it: the page a not-installed row links to (the README's "Get it" column).
+    pub install_url: &'static str,
     /// Arguments after the agent's command that sign in, run in a terminal tab: an installed
     /// agent nobody has signed in to (setup skipped, or the login expired) cannot run a turn.
     /// Empty: the bare command starts its own sign-in on a fresh install.
@@ -67,6 +69,7 @@ const REGISTRY: [DriverInfo; 3] = [
         default_command: "claude",
         profile_name: "Claude",
         install_hint: "Install Claude Code (npm install -g @anthropic-ai/claude-code).",
+        install_url: "https://docs.claude.com/en/docs/claude-code",
         sign_in_args: &[],
         sign_in_hint: "Run claude once and sign in to your Anthropic account (or /login).",
     },
@@ -81,6 +84,7 @@ const REGISTRY: [DriverInfo; 3] = [
         default_command: "agy",
         profile_name: "Antigravity",
         install_hint: "Install the Antigravity CLI (agy).",
+        install_url: "https://antigravity.google",
         sign_in_args: &[],
         sign_in_hint: "Run agy once and sign in with your Google account in the browser it opens.",
     },
@@ -95,6 +99,7 @@ const REGISTRY: [DriverInfo; 3] = [
         default_command: "codex",
         profile_name: "Codex",
         install_hint: "Install the Codex CLI (npm install -g @openai/codex).",
+        install_url: "https://github.com/openai/codex",
         sign_in_args: &["login"],
         sign_in_hint: "Run codex login and sign in with ChatGPT (or an API key).",
     },
@@ -157,6 +162,22 @@ mod mode_tests {
         assert_eq!(Mode::Bypass.session_safe(), Mode::Ask);
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
             assert_eq!(m.session_safe(), m);
+        }
+    }
+}
+
+#[cfg(test)]
+mod install_url_tests {
+    use super::Driver;
+
+    #[test]
+    fn every_driver_links_to_a_page_to_install_it() {
+        for driver in Driver::ALL {
+            assert!(
+                driver.info().install_url.starts_with("https://"),
+                "{:?}",
+                driver
+            );
         }
     }
 }

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use agent_core::adapter::{Driver, Mode};
 
 use super::*;
-use crate::availability::AgentAvailability;
+use crate::availability::{AgentAvailability, Availability};
 use crate::config::Profile;
 use crate::model_catalog::ModelCatalog;
 
@@ -44,6 +44,22 @@ fn account_text(driver: Driver, snap: &crate::account_status::Snapshot) -> (Stri
     }
 }
 
+/// The setup summary line for the agents that are `ready` (installed, enabled, not signed out),
+/// and whether it is a warning. While `detecting`, an empty list is not yet a verdict.
+fn ready_summary(ready: &[&str], detecting: bool) -> (String, bool) {
+    if !ready.is_empty() {
+        (format!("Ready: {}", ready.join(", ")), false)
+    } else if detecting {
+        ("Looking for agents…".to_owned(), false)
+    } else {
+        (
+            "No agent is ready yet: threads need an agent that is installed and signed in."
+                .to_owned(),
+            true,
+        )
+    }
+}
+
 /// What the agent rows hold, as their tooltips (an entry row has no subtitle). Shown again once
 /// a value checks out; an invalid one shows why instead.
 const COMMAND_HELP: &str =
@@ -53,6 +69,11 @@ const ARGS_HELP: &str =
 const ENV_FILE_HELP: &str =
     "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
+
+/// What the approvals group is about, on Settings → Agents and in setup.
+pub(super) const APPROVAL_GROUP_HELP: &str =
+    "How saved rules are used. Each rule is one you chose with Always allow; broad patterns \
+     such as 'cargo *' approve more than you may expect.";
 
 const PERMISSION_SOURCES_HELP: &str =
     "Extra permissions.toml files to import from and export to, separated by ':' (absolute or \
@@ -568,23 +589,19 @@ impl AgentTerminalWindow {
         default_row
     }
 
-    /// The "In-App Approvals and Pattern Matching" preferences group.
-    pub(super) fn permissions_group(&self) -> adw::PreferencesGroup {
-        let group = adw::PreferencesGroup::builder()
-            .title("In-App Approvals and Pattern Matching")
-            .description(
-                "Agent Terminal manages approvals directly within the app, automatically permitting \
-                 commands and tools matching wildcard rules (e.g. 'cargo test*') without interrupting your work.",
-            )
-            .build();
-
+    /// "Automatic Pattern Approvals": whether saved Always-allow rules approve matching requests.
+    /// Shared by Settings → Agents and setup; applies on change.
+    pub(super) fn pattern_approval_row(&self) -> adw::SwitchRow {
         let obj = self.obj();
-        let auto_approve_row = adw::SwitchRow::builder()
-            .title("In-App Pattern Auto-Approval")
-            .subtitle("Automatically approve commands and tools matching saved pattern rules")
+        let row = adw::SwitchRow::builder()
+            .title("Automatic Pattern Approvals")
+            .subtitle(
+                "Saved Always-allow rules approve matching requests without asking. Off: every \
+                 request asks, except what you allow for this session.",
+            )
             .active(self.config.borrow().pattern_auto_approval)
             .build();
-        auto_approve_row.connect_active_notify(glib::clone!(
+        row.connect_active_notify(glib::clone!(
             #[weak]
             obj,
             move |row| {
@@ -594,18 +611,24 @@ impl AgentTerminalWindow {
                     imp.config.borrow_mut().pattern_auto_approval = active;
                     imp.schedule_config_save();
                 }
+                // Process-wide, last writer wins; the settings file monitor keeps windows in step.
+                crate::always_allow::set_saved_rules_enabled(active);
             }
         ));
-        group.add(&auto_approve_row);
+        row
+    }
 
-        let confirm_row = adw::SwitchRow::builder()
+    /// "Confirm and Customise Patterns on Save", shared like [`Self::pattern_approval_row`].
+    pub(super) fn confirm_rule_row(&self) -> adw::SwitchRow {
+        let obj = self.obj();
+        let row = adw::SwitchRow::builder()
             .title("Confirm and Customise Patterns on Save")
             .subtitle(
                 "Prompt with an interactive dialogue to loosen or tighten patterns when choosing 'Always allow'",
             )
             .active(self.config.borrow().confirm_rule_modification)
             .build();
-        confirm_row.connect_active_notify(glib::clone!(
+        row.connect_active_notify(glib::clone!(
             #[weak]
             obj,
             move |row| {
@@ -615,9 +638,23 @@ impl AgentTerminalWindow {
                     imp.config.borrow_mut().confirm_rule_modification = active;
                     imp.schedule_config_save();
                 }
+                // Process-wide, last writer wins; the settings file monitor keeps windows in step.
+                crate::always_allow::set_confirm_rule_modification(active);
             }
         ));
-        group.add(&confirm_row);
+        row
+    }
+
+    /// The "In-App Approvals and Pattern Matching" preferences group.
+    pub(super) fn permissions_group(&self) -> adw::PreferencesGroup {
+        let group = adw::PreferencesGroup::builder()
+            .title("In-App Approvals and Pattern Matching")
+            .description(APPROVAL_GROUP_HELP)
+            .build();
+
+        group.add(&self.pattern_approval_row());
+        group.add(&self.confirm_rule_row());
+        let obj = self.obj();
 
         // Extra permission files to import from and export to; none unless the user names them.
         let sources_row = adw::EntryRow::builder()
@@ -1435,6 +1472,58 @@ impl AgentTerminalWindow {
         group
     }
 
+    /// The top of the setup's agents page: who is ready to run a thread (installed, enabled and
+    /// not known to be signed out), and Check Again to scan once more. Follows detection and the
+    /// account checks until `dialog` closes.
+    pub(super) fn agents_ready_group(&self, dialog: &adw::Dialog) -> adw::PreferencesGroup {
+        let obj = self.obj();
+        let summary = adw::ActionRow::builder()
+            .title("Ready to Use")
+            .use_markup(false)
+            .build();
+        let check = gtk4::Button::builder()
+            .label("Check Again")
+            .valign(gtk4::Align::Center)
+            .tooltip_text("Look for the agents again, for one you just installed")
+            .build();
+        check.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| obj.imp().refresh_agent_data(super::threads::Probes::Force)
+        ));
+        summary.add_suffix(&check);
+        let show = glib::clone!(
+            #[weak]
+            summary,
+            move || {
+                let availability = AgentAvailability::shared();
+                let account = crate::account_status::AccountStatus::shared();
+                let ready: Vec<&str> = Driver::ALL
+                    .into_iter()
+                    .filter(|d| availability.is_ready(*d) && !account.snapshot(*d).signed_out)
+                    .map(|d| d.info().label)
+                    .collect();
+                let (text, error) = ready_summary(&ready, availability.any_detecting());
+                summary.set_subtitle(&text);
+                if error {
+                    summary.add_css_class("warning");
+                } else {
+                    summary.remove_css_class("warning");
+                }
+            }
+        );
+        show();
+        let ready_id = AgentAvailability::shared().connect_changed(show.clone());
+        let account_id = crate::account_status::AccountStatus::shared().connect_changed(show);
+        dialog.connect_closed(move |_| {
+            AgentAvailability::shared().disconnect(ready_id);
+            crate::account_status::AccountStatus::shared().disconnect(account_id);
+        });
+        let group = adw::PreferencesGroup::new();
+        group.add(&summary);
+        group
+    }
+
     /// `driver`'s on/off switch, saying what detection found (ready and where, missing and how to
     /// install, or off). Follows the scan until `dialog` closes.
     pub(super) fn agent_enabled_row(&self, driver: Driver, dialog: &adw::Dialog) -> adw::SwitchRow {
@@ -1448,6 +1537,15 @@ impl AgentTerminalWindow {
         let brand = gtk4::Image::from_gicon(&crate::icons::driver_icon(driver));
         brand.set_pixel_size(20);
         enabled.add_prefix(&brand);
+        // A link to the agent's install page, shown only while detection found nothing.
+        let get_it = gtk4::LinkButton::builder()
+            .uri(driver.info().install_url)
+            .label("Get It")
+            .valign(gtk4::Align::Center)
+            .tooltip_text(driver.info().install_url)
+            .visible(AgentAvailability::shared().get(driver) == Availability::Missing)
+            .build();
+        enabled.add_suffix(&get_it);
         enabled.connect_active_notify(glib::clone!(
             #[weak]
             obj,
@@ -1463,8 +1561,12 @@ impl AgentTerminalWindow {
         let state_id = AgentAvailability::shared().connect_changed(glib::clone!(
             #[weak]
             enabled,
+            #[weak]
+            get_it,
             move || {
-                enabled.set_subtitle(&AgentAvailability::shared().get(driver).describe(driver));
+                let state = AgentAvailability::shared().get(driver);
+                enabled.set_subtitle(&state.describe(driver));
+                get_it.set_visible(state == Availability::Missing);
             }
         ));
         dialog.connect_closed(move |_| AgentAvailability::shared().disconnect(state_id));
@@ -1499,14 +1601,19 @@ impl AgentTerminalWindow {
                 account.set_visible(AgentAvailability::shared().is_ready(driver));
                 let snap = crate::account_status::AccountStatus::shared().snapshot(driver);
                 let (text, signed_out) = account_text(driver, &snap);
+                let started = obj.imp().sign_in_was_started(driver);
+                // After Sign In the button turns into Check Again: say so where it can be read.
+                let text = if signed_out && started {
+                    "Not signed in. Finish signing in in the terminal tab that opened, then \
+                     choose Check Again."
+                        .to_owned()
+                } else {
+                    text
+                };
                 account.set_subtitle(&text);
                 sign_in.set_visible(signed_out);
                 // The same two steps as a thread's banner: open the sign-in, then check.
-                sign_in.set_label(if obj.imp().sign_in_was_started(driver) {
-                    "Check Again"
-                } else {
-                    "Sign In…"
-                });
+                sign_in.set_label(if started { "Check Again" } else { "Sign In…" });
                 if signed_out {
                     account.add_css_class("error");
                 } else {
@@ -1907,11 +2014,14 @@ impl AgentTerminalWindow {
 
         if driver == Driver::Agy {
             self.add_hook_rows(group);
+            group.add(&always_allowed_rows());
         }
     }
 
     /// agy's approval hook: whether hooks.json installs it, the entry to add, and a Copy button.
-    fn add_hook_rows(&self, group: &adw::PreferencesGroup) {
+    /// Read-only towards `~/.gemini`: the app never writes the hook file. Shared by Settings →
+    /// Agents and setup.
+    pub(super) fn add_hook_rows(&self, group: &adw::PreferencesGroup) {
         let entry = crate::hook_config::install_entry_json();
         let hook = adw::ActionRow::builder()
             .title("Approval Hook")
@@ -1956,7 +2066,6 @@ impl AgentTerminalWindow {
             .build();
         expander.add_row(&json);
         group.add(&expander);
-        group.add(&always_allowed_rows());
 
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
@@ -2186,6 +2295,18 @@ fn detect_agent(command: &str) -> Result<String, String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn ready_summary_names_the_ready_agents_or_warns() {
+        assert_eq!(
+            ready_summary(&["Claude", "Codex"], false),
+            ("Ready: Claude, Codex".to_owned(), false)
+        );
+        assert_eq!(ready_summary(&["Claude"], true).0, "Ready: Claude");
+        assert!(!ready_summary(&[], true).1, "detecting is not a verdict");
+        let (text, warn) = ready_summary(&[], false);
+        assert!(warn && text.starts_with("No agent is ready yet"), "{text}");
+    }
 
     #[test]
     fn dropping_a_debounce_saves_its_pending_edit() {

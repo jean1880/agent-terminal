@@ -1088,6 +1088,7 @@ thread_local! {
 fn initial_config() -> crate::config::TerminalConfig {
     let config = crate::config::TerminalConfig::load();
     crate::config::mirror_quick_replies(config.suggest_quick_replies);
+    crate::config::mirror_approval_policy(&config);
     config
 }
 
@@ -1471,6 +1472,7 @@ impl AgentTerminalWindow {
         };
         *self.config.borrow_mut() = *new;
         crate::config::mirror_quick_replies(self.config.borrow().suggest_quick_replies);
+        crate::config::mirror_approval_policy(&self.config.borrow());
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
@@ -2427,6 +2429,11 @@ impl AgentTerminalWindow {
             action.set_enabled(true);
         }
         self.show_boot_page("ready");
+        // On a first run the check waits for setup to close (it reads the then-current switch),
+        // without using up the once-per-process check.
+        if self.setup_holds_update_check() {
+            return;
+        }
         self.check_updates_on_startup();
     }
 
@@ -2867,6 +2874,36 @@ impl AgentTerminalWindow {
                     .for_each_window(|window| window.show_known_update());
             }
         });
+    }
+
+    /// Whether this window's startup update check must wait for the first-run setup: it is a
+    /// first run and setup has not closed yet.
+    fn setup_holds_update_check(&self) -> bool {
+        self.config.borrow().is_first_run() && !setup::setup_finished()
+    }
+
+    /// The "Check for Updates at Startup" switch, shared by Settings → General and setup. It
+    /// applies from the next start; on a first run setup's close starts the check if it is on.
+    pub(super) fn update_check_row(&self) -> adw::SwitchRow {
+        let obj = self.obj();
+        let row = adw::SwitchRow::builder()
+            .title("Check for Updates at Startup")
+            .subtitle(
+                "Ask GitHub in the background whether a newer release is out; one found puts a \
+                 yellow dot on the menu. Off, the app only checks when you pick Check for Updates",
+            )
+            .active(self.config.borrow().check_updates_on_startup)
+            .build();
+        row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                imp.config.borrow_mut().check_updates_on_startup = row.is_active();
+                imp.schedule_config_save();
+            }
+        ));
+        row
     }
 
     /// "Check for Updates…": asks GitHub for the newest release (off the main thread; the one
@@ -3813,6 +3850,14 @@ impl AgentTerminalWindow {
         crate::config::mirror_quick_replies(on);
     }
 
+    /// Drops a queued save and writes now; whether the file was written.
+    fn save_config_now(&self) -> bool {
+        if let Some(pending) = self.pending_save.borrow_mut().take() {
+            pending.remove();
+        }
+        self.config.borrow().save_checked()
+    }
+
     /// Cancels a queued save and writes immediately, if one was pending.
     fn flush_pending_save(&self) {
         if let Some(pending) = self.pending_save.borrow_mut().take() {
@@ -4266,14 +4311,7 @@ impl AgentTerminalWindow {
             .active(config.notify_on_quota)
             .build();
 
-        let update_check_row = adw::SwitchRow::builder()
-            .title("Check for Updates at Startup")
-            .subtitle(
-                "Ask GitHub in the background whether a newer release is out; one found puts a \
-                 yellow dot on the menu. Off, the app only checks when you pick Check for Updates",
-            )
-            .active(config.check_updates_on_startup)
-            .build();
+        let update_check_row = self.update_check_row();
 
         let restore_row = adw::SwitchRow::builder()
             .title("Reopen Terminal Tabs")
@@ -4430,17 +4468,6 @@ impl AgentTerminalWindow {
                     });
                     imp.withdraw_bell_if_answered();
                 }
-                imp.schedule_config_save();
-            }
-        ));
-
-        update_check_row.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let imp = obj.imp();
-                // Applies from the next start: this run's check has already happened or not.
-                imp.config.borrow_mut().check_updates_on_startup = row.is_active();
                 imp.schedule_config_save();
             }
         ));
