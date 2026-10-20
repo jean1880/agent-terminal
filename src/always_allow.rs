@@ -1583,8 +1583,8 @@ pub fn set_saved_rules_enabled(on: bool) {
 }
 
 /// [`set_saved_rules_enabled`]'s value; `true` until set. Off: a saved rule never approves a
-/// call, no card offers "Always allow", and an "Always allow" answer keeps nothing for good
-/// ([`kept_answer`]). Session grants hold either way.
+/// call, no card offers "Always allow", and an "Always allow" answer is allowed once, keeping
+/// nothing ([`kept_answer`]). Session grants hold either way.
 pub fn saved_rules_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_POLICY.with(std::cell::Cell::get) {
@@ -1605,15 +1605,20 @@ pub fn confirm_rule_modification() -> bool {
 }
 
 /// The answer a gate acts on for `decision` when saved rules are `saved_rules_on` or not: with
-/// them off, "Always allow" becomes "Allow for session" (judged afresh, so a call no session
-/// rule can describe is allowed once), and nothing is written to the rules file. Pure: the
-/// switch is passed in.
+/// them off, "Always allow" (a card shown before the switch turned off) is a one-off Allow. It
+/// never becomes a session grant, which could keep a whole folder or a widened read where the
+/// card promised one exact rule, and nothing is written to the rules file. Pure: the switch is
+/// passed in.
 pub fn kept_answer(decision: Decision, saved_rules_on: bool) -> Decision {
     match decision {
-        Decision::AllowAlways if !saved_rules_on => Decision::AllowForSession,
+        Decision::AllowAlways if !saved_rules_on => Decision::Allow,
         d => d,
     }
 }
+
+/// The notice for an "Always allow" answered while saved rules are off ([`kept_answer`]).
+pub const ALLOWED_ONCE_SAVED_RULES_OFF: &str =
+    "Allowed once; no rule was kept: Automatic Pattern Approvals is off.";
 
 /// Holds this test thread's [`saved_rules_enabled`] at a value, and restores the previous one on
 /// drop; the process-wide switch is never touched.
@@ -1754,9 +1759,25 @@ impl AlwaysRules {
 
     /// Adds `rule` to the file at `path` (read, add, save), holding the store lock throughout,
     /// so two quick answers are applied one after the other. `Ok(false)`: it was already there.
-    /// Blocking file I/O: run it off the main thread.
+    /// Blocking file I/O: run it off the main thread. The app saves through
+    /// [`Self::remember_while`].
+    #[cfg(test)]
     pub fn remember(path: &Path, rule: Rule) -> Result<bool, StoreError> {
+        Self::remember_while(path, rule, &|| true)
+    }
+
+    /// [`Self::remember`] only if `enabled` still holds once the store lock is taken, right
+    /// before the write: the answer's own check may be stale by then (the switch turned off while
+    /// the save waited for its worker). `Ok(false)`: nothing was written.
+    pub fn remember_while(
+        path: &Path,
+        rule: Rule,
+        enabled: &dyn Fn() -> bool,
+    ) -> Result<bool, StoreError> {
         with_store_lock(path, || {
+            if !enabled() {
+                return Ok(false);
+            }
             let (mut rules, snapshot) = Self::read(path)?;
             if !rules.add(rule) {
                 return Ok(false);
@@ -6341,7 +6362,7 @@ host_executable(name="ls", paths=["/bin/ls"])
     }
 
     #[test]
-    fn an_always_answer_keeps_a_session_grant_while_saved_rules_are_off() {
+    fn an_always_answer_is_allowed_once_while_saved_rules_are_off() {
         for decision in [
             Decision::Allow,
             Decision::AllowForSession,
@@ -6353,10 +6374,25 @@ host_executable(name="ls", paths=["/bin/ls"])
         }
         assert_eq!(
             kept_answer(Decision::AllowAlways, false),
-            Decision::AllowForSession
+            Decision::Allow,
+            "never a session grant, which could be wider than the card's rule"
         );
         for decision in [Decision::Allow, Decision::AllowForSession, Decision::Deny] {
             assert_eq!(kept_answer(decision, false), decision);
         }
+    }
+
+    #[test]
+    fn a_save_checks_the_switch_again_right_before_it_writes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join(FILE_NAME);
+        let workspace = tmp.path().to_path_buf();
+        let cwd = workspace.to_string_lossy().into_owned();
+        let c = ctx("claude", &workspace, Some(&cwd));
+        let rule = Rule::from_action(&shell("ls -la"), &c).expect("rule");
+        assert!(!AlwaysRules::remember_while(&path, rule.clone(), &|| false).expect("off"));
+        assert!(!path.exists(), "off: nothing was written");
+        assert!(AlwaysRules::remember_while(&path, rule, &|| true).expect("on"));
+        assert_eq!(AlwaysRules::open(&path).expect("open").rules.len(), 1);
     }
 }
