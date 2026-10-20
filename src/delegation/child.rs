@@ -245,6 +245,23 @@ impl Supervisor {
                 "The provider has not listed this effort.",
             ));
         }
+        // agy takes no `--effort` for a catalogue model ("--effort is not supported for model …"):
+        // its effort rides in the model id (`gemini-4-argon-high`), as a thread's picker does.
+        let model = if driver == Driver::Agy {
+            if effort.as_ref().is_some_and(|e| {
+                models
+                    .iter()
+                    .any(|m| Some(&m.id) == model.as_ref() && !m.efforts.contains(e))
+            }) {
+                warnings.push(Warning::new(
+                    "effort_not_listed",
+                    "The provider has not listed this effort; the model's default is used.",
+                ));
+            }
+            super::catalog_info::agy_launch_model(&models, model, effort.as_deref())
+        } else {
+            model
+        };
         // A lease namespace is random and independent of the authority worker minted at accept.
         let lease_plan = if let WorkspaceRequest::IsolatedWorktree { base } = &r.workspace {
             let namespace =

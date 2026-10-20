@@ -349,7 +349,42 @@ impl AgentTerminalWindow {
         };
         let config = self.config.clone();
         let profiles = config.clone();
+        let tags_config = config.clone();
         let weak = self.obj().downgrade();
+        // usage.json for tools outside the app; once per process.
+        crate::usage_file::install();
+        let tags_cache = Rc::new(crate::model_tags_file::TagsCache::default());
+        let catalog = crate::delegation::services::CatalogServices {
+            models: Rc::new(|driver| {
+                let availability = AgentAvailability::shared();
+                crate::model_catalog::only_ready(
+                    crate::model_catalog::ModelCatalog::shared().models_of(driver),
+                    |d| availability.is_ready(d),
+                )
+            }),
+            usage: Rc::new(|driver| {
+                Some(crate::account_status::AccountStatus::shared().snapshot(driver))
+            }),
+            tags: Rc::new(move || -> crate::delegation::seam::LocalFuture<crate::model_tags_file::TagsState> {
+                let (cache, path) = (tags_cache.clone(), tags_config.borrow().model_tags_file());
+                std::boxed::Box::pin(async move { cache.current(path).await })
+            }),
+            refresh_usage: Rc::new(|wait: std::time::Duration| -> crate::delegation::seam::LocalFuture<()> {
+                std::boxed::Box::pin(async move {
+                    // The targets of the window's last availability scan: only agents that are
+                    // ready, in the environment their threads get.
+                    let targets = crate::model_catalog::ModelCatalog::shared().last_targets();
+                    crate::account_status::AccountStatus::shared()
+                        .refresh_and_wait(
+                            &targets,
+                            crate::delegation::services::USAGE_REFRESH_FLOOR,
+                            crate::freshness::now_epoch(),
+                            wait,
+                        )
+                        .await;
+                })
+            }),
+        };
         crate::delegation::start(crate::delegation::AppServices {
             handle: app_handle(),
             store_path: STORE_PATH.with(|p| p.borrow().clone()),
@@ -403,6 +438,7 @@ impl AgentTerminalWindow {
                     obj.imp().show_toast(text);
                 }
             }),
+            catalog,
         });
     }
 }

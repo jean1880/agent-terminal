@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// `cross_agent_capabilities` with `refresh` waits at most this long for usage probes.
+const USAGE_REFRESH_WAIT: Duration = Duration::from_secs(20);
+
 impl CallDispatcher for Supervisor {
     fn authenticate(
         &self,
@@ -906,19 +909,7 @@ impl Supervisor {
                     "connection unauthenticated",
                 )
             })?;
-        let valid = self
-            .state
-            .borrow()
-            .workers
-            .get(&worker)
-            .and_then(|w| w.token.as_ref())
-            .is_some_and(|t| t.live_conn == Some(conn));
-        if !valid {
-            return Err(error(
-                ErrorCode::AuthenticationFailed,
-                "connection capability was revoked",
-            ));
-        }
+        self.still_authorized(conn, &worker)?;
         if !self.profile_available(&worker) {
             return Err(error(
                 ErrorCode::ProviderUnavailable,
@@ -928,20 +919,6 @@ impl Supervisor {
         self.epoch(&worker)?;
         let req = parse_request(call.tool, &call.args, &self.limits)?.normalised();
         let driver = self.state.borrow().workers[&worker].driver;
-        {
-            let state = self.state.borrow();
-            let w = &state.workers[&worker];
-            if w.row.parent_id.is_some()
-                && w.token.as_ref().is_none_or(|t| {
-                    t.epoch.0 != state.roots[&w.root].row.authority_epoch.max(0) as u64
-                })
-            {
-                return Err(error(
-                    ErrorCode::StaleEpoch,
-                    "child credential belongs to an older authority epoch",
-                ));
-            }
-        }
         let args = attestation_arguments(call.tool, &call.args, &self.limits)?;
         let until = Instant::now() + Duration::from_millis(self.limits.attestation_wait_ms);
         let attested = loop {
@@ -974,21 +951,10 @@ impl Supervisor {
             }
             self.recheck_agy(&worker).await?;
         }
-        if !self
-            .state
-            .borrow()
-            .workers
-            .get(&worker)
-            .and_then(|w| w.token.as_ref())
-            .is_some_and(|t| t.live_conn == Some(conn))
-        {
-            return Err(error(
-                ErrorCode::AuthenticationFailed,
-                "capability revoked while authenticating call",
-            ));
-        }
+        // Attestation and the agy recheck awaited: the same checks again before dispatch.
+        self.still_authorized(conn, &worker)?;
         match req {
-            ToolRequest::Capabilities(r) => self.capabilities(&worker, r).await,
+            ToolRequest::Capabilities(r) => self.capabilities(conn, &worker, r).await,
             ToolRequest::List(r) => self.list_workers(&worker, r),
             ToolRequest::Read(r) => self.read_page(&worker, r).await,
             ToolRequest::Wait(r) => self.wait_page(conn, call.id, &worker, r).await,
@@ -1035,12 +1001,64 @@ impl Supervisor {
             .err()
             .map(|e| e.message)
     }
+    /// The caller checks `handle_call` makes before dispatch, and again after any `await`: the
+    /// connection still holds the worker's live capability, the worker's root epoch is current,
+    /// and a child's credential belongs to that epoch. Returns the current epoch.
+    pub(super) fn still_authorized(
+        &self,
+        conn: ConnId,
+        worker: &WorkerId,
+    ) -> Result<AuthorityEpoch, ToolError> {
+        let live = self
+            .state
+            .borrow()
+            .workers
+            .get(worker)
+            .and_then(|w| w.token.as_ref())
+            .is_some_and(|t| t.live_conn == Some(conn));
+        if !live {
+            return Err(error(
+                ErrorCode::AuthenticationFailed,
+                "connection capability was revoked",
+            ));
+        }
+        let epoch = self.epoch(worker)?;
+        let state = self.state.borrow();
+        let stale = state.workers.get(worker).is_none_or(|w| {
+            w.row.parent_id.is_some()
+                && w.token.as_ref().is_none_or(|t| {
+                    state
+                        .roots
+                        .get(&w.root)
+                        .is_none_or(|r| t.epoch.0 != r.row.authority_epoch.max(0) as u64)
+                })
+        });
+        if stale {
+            return Err(error(
+                ErrorCode::StaleEpoch,
+                "child credential belongs to an older authority epoch",
+            ));
+        }
+        Ok(epoch)
+    }
     async fn capabilities(
         &self,
+        conn: ConnId,
         worker: &WorkerId,
         request: CapabilitiesRequest,
     ) -> Result<Value, ToolError> {
-        let epoch = self.epoch(worker)?;
+        self.epoch(worker)?;
+        if request.refresh {
+            // At most once a minute per agent (the status's own gate); the wait never blocks the
+            // main loop, and a probe still running when it ends is left to finish.
+            let wait = Duration::from_millis(u64::from(self.limits.wait_timeout_max_ms))
+                .min(USAGE_REFRESH_WAIT);
+            (self.services.catalog.refresh_usage)(wait).await;
+        }
+        let tags = (self.services.catalog.tags)().await;
+        // The world may have moved during those awaits: answer only a caller still authorized.
+        self.still_authorized(conn, worker)?;
+        let now = crate::freshness::now_epoch();
         let caller = {
             let state = self.state.borrow();
             let w = &state.workers[worker];
@@ -1097,7 +1115,12 @@ impl Supervisor {
                             }
                         })
                         .collect(),
-                    models: Vec::new(),
+                    models: (self.services.catalog.models)(driver)
+                        .iter()
+                        .filter_map(|m| super::catalog_info::model_info(m, tags.tags.as_deref()))
+                        .collect(),
+                    usage: (self.services.catalog.usage)(driver)
+                        .map(|s| super::catalog_info::usage_info(&s, now)),
                     workspaces: vec![
                         WorkspaceKind::SharedReadOnly,
                         WorkspaceKind::IsolatedWorktree,
@@ -1125,6 +1148,25 @@ impl Supervisor {
                 p.reason = Some(e.message);
             }
         }
+        // The last await is behind us: check again, and report the epoch as it is now.
+        let epoch = self.still_authorized(conn, worker)?;
+        // The caller's own profile may have been switched off for delegation meanwhile.
+        if !self.profile_available(worker) {
+            return Err(error(
+                ErrorCode::ProviderUnavailable,
+                "profile disabled for delegation",
+            ));
+        }
+        // The schema's bound on models per profile; what goes is counted like truncation's cuts.
+        let mut omitted = Omitted::default();
+        for p in &mut profiles {
+            let over = p
+                .models
+                .len()
+                .saturating_sub(super::catalog_info::MAX_MODELS);
+            p.models.truncate(super::catalog_info::MAX_MODELS);
+            omitted.models += u32::try_from(over).unwrap_or(u32::MAX);
+        }
         let mut response = CapabilitiesResponse {
             api_version: 1,
             caller,
@@ -1132,8 +1174,15 @@ impl Supervisor {
             delegation_scope: DELEGATION_SCOPE_SUPERVISED.into(),
             profiles,
             limits: CapabilityLimits::from_limits(&self.limits),
-            truncated: false,
-            omitted: Omitted::default(),
+            truncated: omitted.models > 0,
+            omitted,
+            tag_vocabulary: tags
+                .tags
+                .as_ref()
+                .map(|t| t.vocabulary.clone())
+                .unwrap_or_default(),
+            tags_status: tags.status,
+            effort_policy: tags.tags.as_ref().and_then(|t| t.effort_policy.clone()),
         };
         truncate_capabilities(&mut response);
         serde_json::to_value(response)

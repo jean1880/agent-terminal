@@ -4,13 +4,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use agent_core::adapter::{Adapter, Driver};
+use agent_core::catalog::CatalogModel;
 use agent_core::delegation::{ErrorCode, ToolError};
 use agent_kit::store::Store;
 use agent_kit::store_writer::StoreHandle;
 
 use super::seam::{LocalFuture, ResolvedChild};
+use crate::account_status::Snapshot;
 use crate::config::Profile;
 use crate::hook_config::HookTarget;
+use crate::model_tags_file::TagsState;
 
 /// The narrow app services the supervisor holds (built by Lane E from `window::imp::threads`).
 pub(crate) struct AppServices {
@@ -25,6 +28,44 @@ pub(crate) struct AppServices {
     pub hook_check: Rc<HookCheck>,
     pub tab_open_in: Rc<dyn Fn(&Path) -> bool>,
     pub report: Rc<dyn Fn(&str)>,
+    /// Models, tags and usage for `cross_agent_capabilities`.
+    pub catalog: CatalogServices,
+}
+
+/// `cross_agent_capabilities` with `refresh` probes an agent only when its last reading or
+/// attempt is this old (seconds), so repeated calls cannot storm a failing agent.
+pub(crate) const USAGE_REFRESH_FLOOR: i64 = 60;
+
+/// What `cross_agent_capabilities` reports about models and plan usage. The default knows no
+/// model, no usage and no tag file (tests that do not exercise it).
+#[derive(Clone)]
+pub(crate) struct CatalogServices {
+    /// The models a ready agent offers (none for an agent that is not ready).
+    pub models: Rc<dyn Fn(Driver) -> Vec<CatalogModel>>,
+    /// The agent's plan usage as last read; `None` when the app keeps none.
+    pub usage: Rc<dyn Fn(Driver) -> Option<Snapshot>>,
+    /// The tag file, cached and re-read off the main thread only when it changed.
+    pub tags: Rc<dyn Fn() -> LocalFuture<TagsState>>,
+    /// Re-reads usage that is at least a minute old and waits up to the given time for it.
+    pub refresh_usage: Rc<dyn Fn(std::time::Duration) -> LocalFuture<()>>,
+}
+
+impl Default for CatalogServices {
+    fn default() -> Self {
+        Self {
+            models: Rc::new(|_| Vec::new()),
+            usage: Rc::new(|_| None),
+            tags: Rc::new(|| -> LocalFuture<TagsState> {
+                Box::pin(std::future::ready(TagsState {
+                    tags: None,
+                    status: Some("no model tag file configured".into()),
+                }))
+            }),
+            refresh_usage: Rc::new(|_: std::time::Duration| -> LocalFuture<()> {
+                Box::pin(std::future::ready(()))
+            }),
+        }
+    }
 }
 
 /// `threads::cached_agent` plus `unset_list`, as a service.

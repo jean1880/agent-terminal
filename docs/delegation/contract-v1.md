@@ -256,7 +256,7 @@ Counts alone do not bound a response. Every tool output O is therefore measured 
   - `internal_error` is never stored as an operation's error.
 
 ### `cross_agent_capabilities`
-In: `{profile_id?: string}`.
+In: `{profile_id?: string, refresh?: bool}`.
 Out:
 ```jsonc
 {"api_version": 1,
@@ -268,14 +268,39 @@ Out:
    "reason": "string|null",
    "modes": [{"task_mode": "plan", "route_status": "verified|unverified|unsupported", "route_blockers": ["string"],
               "child_bridge": "with_bridge|without_bridge"}],   // one row per TaskMode (route admission, §11)
-   "models": [{"id": "string", "efforts": ["string"]}],   // advisory (codex.md D4)
+   "models": [{"id": "string", "display": "string", "efforts": ["string"], "default_effort": "string?",
+               "tags": ["code","review"], "tier": "fast|standard|deep?", "best_for": "string?",
+               "effort_for": {"fast": "low", "standard": "medium", "deep": "high"}}],  // advisory (codex.md D4)
+   "usage": {"headroom": "ok|low|exhausted|unknown", "load": 0.42, "age_s": 30,
+             "windows": [{"group": "string?", "label": "5-hour", "used": 0.42, "resets_at": "RFC 3339?"}],
+             "refresh_failed": false, "signed_out": false},
    "workspaces": ["shared_read_only","isolated_worktree"],
    "delivery": {"this_run": "strict|best_effort|unsupported", "next_turn": true}, "controls": {"cancel": true, "close": true}}],
  "limits": {"max_task_bytes": 65536, "max_message_bytes": 16384, "max_page_events": 500, "max_page_bytes": 262144,
             "max_wait_ms": 30000, "max_depth": 2, "active_runs_per_root": 4},
+ "tag_vocabulary": {"code": "writes/refactors code"}, "tags_status": "string|null",
+ "effort_policy": {"ladder": ["low","medium","high"], "fast": "low", "standard": "medium", "deep": "high",
+                   "reserved": ["xhigh","max"]},
  "truncated": false, "omitted": {"profiles": 0, "models": 0}}
 ```
 - It never contains environment values, tokens, socket paths or account labels.
+- **Tags, tier, `best_for` and `effort_policy`** come from the model tag file (`model_tags_path` in the config,
+  default `<config dir>/model-tags.json`). It is read off the main thread and parsed again only when its mtime or
+  size changes. A missing or invalid file never fails the call: models are listed with empty tags and
+  `tags_status` says why. Patterns match model ids case-insensitively with `*` wildcards; the first entry wins.
+- **`effort_for`** is each tier's policy effort clamped to the efforts the model offers: the effort itself if
+  offered, else the highest offered below it on the ladder, else the lowest offered. A `reserved` effort is never
+  recommended. Null when there is no policy or no tier gets an effort. agy takes the effort in the model id
+  (`gemini-4-argon-high`): a spawn composes it.
+- **`usage`** is the agent's quota reading. `load` is the fullest window's share used, the value to rank agents
+  by; it is null exactly when `headroom` is `unknown` (no windows, or a reading older than 20 min). `headroom` is
+  `low` at 0.80 and `exhausted` at 0.98. The same reading is written, without any account field, to
+  `$XDG_CACHE_HOME/agent-terminal/usage.json` (0600, atomic, one write in flight) for readers outside
+  agent-terminal.
+- **`refresh: true`** probes, before answering, each agent whose last reading or attempt is at least 60 s old, but
+  never a signed-out agy (its login opens a browser). It waits for those probes at most
+  min(20 s, `max_wait_ms`); a probe still running then is left to finish. The caller's authority is checked
+  again after every wait.
 - `delivery.this_run`: Codex `strict`, Claude `best_effort`, agy `unsupported`.
 - **Per-field bounds**, enforced when the catalogue is read:
   - at most 32 profiles, with names of at most 80 chars and `reason` at most 256 B;
@@ -290,7 +315,8 @@ Out:
      profile that still lists a model is removed. Only when no profile lists a model is the last whole profile
      removed. The first profile is never removed.
   3. A profile is kept or dropped whole. Its identity and status fields are never dropped or shortened:
-     `profile_id`, `name`, `driver`, `available`, `reason`, `modes`, `workspaces`, `delivery` and `controls`.
+     `profile_id`, `name`, `driver`, `available`, `reason`, `modes`, `usage`, `workspaces`, `delivery` and
+     `controls`. `tag_vocabulary` and `effort_policy` are never cut, and count toward the budget.
   4. `truncated` is true if anything was removed. `omitted.profiles` and `omitted.models` count the removed entries.
      A profile whose model list was cut is still in the response; its missing models count in `omitted.models`.
 - One profile with no models costs at most 64 KiB (about 21 KiB of JSON, tripled), even with worst-case escaping, so truncation always ends

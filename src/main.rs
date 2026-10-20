@@ -31,6 +31,7 @@ mod freshness;
 mod hook_config;
 mod icons;
 mod model_catalog;
+mod model_tags_file;
 mod palette;
 mod probe;
 #[cfg(not(feature = "terminal"))]
@@ -38,6 +39,7 @@ pub mod terminal_stub;
 #[cfg(test)]
 mod testutil;
 mod theme;
+mod usage_file;
 mod utils;
 mod window;
 // The GTK-free logic lives in `agent-kit`; these imports keep the

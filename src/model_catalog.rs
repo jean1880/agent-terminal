@@ -45,9 +45,14 @@ use crate::{claude_probe, codex_probe};
 /// (passed in, so tests never read the real environment). A relative or empty value is ignored,
 /// per the XDG spec.
 pub fn cache_path(xdg_cache_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    cache_file(xdg_cache_home, home, "models.json")
+}
+
+/// `<cache dir>/agent-terminal/<name>`, by the same rules as [`cache_path`].
+pub fn cache_file(xdg_cache_home: Option<&str>, home: Option<&str>, name: &str) -> Option<PathBuf> {
     let absolute = |v: Option<&str>| v.filter(|s| Path::new(s).is_absolute()).map(PathBuf::from);
     let base = absolute(xdg_cache_home).or_else(|| absolute(home).map(|h| h.join(".cache")))?;
-    Some(base.join("agent-terminal").join("models.json"))
+    Some(base.join("agent-terminal").join(name))
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -421,6 +426,12 @@ impl ModelCatalog {
         } else {
             self.fetch_due(now, MODEL_TTL);
         }
+    }
+
+    /// The probe targets of the window's last availability scan (empty before the first): what
+    /// an on-demand usage refresh probes.
+    pub fn last_targets(&self) -> ProbeTargets {
+        self.targets.borrow().clone()
     }
 
     /// The picker opened: lists older than [`MODEL_PICKER_AGE`] are fetched in the background

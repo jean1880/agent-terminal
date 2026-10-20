@@ -84,6 +84,145 @@ mod tests {
     fn harness() -> (tempfile::TempDir, Rc<Supervisor>, WorkerId) {
         harness_with("claude", false)
     }
+    thread_local! {
+        /// Catalog services for the next harness on this thread (default: none).
+        static TEST_CATALOG: RefCell<Option<super::super::services::CatalogServices>> =
+            const { RefCell::new(None) };
+    }
+    fn caps_call(id: u64, refresh: bool) -> agent_core::delegation::ipc::Call {
+        let request =
+            ToolRequest::Capabilities(agent_core::delegation::wire::CapabilitiesRequest {
+                profile_id: None,
+                refresh,
+            });
+        agent_core::delegation::ipc::Call {
+            id,
+            tool: request.tool(),
+            args: request.args_value(),
+            timeout_ms: 1000,
+            invocation: None,
+        }
+    }
+    /// Capabilities lists the catalogue's models with their tags and effort per tier, each
+    /// profile's usage (never its account), the vocabulary and the effort policy.
+    #[test]
+    fn capabilities_carry_models_tags_and_usage() {
+        use crate::model_tags_file::TagsState;
+        let tags = agent_core::model_tags::parse(
+            r#"{"version": 1, "vocabulary": {"code": "writes code"},
+                "models": [{"match": "*opus*", "tier": "deep", "tags": ["code"]}],
+                "effort_policy": {"ladder": ["low", "medium", "high"], "fast": "low",
+                                  "standard": "medium", "deep": "high", "reserved": []}}"#,
+        )
+        .unwrap();
+        let tags = std::sync::Arc::new(tags);
+        TEST_CATALOG.with(|c| {
+            *c.borrow_mut() = Some(super::super::services::CatalogServices {
+                models: Rc::new(|driver| {
+                    vec![agent_core::catalog::CatalogModel {
+                        driver,
+                        id: "opus".into(),
+                        display: "Opus".into(),
+                        description: None,
+                        efforts: vec!["low".into(), "high".into()],
+                        default_effort: None,
+                        via: None,
+                    }]
+                }),
+                usage: Rc::new(|_| {
+                    Some(crate::account_status::Snapshot {
+                        account: Some(agent_core::event::Account {
+                            label: "person@example.test".into(),
+                            plan: None,
+                            provider: None,
+                        }),
+                        windows: vec![agent_core::event::QuotaWindow {
+                            group: None,
+                            label: "5-hour".into(),
+                            used: 0.85,
+                            resets_at: None,
+                        }],
+                        read_at: Some(crate::freshness::now_epoch()),
+                        ..Default::default()
+                    })
+                }),
+                tags: Rc::new(move || -> super::super::seam::LocalFuture<TagsState> {
+                    let tags = tags.clone();
+                    Box::pin(async move {
+                        TagsState {
+                            tags: Some(tags),
+                            status: None,
+                        }
+                    })
+                }),
+                refresh_usage: Rc::new(|_: Duration| -> super::super::seam::LocalFuture<()> {
+                    Box::pin(std::future::ready(()))
+                }),
+            })
+        });
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            connect(&sup, &root, ConnId(31)).await;
+            let caps = match sup.call(ConnId(31), caps_call(1, true)).await {
+                agent_core::delegation::ipc::CallOutcome::Ok(v) => v,
+                agent_core::delegation::ipc::CallOutcome::Err(e) => panic!("{e:?}"),
+            };
+            let p = &caps["profiles"][0];
+            assert_eq!(p["models"][0]["id"], "opus");
+            assert_eq!(p["models"][0]["tags"], serde_json::json!(["code"]));
+            assert_eq!(p["models"][0]["tier"], "deep");
+            assert_eq!(
+                p["models"][0]["effort_for"],
+                serde_json::json!({"fast": "low", "standard": "low", "deep": "high"})
+            );
+            assert_eq!(p["usage"]["headroom"], "low");
+            assert_eq!(p["usage"]["load"], 0.85);
+            assert_eq!(caps["tag_vocabulary"]["code"], "writes code");
+            assert_eq!(caps["effort_policy"]["deep"], "high");
+            assert!(caps.get("tags_status").is_none());
+            assert!(!caps.to_string().contains("person@example.test"));
+        });
+    }
+    /// A capability revoked while capabilities awaited (the usage refresh) gets no answer.
+    #[test]
+    fn capabilities_recheck_the_caller_after_their_awaits() {
+        let sup_slot: Rc<RefCell<Option<std::rc::Weak<Supervisor>>>> = Rc::default();
+        let slot = sup_slot.clone();
+        TEST_CATALOG.with(|c| {
+            *c.borrow_mut() = Some(super::super::services::CatalogServices {
+                refresh_usage: Rc::new(move |_: Duration| -> super::super::seam::LocalFuture<()> {
+                    // Revoke every live capability mid-call.
+                    if let Some(sup) = slot.borrow().as_ref().and_then(|w| w.upgrade()) {
+                        for w in sup.state.borrow_mut().workers.values_mut() {
+                            if let Some(t) = w.token.as_mut() {
+                                t.live_conn = None;
+                            }
+                        }
+                    }
+                    Box::pin(std::future::ready(()))
+                }),
+                ..Default::default()
+            })
+        });
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            *sup_slot.borrow_mut() = Some(Rc::downgrade(&sup));
+            connect(&sup, &root, ConnId(32)).await;
+            // Without refresh, the call is answered.
+            assert!(matches!(
+                sup.call(ConnId(32), caps_call(1, false)).await,
+                agent_core::delegation::ipc::CallOutcome::Ok(_)
+            ));
+            match sup.call(ConnId(32), caps_call(2, true)).await {
+                agent_core::delegation::ipc::CallOutcome::Err(e) => {
+                    assert_eq!(e.code, ErrorCode::AuthenticationFailed, "{e:?}")
+                }
+                agent_core::delegation::ipc::CallOutcome::Ok(v) => {
+                    panic!("answered a revoked caller: {v}")
+                }
+            }
+        });
+    }
     /// `command` picks the fixture profile's driver; `hook_proven` is agy's approval hook.
     fn harness_with(
         command: &str,
@@ -155,6 +294,9 @@ mod tests {
             }),
             tab_open_in: Rc::new(|_| false),
             report: Rc::new(|e| eprintln!("delegation test: {e}")),
+            catalog: TEST_CATALOG
+                .with(|c| c.borrow_mut().take())
+                .unwrap_or_default(),
         };
         let root = store
             .create_delegation_root(&NewRoot {
@@ -1396,6 +1538,7 @@ mod tests {
                 hook_check: s.hook_check.clone(),
                 tab_open_in: s.tab_open_in.clone(),
                 report: s.report.clone(),
+                catalog: s.catalog.clone(),
             };
             let recovered = Supervisor::start(services, Limits::default(), Rc::new(Verified))
                 .await
