@@ -2135,7 +2135,8 @@ impl Inner {
     /// session" only where a rule could match the call; "Always allow" also needs a rules file and
     /// a kind it applies to: shell, a contained edit, an MCP tool), says what Always keeps,
     /// records the call for the answer, and returns
-    /// whether a session rule of this agent or an Always rule already allows it.
+    /// whether a session rule of this agent or an Always rule already allows it. With saved rules
+    /// off ([`crate::always_allow::saved_rules_enabled`]) Always neither applies nor is offered.
     fn gate_approval(&self, mut env: Envelope) -> (Envelope, bool) {
         let driver = self.adapter.borrow().driver();
         if driver == Driver::Agy {
@@ -2181,7 +2182,10 @@ impl Inner {
             && action
                 .as_ref()
                 .is_some_and(|a| crate::always_allow::offerable(a, &ctx));
+        // Automatic Pattern Approvals off: saved rules neither approve nor are offered.
+        let saved_on = crate::always_allow::saved_rules_enabled();
         let always = offer
+            && saved_on
             && self.saved_rules.borrow().is_some()
             && action
                 .as_ref()
@@ -2235,7 +2239,7 @@ impl Inner {
                             && action.as_ref().is_some_and(|a| {
                                 let in_session =
                                     self.session_rules.borrow().matches_session(a, &ctx);
-                                in_session || self.saved_allow(a, &ctx)
+                                in_session || saved_on && self.saved_allow(a, &ctx)
                             })));
         // The folder the card offered (pinned: the answer keeps it only if it is still the same).
         let shown = action
@@ -2357,11 +2361,13 @@ impl Inner {
 
     /// Keeps `rule`: for the session at once, and for an Always answer also in the rules file,
     /// written off the main thread (a failure is said in a notice; the session rule stands).
+    /// Nothing reaches the file while saved rules are off.
     fn keep_rule(&self, rule: crate::always_allow::Rule, decision: Decision) {
         let path = self
             .saved_rules
             .borrow()
             .as_ref()
+            .filter(|_| crate::always_allow::saved_rules_enabled())
             .map(|cache| cache.path().to_owned());
         if let (Decision::AllowAlways, Some(path)) = (decision, path) {
             let weak = self.weak_self.borrow().clone();
@@ -3360,6 +3366,19 @@ impl Inner {
         self.respond_approval_with_rule(request, decision, None);
     }
 
+    /// The answer and custom rule acted on with saved rules `saved_rules_on` or not
+    /// ([`crate::always_allow::kept_answer`]): a downgraded "Always allow" drops its custom rule,
+    /// which was typed to be kept for good and may reach further than the call.
+    fn answer_under_policy(
+        decision: Decision,
+        custom_rule: Option<crate::always_allow::Rule>,
+        saved_rules_on: bool,
+    ) -> (Decision, Option<crate::always_allow::Rule>) {
+        let kept = crate::always_allow::kept_answer(decision, saved_rules_on);
+        let custom_rule = custom_rule.filter(|_| kept == decision);
+        (kept, custom_rule)
+    }
+
     fn respond_approval_with_rule(
         self: &Rc<Self>,
         request: &str,
@@ -3369,6 +3388,13 @@ impl Inner {
         // Authority may narrow while a human is reading a card. Re-check at the actual
         // response boundary, including plain Allow; rule validation alone cannot protect it.
         let decision = self.child_answer(request, decision);
+        // Automatic Pattern Approvals off: an "Always allow" (a card shown before the switch
+        // turned off) keeps a session grant at most, and never the pattern typed for good.
+        let (decision, custom_rule) = Self::answer_under_policy(
+            decision,
+            custom_rule,
+            crate::always_allow::saved_rules_enabled(),
+        );
         let permission = self.codex_permissions.borrow().get(request).cloned();
         if let Some(card) = permission {
             self.respond_codex_permissions(request, decision, &card, false);
@@ -9398,6 +9424,96 @@ mod tests {
             }
             assert!(!tmp.path().join(crate::always_allow::FILE_NAME).exists());
         });
+    }
+
+    /// D1: with Automatic Pattern Approvals off, a saved rule approves nothing and no card offers
+    /// "Always allow"; an "Always allow" on a card shown before keeps a session grant and writes
+    /// nothing, and session grants still approve. On again, the saved rule answers as before.
+    #[test]
+    fn saved_rules_off_neither_approve_nor_are_offered_nor_written() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let file = tmp.path().join(crate::always_allow::FILE_NAME);
+            let saved =
+                || crate::always_allow::AlwaysRules::open(&file).map_or(0, |r| r.rules.len());
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            feed(&session, &can_use_tool("r1", "ls -la"));
+            assert!(offered(&seen, "r1").contains(&Decision::AllowAlways));
+            session.respond_approval("r1", Decision::AllowAlways);
+            assert!(pump_until(ctx, 10, || saved() == 1));
+            // From here on only the saved rule could answer `ls -la`.
+            session.inner.end_session_rules();
+            feed(&session, &can_use_tool("r2", "ls -la"));
+            assert!(pump_until(ctx, 10, || resolution(&seen, "r2").is_some()));
+            assert_eq!(
+                resolution(&seen, "r2"),
+                Some(Decision::Allow),
+                "on: it applies"
+            );
+            feed(&session, &can_use_tool("late", "touch b.tmp"));
+            assert!(offered(&seen, "late").contains(&Decision::AllowAlways));
+
+            let off = crate::always_allow::PolicyGuard::saved_rules(false);
+            feed(&session, &can_use_tool("r3", "ls -la"));
+            assert!(
+                !pump_until(ctx, 1, || resolution(&seen, "r3").is_some()),
+                "off: the saved rule does not answer it"
+            );
+            assert!(offered(&seen, "r3").contains(&Decision::AllowForSession));
+            assert!(!offered(&seen, "r3").contains(&Decision::AllowAlways));
+            session.respond_approval("r3", Decision::Deny);
+
+            // The earlier card's "Always allow" is kept for the session only, its pattern too.
+            let pattern = crate::always_allow::Rule::new("", "Bash", "touch *").expect("rule");
+            session.respond_approval_with_rule("late", Decision::AllowAlways, Some(pattern));
+            assert_eq!(resolution(&seen, "late"), Some(Decision::AllowForSession));
+            for _ in 0..50 {
+                ctx.iteration(false);
+            }
+            assert_eq!(saved(), 1, "nothing was written");
+            feed(&session, &can_use_tool("r4", "touch b.tmp"));
+            assert!(pump_until(ctx, 10, || resolution(&seen, "r4").is_some()));
+            assert_eq!(
+                resolution(&seen, "r4"),
+                Some(Decision::Allow),
+                "the session grant"
+            );
+            feed(&session, &can_use_tool("r5", "touch c.tmp"));
+            assert!(
+                !pump_until(ctx, 1, || resolution(&seen, "r5").is_some()),
+                "the typed pattern was not kept"
+            );
+            session.respond_approval("r5", Decision::Deny);
+
+            drop(off);
+            feed(&session, &can_use_tool("r6", "ls -la"));
+            assert!(pump_until(ctx, 10, || resolution(&seen, "r6").is_some()));
+            assert_eq!(resolution(&seen, "r6"), Some(Decision::Allow), "on again");
+        });
+    }
+
+    #[test]
+    fn an_always_answer_is_downgraded_only_while_saved_rules_are_off() {
+        let pattern = || crate::always_allow::Rule::new("", "Bash", "ls *").ok();
+        let (d, custom) = Inner::answer_under_policy(Decision::AllowAlways, pattern(), true);
+        assert_eq!(d, Decision::AllowAlways);
+        assert!(custom.is_some());
+        let (d, custom) = Inner::answer_under_policy(Decision::AllowAlways, pattern(), false);
+        assert_eq!(d, Decision::AllowForSession);
+        assert!(custom.is_none(), "a pattern typed for good is dropped");
+        for decision in [Decision::Allow, Decision::AllowForSession, Decision::Deny] {
+            assert_eq!(
+                Inner::answer_under_policy(decision, None, false).0,
+                decision
+            );
+        }
+        let (d, custom) = Inner::answer_under_policy(Decision::AllowForSession, pattern(), false);
+        assert_eq!(d, Decision::AllowForSession);
+        assert!(custom.is_some(), "a session answer keeps its own pattern");
     }
 
     /// R4: Claude's working directory moves with `cd`, so a relative path is never offered a

@@ -30,9 +30,11 @@
 //! carry those checks), validated by Codex's own parser before it replaces the old file.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use agent_core::codex_rules;
+use agent_core::event::Decision;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1557,6 +1559,81 @@ pub fn decide_as_shown(
     };
     rule.check(scope)?;
     Ok(rule)
+}
+
+// ---- the policy switches (Settings → Agents) ----
+
+/// Set by the window from `pattern_auto_approval`; read by every gate. Relaxed is enough: the
+/// main thread writes it, and a reader acts on one answer at a time.
+static SAVED_RULES_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Set by the window from `confirm_rule_modification`; read by the card's "Always allow" button.
+static CONFIRM_RULE_MODIFICATION: AtomicBool = AtomicBool::new(true);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own view of the switches ([`PolicyGuard`]): each test runs on its own thread, so
+    /// one test turning saved rules off never reaches another's cards.
+    static TEST_POLICY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether saved "Always allow" rules approve matching requests (Settings → Agents,
+/// `pattern_auto_approval`). Set by the window from the config at startup and on change.
+#[allow(dead_code)] // TODO(setup-council lane B): drop once the window calls it
+pub fn set_saved_rules_enabled(on: bool) {
+    SAVED_RULES_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// [`set_saved_rules_enabled`]'s value; `true` until set. Off: a saved rule never approves a
+/// call, no card offers "Always allow", and an "Always allow" answer keeps nothing for good
+/// ([`kept_answer`]). Session grants hold either way.
+pub fn saved_rules_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_POLICY.with(std::cell::Cell::get) {
+        return on;
+    }
+    SAVED_RULES_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether "Always allow" first shows the confirm-and-customise dialog
+/// (`confirm_rule_modification`), read instead of loading the config file.
+#[allow(dead_code)] // TODO(setup-council lane B): drop once the window calls it
+pub fn set_confirm_rule_modification(on: bool) {
+    CONFIRM_RULE_MODIFICATION.store(on, Ordering::Relaxed);
+}
+
+/// [`set_confirm_rule_modification`]'s value; until set, the config's default (`true`).
+pub fn confirm_rule_modification() -> bool {
+    CONFIRM_RULE_MODIFICATION.load(Ordering::Relaxed)
+}
+
+/// The answer a gate acts on for `decision` when saved rules are `saved_rules_on` or not: with
+/// them off, "Always allow" becomes "Allow for session" (judged afresh, so a call no session
+/// rule can describe is allowed once), and nothing is written to the rules file. Pure: the
+/// switch is passed in.
+pub fn kept_answer(decision: Decision, saved_rules_on: bool) -> Decision {
+    match decision {
+        Decision::AllowAlways if !saved_rules_on => Decision::AllowForSession,
+        d => d,
+    }
+}
+
+/// Holds this test thread's [`saved_rules_enabled`] at a value, and restores the previous one on
+/// drop; the process-wide switch is never touched.
+#[cfg(test)]
+pub struct PolicyGuard(Option<bool>);
+
+#[cfg(test)]
+impl PolicyGuard {
+    pub fn saved_rules(on: bool) -> Self {
+        Self(TEST_POLICY.with(|policy| policy.replace(Some(on))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for PolicyGuard {
+    fn drop(&mut self) {
+        TEST_POLICY.with(|policy| policy.set(self.0));
+    }
 }
 
 // ---- the store (D2a) ----
@@ -6231,5 +6308,57 @@ host_executable(name="ls", paths=["/bin/ls"])
             "{result:?}"
         );
         assert_eq!(std::fs::read_to_string(&file).expect("read"), before);
+    }
+
+    #[test]
+    fn the_policy_switches_default_to_the_configs_defaults() {
+        let defaults = crate::config::TerminalConfig::default();
+        // Nothing in the tests sets the process-wide switches; the guard below is per thread.
+        assert_eq!(saved_rules_enabled(), defaults.pattern_auto_approval);
+        assert_eq!(
+            confirm_rule_modification(),
+            defaults.confirm_rule_modification
+        );
+        assert!(confirm_rule_modification());
+    }
+
+    #[test]
+    fn the_policy_guard_holds_this_thread_and_restores_on_drop() {
+        assert!(saved_rules_enabled());
+        {
+            let _off = PolicyGuard::saved_rules(false);
+            assert!(!saved_rules_enabled());
+            {
+                let _on = PolicyGuard::saved_rules(true);
+                assert!(saved_rules_enabled());
+            }
+            assert!(!saved_rules_enabled(), "restores the outer value");
+            let other = std::thread::spawn(saved_rules_enabled).join();
+            assert!(
+                other.is_ok_and(|on| on),
+                "another test's thread is untouched"
+            );
+        }
+        assert!(saved_rules_enabled());
+    }
+
+    #[test]
+    fn an_always_answer_keeps_a_session_grant_while_saved_rules_are_off() {
+        for decision in [
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+            Decision::Deny,
+            Decision::Cancel,
+        ] {
+            assert_eq!(kept_answer(decision, true), decision, "on: unchanged");
+        }
+        assert_eq!(
+            kept_answer(Decision::AllowAlways, false),
+            Decision::AllowForSession
+        );
+        for decision in [Decision::Allow, Decision::AllowForSession, Decision::Deny] {
+            assert_eq!(kept_answer(decision, false), decision);
+        }
     }
 }

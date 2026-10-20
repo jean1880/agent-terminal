@@ -870,6 +870,12 @@ impl ApprovalHandle {
             Some(GateVerdict::AskOnly { .. }) => pending.ask_only = true,
             Some(GateVerdict::Defer) | None => {}
         }
+        // Automatic Pattern Approvals off: an "Always allow" keeps a session grant at most, and
+        // never the pattern typed for good (the card may predate the switch).
+        let kept =
+            crate::always_allow::kept_answer(decision, crate::always_allow::saved_rules_enabled());
+        let custom_rule = custom_rule.filter(|_| kept == decision);
+        let decision = kept;
         let remember_decision = decision;
         let mut decision = decision;
         let keeps_rule = matches!(decision, Decision::AllowForSession | Decision::AllowAlways);
@@ -1048,14 +1054,15 @@ impl ServerInner {
         gate.is_some_and(|g| g.rule_may_apply(action, cwd))
     }
 
-    /// Whether a session rule (agy's own) or an Always rule allows `action`.
+    /// Whether a session rule (agy's own) or, while saved rules are on
+    /// ([`crate::always_allow::saved_rules_enabled`]), an Always rule allows `action`.
     fn rules_allow(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool {
         let Some(ctx) = self.context(cwd) else {
             return false;
         };
         let session = self.session_rules.borrow().clone();
         let in_session = session.borrow().matches_session(action, &ctx);
-        in_session || self.saved_allow(action, &ctx)
+        in_session || crate::always_allow::saved_rules_enabled() && self.saved_allow(action, &ctx)
     }
 
     /// Records what "Allow for session" / "Always allow" keeps for `pending`, judged afresh by
@@ -1092,10 +1099,12 @@ impl ServerInner {
                 return false;
             }
         };
+        // Nothing reaches the file while saved rules are off.
         let path = self
             .always
             .borrow()
             .as_ref()
+            .filter(|_| crate::always_allow::saved_rules_enabled())
             .map(|cache| cache.path().to_owned());
         if let (Scope::Always, Some(path)) = (scope, path) {
             let weak = Rc::downgrade(self);
@@ -1338,7 +1347,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         rule_options(
             action.as_ref(),
             ctx.as_ref(),
-            inner.always.borrow().is_some(),
+            inner.always.borrow().is_some() && crate::always_allow::saved_rules_enabled(),
         )
     } else {
         rule_options(None, None, false)
@@ -1436,8 +1445,8 @@ pub(crate) fn canonical_target(path: &Path) -> PathBuf {
 
 /// The buttons agy's card offers, and what "Always allow" would keep: Allow; "Allow for
 /// session" when a rule could match the call ([`crate::always_allow::offerable`]: no secret, a
-/// simple command, a contained path); "Always allow" when a rules file is configured and the
-/// call is one [`crate::always_allow::always_offerable`] keeps (the predicate the rule is then
+/// simple command, a contained path); "Always allow" when `always` (a rules file is configured
+/// and saved rules are on) and the call is one [`crate::always_allow::always_offerable`] keeps (the predicate the rule is then
 /// checked by, so the button never promises what is refused); Deny; Stop turn (D4).
 fn rule_options(
     action: Option<&crate::always_allow::Action>,
@@ -2523,6 +2532,93 @@ mod tests {
             assert!(handle.respond("p3", Decision::Deny));
             assert_eq!(wait_reply(ctx, &rx3).decision, Decision::Deny);
         });
+    }
+
+    /// D1: with Automatic Pattern Approvals off, a saved rule approves nothing and no card offers
+    /// "Always allow"; an "Always allow" on a card shown before keeps a session grant and writes
+    /// nothing, and session grants still approve. On again, the saved rule answers as before.
+    #[test]
+    fn saved_rules_off_neither_approve_nor_are_offered_nor_written() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let rules_path = tmp.path().join(crate::always_allow::FILE_NAME);
+            let mut rules = crate::always_allow::AlwaysRules::default();
+            assert!(rules.add(
+                crate::always_allow::Rule::new("*", "run_command", "git status*").expect("rule")
+            ));
+            rules.save(&rules_path).expect("save");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            handle.use_always_rules(rules_path.clone());
+            let socket = handle.socket_path().to_owned();
+            let card = |id: &str| {
+                seen.borrow().iter().find_map(|e| match &e.event {
+                    Event::ApprovalRequested {
+                        options, remembers, ..
+                    } if e.request.as_deref() == Some(id) => {
+                        Some((options.clone(), remembers.clone()))
+                    }
+                    _ => None,
+                })
+            };
+
+            // A card shown while saved rules are on offers "Always allow".
+            let late = client(socket.clone(), with_id(cmd("ls -la"), "late"));
+            assert!(pump_until(ctx, 10, || card("late").is_some()));
+            let (options, _) = card("late").expect("card");
+            assert!(options.contains(&Decision::AllowAlways));
+
+            let off = crate::always_allow::PolicyGuard::saved_rules(false);
+            let rx = client(socket.clone(), with_id(cmd("git status --short"), "s1"));
+            assert!(
+                pump_until(ctx, 10, || card("s1").is_some()),
+                "the saved rule does not answer it"
+            );
+            let (options, remembers) = card("s1").expect("card");
+            assert!(options.contains(&Decision::AllowForSession));
+            assert!(!options.contains(&Decision::AllowAlways));
+            assert!(remembers.is_none_or(|r| !r.contains("Always allow")));
+            assert!(handle.respond("s1", Decision::Deny));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
+
+            // The earlier card's "Always allow" is kept for the session only.
+            assert!(handle.respond("late", Decision::AllowAlways));
+            assert_eq!(wait_reply(ctx, &late).decision, Decision::AllowForSession);
+            for _ in 0..50 {
+                ctx.iteration(false);
+            }
+            let saved = crate::always_allow::AlwaysRules::open(&rules_path).expect("rules");
+            assert_eq!(saved.rules.len(), 1, "nothing was written");
+            let rx = client(socket.clone(), with_id(cmd("ls -la"), "s2"));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+            assert!(card("s2").is_none(), "the session grant answers it");
+
+            drop(off);
+            let rx = client(socket, with_id(cmd("git status --short"), "s3"));
+            assert_eq!(wait_reply(ctx, &rx).decision, Decision::Allow);
+            assert!(card("s3").is_none(), "on again: the saved rule answers it");
+        });
+    }
+
+    #[test]
+    fn rule_options_offer_always_only_when_asked_to() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let ctx = crate::always_allow::Context {
+            driver: "agy",
+            workspace: tmp.path(),
+            cwd: Some(&cwd),
+            home: None,
+        };
+        let ls = crate::always_allow::Action::Shell {
+            command: "ls -la".to_owned(),
+        };
+        let (on, note_on) = rule_options(Some(&ls), Some(&ctx), true);
+        assert!(on.contains(&Decision::AllowAlways));
+        assert!(note_on.is_some_and(|n| n.contains("Always allow")));
+        let (off, note_off) = rule_options(Some(&ls), Some(&ctx), false);
+        assert!(off.contains(&Decision::AllowForSession));
+        assert!(!off.contains(&Decision::AllowAlways));
+        assert!(note_off.is_none_or(|n| !n.contains("Always allow")));
     }
 
     #[test]
