@@ -169,11 +169,13 @@ once, and all of them are in Settings later.
 Setup writes Agent Terminal's own settings file and nothing in any agent's configuration.
 Run it again any time from Settings → General → **Run Setup Again…**.
 
-![The Your Agents page of setup, with agents found and a default chosen](docs/screenshots/setup-agents.png)
-
 | Nothing installed yet | Installed, not signed in |
 |---|---|
-| ![Your Agents with no agent found, each with a link to install it](docs/screenshots/setup-nothing-installed.png) | ![An agent found with Sign In offered because nobody is signed in](docs/screenshots/setup-signin.png) |
+| ![Your Agents with no agent found: the ready row warns, and each agent has a Get It link](docs/screenshots/setup-nothing-installed.png) | ![Your Agents with the agents found but signed out: the ready row warns, and each offers Sign In](docs/screenshots/setup-signin.png) |
+
+| Antigravity's approval hook | Approvals and updates |
+|---|---|
+| ![Antigravity's group in setup: the approval hook not installed, with its warning and the entry to copy](docs/screenshots/setup-agy-hook.png) | ![The end of Your Agents: the default agent, Automatic Pattern Approvals and the startup update check](docs/screenshots/setup-approvals.png) |
 
 ### 2. Start a thread and ask
 
@@ -376,8 +378,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Automatic Pattern Approvals** (Settings → Agents, on by default) decides whether saved
   **Always allow** rules approve matching requests without a card. Switched off, every
   request asks, except what you allowed for the session, **Always allow** is not offered, and
-  an answer of Always on a card already showing is kept for the session only. Your saved rules
-  stay in the file either way.
+  an answer of Always on a card already showing allows that one call and keeps nothing. Your
+  saved rules stay in the file either way. Rules you exported into an agent's own settings are
+  applied by that agent, not by this switch.
 - **Your rules mean what you write.** `git *` covers every git command and `cargo test *`
   every `cargo test`. When a rule allows more than reading (a program that runs code, an
   option such as `git -c`, a file outside the workspace), a notice says so when it is kept.

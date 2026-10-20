@@ -142,6 +142,24 @@ python3 tests/qa/record_frames.py claude --cwd /tmp/sandbox --out /tmp/touch.jso
 Never point it at a real project, and re-grep the output for your canary before
 committing a fixture.
 
+## Setup screenshots
+
+The `docs/screenshots/setup-*.png` images come from a debug build run through the
+preview MCP's `preview_app`. It gives fresh XDG homes and its own D-Bus session, and
+Playwright drives the window. Never start Broadway by hand. A seeded `config.json` means
+setup does not open by itself, so open it from Settings → General → **Run Setup Again…**.
+Capture a 950×650 clip of the window.
+
+- **Nothing installed** (`setup-nothing-installed.png`): seed profiles whose commands
+  are absolute paths that do not exist, such as `/nonexistent/claude`. The file name still
+  picks the agent.
+- **Signed out** (`setup-signin.png`, `setup-agy-hook.png`, `setup-approvals.png`): seed
+  the default commands, each with an `env_file` that only exports `HOME` to an empty
+  scratch directory. The account probes then find no sign-in, and no real account name
+  can reach a picture. Never capture a signed-in account row.
+
+Set `check_updates_on_startup` to `false` in both seeds, so the run makes no request.
+
 ## Live contract smoke (opt-in, spends quota)
 
 `tests/qa/live_smoke.py` (stdlib only) drives the real CLI and asserts contract

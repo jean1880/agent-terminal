@@ -2128,15 +2128,15 @@ impl AgentTerminalWindow {
                 crate::hook_config::log_verdict(badge, &probe, bound);
                 let (text, class) = match badge {
                     crate::hook_config::HookBadge::Ready => (
-                        "Ready: Hook entry present and runtime directory available",
+                        "Ready: Hook entry present and runtime directory available.",
                         None,
                     ),
                     crate::hook_config::HookBadge::Missing => (
-                        "Not installed: Antigravity cannot ask before acting until the entry below is added",
+                        "Not installed: Antigravity cannot ask before acting until the entry below is added.",
                         Some("error"),
                     ),
                     crate::hook_config::HookBadge::Unreadable => (
-                        "Could not verify the approval hook for a thread. Treat Antigravity as ungated",
+                        "Could not verify the approval hook for a thread. Treat Antigravity as ungated.",
                         Some("warning"),
                     ),
                 };
