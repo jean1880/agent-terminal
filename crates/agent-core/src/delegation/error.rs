@@ -155,7 +155,7 @@ pub struct ToolError {
 }
 
 /// `s` cut to at most `max` bytes at a character boundary.
-pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
+pub fn truncate_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

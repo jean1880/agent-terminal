@@ -33,6 +33,16 @@ profiles, route support, authority and delivery limitations. Reuse an idempotenc
 only for an identical operation; a receipt means acceptance, and subsequent reads
 report delivery and completion separately.
 
+Capabilities also helps a parent choose. Each model can carry tags (what it is good
+for), a tier and an effort per task tier, read from a model tag file you write
+(`model_tags_path` in the config; by default `model-tags.json` beside it). Without
+that file, models are still listed, untagged. Each profile reports its plan usage: the
+fullest window's share (`load`) and a headroom of ok, low, exhausted or unknown, so a
+parent can spread work across agents with room rather than default to its own. Pass
+`refresh: true` to read usage again first; each agent is read at most once a minute,
+and a signed-out agy never. The same usage, without any account details, is kept in
+`usage.json` in agent-terminal's cache folder for tools outside the app.
+
 Children appear beside native workers in the worker dock. Select one to inspect its
 activity, transcript, messages, approvals and file changes. Its provider, requested
 model and reported model are distinguished. Effort is shown with its evidence;

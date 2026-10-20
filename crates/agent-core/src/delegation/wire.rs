@@ -312,6 +312,9 @@ impl Target {
 pub struct CapabilitiesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<ProfileId>,
+    /// Read usage again before answering (at most once a minute per agent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refresh: bool,
 }
 
 /// `cross_agent_spawn` input.
@@ -600,9 +603,10 @@ pub fn parse_request(
     let a = Args { map };
     let req = match tool {
         ToolName::CrossAgentCapabilities => {
-            a.only(&["profile_id"])?;
+            a.only(&["profile_id", "refresh"])?;
             ToolRequest::Capabilities(CapabilitiesRequest {
                 profile_id: a.opt_parsed("profile_id", ProfileId::parse)?,
+                refresh: a.opt_bool("refresh")?.unwrap_or(false),
             })
         }
         ToolName::CrossAgentSpawn => {
@@ -970,11 +974,85 @@ fn write_canonical(v: &Value, out: &mut String) {
 // Outputs
 // ---------------------------------------------------------------------------------------------
 
-/// A model a profile offers (advisory).
+/// A model a profile offers (advisory). `tags`, `tier` and `best_for` come from the tag file
+/// ([`crate::model_tags`]); with none, `tags` is empty and the other two are absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
+    /// The value to pass as `cross_agent_spawn.model`.
     pub id: String,
+    /// At most [`MAX_MODEL_BYTES`].
+    #[serde(default)]
+    pub display: String,
     pub efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// The effort to spawn this model with per task tier, under the tag file's
+    /// `effort_policy` ([`crate::model_tags::effort_for`]); null when there is no policy.
+    #[serde(default)]
+    pub effort_for: Option<crate::model_tags::EffortFor>,
+}
+
+/// Quota windows reported per profile, at most this many.
+pub const MAX_USAGE_WINDOWS: usize = 16;
+/// A window's `group` or `label`, in bytes.
+pub const MAX_WINDOW_NAME_BYTES: usize = 64;
+/// A window's `resets_at`, in bytes (RFC 3339 is far shorter).
+pub const MAX_RESETS_AT_BYTES: usize = 64;
+/// `capabilities.tags_status`, in bytes.
+pub const MAX_TAGS_STATUS_BYTES: usize = 256;
+
+/// One plan-quota window of `usage.windows`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub label: String,
+    /// Share used, 0.0–1.0.
+    pub used: f64,
+    /// RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+impl UsageWindow {
+    /// The window within its byte bounds (cut on a character boundary); a non-finite share
+    /// reads as 0 so the JSON stays valid.
+    pub fn bounded(
+        group: Option<&str>,
+        label: &str,
+        used: f64,
+        resets_at: Option<&str>,
+    ) -> UsageWindow {
+        UsageWindow {
+            group: group.map(|g| truncate_bytes(g, MAX_WINDOW_NAME_BYTES).to_owned()),
+            label: truncate_bytes(label, MAX_WINDOW_NAME_BYTES).to_owned(),
+            used: if used.is_finite() { used } else { 0.0 },
+            resets_at: resets_at.map(|r| truncate_bytes(r, MAX_RESETS_AT_BYTES).to_owned()),
+        }
+    }
+}
+
+/// `capabilities.profiles[].usage`: how much of the agent's plan is left. Never the account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageInfo {
+    pub headroom: crate::model_tags::Headroom,
+    /// The fullest window's share used, 0.0–1.0, to rank agents by; null exactly when
+    /// `headroom` is `unknown` ([`crate::model_tags::load`]).
+    #[serde(default)]
+    pub load: Option<f64>,
+    /// At most [`MAX_USAGE_WINDOWS`].
+    pub windows: Vec<UsageWindow>,
+    /// Seconds since the last successful reading; absent when never read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_s: Option<i64>,
+    pub refresh_failed: bool,
+    pub signed_out: bool,
 }
 
 /// `capabilities.profiles[].delivery`.
@@ -991,9 +1069,9 @@ pub struct ProfileControls {
     pub close: bool,
 }
 
-/// One profile in the capabilities catalogue. Its identity and status fields are never
+/// One profile in the capabilities catalogue. Its identity, status and usage fields are never
 /// dropped or shortened by truncation; only `models` is cut.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileCapabilities {
     pub profile_id: ProfileId,
     pub name: String,
@@ -1005,6 +1083,9 @@ pub struct ProfileCapabilities {
     pub workspaces: Vec<WorkspaceKind>,
     pub delivery: DeliverySupport,
     pub controls: ProfileControls,
+    /// The agent's plan usage; absent when the app has no reading slot for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
 }
 
 /// `capabilities.limits`.
@@ -1045,7 +1126,7 @@ pub struct Omitted {
 pub const DELEGATION_SCOPE_SUPERVISED: &str = "supervised";
 
 /// `cross_agent_capabilities` output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilitiesResponse {
     pub api_version: u32,
     /// Live: recomputed on every call.
@@ -1056,6 +1137,16 @@ pub struct CapabilitiesResponse {
     pub limits: CapabilityLimits,
     pub truncated: bool,
     pub omitted: Omitted,
+    /// What each model tag means (from the tag file); empty without one.
+    #[serde(default)]
+    pub tag_vocabulary: std::collections::BTreeMap<String, String>,
+    /// Why models carry no tags (no tag file, or one that was refused); absent when tags loaded.
+    /// At most [`MAX_TAGS_STATUS_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags_status: Option<String>,
+    /// The tag file's effort policy, when it has one: what `models[].effort_for` follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_policy: Option<crate::model_tags::EffortPolicy>,
 }
 
 /// A spawn's state at acceptance.
@@ -1420,7 +1511,8 @@ fn truncation_step(resp: &mut CapabilitiesResponse) -> Option<usize> {
 }
 
 /// Deterministic: keeps Settings and catalogue order; drops the last model of the last
-/// profile that still lists one until it fits, and only then whole profiles from the end;
+/// profile that still lists one until it fits, and only then whole profiles from the end (never
+/// a profile's `usage`, nor the bounded `tag_vocabulary`);
 /// never the first profile; never shortens a profile's identity or status fields. Sets
 /// `truncated` and `omitted`. Post-condition: the response's `transport_cost` is at most
 /// [`OUTPUT_BUDGET`].
@@ -1618,10 +1710,54 @@ pub(crate) mod fixtures {
                 child_bridge: ChildBridge::WithoutBridge,
             })
             .collect();
+        use crate::model_tags::{
+            EffortFor, EffortPolicy, Headroom, MAX_BEST_FOR_BYTES, MAX_EFFORT_NAME_BYTES,
+            MAX_LADDER, MAX_MEANING_BYTES, MAX_TAGS, MAX_TAG_BYTES, MAX_TIER_BYTES, MAX_VOCABULARY,
+        };
         let models: Vec<ModelInfo> = (0..64)
             .map(|_| ModelInfo {
                 id: text(c, MAX_MODEL_BYTES),
+                display: text(c, MAX_MODEL_BYTES),
                 efforts: vec![text(c, MAX_EFFORT_BYTES); 8],
+                default_effort: Some(text(c, MAX_EFFORT_BYTES)),
+                tags: vec![text(c, MAX_TAG_BYTES); MAX_TAGS],
+                best_for: Some(text(c, MAX_BEST_FOR_BYTES)),
+                tier: Some(text(c, MAX_TIER_BYTES)),
+                effort_for: Some(EffortFor {
+                    fast: Some(text(c, MAX_EFFORT_NAME_BYTES)),
+                    standard: Some(text(c, MAX_EFFORT_NAME_BYTES)),
+                    deep: Some(text(c, MAX_EFFORT_NAME_BYTES)),
+                }),
+            })
+            .collect();
+        let effort_policy = EffortPolicy {
+            ladder: vec![text(c, MAX_EFFORT_NAME_BYTES); MAX_LADDER],
+            fast: Some(text(c, MAX_EFFORT_NAME_BYTES)),
+            standard: Some(text(c, MAX_EFFORT_NAME_BYTES)),
+            deep: Some(text(c, MAX_EFFORT_NAME_BYTES)),
+            reserved: vec![text(c, MAX_EFFORT_NAME_BYTES); MAX_LADDER],
+        };
+        let usage = UsageInfo {
+            headroom: Headroom::Exhausted,
+            load: Some(-1.234_567_890_123_456_7e-300),
+            windows: vec![
+                UsageWindow {
+                    group: Some(text(c, MAX_WINDOW_NAME_BYTES)),
+                    label: text(c, MAX_WINDOW_NAME_BYTES),
+                    used: -1.234_567_890_123_456_7e-300,
+                    resets_at: Some(text(c, MAX_RESETS_AT_BYTES)),
+                };
+                MAX_USAGE_WINDOWS
+            ],
+            age_s: Some(i64::MAX),
+            refresh_failed: true,
+            signed_out: true,
+        };
+        // Distinct keys at the byte cap: a numbered prefix, then the fill.
+        let tag_vocabulary = (0..MAX_VOCABULARY)
+            .map(|i| {
+                let key = format!("{i:02}{}", text(c, MAX_TAG_BYTES - 2));
+                (key, text(c, MAX_MEANING_BYTES))
             })
             .collect();
         CapabilitiesResponse {
@@ -1657,11 +1793,15 @@ pub(crate) mod fixtures {
                         cancel: true,
                         close: true,
                     },
+                    usage: Some(usage.clone()),
                 })
                 .collect(),
             limits: CapabilityLimits::from_limits(&Limits::default()),
             truncated: false,
             omitted: Omitted::default(),
+            tag_vocabulary,
+            tags_status: Some(text(c, MAX_TAGS_STATUS_BYTES)),
+            effort_policy: Some(effort_policy),
         }
     }
 }
@@ -1834,6 +1974,10 @@ mod tests {
                 ToolName::CrossAgentCapabilities,
                 json!({"profile_id": "codex"}),
             ),
+            (
+                ToolName::CrossAgentCapabilities,
+                json!({"profile_id": "codex", "refresh": true}),
+            ),
             (ToolName::CrossAgentSpawn, spawn_example()),
             (
                 ToolName::CrossAgentSpawn,
@@ -1875,6 +2019,21 @@ mod tests {
             // The typed request serialises back to exactly the arguments given.
             assert_eq!(req.args_value(), v, "{tool:?}");
         }
+    }
+
+    #[test]
+    fn capabilities_refresh_is_an_optional_boolean_defaulting_to_false() {
+        let c = ToolName::CrossAgentCapabilities;
+        let refresh = |v: Value| match parse(c, v) {
+            Ok(ToolRequest::Capabilities(r)) => Some(r.refresh),
+            _ => None,
+        };
+        assert_eq!(refresh(json!({})), Some(false));
+        assert_eq!(refresh(json!({"refresh": false})), Some(false));
+        assert_eq!(refresh(json!({"refresh": true})), Some(true));
+        assert_invalid(c, json!({"refresh": "yes"}), "refresh");
+        assert_invalid(c, json!({"refresh": null}), "refresh");
+        assert_invalid(c, json!({"refreshh": true}), "refreshh");
     }
 
     #[test]
@@ -2180,6 +2339,15 @@ mod tests {
             truncate_capabilities(&mut resp);
             assert!(resp.truncated);
             check_truncation(&original, &resp);
+            assert!(
+                resp.profiles
+                    .iter()
+                    .all(|p| p.usage == original.profiles[0].usage),
+                "usage is never cut"
+            );
+            assert_eq!(resp.tag_vocabulary, original.tag_vocabulary);
+            assert_eq!(resp.tags_status, original.tags_status);
+            assert_eq!(resp.effort_policy, original.effort_policy);
             if c == '\u{1}' {
                 assert!(
                     resp.omitted.profiles > 0,

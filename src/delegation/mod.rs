@@ -12,6 +12,7 @@ mod agy_l2;
 mod attest;
 mod authority;
 mod capacity;
+mod catalog_info;
 mod child;
 mod deferred;
 mod ipc;

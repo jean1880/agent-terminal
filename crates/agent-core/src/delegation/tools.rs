@@ -89,8 +89,16 @@ impl ToolName {
                 "agent-terminal cross-agent delegation: what you may start and how. Lists the \
                  agent profiles you can delegate to (Claude, Codex, Antigravity), the task modes \
                  your current mode allows, each route's status, models, delivery support and \
-                 limits. Call it first. Depth and mode limits apply to agents started through \
-                 agent-terminal; delegated agents cannot start their own built-in sub-agents."
+                 limits. Call it first, before every spawn. Pick the agent whose models fit the \
+                 task's tags, then the lowest usage.load; don't default to your own driver. \
+                 Models carry tags and a tier (tag_vocabulary says what each tag means; best_for \
+                 is a one-line note); pass the chosen model's id to cross_agent_spawn. Spawn \
+                 with effort = effort_for[task tier]; reserved efforts (xhigh/max/ultra) only \
+                 for work that needs them — effort multiplies quota burn. \
+                 usage.headroom is ok, low, exhausted or unknown: when it is low or exhausted, \
+                 prefer a profile of another agent family. refresh=true reads usage again before answering (at most once a minute per \
+                 agent). Depth and mode limits apply to agents started through agent-terminal; \
+                 delegated agents cannot start their own built-in sub-agents."
             }
             ToolName::CrossAgentSpawn => {
                 "agent-terminal cross-agent delegation: start a supervised child agent on a task, \
@@ -252,7 +260,12 @@ fn input_schema_with(tool: ToolName, l: &Limits) -> Value {
                             "maximum": l.page_bytes_max, "default": l.page_bytes_default});
     match tool {
         ToolName::CrossAgentCapabilities => object(
-            json!({"profile_id": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$"}}),
+            json!({
+                "profile_id": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$"},
+                "refresh": {"type": "boolean", "default": false,
+                            "description": "Read each agent's plan usage again before answering \
+                                            (at most once a minute per agent; waits up to 20 s)."}
+            }),
             &[],
         ),
         ToolName::CrossAgentSpawn => object(
@@ -594,6 +607,61 @@ fn route_caveats() -> Value {
     })
 }
 
+/// `profiles[].usage`: the plan's quota windows and the headroom they leave. Never the account.
+fn usage_schema() -> Value {
+    json!({"type": "object", "properties": {
+        "headroom": {"type": "string", "enum": ["ok", "low", "exhausted", "unknown"],
+                     "description": "low: a window is at 80 % or more; exhausted: 98 % or more; \
+                                     unknown: no reading, or one older than 20 minutes. Low or \
+                                     exhausted: prefer another agent family."},
+        "load": {"type": ["number", "null"],
+                 "description": "The fullest window's share used, 0.0 to 1.0; null when headroom \
+                                 is unknown. Among agents whose models fit the task, pick the \
+                                 lowest load."},
+        "windows": {"type": "array", "maxItems": 16, "items": {"type": "object", "properties": {
+            "group": {"type": "string"},
+            "label": {"type": "string"},
+            "used": {"type": "number", "description": "Share used, 0.0 to 1.0."},
+            "resets_at": {"type": "string", "description": "RFC 3339."}},
+            "required": ["label", "used"]}},
+        "age_s": {"type": "integer", "minimum": 0,
+                  "description": "Seconds since the last successful reading."},
+        "refresh_failed": {"type": "boolean"},
+        "signed_out": {"type": "boolean"}},
+        "required": ["headroom", "windows", "refresh_failed", "signed_out"]})
+}
+
+/// `profiles[].models[]`.
+fn model_schema() -> Value {
+    let tier_effort = json!({"type": ["string", "null"]});
+    json!({"type": "object", "properties": {
+        "id": {"type": "string", "description": "Pass as cross_agent_spawn.model."},
+        "display": {"type": "string"},
+        "efforts": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "default_effort": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 16,
+                 "description": "What the model is good for; meanings in tag_vocabulary."},
+        "best_for": {"type": "string"},
+        "tier": {"type": "string", "description": "fast, standard or deep."},
+        "effort_for": {"type": ["object", "null"], "properties": {
+            "fast": tier_effort.clone(), "standard": tier_effort.clone(), "deep": tier_effort},
+            "description": "The effort to spawn this model with, per task tier (effort_policy \
+                            clamped to the model's efforts); null without a policy or efforts."}},
+        "required": ["id", "efforts"]})
+}
+
+/// `effort_policy`: the tag file's effort ladder, per-tier efforts and reserved efforts.
+fn effort_policy_schema() -> Value {
+    let tier_effort = json!({"type": ["string", "null"]});
+    json!({"type": "object", "properties": {
+        "ladder": {"type": "array", "items": {"type": "string"}, "maxItems": 16,
+                   "description": "Efforts from least to most."},
+        "fast": tier_effort.clone(), "standard": tier_effort.clone(), "deep": tier_effort,
+        "reserved": {"type": "array", "items": {"type": "string"}, "maxItems": 16,
+                     "description": "Only for work that needs them: effort multiplies quota burn."}},
+        "required": ["ladder", "reserved"]})
+}
+
 fn capabilities_output() -> Value {
     json!({
         "type": "object",
@@ -619,16 +687,14 @@ fn capabilities_output() -> Value {
                     "route_caveats": route_caveats(),
                     "child_bridge": {"type": "string", "enum": ["with_bridge", "without_bridge"]}},
                     "required": ["task_mode", "route_status", "route_blockers", "child_bridge"]}},
-                "models": {"type": "array", "maxItems": 64, "items": {"type": "object", "properties": {
-                    "id": {"type": "string"},
-                    "efforts": {"type": "array", "items": {"type": "string"}, "maxItems": 8}},
-                    "required": ["id", "efforts"]}},
+                "models": {"type": "array", "maxItems": 64, "items": model_schema()},
                 "workspaces": {"type": "array", "items": {"type": "string",
                                "enum": ["shared_read_only", "isolated_worktree"]}},
                 "delivery": {"type": "object", "properties": {"this_run": this_run(),
                              "next_turn": {"type": "boolean"}}, "required": ["this_run", "next_turn"]},
                 "controls": {"type": "object", "properties": {"cancel": {"type": "boolean"},
-                             "close": {"type": "boolean"}}, "required": ["cancel", "close"]}},
+                             "close": {"type": "boolean"}}, "required": ["cancel", "close"]},
+                "usage": usage_schema()},
                 "required": ["profile_id", "name", "driver", "available", "reason", "modes", "models",
                              "workspaces", "delivery", "controls"]}},
             "limits": {"type": "object", "properties": {
@@ -640,7 +706,12 @@ fn capabilities_output() -> Value {
                              "max_wait_ms", "max_depth", "active_runs_per_root"]},
             "truncated": {"type": "boolean"},
             "omitted": {"type": "object", "properties": {"profiles": {"type": "integer"},
-                        "models": {"type": "integer"}}, "required": ["profiles", "models"]}
+                        "models": {"type": "integer"}}, "required": ["profiles", "models"]},
+            "tag_vocabulary": {"type": "object", "additionalProperties": {"type": "string"},
+                               "description": "Model tag -> what it means."},
+            "tags_status": {"type": "string",
+                            "description": "Why models carry no tags; absent when tags loaded."},
+            "effort_policy": effort_policy_schema()
         },
         "required": ["api_version", "caller", "authority_epoch", "delegation_scope", "profiles",
                      "limits", "truncated", "omitted"]
@@ -761,6 +832,7 @@ mod tests {
             let ok = types.iter().any(|t| match *t {
                 "string" => v.is_string(),
                 "integer" => v.is_u64() || v.is_i64(),
+                "number" => v.is_number(),
                 "boolean" => v.is_boolean(),
                 "object" => v.is_object(),
                 "array" => v.is_array(),

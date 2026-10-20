@@ -745,6 +745,12 @@ pub struct TerminalConfig {
     /// project's layout. Paths are absolute or start with `~/`; see
     /// [`parse_permission_sources`].
     pub permission_sources: Vec<String>,
+    /// The model tag file `cross_agent_capabilities` reads (what each model is good for; format in
+    /// `agent_core::model_tags`). `None` (the default, and what older configs read as) is
+    /// `<config dir>/model-tags.json`; a set path is absolute or starts with `~/`. A missing file
+    /// only means models carry no tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_tags_path: Option<String>,
     /// Set when this process found no settings file at all (none from a pre-rename release
     /// either): a first start, which offers the setup walkthrough. Not persisted.
     #[serde(skip)]
@@ -1035,6 +1041,7 @@ impl Default for TerminalConfig {
             confirm_rule_modification: true,
             suggest_quick_replies: true,
             permission_sources: Vec::new(),
+            model_tags_path: None,
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
@@ -1162,6 +1169,23 @@ impl TerminalConfig {
 
     pub fn config_path() -> PathBuf {
         Self::config_dir().join("config.json")
+    }
+
+    /// The model tag file: [`Self::model_tags_path`] with `~/` expanded, or
+    /// `<config dir>/model-tags.json` when it is unset or blank.
+    pub fn model_tags_file(&self) -> PathBuf {
+        Self::model_tags_file_in(
+            self.model_tags_path.as_deref(),
+            &Self::config_home().join("agent-terminal"),
+        )
+    }
+
+    /// [`Self::model_tags_file`] with the config directory passed in (tests).
+    fn model_tags_file_in(set: Option<&str>, config_dir: &Path) -> PathBuf {
+        match set.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => PathBuf::from(crate::utils::expand_tilde(p)),
+            None => config_dir.join("model-tags.json"),
+        }
     }
 
     /// The pre-2.0 configuration directory, kept only so settings can be carried
@@ -2075,6 +2099,51 @@ mod tests {
         let loaded = TerminalConfig::load_from(&path);
         assert!(loaded.notify_on_quota);
         assert!(!loaded.notify_on_bell);
+    }
+
+    #[test]
+    fn the_model_tag_file_defaults_to_the_config_dir_and_round_trips_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A config from before the field loads, with the default.
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.model_tags_path, None);
+        let cfg_dir = Path::new("/cfg/agent-terminal");
+        assert_eq!(
+            TerminalConfig::model_tags_file_in(None, cfg_dir),
+            cfg_dir.join("model-tags.json")
+        );
+        assert_eq!(
+            TerminalConfig::model_tags_file_in(Some("  "), cfg_dir),
+            cfg_dir.join("model-tags.json"),
+            "blank is unset"
+        );
+        assert_eq!(
+            TerminalConfig::model_tags_file_in(Some("/etc/tags.json"), cfg_dir),
+            PathBuf::from("/etc/tags.json")
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(
+                TerminalConfig::model_tags_file_in(Some("~/t.json"), cfg_dir),
+                Path::new(&home).join("t.json")
+            );
+        }
+        // Unset is not written; a set path survives a save and load.
+        let unset = serde_json::to_value(&loaded).unwrap();
+        assert!(unset.get("model_tags_path").is_none());
+        let mut set = loaded.clone();
+        set.model_tags_path = Some("~/tags.json".into());
+        let text = serde_json::to_string(&set).unwrap();
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(
+            TerminalConfig::load_from(&path).model_tags_path.as_deref(),
+            Some("~/tags.json")
+        );
     }
 
     #[test]

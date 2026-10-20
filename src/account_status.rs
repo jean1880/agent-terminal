@@ -118,6 +118,8 @@ pub struct AccountStatus {
     agy: RefCell<Snapshot>,
     codex: RefCell<Snapshot>,
     listeners: ListenerSet,
+    /// Told of every successful reading, changed or not (`read_at` moved): the usage file.
+    read_listeners: ListenerSet,
     refreshing: Cell<bool>,
     /// Each agent's last finished probe in this run (Claude, agy, Codex), successful or not: with
     /// `read_at`, the due clock.
@@ -141,6 +143,7 @@ impl AccountStatus {
             agy: RefCell::default(),
             codex: RefCell::default(),
             listeners: ListenerSet::default(),
+            read_listeners: ListenerSet::default(),
             refreshing: Cell::new(false),
             tried_at: Cell::new(ReadAt::default()),
             forced: RefCell::default(),
@@ -175,6 +178,12 @@ impl AccountStatus {
         self.listeners.remove(id);
     }
 
+    /// Calls `f` after every successful reading, even one that changed nothing shown (so no
+    /// repaint): what keeps an outside reader's `read_at` current. Never disconnected.
+    pub fn connect_read(&self, f: impl Fn() + 'static) -> u64 {
+        self.read_listeners.add(f)
+    }
+
     fn notify(&self) {
         self.listeners.notify();
     }
@@ -204,6 +213,7 @@ impl AccountStatus {
         if changed {
             self.notify();
         }
+        self.read_listeners.notify();
     }
 
     /// A probe of `driver` failed: what is shown stays, and says it could not refresh.
@@ -337,21 +347,107 @@ impl AccountStatus {
         self.run(targets, |d| due.contains(&d));
     }
 
+    /// A caller asked for fresh usage (`cross_agent_capabilities` with `refresh`): probes the
+    /// agents whose last reading *or attempt* is at least `floor` seconds old at `now`, so a
+    /// failing probe cannot be restarted by every call. The same gate as the clock otherwise: a
+    /// signed-out agy is never probed (that opens its browser login), and this never marks an
+    /// agent for "Check again". Decided per agent, whatever else runs: an agent already being
+    /// probed (by the clock, the user or another caller) is not probed twice, and the others
+    /// that are due start now. Returns the agents the caller may wait for: those started and
+    /// those already being probed.
+    pub fn refresh_if_older_than(
+        self: &Rc<Self>,
+        targets: &ProbeTargets,
+        floor: i64,
+        now: i64,
+    ) -> Vec<Driver> {
+        let in_flight: Vec<Driver> = Driver::ALL
+            .into_iter()
+            .filter(|d| targets.get(*d).is_some() && self.slot(*d).borrow().probing)
+            .collect();
+        let jobs = self.jobs(targets, |d| {
+            let last = latest(self.slot(d).borrow().read_at, self.tried_at.get().get(d));
+            is_due(last, now, floor.saturating_add(crate::freshness::DUE_SLACK))
+        });
+        let mut waiting: Vec<Driver> = jobs.iter().map(|(d, _)| *d).collect();
+        waiting.extend(in_flight);
+        if !jobs.is_empty() {
+            // Not the clock's latch: a refresh started by the clock or the user keeps its own.
+            self.spawn_probes(jobs, Rc::new(|| {}));
+        }
+        waiting
+    }
+
+    /// [`Self::refresh_if_older_than`], then waits (on the main loop, never blocking it) until
+    /// every probe it may wait for has ended, or `timeout`. The listener is removed on return
+    /// and when the future is dropped; a probe still running is left to finish, and updates the
+    /// shared status for everyone.
+    pub async fn refresh_and_wait(
+        self: &Rc<Self>,
+        targets: &ProbeTargets,
+        floor: i64,
+        now: i64,
+        timeout: std::time::Duration,
+    ) {
+        let waiting = self.refresh_if_older_than(targets, floor, now);
+        let done = {
+            let me = Rc::downgrade(self);
+            move || {
+                me.upgrade()
+                    .is_none_or(|st| waiting.iter().all(|d| !st.slot(*d).borrow().probing))
+            }
+        };
+        if done() {
+            return;
+        }
+        let (send, answer) = tokio::sync::oneshot::channel::<()>();
+        let send = RefCell::new(Some(send));
+        let id = self.connect_changed(move || {
+            if done() {
+                if let Some(send) = send.borrow_mut().take() {
+                    let _ = send.send(());
+                }
+            }
+        });
+        /// Disconnects the listener however the wait ends (answered, timed out or dropped).
+        struct Listening(std::rc::Weak<AccountStatus>, u64);
+        impl Drop for Listening {
+            fn drop(&mut self) {
+                if let Some(st) = self.0.upgrade() {
+                    st.disconnect(self.1);
+                }
+            }
+        }
+        let _listening = Listening(Rc::downgrade(self), id);
+        if glib::future_with_timeout(timeout, answer).await.is_err() {
+            debug!("usage refresh still running after the wait");
+        }
+    }
+
     /// A signed-out agy is never probed unless the user asked to check it: probing it starts
     /// agy's own login, which opens a browser.
     fn probeable(&self, driver: Driver) -> bool {
         !(driver == Driver::Agy && self.is_signed_out(driver) && !self.is_rechecking(driver))
     }
 
+    /// The probes to start for the agents `wanted` accepts: each has a target (missing, disabled
+    /// and still-detecting agents have none), may be probed (a signed-out agy only when the user
+    /// asked to check it), and is not being probed already (never two probes of one agent).
+    fn jobs(
+        &self,
+        targets: &ProbeTargets,
+        wanted: impl Fn(Driver) -> bool,
+    ) -> Vec<(Driver, crate::probe::ProbeTarget)> {
+        Driver::ALL
+            .into_iter()
+            .filter(|d| self.probeable(*d) && wanted(*d) && !self.slot(*d).borrow().probing)
+            .filter_map(|d| targets.get(d).map(|t| (d, t.clone())))
+            .collect()
+    }
+
     /// Probes the agents with a target that `wanted` accepts; `refreshing` is already set.
     fn run(self: &Rc<Self>, targets: &ProbeTargets, wanted: impl Fn(Driver) -> bool) {
-        // Missing, disabled and still-detecting agents have no target; a signed-out agy is
-        // skipped unless the user asked to check it.
-        let jobs: Vec<(Driver, crate::probe::ProbeTarget)> = Driver::ALL
-            .into_iter()
-            .filter(|d| self.probeable(*d) && wanted(*d))
-            .filter_map(|d| targets.get(d).map(|t| (d, t.clone())))
-            .collect();
+        let jobs = self.jobs(targets, wanted);
         // Each probed agent's own check is answered by this refresh.
         self.forced
             .borrow_mut()
@@ -360,11 +456,6 @@ impl AccountStatus {
             self.refreshing.set(false);
             return; // nothing is ready: nothing is spawned
         }
-        // Every probed agent is loading until its probe ends; one repaint says so for all.
-        for (driver, _) in &jobs {
-            self.slot(*driver).borrow_mut().probing = true;
-        }
-        self.notify();
         let finish = {
             let me = self.clone();
             join_n(jobs.len() as u8, move || {
@@ -375,6 +466,20 @@ impl AccountStatus {
                 }
             })
         };
+        self.spawn_probes(jobs, finish);
+    }
+
+    /// Starts `jobs`; `finish` runs as each one ends.
+    fn spawn_probes(
+        self: &Rc<Self>,
+        jobs: Vec<(Driver, crate::probe::ProbeTarget)>,
+        finish: Rc<dyn Fn()>,
+    ) {
+        // Every probed agent is loading until its probe ends; one repaint says so for all.
+        for (driver, _) in &jobs {
+            self.slot(*driver).borrow_mut().probing = true;
+        }
+        self.notify();
         for (driver, target) in jobs {
             let (me, done) = (self.clone(), finish.clone());
             match driver {
@@ -750,6 +855,216 @@ mod tests {
             assert!(!snap.probing, "the failed probe ended it");
             assert!(snap.refresh_failed);
         });
+    }
+
+    /// `refresh=true` probes at most once a minute per agent, counted from the last attempt too,
+    /// so a failing probe cannot be restarted by every call; and it never probes a signed-out agy.
+    #[test]
+    fn an_on_demand_refresh_has_a_floor_and_never_opens_agy_login() {
+        use crate::testutil::{in_loop, pump_until};
+        let dir = tempfile::tempdir().unwrap();
+        let (all, mark) = marking_targets(dir.path());
+        let claude_only = ProbeTargets::new(vec![(
+            Driver::Claude,
+            all.get(Driver::Claude).cloned().expect("claude target"),
+        )]);
+        let starts = || {
+            std::fs::read_to_string(&mark)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        in_loop(|ctx| {
+            let st = Rc::new(AccountStatus::new());
+            let now = now_epoch();
+            // Read 30 s ago: under the floor, nothing spawns.
+            st.update_at(
+                Driver::Claude,
+                None,
+                vec![win(None, "5-hour", 0.1)],
+                now - 30,
+            );
+            assert!(st.refresh_if_older_than(&claude_only, 60, now).is_empty());
+            pump_until(ctx, 1, || false);
+            assert_eq!(starts(), 0);
+            // 61 s old: one probe (the fake fails).
+            assert_eq!(
+                st.refresh_if_older_than(&claude_only, 60, now + 31),
+                vec![Driver::Claude]
+            );
+            assert!(pump_until(ctx, 30, || !st.snapshot(Driver::Claude).probing));
+            // One probe: it starts the fake twice (the requests and `--version`, side by side),
+            // and may answer before the second has written its mark.
+            pump_until(ctx, 10, || starts() >= 2);
+            let probed = starts();
+            assert!(probed >= 1);
+            assert!(st.snapshot(Driver::Claude).refresh_failed);
+            // The failed attempt restarts the floor: an immediate call spawns nothing.
+            let again = now_epoch();
+            assert!(st.refresh_if_older_than(&claude_only, 60, again).is_empty());
+            pump_until(ctx, 1, || false);
+            assert_eq!(
+                starts(),
+                probed,
+                "a failing probe was restarted inside the floor"
+            );
+
+            // A signed-out agy, long overdue: never probed this way, never marked for recheck.
+            let agy_only = ProbeTargets::new(vec![(
+                Driver::Agy,
+                all.get(Driver::Agy).cloned().expect("agy target"),
+            )]);
+            st.set_signed_out(Driver::Agy, true);
+            assert!(st
+                .refresh_if_older_than(&agy_only, 60, again + 100 * ACCOUNT_TTL)
+                .is_empty());
+            assert!(!st.is_rechecking(Driver::Agy));
+            pump_until(ctx, 1, || false);
+            assert_eq!(starts(), probed, "a signed-out agy was probed");
+        });
+    }
+
+    /// The wait ends when the probe does, or at its timeout, and leaves no listener behind either
+    /// way (nor when the future is dropped).
+    #[test]
+    fn waiting_for_a_refresh_removes_its_listener() {
+        use crate::testutil::in_loop;
+        let dir = tempfile::tempdir().unwrap();
+        let (all, _mark) = marking_targets(dir.path());
+        let claude_only = ProbeTargets::new(vec![(
+            Driver::Claude,
+            all.get(Driver::Claude).cloned().expect("claude target"),
+        )]);
+        in_loop(|ctx| {
+            let st = Rc::new(AccountStatus::new());
+            let before = st.listeners.len();
+            ctx.block_on(st.refresh_and_wait(
+                &claude_only,
+                60,
+                now_epoch(),
+                std::time::Duration::from_secs(30),
+            ));
+            assert!(!st.snapshot(Driver::Claude).probing, "waited for the probe");
+            assert_eq!(st.listeners.len(), before);
+            // Nothing due: returns at once, nothing connected.
+            ctx.block_on(st.refresh_and_wait(
+                &claude_only,
+                60,
+                now_epoch(),
+                std::time::Duration::from_secs(30),
+            ));
+            assert_eq!(st.listeners.len(), before);
+            // A timeout shorter than the probe: the listener goes, the probe carries on.
+            let slow_dir = tempfile::tempdir().unwrap();
+            let slow = crate::probe::ProbeTarget {
+                program: crate::claude_probe::tests::fake_claude(slow_dir.path(), "sleep 5"),
+                env: crate::agent_proc::AgentEnv::default(),
+            };
+            let st2 = Rc::new(AccountStatus::new());
+            ctx.block_on(st2.refresh_and_wait(
+                &ProbeTargets::new(vec![(Driver::Claude, slow)]),
+                60,
+                now_epoch(),
+                std::time::Duration::from_millis(50),
+            ));
+            assert_eq!(st2.listeners.len(), 0);
+            assert!(st2.snapshot(Driver::Claude).probing, "left to finish");
+            // The caller goes away mid-wait (its future is dropped): the listener goes too.
+            let slow_dir3 = tempfile::tempdir().unwrap();
+            let slow3 = crate::probe::ProbeTarget {
+                program: crate::claude_probe::tests::fake_claude(slow_dir3.path(), "sleep 5"),
+                env: crate::agent_proc::AgentEnv::default(),
+            };
+            let st3 = Rc::new(AccountStatus::new());
+            // The wait's own timeout is long; the caller's is short, so its future is dropped
+            // mid-wait, listener connected.
+            let seen = Rc::new(Cell::new(0usize));
+            {
+                // Record the listener count while the wait is parked.
+                let (st3, seen) = (st3.clone(), seen.clone());
+                glib::spawn_future_local(async move {
+                    glib::timeout_future(std::time::Duration::from_millis(20)).await;
+                    seen.set(st3.listeners.len());
+                });
+            }
+            let targets3 = ProbeTargets::new(vec![(Driver::Claude, slow3)]);
+            let outcome = ctx.block_on(glib::future_with_timeout(
+                std::time::Duration::from_millis(200),
+                st3.refresh_and_wait(
+                    &targets3,
+                    60,
+                    now_epoch(),
+                    std::time::Duration::from_secs(30),
+                ),
+            ));
+            assert!(outcome.is_err(), "the caller gave up first");
+            assert_eq!(seen.get(), 1, "the wait was listening when dropped");
+            assert_eq!(st3.listeners.len(), 0, "dropping the wait disconnected it");
+            assert!(st3.snapshot(Driver::Claude).probing, "left to finish");
+        });
+    }
+
+    /// An agent whose probe the clock already runs is not probed twice, and does not stop an
+    /// on-demand refresh from starting the other agents that are due.
+    #[test]
+    fn an_on_demand_refresh_is_decided_per_agent() {
+        use crate::testutil::{in_loop, pump_until};
+        let slow_dir = tempfile::tempdir().unwrap();
+        let slow = crate::probe::ProbeTarget {
+            program: crate::claude_probe::tests::fake_claude(slow_dir.path(), "sleep 3"),
+            env: crate::agent_proc::AgentEnv::default(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (all, _mark) = marking_targets(dir.path());
+        let both = ProbeTargets::new(vec![
+            (Driver::Claude, slow),
+            (
+                Driver::Codex,
+                all.get(Driver::Codex).cloned().expect("codex target"),
+            ),
+        ]);
+        in_loop(|ctx| {
+            let st = Rc::new(AccountStatus::new());
+            let now = now_epoch();
+            // The clock probes Claude only (Codex was just read).
+            st.update_at(
+                Driver::Codex,
+                None,
+                vec![win(None, "5-hour", 0.1)],
+                now - 90,
+            );
+            st.mark_tried(Driver::Codex, now);
+            st.refresh_if_due(&both, now);
+            assert!(st.refreshing.get() && st.snapshot(Driver::Claude).probing);
+            // On demand, 61 s later: Codex is due and starts despite the clock's refresh;
+            // Claude, already being probed, is waited for, not probed again.
+            let waiting = st.refresh_if_older_than(&both, 60, now + 61);
+            assert!(waiting.contains(&Driver::Codex) && waiting.contains(&Driver::Claude));
+            assert!(st.snapshot(Driver::Codex).probing, "started");
+            assert!(pump_until(ctx, 30, || !st.snapshot(Driver::Codex).probing));
+            assert!(pump_until(ctx, 30, || !st.refreshing.get()));
+        });
+    }
+
+    /// Every successful reading reaches the read listeners, even one that changes nothing shown
+    /// (no repaint), so the usage file's `read_at` keeps up with a live agent.
+    #[test]
+    fn a_reading_that_changes_nothing_still_reaches_the_read_listeners() {
+        let st = AccountStatus::new();
+        let (changed, read) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (c, r) = (changed.clone(), read.clone());
+        st.connect_changed(move || c.set(c.get() + 1));
+        st.connect_read(move || r.set(r.get() + 1));
+        st.update_at(Driver::Claude, None, vec![win(None, "5-hour", 0.1)], NOW);
+        assert_eq!((changed.get(), read.get()), (1, 1));
+        st.update_at(
+            Driver::Claude,
+            None,
+            vec![win(None, "5-hour", 0.1)],
+            NOW + 120,
+        );
+        assert_eq!(changed.get(), 1, "no repaint for the same data while fresh");
+        assert_eq!(read.get(), 2);
+        assert_eq!(st.snapshot(Driver::Claude).read_at, Some(NOW + 120));
     }
 
     #[test]
