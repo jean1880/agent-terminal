@@ -3231,6 +3231,7 @@ impl AgentTerminalWindow {
                     let imp = obj.imp();
                     imp.settle_pages();
                     if view.n_pages() == 0 {
+                        imp.sync_diff_toggle();
                         if let Some(title) = imp.window_title.borrow().as_ref() {
                             title.set_title("Agent Terminal");
                             title.set_subtitle("");
@@ -3385,6 +3386,7 @@ impl AgentTerminalWindow {
         };
         // Also here: a first page is selected before it is registered, then shown directly.
         *self.shown_thread.borrow_mut() = info.as_ref().map(|(thread, ..)| thread.clone());
+        self.refresh_repo_presence(page);
         let Some((thread, title, dir)) = info else {
             // A terminal page: the 2.x handler puts its terminal title in the subtitle.
             if let Some(window_title) = self.window_title.borrow().as_ref() {
@@ -3906,6 +3908,7 @@ impl AgentTerminalWindow {
                 last_seen: std::cell::Cell::new(std::time::Instant::now()),
             }),
             discovered_repo: None,
+            in_repo: None,
         });
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);
@@ -4727,9 +4730,10 @@ impl AgentTerminalWindow {
                 if self.config.borrow().checkpoints {
                     self.request_checkpoint(&page, false);
                 }
-                // The turn may have switched branches.
+                // The turn may have switched branches, or made the folder a repository.
                 if in_view {
                     self.refresh_branch(&page);
+                    self.refresh_repo_presence(&page);
                 }
                 // The turn's events moved the thread in the list (and unread); read it again.
                 // Only looking at it reads it: in an unfocused window the mark stays until

@@ -53,9 +53,9 @@ system theme's name; the shapes are unchanged. Adapted files remain under CC BY-
 `scalable/actions/` (each as `at-<name>-symbolic.svg`):
 action-unavailable, applications-engineering, chat-message-new, dialog-error, dialog-information,
 dialog-question, dialog-warning, document-edit, document-open-recent, document-properties,
-edit-copy, edit-undo, folder, format-text-italic, go-bottom, go-down, go-next, go-up, list-add,
+edit-copy, edit-undo, emblem-system, folder, format-text-italic, go-bottom, go-down, go-next, go-up, list-add,
 media-playback-stop, network-server, object-select, pan-down, pan-end, pan-up, security-high,
-security-medium, sidebar-show, system-search, system-users, utilities-terminal, view-dual,
+security-medium, sidebar-show, system-search, system-users, utilities-terminal,
 view-list-bullet, view-refresh, window-close, x-office-document.
 
 ### GNOME Icon Development Kit (CC0 1.0)

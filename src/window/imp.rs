@@ -375,6 +375,10 @@ struct TabState {
     chat: Option<threads::ChatTab>,
     /// Discovered enclosing git repository when `dir` is not a git repo (e.g. root home directory).
     discovered_repo: Option<String>,
+    /// Whether this tab's diff has a repository to read (`dir`'s, or for a thread the one its
+    /// edits are in). `None`: not read yet, or git failed. Only `Some(false)` hides the Changes
+    /// toggle ([`AgentTerminalWindow::sync_diff_toggle`]).
+    in_repo: Option<bool>,
 }
 
 /// How long a tab's output must be still before its turn counts as over and
@@ -430,6 +434,32 @@ impl IndicatorKind {
             crate::utils::IndicatorState::Unknown { .. } => Self::Unreadable,
         }
     }
+}
+
+/// Whether a tab in `dir` has a repository to diff: `dir`'s, or for `thread`, outside one, the
+/// one the files its edits touched are in (as `refresh_diff` finds it). `None`: git failed.
+async fn repo_present(dir: String, thread: Option<String>) -> Option<bool> {
+    let found = gtk4::gio::spawn_blocking(move || crate::git::discover(std::path::Path::new(&dir)))
+        .await
+        .ok()?;
+    match found {
+        Ok(Some(_)) => return Some(true),
+        Err(_) => return None,
+        Ok(None) => {}
+    }
+    let Some(tid) = thread else {
+        return Some(false);
+    };
+    let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
+        .await
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let paths = crate::diff::touched_paths_from_envelopes(
+        &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
+    );
+    gtk4::gio::spawn_blocking(move || crate::diff::discover_enclosing_repo(&paths).is_some())
+        .await
+        .ok()
 }
 
 /// The main checkout of the repository `dir` is in, and the branch `dir` has checked out.
@@ -1221,6 +1251,9 @@ pub struct AgentTerminalWindow {
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
     /// The toggle button in the header bar controlling the sidebar.
     pub(super) sidebar_toggle: RefCell<Option<gtk4::ToggleButton>>,
+    /// The header's Changes toggle, in a holder of its own: hidden while the page on show has
+    /// no repository to diff, apart from the narrow breakpoint hiding the button itself.
+    diff_toggle: RefCell<Option<gtk4::Widget>>,
     /// The tab view, or the empty state when no page is open.
     pages_stack: RefCell<Option<gtk4::Stack>>,
     /// The last session's threads are still being reopened: an empty tab view shows a loading
@@ -2229,7 +2262,7 @@ impl AgentTerminalWindow {
             .build();
 
         let settings_btn = gtk4::Button::builder()
-            .icon_name("at-applications-engineering-symbolic")
+            .icon_name("at-emblem-system-symbolic")
             .tooltip_text("Settings")
             .build();
         settings_btn.connect_clicked(glib::clone!(
@@ -2501,12 +2534,16 @@ impl AgentTerminalWindow {
                 .action_name("win.toggle-drawer")
                 .build();
             let diff_btn = Button::builder()
-                .icon_name("at-view-dual-symbolic")
+                .icon_name(crate::icons::GIT_ICON)
                 .tooltip_text("Show or Hide Changes (Ctrl+Shift+D)")
                 .action_name("win.toggle-diff")
                 .build();
-            header.pack_end(&diff_btn);
+            // No page is on show yet: `sync_diff_toggle` reveals it.
+            let diff_holder = gtk4::Box::builder().visible(false).build();
+            diff_holder.append(&diff_btn);
+            header.pack_end(&diff_holder);
             header.pack_end(&drawer_btn);
+            *self.diff_toggle.borrow_mut() = Some(diff_holder.upcast());
             self.shell_controls.borrow_mut().extend([
                 menu_btn.upcast::<gtk4::Widget>(),
                 new_btn.upcast::<gtk4::Widget>(),
@@ -3233,6 +3270,7 @@ impl AgentTerminalWindow {
             worktree: None,
             chat: None,
             discovered_repo: None,
+            in_repo: None,
         });
 
         self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
@@ -5866,7 +5904,11 @@ impl AgentTerminalWindow {
                 (res, _) => (res, dir.into()),
             };
             let in_repo = !matches!(result, Ok(crate::git::DiffOutcome::NotRepo));
+            let presence = result.is_ok().then_some(in_repo);
             panel.show(generation, result);
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().record_repo_presence(&page, presence);
+            }
             // The "Open a PR" bar follows the same repository, read after the diff (reads
             // only; it never fetches).
             let pr = if in_repo {
@@ -5883,6 +5925,89 @@ impl AgentTerminalWindow {
             }
             panel.show_pr(generation, pr);
         });
+    }
+
+    /// Reads, off the main thread, whether `page` has a repository to diff, and shows or hides
+    /// the Changes toggle to match. The last answer stays on show meanwhile.
+    pub(super) fn refresh_repo_presence(&self, page: &adw::TabPage) {
+        self.sync_diff_toggle();
+        let Some((dir, thread_id)) = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| &t.page == page)
+            .map(|t| {
+                (
+                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
+                    t.chat.as_ref().map(|c| c.thread.clone()),
+                )
+            })
+        else {
+            return;
+        };
+        let obj = self.obj().downgrade();
+        let page = page.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let presence = repo_present(dir, thread_id).await;
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().record_repo_presence(&page, presence);
+            }
+        });
+    }
+
+    /// Keeps what was learnt of `page`'s repository (`None`: nothing, and the last answer
+    /// stands). A docked panel with nothing to diff is hidden, since its toggle goes too; it
+    /// comes back, if panels are shown by default, once a repository appears.
+    fn record_repo_presence(&self, page: &adw::TabPage, presence: Option<bool>) {
+        let Some(present) = presence else {
+            return;
+        };
+        let Some((was, panel)) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .map(|t| (t.in_repo.replace(present), t.diff_panel.clone()))
+        else {
+            return;
+        };
+        if !present && panel.root.is_visible() {
+            panel.set_shown(false);
+        } else if present
+            && was == Some(false)
+            && !panel.is_shown()
+            && self.config.borrow().diff_panel_visible
+        {
+            panel.set_shown(true);
+            self.refresh_diff(page);
+        }
+        self.sync_diff_toggle();
+    }
+
+    /// Shows the Changes toggle, and enables its action, only while a page is on show that is
+    /// not known to be outside a repository.
+    pub(super) fn sync_diff_toggle(&self) {
+        let selected = self
+            .tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.selected_page());
+        let usable = selected.is_some_and(|page| {
+            self.tabs
+                .borrow()
+                .iter()
+                .any(|t| t.page == page && t.in_repo != Some(false))
+        });
+        if let Some(toggle) = self.diff_toggle.borrow().as_ref() {
+            toggle.set_visible(usable);
+        }
+        if let Some(action) = self
+            .obj()
+            .lookup_action("toggle-diff")
+            .and_downcast::<gtk4::gio::SimpleAction>()
+        {
+            action.set_enabled(usable);
+        }
     }
 
     /// Reads `page`'s branch off the main thread and shows it in the subtitle, if `page` is a
@@ -7411,6 +7536,7 @@ mod tests {
         assert_eq!(label(imp).as_deref(), Some("Check for Updates…"));
         chat_shell_opens_threads_and_lists_them(&window);
         environment_review::tests::confirmation_preserves_target(&window);
+        changes_toggle_needs_a_repository(&window);
     }
 
     /// The narrowest window that still shows the sidebar beside the thread (at 1× text scale).
@@ -7461,6 +7587,11 @@ mod tests {
             .expect("the window's content box");
 
         let dir = tempfile::tempdir().unwrap();
+        // A repository, so the diff panel measured below is not hidden as having nothing to diff.
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .status();
         imp.new_chat_thread(
             Some(Driver::Claude),
             Some(dir.path().to_string_lossy().into_owned()),
@@ -7792,6 +7923,33 @@ mod tests {
         thread_menu::tests::actions_carry_out_each_choice(window);
         threads::tests::a_thread_page_runs_a_real_session(window);
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
+    }
+
+    /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.
+    fn changes_toggle_needs_a_repository(window: &super::super::AgentTerminalWindow) {
+        let imp = window.imp();
+        let plain = tempfile::tempdir().unwrap();
+        let plain_s = plain.path().to_string_lossy().into_owned();
+        imp.new_chat_thread(
+            Some(agent_core::adapter::Driver::Claude),
+            Some(plain_s.clone()),
+            None,
+        );
+        let learnt = crate::testutil::pump_until(&glib::MainContext::default(), 10, || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .any(|t| t.dir == plain_s && t.in_repo == Some(false))
+        });
+        assert!(learnt, "the thread learnt it is outside a repository");
+        assert!(imp
+            .diff_toggle
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| !t.is_visible()));
+        assert!(window
+            .lookup_action("toggle-diff")
+            .is_some_and(|a| !a.is_enabled()));
     }
 
     #[test]
