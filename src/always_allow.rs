@@ -1578,7 +1578,6 @@ thread_local! {
 
 /// Whether saved "Always allow" rules approve matching requests (Settings → Agents,
 /// `pattern_auto_approval`). Set by the window from the config at startup and on change.
-#[allow(dead_code)] // TODO(setup-council lane B): drop once the window calls it
 pub fn set_saved_rules_enabled(on: bool) {
     SAVED_RULES_ENABLED.store(on, Ordering::Relaxed);
 }
@@ -1596,7 +1595,6 @@ pub fn saved_rules_enabled() -> bool {
 
 /// Whether "Always allow" first shows the confirm-and-customise dialog
 /// (`confirm_rule_modification`), read instead of loading the config file.
-#[allow(dead_code)] // TODO(setup-council lane B): drop once the window calls it
 pub fn set_confirm_rule_modification(on: bool) {
     CONFIRM_RULE_MODIFICATION.store(on, Ordering::Relaxed);
 }

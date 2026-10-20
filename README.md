@@ -105,9 +105,9 @@ into `~/.local` (binary, icon and desktop entry), and `make uninstall` to remove
 
 ### The agents themselves
 
-Install and sign in to at least one agent CLI. Agent Terminal finds them on your
-`PATH`, in the usual install folders, and through your login shell (so `nvm` and
-`asdf` installs work):
+Install at least one agent CLI; the [first start](#1-first-start) checks you are signed in
+and offers **Sign In…** if not. Agent Terminal finds them on your `PATH`, in the usual install
+folders, and through your login shell (so `nvm` and `asdf` installs work):
 
 | Agent | Command | Get it |
 |---|---|---|
@@ -144,11 +144,36 @@ scripted threads, no agent running.
 ### 1. First start
 
 Launch Agent Terminal from your app menu, or run `agent-terminal`. The first start opens
-a short setup. It shows which agents are installed, lets you switch off any you don't use,
-offers **Sign In…** for any agent nobody is signed in to, and asks which agent new threads
-start on. Run it again any time from Settings → General → **Run Setup Again…**.
+a short setup of two pages, a welcome and **Your Agents**. Every switch on them applies at
+once, and all of them are in Settings later.
 
 ![The welcome screen of the first-start setup](docs/screenshots/setup-welcome.png)
+
+**Your Agents** shows:
+
+- **Who is ready.** The top row names the agents that are installed and signed in, or says
+  that none is ready yet.
+- **Each agent.** Whether it is installed (with a link to get it if not, and **Check
+  Again** once you have), whether it is switched on, and who is signed in, with **Sign In…**
+  if nobody is.
+- **Antigravity's approval hook.** Whether it is installed. Without it, agy applies file
+  edits by itself in every mode. Setup never edits agy's files: **Copy** gives you the entry
+  to add yourself (see [agy's approval hook](#agys-approval-hook)).
+- **New threads.** Which agent they start on.
+- **Approvals.** Whether your saved **Always allow** rules approve matching requests without
+  asking (see [Approvals and rules](#approvals-and-rules)), and whether saving one first lets
+  you loosen or tighten its pattern.
+- **Updates.** Whether to check GitHub for a new release at startup. On a first start the
+  check waits until setup closes.
+
+Setup writes Agent Terminal's own settings file and nothing in any agent's configuration.
+Run it again any time from Settings → General → **Run Setup Again…**.
+
+![The Your Agents page of setup, with agents found and a default chosen](docs/screenshots/setup-agents.png)
+
+| Nothing installed yet | Installed, not signed in |
+|---|---|
+| ![Your Agents with no agent found, each with a link to install it](docs/screenshots/setup-nothing-installed.png) | ![An agent found with Sign In offered because nobody is signed in](docs/screenshots/setup-signin.png) |
 
 ### 2. Start a thread and ask
 
@@ -348,6 +373,11 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   and answer matching requests from every agent. Always rules match across agents by kind:
   a shell command, one file inside the workspace, or one MCP tool. Session rules end when
   the thread switches agent, and the switch notice says how many ended.
+- **Automatic Pattern Approvals** (Settings → Agents, on by default) decides whether saved
+  **Always allow** rules approve matching requests without a card. Switched off, every
+  request asks, except what you allowed for the session, **Always allow** is not offered, and
+  an answer of Always on a card already showing is kept for the session only. Your saved rules
+  stay in the file either way.
 - **Your rules mean what you write.** `git *` covers every git command and `cargo test *`
   every `cargo test`. When a rule allows more than reading (a program that runs code, an
   option such as `git -c`, a file outside the workspace), a notice says so when it is kept.
@@ -827,6 +857,11 @@ RUST_LOG=debug agent-terminal
 usual install folders, or through your login shell. Install one (see
 [The agents themselves](#the-agents-themselves)), or set its full path in Settings →
 Agents, then press **Check again**.
+
+**Setup never appeared, or keeps coming back.** Setup opens when there is no settings file
+at launch (`~/.config/agent-terminal/config.json`). Closing it writes that file. If it comes back
+at every start, the file could not be written, and the app says so when setup closes. Run it
+any time from Settings → General → **Run Setup Again…**.
 
 **An agent says "Not signed in".** Use **Sign In…** in Settings → Agents (or on the
 thread's banner), finish signing in, then **Check Again**.
