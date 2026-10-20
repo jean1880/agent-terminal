@@ -2538,9 +2538,16 @@ impl AgentTerminalWindow {
                 .tooltip_text("Show or Hide Changes (Ctrl+Shift+D)")
                 .action_name("win.toggle-diff")
                 .build();
-            // No page is on show yet: `sync_diff_toggle` reveals it.
+            // No page is on show yet: `sync_diff_toggle` reveals it. The holder also follows the
+            // button, which the narrow breakpoint hides, so an empty holder never takes the
+            // header's spacing.
             let diff_holder = gtk4::Box::builder().visible(false).build();
             diff_holder.append(&diff_btn);
+            diff_btn.connect_visible_notify(glib::clone!(
+                #[weak]
+                obj,
+                move |_| obj.imp().sync_diff_toggle()
+            ));
             header.pack_end(&diff_holder);
             header.pack_end(&drawer_btn);
             *self.diff_toggle.borrow_mut() = Some(diff_holder.upcast());
@@ -5999,7 +6006,8 @@ impl AgentTerminalWindow {
                 .any(|t| t.page == page && t.in_repo != Some(false))
         });
         if let Some(toggle) = self.diff_toggle.borrow().as_ref() {
-            toggle.set_visible(usable);
+            let fits = toggle.first_child().is_some_and(|b| b.is_visible());
+            toggle.set_visible(usable && fits);
         }
         if let Some(action) = self
             .obj()
@@ -7763,6 +7771,14 @@ mod tests {
                         width <= COLLAPSE_BELOW,
                         "sidebar placement at {state}"
                     );
+                    // The Changes toggle leaves the header with its holder, spacing and all.
+                    if let Some(holder) = imp.diff_toggle.borrow().as_ref() {
+                        assert_eq!(
+                            holder.is_visible(),
+                            holder.first_child().is_some_and(|b| b.is_visible()),
+                            "Changes toggle holder at {state}"
+                        );
+                    }
                     if width == MIN_WINDOW.0 || width == 950 {
                         crate::testutil::capture_window(
                             window.upcast_ref(),
