@@ -121,6 +121,16 @@ Must not touch: lane A's files, `README.md`.
 - The orchestrator runs `make check` on the integrated branch, then opens the PR and merges once
   CI is green.
 
+## Addendum (plan review, binding)
+
+- A: flag-as-parameter pure functions for tests; any test touching the global uses an RAII guard
+  in `always_allow.rs`. Enforce at answer time: with the switch off, `AllowAlways` is downgraded
+  (to session where offered, else once) and no rule is written. `confirm_rule_modification()`
+  defaults to `true`, with a test against `TerminalConfig::default()`.
+- B: call the setters at `initial_config`, at the file-monitor reload and in the row handlers
+  (the `mirror_quick_replies` pattern). On a first run, skip the `reveal_shell` update check
+  without consuming `STARTUP_UPDATE`, and run it from setup's `connect_closed`.
+
 ## Rollback
 
 All changes are in one PR; revert the merge commit. D1 keeps the default and today's behaviour
