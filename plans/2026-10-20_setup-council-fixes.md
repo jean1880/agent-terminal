@@ -131,6 +131,28 @@ Must not touch: lane A's files, `README.md`.
   (the `mirror_quick_replies` pattern). On a first run, skip the `reveal_shell` update check
   without consuming `STARTUP_UPDATE`, and run it from setup's `connect_closed`.
 
+## Outcome (2026-10-20)
+
+- Builders: `cross_agent_spawn` Codex and agy workers stalled on per-command shell approvals,
+  and the user chose native Claude builders (Opus for A, Sonnet for B). Reviews went through the
+  headless `cross-agent` CLI: Codex `gpt-6.1-sol` checked B (two rounds) and A, agy
+  `gemini-4-argon` (red-team) checked A (two rounds), and a native Claude red-team checked A.
+- Changed after review: a late Always with saved rules off allows once (not a session grant);
+  the policy is checked again when the agy reply lands and before the rules file write; the
+  update hold is released only by the first-run dialog; Ready needs a positive sign-in; Check
+  Again rechecks signed-out agents; approval switches save at once.
+- Dismissed: "a second window reverts the switch". Windows share one `SharedConfig`
+  (`imp.rs:1131`).
+- Accepted residual (NICE): a rules-file save can still land if the switch is turned off in the
+  milliseconds between `remember_while`'s check and its rename. The rule was asked for while
+  on, and matching checks the switch, so it approves nothing while off. Closing the window
+  would hold the store lock on the main thread.
+- Not changed: the setup-close save is synchronous on the main thread, like the existing
+  debounced save.
+- Follow-up (pre-existing, not a security gate): the interruption shelf's More menu and
+  `Ctrl+Alt+Enter` answer Always without the confirm-and-customise dialog
+  (`chat/view/interruption.rs`).
+
 ## Rollback
 
 All changes are in one PR; revert the merge commit. D1 keeps the default and today's behaviour
