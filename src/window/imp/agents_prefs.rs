@@ -44,12 +44,18 @@ fn account_text(driver: Driver, snap: &crate::account_status::Snapshot) -> (Stri
     }
 }
 
-/// The setup summary line for the agents that are `ready` (installed, enabled, not signed out),
-/// and whether it is a warning. While `detecting`, an empty list is not yet a verdict.
-fn ready_summary(ready: &[&str], detecting: bool) -> (String, bool) {
+/// The setup summary line for the agents that are `ready` (installed, enabled, and shown to be
+/// signed in), and whether it is a warning. While `checking` (a scan or an account probe is
+/// out), an empty list is not yet a verdict and a short one may grow.
+fn ready_summary(ready: &[&str], checking: bool) -> (String, bool) {
     if !ready.is_empty() {
-        (format!("Ready: {}", ready.join(", ")), false)
-    } else if detecting {
+        let more = if checking {
+            ". Still checking others…"
+        } else {
+            ""
+        };
+        (format!("Ready: {}{more}", ready.join(", ")), false)
+    } else if checking {
         ("Looking for agents…".to_owned(), false)
     } else {
         (
@@ -1489,7 +1495,16 @@ impl AgentTerminalWindow {
         check.connect_clicked(glib::clone!(
             #[weak]
             obj,
-            move |_| obj.imp().refresh_agent_data(super::threads::Probes::Force)
+            move |_| {
+                // As check_sign_in does: a signed-out agy is probed again only when asked to.
+                let account = crate::account_status::AccountStatus::shared();
+                for driver in Driver::ALL {
+                    if AgentAvailability::shared().is_ready(driver) {
+                        account.recheck(driver);
+                    }
+                }
+                obj.imp().refresh_agent_data(super::threads::Probes::Force);
+            }
         ));
         summary.add_suffix(&check);
         let show = glib::clone!(
@@ -1498,12 +1513,22 @@ impl AgentTerminalWindow {
             move || {
                 let availability = AgentAvailability::shared();
                 let account = crate::account_status::AccountStatus::shared();
-                let ready: Vec<&str> = Driver::ALL
-                    .into_iter()
-                    .filter(|d| availability.is_ready(*d) && !account.snapshot(*d).signed_out)
-                    .map(|d| d.info().label)
-                    .collect();
-                let (text, error) = ready_summary(&ready, availability.any_detecting());
+                // Ready needs positive evidence of a sign-in: an account the probe returned. An
+                // installed agent whose probe is still out leaves the answer open.
+                let mut ready: Vec<&str> = Vec::new();
+                let mut checking = availability.any_detecting();
+                for driver in Driver::ALL {
+                    if !availability.is_ready(driver) {
+                        continue;
+                    }
+                    let snap = account.snapshot(driver);
+                    if snap.account.is_some() && !snap.signed_out {
+                        ready.push(driver.info().label);
+                    } else if !snap.signed_out && (snap.probing || account.is_rechecking(driver)) {
+                        checking = true;
+                    }
+                }
+                let (text, error) = ready_summary(&ready, checking);
                 summary.set_subtitle(&text);
                 if error {
                     summary.add_css_class("warning");
@@ -2302,8 +2327,13 @@ pub(super) mod tests {
             ready_summary(&["Claude", "Codex"], false),
             ("Ready: Claude, Codex".to_owned(), false)
         );
-        assert_eq!(ready_summary(&["Claude"], true).0, "Ready: Claude");
-        assert!(!ready_summary(&[], true).1, "detecting is not a verdict");
+        assert_eq!(
+            ready_summary(&["Claude"], true).0,
+            "Ready: Claude. Still checking others…"
+        );
+        let (text, warn) = ready_summary(&[], true);
+        assert!(!warn, "checking is not a verdict");
+        assert_eq!(text, "Looking for agents…");
         let (text, warn) = ready_summary(&[], false);
         assert!(warn && text.starts_with("No agent is ready yet"), "{text}");
     }

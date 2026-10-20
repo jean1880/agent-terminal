@@ -2429,11 +2429,6 @@ impl AgentTerminalWindow {
             action.set_enabled(true);
         }
         self.show_boot_page("ready");
-        // On a first run the check waits for setup to close (it reads the then-current switch),
-        // without using up the once-per-process check.
-        if self.setup_holds_update_check() {
-            return;
-        }
         self.check_updates_on_startup();
     }
 
@@ -2822,6 +2817,11 @@ impl AgentTerminalWindow {
     /// few seconds after the first window's shell shows, off the main thread. A newer release
     /// marks every window's menu; "up to date" and failures are only logged (nobody asked).
     fn check_updates_on_startup(&self) {
+        // On a first run the check waits for setup to close (it reads the then-current switch),
+        // without using up the once-per-process check; setup's close calls this again.
+        if setup::holds_update_check(self.config.borrow().is_first_run()) {
+            return;
+        }
         let start = self.config.borrow().check_updates_on_startup
             && STARTUP_UPDATE.with(|s| {
                 let mut state = s.borrow_mut();
@@ -2874,12 +2874,6 @@ impl AgentTerminalWindow {
                     .for_each_window(|window| window.show_known_update());
             }
         });
-    }
-
-    /// Whether this window's startup update check must wait for the first-run setup: it is a
-    /// first run and setup has not closed yet.
-    fn setup_holds_update_check(&self) -> bool {
-        self.config.borrow().is_first_run() && !setup::setup_finished()
     }
 
     /// The "Check for Updates at Startup" switch, shared by Settings → General and setup. It

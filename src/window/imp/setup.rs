@@ -22,9 +22,17 @@ thread_local! {
     static SETUP_FINISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether a walkthrough has closed in this process.
-pub(super) fn setup_finished() -> bool {
-    SETUP_FINISHED.with(std::cell::Cell::get)
+thread_local! {
+    /// A walkthrough offered on a first run is open. Process-wide: a window opened meanwhile
+    /// loads the config a setup switch already saved, as a normal start.
+    static FIRST_RUN_SETUP_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the startup update check must wait: a first-run walkthrough is open, or this
+/// window's config is a first run and no walkthrough has closed yet.
+pub(super) fn holds_update_check(window_is_first_run: bool) -> bool {
+    FIRST_RUN_SETUP_OPEN.with(std::cell::Cell::get)
+        || (window_is_first_run && !SETUP_FINISHED.with(std::cell::Cell::get))
 }
 
 /// The navigation tag of the agents page.
@@ -37,6 +45,7 @@ impl AgentTerminalWindow {
             return;
         }
         info!("No settings file at launch: offering the setup walkthrough");
+        FIRST_RUN_SETUP_OPEN.with(|f| f.set(true));
         self.show_setup();
     }
 
@@ -69,6 +78,7 @@ impl AgentTerminalWindow {
                 }
                 // A first run held back the startup update check until now; it reads the switch
                 // as set here. (A later window, or a re-run from Settings, finds it done.)
+                FIRST_RUN_SETUP_OPEN.with(|f| f.set(false));
                 SETUP_FINISHED.with(|f| f.set(true));
                 imp.check_updates_on_startup();
                 // The welcome screen is up when no CLI was found; an agent switched on or set up
