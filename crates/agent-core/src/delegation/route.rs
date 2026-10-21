@@ -193,7 +193,7 @@ fn child_group(d: Driver, bridge: ChildBridge) -> &'static [RouteBlocker] {
 }
 
 /// Reviewed evidence for an individual gate. A passing provider proof never clears a separate
-/// application/source-review gate. See `docs/qa/delegation-route-evidence.md` and its fixtures.
+/// application/source-review gate. The recorded proofs are in `tests/fixtures/real/delegation/route-proof/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateEvidence {
     Passed,

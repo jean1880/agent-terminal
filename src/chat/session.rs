@@ -7265,7 +7265,7 @@ mod tests {
             let all = store.events(&thread, None, 1000).expect("events");
             assert!(all.len() > 5);
 
-            // Council #249/#253: the handoff is stored, so a restart now (nothing completed yet)
+            // the handoff is stored, so a restart now (nothing completed yet)
             // re-arms the very same one.
             let stored = |store: &Store| {
                 let events = store.events(&thread, None, 10_000).expect("events");

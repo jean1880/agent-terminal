@@ -1,4 +1,4 @@
-//! The cross-agent delegation supervisor (`docs/delegation/p4-supervisor.md`).
+//! The cross-agent delegation supervisor.
 //!
 //! One application-owned runtime drives authenticated tools, scoped child sessions and
 //! committed worker activity. It is shared by windows and never owned by an MCP process.

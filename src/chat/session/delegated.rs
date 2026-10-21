@@ -1,4 +1,4 @@
-//! Lane B: a session's typed delegated-input API (`docs/delegation/p4-supervisor.md` §3.4).
+//! Lane B: a session's typed delegated-input API.
 //!
 //! Delegated input is never a user prompt: it is stored as `Event::DelegatedMessage` (never a
 //! `UserMessage`), labelled for the agent as data from another agent, and never enters the

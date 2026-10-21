@@ -1,7 +1,7 @@
 //! The pre-v4 upgrade preflight: the one way an existing store reaches schema 4.
 //!
 //! `Store::open` runs it before anything else touches an existing database file (contract §8.2).
-//! The order is the one proven in `docs/qa/delegation-discovery/sdk-and-store.md`:
+//! The order is the one proven against a real pre-v4 database:
 //!
 //! 1. A missing file is a fresh install: no preflight, `Store::open` creates it as before.
 //! 2. `flock(<db>.upgrade-lock)`; open `READ_WRITE` without `CREATE`; read `sqlite_master` with no

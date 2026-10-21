@@ -1,8 +1,7 @@
 //! Claude Code adapter: `claude --input-format stream-json` plus the control protocol.
 //!
-//! A pure, sans-I/O state machine. The wire facts come from the Phase 0 probes
-//! (`plans/2026-10-06_v3-structured-agents.md`, "Phase 0 results") and are replayed against the
-//! recordings in `tests/fixtures/claude-*.ndjson`.
+//! A pure, sans-I/O state machine. The wire facts come from probes of the real CLI
+//! and are replayed against the recordings in `tests/fixtures/claude-*.ndjson`.
 //!
 //! Frames are read as untyped [`serde_json::Value`]s, so a field the CLI adds or drops never
 //! aborts the stream: anything this adapter does not map becomes [`Event::Unknown`] with the whole

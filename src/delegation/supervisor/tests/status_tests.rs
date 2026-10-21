@@ -57,7 +57,7 @@ async fn settled_dispatch(sup: &Rc<Supervisor>, operation: &str) -> (String, Opt
     out.unwrap()
 }
 
-/// H1: a bridge connection that closes leaves the worker `rebind_required` with a reason, in
+/// a bridge connection that closes leaves the worker `rebind_required` with a reason, in
 /// memory and in the store, and the registry hears about it.
 #[test]
 fn a_closed_bridge_says_why_persists_it_and_tells_the_registry() {
@@ -143,7 +143,7 @@ fn an_agy_child_gets_its_task_once_its_process_has_started() {
     });
 }
 
-/// H2: a task whose dispatch fails ends its run in memory as well as in the store, so `list`
+/// a task whose dispatch fails ends its run in memory as well as in the store, so `list`
 /// and `cancel` agree, and the worker says why it cannot proceed.
 #[test]
 fn a_failed_dispatch_ends_the_run_so_list_and_cancel_agree() {
@@ -263,7 +263,7 @@ fn list_reports_the_run_cancel_would_target() {
     });
 }
 
-/// H3: a task handed to the agent whose turn never opens is a stall: the worker fails with a
+/// a task handed to the agent whose turn never opens is a stall: the worker fails with a
 /// reason and its run ends, instead of `starting` for ever.
 #[test]
 fn a_task_that_never_starts_is_a_stall_with_a_reason() {

@@ -71,9 +71,8 @@ Every agent can use every other as a sub-agent, Codex included. Codex 0.161.0 as
 its disable settings, and those run outside Agent Terminal's depth, mode and worktree
 limits (the worker dock shows them). The capabilities response reports it as
 `route_caveats: ["codex_native_workers_unsupervised"]`, and the settings say so where
-you turn delegation on. Provider and route evidence, including
-the distinction between local model fixtures and cloud runs, is recorded in
-[route evidence](../qa/delegation-route-evidence.md).
+you turn delegation on. The recorded provider proofs are local model fixtures, not cloud runs;
+they live under `tests/fixtures/real/delegation/`.
 
 To roll back the feature, disable delegation on profiles, close their threads and
 remove the managed agy entry. The standalone homelab `cross-agent` command is separate

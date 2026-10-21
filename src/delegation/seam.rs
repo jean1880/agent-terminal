@@ -1,4 +1,4 @@
-//! The P4 cross-lane seam (`docs/delegation/p4-supervisor.md` §1.1). Frozen in Wave 0: lanes change
+//! The cross-lane seam of the delegation supervisor. Frozen: lanes change
 //! bodies elsewhere, never these shapes. A change here needs the coordinator.
 
 use std::future::Future;

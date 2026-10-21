@@ -46,7 +46,7 @@ const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
 
 /// Undocumented agy flags that move its whole configuration directory (hooks, MCP servers,
 /// settings) away from `$HOME/.gemini`, the one the app's hook proof reads. Verified live for
-/// `--gemini_dir=` (agy 1.3.5, `docs/qa/delegation-discovery/agy.md`, D2 and D6). Both take a
+/// `--gemini_dir=` (agy 1.3.5). Both take a
 /// value, inline (`=`) or as the next argument.
 const CONFIG_DIR_FLAGS: [&str; 2] = ["gemini_dir", "app_data_dir"];
 

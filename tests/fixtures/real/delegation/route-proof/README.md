@@ -1,7 +1,7 @@
 # Installed-provider route gate proofs
 
-Recorded 2026-10-15 by `make delegation-proof`; full interpretation and limitations
-are in `docs/qa/delegation-route-evidence.md`.
+Recorded 2026-10-15 by `make delegation-proof`. A passing provider proof never clears the
+separate application/source-review gate.
 
 - Claude Code 2.1.300: real restricted CLI, deterministic loopback Anthropic model,
   real MCP process, host Bash denial, generated-home canary scan.

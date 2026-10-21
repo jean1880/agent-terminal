@@ -308,6 +308,11 @@ Keep the three asset lists (deb, rpm metadata, PKGBUILD) in step.
 
 ## 🤖 AI Contribution Rules
 
+- Plans, reports, reviews, council notes, QA evidence and investigation write-ups never go in
+  this repo; they live outside it. `docs/` holds only release notes, screenshots and user
+  documentation. Commit messages, PR descriptions and code comments never cite plans, councils,
+  Hive topics or finding numbers: state the fact itself. `make lint` enforces the `docs/`
+  allowlist.
 - Always prioritize the **Standalone Philosophy**.
 - Colours are user-selectable (`ThemeChoice` in `config.rs`, palettes in
   `theme.rs`, app-wide names in `palette.rs`); add new schemes there and update the

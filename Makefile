@@ -190,6 +190,7 @@ lint:
 	cargo fmt --all -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo check --locked --no-default-features
+	@! git ls-files plans docs | grep -v -E '^docs/(releases/|screenshots/|delegation/user-guide\.md)' | grep . | sed 's/^/not allowed in the repository: /' | grep . >&2 || { echo "plans, reports and reviews never go in this repo; docs/ holds only releases, screenshots and the user guide"; exit 1; }
 
 # What CI and a release run.
 check: lint test test-display test-qa
