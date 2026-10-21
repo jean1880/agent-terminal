@@ -384,12 +384,19 @@ struct Inner {
     /// The process was suspended and nothing has started since: the next start is a resume the
     /// user did not ask for, so a delegation rebind around it says nothing.
     suspended: Cell<bool>,
-    /// The current process generation has written to stdout (its handshake reply, at the
-    /// latest): it is past starting. Presentation only (reset by every start).
+    /// The current process generation is up: its adapter accepted the handshake's answer
+    /// ([`Adapter::handshake_answered`]), or it reported its session or started a turn.
+    /// Presentation only (reset by every start).
     reported: Cell<bool>,
     /// The current start resumes a suspended process: the header says "Resuming…" until it
-    /// reports. Presentation only.
+    /// is up. Presentation only.
     resuming: Cell<bool>,
+    /// The [`crate::chat::Lifecycle`] last given to `lifecycle_listener`.
+    lifecycle_told: Cell<crate::chat::Lifecycle>,
+    /// Told whenever the lifecycle changes, with or without an envelope (a silent handshake
+    /// answer, a suspension). Set by the window; it must not call back into the session
+    /// synchronously.
+    lifecycle_listener: RefCell<Option<crate::chat::LifecycleListener>>,
     /// The native session has a conversation an agent can resume: this process was started
     /// resuming one, or a turn completed on it after a prompt was sent to it. A session id alone
     /// (a fresh start, Claude's prompt-less init turn) may name no transcript yet.
@@ -780,6 +787,8 @@ impl ChatSession {
             suspended: Cell::new(false),
             reported: Cell::new(false),
             resuming: Cell::new(false),
+            lifecycle_told: Cell::new(crate::chat::Lifecycle::default()),
+            lifecycle_listener: RefCell::new(None),
             has_conversation: Cell::new(false),
             prompted: Cell::new(false),
         });
@@ -894,16 +903,15 @@ impl ChatSession {
 
     /// Where the agent process is in its life, for the header and the sidebar (read-only).
     pub fn lifecycle(&self) -> crate::chat::Lifecycle {
-        let inner = &self.inner;
-        let alive = inner.state.borrow().alive;
-        let starting = alive && !inner.reported.get();
-        crate::chat::Lifecycle {
-            alive,
-            starting,
-            resuming: starting && inner.resuming.get(),
-            // A stopped process with nothing started since: the next prompt resumes it.
-            suspended: !alive && inner.suspended.get(),
-        }
+        self.inner.lifecycle()
+    }
+
+    /// Calls `listener` whenever [`Self::lifecycle`] changes, whether or not an envelope says
+    /// so (Codex's handshake answer carries none; a suspension is silent). It is called from
+    /// inside the session, so it must defer anything that calls back into it.
+    pub fn set_lifecycle_listener(&self, listener: crate::chat::LifecycleListener) {
+        self.inner.lifecycle_told.set(self.inner.lifecycle());
+        *self.inner.lifecycle_listener.borrow_mut() = Some(listener);
     }
 
     /// A watch on the running agent process, if one is alive: taken before [`Self::shutdown`],
@@ -1015,6 +1023,8 @@ impl Inner {
             self.offer_reply_question(&ended);
         }
         drop(delivery);
+        // An exit, a failed spawn: whatever the envelope changed of the lifecycle.
+        self.notify_lifecycle();
         self.flush_queued_dispatch();
     }
 
@@ -1024,6 +1034,8 @@ impl Inner {
         self.apply(env);
         (self.sink)(&crate::approval_server::masked_for_view(env.clone()));
         drop(delivery);
+        // An exit, a failed spawn: whatever the envelope changed of the lifecycle.
+        self.notify_lifecycle();
         self.flush_queued_dispatch();
     }
 
@@ -1044,6 +1056,7 @@ impl Inner {
             } => {
                 // The agent is up: a switch to it can no longer roll back.
                 *self.rollback.borrow_mut() = None;
+                self.mark_up();
                 if !native_id.is_empty() {
                     let pt = self.provider_thread.borrow().clone();
                     // A resume that started a new native session leaves the old one behind:
@@ -1080,6 +1093,7 @@ impl Inner {
                 // An agent that runs turns has started, whether or not it reported a session:
                 // an exit from here on is an ordinary one, not a failed switch.
                 *self.rollback.borrow_mut() = None;
+                self.mark_up();
                 if let Some(m) = model {
                     self.set_model(m);
                 }
@@ -1453,6 +1467,7 @@ impl Inner {
         }
         if self.adapter.borrow().driver() != Driver::Agy || self.approval().is_none() {
             self.spawn_generation(generation);
+            self.notify_lifecycle();
             return;
         }
         let target = {
@@ -1468,6 +1483,7 @@ impl Inner {
             writes: Vec::new(),
         });
         self.state.borrow_mut().alive = true;
+        self.notify_lifecycle();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let verdict = gtk4::gio::spawn_blocking(move || check(&target))
@@ -1954,12 +1970,6 @@ impl Inner {
         if generation != self.generation.get() {
             return;
         }
-        if !stderr {
-            // The agent answered: it is up. Not its session report, which Claude sends only
-            // with the first prompt's turn; every agent answers its handshake at once.
-            self.reported.set(true);
-            self.resuming.set(false);
-        }
         if stderr
             && self.thinking.passed.get()
             && agent_core::claude::refuses_thinking_display(line)
@@ -1996,6 +2006,12 @@ impl Inner {
         } else {
             self.adapter.borrow_mut().feed(line)
         };
+        // The adapter accepted the agent's answer to its handshake: it is up. Claude reports its
+        // session only with the first prompt's turn, and Codex's reply carries no event, so
+        // neither `SessionStarted` nor any envelope can be waited for.
+        if !self.reported.get() && self.adapter.borrow().handshake_answered() {
+            self.mark_up();
+        }
         for env in envelopes {
             self.observe(&env);
             if generation != self.generation.get() {
@@ -2748,7 +2764,41 @@ impl Inner {
         let _quiet = ScopedFlag::set(&self.quiet_exit);
         self.stop_current();
         self.suspended.set(true);
+        // Silent for the view and the store, but not for the lifecycle.
+        self.notify_lifecycle();
         true
+    }
+
+    /// Where the agent process is in its life ([`ChatSession::lifecycle`]).
+    fn lifecycle(&self) -> crate::chat::Lifecycle {
+        let alive = self.state.borrow().alive;
+        let starting = alive && !self.reported.get();
+        crate::chat::Lifecycle {
+            alive,
+            starting,
+            resuming: starting && self.resuming.get(),
+            // A stopped process with nothing started since: the next prompt resumes it.
+            suspended: !alive && self.suspended.get(),
+        }
+    }
+
+    /// The current process is up (see `reported`).
+    fn mark_up(&self) {
+        self.reported.set(true);
+        self.resuming.set(false);
+        self.notify_lifecycle();
+    }
+
+    /// Tells the lifecycle listener when the lifecycle changed since it was last told.
+    fn notify_lifecycle(&self) {
+        let now = self.lifecycle();
+        if self.lifecycle_told.replace(now) == now {
+            return;
+        }
+        let listener = self.lifecycle_listener.borrow().clone();
+        if let Some(listener) = listener {
+            listener(now);
+        }
     }
 
     /// A dead process (agy after an interrupt) is restarted resuming its native session.
@@ -5682,6 +5732,125 @@ mod tests {
                 pump_until(ctx, 10, || session.lifecycle() == life(false, false, false)),
                 "the resumed agent never reported: {:?}",
                 session.lifecycle()
+            );
+        });
+    }
+
+    /// An agent counts as up only once its adapter accepted the answer to its handshake: blank,
+    /// malformed, foreign or refused replies leave it starting. The lifecycle listener hears the
+    /// change even when no envelope carries it (Codex's `initialize` result has none), so no
+    /// header or row is left on a stale "Starting…".
+    #[test]
+    fn an_agent_is_up_only_once_its_adapter_accepts_the_handshake_answer() {
+        in_loop(|ctx| {
+            type Make = fn() -> Box<dyn Adapter>;
+            let claude: Make = || Box::new(agent_core::claude::ClaudeAdapter::new());
+            let codex: Make = || Box::new(agent_core::codex::CodexAdapter::new());
+            let claude_reply = |subtype: &str| {
+                serde_json::json!({"type": "control_response", "response": {
+                    "subtype": subtype, "request_id": "init-1"}})
+                .to_string()
+            };
+            let noise = || vec![String::new(), "not json".to_owned()];
+            let cases: Vec<(&str, Make, Vec<String>, bool)> = vec![
+                ("claude noise", claude, noise(), false),
+                (
+                    "claude foreign reply",
+                    claude,
+                    vec![serde_json::json!({"type": "control_response", "response": {
+                        "subtype": "success", "request_id": "other-9"}})
+                    .to_string()],
+                    false,
+                ),
+                ("claude refused", claude, vec![claude_reply("error")], false),
+                (
+                    "claude unknown reply",
+                    claude,
+                    vec![claude_reply("unexpected")],
+                    false,
+                ),
+                (
+                    "claude success",
+                    claude,
+                    vec![claude_reply("success")],
+                    true,
+                ),
+                ("codex noise", codex, noise(), false),
+                (
+                    "codex refused",
+                    codex,
+                    vec![r#"{"id":1,"error":{"message":"unsupported client"}}"#.to_owned()],
+                    false,
+                ),
+                (
+                    "codex silent success",
+                    codex,
+                    vec![r#"{"id":1,"result":{}}"#.to_owned()],
+                    true,
+                ),
+            ];
+            for (name, make, lines, up) in cases {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let (session, seen) = recording(ctx, tmp.path(), make());
+                let told = Rc::new(RefCell::new(Vec::<crate::chat::Lifecycle>::new()));
+                let t = told.clone();
+                session.set_lifecycle_listener(Rc::new(move |l| t.borrow_mut().push(l)));
+                assert!(
+                    session.lifecycle().starting,
+                    "{name}: starting before any answer"
+                );
+                let before = seen.borrow().len();
+                for line in &lines {
+                    feed(&session, line);
+                }
+                let life = session.lifecycle();
+                assert_eq!(life.alive && !life.starting, up, "{name}: {life:?}");
+                let told_up = told.borrow().iter().any(|l| l.alive && !l.starting);
+                assert_eq!(told_up, up, "{name}: told {:?}", told.borrow());
+                if name == "codex silent success" {
+                    assert_eq!(
+                        seen.borrow().len(),
+                        before,
+                        "no envelope carried it, and the listener still heard it"
+                    );
+                }
+                session.shutdown(false);
+            }
+
+            // Output the adapter cannot accept, then an exit: never up, and told it ended.
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, _seen) = make_sink();
+            let session = ChatSession::new(
+                claude(),
+                scripted(
+                    tmp.path(),
+                    "IFS= read -r handshake\necho ''\necho 'not json'\nexit 3",
+                ),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            let told = Rc::new(RefCell::new(Vec::<crate::chat::Lifecycle>::new()));
+            let t = told.clone();
+            session.set_lifecycle_listener(Rc::new(move |l| t.borrow_mut().push(l)));
+            session.reload_session();
+            assert!(session.lifecycle().starting, "{:?}", session.lifecycle());
+            assert!(
+                pump_until(ctx, 10, || !session.lifecycle().alive),
+                "the agent never exited"
+            );
+            assert!(
+                !told.borrow().iter().any(|l| l.alive && !l.starting),
+                "never up: {:?}",
+                told.borrow()
+            );
+            assert_eq!(
+                told.borrow().last().copied(),
+                Some(crate::chat::Lifecycle::default()),
+                "the exit itself was told"
             );
         });
     }

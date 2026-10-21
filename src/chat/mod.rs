@@ -112,6 +112,9 @@ pub trait ChatBackend {
     }
 }
 
+/// Told each new [`Lifecycle`] of a session (`ChatSession::set_lifecycle_listener`).
+pub type LifecycleListener = std::rc::Rc<dyn Fn(Lifecycle)>;
+
 /// Where a thread's agent process is in its life. Presentation only: the header's "Starting…",
 /// "Resuming…" and "Paused" and the sidebar's `ThreadActivity` are read from it; nothing
 /// decides on it.

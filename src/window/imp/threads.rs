@@ -978,6 +978,28 @@ thread_local! {
     static LAST_SESSION: RefCell<Option<LastSession>> = const { RefCell::new(None) };
 }
 
+/// The scan that may still link its sessions. Read on the writer too, so a scan waiting in its
+/// queue is cancelled just like one still reading files.
+static SESSION_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Starts a scan of the agents' own sessions: its generation. Any earlier scan is superseded.
+fn begin_session_scan() -> u64 {
+    SESSION_SCAN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+/// "Show Sessions Started Outside Agent Terminal" went off: no scan in flight may link.
+fn cancel_session_scans() {
+    SESSION_SCAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the scan begun as `scan` may link its sessions now: the setting is still on
+/// (`enabled`) and no newer scan or cancellation came since.
+fn session_scan_wanted(scan: u64, enabled: bool) -> bool {
+    enabled && SESSION_SCAN.load(std::sync::atomic::Ordering::Relaxed) == scan
+}
+
 /// The open-thread layout the last session left, and how many of its threads still exist.
 struct LastSession {
     /// The stored layout ([`OPEN_THREADS_KEY`]), as read before this run recorded its own.
@@ -4218,6 +4240,7 @@ impl AgentTerminalWindow {
             return;
         };
         let obj = self.obj().downgrade();
+        let scan = begin_session_scan();
         glib::MainContext::default().spawn_local(async move {
             // The scan reads the agents' files on a worker; only linking runs on the writer.
             let scan_home = home.clone();
@@ -4226,7 +4249,20 @@ impl AgentTerminalWindow {
             })
             .await
             .unwrap_or_default();
+            // Turned off (or turned off and on again: a newer scan) while the files were read:
+            // nothing is linked or announced.
+            let enabled = obj
+                .upgrade()
+                .is_some_and(|o| o.imp().config.borrow().list_outside_sessions);
+            if !session_scan_wanted(scan, enabled) {
+                info!("A scan of recent agent sessions was dropped: the setting changed");
+                return;
+            }
             let added = write_job("list recent sessions as threads", move |store| {
+                // The setting may have changed while this job waited behind other writes.
+                if !session_scan_wanted(scan, true) {
+                    return Ok(Vec::new());
+                }
                 Ok(link_recent_sessions(
                     store,
                     &sessions,
@@ -4258,6 +4294,9 @@ impl AgentTerminalWindow {
         self.schedule_config_save();
         if on {
             self.list_recent_sessions();
+        } else {
+            // A scan still reading files must not link what it finds.
+            cancel_session_scans();
         }
     }
 
@@ -5070,6 +5109,7 @@ impl AgentTerminalWindow {
         session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
         let dir_for = dir.to_owned();
         session.set_agy_can_ask(Rc::new(move || agy_hook_ready(&dir_for)));
+        session.set_lifecycle_listener(Self::lifecycle_listener(thread));
         *slot.session.borrow_mut() = Some(session.clone());
         if let Some(supervisor) = crate::delegation::supervisor() {
             supervisor.attach_root_session(thread, Rc::downgrade(&session));
@@ -5130,6 +5170,36 @@ impl AgentTerminalWindow {
     // -----------------------------------------------------------------------------------------
     // Live thread events
     // -----------------------------------------------------------------------------------------
+
+    /// `thread`'s session says its lifecycle changed (its agent answered, exited, paused or is
+    /// starting again), maybe with no event at all: its header, and its row if that now shows
+    /// another activity, are brought up to date. Deferred, since the session calls this from
+    /// inside itself.
+    fn lifecycle_listener(thread: &str) -> crate::chat::LifecycleListener {
+        let thread = thread.to_owned();
+        Rc::new(move |_| {
+            let thread = thread.clone();
+            glib::idle_add_local_once(move || {
+                let Some(obj) = thread_owner(&thread) else {
+                    return;
+                };
+                let imp = obj.imp();
+                let view = imp
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .filter_map(|t| t.chat.as_ref())
+                    .find(|c| c.thread == thread)
+                    .and_then(|c| c.view.clone());
+                if let Some(view) = view {
+                    view.refresh_status();
+                }
+                if imp.activity_outdated(&thread) {
+                    imp.refresh_sidebar();
+                }
+            });
+        })
+    }
 
     /// Whether `thread`'s agent activity ([`ChatTab::activity`]) differs from what its drawn
     /// sidebar row shows. A row not drawn (folded away, filtered out) is never outdated.
@@ -5383,12 +5453,6 @@ impl AgentTerminalWindow {
                 After::Nothing if switched => After::Sidebar,
                 other => other,
             }
-        };
-        // The agent reporting its session, or starting again for a message sent while it was
-        // paused, changes the row's activity with no event of its own.
-        let after = match after {
-            After::Nothing if self.activity_outdated(thread) => After::Sidebar,
-            other => other,
         };
         if withdraw_ask {
             if let Some(app) = self.obj().application() {
@@ -7730,6 +7794,66 @@ pub(super) mod tests {
         }
     }
 
+    /// The last session's reopen offer is app-wide: every window's empty state shows it, and
+    /// taking it in one window spends it in all of them.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn the_reopen_offer_shows_in_every_window_and_is_spent_once() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.ReopenOffer")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let first = crate::window::AgentTerminalWindow::new(&app);
+        let second = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        let built =
+            |w: &crate::window::AgentTerminalWindow| w.imp().reopen_button.borrow().is_some();
+        assert!(crate::testutil::pump_until(&ctx, 5, || built(&first) && built(&second)));
+        let shown = |w: &crate::window::AgentTerminalWindow| {
+            w.imp()
+                .reopen_button
+                .borrow()
+                .as_ref()
+                // Its own `visible`: the windows are never presented, so nothing is drawn.
+                .filter(|b| b.property::<bool>("visible"))
+                .and_then(|b| b.label())
+                .map(|l| l.to_string())
+        };
+        assert_eq!(shown(&first), None, "nothing to offer yet");
+
+        // A layout whose threads are gone by the time it is taken: still spent everywhere.
+        LAST_SESSION.with(|s| {
+            *s.borrow_mut() = Some(LastSession {
+                saved: serde_json::json!({"open": ["gone-1", "gone-2"]}).to_string(),
+                count: 2,
+            })
+        });
+        first.imp().update_reopen_offer();
+        second.imp().update_reopen_offer();
+        let offer = Some("Reopen 2 threads from your last session".to_owned());
+        assert_eq!(shown(&first), offer);
+        assert_eq!(shown(&second), offer);
+
+        second.imp().reopen_last_session();
+        assert!(LAST_SESSION.with(|s| s.borrow().is_none()), "spent");
+        assert_eq!(shown(&first), None, "gone from the other window too");
+        assert_eq!(shown(&second), None);
+        // A second click, in either window, does nothing.
+        first.imp().reopen_last_session();
+        crate::testutil::pump_until(&ctx, 1, || false);
+        assert_eq!(first.imp().thread_pages() + second.imp().thread_pages(), 0);
+        first.close();
+        second.close();
+    }
+
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn opening_a_thread_in_two_windows_keeps_one_page_and_remote_actions_reach_it() {
@@ -9316,6 +9440,32 @@ pub(super) mod tests {
         assert_eq!(selected_to_restore(&saved, &open).as_deref(), Some("a"));
         assert!(restorable(&serde_json::json!({}), &known, 5).is_empty());
         assert_eq!(selected_to_restore(&serde_json::json!({}), &[]), None);
+    }
+
+    /// A scan still reading the agents' files when the setting goes off (or off and on again)
+    /// links nothing when it returns; only the newest scan, with the setting on, may.
+    #[test]
+    fn a_delayed_session_scan_is_dropped_once_the_setting_changes() {
+        let first = begin_session_scan();
+        assert!(session_scan_wanted(first, true));
+        assert!(!session_scan_wanted(first, false), "off when it returns");
+        // Turned off while it read: dropped, even if the setting is read as on later.
+        cancel_session_scans();
+        assert!(!session_scan_wanted(first, true));
+        assert!(
+            !std::thread::spawn(move || session_scan_wanted(first, true))
+                .join()
+                .expect("writer check"),
+            "a result already queued on the writer is dropped too"
+        );
+        // Turned on again: a new scan; the old one, returning late, still links nothing.
+        let second = begin_session_scan();
+        assert!(!session_scan_wanted(first, true));
+        assert!(session_scan_wanted(second, true));
+        // A scan begun after another supersedes it: no two link at once.
+        let third = begin_session_scan();
+        assert!(!session_scan_wanted(second, true));
+        assert!(session_scan_wanted(third, true));
     }
 
     #[test]
