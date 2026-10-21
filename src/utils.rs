@@ -516,6 +516,99 @@ pub fn resolve_working_directory(starting_dir: &str, home_dir: &str) -> String {
     }
 }
 
+/// The folders a new chat thread could start in, from the most to the least specific (see
+/// [`resolve_new_thread_dir`]). Each is as configured or picked (`~` not yet expanded).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NewThreadDirs<'a> {
+    /// A folder the user picked for this thread (a folder picker, a worktree, a folder's row, a
+    /// fork of a thread in it). Never replaced: a missing one refuses the thread.
+    pub explicit: Option<&'a str>,
+    /// The folder of a profile the user explicitly chose for this thread.
+    pub chosen_profile: Option<&'a str>,
+    /// The folder of the page in view.
+    pub current: Option<&'a str>,
+    /// The folder of the agent's own profile (Settings → Agents), when nothing more specific is.
+    pub agent_profile: Option<&'a str>,
+    /// The configured starting directory; blank means home.
+    pub starting: &'a str,
+}
+
+/// Which of [`NewThreadDirs`] a new thread starts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewThreadDirSource {
+    Explicit,
+    ChosenProfile,
+    Current,
+    AgentProfile,
+    Starting,
+    Home,
+}
+
+/// Where a new thread starts, from [`resolve_new_thread_dir`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewThreadDir {
+    pub dir: String,
+    pub source: NewThreadDirSource,
+    /// The starting directory was set but is missing: the thread started in home instead, and
+    /// the user is told so.
+    pub missing_start: Option<String>,
+}
+
+/// The one rule for a new chat thread's folder: the explicit folder, else the folder of a
+/// profile explicitly chosen, else the page in view's, else the agent's own profile's, else the
+/// starting directory, else home. A folder that is gone is passed over (a removed worktree, most
+/// often), except an explicit one: that is refused (`Err` with the expanded path) rather than
+/// silently replaced. Blocking (`is_dir` stats the disk): run it off the main thread.
+pub fn resolve_new_thread_dir(
+    dirs: &NewThreadDirs<'_>,
+    home: &str,
+    is_dir: impl Fn(&str) -> bool,
+) -> Result<NewThreadDir, String> {
+    let expand = |d: &str| {
+        // Blank is no folder; anything else is taken as written (a name may end in a space).
+        (!d.trim().is_empty()).then(|| expand_tilde_with(d, home))
+    };
+    let found = |dir: String, source| NewThreadDir {
+        dir,
+        source,
+        missing_start: None,
+    };
+    if let Some(explicit) = dirs.explicit.and_then(expand) {
+        return if is_dir(&explicit) {
+            Ok(found(explicit, NewThreadDirSource::Explicit))
+        } else {
+            Err(explicit)
+        };
+    }
+    let candidates = [
+        (dirs.chosen_profile, NewThreadDirSource::ChosenProfile),
+        (dirs.current, NewThreadDirSource::Current),
+        (dirs.agent_profile, NewThreadDirSource::AgentProfile),
+    ];
+    for (dir, source) in candidates {
+        if let Some(dir) = dir.and_then(expand) {
+            if is_dir(&dir) {
+                return Ok(found(dir, source));
+            }
+            warn!("New thread: {dir} is not a directory; trying the next folder");
+        }
+    }
+    match expand(dirs.starting) {
+        Some(start) if is_dir(&start) => Ok(found(start, NewThreadDirSource::Starting)),
+        Some(start) => {
+            warn!(
+                "Starting directory '{start}' is not a directory, falling back to home directory"
+            );
+            Ok(NewThreadDir {
+                dir: home.to_string(),
+                source: NewThreadDirSource::Home,
+                missing_start: Some(start),
+            })
+        }
+        None => Ok(found(home.to_string(), NewThreadDirSource::Home)),
+    }
+}
+
 /// Quotes an argument for safe inclusion in the single shell command string.
 ///
 /// The command is handed to `$SHELL -ic`, so a profile carrying an argument with
@@ -660,6 +753,88 @@ pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The new-thread folder table: the most specific folder that exists wins, and only an
+    /// explicit one is refused when it is gone.
+    #[test]
+    fn a_new_threads_folder_follows_one_order() {
+        use NewThreadDirSource as S;
+        let exists = |d: &str| ["/x", "/p", "/c", "/a", "/s", "/h/proj"].contains(&d);
+        let all = NewThreadDirs {
+            explicit: Some("/x"),
+            chosen_profile: Some("/p"),
+            current: Some("/c"),
+            agent_profile: Some("/a"),
+            starting: "/s",
+        };
+        let pick = |dirs: NewThreadDirs<'_>| {
+            resolve_new_thread_dir(&dirs, "/h", exists).map(|d| (d.dir, d.source, d.missing_start))
+        };
+        let ok = |dir: &str, source| Ok((dir.to_string(), source, None));
+        assert_eq!(pick(all), ok("/x", S::Explicit));
+        assert_eq!(
+            pick(NewThreadDirs {
+                explicit: None,
+                ..all
+            }),
+            ok("/p", S::ChosenProfile)
+        );
+        assert_eq!(
+            pick(NewThreadDirs {
+                explicit: Some("  "),
+                chosen_profile: None,
+                ..all
+            }),
+            ok("/c", S::Current),
+            "a blank folder is no folder"
+        );
+        assert_eq!(
+            pick(NewThreadDirs {
+                explicit: None,
+                chosen_profile: Some("/gone"),
+                current: None,
+                ..all
+            }),
+            ok("/a", S::AgentProfile),
+            "a missing profile folder is passed over"
+        );
+        assert_eq!(
+            pick(NewThreadDirs {
+                starting: "~/proj",
+                ..NewThreadDirs::default()
+            }),
+            ok("/h/proj", S::Starting),
+            "~ is expanded"
+        );
+        assert_eq!(
+            pick(NewThreadDirs::default()),
+            ok("/h", S::Home),
+            "an unset starting directory is home, without a notice"
+        );
+        assert_eq!(
+            pick(NewThreadDirs {
+                current: Some("/removed-worktree"),
+                starting: "/missing",
+                ..NewThreadDirs::default()
+            }),
+            Ok(("/h".into(), S::Home, Some("/missing".into()))),
+            "a missing starting directory falls back to home and says so"
+        );
+    }
+
+    #[test]
+    fn a_missing_explicit_folder_is_refused_not_replaced() {
+        let dirs = NewThreadDirs {
+            explicit: Some("~/gone"),
+            current: Some("/c"),
+            starting: "/s",
+            ..NewThreadDirs::default()
+        };
+        assert_eq!(
+            resolve_new_thread_dir(&dirs, "/h", |d| d != "/h/gone"),
+            Err("/h/gone".to_string())
+        );
+    }
 
     /// [`super::read_indicator`] with the test process's own PATH: the real one would source
     /// the developer's shell rc.

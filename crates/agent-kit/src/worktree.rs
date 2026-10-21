@@ -8,8 +8,9 @@
 use crate::git::{git_output, git_raw, QUERY_TIMEOUT_SECS};
 use std::path::{Path, PathBuf};
 
-/// A worktree a tab was opened in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A worktree a tab was opened in. Kept beside its thread in the store (as JSON), so a
+/// reopened worktree thread still knows it is one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: String,
@@ -223,6 +224,46 @@ pub fn is_clean(path: &Path) -> Result<bool, String> {
     Ok(ignored.is_empty())
 }
 
+/// Whether `info` is still a worktree of its main checkout, on its branch: what a worktree read
+/// back from the store must be before its removal is offered (it may have been removed, moved
+/// or switched to another branch by hand since). `Err` when git cannot say, which is never
+/// taken as registered.
+pub fn is_registered(info: &WorktreeInfo) -> Result<bool, String> {
+    let out = git_raw(
+        &info.main_toplevel,
+        ["worktree", "list", "--porcelain"],
+        &[],
+        QUERY_TIMEOUT_SECS,
+    )?;
+    let want = info
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| info.path.clone());
+    Ok(listed_worktree(
+        &String::from_utf8_lossy(&out),
+        &want,
+        info.branch.trim(),
+    ))
+}
+
+/// Whether `git worktree list --porcelain` output lists `path` with `branch` checked out.
+fn listed_worktree(porcelain: &str, path: &Path, branch: &str) -> bool {
+    let wanted_ref = format!("refs/heads/{branch}");
+    porcelain.split("\n\n").any(|record| {
+        let mut here = false;
+        let mut on_branch = false;
+        for line in record.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                let p = Path::new(p);
+                here = p == path || p.canonicalize().is_ok_and(|c| c == path);
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                on_branch = b == wanted_ref;
+            }
+        }
+        here && on_branch
+    })
+}
+
 /// Removes the worktree at `path`. Never forced: git refuses a dirty one.
 /// The branch is kept.
 pub fn remove(main_toplevel: &Path, path: &Path) -> Result<(), String> {
@@ -265,6 +306,32 @@ mod tests {
         assert!(precheck_name("-f", "branch name").is_err());
         assert!(precheck_name("  ", "branch name").is_err());
         assert!(precheck_name("feat/x", "branch name").is_ok());
+    }
+
+    #[test]
+    fn a_worktree_is_listed_only_at_its_path_and_on_its_branch() {
+        let porcelain = "worktree /r/main\nHEAD abc\nbranch refs/heads/main\n\n\
+                         worktree /r/.main.worktrees/feat-x\nHEAD def\nbranch refs/heads/feat/x\n\n\
+                         worktree /r/detached\nHEAD 123\ndetached\n";
+        let path = Path::new("/r/.main.worktrees/feat-x");
+        assert!(listed_worktree(porcelain, path, "feat/x"));
+        assert!(
+            !listed_worktree(porcelain, path, "feat/y"),
+            "another branch"
+        );
+        assert!(!listed_worktree(porcelain, Path::new("/r/gone"), "feat/x"));
+        assert!(!listed_worktree(porcelain, Path::new("/r/detached"), "x"));
+    }
+
+    #[test]
+    fn worktree_info_round_trips_as_json() {
+        let info = WorktreeInfo {
+            path: PathBuf::from("/r/.main.worktrees/feat-x"),
+            branch: "feat/x".into(),
+            main_toplevel: PathBuf::from("/r/main"),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(serde_json::from_str::<WorktreeInfo>(&json).unwrap(), info);
     }
 
     mod repo {
@@ -334,6 +401,17 @@ mod tests {
             let path = default_path(&main, "feat/x", None);
             add(&main, "feat/x", &path, &base).unwrap();
             assert_eq!(current_branch(&path).as_deref(), Some("feat/x"));
+            let info = WorktreeInfo {
+                path: path.clone(),
+                branch: "feat/x".into(),
+                main_toplevel: main.clone(),
+            };
+            assert_eq!(is_registered(&info), Ok(true));
+            let other = WorktreeInfo {
+                branch: "feat/other".into(),
+                ..info.clone()
+            };
+            assert_eq!(is_registered(&other), Ok(false), "not on that branch");
             // Seen from inside the worktree, the main tree is still found.
             assert_eq!(main_toplevel(&path).unwrap(), main);
             assert!(add(&main, "feat/y", &path, &base).is_err(), "path exists");
@@ -354,6 +432,7 @@ mod tests {
             assert_eq!(is_clean(&path), Ok(true));
             remove(&main, &path).unwrap();
             assert!(!path.exists());
+            assert_eq!(is_registered(&info), Ok(false), "removed");
             // The branch survives its worktree.
             assert!(check_new_branch(&main, "feat/x").is_err());
         }

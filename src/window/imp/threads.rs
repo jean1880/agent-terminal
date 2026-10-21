@@ -383,8 +383,14 @@ pub(super) struct ChatTab {
     /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
     /// unsent metadata so closing during a build does not lose it.
     pending_prompt: Option<String>,
-    /// Seeded into the session once it exists (fork, compact-by-handoff), with its source.
-    pending_handoff: Option<(crate::chat::session::Handoff, String)>,
+    /// The thread was created carrying a handoff (fork, compact-by-handoff) its session has not
+    /// started with yet. The handoff itself is stored with the thread and re-armed from history
+    /// (`stored_handoff`); this only keeps an unstarted fork from looking blank.
+    pending_handoff: bool,
+    /// The profile the thread was opened with (its id), from its page's creation or its store
+    /// read; honoured while that profile runs the thread's agent
+    /// ([`crate::config::TerminalConfig::thread_profile`]).
+    pub(super) profile_id: Option<String>,
     /// A handoff found stored and undelivered when the thread was built: re-armed (not seeded
     /// again) in whichever session starts first.
     stored_handoff: Option<crate::chat::session::Handoff>,
@@ -423,7 +429,7 @@ impl ChatTab {
             || self.confirming_close
             || self.confirming_switch
             || self.pending_prompt.is_some()
-            || self.pending_handoff.is_some()
+            || self.pending_handoff
             || self.pending_switch.is_some()
     }
 
@@ -442,7 +448,7 @@ impl ChatTab {
         self.title.is_empty()
             && self.title_item.is_none()
             && self.pending_prompt.is_none()
-            && self.pending_handoff.is_none()
+            && !self.pending_handoff
             && self.pending_switch.is_none()
             && !self.view.as_ref().is_some_and(ChatView::has_draft)
     }
@@ -949,7 +955,13 @@ fn record_new_thread(
         thread: store.new_id()?,
         provider: store.new_id()?,
     };
-    store.atomically(|s| record_new_thread_as(s, &ids, cwd, title, driver, model, mode))?;
+    let spec = NewThreadSpec {
+        title: title.map(str::to_owned),
+        model: model.map(str::to_owned),
+        mode,
+        ..NewThreadSpec::new(cwd, driver)
+    };
+    record_new_thread_as(store, &ids, &spec)?;
     Ok(ids.thread)
 }
 
@@ -960,63 +972,155 @@ struct NewThreadIds {
     provider: String,
 }
 
+/// What a new chat thread is stored with ([`record_new_thread_as`]).
+struct NewThreadSpec {
+    cwd: String,
+    title: Option<String>,
+    driver: Driver,
+    /// `None`: the agent's own default.
+    model: Option<String>,
+    /// Recorded as the user's choice when one is carried over (a continued or forked thread
+    /// keeps its source's mode rather than the profile's).
+    mode: Option<Mode>,
+    /// A budgeted, fenced and redacted handoff, with where it came from: stored as the thread's
+    /// first events, so the session re-arms it from history whenever it starts.
+    handoff: Option<(crate::chat::session::Handoff, String)>,
+    attributes: agent_kit::store::ThreadAttributes,
+}
+
+impl NewThreadSpec {
+    fn new(cwd: &str, driver: Driver) -> Self {
+        Self {
+            cwd: cwd.to_owned(),
+            title: None,
+            driver,
+            model: None,
+            mode: None,
+            handoff: None,
+            attributes: agent_kit::store::ThreadAttributes::default(),
+        }
+    }
+}
+
 /// What a thread made by `create_chat_thread` carries into its page once it is stored.
 struct CreatedThread {
     driver: Driver,
     prompt: Option<String>,
     effort: Option<String>,
-    handoff: Option<(crate::chat::session::Handoff, String)>,
+    /// It carries a handoff (stored with it): the page is not blank before its session starts.
+    handoff: bool,
     title: Option<String>,
+    profile_id: Option<String>,
+    worktree: Option<crate::worktree::WorktreeInfo>,
 }
 
-/// [`record_new_thread`] under ids made beforehand: what the store writer runs.
+/// Stores a NEW thread from `spec` under ids made beforehand (what the store writer runs): the
+/// thread, its provider thread made active, the mode carried over, the handoff it carries and the
+/// profile and worktree it was opened with, all through [`Store::create_thread_record`]. Only the
+/// new thread is written: the source of a fork is never touched. All or nothing: a thread
+/// without its agent would start a session on whatever the profile says, not on what was chosen.
 fn record_new_thread_as(
     store: &Store,
     ids: &NewThreadIds,
-    cwd: &str,
-    title: Option<&str>,
-    driver: Driver,
-    model: Option<&str>,
-    mode: Option<Mode>,
+    spec: &NewThreadSpec,
 ) -> agent_kit::store::Result<()> {
-    let NewThreadIds { thread, provider } = ids;
-    // All of it or none of it (the caller runs it as one unit): a thread without its agent
-    // would start a session on whatever the profile says, not on what was chosen.
-    store.create_thread_with_id(thread, cwd, title)?;
-    store.add_provider_thread_with_id(
-        provider,
-        thread,
-        driver_key(driver),
-        model.unwrap_or("default"),
-    )?;
-    store.set_active_provider_thread(thread, provider)?;
-    if let Some(mode) = mode {
-        store.append_event(
-            thread,
-            Some(provider.as_str()),
-            &Envelope::new(Event::ModeChosen { mode }),
-        )?;
+    let mut events = Vec::new();
+    if let Some(mode) = spec.mode {
+        events.push(Envelope::new(Event::ModeChosen { mode }));
     }
-    Ok(())
+    if let Some((handoff, source)) = &spec.handoff {
+        events.extend(crate::chat::session::seeded_handoff_events(handoff, source));
+    }
+    store.create_thread_record(&agent_kit::store::ThreadRecord {
+        title: spec.title.as_deref(),
+        provider: Some(agent_kit::store::ProviderRecord {
+            id: Some(&ids.provider),
+            driver: driver_key(spec.driver),
+            model: spec.model.as_deref(),
+            native_id: None,
+        }),
+        events,
+        attributes: spec.attributes.clone(),
+        ..agent_kit::store::ThreadRecord::new(&ids.thread, &spec.cwd)
+    })
 }
 
-/// A thread to create (see [`AgentTerminalWindow::create_chat_thread`]).
+/// The profile a thread made from another (a fork, a continuation) is opened with: the
+/// source's while it stays on the source's agent, else the target agent's own (`None`).
+fn carried_profile(
+    source_driver: Option<Driver>,
+    source_profile: Option<String>,
+    target: Driver,
+) -> Option<String> {
+    source_profile.filter(|_| source_driver == Some(target))
+}
+
+/// Whether a thread's profile ends with `event`, from its agent `driver`. `profile_runs` is the
+/// agent the thread's profile runs (`None`: no profile; `Some(None)`: one that is gone, which
+/// [`crate::config::TerminalConfig::thread_profile`] already passes over). Only another agent
+/// reporting its session started ends it: the events a switch emits before its agent starts do
+/// not, since a switch whose agent never starts rolls back to the old one, on its own profile.
+fn profile_outlived(profile_runs: Option<Option<Driver>>, driver: Driver, event: &Event) -> bool {
+    matches!(event, Event::SessionStarted { .. })
+        && matches!(profile_runs, Some(Some(runs)) if runs != driver)
+}
+
+/// The folders a new thread could start in, owned, so they can be checked off the main thread
+/// ([`crate::utils::resolve_new_thread_dir`]).
+struct ThreadFolders {
+    explicit: Option<String>,
+    chosen_profile: Option<String>,
+    current: Option<String>,
+    agent_profile: Option<String>,
+    starting: String,
+    home: String,
+}
+
+impl ThreadFolders {
+    /// Blocking: stats the disk.
+    fn resolve(&self) -> Result<crate::utils::NewThreadDir, String> {
+        let dirs = crate::utils::NewThreadDirs {
+            explicit: self.explicit.as_deref(),
+            chosen_profile: self.chosen_profile.as_deref(),
+            current: self.current.as_deref(),
+            agent_profile: self.agent_profile.as_deref(),
+            starting: &self.starting,
+        };
+        crate::utils::resolve_new_thread_dir(&dirs, &self.home, |d| {
+            std::path::Path::new(d).is_dir()
+        })
+    }
+}
+
+/// A new thread asked for while the agents were still being detected: made once the default
+/// agent is known ([`AgentTerminalWindow::new_chat_thread_with`]).
+pub(super) type PendingNewThread = std::boxed::Box<dyn FnOnce(Driver) -> NewThread>;
+
+/// A thread to create (see [`AgentTerminalWindow::create_chat_thread`]). Its folder is
+/// [`crate::utils::resolve_new_thread_dir`]'s: `dir`, else the chosen profile's, else `here`,
+/// else the agent's profile's, else the starting directory.
 pub(super) struct NewThread {
     pub(super) driver: Driver,
-    /// The folder (the agent's, else the starting directory, when `None`).
+    /// A folder the user picked for this thread (a picker, a worktree, a folder's row, the
+    /// thread forked): refused if it no longer exists, never replaced.
     pub(super) dir: Option<String>,
-    /// Refuse folder fallback for workflows whose prompt is bound to an exact target.
-    pub(super) require_exact_dir: bool,
+    /// The folder of the page in view, when no folder was picked.
+    pub(super) here: Option<String>,
     /// Sent once the session has started.
     pub(super) prompt: Option<String>,
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
     pub(super) title: Option<String>,
-    /// A budgeted, fenced and redacted handoff, with where it came from, seeded into the session.
+    /// A budgeted, fenced and redacted handoff, with where it came from, stored with the thread.
     pub(super) handoff: Option<(crate::chat::session::Handoff, String)>,
     /// The mode to start in, when the thread carries one over from another (a continued thread
     /// keeps its mode rather than adopting the profile default). `None`: the profile default.
     pub(super) mode: Option<Mode>,
+    /// The profile the user chose for the thread (its id), when it is not simply the agent's
+    /// own. Kept with the thread, and honoured while that profile runs the thread's agent.
+    pub(super) profile_id: Option<String>,
+    /// The worktree the thread opens in (New Thread in Isolated Git Worktree), kept with it.
+    pub(super) worktree: Option<crate::worktree::WorktreeInfo>,
 }
 
 impl NewThread {
@@ -1024,13 +1128,15 @@ impl NewThread {
         Self {
             driver,
             dir: None,
-            require_exact_dir: false,
+            here: None,
             prompt: None,
             model: None,
             effort: None,
             title: None,
             handoff: None,
             mode: None,
+            profile_id: None,
+            worktree: None,
         }
     }
 }
@@ -1095,6 +1201,8 @@ struct LoadedThread {
     history: Vec<(Option<Driver>, Envelope)>,
     /// The active provider thread (its native session id and model), to resume.
     provider: Option<agent_kit::store::ProviderThread>,
+    /// The profile and worktree the thread was opened with.
+    attributes: agent_kit::store::ThreadAttributes,
 }
 
 fn load_provider(
@@ -1168,6 +1276,7 @@ fn load_thread_with(
         history,
         provider,
         pending_prompt,
+        attributes: store.thread_attributes(thread)?,
     })
 }
 
@@ -1554,11 +1663,24 @@ fn now_ms() -> i64 {
 /// off, still being detected) or has no resolved binary is refused with the reason: nothing is
 /// ever spawned from a guessed command name.
 fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, String> {
+    // The thread's own profile while it runs `driver` (a restart or a roll back); a switch to
+    // another agent gets that agent's own.
+    let profile_id = thread_owner(thread).and_then(|window| {
+        window
+            .imp()
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread)
+            .and_then(|c| c.profile_id.clone())
+    });
     agent_launch_with(
         &AgentAvailability::shared().get(driver),
         driver,
         thread,
         cwd,
+        profile_id.as_deref(),
     )
 }
 
@@ -1568,6 +1690,7 @@ fn agent_launch_with(
     driver: Driver,
     thread: &str,
     cwd: &str,
+    profile_id: Option<&str>,
 ) -> Result<AgentLaunch, String> {
     if !state.is_ready() {
         return Err(not_ready_reason(driver, state));
@@ -1576,7 +1699,7 @@ fn agent_launch_with(
     let (profile, clear) = {
         let c = config.borrow();
         (
-            c.agent_profile(driver)
+            c.thread_profile(profile_id, driver)
                 .cloned()
                 .unwrap_or_else(|| crate::config::new_agent_profile(driver)),
             c.clear_env.clone(),
@@ -3897,7 +4020,8 @@ impl AgentTerminalWindow {
                 confirming_switch: false,
                 title_item: None,
                 pending_prompt: None,
-                pending_handoff: None,
+                pending_handoff: false,
+                profile_id: None,
                 stored_handoff: None,
                 chosen_mode: None,
                 pending_effort: None,
@@ -3953,12 +4077,6 @@ impl AgentTerminalWindow {
             (chat.thread.clone(), chat.driver, dir)
         };
         let (thread, driver, dir) = job;
-        let profile = self
-            .config
-            .borrow()
-            .agent_profile(driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver));
         let obj = self.obj();
         let page = page.clone();
         let hook_clear = self.config.borrow().clear_env.clone();
@@ -3966,12 +4084,9 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             async move {
-                let resolved = resolve_agent(profile.clone()).await;
-                if !obj.imp().session_start_allowed() {
-                    return;
-                }
                 // A long thread's history is read (and decoded) off the main thread; only the
-                // replay into the view happens here.
+                // replay into the view happens here. Its profile and worktree come in the same
+                // read, behind the writer's barrier, so the profile is chosen after it.
                 let loaded = store_job({
                     let thread = thread.clone();
                     // Importing reads the agent's transcript; only where store jobs really run
@@ -3998,6 +4113,13 @@ impl AgentTerminalWindow {
                         return;
                     }
                 };
+                let profile = obj
+                    .imp()
+                    .thread_profile_for(loaded.attributes.profile_id.as_deref(), driver);
+                let resolved = resolve_agent(profile.clone()).await;
+                if !obj.imp().session_start_allowed() {
+                    return;
+                }
                 // agy's hooks file is read off the main thread too; the verdict gates the socket.
                 let hook = match driver {
                     Driver::Agy => {
@@ -4123,6 +4245,20 @@ impl AgentTerminalWindow {
                 obj.imp().view_action(&thread_id, action);
             }
         });
+        let mut worktree_branch = None;
+        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| &t.page == page) {
+            // A reopened worktree thread is one again: its tooltip, and the removal offer when
+            // it closes (checked as still registered first: `offer_worktree_removal`).
+            if tab.worktree.is_none() {
+                if let Some(info) = loaded.attributes.worktree.clone() {
+                    worktree_branch = Some(info.branch.clone());
+                    tab.worktree = Some(info);
+                }
+            }
+        }
+        if let Some(branch) = worktree_branch {
+            page.set_tooltip(&tab_tooltip(Some(&branch), None));
+        }
         if let Some(chat) = self
             .tabs
             .borrow_mut()
@@ -4131,6 +4267,7 @@ impl AgentTerminalWindow {
             .and_then(|t| t.chat.as_mut())
         {
             chat.view = Some(view.clone());
+            chat.profile_id = loaded.attributes.profile_id.clone();
             if chat.pending_prompt.is_none() {
                 chat.pending_prompt = loaded.pending_prompt;
             }
@@ -4419,27 +4556,27 @@ impl AgentTerminalWindow {
             }
         }
 
-        let (prompt, handoff, switch, stored) = {
+        let (prompt, switch, stored) = {
             let mut tabs = self.tabs.borrow_mut();
             let chat = tabs
                 .iter_mut()
                 .find(|t| &t.page == page)
                 .and_then(|t| t.chat.as_mut());
             match chat {
-                Some(chat) => (
-                    chat.pending_prompt.take(),
-                    chat.pending_handoff.take(),
-                    chat.pending_switch.take(),
-                    chat.stored_handoff.take(),
-                ),
-                None => (None, None, None, None),
+                Some(chat) => {
+                    // A new thread's own handoff was stored with it: it is in `stored_handoff`.
+                    chat.pending_handoff = false;
+                    (
+                        chat.pending_prompt.take(),
+                        chat.pending_switch.take(),
+                        chat.stored_handoff.take(),
+                    )
+                }
+                None => (None, None, None),
             }
         };
         if let Some(stored) = stored {
             session.restore_handoff(stored);
-        }
-        if let Some((handoff, source)) = handoff {
-            session.seed_handoff(handoff, &source);
         }
         if let Some((driver, model, effort)) = switch {
             delegation::switch(&slot, driver, model, effort);
@@ -4486,6 +4623,11 @@ impl AgentTerminalWindow {
         // Set by the arms below, acted on after the tab borrow is released.
         let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
         let mut withdraw_ask = false;
+        // Switched in place to another agent, and that agent has started: the profile the thread
+        // was opened with is no longer its agent's, so it follows the new agent's default (stored,
+        // for a reopen). Not before: a switch whose agent never starts rolls back, and the old
+        // agent must restart on its own profile.
+        let mut clear_profile = false;
         enum After {
             Nothing,
             Sidebar,
@@ -4508,6 +4650,16 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
+            let profile_runs = chat.profile_id.as_deref().map(|id| {
+                self.config
+                    .borrow()
+                    .profile_by_id(id)
+                    .and_then(profile_driver)
+            });
+            if profile_outlived(profile_runs, driver, &env.event) {
+                chat.profile_id = None;
+                clear_profile = true;
+            }
             // Heard from: idle suspension counts from the thread's last event too.
             chat.last_seen.set(std::time::Instant::now());
             if chat.rate_limited && limit_over(&env.event) {
@@ -4686,6 +4838,12 @@ impl AgentTerminalWindow {
             if let Some(app) = self.obj().application() {
                 app.withdraw_notification(&approval_notification_id(thread));
             }
+        }
+        if clear_profile {
+            let id = thread.to_owned();
+            self.write_store("clear a switched thread's profile", move |s| {
+                s.set_thread_profile(&id, None)
+            });
         }
         if let Some((page, question)) = ask {
             let heading = if question {
@@ -5177,7 +5335,13 @@ impl AgentTerminalWindow {
                 .map(|t| t.dir.clone())
         });
         match action {
-            ViewAction::NewThread => self.new_chat_thread(Some(slot.driver()), dir, None),
+            // In this thread's folder unless a more specific one applies; it may be gone.
+            ViewAction::NewThread => {
+                self.new_chat_thread_with(Some(slot.driver()), move |driver| NewThread {
+                    here: dir,
+                    ..NewThread::new(driver)
+                });
+            }
             // A named target is the user's own choice; a bare /handoff picks one like the banner.
             // Mid-turn, either asks first (when_not_busy): the switch stops the turn.
             ViewAction::Handoff {
@@ -5228,7 +5392,7 @@ impl AgentTerminalWindow {
         model: Option<String>,
         effort: Option<String>,
     ) {
-        let title = self
+        let (title, source_driver, source_profile) = self
             .tabs
             .borrow()
             .iter()
@@ -5236,9 +5400,12 @@ impl AgentTerminalWindow {
                 t.chat
                     .as_ref()
                     .filter(|c| c.thread == thread)
-                    .map(|c| c.title.clone())
+                    .map(|c| (c.title.clone(), Some(c.driver), c.profile_id.clone()))
             })
             .unwrap_or_default();
+        // A fork on the same agent keeps the profile; continuing in another agent takes that
+        // agent's own.
+        let profile_id = carried_profile(source_driver, source_profile, driver);
         let source = if title.is_empty() {
             "the previous thread".to_owned()
         } else {
@@ -5276,6 +5443,7 @@ impl AgentTerminalWindow {
                 effort,
                 mode,
                 handoff: Some((handoff, source)),
+                profile_id,
                 ..NewThread::new(driver)
             });
         });
@@ -5349,18 +5517,43 @@ impl AgentTerminalWindow {
         crate::config::choose_default_agent(explicit, profile_driver, |d| self.agent_usable(d))
     }
 
-    /// Creates a thread in `dir` (the starting folder when `None`) on `driver` (the default
-    /// agent when `None`), opens and shows it. `prompt` is sent once it has started.
+    /// Creates a thread in `dir` (a folder picked: refused if it is gone; `None`: see
+    /// [`crate::utils::resolve_new_thread_dir`]) on `driver` (the default agent when `None`),
+    /// opens and shows it. `prompt` is sent once it has started.
     pub(super) fn new_chat_thread(
         &self,
         driver: Option<Driver>,
         dir: Option<String>,
         prompt: Option<String>,
     ) {
+        self.new_chat_thread_with(driver, move |driver| NewThread {
+            dir,
+            prompt,
+            ..NewThread::new(driver)
+        });
+    }
+
+    /// A new thread from the page in view: in its folder, unless something more specific
+    /// applies ([`crate::utils::resolve_new_thread_dir`]).
+    pub(super) fn new_chat_thread_here(&self, driver: Option<Driver>) {
+        let here = self.current_dir();
+        self.new_chat_thread_with(driver, move |driver| NewThread {
+            here,
+            ..NewThread::new(driver)
+        });
+    }
+
+    /// Creates the thread `make` describes on `driver`, else on the default agent: while the
+    /// agents are still being detected, once they are.
+    pub(super) fn new_chat_thread_with(
+        &self,
+        driver: Option<Driver>,
+        make: impl FnOnce(Driver) -> NewThread + 'static,
+    ) {
         let Some(driver) = driver.or_else(|| self.default_agent()) else {
             // Still looking for the agents: wait for the scan rather than guess (or give up).
             if AgentAvailability::shared().any_detecting() {
-                *self.pending_new_thread.borrow_mut() = Some((dir, prompt));
+                *self.pending_new_thread.borrow_mut() = Some(std::boxed::Box::new(make));
                 self.show_toast("Detecting agents…");
                 return;
             }
@@ -5372,52 +5565,169 @@ impl AgentTerminalWindow {
             );
             return;
         };
-        self.create_chat_thread(NewThread {
-            dir,
-            prompt,
-            ..NewThread::new(driver)
-        });
+        self.create_chat_thread(make(driver));
     }
 
-    /// Creates a thread, opens and shows it. Whatever `new` leaves unset comes from the agent's
-    /// profile. Returns its page.
-    pub(super) fn create_chat_thread(&self, new: NewThread) -> Option<adw::TabPage> {
+    /// The profile a thread on `driver` runs with, given the id it was opened with
+    /// ([`crate::config::TerminalConfig::thread_profile`]); a bare one for an agent with none.
+    pub(super) fn thread_profile_for(&self, profile_id: Option<&str>, driver: Driver) -> Profile {
+        self.config
+            .borrow()
+            .thread_profile(profile_id, driver)
+            .cloned()
+            .unwrap_or_else(|| crate::config::new_agent_profile(driver))
+    }
+
+    /// The profile open thread `thread` runs on `driver` with.
+    pub(super) fn thread_profile(&self, thread: &str, driver: Driver) -> Profile {
+        let id = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread)
+            .and_then(|c| c.profile_id.clone());
+        self.thread_profile_for(id.as_deref(), driver)
+    }
+
+    /// The folders a new thread on `driver` could start in: `dir` (picked), the folder of the
+    /// profile `profile_id` (chosen), `here` (the page in view's), then the configuration's.
+    fn thread_folders(
+        &self,
+        driver: Driver,
+        dir: Option<String>,
+        here: Option<String>,
+        profile_id: Option<&str>,
+    ) -> ThreadFolders {
+        let config = self.config.borrow();
+        let chosen = profile_id
+            .and_then(|id| config.profile_by_id(id))
+            .filter(|p| profile_driver(p) == Some(driver));
+        ThreadFolders {
+            explicit: dir,
+            chosen_profile: chosen.and_then(|p| p.dir.clone()),
+            current: here,
+            agent_profile: config.agent_profile(driver).and_then(|p| p.dir.clone()),
+            starting: config.starting_directory.clone(),
+            home: env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+        }
+    }
+
+    /// Resolves `folders` off the main thread (it stats the disk, which can hang on a network
+    /// mount), says what it must (a picked folder gone, a missing starting directory), then runs
+    /// `then` with the folder, and returns `None`. Only a test without a store writer resolves in
+    /// place, so its page comes back at once: `then`'s result. A production store without a
+    /// writer (it failed to open or start) still resolves off the main thread.
+    fn with_new_thread_dir<R: 'static>(
+        &self,
+        folders: ThreadFolders,
+        what: &'static str,
+        then: impl FnOnce(&Self, String) -> Option<R> + 'static,
+    ) -> Option<R> {
+        if cfg!(test) && app_handle().writer().is_none() {
+            let cwd = self.use_new_thread_dir(folders.resolve(), what)?;
+            return then(self, cwd);
+        }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let resolved = gtk4::gio::spawn_blocking(move || folders.resolve()).await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            if imp.is_closing() {
+                return;
+            }
+            let Ok(resolved) = resolved else {
+                present_message(&obj, what, "Checking the folder failed.");
+                return;
+            };
+            if let Some(cwd) = imp.use_new_thread_dir(resolved, what) {
+                then(imp, cwd);
+            }
+        });
+        None
+    }
+
+    /// The folder a new thread starts in, once resolved: a picked folder that is gone is
+    /// refused with a dialog, and a missing starting directory is said in a toast.
+    fn use_new_thread_dir(
+        &self,
+        resolved: Result<crate::utils::NewThreadDir, String>,
+        what: &str,
+    ) -> Option<String> {
+        match resolved {
+            Ok(found) => {
+                if let Some(missing) = &found.missing_start {
+                    self.show_toast(&format!("Started in Home: {missing} is missing"));
+                }
+                Some(found.dir)
+            }
+            Err(gone) => {
+                warn!("New thread refused: {gone} no longer exists");
+                present_message(
+                    &self.obj(),
+                    what,
+                    &format!("Folder {gone} no longer exists."),
+                );
+                None
+            }
+        }
+    }
+
+    /// Creates a thread, opens and shows it. Whatever `new` leaves unset comes from its profile
+    /// (the one chosen, else its agent's). Returns its page when it opens at once (a test with
+    /// no store writer); otherwise it opens once its folder is checked and it is stored.
+    pub(super) fn create_chat_thread(&self, mut new: NewThread) -> Option<adw::TabPage> {
+        if self.is_closing() {
+            return None;
+        }
+        // A profile is the thread's only while it runs the thread's agent.
+        if let Some(id) = new.profile_id.as_deref() {
+            let fits = self
+                .config
+                .borrow()
+                .profile_by_id(id)
+                .is_some_and(|p| profile_driver(p) == Some(new.driver));
+            if !fits {
+                warn!("Profile {id} does not run this thread's agent; using the agent's own");
+                new.profile_id = None;
+            }
+        }
+        let folders = self.thread_folders(
+            new.driver,
+            new.dir.take(),
+            new.here.take(),
+            new.profile_id.as_deref(),
+        );
+        self.with_new_thread_dir(folders, "Cannot Create a Thread", move |imp, cwd| {
+            imp.store_new_thread(new, cwd)
+        })
+    }
+
+    /// Stores a thread in `cwd` (resolved) and opens it once stored. Returns its page when that
+    /// is at once (memory-only store, tests).
+    fn store_new_thread(&self, new: NewThread, cwd: String) -> Option<adw::TabPage> {
         if self.is_closing() {
             return None;
         }
         let NewThread {
             driver,
-            dir,
             prompt,
             model,
             effort,
             title,
             handoff,
             mode,
-            require_exact_dir,
+            profile_id,
+            worktree,
+            ..
         } = new;
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let requested = dir.unwrap_or_else(|| {
-            self.config
-                .borrow()
-                .agent_profile(driver)
-                .and_then(|p| p.dir.clone())
-                .unwrap_or_else(|| self.config.borrow().starting_directory.clone())
-        });
-        let cwd = if require_exact_dir {
-            // The review validates this folder off the UI thread before calling us.
-            // Preserve it verbatim: a later deletion must fail spawning, never fall back.
-            requested
-        } else {
-            resolve_working_directory(&requested, &home)
-        };
         let store = app_handle();
         // The agent is recorded now, so the sidebar and a later reopen know it before the
         // session starts. The session adopts this provider thread.
         let model = model.or_else(|| {
             self.config
                 .borrow()
-                .agent_profile(driver)
+                .thread_profile(profile_id.as_deref(), driver)
                 .and_then(|p| p.effective_default_model(None))
         });
         // A profile default the agent has retired is never started: the suggestion is used.
@@ -5435,31 +5745,34 @@ impl AgentTerminalWindow {
             }
         };
         let thread = ids.thread.clone();
+        let carries_handoff = handoff.as_ref().is_some_and(|(h, _)| h.carried > 0);
+        let spec = NewThreadSpec {
+            title: title.clone(),
+            model,
+            mode,
+            handoff,
+            attributes: agent_kit::store::ThreadAttributes {
+                profile_id: profile_id.clone(),
+                worktree: worktree.clone(),
+            },
+            ..NewThreadSpec::new(&cwd, driver)
+        };
         let pending = prompt.clone();
-        let record = {
-            let (cwd, title, model) = (cwd.clone(), title.clone(), model.clone());
-            move |s: &Store| {
-                record_new_thread_as(
-                    s,
-                    &ids,
-                    &cwd,
-                    title.as_deref(),
-                    driver,
-                    model.as_deref(),
-                    mode,
-                )?;
-                if let Some(prompt) = pending {
-                    save_pending_prompt(s, &ids.thread, &prompt)?;
-                }
-                Ok(())
+        let record = move |s: &Store| {
+            record_new_thread_as(s, &ids, &spec)?;
+            if let Some(prompt) = pending {
+                save_pending_prompt(s, &ids.thread, &prompt)?;
             }
+            Ok(())
         };
         let created = CreatedThread {
             driver,
             prompt,
             effort,
-            handoff,
+            handoff: carries_handoff,
             title,
+            profile_id,
+            worktree,
         };
         if store.writer().is_none() {
             // In place (memory-only store, tests): the page opens at once.
@@ -5511,66 +5824,108 @@ impl AgentTerminalWindow {
             effort,
             handoff,
             title,
+            profile_id,
+            worktree,
         } = created;
         self.reload_summaries();
         let page = self.open_thread(thread, false)?;
-        if let Some(chat) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| t.page == page)
-            .and_then(|t| t.chat.as_mut())
-        {
-            chat.driver = driver;
-            chat.pending_prompt = prompt;
-            chat.pending_effort = effort;
-            chat.pending_handoff = handoff;
-            if let Some(title) = title {
-                chat.title = title;
+        let branch = worktree.as_ref().map(|w| w.branch.clone());
+        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| t.page == page) {
+            if worktree.is_some() {
+                tab.worktree = worktree;
             }
+            if let Some(chat) = tab.chat.as_mut() {
+                chat.driver = driver;
+                chat.pending_prompt = prompt;
+                chat.pending_effort = effort;
+                chat.pending_handoff = handoff;
+                chat.profile_id = profile_id;
+                if let Some(title) = title {
+                    chat.title = title;
+                }
+            }
+        }
+        if let Some(branch) = branch {
+            page.set_tooltip(&tab_tooltip(Some(&branch), None));
         }
         self.open_thread(thread, true);
         Some(page)
     }
 
     /// Resumes a native Claude or agy session as a chat thread: a new thread whose provider
-    /// thread carries that native id. Its page opens once the thread is stored.
+    /// thread carries that native id, opened once stored. A thread that already holds that
+    /// session is opened instead (never a duplicate), and a delegated worker's session is
+    /// refused. `dir` is the session's folder, passed over if it is gone.
     pub(super) fn resume_as_thread(&self, driver: Driver, native_id: &str, dir: Option<String>) {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let cwd = resolve_working_directory(
-            &dir.unwrap_or_else(|| self.config.borrow().starting_directory.clone()),
-            &home,
-        );
+        let folders = self.thread_folders(driver, None, dir, None);
+        let native = native_id.to_owned();
+        self.with_new_thread_dir(folders, "Cannot Resume the Session", move |imp, cwd| {
+            imp.store_resumed_thread(driver, native, cwd);
+            Some(())
+        });
+    }
+
+    /// [`Self::resume_as_thread`] once its folder is known: checked and created in one unit on
+    /// the store writer ([`Store::create_native_thread`]).
+    fn store_resumed_thread(&self, driver: Driver, native: String, cwd: String) {
+        if self.is_closing() {
+            return;
+        }
         let store = app_handle();
-        let ids = match store.new_id().and_then(|t| Ok((t, store.new_id()?))) {
-            Ok(ids) => ids,
+        let thread = match store.new_id() {
+            Ok(id) => id,
             Err(e) => {
                 present_message(&self.obj(), "Cannot Resume the Session", &e.to_string());
                 return;
             }
         };
-        let thread = ids.0.clone();
         let record = {
-            let native = native_id.to_owned();
-            move |s: &Store| -> agent_kit::store::Result<()> {
-                let (t, pt) = &ids;
-                s.create_thread_with_id(t, &cwd, None)?;
-                s.add_provider_thread_with_id(pt, t, driver_key(driver), "default")?;
-                s.set_native_id(pt, &native)?;
-                s.set_active_provider_thread(t, pt)
+            let (thread, native) = (thread.clone(), native.clone());
+            move |s: &Store| {
+                let key = driver_key(driver);
+                let record = agent_kit::store::ThreadRecord {
+                    provider: Some(agent_kit::store::ProviderRecord {
+                        id: None,
+                        driver: key,
+                        model: None,
+                        native_id: Some(&native),
+                    }),
+                    ..agent_kit::store::ThreadRecord::new(&thread, &cwd)
+                };
+                s.create_native_thread(&record, key, &native)
             }
         };
-        let native = native_id.to_owned();
-        let opened = move |imp: &Self| {
-            info!(
-                "Resuming {} session {native} as a thread",
-                driver_label(driver)
-            );
-            imp.open_thread(&thread, true);
+        let opened = move |imp: &Self, made: agent_kit::store::NativeThread| match made {
+            agent_kit::store::NativeThread::Created => {
+                info!(
+                    "Resuming {} session {native} as a thread",
+                    driver_label(driver)
+                );
+                imp.open_thread(&thread, true);
+            }
+            agent_kit::store::NativeThread::Existing(existing) => {
+                info!(
+                    "{} session {native} is already thread {existing}: opening it",
+                    driver_label(driver)
+                );
+                imp.open_thread(&existing, true);
+            }
+            agent_kit::store::NativeThread::Supervised => {
+                warn!(
+                    "{} session {native} belongs to a delegated worker: not resumed",
+                    driver_label(driver)
+                );
+                present_message(
+                    &imp.obj(),
+                    "Cannot Resume the Session",
+                    "This session belongs to a worker another thread delegated to. Open that \
+                     thread to follow it.",
+                );
+            }
         };
         if store.writer().is_none() {
             match store.reader().atomically(record) {
-                Ok(()) => opened(self),
+                Ok(made) => opened(self, made),
                 Err(e) => present_message(&self.obj(), "Cannot Resume the Session", &e.to_string()),
             }
             return;
@@ -5586,7 +5941,7 @@ impl AgentTerminalWindow {
             .await;
             let Some(obj) = obj.upgrade() else { return };
             match stored {
-                Some(Ok(())) => opened(obj.imp()),
+                Some(Ok(made)) => opened(obj.imp(), made),
                 Some(Err(e)) => present_message(&obj, "Cannot Resume the Session", &e.to_string()),
                 None => {
                     present_message(
@@ -5940,8 +6295,8 @@ impl AgentTerminalWindow {
         // A "new thread" asked for while the agents were still being detected.
         if !AgentAvailability::shared().any_detecting() {
             let pending = self.pending_new_thread.borrow_mut().take();
-            if let Some((dir, prompt)) = pending {
-                self.new_chat_thread(None, dir, prompt);
+            if let Some(make) = pending {
+                self.new_chat_thread_with(None, make);
             }
         }
     }
@@ -6163,12 +6518,8 @@ impl AgentTerminalWindow {
             })
             .collect();
         for (page, thread, driver, dir) in waiting {
-            let profile = self
-                .config
-                .borrow()
-                .agent_profile(driver)
-                .cloned()
-                .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+            // Built, so its profile was read with its history.
+            let profile = self.thread_profile(&thread, driver);
             let obj = self.obj().downgrade();
             let hook_clear = self.config.borrow().clear_env.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -7053,7 +7404,7 @@ pub(super) mod tests {
             thread: "thread".into(),
             provider: "provider".into(),
         };
-        record_new_thread_as(&store, &ids, "/tmp", None, Driver::Claude, None, None).unwrap();
+        record_new_thread_as(&store, &ids, &NewThreadSpec::new("/tmp", Driver::Claude)).unwrap();
         let text = "Please continue\nPASSWORD=private-value";
         let prompt = agent_core::redact::redact(text);
         save_pending_prompt(&store, &ids.thread, text).unwrap();
@@ -7721,7 +8072,7 @@ pub(super) mod tests {
             (Availability::Disabled, "Claude is switched off."),
             (Availability::Detecting, "Claude is still being detected."),
         ] {
-            let refused = agent_launch_with(&state, Driver::Claude, "t", "/w");
+            let refused = agent_launch_with(&state, Driver::Claude, "t", "/w", None);
             assert_eq!(refused.err().as_deref(), Some(text));
         }
     }
@@ -8314,6 +8665,7 @@ pub(super) mod tests {
                 Driver::Agy,
                 "t",
                 "/tmp",
+                None,
             )
             .expect("launch description");
             assert_eq!(
@@ -8597,7 +8949,11 @@ pub(super) mod tests {
             .expect("queued");
         handle
             .write("create a thread", Some(&thread), move |s| {
-                record_new_thread_as(s, &ids, "/w", Some("t"), Driver::Claude, None, None)
+                let spec = NewThreadSpec {
+                    title: Some("t".into()),
+                    ..NewThreadSpec::new("/w", Driver::Claude)
+                };
+                record_new_thread_as(s, &ids, &spec)
             })
             .expect("queued");
         let say = |n: usize| {
@@ -8644,6 +9000,357 @@ pub(super) mod tests {
             renamed.expect("job").expect("rename").as_deref(),
             Some("renamed")
         );
+        assert_eq!(writer.failures().0, 0);
+    }
+
+    fn handoff(carried: usize) -> crate::chat::session::Handoff {
+        crate::chat::session::Handoff {
+            summary: "earlier context".into(),
+            fence: "0123456789abcdef0123456789abcdef".into(),
+            carried,
+            total: 2,
+        }
+    }
+
+    fn seeded_count(store: &Store, thread: &str) -> usize {
+        store
+            .events(thread, None, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| matches!(e.event, Event::HandoffSeeded { .. }))
+            .count()
+    }
+
+    /// A fork's handoff, mode and profile are stored with the thread itself: a page closed
+    /// before its session ever started reopens owing the same handoff.
+    #[test]
+    fn a_new_threads_handoff_survives_a_page_closed_before_its_session_starts() {
+        let store = Store::open_in_memory().unwrap();
+        let ids = NewThreadIds {
+            thread: "fork".into(),
+            provider: "provider".into(),
+        };
+        let spec = NewThreadSpec {
+            mode: Some(Mode::Plan),
+            handoff: Some((handoff(2), "“source”".into())),
+            attributes: agent_kit::store::ThreadAttributes {
+                profile_id: Some("claude-work".into()),
+                worktree: None,
+            },
+            ..NewThreadSpec::new("/w", Driver::Claude)
+        };
+        record_new_thread_as(&store, &ids, &spec).unwrap();
+        let loaded = load_thread(&store, "fork", None).unwrap();
+        assert_eq!(
+            crate::chat::session::undelivered_handoff(loaded.history.iter().map(|(_, e)| e)),
+            Some(handoff(2)),
+            "re-armed from history whenever its session starts"
+        );
+        assert_eq!(
+            crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e)),
+            Some(Mode::Plan)
+        );
+        assert_eq!(loaded.attributes.profile_id.as_deref(), Some("claude-work"));
+        assert_eq!(seeded_count(&store, "fork"), 1);
+        assert!(
+            !store.is_blank("fork").unwrap(),
+            "an unstarted fork is never discarded as blank"
+        );
+    }
+
+    #[test]
+    fn a_handoff_carrying_nothing_leaves_the_new_thread_blank() {
+        let store = Store::open_in_memory().unwrap();
+        let ids = NewThreadIds {
+            thread: "t".into(),
+            provider: "p".into(),
+        };
+        let spec = NewThreadSpec {
+            handoff: Some((handoff(0), "“source”".into())),
+            ..NewThreadSpec::new("/w", Driver::Claude)
+        };
+        record_new_thread_as(&store, &ids, &spec).unwrap();
+        assert_eq!(seeded_count(&store, "t"), 0);
+        assert!(store.events("t", None, 10).unwrap().is_empty());
+        assert!(store.is_blank("t").unwrap());
+    }
+
+    #[test]
+    fn a_fork_keeps_the_profile_only_on_the_same_agent() {
+        let work = || Some("claude-work".to_owned());
+        assert_eq!(
+            carried_profile(Some(Driver::Claude), work(), Driver::Claude),
+            work()
+        );
+        assert_eq!(
+            carried_profile(Some(Driver::Claude), work(), Driver::Codex),
+            None,
+            "continued in another agent: that agent's own"
+        );
+        assert_eq!(carried_profile(None, work(), Driver::Claude), None);
+        assert_eq!(
+            carried_profile(Some(Driver::Claude), None, Driver::Claude),
+            None
+        );
+    }
+
+    #[test]
+    fn a_profile_ends_only_when_another_agent_has_started() {
+        let started = Event::SessionStarted {
+            native_id: "n".into(),
+            model: None,
+            cwd: None,
+        };
+        let early = Event::ModelChanged { model: "m".into() };
+        let claude = Some(Some(Driver::Claude));
+        assert!(profile_outlived(claude, Driver::Codex, &started));
+        assert!(
+            !profile_outlived(claude, Driver::Codex, &early),
+            "a switch's events before its agent starts keep it (it may roll back)"
+        );
+        assert!(
+            !profile_outlived(claude, Driver::Claude, &started),
+            "its own agent (re)started, a roll back included"
+        );
+        assert!(!profile_outlived(None, Driver::Codex, &started));
+        assert!(!profile_outlived(Some(None), Driver::Codex, &started));
+    }
+
+    /// A thread on the second of two Claude profiles is switched to Codex, which fails before it
+    /// starts: the events the provisional switch emits keep the thread's profile, so the
+    /// roll back relaunches Claude with it (its program and arguments), not the default's. Only
+    /// a replacement that reports its session ends it.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_failed_switch_rolls_back_onto_the_threads_own_profile() {
+        use crate::testutil::pump_until;
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.FailedSwitchKeepsProfile")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        let imp = window.imp();
+        let default = Profile {
+            id: "claude-default".into(),
+            name: "Claude".into(),
+            command: "/opt/default/claude".into(),
+            args: vec!["--default".into()],
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        let work = Profile {
+            id: "claude-work".into(),
+            name: "Claude (work)".into(),
+            command: "/opt/work/claude".into(),
+            args: vec!["--work".into()],
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        assert_eq!(profile_driver(&work), Some(Driver::Claude));
+        {
+            let mut config = imp.config.borrow_mut();
+            config
+                .profiles
+                .retain(|p| profile_driver(p) != Some(Driver::Claude));
+            config.profiles.insert(0, default.clone());
+            config.profiles.insert(1, work.clone());
+        }
+        for p in [&default, &work] {
+            RESOLVED.with(|r| {
+                r.borrow_mut().insert(
+                    (p.command.clone(), p.env_file.clone()),
+                    ResolvedAgent {
+                        program: Some(p.command.clone()),
+                        env: Vec::new(),
+                        env_failed: false,
+                    },
+                )
+            });
+        }
+        AgentAvailability::shared().set(
+            Driver::Claude,
+            Availability::Ready("/opt/default/claude".into()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        imp.create_chat_thread(NewThread {
+            dir: Some(cwd.clone()),
+            title: Some("work".into()),
+            profile_id: Some("claude-work".into()),
+            ..NewThread::new(Driver::Claude)
+        })
+        .expect("opened in place");
+        let thread = imp.current_thread().expect("its page");
+        let relaunch = || agent_launch(Driver::Claude, &thread, &cwd).expect("launch");
+
+        // The switch to Codex emits its events before Codex starts; Codex then fails, and the
+        // session rolls back to Claude, reporting the failure on Claude.
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Codex,
+            &Envelope::new(Event::ModelChanged {
+                model: "gpt".into(),
+            }),
+        );
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::new(Event::Error {
+                message: "Codex did not start. Back on Claude.".into(),
+            }),
+        );
+        let launch = relaunch();
+        assert_eq!(
+            launch.program, "/opt/work/claude",
+            "the thread's own profile"
+        );
+        assert_eq!(launch.extra_args, vec!["--work".to_owned()]);
+        // Its own agent restarting keeps it too.
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::new(Event::SessionStarted {
+                native_id: "claude-1".into(),
+                model: None,
+                cwd: None,
+            }),
+        );
+        assert_eq!(relaunch().program, "/opt/work/claude");
+
+        // A switch whose agent started: the thread follows that agent's default from then on.
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Codex,
+            &Envelope::new(Event::SessionStarted {
+                native_id: "codex-1".into(),
+                model: None,
+                cwd: None,
+            }),
+        );
+        assert_eq!(
+            relaunch().program,
+            "/opt/default/claude",
+            "back on Claude later, it is Claude's default"
+        );
+        crate::testutil::settle(&ctx);
+        assert_eq!(
+            app_store().thread_attributes(&thread).unwrap().profile_id,
+            None,
+            "cleared in the store too"
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A worktree thread made through the store writer keeps its worktree and profile: on its
+    /// page at once, and again when it is closed and reopened (read back with its history). A
+    /// second resume of one native session opens the thread that holds it.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_worktree_thread_keeps_its_worktree_and_profile_through_the_writer_and_a_reopen() {
+        use crate::testutil::pump_until;
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("threads.db");
+        let reader = Rc::new(Store::open(&path).expect("open"));
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
+        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let app = adw::Application::builder()
+            .application_id("org.test.WorktreeThreadReopen")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        let imp = window.imp();
+        imp.config.borrow_mut().profiles.push(Profile {
+            id: "claude-work".into(),
+            name: "Claude (work)".into(),
+            ..crate::config::new_agent_profile(Driver::Claude)
+        });
+        let tree = tempfile::tempdir().unwrap();
+        let info = crate::worktree::WorktreeInfo {
+            path: tree.path().to_path_buf(),
+            branch: "feat/x".into(),
+            main_toplevel: tree.path().join("main"),
+        };
+        let dir = tree.path().to_string_lossy().into_owned();
+        assert!(
+            imp.create_chat_thread(NewThread {
+                dir: Some(dir.clone()),
+                title: Some("wt".into()),
+                profile_id: Some("claude-work".into()),
+                worktree: Some(info.clone()),
+                ..NewThread::new(Driver::Claude)
+            })
+            .is_none(),
+            "through the writer, the page opens once the thread is stored"
+        );
+        let attributes = || {
+            imp.tabs.borrow().iter().find_map(|t| {
+                let chat = t.chat.as_ref()?;
+                Some((
+                    chat.thread.clone(),
+                    t.worktree.clone(),
+                    chat.profile_id.clone(),
+                    t.page.tooltip(),
+                ))
+            })
+        };
+        assert!(pump_until(&ctx, 10, || attributes().is_some()));
+        let (thread, worktree, profile, tooltip) = attributes().unwrap();
+        assert_eq!(worktree.as_ref(), Some(&info));
+        assert_eq!(profile.as_deref(), Some("claude-work"));
+        assert!(tooltip.is_some_and(|t| t.contains("feat/x")));
+
+        // Closed and reopened: the page starts without them and gets them from the store.
+        let view = imp.tab_view.borrow().clone().unwrap();
+        view.close_page(&view.nth_page(0));
+        assert!(pump_until(&ctx, 5, || imp.tabs.borrow().is_empty()));
+        imp.open_thread(&thread, true);
+        assert!(pump_until(&ctx, 10, || attributes().is_some_and(
+            |(_, w, p, _)| w.as_ref() == Some(&info) && p.as_deref() == Some("claude-work")
+        )));
+
+        // Two resumes of one native session: one thread, the one already holding it.
+        let threads = || reader.list_threads(true).unwrap().len();
+        let before = threads();
+        imp.resume_as_thread(Driver::Claude, "native-1", Some(dir.clone()));
+        assert!(pump_until(&ctx, 10, || threads() == before + 1));
+        imp.resume_as_thread(Driver::Claude, "native-1", Some(dir));
+        crate::testutil::settle(&ctx);
+        assert_eq!(threads(), before + 1, "never a duplicate");
+
+        window.destroy();
+        crate::testutil::settle(&ctx);
+        WRITER.with(|w| *w.borrow_mut() = None);
+        STORE_PATH.with(|p| *p.borrow_mut() = None);
+        STORE.with(|s| *s.borrow_mut() = None);
         assert_eq!(writer.failures().0, 0);
     }
 }

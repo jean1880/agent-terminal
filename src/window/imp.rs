@@ -1243,8 +1243,9 @@ pub struct AgentTerminalWindow {
     summaries_stale: std::cell::Cell<bool>,
     /// The sidebar's "Show archived" toggle.
     show_archived: std::cell::Cell<bool>,
-    /// A new thread asked for while agents were still being detected: (folder, prompt).
-    pending_new_thread: RefCell<Option<(Option<String>, Option<String>)>>,
+    /// A new thread asked for while agents were still being detected: what to create once the
+    /// default agent is known.
+    pending_new_thread: RefCell<Option<threads::PendingNewThread>>,
     /// The thread page last in view: left blank, it is discarded when another page is shown.
     shown_thread: RefCell<Option<String>>,
     /// The thread sidebar beside the pages.
@@ -1916,8 +1917,7 @@ impl AgentTerminalWindow {
                 let driver = target
                     .and_then(|t| t.get::<String>())
                     .and_then(|k| crate::window::sidebar_model::parse_driver(&k));
-                let imp = obj.imp();
-                imp.new_chat_thread(driver, imp.current_dir(), None);
+                obj.imp().new_chat_thread_here(driver);
             }
         ));
         obj.add_action(&new_thread_agent);
@@ -3069,7 +3069,7 @@ impl AgentTerminalWindow {
 
     /// Opens a new tab rooted in the current tab's directory (fast path).
     fn new_tab(&self) {
-        self.new_chat_thread(None, self.current_dir(), None);
+        self.new_chat_thread_here(None);
     }
 
     /// Prompts for a folder, then opens a new tab rooted there running `profile`,
@@ -3106,11 +3106,18 @@ impl AgentTerminalWindow {
                                 Some(p) if crate::config::profile_driver(&p).is_none() => {
                                     imp.add_terminal_tab(Some(&p), Some(&dir));
                                 }
-                                p => imp.new_chat_thread(
-                                    p.as_ref().and_then(crate::config::profile_driver),
-                                    Some(dir),
-                                    None,
-                                ),
+                                // The folder picked; the profile chosen, if one was.
+                                p => {
+                                    let profile_id = p.as_ref().map(|p| p.id.clone());
+                                    imp.new_chat_thread_with(
+                                        p.as_ref().and_then(crate::config::profile_driver),
+                                        move |driver| threads::NewThread {
+                                            dir: Some(dir),
+                                            profile_id,
+                                            ..threads::NewThread::new(driver)
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -4778,11 +4785,21 @@ impl AgentTerminalWindow {
     /// it names one, else in the current tab's — switching CLI mid-task should
     /// not lose the project.
     fn new_tab_with_profile(&self, profile: &Profile) {
-        let dir = profile_tab_dir(profile.dir.as_deref(), self.current_dir());
         info!("Opening a thread for profile '{}'", profile.name);
         match crate::config::profile_driver(profile) {
-            Some(driver) => self.new_chat_thread(Some(driver), dir, None),
-            None => self.add_terminal_tab(Some(profile), dir.as_deref()),
+            // The profile chosen is the thread's (kept with it), and its folder comes first
+            // after a picked one (`resolve_new_thread_dir`).
+            Some(driver) => {
+                self.create_chat_thread(threads::NewThread {
+                    here: self.current_dir(),
+                    profile_id: Some(profile.id.clone()),
+                    ..threads::NewThread::new(driver)
+                });
+            }
+            None => {
+                let dir = profile_tab_dir(profile.dir.as_deref(), self.current_dir());
+                self.add_terminal_tab(Some(profile), dir.as_deref());
+            }
         }
     }
 
@@ -6586,23 +6603,33 @@ impl AgentTerminalWindow {
         match &profile {
             Some(p) if crate::config::profile_driver(p).is_none() => {
                 self.add_terminal_tab(Some(p), Some(&dir));
+                // A terminal page is added at once: the page just added, unless adding failed
+                // and the last is another.
+                let page = {
+                    let mut tabs = self.tabs.borrow_mut();
+                    tabs.last_mut().filter(|t| t.dir == dir).map(|t| {
+                        t.worktree = Some(info.clone());
+                        t.page.clone()
+                    })
+                };
+                if let Some(page) = page {
+                    page.set_tooltip(&tab_tooltip(Some(&info.branch), None));
+                }
             }
-            p => self.new_chat_thread(
-                p.as_ref().and_then(crate::config::profile_driver),
-                Some(dir.clone()),
-                None,
-            ),
-        }
-        let page = {
-            let mut tabs = self.tabs.borrow_mut();
-            // The page just added, unless adding failed and the last is another.
-            tabs.last_mut().filter(|t| t.dir == dir).map(|t| {
-                t.worktree = Some(info.clone());
-                t.page.clone()
-            })
-        };
-        if let Some(page) = page {
-            page.set_tooltip(&tab_tooltip(Some(&info.branch), None));
+            // A thread carries its worktree through its creation (stored with it), so its page
+            // knows it whenever it opens, and again after a reopen.
+            p => {
+                let profile_id = p.as_ref().map(|p| p.id.clone());
+                self.new_chat_thread_with(
+                    p.as_ref().and_then(crate::config::profile_driver),
+                    move |driver| threads::NewThread {
+                        dir: Some(dir),
+                        profile_id,
+                        worktree: Some(info),
+                        ..threads::NewThread::new(driver)
+                    },
+                );
+            }
         }
     }
 
@@ -6618,10 +6645,17 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             async move {
-                let path = info.path.clone();
-                let clean = gtk4::gio::spawn_blocking(move || crate::worktree::is_clean(&path))
-                    .await
-                    .unwrap_or_else(|_| Err("the status check panicked".to_string()));
+                // The worktree may have come back from the store (a reopened thread): it is
+                // offered only while git still has it, at that path and on that branch.
+                let checked = info.clone();
+                let clean = gtk4::gio::spawn_blocking(move || {
+                    if !crate::worktree::is_registered(&checked)? {
+                        return Err("it is no longer a registered worktree on its branch".into());
+                    }
+                    crate::worktree::is_clean(&checked.path)
+                })
+                .await
+                .unwrap_or_else(|_| Err("the status check panicked".to_string()));
                 match clean {
                     Ok(true) => {}
                     Ok(false) => {

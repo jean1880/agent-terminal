@@ -83,11 +83,11 @@ impl AgentTerminalWindow {
                 );
                 return;
             }
-            // Explicit folder: profile defaults must never redirect this review.
+            // Explicit folder: profile defaults never redirect this review, and a folder gone
+            // since is refused rather than replaced (`resolve_new_thread_dir`).
             window.imp().create_chat_thread(NewThread {
                 prompt: Some(crate::environment_review::prompt(&dir)),
                 dir: Some(dir),
-                require_exact_dir: true,
                 title: Some("Multi-agent environment review".to_owned()),
                 ..NewThread::new(driver)
             });

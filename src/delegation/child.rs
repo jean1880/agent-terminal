@@ -83,7 +83,7 @@ impl Supervisor {
             spec.provider = self
                 .services
                 .durable("restore child provider thread", move |s| {
-                    s.add_provider_thread(&thread, driver.info().key, "")
+                    s.add_provider_thread(&thread, driver.info().key, "default")
                 })
                 .await?;
             self.state
@@ -362,7 +362,7 @@ impl Supervisor {
                     .backing_thread_id
                     .as_deref()
                     .ok_or(agent_kit::store::StoreError::WriterGone)?;
-                let provider = s.add_provider_thread(thread, driver.info().key, "")?;
+                let provider = s.add_provider_thread(thread, driver.info().key, "default")?;
                 Ok((row, provider))
             })
             .await;
