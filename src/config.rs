@@ -1388,6 +1388,21 @@ impl TerminalConfig {
             .and_then(|i| self.profiles.get(i))
     }
 
+    /// The profile a chat thread on `driver` runs with: the one it was opened with (`profile_id`)
+    /// while that profile still runs `driver`, else `driver`'s own ([`Self::agent_profile`]). A
+    /// thread switched to another agent, or whose profile was deleted or now runs another CLI,
+    /// falls back rather than starting the wrong agent.
+    pub fn thread_profile(
+        &self,
+        profile_id: Option<&str>,
+        driver: agent_core::adapter::Driver,
+    ) -> Option<&Profile> {
+        profile_id
+            .and_then(|id| self.profile_by_id(id))
+            .filter(|p| profile_driver(p) == Some(driver))
+            .or_else(|| self.agent_profile(driver))
+    }
+
     /// Whether this is a first start: no settings file existed when these were loaded.
     pub fn is_first_run(&self) -> bool {
         self.first_run.get()
@@ -2584,6 +2599,43 @@ mod tests {
         // The first save replaces the file without taking a second copy.
         loaded.save_to(&path);
         assert!(kept_copies(dir.path(), "external").is_empty());
+    }
+
+    #[test]
+    fn a_threads_profile_is_kept_only_while_it_runs_the_threads_agent() {
+        use agent_core::adapter::Driver;
+        let mut config = TerminalConfig::default();
+        let named = |id: &str, name: &str, driver: Driver| Profile {
+            id: id.into(),
+            name: name.into(),
+            ..new_agent_profile(driver)
+        };
+        config.profiles = vec![
+            named("claude-default", "Claude", Driver::Claude),
+            named("claude-work", "Claude (work)", Driver::Claude),
+            named("codex-default", "Codex", Driver::Codex),
+        ];
+        let id = |p: Option<&Profile>| p.map(|p| p.id.clone());
+        assert_eq!(
+            id(config.thread_profile(Some("claude-work"), Driver::Claude)),
+            Some("claude-work".into()),
+            "the profile the thread was opened with"
+        );
+        assert_eq!(
+            id(config.thread_profile(Some("claude-work"), Driver::Codex)),
+            Some("codex-default".into()),
+            "switched to another agent: that agent's own"
+        );
+        assert_eq!(
+            id(config.thread_profile(Some("deleted"), Driver::Claude)),
+            Some("claude-default".into()),
+            "a deleted profile falls back"
+        );
+        assert_eq!(
+            id(config.thread_profile(None, Driver::Claude)),
+            Some("claude-default".into())
+        );
+        assert_eq!(config.thread_profile(None, Driver::Agy), None);
     }
 
     #[test]

@@ -224,11 +224,15 @@ pub(super) fn switch(
         session.rebind_start();
         return;
     };
-    let profile = SharedConfig::default()
-        .borrow()
-        .agent_profile(driver)
-        .cloned()
-        .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+    // The thread's own profile on its own agent; another agent's default on a switch.
+    let profile = match super::thread_owner(&thread) {
+        Some(window) => window.imp().thread_profile(&thread, driver),
+        None => SharedConfig::default()
+            .borrow()
+            .agent_profile(driver)
+            .cloned()
+            .unwrap_or_else(|| crate::config::new_agent_profile(driver)),
+    };
     let serial = slot.switch_serial.clone();
     let chosen = serial.get().wrapping_add(1);
     serial.set(chosen);
@@ -282,12 +286,7 @@ impl AgentTerminalWindow {
             return;
         };
         let driver = slot.driver();
-        let profile = self
-            .config
-            .borrow()
-            .agent_profile(driver)
-            .cloned()
-            .unwrap_or_else(|| crate::config::new_agent_profile(driver));
+        let profile = self.thread_profile(thread, driver);
         let thread = thread.to_owned();
         let serial = slot.switch_serial.clone();
         let chosen = serial.get();

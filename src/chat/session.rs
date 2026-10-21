@@ -796,8 +796,6 @@ impl ChatSession {
         self.inner.launch_env.borrow().clone()
     }
 
-    /// Seeds a new thread with a budgeted, redacted handoff (fork, compact-by-handoff): it
-    /// rides on the next real prompt, exactly like a cross-agent switch's.
     /// The mode the user chose, which the running one can differ from (agy without its hook
     /// cannot ask), as a new process would get it (a fork, a handoff): never dangerous
     /// permissive mode, which ends with its agent; the last safe choice instead.
@@ -805,18 +803,10 @@ impl ChatSession {
         self.inner.safe_mode.get()
     }
 
-    pub fn seed_handoff(&self, handoff: Handoff, source: &str) {
-        if handoff.carried == 0 {
-            return;
-        }
-        let text = handoff_notice(&format!("from {source}"), &handoff);
-        self.inner.arm_handoff(handoff);
-        self.inner.emit(Envelope::new(Event::Notice { text }));
-    }
-
     /// Re-arms a handoff found stored and undelivered in the thread's history (see
-    /// [`undelivered_handoff`]), as the thread reopens. Already stored and announced, so neither
-    /// is done again. A stored fence that is not one this app draws is not trusted: dropped.
+    /// [`undelivered_handoff`]), as the thread opens: a new thread's own handoff too (stored with
+    /// it by [`seeded_handoff_events`]), which rides on the next real prompt exactly like a
+    /// cross-agent switch's. Already stored and announced, so neither is done again. A stored fence that is not one this app draws is not trusted: dropped.
     pub fn restore_handoff(&self, handoff: Handoff) {
         if !agent_core::handoff_budget::is_valid_fence(&handoff.fence) {
             warn!("ignoring a stored handoff with an invalid fence");
@@ -4916,6 +4906,27 @@ fn session_rules_end(n: usize) -> String {
     }
 }
 
+/// What a NEW thread carrying `handoff` (a fork, compact-by-handoff, a continuation) is stored
+/// with: the `HandoffSeeded` its session re-arms from history ([`undelivered_handoff`]), then the
+/// notice saying what it carried, from `source`. Nothing when it carries nothing. Written with the
+/// thread itself, so a page closed before its session starts keeps the handoff.
+pub(crate) fn seeded_handoff_events(handoff: &Handoff, source: &str) -> Vec<Envelope> {
+    if handoff.carried == 0 {
+        return Vec::new();
+    }
+    vec![
+        Envelope::new(Event::HandoffSeeded {
+            summary: handoff.summary.clone(),
+            fence: handoff.fence.clone(),
+            carried: handoff.carried,
+            total: handoff.total,
+        }),
+        Envelope::new(Event::Notice {
+            text: handoff_notice(&format!("from {source}"), handoff),
+        }),
+    ]
+}
+
 /// What a handoff carried, said plainly: all of the thread, or how much of it (the budget keeps
 /// the first request and the most recent work), and what never travels. `place` reads after
 /// "Continuing": "in Codex", "from “title”".
@@ -5458,6 +5469,134 @@ mod tests {
                 "the resume starts with the model picked while paused: {launches:?}"
             );
         });
+    }
+
+    /// The suspended same-agent switch with no model named keeps the one the agent reported:
+    /// it never resumes on an empty model or on the store's `"default"` sentinel.
+    #[test]
+    fn a_paused_switch_naming_no_model_keeps_the_reported_one() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                idle_claude(tmp.path()),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            session.reload_session();
+            assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+                e,
+                Event::TurnCompleted { .. }
+            ))));
+            session.send_prompt("first");
+            assert!(pump_until(ctx, 10, || seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
+                .count()
+                == 2));
+            assert!(session.suspend_if_idle(), "an idle session suspends");
+            session.switch(Driver::Claude, None, Some("high".into()));
+            assert!(
+                !has(&seen, |e| matches!(
+                    e,
+                    Event::ModelChanged { model } if model.is_empty() || model == "default"
+                )),
+                "no empty or sentinel model is shown"
+            );
+            session.send_prompt("after a pause");
+            assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
+                .len()
+                == 2));
+            let launches = lines(tmp.path().join("args.log"));
+            assert!(
+                launches[1].contains("--model m"),
+                "the reported model is kept: {launches:?}"
+            );
+            assert!(
+                !launches[1].contains("--model default"),
+                "never the sentinel: {launches:?}"
+            );
+            assert!(launches[1].contains("--effort high"), "{launches:?}");
+        });
+    }
+
+    /// A new thread's handoff is stored with the thread ([`seeded_handoff_events`]); its
+    /// session re-arms it from history and sends it with the first prompt, without storing a
+    /// second `HandoffSeeded`.
+    #[test]
+    fn a_new_threads_stored_handoff_rides_on_the_first_prompt_once() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let handoff = Handoff {
+                summary: "earlier context".into(),
+                fence: "0123456789abcdef0123456789abcdef".into(),
+                carried: 2,
+                total: 3,
+            };
+            for env in seeded_handoff_events(&handoff, "“source”") {
+                store.append_event(&thread, None, &env).expect("stored");
+            }
+            let seeded_count = || {
+                store
+                    .events(&thread, None, 1000)
+                    .expect("events")
+                    .into_iter()
+                    .filter(|(_, e)| matches!(e.event, Event::HandoffSeeded { .. }))
+                    .count()
+            };
+            let history: Vec<Envelope> = store
+                .events(&thread, None, 1000)
+                .expect("events")
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
+            assert!(history
+                .iter()
+                .any(|e| matches!(&e.event, Event::Notice { text } if text.contains("2 of 3"))));
+            let stored = undelivered_handoff(&history).expect("owed to the new session");
+            let (sink, _seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                idle_claude(tmp.path()),
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            session.restore_handoff(stored);
+            session.send_prompt("first");
+            assert!(pump_until(ctx, 10, || lines(
+                tmp.path().join("prompts.log")
+            )
+            .iter()
+            .any(|l| l.contains("first"))));
+            let sent = lines(tmp.path().join("prompts.log"));
+            assert!(
+                sent.iter()
+                    .any(|l| l.contains("first") && l.contains("earlier context")),
+                "the handoff rides on the first prompt: {sent:?}"
+            );
+            assert_eq!(seeded_count(), 1, "never stored twice");
+        });
+    }
+
+    #[test]
+    fn a_handoff_carrying_nothing_is_not_stored() {
+        let empty = Handoff {
+            summary: String::new(),
+            fence: "0123456789abcdef0123456789abcdef".into(),
+            carried: 0,
+            total: 0,
+        };
+        assert!(seeded_handoff_events(&empty, "“source”").is_empty());
     }
 
     /// Suspension waits for anything a stopped process would lose: no session id yet, a turn
