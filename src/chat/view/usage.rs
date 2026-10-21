@@ -379,6 +379,27 @@ fn shown_class(used: f64, aging: bool) -> &'static str {
     }
 }
 
+/// How many rows the loaded meter will draw: one per window kind the last reading had, else
+/// both, the usual shape.
+fn expected_rows(windows: &[QuotaWindow]) -> usize {
+    match split_windows(windows) {
+        (None, None) => 2,
+        (short, weekly) => usize::from(short.is_some()) + usize::from(weekly.is_some()),
+    }
+}
+
+/// The loading text laid out as the loaded meter's rows (same spacing, same text style), so the
+/// meter keeps its height when the reading arrives: "Checking…" on the first, blank lines below.
+fn loading_rows(windows: &[QuotaWindow]) -> gtk4::Box {
+    let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+    rows.set_valign(gtk4::Align::Center);
+    rows.append(&label(LOADING_TEXT, &["usage-text"]));
+    for _ in 1..expected_rows(windows) {
+        rows.append(&label("", &["usage-text"]));
+    }
+    rows
+}
+
 /// Accent dot + one thin row per window kind, labelled by its length, with a bar and percentage.
 /// Only a Fresh reading is drawn as is; an Aging one is muted (never green) with when it was
 /// read; an Expired one is the could-not-read state ("Unknown"), unless a probe is fetching one,
@@ -389,7 +410,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     if is_loading(snap, now) {
         b.add_css_class("usage-loading");
         b.append(&crate::brand::drip(driver));
-        b.append(&label(LOADING_TEXT, &["usage-text"]));
+        b.append(&loading_rows(&snap.windows));
         b.set_tooltip_text(Some(&loading_tooltip(driver_name(driver))));
         return b;
     }
@@ -831,12 +852,31 @@ pub(crate) mod tests {
             }
             // One droplet: the loop's and the falling one hand over, never shown together.
             assert_eq!((orbits, falls, ripples), (1, 1, 1));
-            let text = form
-                .last_child()
+            let rows = form.last_child().expect("the rows");
+            let text = rows
+                .first_child()
                 .and_downcast::<gtk4::Label>()
                 .expect("text");
             assert_eq!(text.text(), LOADING_TEXT);
+            // As tall as the meter it stands for: two rows, both window kinds.
+            let loaded = compact_form(
+                driver,
+                &Snapshot {
+                    windows: vec![named("5-hour", 0.4), named("Weekly", 0.2)],
+                    read_at: Some(now_epoch()),
+                    ..Snapshot::default()
+                },
+                now_epoch(),
+            );
+            let height = |w: &gtk4::Box| w.measure(gtk4::Orientation::Vertical, -1).1;
+            assert_eq!(
+                height(&form),
+                height(&loaded),
+                "{driver:?} keeps its height"
+            );
         }
+        assert_eq!(expected_rows(&[]), 2, "never read: the usual two");
+        assert_eq!(expected_rows(&[named("Weekly", 0.1)]), 1, "as last read");
         // The probe ended with nothing read: the could-not-read state.
         let form = compact_form(Driver::Claude, &Snapshot::default(), now_epoch());
         assert!(!form.has_css_class("usage-loading"));
