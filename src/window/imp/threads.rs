@@ -1055,6 +1055,16 @@ fn carried_profile(
     source_profile.filter(|_| source_driver == Some(target))
 }
 
+/// Whether a thread's profile ends with `event`, from its agent `driver`. `profile_runs` is the
+/// agent the thread's profile runs (`None`: no profile; `Some(None)`: one that is gone, which
+/// [`crate::config::TerminalConfig::thread_profile`] already passes over). Only another agent
+/// reporting its session started ends it: the events a switch emits before its agent starts do
+/// not, since a switch whose agent never starts rolls back to the old one, on its own profile.
+fn profile_outlived(profile_runs: Option<Option<Driver>>, driver: Driver, event: &Event) -> bool {
+    matches!(event, Event::SessionStarted { .. })
+        && matches!(profile_runs, Some(Some(runs)) if runs != driver)
+}
+
 /// The folders a new thread could start in, owned, so they can be checked off the main thread
 /// ([`crate::utils::resolve_new_thread_dir`]).
 struct ThreadFolders {
@@ -4613,8 +4623,10 @@ impl AgentTerminalWindow {
         // Set by the arms below, acted on after the tab borrow is released.
         let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
         let mut withdraw_ask = false;
-        // Switched in place to another agent: the profile it was opened with is that agent's no
-        // longer, so the thread follows the new agent's default (stored, for a reopen).
+        // Switched in place to another agent, and that agent has started: the profile the thread
+        // was opened with is no longer its agent's, so it follows the new agent's default (stored,
+        // for a reopen). Not before: a switch whose agent never starts rolls back, and the old
+        // agent must restart on its own profile.
         let mut clear_profile = false;
         enum After {
             Nothing,
@@ -4638,7 +4650,14 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
-            if switched && chat.profile_id.take().is_some() {
+            let profile_runs = chat.profile_id.as_deref().map(|id| {
+                self.config
+                    .borrow()
+                    .profile_by_id(id)
+                    .and_then(profile_driver)
+            });
+            if profile_outlived(profile_runs, driver, &env.event) {
+                chat.profile_id = None;
                 clear_profile = true;
             }
             // Heard from: idle suspension counts from the thread's last event too.
@@ -5594,17 +5613,18 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// Resolves `folders` (off the main thread when the store is a file store: it stats the
-    /// disk), says what it must (a picked folder gone, a missing starting directory), then runs
-    /// `then` with the folder. In place (memory-only store, tests), `then`'s result comes back;
-    /// otherwise `None`, and `then` runs once the folder is known.
+    /// Resolves `folders` off the main thread (it stats the disk, which can hang on a network
+    /// mount), says what it must (a picked folder gone, a missing starting directory), then runs
+    /// `then` with the folder, and returns `None`. Only a test without a store writer resolves in
+    /// place, so its page comes back at once: `then`'s result. A production store without a
+    /// writer (it failed to open or start) still resolves off the main thread.
     fn with_new_thread_dir<R: 'static>(
         &self,
         folders: ThreadFolders,
         what: &'static str,
         then: impl FnOnce(&Self, String) -> Option<R> + 'static,
     ) -> Option<R> {
-        if app_handle().writer().is_none() {
+        if cfg!(test) && app_handle().writer().is_none() {
             let cwd = self.use_new_thread_dir(folders.resolve(), what)?;
             return then(self, cwd);
         }
@@ -5654,8 +5674,8 @@ impl AgentTerminalWindow {
     }
 
     /// Creates a thread, opens and shows it. Whatever `new` leaves unset comes from its profile
-    /// (the one chosen, else its agent's). Returns its page when it opens at once (memory-only
-    /// store, tests); otherwise it opens once its folder is checked and it is stored.
+    /// (the one chosen, else its agent's). Returns its page when it opens at once (a test with
+    /// no store writer); otherwise it opens once its folder is checked and it is stored.
     pub(super) fn create_chat_thread(&self, mut new: NewThread) -> Option<adw::TabPage> {
         if self.is_closing() {
             return None;
@@ -9072,6 +9092,166 @@ pub(super) mod tests {
             carried_profile(Some(Driver::Claude), None, Driver::Claude),
             None
         );
+    }
+
+    #[test]
+    fn a_profile_ends_only_when_another_agent_has_started() {
+        let started = Event::SessionStarted {
+            native_id: "n".into(),
+            model: None,
+            cwd: None,
+        };
+        let early = Event::ModelChanged { model: "m".into() };
+        let claude = Some(Some(Driver::Claude));
+        assert!(profile_outlived(claude, Driver::Codex, &started));
+        assert!(
+            !profile_outlived(claude, Driver::Codex, &early),
+            "a switch's events before its agent starts keep it (it may roll back)"
+        );
+        assert!(
+            !profile_outlived(claude, Driver::Claude, &started),
+            "its own agent (re)started, a roll back included"
+        );
+        assert!(!profile_outlived(None, Driver::Codex, &started));
+        assert!(!profile_outlived(Some(None), Driver::Codex, &started));
+    }
+
+    /// A thread on the second of two Claude profiles is switched to Codex, which fails before it
+    /// starts: the events the provisional switch emits keep the thread's profile, so the
+    /// roll back relaunches Claude with it (its program and arguments), not the default's. Only
+    /// a replacement that reports its session ends it.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_failed_switch_rolls_back_onto_the_threads_own_profile() {
+        use crate::testutil::pump_until;
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.FailedSwitchKeepsProfile")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        let imp = window.imp();
+        let default = Profile {
+            id: "claude-default".into(),
+            name: "Claude".into(),
+            command: "/opt/default/claude".into(),
+            args: vec!["--default".into()],
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        let work = Profile {
+            id: "claude-work".into(),
+            name: "Claude (work)".into(),
+            command: "/opt/work/claude".into(),
+            args: vec!["--work".into()],
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        assert_eq!(profile_driver(&work), Some(Driver::Claude));
+        {
+            let mut config = imp.config.borrow_mut();
+            config
+                .profiles
+                .retain(|p| profile_driver(p) != Some(Driver::Claude));
+            config.profiles.insert(0, default.clone());
+            config.profiles.insert(1, work.clone());
+        }
+        for p in [&default, &work] {
+            RESOLVED.with(|r| {
+                r.borrow_mut().insert(
+                    (p.command.clone(), p.env_file.clone()),
+                    ResolvedAgent {
+                        program: Some(p.command.clone()),
+                        env: Vec::new(),
+                        env_failed: false,
+                    },
+                )
+            });
+        }
+        AgentAvailability::shared().set(
+            Driver::Claude,
+            Availability::Ready("/opt/default/claude".into()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        imp.create_chat_thread(NewThread {
+            dir: Some(cwd.clone()),
+            title: Some("work".into()),
+            profile_id: Some("claude-work".into()),
+            ..NewThread::new(Driver::Claude)
+        })
+        .expect("opened in place");
+        let thread = imp.current_thread().expect("its page");
+        let relaunch = || agent_launch(Driver::Claude, &thread, &cwd).expect("launch");
+
+        // The switch to Codex emits its events before Codex starts; Codex then fails, and the
+        // session rolls back to Claude, reporting the failure on Claude.
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Codex,
+            &Envelope::new(Event::ModelChanged {
+                model: "gpt".into(),
+            }),
+        );
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::new(Event::Error {
+                message: "Codex did not start. Back on Claude.".into(),
+            }),
+        );
+        let launch = relaunch();
+        assert_eq!(
+            launch.program, "/opt/work/claude",
+            "the thread's own profile"
+        );
+        assert_eq!(launch.extra_args, vec!["--work".to_owned()]);
+        // Its own agent restarting keeps it too.
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::new(Event::SessionStarted {
+                native_id: "claude-1".into(),
+                model: None,
+                cwd: None,
+            }),
+        );
+        assert_eq!(relaunch().program, "/opt/work/claude");
+
+        // A switch whose agent started: the thread follows that agent's default from then on.
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Codex,
+            &Envelope::new(Event::SessionStarted {
+                native_id: "codex-1".into(),
+                model: None,
+                cwd: None,
+            }),
+        );
+        assert_eq!(
+            relaunch().program,
+            "/opt/default/claude",
+            "back on Claude later, it is Claude's default"
+        );
+        crate::testutil::settle(&ctx);
+        assert_eq!(
+            app_store().thread_attributes(&thread).unwrap().profile_id,
+            None,
+            "cleared in the store too"
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
     }
 
     /// A worktree thread made through the store writer keeps its worktree and profile: on its
