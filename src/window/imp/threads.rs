@@ -442,9 +442,34 @@ impl DiscardedThread {
     }
 }
 
+/// What a blank thread was stored with, read in the job that deletes it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StoredChoices {
+    pub(super) model: Option<String>,
+    pub(super) attributes: agent_kit::store::ThreadAttributes,
+    pub(super) mode: Option<Mode>,
+}
+
+impl DiscardedThread {
+    /// Fills in from the store what the page could not say. `live`: the page had a session, so
+    /// its model is the session's (`None` meaning the agent's own) and is kept. Without one the
+    /// model is the stored one, and a profile, worktree or mode the page does not know yet (it
+    /// closed before it was built) is the stored one too.
+    pub(super) fn with_stored(mut self, stored: StoredChoices, live: bool) -> Self {
+        if live {
+            return self;
+        }
+        self.model = stored_model(stored.model.as_deref());
+        self.profile_id = self.profile_id.or(stored.attributes.profile_id);
+        self.worktree = self.worktree.or(stored.attributes.worktree);
+        self.mode = self.mode.or(stored.mode).map(Mode::session_safe);
+        self
+    }
+}
+
 /// The [`DiscardedThread`] a blank thread page leaves: what its session runs with, else what
-/// the page was opened with. The model of a page with no session is the stored one, read as
-/// the thread is deleted: `None` here, and `false` returned with it.
+/// the page knows; `true` with it when it had a session. What the page cannot say is read from
+/// the store as the thread is deleted ([`DiscardedThread::with_stored`]).
 fn discarded_thread(tab: &TabState, chat: &ChatTab) -> (DiscardedThread, bool) {
     let session = chat.slot.get();
     let spec = DiscardedThread {
@@ -925,9 +950,9 @@ thread_local! {
     static OPEN_LAYOUT_WRITES: LayoutWrites = LayoutWrites::default();
     static SCAN_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CHAT_RESTORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Threads whose page is closing because they are being deleted: their detach discards
-    /// nothing and offers no Undo ([`AgentTerminalWindow::close_row_for_delete`]).
-    static DELETING: RefCell<std::collections::HashSet<String>> =
+    /// Threads whose page is closing for a delete or an archive: their detach discards nothing
+    /// and offers no Undo ([`AgentTerminalWindow::close_row_without_discard`]).
+    static NO_DISCARD: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
 }
 
@@ -1257,6 +1282,8 @@ struct CreatedThread {
     title: Option<String>,
     profile_id: Option<String>,
     worktree: Option<crate::worktree::WorktreeInfo>,
+    /// The mode it was created in (stored as its choice), known before its page is built.
+    mode: Option<Mode>,
 }
 
 /// Stores a NEW thread from `spec` under ids made beforehand (what the store writer runs): the
@@ -3708,39 +3735,43 @@ impl AgentTerminalWindow {
         };
         if self.is_closing()
             || !chat.looks_blank()
-            || DELETING.with(|d| d.borrow().contains(&chat.thread))
+            || NO_DISCARD.with(|d| d.borrow().contains(&chat.thread))
         {
             return;
         }
-        let (mut spec, live_model) = discarded_thread(tab, chat);
+        let (spec, live) = discarded_thread(tab, chat);
         let id = chat.thread.clone();
         let thread = id.clone();
         self.write_store_then(
             "discard a blank thread",
-            // Some(stored model) once deleted; None when the store found something in it.
+            // What it was stored with, once deleted; None when the store found something in it.
             move |s| {
-                let model = s.thread_summary(&id)?.and_then(|t| t.model);
-                Ok(s.delete_if_blank(&id)?.then_some(model))
+                let stored = StoredChoices {
+                    model: s.thread_summary(&id)?.and_then(|t| t.model),
+                    attributes: s.thread_attributes(&id)?,
+                    mode: crate::chat::session::chosen_mode(
+                        s.events(&id, None, REPLAY_LIMIT)?.iter().map(|(_, e)| e),
+                    ),
+                };
+                Ok(s.delete_if_blank(&id)?.then_some(stored))
             },
             move |imp, outcome| {
-                if let Some(Ok(Some(model))) = outcome {
+                if let Some(Ok(Some(stored))) = outcome {
                     info!("Discarded blank thread {thread}");
-                    if !live_model {
-                        spec.model = stored_model(model.as_deref());
-                    }
-                    imp.offer_undo_discard(spec);
+                    imp.offer_undo_discard(spec.with_stored(stored, live));
                 }
             },
         );
     }
 
-    /// Closes `thread`'s page, in whichever window has it, for a delete: the delete removes the
-    /// thread, so its page's detach discards nothing and never offers to undo a discard.
-    pub(super) fn close_row_for_delete(&self, thread: &str) {
-        DELETING.with(|d| d.borrow_mut().insert(thread.to_owned()));
+    /// Closes `thread`'s page, in whichever window has it, for a delete or an archive: that
+    /// write decides the thread's fate, so its page's detach discards nothing (a discard racing
+    /// an archive could delete the thread archived) and never offers to undo a discard.
+    pub(super) fn close_row_without_discard(&self, thread: &str) {
+        NO_DISCARD.with(|d| d.borrow_mut().insert(thread.to_owned()));
         // The page closes (and detaches) in place: `close-page` finishes at once.
         self.close_row_now(&RowKey::Thread(thread.to_owned()));
-        DELETING.with(|d| d.borrow_mut().remove(thread));
+        NO_DISCARD.with(|d| d.borrow_mut().remove(thread));
     }
 
     /// The "Empty thread discarded" toast, whose Undo creates the thread again from `spec`.
@@ -6087,6 +6118,7 @@ impl AgentTerminalWindow {
             title,
             profile_id,
             worktree,
+            mode,
         };
         if store.writer().is_none() {
             // In place (memory-only store, tests): the page opens at once.
@@ -6140,6 +6172,7 @@ impl AgentTerminalWindow {
             title,
             profile_id,
             worktree,
+            mode,
         } = created;
         self.reload_summaries();
         let page = self.open_thread(thread, false)?;
@@ -6154,6 +6187,8 @@ impl AgentTerminalWindow {
                 chat.pending_effort = effort;
                 chat.pending_handoff = handoff;
                 chat.profile_id = profile_id;
+                // Before the build reads it from history: a page closed sooner still knows it.
+                chat.chosen_mode = mode.map(Mode::session_safe);
                 if let Some(title) = title {
                     chat.title = title;
                 }
@@ -9806,7 +9841,7 @@ pub(super) mod tests {
             "the folder is explicit"
         );
         assert_eq!(new.profile_id.as_deref(), Some("codex-work"));
-        assert_eq!(new.worktree, Some(worktree));
+        assert_eq!(new.worktree.as_ref(), Some(&worktree));
         assert_eq!(new.model.as_deref(), Some("gpt-5"));
         assert_eq!(new.effort.as_deref(), Some("high"));
         assert_eq!(new.mode, Some(Mode::Ask), "never dangerous permissive mode");
@@ -9816,6 +9851,47 @@ pub(super) mod tests {
             ..spec.clone()
         };
         assert_eq!(plan.new_thread().mode, Some(Mode::Plan));
+
+        // A page closed before it was built knows only its agent and folder: the store fills in
+        // the rest. A page with a session keeps its own, the session's model included.
+        let unbuilt = DiscardedThread {
+            profile_id: None,
+            worktree: None,
+            model: None,
+            effort: None,
+            mode: None,
+            ..spec.clone()
+        };
+        let stored = StoredChoices {
+            model: Some("default".into()),
+            attributes: agent_kit::store::ThreadAttributes {
+                profile_id: Some("codex-work".into()),
+                worktree: Some(worktree.clone()),
+            },
+            mode: Some(Mode::Bypass),
+        };
+        let filled = unbuilt.clone().with_stored(stored.clone(), false);
+        assert_eq!(filled.model, None, "the stored sentinel is the agent's own");
+        assert_eq!(filled.profile_id.as_deref(), Some("codex-work"));
+        assert_eq!(filled.worktree, Some(worktree));
+        assert_eq!(
+            filled.mode,
+            Some(Mode::Ask),
+            "never dangerous permissive mode"
+        );
+        let stored_opus = StoredChoices {
+            model: Some("opus".into()),
+            ..stored.clone()
+        };
+        assert_eq!(
+            unbuilt
+                .clone()
+                .with_stored(stored_opus, false)
+                .model
+                .as_deref(),
+            Some("opus")
+        );
+        assert_eq!(unbuilt.clone().with_stored(stored, true), unbuilt);
     }
 
     /// Through the store writer: an unsent message makes closing ask; a blank thread left is
@@ -10036,6 +10112,95 @@ pub(super) mod tests {
                 == Some("Thread deleted")));
         settle(&ctx);
         assert_eq!(discards(), 3, "a deleted thread offers no Undo");
+
+        // Archiving a blank thread keeps it, archived: its page's close discards nothing.
+        let shelved = create(NewThread::new(Driver::Claude));
+        imp.set_thread_archived(&shelved, true);
+        assert!(pump_until(&ctx, 10, || reader
+            .thread_summary(&shelved)
+            .unwrap()
+            .is_some_and(|t| t.archived)
+            && titles().last().map(String::as_str)
+                == Some("Thread archived")));
+        settle(&ctx);
+        assert!(
+            exists(&shelved),
+            "an archived blank thread is never deleted"
+        );
+        assert_eq!(discards(), 3, "and offers no discard Undo");
+        // The guard itself, with no archive write to save the thread: a blank page closed this
+        // way queues no discard at all, so no write order can delete it.
+        let kept = create(NewThread::new(Driver::Claude));
+        imp.close_row_without_discard(&kept);
+        assert!(pump_until(&ctx, 5, || imp.page_of_thread(&kept).is_none()));
+        writer.flush(WORKER_FLUSH_WAIT);
+        settle(&ctx);
+        assert!(exists(&kept), "no discard was queued");
+        assert_eq!(discards(), 3);
+
+        // A page closed before it was ever built: Undo still gets back what the store held.
+        let tree = tempfile::tempdir().unwrap();
+        let tree_dir = tree.path().to_string_lossy().into_owned();
+        let info = crate::worktree::WorktreeInfo {
+            path: tree.path().to_path_buf(),
+            branch: "feat/y".into(),
+            main_toplevel: tree.path().join("main"),
+        };
+        let handle = app_handle();
+        let ids = NewThreadIds {
+            thread: handle.new_id().unwrap(),
+            provider: handle.new_id().unwrap(),
+        };
+        let unbuilt = ids.thread.clone();
+        let spec = NewThreadSpec {
+            model: Some("sonnet".into()),
+            mode: Some(Mode::Plan),
+            attributes: agent_kit::store::ThreadAttributes {
+                profile_id: Some("claude-work".into()),
+                worktree: Some(info.clone()),
+            },
+            ..NewThreadSpec::new(&tree_dir, Driver::Claude)
+        };
+        handle
+            .write("create a thread", Some(&unbuilt), move |s| {
+                record_new_thread_as(s, &ids, &spec)
+            })
+            .unwrap();
+        assert!(pump_until(&ctx, 10, || exists(&unbuilt)));
+        imp.reload_summaries();
+        assert!(imp.open_thread(&unbuilt, false).is_some());
+        assert!(built(&unbuilt).is_none(), "never shown, never built");
+        imp.close_row_now(&RowKey::Thread(unbuilt.clone()));
+        assert!(pump_until(&ctx, 10, || !exists(&unbuilt) && discards() == 4));
+        toasts()
+            .last()
+            .unwrap()
+            .emit_by_name::<()>("button-clicked", &[]);
+        assert!(pump_until(&ctx, 10, || threads_in(&tree_dir).len() == 1));
+        let back = threads_in(&tree_dir).remove(0);
+        assert!(pump_until(&ctx, 10, || imp.page_of_thread(&back).is_some()));
+        assert_eq!(
+            reader
+                .thread_summary(&back)
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("sonnet")
+        );
+        let modes: Vec<Mode> = reader
+            .events(&back, None, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, e)| match e.event {
+                Event::ModeChosen { mode } => Some(mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes, [Mode::Plan]);
+        let attributes = reader.thread_attributes(&back).unwrap();
+        assert_eq!(attributes.profile_id.as_deref(), Some("claude-work"));
+        assert_eq!(attributes.worktree.as_ref(), Some(&info));
 
         // The writer gone: the second Undo says it could not make the thread, and a delete
         // says it could not delete.

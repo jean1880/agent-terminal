@@ -520,9 +520,10 @@ impl AgentTerminalWindow {
     fn archive_now(&self, thread: &str) {
         let key = RowKey::Thread(thread.to_owned());
         let stopped = self.row_is_busy(&key);
-        // Stored before the page closes: an archived thread is never discarded as blank.
         self.store_archived(thread, true, stopped);
-        self.close_row_now(&key);
+        // Its page's detach discards nothing: a blank thread archived is never deleted, however
+        // the archive's write fares.
+        self.close_row_without_discard(thread);
     }
 
     /// Archives (or brings back) the thread in the store, and says so once the writer has
@@ -599,11 +600,14 @@ impl AgentTerminalWindow {
     /// Closes the thread's page (ending its session) and removes it from the store.
     /// Says so once the writer has answered: "Thread deleted", or what failed.
     pub(super) fn delete_thread_now(&self, thread: &str) {
-        // Running in any window: closing its page stops its agent, whatever the write does.
+        // An agent alive in any window (not suspended, not exited), or its live sub-agents:
+        // closing its page stops them, whatever the write does.
         let stopped = super::threads::thread_owner(thread)
             .and_then(|w| w.imp().slot_of(thread))
-            .is_some_and(|slot| slot.get().is_some());
-        self.close_row_for_delete(thread);
+            .and_then(|slot| slot.get())
+            .is_some_and(|s| s.status().alive)
+            || crate::delegation::supervisor().is_some_and(|s| s.root_has_live_children(thread));
+        self.close_row_without_discard(thread);
         let id = thread.to_owned();
         // Already gone (deleted elsewhere meanwhile) is deleted too.
         self.write_store_then(
