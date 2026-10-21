@@ -81,9 +81,9 @@ pub(super) enum SwitchRoute {
 pub(super) fn switch_route(has_session: bool, building: bool, own: &Availability) -> SwitchRoute {
     match (has_session, own) {
         (true, _) => SwitchRoute::Live,
-        (false, Availability::Ready(_) | Availability::Detecting) => SwitchRoute::Park,
-        (false, Availability::Missing | Availability::Disabled) if building => SwitchRoute::Park,
-        (false, Availability::Missing | Availability::Disabled) => SwitchRoute::Rebind,
+        (false, Availability::Detecting) => SwitchRoute::Park,
+        (false, _) if building => SwitchRoute::Park,
+        (false, _) => SwitchRoute::Rebind,
     }
 }
 
@@ -1475,6 +1475,19 @@ fn carried_profile(
     target: Driver,
 ) -> Option<String> {
     source_profile.filter(|_| source_driver == Some(target))
+}
+
+/// A closed source has no page attributes: its stored provider must identify the target agent
+/// before its profile can be inherited. Missing or foreign providers carry no profile.
+fn carried_stored_profile(loaded: &LoadedThread, target: Driver) -> Option<String> {
+    carried_profile(
+        loaded
+            .provider
+            .as_ref()
+            .and_then(|p| Driver::from_key(&p.driver)),
+        loaded.attributes.profile_id.clone(),
+        target,
+    )
 }
 
 /// Whether a thread's profile ends with `event`, from its agent `driver`. `profile_runs` is the
@@ -6383,13 +6396,14 @@ impl AgentTerminalWindow {
                     crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
                 }),
             );
+            let profile_id = profile_id.or_else(|| carried_stored_profile(&loaded, driver));
             imp.create_chat_thread(NewThread {
                 dir,
                 model: settings.model,
                 effort: settings.effort,
                 mode: settings.mode,
                 handoff: Some((handoff, source)),
-                profile_id: profile_id.or(loaded.attributes.profile_id),
+                profile_id,
                 notice: Some(if compact {
                     CreationNotice::Compact(thread)
                 } else {
@@ -7575,7 +7589,7 @@ impl AgentTerminalWindow {
                 let ready = own.is_ready() && resolved.program.is_some();
                 let Some(provider) = provider.filter(|_| ready) else {
                     // Gone again while resolving, or the store failed: wait for the next change.
-                    if let Some(chat) = obj
+                    let parked = if let Some(chat) = obj
                         .imp()
                         .tabs
                         .borrow_mut()
@@ -7584,9 +7598,20 @@ impl AgentTerminalWindow {
                         .and_then(|t| t.chat.as_mut())
                     {
                         chat.starting = false;
-                        if !keep_switch && !read_ok {
+                        if !read_ok {
                             chat.pending_switch = None;
+                            None
+                        } else if !keep_switch {
+                            chat.pending_switch.take()
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
+                    if let Some((target, model, effort)) = parked {
+                        obj.imp()
+                            .switch_in_place_with(&thread, target, model, effort);
                     }
                     obj.imp().update_unavailable_banners();
                     return;
@@ -7639,6 +7664,94 @@ pub(super) mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_failed_custom_profile_does_not_strand_a_switch_while_its_driver_is_ready() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.SwitchFailedProfile")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        CHAT_RESTORED.with(|done| done.set(true));
+        let availability = AgentAvailability::shared();
+        for driver in Driver::ALL {
+            availability.set(driver, Availability::Missing);
+        }
+        let mut profile = crate::config::new_agent_profile(Driver::Claude);
+        profile.id = "unavailable-custom-claude".into();
+        profile.command = "/nonexistent/custom-claude".into();
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (profile.command.clone(), profile.env_file.clone()),
+                ResolvedAgent::default(),
+            )
+        });
+        window
+            .imp()
+            .config
+            .borrow_mut()
+            .profiles
+            .push(profile.clone());
+        let folder = tempfile::tempdir().unwrap();
+        window
+            .imp()
+            .create_chat_thread(NewThread {
+                dir: Some(folder.path().to_string_lossy().into_owned()),
+                profile_id: Some(profile.id.clone()),
+                ..NewThread::new(Driver::Claude)
+            })
+            .unwrap();
+        let thread = window.imp().current_thread().unwrap();
+        let built = || {
+            window
+                .imp()
+                .tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .any(|c| c.thread == thread && c.view.is_some() && !c.building && !c.starting)
+        };
+        assert!(crate::testutil::pump_until(&ctx, 5, built));
+        assert!(window.imp().slot_of(&thread).unwrap().get().is_none());
+        let before = app_store().list_threads(false).unwrap().len();
+        availability.set(
+            Driver::Claude,
+            Availability::Ready("/fixture/default-claude".into()),
+        );
+        window.imp().switch_in_place(&thread, Driver::Codex);
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .slot_of(&thread)
+            .unwrap()
+            .driver()
+            == Driver::Codex));
+        assert_eq!(app_store().list_threads(false).unwrap().len(), before);
+        assert_eq!(
+            load_provider(&app_store(), &thread)
+                .unwrap()
+                .unwrap()
+                .driver,
+            "codex"
+        );
+        assert_eq!(
+            app_store().thread_attributes(&thread).unwrap().profile_id,
+            None
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    #[test]
     fn switch_routes_serialize_builds_and_never_fork_missing_agents() {
         for own in [
             Availability::Detecting,
@@ -7648,9 +7761,7 @@ pub(super) mod tests {
         ] {
             for building in [false, true] {
                 assert_eq!(switch_route(true, building, &own), SwitchRoute::Live);
-                let expected = if building
-                    || matches!(own, Availability::Ready(_) | Availability::Detecting)
-                {
+                let expected = if building || matches!(own, Availability::Detecting) {
                     SwitchRoute::Park
                 } else {
                     SwitchRoute::Rebind
@@ -10314,6 +10425,71 @@ pub(super) mod tests {
         assert_eq!(carried_profile(None, work(), Driver::Claude), None);
         assert_eq!(
             carried_profile(Some(Driver::Claude), None, Driver::Claude),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unopened_source_carries_its_stored_profile_only_to_the_same_agent() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store.create_thread("/w", Some("source")).unwrap();
+        let provider = store
+            .add_provider_thread(&source, "claude", "source-model")
+            .unwrap();
+        store
+            .set_active_provider_thread(&source, &provider)
+            .unwrap();
+        store
+            .set_thread_profile(&source, Some("claude-work"))
+            .unwrap();
+        let loaded = load_thread(&store, &source, None).unwrap();
+        for (target, expected) in [(Driver::Claude, Some("claude-work")), (Driver::Codex, None)] {
+            let ids = NewThreadIds {
+                thread: store.new_id().unwrap(),
+                provider: store.new_id().unwrap(),
+            };
+            record_new_thread_as(
+                &store,
+                &ids,
+                &NewThreadSpec {
+                    attributes: agent_kit::store::ThreadAttributes {
+                        profile_id: carried_stored_profile(&loaded, target),
+                        ..Default::default()
+                    },
+                    ..NewThreadSpec::new("/w", target)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                store
+                    .thread_attributes(&ids.thread)
+                    .unwrap()
+                    .profile_id
+                    .as_deref(),
+                expected
+            );
+            assert_eq!(
+                load_provider(&store, &ids.thread).unwrap().unwrap().driver,
+                driver_key(target)
+            );
+        }
+        assert_eq!(
+            store
+                .thread_attributes(&source)
+                .unwrap()
+                .profile_id
+                .as_deref(),
+            Some("claude-work")
+        );
+        let unbound = store.create_thread("/w", Some("no provider")).unwrap();
+        store
+            .set_thread_profile(&unbound, Some("claude-work"))
+            .unwrap();
+        assert_eq!(
+            carried_stored_profile(
+                &load_thread(&store, &unbound, None).unwrap(),
+                Driver::Claude
+            ),
             None
         );
     }
