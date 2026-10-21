@@ -80,6 +80,15 @@ pub(crate) fn shutdown_all() -> Vec<seam::ChildStop> {
     supervisor().map(|s| s.shutdown()).unwrap_or_default()
 }
 
+/// Runs the main context until the revocations `shutdown_all` started are committed, at most
+/// `wait`. They are futures on this context: without this they would only run in GLib's flush
+/// after `shutdown`, once the store writer has closed, and be refused.
+pub(crate) fn settle_shutdown(wait: std::time::Duration) {
+    if let Some(sup) = supervisor() {
+        sup.settle_revokes(wait);
+    }
+}
+
 /// Removes the socket and the overlays of exited generations. Idempotent.
 pub(crate) fn final_cleanup() {
     SUPERVISOR.with(|s| {
