@@ -260,6 +260,9 @@ struct Inner {
     /// The pending handoff went out with the prompt now running: not sent again unless that turn
     /// ends without completing.
     handoff_in_flight: Cell<bool>,
+    /// The agent produced something since the prompt carrying the handoff went out: the next
+    /// completed turn is the one that carried it ([`handoff_turn_end`]).
+    handoff_answered: Cell<bool>,
     /// The agent a switch left, until the new one reports a session (see [`Previous`]).
     rollback: RefCell<Option<Previous>>,
     /// The thread's model was retired by its agent: the next prompt first moves to this one.
@@ -710,6 +713,7 @@ impl ChatSession {
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
             handoff_in_flight: Cell::new(false),
+            handoff_answered: Cell::new(false),
             rollback: RefCell::new(None),
             retired: RefCell::new(None),
             selected: RefCell::new(selected),
@@ -1074,13 +1078,25 @@ impl Inner {
                 }
                 // Codex's turn-scoped permission grants ended with the turn.
                 self.codex_turn_grant_paths.borrow_mut().clear();
-                // A completed turn is the proof the new agent read the handoff it carried; any
-                // other end (failed, interrupted, the process died) leaves it for the next prompt.
-                if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
-                    // Stored as delivered (a handoff carrying nothing withdraws it), so a reopen
-                    // never re-arms what this turn carried.
-                    if self.pending_handoff.borrow_mut().take().is_some() {
-                        self.emit(handoff_spent());
+                // A completed turn that answered is the proof the new agent read the handoff it
+                // carried. A completed turn with no answer since the prompt went out is not the
+                // one that carried it (Claude's prompt-less init turn, completing before the
+                // prompt sent early is read): it stays in flight for the turn that does. Any other
+                // end (failed, interrupted, the process died) leaves it for the next prompt.
+                match handoff_turn_end(
+                    self.handoff_in_flight.get(),
+                    self.handoff_answered.get(),
+                    *state,
+                ) {
+                    HandoffTurnEnd::NotCarried | HandoffTurnEnd::StillInFlight => {}
+                    HandoffTurnEnd::Undelivered => self.handoff_in_flight.set(false),
+                    HandoffTurnEnd::Delivered => {
+                        self.handoff_in_flight.set(false);
+                        // Stored as delivered (a handoff carrying nothing withdraws it), so a
+                        // reopen never re-arms what this turn carried.
+                        if self.pending_handoff.borrow_mut().take().is_some() {
+                            self.emit(handoff_spent());
+                        }
                     }
                 }
                 if *state == TurnState::Completed {
@@ -1093,6 +1109,9 @@ impl Inner {
             // The agent produced an item: Codex has recorded the turn, so the thread can be
             // resumed even if this turn never completes (2.5).
             Event::ItemStarted { kind, .. } if *kind != ItemKind::UserMessage => {
+                if self.handoff_in_flight.get() {
+                    self.handoff_answered.set(true);
+                }
                 self.confirm_provisional_native();
             }
             Event::ModelChanged { model } => {
@@ -3190,6 +3209,8 @@ impl Inner {
         }
         if accepted && handoff.is_some() {
             self.handoff_in_flight.set(true);
+            // Nothing has answered it yet: only an answer marks the turn that carried it.
+            self.handoff_answered.set(false);
         }
         accepted
     }
@@ -4870,6 +4891,31 @@ pub(crate) fn undelivered_handoff<'a>(
     pending
 }
 
+/// What a turn ending means for the handoff a prompt carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffTurnEnd {
+    /// No handoff was in flight.
+    NotCarried,
+    /// Completed with no answer since the prompt went out: not the turn that carried it (Claude's
+    /// prompt-less init turn). Still in flight, never acknowledged.
+    StillInFlight,
+    /// Failed or interrupted: the next prompt carries it again.
+    Undelivered,
+    /// Completed after an answer: the agent had it. Acknowledged ([`handoff_spent`]).
+    Delivered,
+}
+
+/// [`HandoffTurnEnd`] for a turn ending in `state`, with a handoff `in_flight` and `answered` or
+/// not since its prompt went out.
+fn handoff_turn_end(in_flight: bool, answered: bool, state: TurnState) -> HandoffTurnEnd {
+    match (in_flight, state, answered) {
+        (false, _, _) => HandoffTurnEnd::NotCarried,
+        (true, TurnState::Completed, true) => HandoffTurnEnd::Delivered,
+        (true, TurnState::Completed, false) => HandoffTurnEnd::StillInFlight,
+        (true, _, _) => HandoffTurnEnd::Undelivered,
+    }
+}
+
 /// The stored `HandoffSeeded` for `handoff`: spent only by its acknowledgement
 /// ([`handoff_spent`]).
 fn handoff_seeded(handoff: &Handoff) -> Envelope {
@@ -5374,6 +5420,20 @@ mod tests {
         )
     }
 
+    /// [`idle_claude`] that answers each prompt with a line of text before its result.
+    fn answering_claude(dir: &Path) -> OpenSession {
+        scripted(
+            dir,
+            "IFS= read -r handshake\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
+             case \"$line\" in *'\"type\":\"user\"'*) \
+             echo '{\"type\":\"assistant\",\"uuid\":\"u1\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'; \
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
+        )
+    }
+
     /// Idle suspension stops the agent process without a word to the view or the store, and
     /// the next prompt starts it again resuming the same native session.
     #[test]
@@ -5601,7 +5661,7 @@ mod tests {
                 let (sink, _seen) = make_sink();
                 let session = ChatSession::new(
                     Box::new(agent_core::claude::ClaudeAdapter::new()),
-                    idle_claude(tmp.path()),
+                    answering_claude(tmp.path()),
                     store.clone(),
                     thread.clone(),
                     sink,
@@ -5652,6 +5712,106 @@ mod tests {
                 "the delivery was not stored"
             );
         });
+    }
+
+    /// A prompt carrying the handoff is sent before Claude's init; the prompt-less init turn
+    /// completes, then Claude exits before answering the prompt. That init turn is not the one
+    /// that carried the handoff: nothing is acknowledged, and a reopen still owes it.
+    #[test]
+    fn an_init_turn_completing_before_the_prompted_one_does_not_spend_the_handoff() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let handoff = Handoff {
+                summary: "earlier context".into(),
+                fence: "0123456789abcdef0123456789abcdef".into(),
+                carried: 2,
+                total: 3,
+            };
+            for env in seeded_handoff_events(&handoff, "“source”") {
+                store.append_event(&thread, None, &env).expect("stored");
+            }
+            let history = || -> Vec<Envelope> {
+                store
+                    .events(&thread, None, 1000)
+                    .expect("events")
+                    .into_iter()
+                    .map(|(_, e)| e)
+                    .collect()
+            };
+            // Takes the early prompt, completes its prompt-less init turn, and dies before
+            // answering the prompt.
+            let open = scripted(
+                tmp.path(),
+                "IFS= read -r handshake\n\
+                 IFS= read -r line\n\
+                 printf '%s\\n' \"$line\" >> \"$D/prompts.log\"\n\
+                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
+                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                 exit 0",
+            );
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                open,
+                store.clone(),
+                thread.clone(),
+                sink,
+                None,
+            );
+            session.restore_handoff(undelivered_handoff(&history()).expect("owed"));
+            session.send_prompt("first");
+            assert!(
+                pump_until(ctx, 10, || has(&seen, |e| matches!(
+                    e,
+                    Event::TurnCompleted {
+                        state: TurnState::Completed,
+                        ..
+                    }
+                )) && !session.status().alive),
+                "the init turn never completed, or the agent never exited"
+            );
+            assert!(lines(tmp.path().join("prompts.log"))
+                .iter()
+                .any(|l| l.contains("earlier context")));
+            assert!(
+                !history()
+                    .iter()
+                    .any(|e| matches!(e.event, Event::HandoffSeeded { carried: 0, .. })),
+                "the init turn is not the one that carried it"
+            );
+            assert_eq!(
+                undelivered_handoff(&history()),
+                Some(handoff),
+                "a reopen still owes it"
+            );
+        });
+    }
+
+    #[test]
+    fn a_turn_spends_the_handoff_only_once_it_answered() {
+        use HandoffTurnEnd as E;
+        assert_eq!(
+            handoff_turn_end(false, true, TurnState::Completed),
+            E::NotCarried
+        );
+        assert_eq!(
+            handoff_turn_end(true, false, TurnState::Completed),
+            E::StillInFlight
+        );
+        assert_eq!(
+            handoff_turn_end(true, true, TurnState::Completed),
+            E::Delivered
+        );
+        assert_eq!(
+            handoff_turn_end(true, true, TurnState::Interrupted),
+            E::Undelivered
+        );
+        assert_eq!(
+            handoff_turn_end(true, false, TurnState::Failed),
+            E::Undelivered
+        );
     }
 
     #[test]
@@ -6998,7 +7158,23 @@ mod tests {
                 sent[4]
             );
 
-            // A completed turn spends it, in the session and in the store.
+            // A completed turn with no answer is not the one that carried it (Claude's
+            // prompt-less init turn): still owed.
+            turn_ends(TurnState::Completed);
+            assert!(
+                stored(&store).is_some(),
+                "an unanswered turn spends nothing"
+            );
+            // A completed turn that answered spends it, in the session and in the store.
+            session.inner.emit(
+                Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::AssistantMessage,
+                    title: String::new(),
+                    input: None,
+                    parent: None,
+                })
+                .item("answer"),
+            );
             turn_ends(TurnState::Completed);
             session.send_prompt("thanks");
             assert_eq!(prompts(&log_claude)[5], "thanks");
