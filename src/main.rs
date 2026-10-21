@@ -235,6 +235,7 @@ fn main() -> glib::ExitCode {
         let started = std::time::Instant::now();
         diff_tool::remove_own();
         let _ = delegation::shutdown_all();
+        delegation::settle_shutdown(std::time::Duration::from_secs(3));
         delegation::final_cleanup();
         agent_proc::terminate_all();
         tracing::debug!(

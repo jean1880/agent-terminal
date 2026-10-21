@@ -1533,6 +1533,47 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// The app's `shutdown` handler runs outside any future, and the store writer closes right
+    /// after it: the shutdown revocation must be committed before then, not left to GLib's flush.
+    #[test]
+    fn shutdown_revocations_commit_before_the_store_writer_closes() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let (_dir, sup, root) = context.block_on(async {
+                    let (dir, sup, root) = harness();
+                    let receipt = sup
+                        .spawn_worker(&root, spawn_request("shutdown"))
+                        .await
+                        .unwrap();
+                    let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+                    pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+                    (dir, sup, root)
+                });
+                let row = sup.state.borrow().roots[&root].row.clone();
+                let stops = sup.shutdown();
+                assert!(sup.state.borrow().revokes_in_flight > 0, "committed later");
+                sup.settle_revokes(Duration::from_secs(10));
+                assert_eq!(sup.state.borrow().revokes_in_flight, 0);
+                let stored = sup
+                    .services
+                    .handle
+                    .reader()
+                    .delegation_root(&row.id)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    stored.authority_epoch > row.authority_epoch,
+                    "the AppShutdown revocation reached the store"
+                );
+                context.block_on(async {
+                    for stop in stops {
+                        super::super::capacity::wait_exit(&stop.watch).await;
+                    }
+                });
+            })
+            .expect("main context");
+    }
     #[test]
     fn production_start_reconciles_crash_without_replaying_or_signalling_old_process() {
         const MARKER: &str = "AGENT_TERMINAL_RESTART_FIXTURE";
@@ -2062,6 +2103,9 @@ pub(super) struct Runtime {
     pub waits: HashMap<(ConnId, u64), WorkerId>,
     pub subscribers: Vec<(String, Weak<dyn WorkerSubscriber>)>,
     pub shutting_down: bool,
+    /// `commit_revoke` futures not yet finished. Quitting waits for them before the store
+    /// writer closes, so the shutdown revocation is saved rather than refused.
+    pub revokes_in_flight: usize,
     pub deferred: HashMap<WorkerId, std::collections::VecDeque<super::deferred::Delivery>>,
     pub controls: HashMap<String, super::deferred::Delivery>,
     pub child_specs: HashMap<WorkerId, super::child::ChildSpec>,
@@ -3054,11 +3098,39 @@ impl Supervisor {
             .map_or(0, |r| r.revision);
         let sup = self.clone();
         let root = root.clone();
+        self.state.borrow_mut().revokes_in_flight += 1;
         glib::spawn_future_local(async move {
-            if let Err(e) = sup.commit_revoke(&root, event, revision).await {
+            let committed = sup.commit_revoke(&root, event, revision).await;
+            sup.state.borrow_mut().revokes_in_flight -= 1;
+            if let Err(e) = committed {
                 (sup.services.report)(&e.to_string());
             }
         });
+    }
+    /// Iterates this thread's main context until no revocation is being committed, at most
+    /// `wait`. Called outside any future on that context (the app's `shutdown` handler).
+    pub(crate) fn settle_revokes(&self, wait: std::time::Duration) {
+        let context = glib::MainContext::ref_thread_default();
+        let deadline = Instant::now() + wait;
+        while self.state.borrow().revokes_in_flight > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                tracing::warn!(
+                    left = self.state.borrow().revokes_in_flight,
+                    "shutdown: delegation revocations did not commit in time"
+                );
+                return;
+            };
+            // A wake-up so a blocking iteration never outlives the deadline.
+            let tick = glib::timeout_source_new(
+                left.min(std::time::Duration::from_millis(50)),
+                None,
+                glib::Priority::DEFAULT,
+                || glib::ControlFlow::Break,
+            );
+            tick.attach(Some(&context));
+            context.iteration(true);
+            tick.destroy();
+        }
     }
     pub(super) fn latch_revoke(&self, root: &WorkerId, event: &RevocationEvent) {
         if matches!(
