@@ -605,8 +605,9 @@ impl Header {
         })
     }
 
-    /// Shows what the thread is doing: the main agent working, only background work left (its
-    /// spinner in the background colour), finished, or nothing.
+    /// Shows what the thread is doing: its agent starting, resuming or paused, the main agent
+    /// working, only background work left (its spinner in the background colour), finished, or
+    /// nothing.
     pub fn set_activity(&self, activity: &Activity) {
         if *self.shown.borrow() == *activity {
             return;
@@ -631,6 +632,7 @@ impl Header {
         for (class, on) in [
             ("activity-background", waiting),
             ("activity-finished", finished),
+            ("activity-paused", *activity == Activity::Paused),
         ] {
             if on {
                 self.activity.add_css_class(class);

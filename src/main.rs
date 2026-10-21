@@ -595,6 +595,15 @@ fn load_css() {
         .thread-background { color: @at_info; }
         .thread-badge.badge-limited { color: @at_danger; }
         .thread-badge.badge-unread { color: @at_accent; }
+        /* The agent starting; a quiet colour, so it never reads as work running. */
+        .thread-starting { color: @at_fg_soft; }
+        /* The agent paused to save memory: a state, not an alert. */
+        .thread-paused {
+            color: @at_fg_soft;
+            border: 1px solid alpha(@at_fg_soft, 0.4);
+            border-radius: 6px;
+            padding: 0 5px;
+        }
         .thread-close, .thread-delete {
             min-width: 20px;
             min-height: 20px;

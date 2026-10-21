@@ -222,6 +222,9 @@ pub(crate) struct Inner {
     file_seq: Cell<u64>,
     /// The folder's file list, reused for a few seconds between keystrokes.
     file_index: RefCell<workspace_files::Index>,
+    /// The agent process's [`crate::chat::Lifecycle`] as the header last showed it: an envelope
+    /// that moves it (the agent answering, exiting) refreshes the header.
+    shown_lifecycle: Cell<crate::chat::Lifecycle>,
 }
 
 impl ChatView {
@@ -304,6 +307,7 @@ impl ChatView {
                 workspace: RefCell::new(None),
                 file_seq: Cell::new(0),
                 file_index: RefCell::new(workspace_files::Index::default()),
+                shown_lifecycle: Cell::new(crate::chat::Lifecycle::default()),
             }
         });
 
@@ -624,19 +628,22 @@ impl Inner {
         if matches!(env.event, Event::TurnCompleted { .. }) && polls_context(driver) {
             self.poll_context_soon();
         }
-        // Phase changes are discrete events: never walk the transcript for each text delta.
-        if matches!(
-            env.event,
-            Event::ItemStarted { .. }
-                | Event::ItemCompleted { .. }
-                | Event::ApprovalRequested { .. }
-                | Event::ApprovalResolved { .. }
-                | Event::ApprovalExpired
-                | Event::QuestionRequested { .. }
-                | Event::QuestionResolved { .. }
-                | Event::FormRequested { .. }
-                | Event::FormResolved { .. }
-        ) {
+        // Phase changes are discrete events: never walk the transcript for each text delta. The
+        // agent's first answer (or its exit) ends its "Starting…" or "Resuming…".
+        if self.backend.lifecycle() != self.shown_lifecycle.get()
+            || matches!(
+                env.event,
+                Event::ItemStarted { .. }
+                    | Event::ItemCompleted { .. }
+                    | Event::ApprovalRequested { .. }
+                    | Event::ApprovalResolved { .. }
+                    | Event::ApprovalExpired
+                    | Event::QuestionRequested { .. }
+                    | Event::QuestionResolved { .. }
+                    | Event::FormRequested { .. }
+                    | Event::FormResolved { .. }
+            )
+        {
             self.refresh_status();
         }
     }
@@ -1000,7 +1007,12 @@ impl Inner {
         let running = status.running_turn || self.model.borrow().running;
         // The header counts background work too; the stop button follows the main turn only.
         let activity = self.model.borrow().activity(running);
-        self.header.set_activity(&activity);
+        // The agent's own start, resume or pause shows in the header only: the strip by the
+        // composer keeps the turn's own activity.
+        let lifecycle = self.backend.lifecycle();
+        self.shown_lifecycle.set(lifecycle);
+        self.header
+            .set_activity(&activity.clone().with_lifecycle(lifecycle));
         let stop_note = status.capabilities.unsupported_note(
             agent_core::caps::Feature::InterruptKeepsProcess,
             cards::driver_name(status.driver),
@@ -1427,6 +1439,10 @@ impl ComposerHost for Inner {
             self.backend.queue_prompt(text);
         } else {
             self.backend.send_prompt(text);
+        }
+        // A paused agent starts again for this message: the header says "Resuming…" at once.
+        if let Some(me) = self.view().and_then(|v| v.inner()) {
+            me.refresh_status();
         }
     }
 

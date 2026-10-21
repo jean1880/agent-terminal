@@ -101,10 +101,30 @@ pub trait ChatBackend {
     fn control(&self, control: Control) -> String;
     /// Current agent, model, mode and capabilities for the header and typeahead.
     fn status(&self) -> SessionStatus;
+    /// Where the agent process is in its life (starting, resuming, paused), for the header. A
+    /// backend with no process to start says nothing.
+    fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::default()
+    }
     /// Pops the most recent queued user prompt if sitting in queue, returning (item_id, prompt_text).
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
         None
     }
+}
+
+/// Where a thread's agent process is in its life. Presentation only: the header's "Starting…",
+/// "Resuming…" and "Paused" and the sidebar's `ThreadActivity` are read from it; nothing
+/// decides on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lifecycle {
+    /// A process is running or starting.
+    pub alive: bool,
+    /// The process is starting and has not answered yet.
+    pub starting: bool,
+    /// That start resumes an agent paused to save memory.
+    pub resuming: bool,
+    /// The agent is paused to save memory; the next prompt resumes it.
+    pub suspended: bool,
 }
 
 /// Actions originating in a supervised worker inspector. Native request ids are recovered

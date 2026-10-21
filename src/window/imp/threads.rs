@@ -43,6 +43,9 @@ use crate::window::sidebar_model::{
     sidebar_sections, stop_heading, stored_model, thread_title, turn_finishes_thread, Attention,
     Badge, FolderGroup, OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
+use crate::window::sidebar_model::{
+    reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
+};
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
 /// `remove` refuses it, so walking `first_child` would never end.
@@ -699,6 +702,18 @@ impl ChatTab {
             || self.pending_switch.is_some()
     }
 
+    /// Where this thread's agent process is, for its sidebar row ([`thread_activity`]): the page
+    /// being built or its session started count as starting.
+    fn activity(&self) -> Option<ThreadActivity> {
+        let life = self.slot.get().map(|s| s.lifecycle()).unwrap_or_default();
+        thread_activity(
+            self.building || self.starting,
+            life.alive,
+            life.starting,
+            life.suspended,
+        )
+    }
+
     pub(super) fn reset_transfer_preparation(&mut self) {
         if self.view.is_none() {
             self.building = false;
@@ -912,6 +927,9 @@ impl ChatBackend for SessionSlot {
             },
         }
     }
+    fn lifecycle(&self) -> crate::chat::Lifecycle {
+        self.get().map(|s| s.lifecycle()).unwrap_or_default()
+    }
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
         self.get().and_then(|s| s.pop_queued_prompt())
     }
@@ -954,6 +972,28 @@ thread_local! {
     /// and offers no Undo ([`AgentTerminalWindow::close_row_without_discard`]).
     static NO_DISCARD: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
+    /// The last session's open threads, as `restore_open_threads` read them before any page
+    /// opened, while the empty state offers to reopen them. `None` once reopened or when there
+    /// is nothing to offer.
+    static LAST_SESSION: RefCell<Option<LastSession>> = const { RefCell::new(None) };
+}
+
+/// The open-thread layout the last session left, and how many of its threads still exist.
+struct LastSession {
+    /// The stored layout ([`OPEN_THREADS_KEY`]), as read before this run recorded its own.
+    saved: String,
+    /// Its threads that still existed when it was read ([`restorable`]).
+    count: usize,
+}
+
+/// How many threads of the stored layout `saved` could be reopened against the stored thread
+/// ids `known` (archived and deleted ones drop out): what the empty state's offer counts.
+fn last_session_count(saved: Option<&str>, known: &[String]) -> usize {
+    saved
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .map_or(0, |value| {
+            restorable(&value, known, crate::config::SessionState::MAX_TABS).len()
+        })
 }
 
 /// The app's one thread store, opened on first use. A store that cannot be opened falls back
@@ -1557,13 +1597,13 @@ const RECENT_SESSIONS: usize = 20;
 
 /// Gives each recent native session a thread, unless one already holds it or the user deleted
 /// that thread. The thread is dated with the session's time and titled after it; its history is
-/// imported when it is first opened ([`load_thread`]). Returns how many were added.
+/// imported when it is first opened ([`load_thread`]). Returns the agent of each one added.
 fn link_recent_sessions(
     store: &Store,
     sessions: &[agent_kit::native::NativeSession],
     fallback_cwd: &str,
-) -> usize {
-    let mut added = 0;
+) -> Vec<Driver> {
+    let mut added = Vec::new();
     for s in sessions {
         let key = driver_key(s.driver);
         let known = store
@@ -1583,7 +1623,7 @@ fn link_recent_sessions(
             &s.native_id,
         );
         match made {
-            Ok(_) => added += 1,
+            Ok(_) => added.push(s.driver),
             Err(e) => warn!("Cannot list a {} session: {e}", driver_label(s.driver)),
         }
     }
@@ -2454,7 +2494,8 @@ impl AgentTerminalWindow {
 
     /// Stops the agent of every thread here that has been out of sight and idle for
     /// `idle_suspend_minutes`, to free its memory (hundreds of MB each). Its conversation
-    /// resumes with the next prompt; nothing changes on its page.
+    /// resumes with the next prompt. Nothing is stored or added to its transcript; its row says
+    /// "Paused" and its header "Paused: resumes when you send".
     pub(super) fn suspend_idle_threads(&self) {
         let minutes = self.config.borrow().idle_suspend_minutes;
         if minutes == 0 || self.is_closing() {
@@ -2463,7 +2504,8 @@ impl AgentTerminalWindow {
         let shown = self.shown_thread.borrow().clone();
         let now = std::time::Instant::now();
         // Collected first: a session stopping must not find the registry borrowed.
-        let due: Vec<(String, Rc<ChatSession>)> = self
+        type Due = (String, Rc<ChatSession>, Option<ChatView>);
+        let due: Vec<Due> = self
             .tabs
             .borrow()
             .iter()
@@ -2476,12 +2518,21 @@ impl AgentTerminalWindow {
                     c.holds_suspension(),
                 )
             })
-            .filter_map(|c| c.slot.get().map(|s| (c.thread.clone(), s)))
+            .filter_map(|c| c.slot.get().map(|s| (c.thread.clone(), s, c.view.clone())))
             .collect();
-        for (thread, session) in due {
+        let mut paused = false;
+        for (thread, session, view) in due {
             if session.suspend_if_idle() {
                 info!("Stopped the idle agent of thread {thread} ({minutes} min out of sight); it resumes with the next prompt");
+                paused = true;
+                // The suspension is silent (no event reaches the view): its header is told.
+                if let Some(view) = view {
+                    view.refresh_status();
+                }
             }
+        }
+        if paused {
+            self.refresh_sidebar();
         }
     }
 
@@ -2588,7 +2639,7 @@ impl AgentTerminalWindow {
         let show = Button::builder()
             .label("Show Threads")
             .halign(Align::Center)
-            .tooltip_text("Show existing threads (F9, Ctrl+B)")
+            .tooltip_text("Show existing threads (F9, Ctrl+Shift+B)")
             .build();
         split
             .bind_property("show-sidebar", &show, "visible")
@@ -2611,8 +2662,74 @@ impl AgentTerminalWindow {
             }
         ));
         actions.append(&show);
+        // Shown once the last session's open threads are known, and only when there are some
+        // that "Reopen Last Thread" (off) did not reopen.
+        let reopen = Button::builder()
+            .halign(Align::Center)
+            .css_classes(["pill"])
+            .tooltip_text("Open the threads that were open when Agent Terminal last closed")
+            .visible(false)
+            .build();
+        reopen.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| obj.imp().reopen_last_session()
+        ));
+        actions.insert_child_after(&reopen, Some(&new));
+        *self.reopen_button.borrow_mut() = Some(reopen);
+        self.update_reopen_offer();
         page.set_child(Some(&actions));
         page.upcast()
+    }
+
+    /// Shows the empty state's reopen offer while the last session left threads to reopen
+    /// ([`LAST_SESSION`]), and hides it otherwise.
+    fn update_reopen_offer(&self) {
+        let Some(button) = self.reopen_button.borrow().clone() else {
+            return;
+        };
+        let offer = LAST_SESSION.with(|s| s.borrow().as_ref().and_then(|l| reopen_offer(l.count)));
+        match offer {
+            Some(label) => {
+                button.set_label(&label);
+                button.set_visible(true);
+            }
+            None => button.set_visible(false),
+        }
+    }
+
+    /// The empty state's "Reopen N threads from your last session": reopens the saved layout
+    /// (whatever "Reopen Last Thread" says) against the threads that still exist now, read off
+    /// the main thread. Offered once: the snapshot is spent.
+    fn reopen_last_session(&self) {
+        let Some(last) = LAST_SESSION.with(|s| s.borrow_mut().take()) else {
+            return;
+        };
+        self.for_each_window(|window| window.update_reopen_offer());
+        let obj = self.obj().downgrade();
+        let before = self.thread_pages();
+        glib::MainContext::default().spawn_local(async move {
+            let threads = store_job(|store| store.list_threads(false)).await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            match threads {
+                Some(Ok(threads)) => {
+                    if !imp.reopen_saved(Some(last.saved), threads, before, true) {
+                        imp.show_toast("Those threads are no longer in the list");
+                    }
+                }
+                failed => {
+                    if let Some(Err(e)) = failed {
+                        warn!("Cannot list threads to reopen: {e}");
+                    }
+                    // Nothing was reopened: the offer stands.
+                    LAST_SESSION.with(|s| *s.borrow_mut() = Some(last));
+                    imp.for_each_window(|window| window.update_reopen_offer());
+                    imp.show_toast("Could not read the thread list. Try again.");
+                }
+            }
+            imp.settle_pages();
+        });
     }
 
     fn build_sidebar(&self) -> Rc<Sidebar> {
@@ -2790,6 +2907,7 @@ impl AgentTerminalWindow {
                         .map(|c| c.driver)
                         .or_else(|| s.driver.as_deref().and_then(parse_driver)),
                     badge,
+                    activity: chat.and_then(ChatTab::activity),
                     background: chat
                         .map(|c| {
                             c.background
@@ -2821,6 +2939,7 @@ impl AgentTerminalWindow {
                     .unwrap_or(0),
                 driver: None,
                 badge: tab.page.needs_attention().then_some(Badge::Unread),
+                activity: None,
                 background: Vec::new(),
                 open: OpenState::Here,
                 archived: false,
@@ -3308,6 +3427,27 @@ impl AgentTerminalWindow {
                 .build();
             line.append(&mark);
         }
+        let spins = row
+            .badge
+            .is_some_and(|b| matches!(b, Badge::Running | Badge::Background));
+        match row.activity {
+            // The agent is starting: the row spins, unless its badge already does.
+            Some(ThreadActivity::Starting) if !spins => {
+                let spinner = gtk4::Spinner::builder().spinning(true).build();
+                spinner.add_css_class("thread-starting");
+                spinner.set_tooltip_text(Some(ThreadActivity::Starting.tooltip()));
+                line.append(&spinner);
+            }
+            Some(ThreadActivity::Paused) => {
+                let paused = Label::builder()
+                    .label("Paused")
+                    .css_classes(["thread-paused", "caption"])
+                    .tooltip_text(ThreadActivity::Paused.tooltip())
+                    .build();
+                line.append(&paused);
+            }
+            _ => {}
+        }
         if let Some(badge) = row.badge {
             // Spinning means not finished: the main agent working, or background work (sub-agents,
             // background commands) it is still waiting on, which spins in its own colour.
@@ -3365,10 +3505,16 @@ impl AgentTerminalWindow {
             line.append(&close);
         }
         let widget = gtk4::ListBoxRow::builder().child(&line).build();
-        let state = row
+        let mut state = row
             .badge
             .map(|b| row_tooltip(b, &row.background))
             .unwrap_or_else(|| row.open.description().to_owned());
+        if let Some(activity) = row
+            .activity
+            .filter(|a| matches!(a, ThreadActivity::Starting | ThreadActivity::Paused))
+        {
+            state = format!("{state}, {}", activity.tooltip());
+        }
         widget.update_property(&[
             gtk4::accessible::Property::Label(&row.title),
             gtk4::accessible::Property::Description(&format!("{}, {state}", row.folder)),
@@ -3981,7 +4127,16 @@ impl AgentTerminalWindow {
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             if let Some((saved, threads)) = loaded {
-                imp.reopen_saved(saved, threads, before);
+                // With "Reopen Last Thread" off, the empty state offers what it would reopen.
+                if !imp.config.borrow().reopen_last_thread {
+                    let known: Vec<String> = threads.iter().map(|s| s.id.clone()).collect();
+                    let count = last_session_count(saved.as_deref(), &known);
+                    if let Some(saved) = saved.clone().filter(|_| count > 0) {
+                        LAST_SESSION.with(|s| *s.borrow_mut() = Some(LastSession { saved, count }));
+                    }
+                    imp.for_each_window(|window| window.update_reopen_offer());
+                }
+                imp.reopen_saved(saved, threads, before, false);
             }
             // Whatever reopened (or nothing did): the loading skeleton gives way.
             imp.restoring_threads.set(false);
@@ -3999,49 +4154,59 @@ impl AgentTerminalWindow {
     }
 
     /// Reopens the saved open-thread list `saved` against the stored `threads`. `before` is how
-    /// many thread pages were open when the restore began.
+    /// many thread pages were open when the restore began. `asked`: the user asked for it (the
+    /// empty state's offer), so "Reopen Last Thread" being off does not stop it. Whether any
+    /// thread was reopened.
     fn reopen_saved(
         &self,
         saved: Option<String>,
         threads: Vec<agent_kit::store::ThreadSummary>,
         before: usize,
-    ) {
+        asked: bool,
+    ) -> bool {
         // Off (the default), the window starts on no thread; the list is still recorded, so
         // turning it on later picks up where the last run left off.
-        if !self.config.borrow().reopen_last_thread {
-            return;
+        if !asked && !self.config.borrow().reopen_last_thread {
+            return false;
         }
         let Some(value) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         else {
-            return;
+            return false;
         };
         let known: Vec<String> = threads.into_iter().map(|s| s.id).collect();
         let open = restorable(&value, &known, crate::config::SessionState::MAX_TABS);
         if open.is_empty() {
-            return;
+            return false;
         }
         // Something else put in view since the restore began (a resume, a thread the user
         // opened) stays there. The 2.x terminal pages, which reopen once detection is done,
-        // do not count: the saved thread is shown over them, as it always was.
-        let others_in_view = self.resume_opened.get() || self.thread_pages() > before;
+        // do not count: the saved thread is shown over them, as it always was. Asked for, the
+        // reopened selection is what the user wants to see.
+        let others_in_view = !asked && (self.resume_opened.get() || self.thread_pages() > before);
         info!("Reopening {} thread(s) from the last session", open.len());
         for id in &open {
             self.open_thread(id, false);
         }
         if others_in_view {
-            return;
+            return true;
         }
         if let Some(id) = selected_to_restore(&value, &open) {
-            if self.open_thread(&id, true).is_some() {
+            if self.open_thread(&id, true).is_some() && !asked {
                 self.thread_selected_by_restore.set(true);
             }
         }
+        true
     }
 
     /// Lists the agents' own recent sessions (Claude Code and agy, newest [`RECENT_SESSIONS`])
-    /// as threads in the sidebar, once per run. The scan reads only file metadata and the tail
-    /// of each transcript, off the main thread; a session's history is imported when opened.
+    /// as threads in the sidebar: once per run at startup, and when "Show Sessions Started
+    /// Outside Agent Terminal" is turned on. The scan reads only file metadata and the tail of
+    /// each transcript, off the main thread; a session's history is imported when opened. Any
+    /// added are announced with a toast. With the setting off, nothing is scanned.
     fn list_recent_sessions(&self) {
+        if !self.config.borrow().list_outside_sessions {
+            return;
+        }
         // Tests never read the real home's agent histories (`link_recent_sessions` is tested on
         // its own).
         // Nor does the memory-only fallback store: its jobs run in place on the main thread,
@@ -4070,15 +4235,30 @@ impl AgentTerminalWindow {
             })
             .await
             .and_then(Result::ok)
-            .unwrap_or(0);
-            if added > 0 {
-                info!("Listed {added} recent agent session(s) as threads");
+            .unwrap_or_default();
+            if let Some(toast) = sessions_added_toast(&added) {
+                info!("Listed {} recent agent session(s) as threads", added.len());
                 // New rows in the store: the list loaded meanwhile does not have them.
                 if let Some(obj) = obj.upgrade() {
-                    obj.imp().reload_summaries();
+                    let imp = obj.imp();
+                    imp.reload_summaries();
+                    imp.show_toast(&toast);
                 }
             }
         });
+    }
+
+    /// Settings → Behaviour → "Show Sessions Started Outside Agent Terminal". Applies at once:
+    /// on, the scan runs now; off, it never runs (threads already listed stay).
+    pub(super) fn set_list_outside_sessions(&self, on: bool) {
+        if self.config.borrow().list_outside_sessions == on {
+            return;
+        }
+        self.config.borrow_mut().list_outside_sessions = on;
+        self.schedule_config_save();
+        if on {
+            self.list_recent_sessions();
+        }
     }
 
     /// Shows the thread's page, adding it if it is not open. `select` brings it into view (and
@@ -4420,6 +4600,8 @@ impl AgentTerminalWindow {
             (chat.thread.clone(), chat.driver, dir)
         };
         let (thread, driver, dir) = job;
+        // Its agent is on its way: the row spins.
+        self.refresh_sidebar();
         let obj = self.obj();
         let page = page.clone();
         let hook_clear = self.config.borrow().clear_env.clone();
@@ -4521,6 +4703,8 @@ impl AgentTerminalWindow {
                 loading::settle(&skeleton);
             }
         }
+        // Not starting any more: the row stops spinning.
+        self.refresh_sidebar();
         self.show_toast("Could not read this thread from the store. Select it again to retry.");
     }
 
@@ -4666,6 +4850,8 @@ impl AgentTerminalWindow {
                 }
             }
             self.update_unavailable_banners();
+            // Built, with no agent to start: the row stops spinning.
+            self.refresh_sidebar();
             if self
                 .tab_view
                 .borrow()
@@ -4945,6 +5131,27 @@ impl AgentTerminalWindow {
     // Live thread events
     // -----------------------------------------------------------------------------------------
 
+    /// Whether `thread`'s agent activity ([`ChatTab::activity`]) differs from what its drawn
+    /// sidebar row shows. A row not drawn (folded away, filtered out) is never outdated.
+    fn activity_outdated(&self, thread: &str) -> bool {
+        let now = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread)
+            .and_then(ChatTab::activity);
+        let Some(sidebar) = self.sidebar.borrow().clone() else {
+            return false;
+        };
+        let key = RowKey::Thread(thread.to_owned());
+        let drawn = sidebar.drawn.borrow();
+        drawn
+            .as_ref()
+            .and_then(|m| m.rows().find(|r| r.key == key))
+            .is_some_and(|r| r.activity != now)
+    }
+
     fn on_thread_envelope(&self, thread: &str, driver: Driver, env: &Envelope) {
         if matches!(env.event, Event::TurnCompleted { .. }) {
             if let Some(supervisor) = crate::delegation::supervisor() {
@@ -5176,6 +5383,12 @@ impl AgentTerminalWindow {
                 After::Nothing if switched => After::Sidebar,
                 other => other,
             }
+        };
+        // The agent reporting its session, or starting again for a message sent while it was
+        // paused, changes the row's activity with no event of its own.
+        let after = match after {
+            After::Nothing if self.activity_outdated(thread) => After::Sidebar,
+            other => other,
         };
         if withdraw_ask {
             if let Some(app) = self.obj().application() {
@@ -8353,7 +8566,11 @@ pub(super) mod tests {
             native(Driver::Claude, "c-new", Some("/w/new"), 2_000),
             native(Driver::Agy, "a-old", None, 1_000),
         ];
-        assert_eq!(link_recent_sessions(&store, &sessions, "/home/u"), 2);
+        assert_eq!(
+            link_recent_sessions(&store, &sessions, "/home/u"),
+            [Driver::Claude, Driver::Agy],
+            "each one added, by its agent (the toast names them)"
+        );
         let threads = store.list_threads(false).expect("list");
         let titles: Vec<_> = threads.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(
@@ -8374,10 +8591,10 @@ pub(super) mod tests {
         assert_eq!(pt.native_id.as_deref(), Some("c-new"));
 
         // A second scan adds nothing.
-        assert_eq!(link_recent_sessions(&store, &sessions, "/home/u"), 0);
+        assert!(link_recent_sessions(&store, &sessions, "/home/u").is_empty());
         // A deleted one stays gone.
         store.delete_thread(&threads[1].id).expect("delete");
-        assert_eq!(link_recent_sessions(&store, &sessions, "/home/u"), 0);
+        assert!(link_recent_sessions(&store, &sessions, "/home/u").is_empty());
         assert_eq!(store.list_threads(true).expect("list").len(), 1);
     }
 
@@ -9099,6 +9316,32 @@ pub(super) mod tests {
         assert_eq!(selected_to_restore(&saved, &open).as_deref(), Some("a"));
         assert!(restorable(&serde_json::json!({}), &known, 5).is_empty());
         assert_eq!(selected_to_restore(&serde_json::json!({}), &[]), None);
+    }
+
+    #[test]
+    fn the_reopen_offer_counts_the_last_sessions_threads_that_still_exist() {
+        let known: Vec<String> = ["a", "b", "c"].map(str::to_owned).to_vec();
+        // Every window's layout counts, each thread once; deleted or archived ones drop out.
+        let saved = serde_json::json!({
+            "windows": [{"open": ["a", "gone"]}, {"open": ["b", "a"]}],
+            "selected": "a"
+        })
+        .to_string();
+        assert_eq!(last_session_count(Some(&saved), &known), 2);
+        // The legacy single-window shape.
+        let legacy = serde_json::json!({"open": ["c"]}).to_string();
+        assert_eq!(last_session_count(Some(&legacy), &known), 1);
+        // Nothing saved, nothing readable, or nothing left: no offer.
+        assert_eq!(last_session_count(None, &known), 0);
+        assert_eq!(last_session_count(Some("not json"), &known), 0);
+        assert_eq!(last_session_count(Some(&saved), &[]), 0);
+        // Capped like the restore itself.
+        let many: Vec<String> = (0..50).map(|i| format!("t{i}")).collect();
+        let all = serde_json::json!({ "open": many }).to_string();
+        assert_eq!(
+            last_session_count(Some(&all), &many),
+            crate::config::SessionState::MAX_TABS
+        );
     }
 
     #[test]

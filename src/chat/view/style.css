@@ -93,6 +93,8 @@
 .activity.activity-background spinner,
 .activity.activity-background .activity-text { color: @at_info; }
 .activity.activity-finished .activity-text { color: alpha(@at_fg_dim, 0.7); }
+/* Paused to save memory: nothing is wrong, so the quiet colour, in italics to read as a state. */
+.activity.activity-paused .activity-text { color: @at_fg_soft; font-style: italic; }
 
 .usage-indicator { padding: 2px 8px; border-radius: 8px; }
 .usage-bar { min-height: 4px; }

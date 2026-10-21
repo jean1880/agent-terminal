@@ -484,9 +484,33 @@ pub enum Activity {
     },
     /// A turn ran, and neither it nor any background work is still going.
     Finished,
+    /// The agent process is starting and has not answered yet.
+    Starting,
+    /// The agent, paused to save memory, is starting again for the message just sent.
+    Resuming,
+    /// The agent is paused to save memory; the next message resumes it.
+    Paused,
 }
 
 impl Activity {
+    /// What the header shows given where the agent process is in its life: a start (or a
+    /// resume) in progress says so over anything else, since nothing the thread does can show
+    /// until the agent is up; a paused agent says so unless something still runs or waits.
+    pub fn with_lifecycle(self, lifecycle: crate::chat::Lifecycle) -> Self {
+        if lifecycle.starting {
+            return if lifecycle.resuming {
+                Self::Resuming
+            } else {
+                Self::Starting
+            };
+        }
+        let waits = matches!(self, Self::NeedsApproval | Self::NeedsAnswer);
+        if lifecycle.suspended && !self.busy() && !waits {
+            return Self::Paused;
+        }
+        self
+    }
+
     /// The thread's status from the main turn and the background task list. `ran`: a turn has
     /// run in this thread (so an idle one has finished rather than never started).
     pub fn of(main_running: bool, background: &[BackgroundTask], ran: bool) -> Self {
@@ -550,6 +574,9 @@ impl Activity {
                 Some(format!("Main agent done, waiting on {count}: {names}"))
             }
             Self::Finished => Some("Completed".to_owned()),
+            Self::Starting => Some("Starting…".to_owned()),
+            Self::Resuming => Some("Resuming…".to_owned()),
+            Self::Paused => Some("Paused: resumes when you send".to_owned()),
         }
     }
 
@@ -562,6 +589,8 @@ impl Activity {
                 | Self::Tool { .. }
                 | Self::WaitingForWorkers { .. }
                 | Self::Waiting { .. }
+                | Self::Starting
+                | Self::Resuming
         )
     }
 }
@@ -4307,6 +4336,56 @@ mod tests {
             ..task
         };
         assert_eq!(task_name(&leading), "Map the crate");
+    }
+
+    #[test]
+    fn the_header_says_when_the_agent_starts_resumes_or_is_paused() {
+        use crate::chat::Lifecycle;
+        let starting = Lifecycle {
+            alive: true,
+            starting: true,
+            ..Lifecycle::default()
+        };
+        let resuming = Lifecycle {
+            resuming: true,
+            ..starting
+        };
+        let paused = Lifecycle {
+            suspended: true,
+            ..Lifecycle::default()
+        };
+        let up = Lifecycle {
+            alive: true,
+            ..Lifecycle::default()
+        };
+        let working = Activity::Working { background: 0 };
+        // A start or a resume says so over anything, even the turn the message just started.
+        assert_eq!(Activity::Idle.with_lifecycle(starting), Activity::Starting);
+        assert_eq!(working.clone().with_lifecycle(resuming), Activity::Resuming);
+        // Paused only says so when nothing runs or waits.
+        for quiet in [
+            Activity::Idle,
+            Activity::Finished,
+            Activity::Stopped,
+            Activity::Failed,
+        ] {
+            assert_eq!(quiet.with_lifecycle(paused), Activity::Paused);
+        }
+        assert_eq!(
+            Activity::NeedsApproval.with_lifecycle(paused),
+            Activity::NeedsApproval
+        );
+        assert_eq!(working.clone().with_lifecycle(paused), working);
+        // An agent that is up changes nothing.
+        assert_eq!(Activity::Finished.with_lifecycle(up), Activity::Finished);
+        assert_eq!(
+            Activity::Paused.text().as_deref(),
+            Some("Paused: resumes when you send")
+        );
+        assert_eq!(Activity::Starting.text().as_deref(), Some("Starting…"));
+        assert_eq!(Activity::Resuming.text().as_deref(), Some("Resuming…"));
+        assert!(Activity::Starting.busy() && Activity::Resuming.busy());
+        assert!(!Activity::Paused.busy(), "a paused agent does not spin");
     }
 
     #[test]

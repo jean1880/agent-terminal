@@ -127,6 +127,82 @@ pub fn busy_reason(running: bool, background: usize, approval: bool) -> Option<S
     Some(format!("{}.", reasons.join(". ")))
 }
 
+/// Where an open thread's agent process is, as the sidebar shows it. Presentation only, derived
+/// by [`thread_activity`] from state the window and session already hold; nothing decides on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadActivity {
+    /// The page is being built, or its agent is starting (or resuming) and has not reported its
+    /// session yet: the row spins.
+    Starting,
+    /// The agent is up.
+    Live,
+    /// The agent was stopped to save memory; the next message resumes it. The row says "Paused".
+    Paused,
+}
+
+impl ThreadActivity {
+    /// The row's words for it, if it shows any.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting the agent",
+            Self::Live => "Agent running",
+            Self::Paused => "Paused to save memory; resumes when you send",
+        }
+    }
+}
+
+/// The activity of a thread's agent. `preparing`: the window is building the page or starting
+/// its session; `alive`, `starting` and `suspended`: what the session says of its process (all
+/// false with no session). `None`: no agent to speak of (a closed or unbuilt page, an agent that
+/// is not installed, a process that exited).
+pub fn thread_activity(
+    preparing: bool,
+    alive: bool,
+    starting: bool,
+    suspended: bool,
+) -> Option<ThreadActivity> {
+    if suspended && !alive {
+        Some(ThreadActivity::Paused)
+    } else if preparing || (alive && starting) {
+        Some(ThreadActivity::Starting)
+    } else if alive {
+        Some(ThreadActivity::Live)
+    } else {
+        None
+    }
+}
+
+/// The empty state's offer to reopen the `n` threads open when the app last closed, or `None`
+/// when there are none to reopen.
+pub fn reopen_offer(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some("Reopen 1 thread from your last session".to_owned()),
+        n => Some(format!("Reopen {n} threads from your last session")),
+    }
+}
+
+/// The toast after the agents' own recent sessions were listed as threads: how many, and from
+/// which agents (each named once, in the order first met). `None` when none were added.
+pub fn sessions_added_toast(drivers: &[Driver]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    for d in drivers {
+        let name = driver_label(*d);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let agents = match names.as_slice() {
+        [] => return None,
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    Some(match drivers.len() {
+        1 => format!("Added 1 recent session from {agents}"),
+        n => format!("Added {n} recent sessions from {agents}"),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenState {
     Closed,
@@ -229,6 +305,8 @@ pub struct SidebarRow {
     /// `None`: a terminal page.
     pub driver: Option<Driver>,
     pub badge: Option<Badge>,
+    /// Where an open thread's agent process is ([`thread_activity`]); `None` for the rest.
+    pub activity: Option<ThreadActivity>,
     /// What runs in the background (sub-agents, background commands), for the row's tooltip.
     pub background: Vec<String>,
     /// Where the thread's page is open, if anywhere.
@@ -868,10 +946,92 @@ mod tests {
             updated_ms: 1_000,
             driver: None,
             badge,
+            activity: None,
             background: Vec::new(),
             open: OpenState::Here,
             archived: false,
         }
+    }
+
+    #[test]
+    fn a_threads_activity_follows_its_agent_process() {
+        use ThreadActivity::{Live, Paused, Starting};
+        // (preparing, alive, starting, suspended) -> activity
+        let table = [
+            ((false, false, false, false), None),
+            ((true, false, false, false), Some(Starting)),
+            ((false, true, true, false), Some(Starting)),
+            ((true, true, true, false), Some(Starting)),
+            ((false, true, false, false), Some(Live)),
+            // The window is still applying what waited for the session: not up yet.
+            ((true, true, false, false), Some(Starting)),
+            ((false, false, false, true), Some(Paused)),
+            // A resume clears the pause before it spawns: a live process is never paused.
+            ((false, true, true, true), Some(Starting)),
+            ((false, true, false, true), Some(Live)),
+            // An exited process with no pause behind it: nothing to show.
+            ((false, false, true, false), None),
+        ];
+        for ((preparing, alive, starting, suspended), want) in table {
+            assert_eq!(
+                thread_activity(preparing, alive, starting, suspended),
+                want,
+                "preparing {preparing}, alive {alive}, starting {starting}, suspended {suspended}"
+            );
+        }
+        assert!(Paused.tooltip().contains("resumes when you send"));
+    }
+
+    #[test]
+    fn the_empty_state_offers_a_reopen_only_when_there_is_something_to_reopen() {
+        assert_eq!(reopen_offer(0), None);
+        assert_eq!(
+            reopen_offer(1).as_deref(),
+            Some("Reopen 1 thread from your last session")
+        );
+        assert_eq!(
+            reopen_offer(4).as_deref(),
+            Some("Reopen 4 threads from your last session")
+        );
+    }
+
+    #[test]
+    fn the_import_toast_counts_sessions_and_names_each_agent_once() {
+        let (c, a, x) = (Driver::Claude, Driver::Agy, Driver::Codex);
+        let name = driver_label;
+        assert_eq!(sessions_added_toast(&[]), None);
+        assert_eq!(
+            sessions_added_toast(&[c]).as_deref(),
+            Some(format!("Added 1 recent session from {}", name(c)).as_str())
+        );
+        assert_eq!(
+            sessions_added_toast(&[c, c, a]).as_deref(),
+            Some(format!("Added 3 recent sessions from {} and {}", name(c), name(a)).as_str())
+        );
+        assert_eq!(
+            sessions_added_toast(&[x, c, x, a]).as_deref(),
+            Some(
+                format!(
+                    "Added 4 recent sessions from {}, {} and {}",
+                    name(x),
+                    name(c),
+                    name(a)
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn a_change_of_activity_redraws_the_row() {
+        let rows = vec![model_row("a", None)];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        let mut paused = rows;
+        paused[0].activity = Some(ThreadActivity::Paused);
+        assert_eq!(
+            redraw_for(Some(&drawn), &model_of(paused, Some("a"), true)),
+            Redraw::Rebuild
+        );
     }
 
     fn model_of(rows: Vec<SidebarRow>, selected: Option<&str>, focused: bool) -> SidebarModel {
@@ -1015,6 +1175,7 @@ mod tests {
             updated_ms: at,
             driver: Some(Driver::Claude),
             badge: None,
+            activity: None,
             background: Vec::new(),
             open: OpenState::Closed,
             archived: false,

@@ -384,6 +384,12 @@ struct Inner {
     /// The process was suspended and nothing has started since: the next start is a resume the
     /// user did not ask for, so a delegation rebind around it says nothing.
     suspended: Cell<bool>,
+    /// The current process generation has written to stdout (its handshake reply, at the
+    /// latest): it is past starting. Presentation only (reset by every start).
+    reported: Cell<bool>,
+    /// The current start resumes a suspended process: the header says "Resuming…" until it
+    /// reports. Presentation only.
+    resuming: Cell<bool>,
     /// The native session has a conversation an agent can resume: this process was started
     /// resuming one, or a turn completed on it after a prompt was sent to it. A session id alone
     /// (a fresh start, Claude's prompt-less init turn) may name no transcript yet.
@@ -772,6 +778,8 @@ impl ChatSession {
             bound_generation: Cell::new(false),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
+            reported: Cell::new(false),
+            resuming: Cell::new(false),
             has_conversation: Cell::new(false),
             prompted: Cell::new(false),
         });
@@ -882,6 +890,20 @@ impl ChatSession {
     /// is said to the view or stored. Whether it stopped.
     pub fn suspend_if_idle(&self) -> bool {
         self.inner.suspend()
+    }
+
+    /// Where the agent process is in its life, for the header and the sidebar (read-only).
+    pub fn lifecycle(&self) -> crate::chat::Lifecycle {
+        let inner = &self.inner;
+        let alive = inner.state.borrow().alive;
+        let starting = alive && !inner.reported.get();
+        crate::chat::Lifecycle {
+            alive,
+            starting,
+            resuming: starting && inner.resuming.get(),
+            // A stopped process with nothing started since: the next prompt resumes it.
+            suspended: !alive && inner.suspended.get(),
+        }
     }
 
     /// A watch on the running agent process, if one is alive: taken before [`Self::shutdown`],
@@ -1411,7 +1433,8 @@ impl Inner {
     fn start_process(self: &Rc<Self>) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
-        self.suspended.set(false);
+        self.resuming.set(self.suspended.replace(false));
+        self.reported.set(false);
         // A fresh native session (no resume: a new thread, a switch) has nothing to resume yet,
         // whatever the previous one had.
         self.has_conversation
@@ -1930,6 +1953,12 @@ impl Inner {
     fn dispatch_line(self: &Rc<Self>, generation: u64, line: &str, stderr: bool) {
         if generation != self.generation.get() {
             return;
+        }
+        if !stderr {
+            // The agent answered: it is up. Not its session report, which Claude sends only
+            // with the first prompt's turn; every agent answers its handshake at once.
+            self.reported.set(true);
+            self.resuming.set(false);
         }
         if stderr
             && self.thinking.passed.get()
@@ -5532,13 +5561,29 @@ mod tests {
                     .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
                     .count()
             };
+            let life = |starting: bool, resuming: bool, suspended: bool| crate::chat::Lifecycle {
+                alive: !suspended,
+                starting,
+                resuming,
+                suspended,
+            };
             session.reload_session();
+            assert_eq!(
+                session.lifecycle(),
+                life(true, false, false),
+                "a fresh start is starting, not resuming"
+            );
             assert!(
                 pump_until(ctx, 10, || has(&seen, |e| matches!(
                     e,
                     Event::SessionStarted { native_id, .. } if native_id == "s1"
                 )) && turns_done(&seen) == 1),
                 "the agent never reported its session and ended its init turn"
+            );
+            assert_eq!(
+                session.lifecycle(),
+                life(false, false, false),
+                "up once it reported"
             );
             assert_eq!(
                 session.inner.suspend_blocker(),
@@ -5565,6 +5610,7 @@ mod tests {
             assert_eq!(session.inner.suspend_blocker(), None);
             assert!(session.suspend_if_idle(), "an idle session suspends");
             assert!(!session.status().alive);
+            assert_eq!(session.lifecycle(), life(false, false, true), "paused");
             assert!(
                 !session.suspend_if_idle(),
                 "a suspended one has nothing to stop"
@@ -5603,7 +5649,17 @@ mod tests {
                 "the paused notice is not stored"
             );
 
+            assert_eq!(
+                session.lifecycle(),
+                life(false, false, true),
+                "a mode or model picked while paused starts nothing"
+            );
             session.send_prompt("after a pause");
+            assert_eq!(
+                session.lifecycle(),
+                life(true, true, false),
+                "the message sent while paused resumes it"
+            );
             assert!(
                 pump_until(ctx, 10, || lines(tmp.path().join("prompts.log"))
                     .iter()
@@ -5621,6 +5677,11 @@ mod tests {
             assert!(
                 launches[1].contains("--model opus"),
                 "the resume starts with the model picked while paused: {launches:?}"
+            );
+            assert!(
+                pump_until(ctx, 10, || session.lifecycle() == life(false, false, false)),
+                "the resumed agent never reported: {:?}",
+                session.lifecycle()
             );
         });
     }
