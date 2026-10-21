@@ -228,6 +228,41 @@ fn losing_a_call_never_replays_it_and_reconnects_only_once() {
     });
 }
 
+/// agy's capability is spent by its first hello: a lost connection degrades the bridge at once
+/// and never presents that used credential again.
+#[test]
+fn an_agy_bridge_never_reconnects_with_its_spent_capability() {
+    runtime().block_on(async {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("ipc.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let client = Client::start(Ok(test_support::config(path)), Instant::now());
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        assert!(matches!(
+            test_support::read(&mut socket).await,
+            Frame::Hello(_)
+        ));
+        let Frame::Welcome(mut agy) = welcome() else {
+            unreachable!()
+        };
+        agy.principal.driver = Driver::Agy;
+        test_support::write(&mut socket, &Frame::Welcome(agy)).await;
+        client.ready().await.expect("ready");
+        drop(socket);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            client.ready().await.expect_err("degraded").code,
+            ErrorCode::RuntimeUnavailable
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the spent capability was presented again"
+        );
+    });
+}
+
 #[test]
 fn welcome_deadline_starts_at_process_start() {
     runtime().block_on(async {

@@ -267,6 +267,9 @@ async fn actor(
             }
         };
         state.send_replace(State::Ready);
+        // agy's capability is single use (contract §7 L4): spent by this hello, it can never
+        // authenticate again, so a reconnect would only present a used credential to be refused.
+        let single_use = welcome.principal.driver == agent_core::adapter::Driver::Agy;
         let max_inflight = (welcome.limits.max_inflight as usize).min(MAX_INFLIGHT);
         let (mut reader, mut writer) = socket.into_split();
         let (incoming_tx, mut incoming) = mpsc::channel(1);
@@ -328,6 +331,13 @@ async fn actor(
         }
         if let Some(error) = revoked {
             state.send_replace(State::Degraded(error));
+            return;
+        }
+        if single_use {
+            state.send_replace(State::Degraded(unavailable(
+                "the delegation connection was lost; its single-use capability cannot reconnect, \
+                 so delegation returns when the agent is rebound before its next turn",
+            )));
             return;
         }
         if reconnect_used {

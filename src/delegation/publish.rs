@@ -429,6 +429,7 @@ impl Supervisor {
             let Some(w) = state.workers.get_mut(worker) else {
                 return;
             };
+            let before = w.row.state.clone();
             if w.row.state != "closed"
                 && w.generation == scope.generation
                 && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref()
@@ -507,6 +508,14 @@ impl Supervisor {
                     }
                     _ => {}
                 }
+            }
+            if w.row.state != before {
+                tracing::info!(
+                    %worker,
+                    from = %before,
+                    to = %w.row.state,
+                    "delegated worker state changed"
+                );
             }
         }
         if let Some((state, usage)) = ended {

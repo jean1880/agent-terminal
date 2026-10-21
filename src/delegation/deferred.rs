@@ -12,6 +12,10 @@ use agent_core::event::{Envelope, Event};
 use agent_kit::store::delegation_typed::*;
 use serde_json::Value;
 use std::rc::Rc;
+use tracing::{info, warn};
+
+/// How long a task handed to a child may wait for its turn to open (see `arm_task_start`).
+pub(super) const TASK_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(super) struct Delivery {
@@ -320,13 +324,23 @@ impl Supervisor {
                 }
             }
         }
-        if let Err(e) = self.reserve_run(&entry).await {
-            if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-                w.dispatching = false;
+        let prior = self
+            .state
+            .borrow()
+            .workers
+            .get(&entry.worker)
+            .and_then(|w| w.run.clone());
+        // The run this delivery reserved itself, which it must end if nothing reaches the agent.
+        let fresh = match self.reserve_run(&entry).await {
+            Ok(run) => run.filter(|r| prior.as_ref() != Some(r)),
+            Err(e) => {
+                if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
+                    w.dispatching = false;
+                }
+                self.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                return;
             }
-            self.record_fact(entry.input.operation, DispatchFact::Failed(e));
-            return;
-        }
+        };
         let expected = match &entry.input.plan {
             DeliveryPlan::SteerNow(r) => Some(r),
             DeliveryPlan::WriteLive { target } => target.as_ref(),
@@ -342,17 +356,15 @@ impl Supervisor {
             entry.input.epoch,
             expected,
         ) {
-            self.record_fact(entry.input.operation, DispatchFact::Failed(e));
+            self.fail_dispatch(&entry, fresh, e);
             return;
         }
         let session = self.child_session(&entry.worker);
         let Some(session) = session else {
-            self.record_fact(
-                entry.input.operation,
-                DispatchFact::Failed(error(
-                    ErrorCode::ProviderUnavailable,
-                    "child session unavailable",
-                )),
+            self.fail_dispatch(
+                &entry,
+                fresh,
+                error(ErrorCode::ProviderUnavailable, "child session unavailable"),
             );
             return;
         };
@@ -361,11 +373,12 @@ impl Supervisor {
             .borrow_mut()
             .dispatching
             .remove(&entry.input.operation);
+        let turn_started = matches!(outcome, DelegatedOutcome::TurnStarted);
         match outcome {
-            DelegatedOutcome::Refused(c) => self.record_fact(
-                entry.input.operation.clone(),
-                DispatchFact::Failed(error(c, "session refused delegated input")),
-            ),
+            DelegatedOutcome::Refused(c) => {
+                self.fail_dispatch(&entry, fresh, error(c, "session refused delegated input"));
+                return;
+            }
             DelegatedOutcome::SteerSent { tag } => {
                 self.record_fact(entry.input.operation.clone(), DispatchFact::Submitted);
                 self.state.borrow_mut().controls.insert(tag, entry.clone());
@@ -392,6 +405,10 @@ impl Supervisor {
             .workers
             .get(&entry.worker)
             .and_then(|w| w.run.clone());
+        if let (true, Some(run)) = (turn_started, run.as_ref()) {
+            info!(worker = %entry.worker, %run, "delegated task handed to the agent");
+            self.arm_task_start(&entry.worker, run);
+        }
         if let Some(run) = run {
             let sup = self.weak.clone();
             let worker = entry.worker.clone();
@@ -561,6 +578,117 @@ impl Supervisor {
                 self.confirm_delivery(e);
             }
         }
+    }
+    /// A delivery that failed before anything reached the agent. Its operation fails, and the
+    /// run it would have started ends with it, in memory and in the store alike, so `list` (which
+    /// reads the store's run, as `cancel` does) never names a run that is already over. A spawn's
+    /// task that cannot be delivered leaves the worker nothing to do: the worker fails, saying why.
+    fn fail_dispatch(self: &Rc<Self>, entry: &Delivery, fresh: Option<RunId>, e: ToolError) {
+        warn!(
+            worker = %entry.worker,
+            operation = %entry.input.operation,
+            code = %e.code,
+            reason = %e.message,
+            "delegated dispatch failed"
+        );
+        self.state
+            .borrow_mut()
+            .dispatching
+            .remove(&entry.input.operation);
+        self.record_fact(
+            entry.input.operation.clone(),
+            DispatchFact::Failed(e.clone()),
+        );
+        if matches!(entry.input.source, InputSource::Task) {
+            let reason = format!("its task could not be delivered: {}", e.message);
+            self.fail_worker(&entry.worker, error(e.code, &reason));
+            return;
+        }
+        let Some(run) = fresh else {
+            return;
+        };
+        let ended = self
+            .state
+            .borrow_mut()
+            .workers
+            .get_mut(&entry.worker)
+            .filter(|w| w.run.as_ref() == Some(&run))
+            .map(|w| w.last_run = w.run.take())
+            .is_some();
+        if !ended {
+            return;
+        }
+        let reason = e.code.as_str().to_owned();
+        self.services
+            .write("end undelivered delegated run", None, true, move |s| {
+                if s.delegation_run(run.as_str())?.is_some_and(|r| {
+                    !matches!(
+                        r.state.as_str(),
+                        "completed" | "interrupted" | "failed" | "unknown"
+                    )
+                }) {
+                    s.set_delegation_run_state(
+                        run.as_str(),
+                        "failed",
+                        None,
+                        Some(&reason),
+                        None,
+                        super::supervisor::now(),
+                    )?;
+                }
+                Ok(())
+            });
+        self.notify_registry();
+        self.drain_deferred(&entry.worker);
+    }
+    /// A task handed to the agent must open its turn within the deadline, or the worker is
+    /// stalled: it fails with that reason (stopping its process and ending its run) rather than
+    /// staying `starting` with nothing to show. A turn that opened (`running`, `waiting`) or a
+    /// run that already ended is left alone.
+    fn arm_task_start(self: &Rc<Self>, worker: &WorkerId, run: &RunId) {
+        let deadline = self
+            .state
+            .borrow()
+            .task_start_deadline
+            .unwrap_or(TASK_START_DEADLINE);
+        let Some(generation) = self
+            .state
+            .borrow()
+            .workers
+            .get(worker)
+            .map(|w| w.generation)
+        else {
+            return;
+        };
+        let sup = self.weak.clone();
+        let worker = worker.clone();
+        let run = run.clone();
+        gtk4::glib::spawn_future_local(async move {
+            gtk4::glib::timeout_future(deadline).await;
+            let Some(sup) = sup.upgrade() else {
+                return;
+            };
+            let stalled = sup.state.borrow().workers.get(&worker).is_some_and(|w| {
+                w.generation == generation
+                    && w.run.as_ref() == Some(&run)
+                    && !matches!(
+                        w.row.state.as_str(),
+                        "running" | "waiting" | "stopping" | "failed" | "closed"
+                    )
+            });
+            if stalled {
+                warn!(%worker, %run, ?deadline, "delegated task never started; worker stalled");
+                sup.fail_worker(
+                    &worker,
+                    error(
+                        ErrorCode::ProviderUnavailable,
+                        &format!(
+                            "the agent was given its task but did not start it within {deadline:?}"
+                        ),
+                    ),
+                );
+            }
+        });
     }
     pub(super) fn queue_human(self: &Rc<Self>, worker: &WorkerId, text: &str) {
         let caller = {

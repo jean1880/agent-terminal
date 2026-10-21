@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import sys
+import time
 
 root = Path(sys.argv[1])
 turn = 0
@@ -51,6 +52,9 @@ for line in sys.stdin:
             emit({"type": "assistant", "message": {"id": f"a-{turn}", "role": "assistant",
                   "model": model, "content": [{"type": "text",
                   "text": "OK" if bootstrap else "Synthetic delegated result."}]}})
+        # A test holds the startup check open to change the world before the task is sent.
+        while bootstrap and (root / "hold-bootstrap").exists():
+            time.sleep(0.01)
         if "hold" not in text or bootstrap:
             emit({"type": "result", "subtype": "success", "is_error": False,
                   "session_id": "synthetic-session", "result": "OK" if bootstrap else "Synthetic delegated result."})

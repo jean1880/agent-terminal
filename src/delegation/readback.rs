@@ -31,9 +31,18 @@ impl Readback {
             driver: Some(driver),
             mode: Some(mode),
             bootstrap: driver == Driver::Claude,
-            ready: driver == Driver::Agy,
             ..Self::default()
         }
+    }
+    /// The child's process has spawned. agy has no read-back of its own (its launch was proven
+    /// before the spawn), but its session takes input only once that spawn is done: before it,
+    /// a task is refused as `runtime_unavailable`. So agy becomes ready here, and only here.
+    pub(super) fn started(&mut self) -> Step {
+        if self.driver != Some(Driver::Agy) || self.failed || self.ready {
+            return Step::Wait;
+        }
+        self.ready = true;
+        Step::Task
     }
     pub(super) fn line(&mut self, v: &Value) -> Step {
         if self.failed {
@@ -162,6 +171,11 @@ impl Readback {
         if self.driver == Some(Driver::Codex) && self.policy && hello {
             self.ready = true;
             Step::Task
+        } else if self.driver == Some(Driver::Agy) {
+            self.stop(
+                ErrorCode::ProviderUnavailable,
+                "the agy process did not start within the startup deadline",
+            )
         } else {
             self.stop(
                 ErrorCode::RouteUnverified,
@@ -293,6 +307,29 @@ mod tests {
         assert!(guard.ready);
         assert!(matches!(guard.line(&json!({"method":"mcpServer/startupStatus/updated","params":{"name":"foreign","status":"ready"}})),Step::Stop(_)));
         assert!(!guard.ready);
+    }
+    #[test]
+    fn agy_is_ready_only_once_its_process_started_and_the_deadline_bites_before() {
+        let mut guard = Readback::child(Driver::Agy, TaskMode::Plan);
+        assert!(
+            !guard.ready,
+            "agy must not take its task before its process exists"
+        );
+        assert!(matches!(guard.started(), Step::Task));
+        assert!(guard.ready);
+        assert!(
+            matches!(guard.started(), Step::Wait),
+            "the task is released once"
+        );
+        assert!(matches!(guard.hello_timeout(false), Step::Wait));
+        let mut never = Readback::child(Driver::Agy, TaskMode::Plan);
+        assert!(matches!(never.hello_timeout(true), Step::Stop(_)));
+        assert!(
+            matches!(never.started(), Step::Wait),
+            "a stopped start stays stopped"
+        );
+        let mut claude = Readback::child(Driver::Claude, TaskMode::Plan);
+        assert!(matches!(claude.started(), Step::Wait));
     }
     #[test]
     fn codex_startup_deadline_requires_policy_and_hello() {
