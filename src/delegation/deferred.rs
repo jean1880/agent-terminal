@@ -619,11 +619,11 @@ impl Supervisor {
             .borrow_mut()
             .dispatching
             .remove(&entry.input.operation);
-        self.record_fact(
-            entry.input.operation.clone(),
-            DispatchFact::Failed(e.clone()),
-        );
+        let fact_only = |e: ToolError| {
+            self.record_fact(entry.input.operation.clone(), DispatchFact::Failed(e));
+        };
         let Some(run) = used.run.clone() else {
+            fact_only(e);
             return;
         };
         let (current, stopping) = {
@@ -641,25 +641,30 @@ impl Supervisor {
                 })
         };
         if !current {
+            fact_only(e);
             return;
         }
         let task = matches!(entry.input.source, InputSource::Task);
         // Only a run this delivery owns (the task's, or one it reserved) and whose turn never
         // opened is ended here; a cancel of a live turn ends that turn itself.
         if stopping && !(task || used.fresh) {
+            fact_only(e);
             return;
         }
         if task && !stopping {
+            fact_only(e.clone());
             let reason = format!("its task could not be delivered: {}", e.message);
             self.fail_worker(&entry.worker, error(e.code, &reason));
             return;
         }
         if !task && !used.fresh {
+            fact_only(e);
             return;
         }
         // The run ends: interrupted by the cancel that stopped it, or failed with the
-        // delivery. (A spawn's run may already be failed by the dispatch fact above, in the
-        // writer's order; a run that already ended is left as it is.)
+        // delivery. It ends first, and the failed dispatch is recorded after it in the same
+        // transaction: recording the fact on a spawn's still-open run would otherwise end that
+        // run as `failed` and hide the cancel. A run that already ended is left as it is.
         let (run_state, worker_state) = if stopping {
             ("interrupted", Some("waiting"))
         } else {
@@ -671,46 +676,58 @@ impl Supervisor {
                 w.row.state = state.into();
             }
         }
-        if stopping && task {
-            // As `cancel_bound_run` does with a task still pending: a child that never got
-            // its task is stopped.
-            if let Some(session) = self.child_session(&entry.worker) {
-                session.shutdown(true);
-            }
-        }
         let worker = entry.worker.clone();
         let reason = if stopping {
             "cancelled".to_owned()
         } else {
             e.code.as_str().to_owned()
         };
+        let operation = entry.input.operation.clone();
+        let fact = DispatchFact::Failed(e);
         self.services
             .write("end undelivered delegated run", None, true, move |s| {
-                let at = super::supervisor::now();
-                if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                    !matches!(
-                        r.state.as_str(),
-                        "completed" | "interrupted" | "failed" | "unknown"
-                    )
-                }) {
-                    s.set_delegation_run_state(
-                        run.as_str(),
-                        run_state,
-                        None,
-                        Some(&reason),
-                        None,
-                        at,
-                    )?;
-                }
-                if let Some(state) = worker_state {
-                    if s.delegation_worker(worker.as_str())?
-                        .is_some_and(|w| w.state != "closed")
-                    {
-                        s.set_delegation_worker_state(worker.as_str(), state, None, at)?;
+                s.atomically(|s| {
+                    let at = super::supervisor::now();
+                    if s.delegation_run(run.as_str())?.is_some_and(|r| {
+                        !matches!(
+                            r.state.as_str(),
+                            "completed" | "interrupted" | "failed" | "unknown"
+                        )
+                    }) {
+                        s.set_delegation_run_state(
+                            run.as_str(),
+                            run_state,
+                            None,
+                            Some(&reason),
+                            None,
+                            at,
+                        )?;
                     }
-                }
-                Ok(())
+                    if let Some(state) = worker_state {
+                        if s.delegation_worker(worker.as_str())?
+                            .is_some_and(|w| w.state != "closed")
+                        {
+                            s.set_delegation_worker_state(worker.as_str(), state, None, at)?;
+                        }
+                    }
+                    // As `record_fact` does: a fact already recorded is not recorded again.
+                    if !s
+                        .delegation_operation(operation.as_str())?
+                        .is_some_and(|o| o.dispatch_state == "failed")
+                    {
+                        s.record_delegation_dispatch(&operation, &fact)?;
+                    }
+                    Ok(())
+                })
             });
+        if stopping && task {
+            // As `cancel_bound_run` does with a task still pending: a child that never got
+            // its task is stopped. Only after the run's end is queued: stopping ends any turn
+            // in flight, whose publication would otherwise end the run first, with no reason.
+            if let Some(session) = self.child_session(&entry.worker) {
+                session.shutdown(true);
+            }
+        }
         self.notify_registry();
         if !task {
             self.drain_deferred(&entry.worker);

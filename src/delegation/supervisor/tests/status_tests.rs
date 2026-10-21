@@ -539,10 +539,29 @@ fn a_cancel_between_taking_the_task_and_delivering_it_stays_a_cancel() {
                 .reader()
                 .delegation_run(run.as_str())
                 .unwrap()
-                // The dispatch fact may end it first (as for a cancelled pending task).
-                .is_some_and(|r| matches!(r.state.as_str(), "interrupted" | "failed"))
+                .is_some_and(|r| r.state != "reserved" && r.state != "starting")
         })
         .await;
+        let ended = sup
+            .services
+            .handle
+            .reader()
+            .delegation_run(run.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ended.state, "interrupted",
+            "a cancelled run was saved as failed"
+        );
+        assert_eq!(ended.terminal_reason.as_deref(), Some("cancelled"));
+        let stored = sup
+            .services
+            .handle
+            .reader()
+            .delegation_worker(worker.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "waiting");
         {
             let state = sup.state.borrow();
             let w = &state.workers[&worker];
