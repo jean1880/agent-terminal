@@ -53,7 +53,94 @@ const DISMISSED_KEY: &str = "dismissed_natives";
 pub fn pending_prompt_key(thread: &str) -> String {
     format!("pending_prompt:{thread}")
 }
+
+/// The [`Store::meta`] key of the profile id a thread was opened with (see
+/// [`ThreadAttributes::profile_id`]).
+pub fn thread_profile_key(thread: &str) -> String {
+    format!("thread_profile:{thread}")
+}
+
+/// The [`Store::meta`] key of the worktree a thread was opened in, as JSON (see
+/// [`ThreadAttributes::worktree`]).
+pub fn thread_worktree_key(thread: &str) -> String {
+    format!("thread_worktree:{thread}")
+}
+
+/// Every per-thread [`Store::meta`] key: what deleting a thread removes with it.
+fn thread_meta_keys(thread: &str) -> [String; 3] {
+    [
+        pending_prompt_key(thread),
+        thread_profile_key(thread),
+        thread_worktree_key(thread),
+    ]
+}
 const MAX_DISMISSED_NATIVES: usize = 500;
+
+/// What a thread was opened with, beside its rows: kept in [`Store::meta`] (no schema change, so
+/// an older build still opens the store and ignores them).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadAttributes {
+    /// The id of the profile the user chose for the thread (`Profile::id`). Honoured only while
+    /// that profile still runs the thread's current agent; else the agent's default profile.
+    pub profile_id: Option<String>,
+    /// The worktree the thread was opened in (New Thread in Isolated Git Worktree).
+    pub worktree: Option<crate::worktree::WorktreeInfo>,
+}
+
+/// A thread's provider thread, written with it by [`Store::create_thread_record`].
+#[derive(Debug, Clone)]
+pub struct ProviderRecord<'a> {
+    /// Made beforehand ([`Store::new_id`]), or `None` for a fresh one.
+    pub id: Option<&'a str>,
+    pub driver: &'a str,
+    /// `None`: the agent's own default (stored as `"default"`, the one sentinel).
+    pub model: Option<&'a str>,
+    /// The agent's own session the thread holds (a resumed or listed one).
+    pub native_id: Option<&'a str>,
+}
+
+/// Everything a new thread is created with, in one unit ([`Store::create_thread_record`]).
+#[derive(Debug, Clone)]
+pub struct ThreadRecord<'a> {
+    /// Made beforehand ([`Store::new_id`]): a write queued to the writer knows its id.
+    pub id: &'a str,
+    pub cwd: &'a str,
+    pub title: Option<&'a str>,
+    /// When it sorts (epoch milliseconds): an existing session's own time. `None`: now.
+    pub at_ms: Option<i64>,
+    /// Its agent, made active. `None` for a delegated child's backing thread, whose provider
+    /// thread is added when its process is prepared.
+    pub provider: Option<ProviderRecord<'a>>,
+    /// Stored after the rows, under the provider thread (scrubbed like any event): the mode the
+    /// user chose, a handoff it carries.
+    pub events: Vec<Envelope>,
+    pub attributes: ThreadAttributes,
+}
+
+impl<'a> ThreadRecord<'a> {
+    pub fn new(id: &'a str, cwd: &'a str) -> Self {
+        Self {
+            id,
+            cwd,
+            title: None,
+            at_ms: None,
+            provider: None,
+            events: Vec::new(),
+            attributes: ThreadAttributes::default(),
+        }
+    }
+}
+
+/// What [`Store::create_native_thread`] found or made for an agent's native session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeThread {
+    /// A new thread was made for it.
+    Created,
+    /// A visible thread already holds it: open that one, never a duplicate.
+    Existing(ThreadId),
+    /// A supervised child's hidden backing thread holds it: never surfaced as a thread.
+    Supervised,
+}
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -926,15 +1013,125 @@ impl Store {
         driver: &str,
         native_id: &str,
     ) -> Result<ThreadId> {
-        let tx = self.write_txn()?;
-        let thread = self.create_thread_at(cwd, title, at_ms)?;
-        let pt = self.add_provider_thread(&thread, driver, "default")?;
-        self.set_native_id(&pt, native_id)?;
-        self.set_active_provider_thread(&thread, &pt)?;
-        // Linking bumped the time to now; the thread sorts by the session's own.
-        self.touch(&thread, at_ms)?;
-        tx.commit()?;
+        let thread = self.new_id()?;
+        self.create_thread_record(&ThreadRecord {
+            title,
+            at_ms: Some(at_ms),
+            provider: Some(ProviderRecord {
+                id: None,
+                driver,
+                model: None,
+                native_id: Some(native_id),
+            }),
+            ..ThreadRecord::new(&thread, cwd)
+        })?;
         Ok(thread)
+    }
+
+    /// Creates a thread from `record`, all or nothing: its row, its provider thread (made
+    /// active), its events and its attributes. The one way a thread is made (a new thread, a
+    /// fork, a resumed or listed session, a delegated child's backing thread), so none of them
+    /// can leave a thread without what it was created with. Inside an open transaction, a
+    /// savepoint of it.
+    pub fn create_thread_record(&self, record: &ThreadRecord<'_>) -> Result<()> {
+        self.atomically(|s| {
+            let at = record.at_ms.unwrap_or_else(|| s.now());
+            s.insert_thread(record.id, record.cwd, record.title, at)?;
+            let provider = match &record.provider {
+                Some(p) => {
+                    let id = match p.id {
+                        Some(id) => id.to_owned(),
+                        None => s.new_id()?,
+                    };
+                    s.add_provider_thread_with_id(
+                        &id,
+                        record.id,
+                        p.driver,
+                        p.model.unwrap_or("default"),
+                    )?;
+                    if let Some(native) = p.native_id {
+                        s.set_native_id(&id, native)?;
+                    }
+                    s.set_active_provider_thread(record.id, &id)?;
+                    Some(id)
+                }
+                None => None,
+            };
+            for env in &record.events {
+                s.append_event(record.id, provider.as_deref(), env)?;
+            }
+            s.write_thread_attributes(record.id, &record.attributes)?;
+            if record.at_ms.is_some() {
+                // Recording the agent and events bumped the time to now; the thread sorts by
+                // its own.
+                s.touch(record.id, at)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Opens a thread on `driver`'s native session `native_id`, checked and created in one unit,
+    /// so two resumes of one session never make two threads: a visible thread that already
+    /// holds it is returned instead, and a supervised child's hidden one is refused. `record`
+    /// gives the new thread (its provider must name that session).
+    pub fn create_native_thread(
+        &self,
+        record: &ThreadRecord<'_>,
+        driver: &str,
+        native_id: &str,
+    ) -> Result<NativeThread> {
+        self.atomically(|s| {
+            if let Some(existing) = s.thread_with_native_id(driver, native_id)? {
+                return Ok(if s.is_hidden_child_thread(&existing)? {
+                    NativeThread::Supervised
+                } else {
+                    NativeThread::Existing(existing)
+                });
+            }
+            s.create_thread_record(record)?;
+            Ok(NativeThread::Created)
+        })
+    }
+
+    /// What `thread` was opened with ([`ThreadAttributes`]). A malformed value is ignored (with
+    /// a warning): the thread then opens as one without it.
+    pub fn thread_attributes(&self, thread: &str) -> Result<ThreadAttributes> {
+        let profile_id = self
+            .meta(&thread_profile_key(thread))?
+            .filter(|id| !id.trim().is_empty());
+        let worktree = match self.meta(&thread_worktree_key(thread))? {
+            None => None,
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    tracing::warn!(%thread, error = %e, "ignoring an unreadable thread worktree");
+                    None
+                }
+            },
+        };
+        Ok(ThreadAttributes {
+            profile_id,
+            worktree,
+        })
+    }
+
+    /// Records (or with `None` clears) the profile a thread runs with: an in-place switch to
+    /// another agent clears it, so the thread follows that agent's default profile.
+    pub fn set_thread_profile(&self, thread: &str, profile_id: Option<&str>) -> Result<()> {
+        let key = thread_profile_key(thread);
+        match profile_id.filter(|id| !id.trim().is_empty()) {
+            Some(id) => self.set_meta(&key, id),
+            None => self.delete_meta(&key),
+        }
+    }
+
+    fn write_thread_attributes(&self, thread: &str, attributes: &ThreadAttributes) -> Result<()> {
+        self.set_thread_profile(thread, attributes.profile_id.as_deref())?;
+        let key = thread_worktree_key(thread);
+        match &attributes.worktree {
+            Some(info) => self.set_meta(&key, &serde_json::to_string(info)?),
+            None => self.delete_meta(&key),
+        }
     }
 
     /// The thread (archived or not) that already holds `driver`'s native session `native_id`,
@@ -997,7 +1194,9 @@ impl Store {
                 .filter_map(|pt| pt.native_id.map(|n| (pt.driver, n)))
                 .collect();
             self.add_dismissed(&natives)?;
-            self.delete_meta(&pending_prompt_key(t))?;
+            for key in thread_meta_keys(t) {
+                self.delete_meta(&key)?;
+            }
             let n = self
                 .conn
                 .execute("DELETE FROM threads WHERE id = ?1", params![t])?;
@@ -1115,7 +1314,9 @@ impl Store {
             .optional()?)
     }
 
-    /// Sets (replacing) a [`Store::meta`] value. Not redacted: callers store ids, not text.
+    /// Sets (replacing) a [`Store::meta`] value. Not redacted: callers store ids, paths and
+    /// user-chosen names; never agent or user text (that goes through a redacting writer, such
+    /// as [`Store::set_pending_prompt`]).
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -2201,6 +2402,172 @@ mod tests {
         s.set_pending_prompt(&t, "recover me").unwrap();
         s.delete_thread(&t).unwrap();
         assert_eq!(s.meta(&pending_prompt_key(&t)).unwrap(), None);
+    }
+
+    fn worktree() -> crate::worktree::WorktreeInfo {
+        crate::worktree::WorktreeInfo {
+            path: PathBuf::from("/r/.main.worktrees/feat-x"),
+            branch: "feat/x".into(),
+            main_toplevel: PathBuf::from("/r/main"),
+        }
+    }
+
+    #[test]
+    fn a_thread_record_is_created_whole_with_its_attributes() {
+        let s = store();
+        let (t, pt) = (s.new_id().unwrap(), s.new_id().unwrap());
+        s.create_thread_record(&ThreadRecord {
+            title: Some("t"),
+            provider: Some(ProviderRecord {
+                id: Some(&pt),
+                driver: "claude",
+                model: None,
+                native_id: None,
+            }),
+            events: vec![Envelope::new(Event::ModeChosen {
+                mode: agent_core::adapter::Mode::Plan,
+            })],
+            attributes: ThreadAttributes {
+                profile_id: Some("p-1".into()),
+                worktree: Some(worktree()),
+            },
+            ..ThreadRecord::new(&t, "/r/.main.worktrees/feat-x")
+        })
+        .unwrap();
+        assert_eq!(s.active_provider_thread(&t).unwrap(), Some(pt.clone()));
+        let providers = s.provider_threads(&t).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].model, "default", "the one sentinel");
+        let events = s.events(&t, None, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].1.event, Event::ModeChosen { .. }));
+        assert_eq!(
+            s.thread_attributes(&t).unwrap(),
+            ThreadAttributes {
+                profile_id: Some("p-1".into()),
+                worktree: Some(worktree()),
+            }
+        );
+        // A later write of the same id fails whole: nothing half-made is left of the second.
+        let again = s.create_thread_record(&ThreadRecord::new(&t, "/elsewhere"));
+        assert!(again.is_err());
+        assert_eq!(
+            s.thread_summary(&t).unwrap().unwrap().cwd,
+            "/r/.main.worktrees/feat-x"
+        );
+    }
+
+    #[test]
+    fn a_failed_part_leaves_no_thread_behind() {
+        let s = store();
+        let t = s.new_id().unwrap();
+        let other = s.create_thread("/w", None).unwrap();
+        let pt = s.add_provider_thread(&other, "claude", "default").unwrap();
+        // The provider id is taken: the whole record is refused.
+        let made = s.create_thread_record(&ThreadRecord {
+            provider: Some(ProviderRecord {
+                id: Some(&pt),
+                driver: "claude",
+                model: None,
+                native_id: None,
+            }),
+            attributes: ThreadAttributes {
+                profile_id: Some("p".into()),
+                worktree: None,
+            },
+            ..ThreadRecord::new(&t, "/w")
+        });
+        assert!(made.is_err());
+        assert!(s.thread_summary(&t).unwrap().is_none());
+        assert_eq!(s.meta(&thread_profile_key(&t)).unwrap(), None);
+    }
+
+    #[test]
+    fn unreadable_or_blank_attributes_are_ignored() {
+        let s = store();
+        let t = s.create_thread("/w", None).unwrap();
+        s.set_meta(&thread_worktree_key(&t), "not json").unwrap();
+        s.set_meta(&thread_profile_key(&t), "  ").unwrap();
+        assert_eq!(
+            s.thread_attributes(&t).unwrap(),
+            ThreadAttributes::default()
+        );
+        s.set_thread_profile(&t, Some("p")).unwrap();
+        assert_eq!(
+            s.thread_attributes(&t).unwrap().profile_id.as_deref(),
+            Some("p")
+        );
+        s.set_thread_profile(&t, None).unwrap();
+        assert_eq!(s.meta(&thread_profile_key(&t)).unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_a_thread_removes_its_attributes() {
+        let s = store();
+        let t = s.new_id().unwrap();
+        s.create_thread_record(&ThreadRecord {
+            attributes: ThreadAttributes {
+                profile_id: Some("p".into()),
+                worktree: Some(worktree()),
+            },
+            ..ThreadRecord::new(&t, "/w")
+        })
+        .unwrap();
+        s.delete_thread(&t).unwrap();
+        for key in thread_meta_keys(&t) {
+            assert_eq!(s.meta(&key).unwrap(), None, "{key}");
+        }
+        // And through the blank-thread discard, which deletes the same way.
+        let blank = s.new_id().unwrap();
+        s.create_thread_record(&ThreadRecord {
+            attributes: ThreadAttributes {
+                profile_id: Some("p".into()),
+                worktree: None,
+            },
+            ..ThreadRecord::new(&blank, "/w")
+        })
+        .unwrap();
+        assert!(s.delete_if_blank(&blank).unwrap());
+        assert_eq!(s.meta(&thread_profile_key(&blank)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_native_session_is_resumed_into_one_thread_only() {
+        let s = store();
+        let record = |id: &'static str| ThreadRecord {
+            provider: Some(ProviderRecord {
+                id: None,
+                driver: "claude",
+                model: None,
+                native_id: Some("native-1"),
+            }),
+            ..ThreadRecord::new(id, "/w")
+        };
+        assert_eq!(
+            s.create_native_thread(&record("first"), "claude", "native-1")
+                .unwrap(),
+            NativeThread::Created
+        );
+        assert_eq!(
+            s.create_native_thread(&record("second"), "claude", "native-1")
+                .unwrap(),
+            NativeThread::Existing("first".into()),
+            "the thread that holds it is opened, never a duplicate"
+        );
+        assert!(s.thread_summary("second").unwrap().is_none());
+        assert_eq!(s.list_threads(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_linked_session_sorts_by_its_own_time() {
+        let s = store();
+        let t = s
+            .link_native_thread("/w", Some("old"), 1_000, "claude", "n")
+            .unwrap();
+        let summary = s.thread_summary(&t).unwrap().unwrap();
+        assert_eq!(summary.updated_at, 1_000);
+        assert_eq!(summary.model.as_deref(), Some("default"));
+        assert_eq!(s.thread_with_native_id("claude", "n").unwrap(), Some(t));
     }
 
     #[test]

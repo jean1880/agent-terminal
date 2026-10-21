@@ -858,7 +858,12 @@ impl Store {
         let worker = self.new_worker_id()?;
         let run = self.new_run_id()?;
         let thread = self.new_id()?;
-        self.insert_thread(&thread, &plan.cwd, Some(&req.name), now)?;
+        // The backing thread has no provider yet: one is added when its process is prepared.
+        self.create_thread_record(&super::ThreadRecord {
+            title: Some(&req.name),
+            at_ms: Some(now),
+            ..super::ThreadRecord::new(&thread, &plan.cwd)
+        })?;
         self.insert_delegation_worker(&WorkerRow {
             id: worker.to_string(),
             root_id: root.id.clone(),
@@ -4494,6 +4499,72 @@ mod tests {
             .s
             .record_child_native_session(&f.root.worker, Driver::Claude, "opus", "x")
             .is_err());
+    }
+
+    /// A resume of a child's native session never surfaces its hidden backing thread: it is
+    /// refused, and no visible duplicate is made.
+    #[test]
+    fn resuming_a_childs_native_session_is_refused() {
+        let f = fx();
+        let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        let backing =
+            f.s.delegation_worker(child.as_str())
+                .expect("q")
+                .expect("row")
+                .backing_thread_id
+                .expect("t");
+        // Created through the one creation helper, without a provider: none until prepared.
+        assert!(f.s.provider_threads(&backing).expect("q").is_empty());
+        f.s.record_child_native_session(&child, Driver::Codex, "default", "child-native")
+            .expect("native");
+        let id = f.s.new_id().expect("id");
+        let record = super::super::ThreadRecord {
+            provider: Some(super::super::ProviderRecord {
+                id: None,
+                driver: "codex",
+                model: None,
+                native_id: Some("child-native"),
+            }),
+            ..super::super::ThreadRecord::new(&id, "/w")
+        };
+        assert_eq!(
+            f.s.create_native_thread(&record, "codex", "child-native")
+                .expect("checked"),
+            super::super::NativeThread::Supervised
+        );
+        assert!(
+            f.s.thread_summary(&id).expect("q").is_none(),
+            "nothing made"
+        );
+    }
+
+    /// A deleted root takes its descendants' per-thread metadata with their hidden threads.
+    #[test]
+    fn deleting_a_root_removes_its_descendants_thread_metadata() {
+        let f = fx();
+        let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        let backing =
+            f.s.delegation_worker(child.as_str())
+                .expect("q")
+                .expect("row")
+                .backing_thread_id
+                .expect("t");
+        for t in [&f.root_thread, &backing] {
+            f.s.set_thread_profile(t, Some("profile-1"))
+                .expect("profile");
+            f.s.set_meta(&super::super::thread_worktree_key(t), "{}")
+                .expect("worktree");
+            f.s.set_pending_prompt(t, "unsent").expect("prompt");
+        }
+        f.s.close_and_revoke_for_delete(&f.root_thread)
+            .expect("s")
+            .expect("revoked");
+        f.s.delete_thread(&f.root_thread).expect("deleted");
+        for t in [&f.root_thread, &backing] {
+            for key in super::super::thread_meta_keys(t) {
+                assert_eq!(f.s.meta(&key).expect("q"), None, "{key} left behind");
+            }
+        }
     }
 
     #[test]
