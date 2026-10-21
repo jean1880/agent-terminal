@@ -400,7 +400,7 @@ impl ChatView {
             if !status.alive && model.settle_stale() {
                 tracing::info!("chat view: settled a stored turn left open");
             }
-            // Reasoning loaded from the store says so (W3.1: the Replayed state).
+            // Reasoning loaded from the store says so.
             model.mark_replayed();
         }
         inner.dirty.borrow_mut().clear();
@@ -1338,7 +1338,7 @@ impl Inner {
 
 /// Whether the host must ask for the context gauge itself after each turn. Codex pushes its
 /// occupancy (`thread/tokenUsage/updated`); Claude and agy report it only when asked
-/// (`get_context_usage`, agy's running token count), which left Claude's gauge empty (F11).
+/// (`get_context_usage`, agy's running token count), which left Claude's gauge empty.
 fn polls_context(driver: Driver) -> bool {
     !matches!(driver, Driver::Codex)
 }
@@ -3705,7 +3705,7 @@ pub(crate) mod tests {
             "the paragraphs' labels are kept, not rebuilt"
         );
 
-        // F17: a Codex summary's markdown renders (bold, no `**`), and markup in the text stays
+        // A Codex summary's markdown renders (bold, no `**`), and markup in the text stays
         // text.
         delta("\n\n**Planning** the listing\n\n<b>not bold</b>");
         while ctx.iteration(false) {}
@@ -4448,7 +4448,7 @@ pub(crate) mod tests {
         assert!(agy.contains("Esc stops"));
     }
 
-    /// The caps contract (D6): every built-in that needs a capability is a working control when
+    /// The caps contract: every built-in that needs a capability is a working control when
     /// the agent has it, and a named, explained absence when it does not (`/help` lists it, and
     /// typing it says why instead of sending it to the agent as a prompt).
     #[test]
@@ -4496,7 +4496,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// F8: `/fork` is a built-in for every agent, run locally, never sent to the agent as text.
+    /// `/fork` is a built-in for every agent, run locally, never sent to the agent as text.
     #[test]
     fn slash_fork_is_a_local_builtin_for_every_agent() {
         use agent_core::adapter::Driver;

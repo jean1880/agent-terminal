@@ -1,4 +1,4 @@
-//! The delegation capability token and the app-instance nonce (contract §5).
+//! The delegation capability token and the app-instance nonce.
 //!
 //! The app draws the random bytes; these types only encode, parse and compare them. The token
 //! is a secret: [`CapabilityToken::expose_secret`] is its only accessor, its `Debug` prints

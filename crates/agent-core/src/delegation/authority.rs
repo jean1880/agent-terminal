@@ -1,5 +1,5 @@
-//! Authority (contract §6): task modes, the live mode ceiling, depth, workspace rules,
-//! inherited authority and the revocation table.
+//! Authority: task modes, the live mode ceiling, depth, workspace rules,
+//! Inherited authority and the revocation table.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use super::mailbox::{kind_allowed, Direction, MessageKind};
 use super::wire::WorkspaceRequest;
 use crate::adapter::Mode;
 
-/// A supervised child's mode (contract §2 `TaskMode`).
+/// A supervised child's mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskMode {
@@ -51,7 +51,7 @@ const CEILING_ACCEPT_EDITS: [TaskMode; 3] = [TaskMode::AcceptEdits, TaskMode::As
 const CEILING_ASK: [TaskMode; 2] = [TaskMode::Ask, TaskMode::Plan];
 const CEILING_PLAN: [TaskMode; 1] = [TaskMode::Plan];
 
-/// The contract §6 ceiling table, applied to the principal's mode after
+/// Mode ceiling, applied to the principal's mode after
 /// [`Mode::session_safe`] (Bypass never propagates: it counts as Ask).
 pub fn ceiling(principal_mode: Mode) -> &'static [TaskMode] {
     match principal_mode.session_safe() {
@@ -75,7 +75,7 @@ pub fn can_spawn(depth: u8) -> bool {
 }
 
 /// Writers (`ask`, `accept_edits`) need an isolated worktree; a shared read-only tree needs
-/// `plan` (contract §3 spawn rules). Whether the provider's read-only enforcement is proven is
+/// `plan`. Whether the provider's read-only enforcement is proven is
 /// the route's question, not this one.
 pub fn workspace_allowed(mode: TaskMode, ws: &WorkspaceRequest) -> Result<(), ErrorCode> {
     match ws {
@@ -86,7 +86,7 @@ pub fn workspace_allowed(mode: TaskMode, ws: &WorkspaceRequest) -> Result<(), Er
 
 /// Every parent→child delivery, any kind: the recipient's `task_mode` must be within the
 /// sender's live ceiling (an unknown recipient mode is refused). Child→parent: kind rules only.
-/// Called at acceptance and again at dispatch (E7).
+/// Called at acceptance and again at dispatch.
 pub fn delivery_allowed(
     dir: Direction,
     kind: MessageKind,
@@ -119,7 +119,7 @@ pub enum WorkspaceScope {
     },
 }
 
-/// The authority a worker holds, inherited down the tree (contract §6, E5).
+/// The authority a worker holds, inherited down the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InheritedAuthority {
     pub worker: WorkerId,
@@ -185,7 +185,7 @@ impl InheritedAuthority {
     }
 }
 
-/// An event that may revoke credentials (contract §6 revocation table).
+/// An event that may revoke credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevocationEvent {
     /// The user stopped the root.
@@ -250,7 +250,7 @@ fn subtree(
     out
 }
 
-/// The contract §6 revocation table over a caller-supplied tree snapshot:
+/// Credential revocation over a caller-supplied tree snapshot:
 /// `(worker, parent, task_mode)`, the root having no parent.
 pub fn revocation(
     event: &RevocationEvent,

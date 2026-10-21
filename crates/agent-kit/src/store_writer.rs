@@ -455,7 +455,7 @@ impl StoreWriter {
 
     /// Runs `job` as a **durable control write** on this same writer, in order after everything
     /// queued before it, and hands its result back once it is committed under
-    /// `synchronous=FULL` (plan §5, contract §8.4):
+    /// `synchronous=FULL`:
     ///
     /// 1. the writes batched before it are committed (and answered) first;
     /// 2. `synchronous` is switched to FULL outside any transaction and read back;
@@ -520,7 +520,7 @@ impl StoreWriter {
         rx
     }
 
-    // ---- typed delegation control writes (plan §5 write protocol) ----
+    // ---- typed delegation control writes ----
     //
     // Each runs as one durable control write. Classify the answer with
     // `DurableOutcome::from_answer`: only `Committed` may be dispatched; a "committed" durability

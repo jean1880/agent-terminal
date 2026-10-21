@@ -45,7 +45,7 @@ impl Config {
         let parent = parent_pid();
         let grandparent = parent.and_then(|pid| read_ppid(pid).ok());
         if app_pid.is_none() || app_pid == Some(0) || grandparent != app_pid {
-            // Until P5 confirms their chains, the contract makes Claude/Codex advisory.
+            // Claude/Codex process chains are unverified, so their peer checks are advisory.
             // Unknown launchers fail closed, so they cannot turn agy's check into advisory.
             if !parent.is_some_and(known_advisory_parent) {
                 return Err(unavailable("the delegation bridge lineage check failed"));
@@ -267,7 +267,7 @@ async fn actor(
             }
         };
         state.send_replace(State::Ready);
-        // agy's capability is single use (contract §7 L4): spent by this hello, it can never
+        // Agy's capability is single use: spent by this hello, it can never
         // authenticate again, so a reconnect would only present a used credential to be refused.
         let single_use = welcome.principal.driver == agent_core::adapter::Driver::Agy;
         let max_inflight = (welcome.limits.max_inflight as usize).min(MAX_INFLIGHT);

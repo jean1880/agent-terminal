@@ -1,14 +1,14 @@
-//! The contract §9 limits, and admission checks against them.
+//! Resource limits and admission checks against them.
 
 use super::error::{ErrorCode, ToolError};
 
-/// Defaults the request normaliser fills (contract §3).
+/// Defaults the request normaliser fills.
 pub const DEFAULT_PAGE_EVENTS: u32 = 100;
 pub const DEFAULT_PAGE_BYTES: u32 = 64 * 1024;
 pub const DEFAULT_WAIT_TIMEOUT_MS: u32 = 10_000;
 pub const DEFAULT_LIST_LIMIT: u32 = 50;
 
-/// Every row of contract §9. Time values are milliseconds; sizes are bytes.
+/// Resource limits. Time values are milliseconds; sizes are bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     // Runs, processes, depth, pending starts.

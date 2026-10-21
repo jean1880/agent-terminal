@@ -430,7 +430,7 @@ impl AgyAdapter {
             .or(info.name.clone())
             .unwrap_or_else(|| "tool".to_owned());
         let kind = tool_kind(&name);
-        // Stdout's parameters, else the transcript's record of the same call (W3.4: decoded, so
+        // Stdout's parameters, else the transcript's record of the same call (decoded, so
         // the card title reads `/etc/hostname`, not `"/etc/hostname"`).
         let mut params = info
             .parameters
@@ -2174,8 +2174,8 @@ mod tests {
         assert!(events.iter().any(|e| matches!(&e.event, Event::ContentDelta { stream: StreamKind::Assistant, text } if text == "The file looks good.")));
     }
 
-    /// W3.4: a step whose stdout carries no parameters takes them from the transcript's record of
-    /// the call (W0 `transcript-view-file.jsonl`, quoted values), decoded, and titles
+    /// A step whose stdout carries no parameters takes them from the transcript's record of
+    /// the call, decoded, and titles
     /// `Read /etc/hostname`.
     #[test]
     fn w0_transcript_calls_fill_a_bare_step_and_title_it() {
@@ -2211,7 +2211,7 @@ mod tests {
         );
     }
 
-    /// W3.1 contract, from the W0 agy frames (`read-outside-project.jsonl`) with the thinking the
+    /// Recorded agy frames (`read-outside-project.jsonl`) with the thinking the
     /// session reads from agy's transcript put on the step, as `enrich_agy_step` does: one
     /// reasoning block, Complete at once (never Streaming), its text whole, delivered once even
     /// though the step is reported twice (ACTIVE, then DONE).

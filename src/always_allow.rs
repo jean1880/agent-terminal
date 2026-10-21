@@ -1,5 +1,5 @@
 //! The app's approval rules: what "Allow for session" and "Always allow" remember, for every
-//! agent (plan D1, D2, D2a).
+//! agent.
 //!
 //! agent-terminal owns every approval decision: it never forwards a CLI's own scope or rule
 //! change. A rule is typed: the workspace it applies in (or `*`), the canonical working directory
@@ -43,7 +43,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The rules file's name, beside the thread store.
 pub const FILE_NAME: &str = "approval-rules.json";
 
-// ---- the fail-closed command parser (D2) ----
+// ---- the fail-closed command parser ----
 
 /// Characters that make a command line never auto-match, quoted or not: command separators and
 /// pipes (`;`, `&`, `|`), substitution (backtick, `$(`, `$VAR`, `${`), escapes and line
@@ -350,7 +350,7 @@ const GIT_SAFE: &[&str] = &[
 
 /// Read-only programs a `*` pattern may widen (C1: an allowlist; the option denylist below stays
 /// as defence in depth). Every other program's pattern matches its exact argv only.
-/// D1: only programs whose options can neither write nor execute (with the exec options of rg,
+/// only programs whose options can neither write nor execute (with the exec options of rg,
 /// find and jq denied below). Not fd (`-x`/`--exec`), tree (`-o`), file (`-C`/`-m`), date
 /// (`--set`).
 const PREFIX_PROGRAMS: &[&str] = &[
@@ -358,7 +358,7 @@ const PREFIX_PROGRAMS: &[&str] = &[
     "pwd", "which", "uname",
 ];
 
-/// The git subcommands a `git …*` pattern may widen into (D1: not branch, which deletes and
+/// The git subcommands a `git …*` pattern may widen into (except branch, which deletes and
 /// renames, nor remote, which adds and rewrites).
 const PREFIX_GIT: &[&str] = &[
     "status",
@@ -585,7 +585,7 @@ fn git_signature_format(argv: &[String]) -> Option<&str> {
 
 /// Short option letters that do the same, refused in any single-dash cluster and with any
 /// attached value (`-ccore.pager=x`, `-C/tmp`, `-tI/usr/bin/id`, `-xzfI…`). git's letters are
-/// its global options, so they count only before the subcommand (D2: `git log -p` is a patch,
+/// its global options, so they count only before the subcommand (`git log -p` is a patch,
 /// not the pager).
 const EXEC_SHORT: &[(&str, &str)] = &[
     ("git", "cCOp"),
@@ -741,7 +741,7 @@ fn argv_text(argv: &[String]) -> String {
 
 // ---- actions and rules ----
 
-/// What an action does, whichever agent names it (U2): rules match across agents by kind.
+/// What an action does, whichever agent names it: rules match across agents by kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
@@ -1639,7 +1639,7 @@ impl Drop for PolicyGuard {
     }
 }
 
-// ---- the store (D2a) ----
+// ---- the store ----
 
 /// Why the rules file cannot be used (it is then never overwritten), or why a write failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1822,7 +1822,7 @@ impl AlwaysRules {
             .any(|r| r.matches_probe(action, &probe))
     }
 
-    /// A rule created on this agent allows `action` (session rules are per agent, D3).
+    /// A rule created on this agent allows `action` (session rules are per agent).
     pub fn matches_session(&self, action: &Action, ctx: &Context) -> bool {
         let probe = ctx.probe(action);
         self.rules
@@ -2229,7 +2229,7 @@ pub struct Imported {
 }
 
 impl Imported {
-    /// What the import toast says, every count and refusal included (C6).
+    /// What the import toast says, every count and refusal included.
     pub fn summary(&self) -> String {
         let mut out = match self.added {
             0 => "Permission rules are already up to date".to_owned(),
@@ -3237,7 +3237,7 @@ fn codex_check(target: &CodexTarget, files: &[PathBuf]) -> Result<(), String> {
 
 /// Runs `f` holding an exclusive advisory lock on `<path>.lock` (beside the rules file; the
 /// file itself is replaced by each atomic write, so it cannot carry the lock), so a whole
-/// read-modify-write is never interleaved with another thread's or process's (C5).
+/// read-modify-write is never interleaved with another thread's or process's.
 fn with_store_lock<T>(
     path: &Path,
     f: impl FnOnce() -> Result<T, StoreError>,
@@ -3558,7 +3558,7 @@ mod tests {
         }
     }
 
-    /// B3: only the ASCII space separates words; any other whitespace fails closed.
+    /// Only the ASCII space separates words; any other whitespace fails closed.
     #[test]
     fn unicode_whitespace_fails_closed() {
         for c in ['\u{00A0}', '\u{2028}', '\u{3000}', '\u{2009}', '\u{FEFF}'] {
@@ -3576,7 +3576,7 @@ mod tests {
         assert!(!r.matches(&shell("ls\u{3000}-la"), &c));
     }
 
-    /// B2: zsh expands an unquoted `=word` to a path, so it never matches a quoted `'=word'`.
+    /// Zsh expands an unquoted `=word` to a path, so it never matches a quoted `'=word'`.
     #[test]
     fn a_leading_equals_is_refused_unquoted_even_in_a_wrapper() {
         assert_eq!(simple_command_tokens("printf %s =sh"), None);
@@ -3590,7 +3590,7 @@ mod tests {
         assert!(!r.matches(&shell("printf %s =sh"), &c));
     }
 
-    /// B4: a credential split by quotes is caught on the joined argv.
+    /// A credential split by quotes is caught on the joined argv.
     #[test]
     fn a_secret_split_by_quotes_is_caught_on_the_argv() {
         let c = ctx("codex", Path::new("/w"), Some("/w"));
@@ -3612,7 +3612,7 @@ mod tests {
         assert!(custom.map_or(true, |r| r.check(Scope::Session).is_err()));
     }
 
-    /// B1: a prefix (or exact) rule never covers an option that runs other code, and never
+    /// A prefix (or exact) rule never covers an option that runs other code, and never
     /// extends a program that runs its own arguments.
     #[test]
     fn exec_capable_options_never_match() {
@@ -3647,7 +3647,7 @@ mod tests {
             "sed 1e x",
             "tar --to-command=./evil -xf a.tar",
             "env ./evil",
-            // A1: attached and clustered forms, and git global options before the subcommand.
+            // Attached and clustered forms, and git global options before the subcommand.
             "git -ccore.pager=./evil status",
             "git -C/tmp status",
             "git -p log",
@@ -3753,8 +3753,8 @@ mod tests {
         assert!(make.matches(&shell("make test"), &c));
     }
 
-    /// What the app's own read pattern ([`session_pattern`]) widens into: D1, programs whose
-    /// options write or execute are not reads; D2, git's short global letters count only before
+    /// What the app's own read pattern ([`session_pattern`]) widens into: programs whose
+    /// options write or execute are not reads; git's short global letters count only before
     /// the subcommand; jq's program file and module path run code. A user's rule covers all of
     /// these as written.
     #[test]
@@ -3783,7 +3783,7 @@ mod tests {
         let git = Rule::new("*", "Bash", "git *").complete(&c).expect("git");
         assert!(git.matches(&shell("git branch -D main"), &c));
         assert!(git.matches(&shell("git remote set-url origin x"), &c));
-        // D2: after the subcommand these letters are read-only options again.
+        // After the subcommand these letters are read-only options again.
         for ok in [
             "git log -p",
             "git diff -p",
@@ -3824,7 +3824,7 @@ mod tests {
             assert!(jq.matches(&shell(runs), &c), "{runs}");
             assert!(!app_reads(runs), "{runs}");
         }
-        // D4/D5 on the rule side: curl clusters are credentials; docker's -u is not.
+        // Curl clusters are credentials; docker's -u is not.
         for cred in [
             "curl -su alice:pw https://x",
             "curl -vualice:pw https://x",
@@ -3839,7 +3839,7 @@ mod tests {
         assert!(credential_option(&argv(&["curl", "-u", "alice", "https://x"])).is_none());
     }
 
-    /// E1-E3: jq's long module path, rg's hostname program and git's signature output run code,
+    /// Jq's long module path, rg's hostname program and git's signature output run code,
     /// so the app's own read pattern never covers them; plain git log/show formats are reads. A
     /// user's `jq *`, `rg *` or `git *` covers all of them as written.
     #[test]
@@ -3884,7 +3884,7 @@ mod tests {
         }
     }
 
-    /// C2 (and A3): these run code. "Always allow" is the user's choice for them too, kept with
+    /// These run code. "Always allow" is the user's choice for them too, kept with
     /// a warning that says so; the session keeps their exact command.
     #[test]
     fn runners_and_wrappers_are_kept_always_with_a_warning() {
@@ -3927,7 +3927,7 @@ mod tests {
         }
     }
 
-    /// C3: empty quotes before `=` do not hide zsh's EQUALS expansion.
+    /// Empty quotes before `=` do not hide zsh's EQUALS expansion.
     #[test]
     fn empty_quotes_before_equals_are_refused() {
         for refused in ["printf %s ''=sh", "printf %s \"\"=sh", "''=sh"] {
@@ -3943,7 +3943,7 @@ mod tests {
         );
     }
 
-    /// C4: a command carrying a credential in an option is never offered, kept or matched.
+    /// A command carrying a credential in an option is never offered, kept or matched.
     #[test]
     fn credential_options_are_never_remembered_or_matched() {
         let c = ctx("claude", Path::new("/w"), Some("/w"));
@@ -3978,7 +3978,7 @@ mod tests {
         assert!(credential_option(&argv(&["mysql", "-u", "root", "db"])).is_none());
     }
 
-    /// C5: concurrent saves under the store lock lose nothing and never report a spurious
+    /// Concurrent saves under the store lock lose nothing and never report a spurious
     /// "changed while saving".
     #[test]
     fn concurrent_saves_are_serialised_by_the_store_lock() {
@@ -4005,7 +4005,7 @@ mod tests {
         assert_eq!(AlwaysRules::open(&path).expect("open").rules.len(), 8);
     }
 
-    /// R1, as warnings: a runner, wrapper, interpreter, path-named program or unsafe git command
+    /// As warnings: a runner, wrapper, interpreter, path-named program or unsafe git command
     /// is kept by "Always allow", by the button or by the user's own pattern, and the user is
     /// told it runs code; "Allow for session" keeps the exact command unless the user typed more.
     #[test]
@@ -4293,8 +4293,8 @@ mod tests {
         assert_eq!(login_shell(u32::MAX - 7), None, "no such user");
     }
 
-    /// The one unwrap (W2's `unwrap_shell_wrapper`, which `dialog_prefill` and `command_tokens`
-    /// share) applies the B2/B3 checks to the quoted body: no prefill and no match for a body a
+    /// The one unwrap (`unwrap_shell_wrapper`, which `dialog_prefill` and `command_tokens`
+    /// share) applies the equals-expansion and whitespace checks to the quoted body: no prefill and no match for a body a
     /// rule could never hold.
     #[test]
     fn the_one_unwrap_applies_the_body_checks() {
@@ -4332,7 +4332,7 @@ mod tests {
         assert_eq!(dialog_prefill("NoSuchTool", &serde_json::json!({})), "");
     }
 
-    /// U2 as warnings, through the shared re-check: Always keeps an edit wherever it is (outside
+    /// Through the shared re-check: Always keeps an edit wherever it is (outside
     /// the workspace or sensitive: kept with a warning), one MCP tool, and a read.
     #[test]
     fn always_for_edits_and_mcp_goes_through_decide() {
@@ -4640,7 +4640,7 @@ mod tests {
         }
     }
 
-    /// B5: a read that names a second path (a search directory) never rides on a one-path rule.
+    /// A read that names a second path (a search directory) never rides on a one-path rule.
     #[test]
     fn every_named_path_counts() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -4806,7 +4806,7 @@ mod tests {
         assert!(AlwaysRules::open(&path).expect("open").rules.is_empty());
     }
 
-    /// S5: a file another writer changed between the read and the write is not overwritten.
+    /// A file another writer changed between the read and the write is not overwritten.
     #[test]
     fn a_file_changed_during_a_save_is_left_alone() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -4827,7 +4827,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("bytes"), between);
     }
 
-    /// S1: the cache re-reads only when the file changed.
+    /// The cache re-reads only when the file changed.
     #[test]
     fn the_store_cache_follows_the_file() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -4842,7 +4842,7 @@ mod tests {
         assert!(cache.rules().is_err());
     }
 
-    /// D2a: an unparseable or newer file is never overwritten and saved rules are off.
+    /// An unparseable or newer file is never overwritten and saved rules are off.
     #[test]
     fn a_corrupt_or_newer_file_is_kept_byte_for_byte() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -5018,7 +5018,7 @@ mcp = [
         );
     }
 
-    /// B6 and R3: export escapes properly, writes global rules only, and round-trips.
+    /// Export escapes properly, writes global rules only, and round-trips.
     #[test]
     fn export_escapes_and_writes_only_global_rules() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -5121,7 +5121,7 @@ mcp = [
         assert!(agy.contains("command(make test)"), "{agy}");
         assert!(agy.contains("mcp(test-mcp/tool)"), "{agy}");
         assert_eq!(rules.rules.len(), 6, "export never changes the rules");
-        // A5: what agy's file gets back is read back whole, the runner and the MCP entry included.
+        // What agy's file gets back is read back whole, the runner and the MCP entry included.
         let mut back = AlwaysRules::default();
         let imported = back.import_agy_settings(&agy);
         assert_eq!(imported.skipped, 0, "make test * comes back as written");

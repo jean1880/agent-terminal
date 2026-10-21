@@ -1,4 +1,4 @@
-//! Invocation keys and attestation (contract §2 "Attestation arguments", §4).
+//! Invocation keys and attestation.
 //!
 //! A bridge call is attested when its key matches an unconsumed call to `agent_terminal` seen
 //! in the principal's own provider stream, with the same tool and the same attestation
@@ -51,7 +51,7 @@ fn agy_step(progress_token: &str) -> Option<u64> {
     n.parse().ok()
 }
 
-/// The whitelisted keys only (contract §4); every other `_meta` entry, Codex
+/// The whitelisted keys only; every other `_meta` entry, Codex
 /// `x-codex-turn-metadata` included, is ignored. A present but malformed or over-long value
 /// gives `None`.
 pub fn invocation_from_meta(meta: &Map<String, Value>) -> Option<InvocationKey> {

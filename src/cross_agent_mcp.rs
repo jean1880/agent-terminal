@@ -147,7 +147,7 @@ impl ServerHandler for Bridge {
 }
 
 fn tool(name: ToolName) -> Tool {
-    // P1 owns these schemas; the same parser validates what they document.
+    // The shared parser validates what these schemas document.
     let input = name.input_schema().as_object().cloned().unwrap_or_default();
     let output = name
         .output_schema()

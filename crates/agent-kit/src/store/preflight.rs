@@ -1,6 +1,6 @@
 //! The pre-v4 upgrade preflight: the one way an existing store reaches schema 4.
 //!
-//! `Store::open` runs it before anything else touches an existing database file (contract §8.2).
+//! `Store::open` runs it before anything else touches an existing database file.
 //! The order is the one proven against a real pre-v4 database:
 //!
 //! 1. A missing file is a fresh install: no preflight, `Store::open` creates it as before.

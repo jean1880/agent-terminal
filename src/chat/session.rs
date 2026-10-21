@@ -298,10 +298,10 @@ struct Inner {
     safe_mode: Cell<Mode>,
     /// Open Claude and Codex approvals a rule can describe: the call and the working directory
     /// its rule is judged in (`None`: relative paths never resolve), by request id, so "Allow for
-    /// session" / "Always allow" can record it (D1: app-owned).
+    /// session" / "Always allow" can record it.
     pending_rules: RefCell<HashMap<String, PendingRule>>,
     /// This thread's session rules, each tagged with its agent; shared with agy's approval
-    /// server, kept through a same-agent restart, cleared by a cross-agent switch (D3).
+    /// server, kept through a same-agent restart, cleared by a cross-agent switch.
     session_rules: crate::approval_server::SessionRules,
     /// The Always rules ([`crate::always_allow::path`]), cached and re-read when the file
     /// changes; `None` offers no "Always".
@@ -331,7 +331,7 @@ struct Inner {
     /// How long a Claude permission request may wait for the user before it is denied (agy's
     /// socket has the same bound). Injectable for tests.
     approval_deadline: Cell<Duration>,
-    /// Claude's `--thinking-display summarized` for the running process (W3.2).
+    /// Claude's `--thinking-display summarized` for the running process.
     thinking: ThinkingFlag,
     /// User input written before Claude's init, retained only for the thinking-flag retry.
     pre_init_prompts: RefCell<Vec<Sent>>,
@@ -351,7 +351,7 @@ struct Inner {
     codex_turn_grant_paths: RefCell<Vec<PathBuf>>,
     /// What the current turn said, for the quick replies offered when it completes.
     reply_turn: RefCell<reply_questions::ReplyTurn>,
-    // ---- delegation (P4 §3.4) ----
+    // ---- delegation ----
     /// A bound root's or a supervised child's delegation hooks.
     hooks: Option<Rc<dyn DelegationHooks>>,
     /// A supervised child's gate, publication boundary and fixed task mode.
@@ -955,7 +955,7 @@ impl Inner {
             self.has_conversation.set(true);
         }
         let env = self.route_codex_permission(env);
-        // A supervised child's events cross its publication boundary first (P4 §3.5): what it
+        // A supervised child's events cross its publication boundary first: what it
         // withholds goes nowhere, and what it passes is the sanitised envelope.
         let env = match &self.child {
             Some(child) => {
@@ -1350,7 +1350,7 @@ impl Inner {
         self.open.borrow_mut().delegation = binding.as_ref().and_then(|b| b.open.clone());
         let open = self.open.borrow();
         let mut argv = self.adapter.borrow().argv(&open);
-        // W3.2: Claude shares its thinking only with this hidden flag, so it goes only to a
+        // Claude shares its thinking only with this hidden flag, so it goes only to a
         // version known to take it (`claude_probe`), and never after the one retry without it.
         let thinking = self.adapter.borrow().driver() == Driver::Claude
             && !self.thinking.retried.get()
@@ -2122,7 +2122,7 @@ impl Inner {
         }
     }
 
-    /// Codex fields an approval request is known to carry (W0 fixtures). Any other field with a
+    /// Codex fields an approval request is known to carry. Any other field with a
     /// value (an escalation, extra permissions, a grant root) means the request is not the plain
     /// call a rule was made for, so it is never auto-accepted.
     fn codex_plain_request(tool: &str, input: &serde_json::Value) -> bool {
@@ -2172,7 +2172,7 @@ impl Inner {
                 .all(|(k, v)| known.contains(&k.as_str()) || v.is_null())
     }
 
-    /// The app's own approval gate for Claude and Codex (agy's is its socket, D1). For an
+    /// The app's own approval gate for Claude and Codex (agy's is its socket). For an
     /// `ApprovalRequested` envelope it sets the buttons that mean the same everywhere ("Allow for
     /// session" only where a rule could match the call; "Always allow" also needs a rules file and
     /// a kind it applies to: shell, a contained edit, an MCP tool), says what Always keeps,
@@ -2212,7 +2212,7 @@ impl Inner {
             cwd: cwd.as_deref(),
             home: home.as_deref(),
         };
-        // A4: in a supervised child, a rule applies, and a card offers to keep one, only where
+        // In a supervised child, a rule applies, and a card offers to keep one, only where
         // its gate says (inside its own lease, a writing mode within the parent's ceiling); a
         // card the gate forced (`AskOnly`) offers none.
         let forced = self.ask_only.borrow().contains(&request);
@@ -2245,10 +2245,10 @@ impl Inner {
                 options.contains(&Decision::AllowAlways),
             )
         });
-        // R5: a Codex request with a field a plain call does not carry (an escalation) is never
+        // A Codex request with a field a plain call does not carry (an escalation) is never
         // answered by the app, by a rule or by Accept edits.
         let plain = driver != Driver::Codex || Self::codex_plain_request(tool, input);
-        // Codex Accept edits runs on `untrusted` (D5): the app accepts edits whose every path is
+        // Codex Accept edits runs on `untrusted`: the app accepts edits whose every path is
         // in the workspace and not sensitive; anything else, and every shell command, asks.
         // A child's Accept edits auto also needs every target to be one its rules may cover.
         let accept_edit = driver == Driver::Codex
@@ -2444,7 +2444,7 @@ impl Inner {
         self.session_rules.borrow_mut().add(rule);
     }
 
-    /// Ends this thread's session approvals (a cross-agent switch, D3); returns how many.
+    /// Ends this thread's session approvals (a cross-agent switch); returns how many.
     fn end_session_rules(&self) -> usize {
         self.pending_rules.borrow_mut().clear();
         let mut rules = self.session_rules.borrow_mut();
@@ -2507,7 +2507,7 @@ impl Inner {
         }
     }
 
-    /// W3.2: Claude exited refusing `--thinking-display`. Restarts it ONCE without the flag (the
+    /// Claude exited refusing `--thinking-display`. Restarts it ONCE without the flag (the
     /// session never fails to start over it) and shows the thread's reasoning as not shared.
     /// False when this exit is anything else.
     fn retry_without_thinking(self: &Rc<Self>, code: Option<i32>) -> bool {
@@ -3472,13 +3472,13 @@ impl Inner {
             custom_rule,
             crate::always_allow::saved_rules_enabled(),
         );
-        // App-owned scope (D1): the rule is recorded here; the agent only ever hears a plain
+        // App-owned scope: the rule is recorded here; the agent only ever hears a plain
         // allow (Claude without `updatedPermissions`, Codex `accept`). No rule, no claim of one:
         // the card then says "Allowed".
         let pending = self.pending_rules.borrow_mut().remove(request);
         let plan =
             matches!(decision, Decision::AllowAlways | Decision::AllowForSession).then(|| {
-                // A4, re-checked at keep: a child keeps only a rule its gate lets cover this call,
+                // Re-checked at keep: a child keeps only a rule its gate lets cover this call,
                 // never a custom one (it could reach further than the call).
                 if self.child.is_some()
                     && !self.child_may_keep(request, pending.as_ref(), &custom_rule)
@@ -3992,7 +3992,7 @@ impl Inner {
         } else {
             handoff_notice(&format!("in {}", driver_label(driver)), &handoff)
         };
-        // Session approvals belong to the agent they were given to (D3); Always rules carry.
+        // Session approvals belong to the agent they were given to; Always rules carry.
         if from != driver {
             let ended = self.end_session_rules();
             if ended > 0 {
@@ -4721,9 +4721,9 @@ impl Inner {
     }
 }
 
-// ---- delegation: hooks and a supervised child's inherited authority (P4 §3.4, §5.2–§5.3) ----
+// ---- delegation: hooks and a supervised child's inherited authority ----
 
-/// Said when a supervised child's answer would keep a rule its gate does not allow (A4).
+/// Said when a supervised child's answer would keep a rule its gate does not allow.
 const CHILD_RULE_REFUSED: &str = "a delegated agent keeps rules only for files in its own worktree";
 
 /// A mode as the picker names it, for notices.
@@ -4781,7 +4781,7 @@ impl Inner {
             .map(|child| child.gate.judge(tool, input, cwd))
     }
 
-    /// Whether a session or Always rule may match `action` here (A4): always in a root; in a
+    /// Whether a session or Always rule may match `action` here: always in a root; in a
     /// child, only where its gate says.
     fn rule_may_apply(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool {
         self.child
@@ -5036,7 +5036,7 @@ fn codex_edits_contained(input: &serde_json::Value, workspace: &Path, home: Opti
     })
 }
 
-/// What the switch notice adds when session approvals end (D3).
+/// What the switch notice adds when session approvals end.
 fn session_rules_ended(n: usize) -> String {
     format!("Session approvals ({n}) ended.")
 }
@@ -5173,7 +5173,7 @@ impl ChatBackend for ChatSession {
     }
 
     fn answer_questions(&self, request: &str, answers: serde_json::Value) {
-        // No agent acknowledges an answer (F19): once the adapter has accepted and written it,
+        // No agent acknowledges an answer: once the adapter has accepted and written it,
         // the card is resolved here, or it would sit at "Sending…" for good.
         if self.inner.command(Command::Answer {
             request: request.to_owned(),
@@ -7835,7 +7835,7 @@ mod tests {
         }
     }
 
-    /// W3.2: a Claude known to take `--thinking-display` gets it; one that exits at start with
+    /// A Claude known to take `--thinking-display` gets it; one that exits at start with
     /// an unknown-option error is restarted ONCE without it, its reasoning shows as not shared,
     /// and the session starts with no error shown.
     #[test]
@@ -7943,7 +7943,7 @@ mod tests {
         });
     }
 
-    /// W3.2: the retry is for a failed exit before the CLI started. A Claude that sent its
+    /// The retry is for a failed exit before the CLI started. A Claude that sent its
     /// `init` and then exits, or one that exits 0, takes the normal path: no restart.
     #[test]
     fn the_thinking_retry_needs_a_failed_exit_before_init() {
@@ -8267,7 +8267,7 @@ mod tests {
         });
     }
 
-    /// W1b 1.11 (F22): an agy thread in Ask keeps Ask through a model switch and through a
+    /// An agy thread in Ask keeps Ask through a model switch and through a
     /// compact-style same-agent restart onto a launch whose profile default is another mode.
     /// No mode change is announced, and the restart never passes `--mode plan`.
     #[test]
@@ -9054,7 +9054,7 @@ mod tests {
         assert_ne!(build_handoff(&history, "t").fence, handoff.fence);
     }
 
-    // ---- app-owned approval rules (plan W1a) ----
+    // ---- app-owned approval rules ----
 
     /// A session on a real adapter whose process records what it is sent in `stdin.log`, with
     /// its Always rules in `dir`.
@@ -9132,7 +9132,7 @@ mod tests {
         std::fs::read_to_string(dir.join("stdin.log")).unwrap_or_default()
     }
 
-    /// F1, live: after "Allow for session" on `touch b.tmp` with the user's exact pattern,
+    /// Live: after "Allow for session" on `touch b.tmp` with the user's exact pattern,
     /// `touch b.tmp` is answered by the app, while `mkdir dd` and `touch b.tmp; rm x` ask; Claude
     /// is never sent `updatedPermissions` and the mode stays Ask.
     #[test]
@@ -9174,7 +9174,7 @@ mod tests {
         });
     }
 
-    /// W1b 1.5, canary: a command carrying an `sk-` token reaches the view masked, in the title,
+    /// A command carrying an `sk-` token reaches the view masked, in the title,
     /// input and reason; it is offered neither "Allow for session" nor "Always allow"; the
     /// user's prompt snapshot is masked too. The call the app answers is still the real one.
     #[test]
@@ -9265,7 +9265,7 @@ mod tests {
         });
     }
 
-    /// W1b 1.6: a Claude request nobody answers is denied at the deadline, with a deny frame to
+    /// A Claude request nobody answers is denied at the deadline, with a deny frame to
     /// the agent and a notice; one answered in time sends nothing more.
     #[test]
     fn an_unanswered_claude_request_is_denied_at_the_deadline() {
@@ -9313,7 +9313,7 @@ mod tests {
     const W0_CODEX_SHELL: &str =
         include_str!("../../tests/fixtures/real/codex/ask-shell-decline.jsonl");
 
-    /// The W0 Codex frame: "Allow for session" sends a plain `accept` and records a rule; the
+    /// The Codex frame: "Allow for session" sends a plain `accept` and records a rule; the
     /// same command then auto-approves, `ls -la; id` asks.
     #[test]
     fn codex_allow_for_session_replays_the_w0_frame() {
@@ -9445,7 +9445,7 @@ mod tests {
     const W0_CODEX_ACCEPT_EDITS: &str =
         include_str!("../../tests/fixtures/real/codex/untrusted-workspacewrite.jsonl");
 
-    /// The W0 frames of `fixture` whose method is one of `methods`, the recording's sandbox
+    /// The frames of `fixture` whose method is one of `methods`, the recording's sandbox
     /// replaced by `dir`.
     fn w0_frames(fixture: &str, dir: &Path, methods: &[&str]) -> Vec<String> {
         let dir = dir.to_string_lossy();
@@ -9476,8 +9476,8 @@ mod tests {
         .to_string()
     }
 
-    /// U2 and D4: Session and Always are offered for a contained edit (a Codex patch's path
-    /// comes from its `item/started` frame, W0 `ask-edit-decline.jsonl`) and for one MCP tool.
+    /// Session and Always are offered for a contained edit and for one MCP tool. A Codex
+    /// patch's path comes from its `item/started` frame (`ask-edit-decline.jsonl`).
     /// The Always rule is matched by kind: a new Codex session and a Claude session both have
     /// the same edit answered by the app. An edit outside the workspace is offered neither.
     #[test]
@@ -9559,7 +9559,7 @@ mod tests {
         });
     }
 
-    /// Plan 2.4 (review): Accept edits chosen while an Ask turn runs is deferred to the next turn,
+    /// Accept edits chosen while an Ask turn runs is deferred to the next turn,
     /// so an edit that turn asks for is not answered by the app.
     #[test]
     fn codex_accept_edits_chosen_mid_turn_does_not_auto_accept_that_turn() {
@@ -9603,7 +9603,7 @@ mod tests {
         });
     }
 
-    /// Plan 2.4 (D5), replaying `codex/untrusted-workspacewrite.jsonl`: in Accept edits the
+    /// Replaying `codex/untrusted-workspacewrite.jsonl`: in Accept edits the
     /// in-workspace edit is answered `accept` by the app and the shell `ls -la` shows a card. In
     /// Ask, or for an edit outside the workspace, the edit asks too.
     #[test]
@@ -9656,7 +9656,7 @@ mod tests {
         }
     }
 
-    /// R5 on Accept edits: the same in-workspace W0 patch, carrying an escalation (a grant root),
+    /// On Accept edits: the same in-workspace patch, carrying an escalation (a grant root),
     /// is not accepted by the app.
     #[test]
     fn codex_accept_edits_never_accepts_a_request_with_an_escalation() {
@@ -9686,7 +9686,7 @@ mod tests {
         });
     }
 
-    /// B5 on Accept edits: every target of a multi-change patch (paths and rename targets) must
+    /// On Accept edits: every target of a multi-change patch (paths and rename targets) must
     /// pass the containment check; one outside, or one that is not text, makes it ask.
     #[test]
     fn codex_accept_edits_checks_every_target_of_a_patch() {
@@ -9713,7 +9713,7 @@ mod tests {
         }
     }
 
-    /// Plan 2.3, from the W0 Codex frame: "Always allow" saved with the dialog's prefill (the
+    /// From the Codex frame: "Always allow" saved with the dialog's prefill (the
     /// bare `ls -la`) is a rule a new session matches the same wrapped request with.
     #[test]
     fn codex_always_rule_from_the_prefill_matches_the_w0_request_next_time() {
@@ -9846,7 +9846,7 @@ mod tests {
         });
     }
 
-    /// D2a: an unusable rules file is kept byte-for-byte, saved rules are off with a notice
+    /// An unusable rules file is kept byte-for-byte, saved rules are off with a notice
     /// naming it, and "Always allow" still holds for the session.
     #[test]
     fn a_corrupt_rules_file_is_never_overwritten_and_is_named() {
@@ -9874,7 +9874,7 @@ mod tests {
         });
     }
 
-    /// D3 and U2: session approvals end on a cross-agent switch (and the notice says how many),
+    /// Session approvals end on a cross-agent switch (and the notice says how many),
     /// survive a same-agent model switch, and an Always rule carries to the other agent by kind.
     #[test]
     fn session_rules_end_on_a_cross_agent_switch_and_always_rules_carry() {
@@ -9962,7 +9962,7 @@ mod tests {
         });
     }
 
-    /// S6: an answer that arrives after the deadline denied the request keeps no rule, whatever
+    /// An answer that arrives after the deadline denied the request keeps no rule, whatever
     /// the user's pattern.
     #[test]
     fn a_late_answer_after_the_deadline_keeps_no_rule() {
@@ -9991,7 +9991,7 @@ mod tests {
         });
     }
 
-    /// D1: with Automatic Pattern Approvals off, a saved rule approves nothing and no card offers
+    /// With Automatic Pattern Approvals off, a saved rule approves nothing and no card offers
     /// "Always allow"; an "Always allow" on a card shown before is allowed once and keeps
     /// nothing, and session grants still approve. On again, the saved rule answers as before.
     #[test]
@@ -10089,7 +10089,7 @@ mod tests {
         assert!(custom.is_some(), "a session answer keeps its own pattern");
     }
 
-    /// R4: Claude's working directory moves with `cd`, so a relative path is never offered a
+    /// Claude's working directory moves with `cd`, so a relative path is never offered a
     /// rule; an absolute one inside the workspace is.
     #[test]
     fn claude_relative_paths_are_never_offered_a_rule() {
@@ -10151,7 +10151,7 @@ mod tests {
         });
     }
 
-    /// R5: a Codex request carrying a field a plain call does not have (an escalation) is never
+    /// A Codex request carrying a field a plain call does not have (an escalation) is never
     /// auto-accepted by a matching rule.
     #[test]
     fn codex_requests_with_extra_fields_are_never_auto_accepted() {
@@ -10319,7 +10319,7 @@ mod tests {
             assert!(session.inner.agy_reading.get().is_none());
             assert!(session.inner.agy_hold.borrow().is_empty());
 
-            // Whole, as a snapshot: agy's thinking is never streamed for show (W3.1).
+            // Whole, as a snapshot: agy's thinking is never streamed for show.
             let reasoning_delta = seen.borrow().iter().find_map(|env| {
                 if let Event::ContentSnapshot {
                     stream: StreamKind::Reasoning,

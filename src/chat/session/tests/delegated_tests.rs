@@ -1,4 +1,4 @@
-//! Lane B (P4 §3.4, §5.2–§5.3, §7.1): the session seam with fake delegation hooks, a fake child
+//! The session seam with fake delegation hooks, a fake child
 //! gate and publisher, and real adapters over deterministic fake processes. Nothing reaches a
 //! provider or the network.
 
@@ -50,7 +50,7 @@ impl ApprovalGate for TestGate {
     }
 }
 
-/// §5.2 step 3 for a Plan child: only reads pass to the existing policy; every edit, command
+/// For a Plan child: only reads pass to the existing policy; every edit, command
 /// and unknown tool is denied. The classification here stands in for `authority::effect`.
 fn plan_gate() -> Rc<TestGate> {
     const READS: &[&str] = &["Read", "Glob", "Grep", "LS", "view_file", "list_dir"];
@@ -400,7 +400,7 @@ fn stdin_has(ctx: &glib::MainContext, dir: &Path, needle: &str) -> bool {
 
 // ---- delivery ----
 
-/// §3.4: a task starts a turn as a stored `DelegatedMessage` (never a `UserMessage`), labelled
+/// A task starts a turn as a stored `DelegatedMessage` (never a `UserMessage`), labelled
 /// for the agent as coming from another agent, through the child's publication boundary
 /// (never `store.append_event`), and never through the session's own queue.
 #[test]
@@ -514,7 +514,7 @@ fn delegated_input_that_cannot_be_written_now_is_refused_and_never_queued() {
     });
 }
 
-/// §3.4: a Codex strict steer is pinned to the running turn. Accepted, its tag gets an `ok`;
+/// A Codex strict steer is pinned to the running turn. Accepted, its tag gets an `ok`;
 /// refused, its tag gets an `error`, and NO new turn starts (the user steer's fallback is not
 /// taken).
 #[test]
@@ -585,7 +585,7 @@ fn a_refused_strict_steer_starts_no_new_turn() {
 
 // ---- inherited authority before every auto-allow ----
 
-/// A4 / §5.3: the gate judges first. A denial is answered at once even when an Always rule
+/// The gate judges first. A denial is answered at once even when an Always rule
 /// matches the call; with the gate deferring but forbidding rules, the rule neither applies
 /// nor is offered; only when the gate allows rules does the Always rule answer the call.
 #[test]
@@ -672,7 +672,7 @@ fn an_ask_only_card_offers_no_grant_and_is_never_auto_allowed() {
     });
 }
 
-/// §5.3 keep row: a rule the card offered is checked again when the answer comes; if the gate
+/// A rule the card offered is checked again when the answer comes; if the gate
 /// no longer allows it, the call is allowed once and nothing is kept, with a notice.
 #[test]
 fn a_rule_is_rechecked_when_it_would_be_kept() {
@@ -981,7 +981,7 @@ fn an_agy_child_never_falls_back_to_a_hookless_process() {
     }
 }
 
-/// §5.2 step 3, Claude: a Plan child's edit, command and unknown tool are denied before any
+/// Claude: a Plan child's edit, command and unknown tool are denied before any
 /// card or rule; a read passes to the existing policy.
 #[test]
 fn plan_denies_edit_exec_and_unknown_for_claude() {
@@ -1015,7 +1015,7 @@ fn plan_denies_edit_exec_and_unknown_for_claude() {
     });
 }
 
-/// §5.2 step 3, Codex: a Plan child's patch, command, permission request and unresolved MCP
+/// Codex: a Plan child's patch, command, permission request and unresolved MCP
 /// call (unknown) are all declined at once, before any card can be answered.
 #[test]
 fn plan_denies_edit_exec_and_unknown_for_codex() {
@@ -1125,7 +1125,7 @@ fn a_codex_ask_child_requests_workspace_write_and_reads_it_back() {
 
 // ---- root isolation ----
 
-/// §3.6: a child's turn, model change and usage reach its own sink and publisher only; the
+/// A child's turn, model change and usage reach its own sink and publisher only; the
 /// root session's state, sink and store are untouched.
 #[test]
 fn a_child_turn_model_change_and_usage_never_touch_the_root() {
@@ -1203,7 +1203,7 @@ fn a_child_turn_model_change_and_usage_never_touch_the_root() {
     });
 }
 
-// ---- generations, exit watches and rebinds (§7.1, amendment A2) ----
+// ---- generations, exit watches and rebinds ----
 
 /// One watch per generation, kept until that generation is seen to exit; `process_stopping`
 /// (the synthetic stop) runs once per generation, before the exit, and frees nothing; a rebind
@@ -1283,7 +1283,7 @@ fn every_generation_keeps_its_exit_watch_until_it_has_exited() {
     });
 }
 
-/// §3.4 `launch_spec`: the binding staged for the next generation is taken once: its argv tail
+/// `launch_spec`: the binding staged for the next generation is taken once: its argv tail
 /// follows the adapter's argv, its environment follows the profile's, and every inherited
 /// delegation variable is removed first. A start nothing was staged for gets no binding.
 #[test]

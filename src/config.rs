@@ -1666,7 +1666,7 @@ mod tests {
             .contains("existing file"));
     }
 
-    /// W1b 1.10: no project's config path is baked into the binary (the plan's U1).
+    /// No project's config path is baked into the binary.
     #[test]
     fn no_agent_config_path_is_hard_coded() {
         fn scan(dir: &Path, hits: &mut Vec<String>) {

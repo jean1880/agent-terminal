@@ -10,7 +10,7 @@
 //! The probe also runs `claude --version` beside it and remembers the answer per binary
 //! ([`known_version`]); a thread's session adds what its own `init` reports
 //! ([`note_version`]). That version gates `--thinking-display summarized`
-//! ([`thinking_display_allowed`], W3.2): the flag is hidden, so it is passed only to a Claude
+//! ([`thinking_display_allowed`]): the flag is hidden, so it is passed only to a Claude
 //! known to take it, and a binary that refused it once is not offered it again this run.
 
 use std::cell::{Cell, RefCell};
@@ -397,7 +397,7 @@ pub(crate) mod tests {
         assert_eq!(launches.lines().count(), 1, "one process for three callers");
     }
 
-    /// W3.2: the probe learns the binary's version from `claude --version`, which gates
+    /// The probe learns the binary's version from `claude --version`, which gates
     /// `--thinking-display`; an old, unknown or refusing binary is not offered it.
     #[test]
     fn the_probe_learns_the_version_that_gates_thinking_display() {

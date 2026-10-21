@@ -70,7 +70,7 @@ pub fn current_step(model: &Transcript, id: &str) -> Option<String> {
         }
     }
     let step = running.or(latest)?;
-    // The step card's own title (W3.4), so the shelf and the card say the same.
+    // The step card's own title, so the shelf and the card say the same.
     Some(
         payload::tool_title(
             step.kind,
@@ -481,7 +481,7 @@ pub(crate) mod tests {
             Some("Read src/config.rs")
         );
 
-        // The shelf line is exactly the step card's title (one grammar, W3.4).
+        // The shelf line is exactly the step card's title (one grammar).
         let step = match &t.get("r1").expect("step").body {
             Body::Tool(tool) => tool.clone(),
             other => panic!("{other:?}"),

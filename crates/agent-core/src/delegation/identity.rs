@@ -1,5 +1,4 @@
-//! A worker's model and effort, and how sure we are of each (contract §2 `Provenance`, §5
-//! provenance rows).
+//! A worker's model and effort, and the provenance of each observation.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +52,7 @@ impl ValueProvenance {
     }
 }
 
-/// A worker's identity (contract §2 `Identity`).
+/// A worker's identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub driver: Driver,
@@ -136,7 +135,7 @@ fn refuse(v: &mut ValueProvenance) {
     v.effective = None;
 }
 
-/// Applies one observation under the contract §5 provenance rows.
+/// Applies one observation using the provider's provenance rules.
 pub fn observe(id: &mut Identity, obs: IdentityObservation) {
     let model_rule = model_rule(id.driver);
     let effort_rule = effort_rule(id.driver);

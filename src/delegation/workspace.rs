@@ -1,4 +1,4 @@
-//! Lane D: worktree leases for `isolated_worktree` children (§6). Every function here blocks
+//! Worktree leases for `isolated_worktree` children. Every function here blocks
 //! (git): run it in `gio::spawn_blocking`.
 //!
 //! The AGENTS.md worktree rules hold: names reaching git never start with `-` (agent-kit's

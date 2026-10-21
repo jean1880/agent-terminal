@@ -262,8 +262,7 @@ mod tests {
     }
 
     /// The walkthrough's "Get Started" lies fully inside the dialog, clear of its edge, in a
-    /// narrow window (the dialog becomes a bottom sheet) and a wide one (ui-audit: it sat on
-    /// the dialog's bottom edge).
+    /// narrow window (the dialog becomes a bottom sheet) and a wide one.
     #[test]
     #[ignore = "native GTK layout; run alone in an isolated display"]
     fn native_welcome_button_is_inside_the_dialog() {

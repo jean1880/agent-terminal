@@ -1,4 +1,4 @@
-//! The pure parts of the agy capability-leak mitigation (contract §7). The app does the I/O
+//! The pure parts of the agy capability-leak mitigation. The app does the I/O
 //! (directory scans, `/proc` reads, `SO_PEERCRED`) and passes the results in.
 
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ pub fn allow_rule(tool: ToolName) -> String {
     format!("mcp({}/{})", super::SERVER_NAME, tool.as_str())
 }
 
-/// Why §7 L2 withheld delegation. Names and relative paths only, never values.
+/// Why the file-system guard withheld delegation. Names and relative paths only, never values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum L2Refusal {
     ArgvRedirect(String),
@@ -138,7 +138,7 @@ pub fn is_bridge_cmdline(cmdline: &[u8]) -> bool {
     argv0_ok && fields.next() == Some(BRIDGE_ARG.as_bytes()) && fields.next().is_none()
 }
 
-/// Contract §1 lineage self-check, bridge side: the bridge's parent's ppid (from the parent's
+/// Lineage self-check, bridge side: the bridge's parent's ppid (from the parent's
 /// `stat`) equals `AGENT_TERMINAL_DELEGATION_APP_PID`.
 pub fn lineage_ok(parent_stat: &str, app_pid: &str) -> bool {
     match (stat_ppid(parent_stat), app_pid.trim().parse::<u32>()) {

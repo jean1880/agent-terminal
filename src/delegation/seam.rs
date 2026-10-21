@@ -1,5 +1,4 @@
-//! The cross-lane seam of the delegation supervisor. Frozen: lanes change
-//! bodies elsewhere, never these shapes. A change here needs the coordinator.
+//! Shared interfaces between the delegation supervisor, sessions and app services.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -60,7 +59,7 @@ impl RuntimeDir {
 /// token).
 #[derive(Clone, Default)]
 pub(crate) struct LaunchBinding {
-    /// `OpenSession.delegation` (the Codex adapter's thread config overlay: P5).
+    /// `OpenSession.delegation` (the Codex adapter's thread config overlay).
     pub open: Option<DelegationBinding>,
     /// agy only: `DelegationBinding::env(app_pid)`.
     pub env: Vec<(String, String)>,
@@ -149,9 +148,9 @@ pub(crate) trait ProcFacts {
     fn children_of(&self, ppid: u32) -> Vec<u32>;
 }
 
-// ---- authority (D implements, B calls, A constructs) --------------------------------------------
+// ---- authority --------------------------------------------
 
-/// What a provider tool call does, provider by provider (§5.1).
+/// What a provider tool call does, provider by provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Effect {
     Read,
@@ -288,7 +287,7 @@ pub(crate) struct SessionOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputSource {
-    /// Claude's inert read-back turn (§3.3).
+    /// Claude's inert read-back turn.
     Bootstrap,
     /// The spawn's task.
     Task,
@@ -298,7 +297,7 @@ pub(crate) enum InputSource {
     },
 }
 
-/// One execution-driving delivery, already reserved durably and passed E7 by the caller.
+/// One execution-driving delivery, already reserved durably and checked against the current authority by the caller.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegatedInput {
     pub operation: OperationId,
@@ -306,9 +305,9 @@ pub(crate) struct DelegatedInput {
     pub source: InputSource,
     pub from: WorkerId,
     pub from_label: String,
-    /// The scrubbed canonical text (contract §2). Labelled by the session as delegated data.
+    /// The scrubbed canonical text. Labelled by the session as delegated data.
     pub text: String,
-    /// `StartTurn`, `WriteLive` or `SteerNow` only. `QueueNextTurn` is the supervisor's (§4.5).
+    /// `StartTurn`, `WriteLive` or `SteerNow` only. `QueueNextTurn` is the supervisor's.
     pub plan: DeliveryPlan,
     /// Correlates the adapter's `ControlResult` for a Codex steer.
     pub tag: String,
@@ -326,9 +325,9 @@ pub(crate) enum DelegatedOutcome {
     Refused(ErrorCode),
 }
 
-// ---- UI and closing (A provides, E and P6 consume) --------------------------------------------
+// ---- UI and closing --------------------------------------------
 
-/// P6 implements; the supervisor holds it weakly.
+/// A worker event subscriber, held weakly by the supervisor.
 pub(crate) trait WorkerSubscriber {
     fn scoped(&self, env: &ScopedEnvelope);
     /// A live event whose store transaction committed at this sequence.

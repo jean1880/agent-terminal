@@ -1,4 +1,4 @@
-//! The tool wire format (contract §2 and §3): request and response structs, the mutation
+//! The tool wire format: request and response structs, the mutation
 //! receipt envelope, and the output budget.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -21,10 +21,10 @@ use super::tools::ToolName;
 use crate::adapter::Driver;
 use crate::event::{WorkerOrigin, WorkerState};
 
-/// Contract §3 "Output budget": `structuredContent` plus the same JSON as an escaped text
+/// "Output budget": `structuredContent` plus the same JSON as an escaped text
 /// block, measured on the real serialisation.
 pub const OUTPUT_BUDGET: usize = 786_432;
-/// A serialised `WorkerSummary` (contract §2 output bounds).
+/// A serialised `WorkerSummary`.
 pub const MAX_SUMMARY_BYTES: usize = 48 * 1024;
 /// Holds `delivery_unknown.details.receipt` of a maximal receipt.
 pub const MAX_ERROR_DETAILS_BYTES: usize = 64 * 1024;
@@ -35,7 +35,7 @@ pub const MAX_ACK_BYTES: usize = 64 * 1024;
 /// An encoded JSON-RPC id (the bridge checks it before dispatch).
 pub const MAX_REQUEST_ID_BYTES: usize = 256;
 
-/// The workspace a spawn asks for (contract §2 `Workspace`), tagged by `kind`.
+/// The workspace a spawn asks for, tagged by `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceRequest {
@@ -68,7 +68,7 @@ pub enum WorkspaceKind {
     IsolatedWorktree,
 }
 
-/// When a send is delivered (contract §3 `cross_agent_send`).
+/// When a send is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
@@ -77,7 +77,7 @@ pub enum Delivery {
     NextTurn,
 }
 
-/// An operation's dispatch state (contract §2 `DispatchState`).
+/// An operation's dispatch state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchState {
@@ -112,7 +112,7 @@ impl DispatchState {
     }
 }
 
-/// How a provider honours `delivery: this_run` (contract §2 `ThisRunSupport`).
+/// How a provider honours `delivery: this_run`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThisRunSupport {
@@ -124,7 +124,7 @@ pub enum ThisRunSupport {
     Unsupported,
 }
 
-/// What a caller may do to a worker (contract §2 `Controls`).
+/// What a caller may do to a worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Controls {
     pub send: bool,
@@ -133,7 +133,7 @@ pub struct Controls {
     pub close: bool,
 }
 
-/// A state of either domain (contract §2 `StateRef`).
+/// A state of either domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "domain", content = "value", rename_all = "snake_case")]
 pub enum StateRef {
@@ -141,13 +141,13 @@ pub enum StateRef {
     Run(RunState),
 }
 
-/// Most warnings in one receipt (contract §2).
+/// Most warnings in one receipt.
 pub const MAX_WARNINGS: usize = 8;
-/// Longest warning code and message, in bytes (contract §2).
+/// Longest warning code and message, in bytes.
 pub const MAX_WARNING_CODE_BYTES: usize = 64;
 pub const MAX_WARNING_MESSAGE_BYTES: usize = 512;
 
-/// A non-fatal note on a receipt (contract §2 `Warning`). `message` is scrubbed.
+/// A non-fatal note on a receipt. `message` is scrubbed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Warning {
     pub code: String,
@@ -164,7 +164,7 @@ impl Warning {
     }
 }
 
-/// The envelope every mutating tool's output starts with (contract §2 `MutationReceipt`),
+/// The envelope every mutating tool's output starts with,
 /// flattened into the tool's output object. Frozen at acceptance: a replay refreshes only
 /// `replayed` and `dispatch`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,7 +179,7 @@ pub struct MutationReceipt {
     pub warnings: Vec<Warning>,
 }
 
-/// A worker's delegation status (contract §6), the same 6 codes in the store, on the wire and
+/// A worker's delegation status, the same 6 codes in the store, on the wire and
 /// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,7 +202,7 @@ impl DelegationStatusCode {
         DelegationStatusCode::Unavailable,
     ];
 
-    /// Only `rebind_required` is left by an automatic rebind (contract §6).
+    /// Only `rebind_required` is left by an automatic rebind.
     pub fn auto_rebind(self) -> bool {
         match self {
             DelegationStatusCode::RebindRequired => true,
@@ -221,7 +221,7 @@ pub const MAX_STATUS_REASON_BYTES: usize = 256;
 pub const MAX_STATUS_PATHS: usize = 16;
 pub const MAX_STATUS_PATH_BYTES: usize = 256;
 
-/// `WorkerSummary.delegation` (contract §2 `DelegationStatus`).
+/// `WorkerSummary.delegation`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationStatus {
     pub code: DelegationStatusCode,
@@ -270,7 +270,7 @@ pub struct ModeAdmission {
     pub child_bridge: ChildBridge,
 }
 
-/// `"parent"` or a worker handle (contract §3 `cross_agent_send.target`).
+/// `"parent"` or a worker handle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Target {
     Parent,
@@ -779,7 +779,7 @@ impl ToolRequest {
         }
     }
 
-    /// Bounds (contract §3) and cross-field rules: a spawn's workspace for its mode, a send's
+    /// Bounds and cross-field rules: a spawn's workspace for its mode, a send's
     /// kind for its direction, read's `idempotency_key` iff `acknowledge`.
     pub fn validate(&self, limits: &Limits) -> Result<(), ToolError> {
         match self {
@@ -881,8 +881,7 @@ impl ToolRequest {
         }
     }
 
-    /// Every omitted optional field with a documented default filled in (contract §2
-    /// canonical request).
+    /// A canonical request with every omitted optional field's documented default filled in.
     pub fn normalised(&self) -> ToolRequest {
         let mut out = self.clone();
         match &mut out {
@@ -1297,7 +1296,7 @@ pub struct PageMessage {
     pub at: String,
 }
 
-/// A worker as `list`, `read` and `wait` report it (contract §2 `WorkerSummary`).
+/// A worker as `list`, `read` and `wait` report it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
     pub worker_id: WorkerId,
@@ -1354,7 +1353,7 @@ pub struct ListPage {
 // Output bounds
 // ---------------------------------------------------------------------------------------------
 
-/// Field bounds of a `WorkerSummary` (contract §2 output bounds).
+/// Field bounds of a `WorkerSummary`.
 pub const MAX_NAME_CHARS: usize = 80;
 pub const MAX_MODEL_BYTES: usize = 128;
 pub const MAX_EFFORT_BYTES: usize = 32;
@@ -1457,7 +1456,7 @@ pub fn request_id_ok(encoded_id: &str) -> bool {
     encoded_id.len() <= MAX_REQUEST_ID_BYTES
 }
 
-/// The final guard (contract §3): an over-budget output becomes `internal_error` with
+/// The final guard: an over-budget output becomes `internal_error` with
 /// `details.reason: "output_budget"` (and `details.operation_id` when one exists). It only
 /// changes what is sent, never the stored operation.
 pub fn guard_output(output: Value, operation: Option<&OperationId>) -> Result<Value, ToolError> {

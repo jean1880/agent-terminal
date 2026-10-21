@@ -1,4 +1,4 @@
-//! Lane D: contract §7 L2, the file-system part (the pure parts are `agent_core::delegation::
+//! L2, the file-system part (the pure parts are `agent_core::delegation::
 //! agy_guard`). Blocking: run off the main thread.
 //!
 //! Every check fails closed: an entry that cannot be listed, a type that cannot be read, a

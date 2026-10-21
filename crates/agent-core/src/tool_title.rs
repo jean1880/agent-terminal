@@ -1,4 +1,4 @@
-//! One title grammar for every agent's tool cards (plan W3.4).
+//! One title grammar for every agent's tool cards.
 //!
 //! `Read <path>`, `Search <pattern>`, `Run <command>`, `Edit <path>`, `Create <path>`,
 //! `Fetch <url>` and `<server>/<tool>`, whichever agent ran the tool and whatever it named it.
@@ -519,7 +519,7 @@ mod tests {
         classify(item, name, Some(&input)).text()
     }
 
-    /// The W0 frames of one agent, as recorded.
+    /// The frames of one agent, as recorded.
     fn frames(fixture: &str) -> Vec<Value> {
         fixture
             .lines()
@@ -527,7 +527,7 @@ mod tests {
             .collect()
     }
 
-    /// Golden titles from the W0 Claude recording: its `Bash touch x.tmp` call.
+    /// Golden titles from the Claude recording: its `Bash touch x.tmp` call.
     #[test]
     fn golden_titles_claude_w0() {
         let recorded = frames(include_str!(
@@ -632,7 +632,7 @@ mod tests {
         }
     }
 
-    /// Golden titles from the W0 agy recordings: the live `view_file` step (titled by its path,
+    /// Golden titles from the agy recordings: the live `view_file` step (titled by its path,
     /// tool name in the input, as the adapter starts it) and the transcript's quoted args.
     #[test]
     fn golden_titles_agy_w0() {
@@ -737,7 +737,7 @@ mod tests {
         }
     }
 
-    /// Golden titles from the W0 Codex recordings, through the shared helpers its adapter will
+    /// Golden titles from the Codex recordings, through the shared helpers its adapter will
     /// use: the wrapped command, its `commandActions`, a patch's paths, an MCP call.
     #[test]
     fn golden_titles_codex_w0() {
@@ -756,7 +756,7 @@ mod tests {
         // As codex.rs starts it today (title = command, input = {command, cwd}).
         let input = json!({"command": command, "cwd": item["cwd"]});
         assert_eq!(title(ItemKind::Command, command, input), "Run ls -la");
-        // With its commandActions passed on (the W3.4 Codex hook point).
+        // With its commandActions passed on (the Codex hook point).
         assert_eq!(
             from_command_actions(&item["commandActions"]),
             None,

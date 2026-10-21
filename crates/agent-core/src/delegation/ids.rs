@@ -1,4 +1,4 @@
-//! Handles and small identifiers of the delegation contract (contract §2).
+//! Handles and small identifiers of the delegation contract.
 //!
 //! Handles are opaque ASCII, `^[a-z]{1,3}_[A-Za-z0-9]{8,40}$`, each with its own prefix. The app
 //! supplies the random suffix ([`WorkerId::from_suffix`] and friends); nothing here draws
@@ -34,7 +34,7 @@ impl fmt::Display for IdError {
 
 impl std::error::Error for IdError {}
 
-/// Shortest and longest handle suffix (contract §2).
+/// Shortest and longest handle suffix.
 pub const HANDLE_SUFFIX_MIN: usize = 8;
 pub const HANDLE_SUFFIX_MAX: usize = 40;
 
@@ -167,11 +167,11 @@ macro_rules! checked_string {
     };
 }
 
-/// Longest cursor, in bytes (contract §2).
+/// Longest cursor, in bytes.
 pub const MAX_CURSOR_BYTES: usize = 256;
-/// Longest idempotency key (contract §2).
+/// Longest idempotency key.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
-/// Longest profile id (contract §2).
+/// Longest profile id.
 pub const MAX_PROFILE_ID_BYTES: usize = 64;
 
 fn bounded(s: &str, max: usize, ok: impl Fn(u8) -> bool) -> Result<(), IdError> {
@@ -213,14 +213,14 @@ checked_string!(
         || b == b'-')
 );
 
-/// A root tree's authority epoch (contract §6). Every revocation bumps it once.
+/// A root tree's authority epoch. Every revocation bumps it once.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
 #[serde(transparent)]
 pub struct AuthorityEpoch(pub u64);
 
-/// A worker's process generation (contract §5): one OS process for Claude and agy, one
+/// A worker's process generation: one OS process for Claude and agy, one
 /// `thread/start` or `thread/resume` for Codex.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,

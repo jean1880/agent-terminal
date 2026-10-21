@@ -1,4 +1,4 @@
-//! Lane D: inherited authority for supervised children (§5.1–§5.3, contract §6 E5, amendment A4).
+//! Inherited authority for supervised children.
 //!
 //! `judge` runs before every auto-allow path (Bypass, Accept edits, session and Always rules), and
 //! `rule_may_apply` filters which remembered rules may match in a child at all. Both read the
@@ -42,7 +42,7 @@ fn agy_mcp(input: &Value) -> Effect {
     }
 }
 
-/// What a provider tool call does (§5.1 table). Anything not listed is `Unknown`.
+/// What a provider tool call does. Anything not listed is `Unknown`.
 pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
     match driver {
         Driver::Claude => match tool {
@@ -75,7 +75,7 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
     }
 }
 
-/// Every file an edit names, per provider (§5.2 step 5). Empty: nothing checkable.
+/// Every file an edit names, per provider. Empty: nothing checkable.
 fn edit_paths<'a>(driver: Driver, tool: &str, input: &'a Value) -> Vec<&'a str> {
     match driver {
         Driver::Claude => ["file_path", "notebook_path"]

@@ -1,4 +1,4 @@
-//! Lane C: the delegation IPC server (contract §4, P4 §4.1–§4.2): a GIO Unix socket on the main
+//! The delegation IPC server: a GIO Unix socket on the main
 //! context. Nothing here blocks: the accept loop, every connection's reader and writer are
 //! futures on the main context, and every call goes to the supervisor through the
 //! [`CallDispatcher`]. Local only: a Unix socket in the private runtime directory, no port.

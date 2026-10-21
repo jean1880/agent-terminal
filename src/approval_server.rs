@@ -524,7 +524,7 @@ struct ServerInner {
     /// A supervised delegation child's server: every call is judged by `gate` first, and with
     /// no gate (yet) every call is denied.
     child: Cell<bool>,
-    /// The child's inherited authority (P4 §5.2–§5.3), applied before the mode policy and
+    /// The child's inherited authority, applied before the mode policy and
     /// before every rule.
     gate: RefCell<Option<Rc<dyn ApprovalGate>>>,
 }
@@ -788,7 +788,7 @@ impl ApprovalHandle {
     /// with the Always rules file). Fail closed: every call is denied until the session installs
     /// the child's gate ([`Self::set_gate`], which `ChatSession::with_options` does). A child
     /// never runs Bypass, so it is bound in Plan if asked for it.
-    #[cfg_attr(not(test), allow(dead_code))] // the child factory (Lane A) binds with it
+    #[cfg_attr(not(test), allow(dead_code))] // the child factory binds with it
     pub(crate) fn bind_child(
         hook: Result<(), String>,
         thread: &str,
@@ -806,7 +806,7 @@ impl ApprovalHandle {
     }
 
     /// Makes this a supervised child's server, judged by `gate` before the mode policy, the
-    /// session and Always rules, and every grant button (P4 §5.3, amendment A4).
+    /// session and Always rules, and every grant button.
     pub(crate) fn set_gate(&self, gate: Rc<dyn ApprovalGate>) {
         self.inner.child.set(true);
         *self.inner.gate.borrow_mut() = Some(gate);
@@ -889,7 +889,7 @@ impl ApprovalHandle {
         {
             decision = Decision::Allow;
         }
-        // Stop turn denies the call; the session then interrupts the turn (D4).
+        // Stop turn denies the call; the session then interrupts the turn.
         let (decision, reason) = match decision {
             Decision::Cancel => (Decision::Deny, Some("The user stopped the turn".to_owned())),
             d => (d, None),
@@ -982,7 +982,7 @@ impl ServerInner {
         let ctx = self
             .context(pending.cwd.as_deref())
             .ok_or_else(|| "no workspace is available".to_owned())?;
-        // A4: a child keeps a rule only for a call its gate lets rules cover; a custom rule could
+        // A child keeps a rule only for a call its gate lets rules cover; a custom rule could
         // reach further than the call, so a child never keeps one.
         if self.child.get() {
             let allowed = !pending.ask_only
@@ -1058,7 +1058,7 @@ impl ServerInner {
     }
 
     /// Whether a session or Always rule may match `action` here: always for a root; for a child,
-    /// only where its gate allows (A4), and nowhere without a gate.
+    /// only where its gate allows, and nowhere without a gate.
     fn rule_may_apply(&self, action: &crate::always_allow::Action, cwd: Option<&str>) -> bool {
         if !self.child.get() {
             return true;
@@ -1304,7 +1304,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
         .borrow_mut()
         .entry(query.tool.clone())
         .or_insert(0) += 1;
-    // A child's inherited authority first, before the mode policy and every rule (P4 §5.2).
+    // A child's inherited authority first, before the mode policy and every rule.
     let ask_only = match inner.judge(&query) {
         Some(GateVerdict::Deny { reason }) => return deny(conn, &reason),
         Some(GateVerdict::AskOnly { .. }) => true,
@@ -1333,7 +1333,7 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     // One matcher for every agent (`always_allow`): the call in canonical terms, judged by the
     // thread's session rules (agy's own) and the Always rules.
     let action = crate::always_allow::Action::of(&query.tool, &query.args);
-    // A4: in a child, a rule applies (and a card offers to keep one) only where its gate says.
+    // In a child, a rule applies (and a card offers to keep one) only where its gate says.
     let rules_apply = !ask_only
         && action
             .as_ref()
@@ -1465,7 +1465,7 @@ pub(crate) fn canonical_target(path: &Path) -> PathBuf {
 /// session" when a rule could match the call ([`crate::always_allow::offerable`]: no secret, a
 /// simple command, a contained path); "Always allow" when `always` (a rules file is configured
 /// and saved rules are on) and the call is one [`crate::always_allow::always_offerable`] keeps (the predicate the rule is then
-/// checked by, so the button never promises what is refused); Deny; Stop turn (D4).
+/// checked by, so the button never promises what is refused); Deny; Stop turn.
 fn rule_options(
     action: Option<&crate::always_allow::Action>,
     ctx: Option<&crate::always_allow::Context>,
@@ -2455,7 +2455,7 @@ mod tests {
             assert!(!options(2).contains(&Decision::AllowAlways));
             assert!(handle.respond("q2", Decision::Deny));
             wait_reply(ctx, &rx);
-            // U2: also for an edit of one contained path and for one MCP tool, as for every
+            // Also for an edit of one contained path and for one MCP tool, as for every
             // agent (an edit outside the workspace or of a sensitive file gets neither).
             let target = tmp.path().join("a.rs").to_string_lossy().into_owned();
             let rx = client(
@@ -2552,7 +2552,7 @@ mod tests {
         });
     }
 
-    /// D1: with Automatic Pattern Approvals off, a saved rule approves nothing and no card offers
+    /// With Automatic Pattern Approvals off, a saved rule approves nothing and no card offers
     /// "Always allow"; an "Always allow" on a card shown before is allowed once and keeps
     /// nothing, and session grants still approve. On again, the saved rule answers as before.
     #[test]
@@ -2639,7 +2639,7 @@ mod tests {
         crate::always_allow::AlwaysRules::open(rules).map_or(0, |r| r.rules.len())
     }
 
-    /// D1: saved rules turned off after an "Always allow" was answered but before its reply was
+    /// Saved rules turned off after an "Always allow" was answered but before its reply was
     /// written keep nothing: the answer is checked again as it lands, and the card says Allow.
     #[test]
     fn saved_rules_turned_off_while_an_always_reply_is_written_keep_nothing() {
@@ -3277,7 +3277,7 @@ mod tests {
         });
     }
 
-    /// R1 and S2 as the user decides them: a runner can be kept by "Always allow" and by a typed
+    /// A runner can be kept by "Always allow" and by a typed
     /// session pattern, exactly as written, with a notice saying it runs code.
     #[test]
     fn runners_are_kept_as_the_user_types_them_with_a_warning() {

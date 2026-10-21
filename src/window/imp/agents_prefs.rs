@@ -972,7 +972,7 @@ impl AgentTerminalWindow {
                         return;
                     };
                     let imp = obj.imp();
-                    // E4: the button and the sync indicator follow the finished job.
+                    // The button and the sync indicator follow the finished job.
                     let on_sync = on_sync.clone();
                     let done = move || mark_synced(&btn_weak, move || on_sync());
                     match crate::always_allow::path() {
@@ -1009,7 +1009,7 @@ impl AgentTerminalWindow {
                         return;
                     };
                     let imp = obj.imp();
-                    // E4: the button and the sync indicator follow the finished job.
+                    // The button and the sync indicator follow the finished job.
                     let on_sync = on_sync.clone();
                     let done = move || mark_synced(&btn_weak, move || on_sync());
                     match crate::always_allow::path() {
@@ -1414,7 +1414,7 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 match response.as_str() {
                     "import" => {
-                        // E4: refreshed once the import has finished.
+                        // Refreshed once the import has finished.
                         imp.import_rules(&p, move || {
                             if let Some(f) = on_changed {
                                 f();
@@ -1434,7 +1434,7 @@ impl AgentTerminalWindow {
                         confirm.set_default_response(Some("cancel"));
                         confirm.set_close_response("cancel");
                         if confirm.choose_future(root.as_ref()).await == "export" {
-                            // E4: refreshed once the export has finished.
+                            // Refreshed once the export has finished.
                             imp.export_rules(&p, move || {
                                 if let Some(f) = on_changed {
                                     f();
@@ -2160,7 +2160,7 @@ impl AgentTerminalWindow {
 }
 
 /// Shows a sync button as done ("✓ Synced", then "Synced" a second later) and then runs
-/// `refresh` (the sync indicator). Called from the background job's completion (E4).
+/// `refresh` (the sync indicator). Called from the background job's completion.
 fn mark_synced(button: &glib::WeakRef<Button>, refresh: impl Fn() + 'static) {
     let Some(btn) = button.upgrade() else {
         refresh();
@@ -2674,7 +2674,7 @@ pub(super) mod tests {
     }
 
     /// Every row and group title under `root` is non-empty and, when Pango reads it as markup,
-    /// valid markup: a bare `&` makes the parse fail and the title renders blank (F20).
+    /// valid markup: a bare `&` makes the parse fail and the title renders blank.
     pub(crate) fn assert_titles_render(root: &impl IsA<gtk4::Widget>, what: &str) {
         let mut checked = 0;
         for widget in crate::testutil::descendants(root.upcast_ref()) {
@@ -2703,7 +2703,7 @@ pub(super) mod tests {
     }
 
     /// A dropdown row shows its whole selected value, even in a narrow window beside a long
-    /// subtitle (ui-audit #9: "Agent T…", "Auto…").
+    /// subtitle (for example, "Agent T…" or "Auto…").
     #[test]
     #[ignore = "native GTK layout; run alone in an isolated display"]
     fn native_dropdown_rows_show_their_whole_value() {
@@ -2832,7 +2832,7 @@ pub(super) mod tests {
         assert_titles_render(&page, "setup walkthrough");
     }
 
-    /// D6: a Settings removal never takes the store lock on the GTK thread. While another holder
+    /// A Settings removal never takes the store lock on the GTK thread. While another holder
     /// keeps the lock, the call returns at once and the loop stays free; the removal finishes
     /// once the lock is released.
     #[test]
@@ -2884,7 +2884,7 @@ pub(super) mod tests {
         });
     }
 
-    /// E4: a Settings import's completion (the toast, the sync indicator, `on_changed`) runs
+    /// A Settings import's completion (the toast, the sync indicator, `on_changed`) runs
     /// only once the background job has finished: not while it waits for the store lock.
     #[test]
     fn import_completion_waits_for_the_background_job() {

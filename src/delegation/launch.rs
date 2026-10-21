@@ -1,4 +1,4 @@
-//! Lane D: per-generation launch bindings and Claude overlay files (§5.5, contract §5).
+//! Per-generation launch bindings and Claude overlay files.
 //!
 //! The token reaches only the places the contract's exposure matrix lists: the Claude overlay's
 //! server `env`, agy's process env, and Codex's `OpenSession.delegation`. Never argv.

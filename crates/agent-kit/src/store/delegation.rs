@@ -1,6 +1,6 @@
 //! Schema v4: the cross-agent delegation tables, and thin row-level helpers over them.
 //!
-//! v4 is **strictly additive** (contract §8.1): it creates new tables, indexes and triggers on
+//! v4 is **strictly additive**: it creates new tables, indexes and triggers on
 //! those new tables, and adds a row to `schema_version`. It never alters a v3 table, so a v3
 //! writer still running against the file cannot corrupt it.
 //!
@@ -302,7 +302,7 @@ pub struct OperationRow {
     pub idempotency_key: String,
     /// The epoch the operation was accepted under.
     pub authority_epoch: i64,
-    /// Scrubbed, syntax-normalised sorted-key JSON, compared byte for byte (contract §2).
+    /// Scrubbed, syntax-normalised sorted-key JSON, compared byte for byte.
     pub canonical_request: String,
     /// Target worker, bound runs and base commit, fixed at acceptance.
     pub resolution_json: String,
@@ -509,7 +509,7 @@ fn scrubbed_json(text: &str) -> Result<String> {
     Ok(serde_json::to_string(&super::scrub_value(None, value))?)
 }
 
-/// Refuses a value that is not one of the P1 enum's (`operations.kind` and
+/// Refuses a value that is not one of the enum values (`operations.kind` and
 /// `messages.delivery_policy` carry only length CHECKs in SQL, so a later rename never forces a
 /// table rebuild; the value set is enforced here, on write).
 fn known<T: serde::de::DeserializeOwned>(what: &str, value: &str) -> Result<()> {
@@ -854,7 +854,7 @@ impl Store {
             .optional()?)
     }
 
-    /// The operation stored under an idempotency key, across all epochs (contract §2).
+    /// The operation stored under an idempotency key, across all epochs.
     pub fn delegation_operation_by_key(
         &self,
         principal_worker: &str,

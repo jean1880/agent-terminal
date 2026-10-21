@@ -1,4 +1,4 @@
-//! Worker and run reducers, and cancel completion (contract §2 states, §3 `cross_agent_cancel`).
+//! Worker and run reducers, and cancel completion.
 //!
 //! Invariants: `Closed` is absorbing; a worker goes `Stopping → Stopped` only on an observed
 //! exit; `Stopping` plus an interrupted turn with the process alive gives `Waiting` (run
@@ -155,7 +155,7 @@ pub fn worker_step(
     }
 }
 
-/// A run's state (contract §2 `RunState`).
+/// A run's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {

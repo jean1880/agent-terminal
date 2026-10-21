@@ -68,9 +68,9 @@
 //! | `Bypass`      | `never`        | `dangerFullAccess`  | runs everything unasked and unsandboxed (dangerous permissive mode; session-only) |
 //!
 //! `Ask` is T3's `approval-required` row. `AcceptEdits` is not T3's `auto-accept-edits`
-//! (`on-request`, under which Codex runs shell commands unasked): W0
+//! (`on-request`, under which Codex runs shell commands unasked):
 //! (`untrusted-workspacewrite.jsonl`) showed that on `untrusted` + `workspaceWrite` both edits and
-//! shell ask, and an `accept` applies the edit (plan D5). The app's session accepts edits whose
+//! shell ask, and an `accept` applies the edit. The app's session accepts edits whose
 //! every path is inside the workspace and not sensitive.
 //!
 //! # Known limits (each with its upgrade path)
@@ -84,7 +84,7 @@
 //!   UI has a place for it. `item/tool/requestUserInput` is mapped to the native question card.
 //! - Approval decisions that carry a payload (`acceptWithExecpolicyAmendment`,
 //!   `applyNetworkPolicyAmendment`) and `acceptForSession` are never sent: session and always
-//!   scope of commands and edits are agent-terminal's own rules (plan D1), answered with a plain
+//! scope of commands and edits are agent-terminal's own rules, answered with a plain
 //!   `accept`.
 //!
 //! # Permission requests (`item/permissions/requestApproval`)
@@ -123,8 +123,8 @@
 //! `mcp__<server>__<tool>`, the name Claude's calls carry, so the app's rules answer it the same
 //! way. The form names no item; the `mcpToolCall` item Codex starts just before it does
 //! ([`CodexAdapter::on_mcp_tool_approval`]). Allow, Allow for session and Always allow send
-//! `{"action": "accept", "content": {}}` (never `_meta.persist`: those scopes are the app's,
-//! plan D1); Deny sends `decline` (Codex tells the model the user rejected the call); Stop turn
+//! `{"action": "accept", "content": {}}` (never `_meta.persist`: those scopes are the app's);
+//! Deny sends `decline` (Codex tells the model the user rejected the call); Stop turn
 //! sends `cancel` and interrupts the turn. It expires like any approval.
 //!
 //! stderr (Codex's tracing output) is ignored.
@@ -335,7 +335,7 @@ pub struct CodexAdapter {
     /// Accumulated reasoning summary per open reasoning item.
     reasoning: HashMap<String, String>,
     /// The `changes` of each open `fileChange` item: its approval request carries no path or
-    /// diff (W0), so the card and the app's rules take them from here.
+    /// diff, so the card and the app's rules take them from here.
     file_changes: HashMap<String, Value>,
     /// Each open `mcpToolCall` item, by item id.
     mcp_calls: HashMap<String, McpCall>,
@@ -976,7 +976,7 @@ impl CodexAdapter {
             out.push(Envelope::new(Event::ContentSnapshot { stream, text }).item(id));
         }
         if s(item, "type") == Some("reasoning") {
-            // W3.1: a reasoning item with no summary is one the model did not share.
+            // A reasoning item with no summary is one the model did not share.
             out.push(
                 reasoning_state(if shared {
                     ReasoningState::Complete
@@ -1008,7 +1008,7 @@ impl CodexAdapter {
         };
         self.start_item(out, id, kind, title.to_owned(), None);
         if stream == StreamKind::Reasoning && !self.reasoning.contains_key(id) {
-            // W3.1: Codex shares a summary of its reasoning, streamed.
+            // Codex shares a summary of its reasoning, streamed.
             out.push(reasoning_state(ReasoningState::Streaming).item(id));
         }
         let acc = match stream {
@@ -1656,11 +1656,11 @@ impl CodexAdapter {
             }
             _ => ALL_DECISIONS.to_vec(),
         };
-        // "Allow for session" and "Always allow" are the app's (plan D1): each is a plain
+        // "Allow for session" and "Always allow" are the app's: each is a plain
         // `accept` on the wire plus a rule the app records, so they are offered wherever the
         // server offers `accept`. `acceptForSession` and `acceptWithExecpolicyAmendment` (which
         // would write Codex's own rules) are never sent. The app narrows these to what a rule
-        // can describe. A `fileChange` request has no `availableDecisions` (W0).
+        // can describe. A `fileChange` request has no `availableDecisions`.
         if let Some(pos) = options.iter().position(|d| *d == Decision::Allow) {
             for (offset, d) in [Decision::AllowAlways, Decision::AllowForSession]
                 .into_iter()
@@ -1671,7 +1671,7 @@ impl CodexAdapter {
                 }
             }
         }
-        // Deny is always `decline`, offered or not: W0 showed Codex accepts it (the item ends
+        // Deny is always `decline`, offered or not: recorded frames show Codex accepts it (the item ends
         // `declined` and the turn continues). Stop turn (`cancel`) stays a separate choice.
         if !options.contains(&Decision::Deny) {
             let at = options
@@ -1680,7 +1680,7 @@ impl CodexAdapter {
                 .unwrap_or(options.len());
             options.insert(at, Decision::Deny);
         }
-        // A patch approval names no file (W0): its changes come from the item that started it.
+        // A patch approval names no file: its changes come from the item that started it.
         let mut input = params.clone();
         if method == "item/fileChange/requestApproval" {
             if let (Some(obj), Some(changes)) =
@@ -2512,7 +2512,7 @@ impl Adapter for CodexAdapter {
                 ..
             } => {
                 // Checked before it is removed: a refused decision leaves the request answerable.
-                // `decline` is never refused: Codex accepts it unoffered (W0, plan D4).
+                // `decline` is never refused: Codex accepts it unoffered.
                 let rewritten = match self.approvals.get(&request) {
                     None => {
                         return Err(AdapterError::Invalid(format!(
@@ -2547,7 +2547,7 @@ impl Adapter for CodexAdapter {
                 };
                 self.remember_settled_request(request, approval.scope.clone());
                 if approval.form {
-                    // `persist` is never sent: session and always scope are the app's (D1).
+                    // `persist` is never sent: session and always scope are the app's.
                     let result = match decision {
                         Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => {
                             json!({"action": "accept", "content": {}})
@@ -2914,7 +2914,7 @@ pub fn mode_policy(mode: Mode) -> (&'static str, Value) {
     }
 }
 
-/// `approvalPolicy` and `sandboxPolicy` for a supervised delegation child (P4 §10.1). Unlike a
+/// `approvalPolicy` and `sandboxPolicy` for a supervised delegation child. Unlike a
 /// root's Ask, a child's Ask and Accept edits write inside the sandbox (its cwd is its own
 /// worktree lease) while every write and command still asks (`untrusted`). Plan is read-only. A
 /// child never runs Bypass; asked anyway, it gets Plan's policy, never full access.
@@ -2947,7 +2947,7 @@ fn codex_mode_label(mode: Mode) -> &'static str {
 /// The wire name of a decision (`CommandExecutionApprovalDecision` / `FileChangeApprovalDecision`).
 fn decision_wire(decision: Decision) -> &'static str {
     match decision {
-        // Session and Always scope are agent-terminal's (D1): on the wire they are an accept.
+        // Session and Always scope are agent-terminal's: on the wire they are an accept.
         Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => "accept",
         Decision::Deny => "decline",
         Decision::Cancel => "cancel",
@@ -2980,7 +2980,7 @@ fn item_info(item: &Value) -> (ItemKind, String, Option<Value>) {
         "commandExecution" => {
             let command = s(item, "command").unwrap_or("command").to_owned();
             let mut input = json!({"command": command, "cwd": item.get("cwd")});
-            // W3.4: Codex's own reading of the command titles the card
+            // Codex's own reading of the command titles the card
             // (`tool_title::from_command_actions`); the wrapped command is unwrapped for display.
             if let Some(actions) = item
                 .get("commandActions")
@@ -3213,7 +3213,7 @@ fn content_text(content: Option<&Value>) -> Option<String> {
 }
 
 /// One selectable model from `model/list` (`Model` in `v2/model.rs`). Shaped for the catalogue
-/// (id, display, description, efforts); the coordinator maps it onto `catalog::CatalogModel`.
+/// (id, display, description, efforts); the model catalogue maps it onto `catalog::CatalogModel`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CodexModel {
     /// The `model` slug to send in `turn/start` (not the catalogue row's own `id`).
@@ -3721,7 +3721,7 @@ mod tests {
         ));
     }
 
-    /// P4 §10.1: a supervised Ask or Accept-edits child writes inside its sandbox and still asks;
+    /// A supervised Ask or Accept-edits child writes inside its sandbox and still asks;
     /// Plan is read-only, and Bypass never gives a child full access. Roots are unchanged.
     #[test]
     fn child_mode_policy_maps_ask_and_accept_edits_to_workspace_write() {
@@ -4293,7 +4293,7 @@ mod tests {
         );
     }
 
-    /// Plan 2.5: a resume of a thread that never completed a turn finds no rollout. The adapter
+    /// A resume of a thread that never completed a turn finds no rollout. The adapter
     /// starts a new thread with the same settings (and says so) instead of failing, and a prompt
     /// queued meanwhile goes to the new thread. Any other resume error still fails startup.
     #[test]
@@ -5251,7 +5251,7 @@ mod tests {
             .to_string()
     }
 
-    /// W0 (`codex/ask-shell-decline.jsonl`): the server offers `accept`, an execpolicy amendment
+    /// (`codex/ask-shell-decline.jsonl`): the server offers `accept`, an execpolicy amendment
     /// and `cancel`, never `acceptForSession`. "Allow for session" and "Always allow" are offered
     /// by the app and both go out as a plain `accept`; the amendment is never sent.
     #[test]
@@ -5413,7 +5413,7 @@ mod tests {
         assert!(a.file_changes.is_empty(), "exit");
     }
 
-    /// The W0 frames from a fixture, replayed: server frames are fed (collecting the events),
+    /// The frames from a fixture, replayed: server frames are fed (collecting the events),
     /// the recorded prompt is encoded so the turn/start reply matches, and the replay stops
     /// after the first frame with method `until`. Returns the adapter, the events up to there
     /// and the server frames after it.
@@ -5460,7 +5460,7 @@ mod tests {
         frames.iter().flat_map(|f| a.feed(f)).collect()
     }
 
-    /// Plan 2.1, W0 `ask-shell-decline.jsonl` and `ask-edit-decline.jsonl`: Deny sends
+    /// `ask-shell-decline.jsonl` and `ask-edit-decline.jsonl`: Deny sends
     /// `decline` though neither request offers it, the item ends `declined` and the turn goes
     /// on to complete; Stop turn sends `cancel`. The patch approval, which names no file,
     /// shows the change its `item/started` frame carried.
@@ -6365,7 +6365,7 @@ mod tests {
             )
         };
         let first = a.feed(&delta(0, "first"));
-        // W3.1: one Streaming state, labelled "summary", when the first words arrive.
+        // One Streaming state, labelled "summary", when the first words arrive.
         let summary = |state| Event::Reasoning {
             state,
             label: crate::event::ReasoningLabel::Summary,
@@ -6403,7 +6403,7 @@ mod tests {
                 && e.item.as_deref() == Some("rs2")));
     }
 
-    /// W3.4: the W0 command item carries its `commandActions` on, and titles through the shared
+    /// The recorded command item carries its `commandActions` on, and titles through the shared
     /// grammar: the wrapped `/usr/bin/zsh -lc 'ls -la'` is `Run ls -la` (its one `listFiles`
     /// action has no path); a `read` action titles `Read <path>`.
     #[test]

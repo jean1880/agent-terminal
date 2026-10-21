@@ -152,7 +152,7 @@ pub fn overflowing_bins(root: &gtk4::Widget) -> Vec<String> {
             }
             if interruption {
                 if let Some(bounds) = widget.compute_bounds(&widget) {
-                    // 34 px: the plan's HIG minimum for primary actions (ui-audit.md #8).
+                    // 34 px: the minimum height for primary actions.
                     if bounds.width() < 34.0 || bounds.height() < 34.0 {
                         out.push(format!(
                             "permission target is {}×{}; needs 34×34",

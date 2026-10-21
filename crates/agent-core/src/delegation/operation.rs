@@ -1,4 +1,4 @@
-//! Operations (contract §2 "Canonical request", "Idempotency and replay"; §8 item 5).
+//! Operations.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -117,7 +117,7 @@ pub struct Resolution {
     pub base_commit: Option<String>,
 }
 
-/// One stored operation (contract §8 item 5).
+/// One stored operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOperation {
     pub id: OperationId,
@@ -143,7 +143,7 @@ pub enum IdempotencyDecision {
     StaleEpoch(OperationId),
 }
 
-/// Contract §2 order: an `expected_epoch` that is not current is `Err(StaleEpoch)` before any
+/// An `expected_epoch` that is not current is `Err(StaleEpoch)` before any
 /// lookup; a key stored under an older epoch is `StaleEpoch`; a different canonical request is
 /// `Conflict`; an identical one is `Replay`.
 pub fn idempotency(
@@ -170,7 +170,7 @@ pub fn idempotency(
     Ok(IdempotencyDecision::Replay(op.id.clone()))
 }
 
-/// What a replay returns (the contract §2 table).
+/// What a replay returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayOutcome {
     /// The original receipt with `replayed: true` and `dispatch` = the current state.
@@ -193,7 +193,7 @@ fn missing_receipt(op: &StoredOperation) -> ReplayOutcome {
     )
 }
 
-/// The contract §2 replay table. The stored receipt is refreshed in exactly two fields,
+/// Replay rules. The stored receipt is refreshed in exactly two fields,
 /// `replayed` and `dispatch`; nothing else of it ever changes.
 pub fn replay(op: &StoredOperation, dispatching_now: bool) -> ReplayOutcome {
     match op.dispatch {

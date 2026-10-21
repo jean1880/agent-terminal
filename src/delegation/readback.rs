@@ -1,5 +1,5 @@
-//! Lane A: child read-back (§3.2–§3.3). Wave 0 holds the Codex extraction and comparison, which
-//! the launch mapping (Lane B) and the checker (Lane A) must share.
+//! Child read-back. The launch mapping and checker share the Codex policy extraction
+//! and comparison helpers.
 
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::TaskMode;
@@ -216,7 +216,7 @@ pub(crate) struct CodexRequested {
 }
 
 /// Extracts the read-back expectation from a Codex `(approvalPolicy, sandboxPolicy)` pair, as
-/// `agent_core::codex::mode_policy` (roots) or the child mapping (Lane B) returns it. `None` when
+/// `agent_core::codex::mode_policy` (roots) or the child mapping returns it. `None` when
 /// the sandbox policy has no string `type`: nothing could be checked, so the child must not start.
 #[cfg(test)]
 pub(crate) fn codex_requested(policy: &(&'static str, Value)) -> Option<CodexRequested> {

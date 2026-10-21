@@ -1,4 +1,4 @@
-//! Route admission (contract §11) and per-driver delegation role facts.
+//! Route admission and per-driver delegation role facts.
 //!
 //! [`DelegationCaps`] is separate from `caps::Capabilities` on purpose: those are UI features
 //! guarded one to one by `Feature::ALL`; these are role facts no control renders. The same
@@ -10,7 +10,7 @@ use super::authority::TaskMode;
 use super::wire::ThisRunSupport;
 use crate::adapter::Driver;
 
-/// Whether a route may be used (contract §3 `route_status`).
+/// Whether a route may be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStatus {
@@ -19,7 +19,7 @@ pub enum RouteStatus {
     Unsupported,
 }
 
-/// What still blocks a route: a proof gate or a missing piece of work (contract §11).
+/// What still blocks a route: a proof gate or a missing piece of work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteBlocker {
@@ -36,20 +36,20 @@ pub enum RouteBlocker {
     /// PR #44 merged: workspace plugin hooks, config-dir flags dropped, fresh proof per start.
     AgyHookProofFix,
     AgyHookProofInWorktree,
-    /// §7 L2 in full (non-git walk, recursive scan, argv/env/home, allow rules).
+    /// Complete workspace scan (including non-git folders, argv, environment, home and allow rules).
     AgyWorkspaceMcpCheck,
-    /// §7 L3 + census + L4 + hello window.
+    /// Process lineage, peer census, single-use tokens and hello deadline.
     AgyPeerAndSingleUse,
-    /// G-A5.
+    /// Every tool call carries verified attestation.
     AgyAttestation,
-    /// G-A1: also denies other servers and the sub-agent tools in children.
+    /// The child hook denies other servers and sub-agent tools.
     AgyHookPayloadUnrecorded,
-    /// G-A3.
+    /// The capability token is absent from persistent provider state.
     AgyTokenPersistence,
     AgyManagedEntry,
     AgyAllowRules,
     AgentSyncEntry,
-    /// The route's P5/P8 evidence bundle is not recorded.
+    /// The route's provider evidence bundle is not recorded.
     EvidenceBundle,
 }
 
@@ -125,7 +125,7 @@ pub fn blocker_scope(b: RouteBlocker) -> BlockerScope {
     }
 }
 
-/// An agy child's variant: with its own token and bridge, or without (contract §11).
+/// An agy child's variant: with its own token and bridge, or without.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildBridge {
@@ -274,7 +274,7 @@ pub fn route_caveats(child: Driver) -> &'static [RouteCaveat] {
     }
 }
 
-/// Contract §11 route admission: the parent group plus the child group (variant-specific for
+/// Route admission: the parent group plus the child group (variant-specific for
 /// agy), mode-conditional blockers counted only for their modes, plus the evidence bundle.
 /// `child_bridge` is ignored for a non-agy child (it always has its bridge). A child's
 /// unsupervised behaviour is a caveat ([`route_caveats`]), never a blocker.
@@ -366,7 +366,7 @@ pub enum TokenPlacement {
 pub enum TokenReuse {
     /// Re-hello with the same token within a generation.
     SequentialPerGeneration,
-    /// The first accepted hello consumes it (§7 L4).
+    /// The first accepted hello consumes it.
     SingleUse,
 }
 
@@ -429,13 +429,13 @@ pub enum Receipt {
     None,
 }
 
-/// A driver's delegation role facts (contract §5 mapping table).
+/// A driver's delegation role facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationCaps {
     pub parent_binding: ParentBinding,
     pub token_placement: TokenPlacement,
     pub token_reuse: TokenReuse,
-    /// The §7 L3 peer check is enforced (advisory for Claude and Codex).
+    /// The process-lineage peer check is enforced (advisory for Claude and Codex).
     pub peer_check_required: bool,
     /// Every call must be attested (agy; Claude and Codex once G-C5/G-X5 pass).
     pub attestation_required: bool,
