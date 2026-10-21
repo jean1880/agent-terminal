@@ -26,6 +26,8 @@ pub(super) struct Workers {
     pending: VecDeque<(ScopedEnvelope, bool)>,
     pending_bytes: usize,
     overflowed: bool,
+    /// The overflow notice is shown once per backlog, not once per dropped envelope.
+    overflow_noticed: bool,
 }
 
 struct Worker {
@@ -231,6 +233,17 @@ impl Workers {
         for (envelope, replayed) in pending {
             self.apply(&envelope, replayed);
         }
+        if self.pending.is_empty() {
+            self.overflow_noticed = false;
+        }
+    }
+
+    /// Whether a drop since the last call still needs its notice.
+    fn take_overflow_notice(&mut self) -> bool {
+        let notice = self.overflowed && !self.overflow_noticed;
+        self.overflow_noticed |= self.overflowed;
+        self.overflowed = false;
+        notice
     }
 
     fn set_scope(&mut self, worker: &WorkerId, scope: Option<Scope>) {
@@ -377,11 +390,10 @@ impl Subscriber {
         state.apply(envelope, replayed);
         drop(state);
         inner.queue_worker_flush();
-        if inner.delegation.borrow_mut().overflowed {
+        if inner.delegation.borrow_mut().take_overflow_notice() {
             inner.worker_notice(
                 "Some worker activity could not be displayed because its registry was unavailable.",
             );
-            inner.delegation.borrow_mut().overflowed = false;
         }
     }
 }
@@ -1090,6 +1102,37 @@ pub(crate) mod tests {
                 assert_eq!(approval.state, super::super::model::ApprovalState::Pending);
             }
         }
+    }
+
+    #[test]
+    fn an_overflowing_backlog_gives_one_notice_until_the_registry_drains_it() {
+        let mut workers = Workers::default();
+        let scoped = scope("w_workerAA", 1, "r_firstRun");
+        let mut notices = 0;
+        for _ in 0..200 {
+            feed(
+                &mut workers,
+                &scoped,
+                Envelope::new(Event::TurnStarted { model: None }),
+            );
+            notices += usize::from(workers.take_overflow_notice());
+        }
+        assert_eq!(notices, 1);
+        workers.registry(&[summary("w_workerAA", "r_firstRun")]);
+        assert!(workers.pending.is_empty());
+        assert!(!workers.take_overflow_notice());
+        let other = scope("w_workerBB", 1, "r_firstRun");
+        for _ in 0..65 {
+            feed(
+                &mut workers,
+                &other,
+                Envelope::new(Event::TurnStarted { model: None }),
+            );
+        }
+        assert!(
+            workers.take_overflow_notice(),
+            "a new backlog is told again"
+        );
     }
 
     #[test]
