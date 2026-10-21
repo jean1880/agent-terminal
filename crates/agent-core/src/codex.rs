@@ -84,7 +84,7 @@
 //!   UI has a place for it. `item/tool/requestUserInput` is mapped to the native question card.
 //! - Approval decisions that carry a payload (`acceptWithExecpolicyAmendment`,
 //!   `applyNetworkPolicyAmendment`) and `acceptForSession` are never sent: session and always
-//! scope of commands and edits are agent-terminal's own rules, answered with a plain
+//!   scope of commands and edits are agent-terminal's own rules, answered with a plain
 //!   `accept`.
 //!
 //! # Permission requests (`item/permissions/requestApproval`)
