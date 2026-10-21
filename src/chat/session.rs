@@ -1077,7 +1077,11 @@ impl Inner {
                 // A completed turn is the proof the new agent read the handoff it carried; any
                 // other end (failed, interrupted, the process died) leaves it for the next prompt.
                 if self.handoff_in_flight.replace(false) && *state == TurnState::Completed {
-                    *self.pending_handoff.borrow_mut() = None;
+                    // Stored as delivered (a handoff carrying nothing withdraws it), so a reopen
+                    // never re-arms what this turn carried.
+                    if self.pending_handoff.borrow_mut().take().is_some() {
+                        self.emit(handoff_spent());
+                    }
                 }
                 if *state == TurnState::Completed {
                     self.confirm_provisional_native();
@@ -3347,12 +3351,7 @@ impl Inner {
     /// Arms `handoff` for the next prompt and stores it (under the current provider thread), so
     /// a restart before it is delivered re-arms it.
     fn arm_handoff(&self, handoff: Handoff) {
-        self.emit(Envelope::new(Event::HandoffSeeded {
-            summary: handoff.summary.clone(),
-            fence: handoff.fence.clone(),
-            carried: handoff.carried,
-            total: handoff.total,
-        }));
+        self.emit(handoff_seeded(&handoff));
         self.handoff_in_flight.set(false);
         *self.pending_handoff.borrow_mut() = Some(handoff);
     }
@@ -4084,12 +4083,7 @@ impl Inner {
         // so a reopen does not feed it to this one.
         self.handoff_in_flight.set(false);
         *self.pending_handoff.borrow_mut() = None;
-        self.emit(Envelope::new(Event::HandoffSeeded {
-            summary: String::new(),
-            fence: String::new(),
-            carried: 0,
-            total: 0,
-        }));
+        self.emit(handoff_spent());
         self.error(format!("{failed} did not start: {reason}. Back on {back}."));
         if let Some(m) = model {
             self.emit(Envelope::new(Event::ModelChanged { model: m }));
@@ -4834,24 +4828,29 @@ fn form_keys(fields: &[agent_core::form::FormField]) -> Vec<String> {
 }
 
 /// The handoff a thread still owes its current agent, from its stored history: the latest
-/// `HandoffSeeded` with no completed turn after it. `None` once a turn completed after it (the
-/// agent had it), or when there is none.
+/// `HandoffSeeded` not yet delivered. `None` when there is none.
 ///
-/// Judged by a completed turn, not by a native session id (agy reports one at spawn, before any
-/// prompt) nor by the prompt having been written (the agent may have died reading it).
+/// Delivery is the stored acknowledgement ([`handoff_spent`]: a `HandoffSeeded` carrying
+/// nothing), written once the turn that carried the handoff completed; it also withdraws one a
+/// switch rolled back. A completed turn alone proves nothing: Claude's prompt-less init turn
+/// completes before any prompt carried it. Nor does a native session id (agy reports one at
+/// spawn), nor the prompt having been written (the agent may have died reading it). Only a seed
+/// written before acknowledgements existed (`acknowledged: false`) is still spent by any
+/// completed turn after it, as it always was.
 pub(crate) fn undelivered_handoff<'a>(
     events: impl IntoIterator<Item = &'a Envelope>,
 ) -> Option<Handoff> {
     let mut pending = None;
+    let mut legacy = false;
     for env in events {
         match &env.event {
-            // One that carries nothing withdraws any earlier one (a switch rolled back).
             Event::HandoffSeeded { carried: 0, .. } => pending = None,
             Event::HandoffSeeded {
                 summary,
                 fence,
                 carried,
                 total,
+                acknowledged,
             } => {
                 pending = Some(Handoff {
                     summary: summary.clone(),
@@ -4859,15 +4858,40 @@ pub(crate) fn undelivered_handoff<'a>(
                     carried: *carried,
                     total: *total,
                 });
+                legacy = !acknowledged;
             }
             Event::TurnCompleted {
                 state: TurnState::Completed,
                 ..
-            } => pending = None,
+            } if legacy => pending = None,
             _ => {}
         }
     }
     pending
+}
+
+/// The stored `HandoffSeeded` for `handoff`: spent only by its acknowledgement
+/// ([`handoff_spent`]).
+fn handoff_seeded(handoff: &Handoff) -> Envelope {
+    Envelope::new(Event::HandoffSeeded {
+        summary: handoff.summary.clone(),
+        fence: handoff.fence.clone(),
+        carried: handoff.carried,
+        total: handoff.total,
+        acknowledged: true,
+    })
+}
+
+/// A `HandoffSeeded` carrying nothing: the earlier one was delivered (the turn that carried it
+/// completed), or withdrawn (the switch it was for rolled back). Either way, nothing is owed.
+fn handoff_spent() -> Envelope {
+    Envelope::new(Event::HandoffSeeded {
+        summary: String::new(),
+        fence: String::new(),
+        carried: 0,
+        total: 0,
+        acknowledged: true,
+    })
 }
 
 /// The mode the user last chose in a thread, from its stored history (the latest `ModeChosen`).
@@ -4915,12 +4939,7 @@ pub(crate) fn seeded_handoff_events(handoff: &Handoff, source: &str) -> Vec<Enve
         return Vec::new();
     }
     vec![
-        Envelope::new(Event::HandoffSeeded {
-            summary: handoff.summary.clone(),
-            fence: handoff.fence.clone(),
-            carried: handoff.carried,
-            total: handoff.total,
-        }),
+        handoff_seeded(handoff),
         Envelope::new(Event::Notice {
             text: handoff_notice(&format!("from {source}"), handoff),
         }),
@@ -5527,8 +5546,9 @@ mod tests {
     }
 
     /// A new thread's handoff is stored with the thread ([`seeded_handoff_events`]); its
-    /// session re-arms it from history and sends it with the first prompt, without storing a
-    /// second `HandoffSeeded`.
+    /// session re-arms it from history. Claude's prompt-less init turn does not spend it: closed
+    /// and reopened after that turn, the thread still owes it, and the first prompt carries it
+    /// exactly once. The completed turn that carried it is stored as its delivery.
     #[test]
     fn a_new_threads_stored_handoff_rides_on_the_first_prompt_once() {
         in_loop(|ctx| {
@@ -5544,47 +5564,93 @@ mod tests {
             for env in seeded_handoff_events(&handoff, "“source”") {
                 store.append_event(&thread, None, &env).expect("stored");
             }
-            let seeded_count = || {
+            let history = || -> Vec<Envelope> {
                 store
                     .events(&thread, None, 1000)
                     .expect("events")
                     .into_iter()
-                    .filter(|(_, e)| matches!(e.event, Event::HandoffSeeded { .. }))
+                    .map(|(_, e)| e)
+                    .collect()
+            };
+            let carrying = || {
+                history()
+                    .iter()
+                    .filter(
+                        |e| matches!(e.event, Event::HandoffSeeded { carried, .. } if carried > 0),
+                    )
                     .count()
             };
-            let history: Vec<Envelope> = store
-                .events(&thread, None, 1000)
-                .expect("events")
-                .into_iter()
-                .map(|(_, e)| e)
-                .collect();
-            assert!(history
+            let completed = || {
+                history()
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e.event,
+                            Event::TurnCompleted {
+                                state: TurnState::Completed,
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+            };
+            assert!(history()
                 .iter()
                 .any(|e| matches!(&e.event, Event::Notice { text } if text.contains("2 of 3"))));
-            let stored = undelivered_handoff(&history).expect("owed to the new session");
-            let (sink, _seen) = make_sink();
-            let session = ChatSession::new(
-                Box::new(agent_core::claude::ClaudeAdapter::new()),
-                idle_claude(tmp.path()),
-                store.clone(),
-                thread.clone(),
-                sink,
-                None,
+            let open = || {
+                let (sink, _seen) = make_sink();
+                let session = ChatSession::new(
+                    Box::new(agent_core::claude::ClaudeAdapter::new()),
+                    idle_claude(tmp.path()),
+                    store.clone(),
+                    thread.clone(),
+                    sink,
+                    None,
+                );
+                let owed = undelivered_handoff(&history()).expect("owed to the new session");
+                session.restore_handoff(owed);
+                session
+            };
+
+            // Opened, its init turn completes with no prompt, and it is closed again.
+            let first = open();
+            first.reload_session();
+            assert!(
+                pump_until(ctx, 10, || completed() == 1),
+                "the init turn never completed"
             );
-            session.restore_handoff(stored);
-            session.send_prompt("first");
+            first.shutdown(true);
+            drop(first);
+            assert!(
+                undelivered_handoff(&history()).is_some(),
+                "a prompt-less turn carried nothing"
+            );
+
+            // Reopened: the first prompt carries it, once.
+            let second = open();
+            second.send_prompt("first");
             assert!(pump_until(ctx, 10, || lines(
                 tmp.path().join("prompts.log")
             )
             .iter()
             .any(|l| l.contains("first"))));
             let sent = lines(tmp.path().join("prompts.log"));
-            assert!(
+            assert_eq!(
                 sent.iter()
-                    .any(|l| l.contains("first") && l.contains("earlier context")),
-                "the handoff rides on the first prompt: {sent:?}"
+                    .filter(|l| l.contains("earlier context"))
+                    .count(),
+                1,
+                "the handoff rides on the first prompt, once: {sent:?}"
             );
-            assert_eq!(seeded_count(), 1, "never stored twice");
+            assert!(sent
+                .iter()
+                .any(|l| l.contains("first") && l.contains("earlier context")));
+            assert_eq!(carrying(), 1, "never stored twice");
+            // Its turn completed: stored as delivered, so a later reopen owes nothing.
+            assert!(
+                pump_until(ctx, 10, || undelivered_handoff(&history()).is_none()),
+                "the delivery was not stored"
+            );
         });
     }
 
@@ -7343,12 +7409,14 @@ mod tests {
 
     #[test]
     fn an_undelivered_handoff_is_the_latest_seeded_with_no_completed_turn_after_it() {
+        // Written before acknowledgements existed: any completed turn spends it.
         let seeded = |fence: &str| {
             Envelope::new(Event::HandoffSeeded {
                 summary: format!("summary {fence}"),
                 fence: fence.to_owned(),
                 carried: 2,
                 total: 3,
+                acknowledged: false,
             })
         };
         let turn = |state| {
@@ -7360,10 +7428,32 @@ mod tests {
             })
         };
         let pending = |events: &[Envelope]| undelivered_handoff(events).map(|h| h.fence);
+        let handoff = |fence: &str| Handoff {
+            summary: format!("summary {fence}"),
+            fence: fence.to_owned(),
+            carried: 2,
+            total: 3,
+        };
 
         assert_eq!(pending(&[]), None);
         assert_eq!(pending(&[seeded("a")]).as_deref(), Some("a"));
         assert_eq!(pending(&[seeded("a"), turn(TurnState::Completed)]), None);
+        // Written now: only its acknowledgement spends it, never a completed turn alone
+        // (Claude's prompt-less init turn carried nothing).
+        let new = handoff_seeded(&handoff("n"));
+        assert_eq!(
+            pending(&[new.clone(), turn(TurnState::Completed)]).as_deref(),
+            Some("n")
+        );
+        assert_eq!(
+            pending(&[new.clone(), turn(TurnState::Completed), handoff_spent()]),
+            None
+        );
+        // A legacy seed replaced by a new one follows the new one's rule.
+        assert_eq!(
+            pending(&[seeded("a"), new, turn(TurnState::Completed)]).as_deref(),
+            Some("n")
+        );
         // A turn that did not complete proves nothing.
         assert_eq!(
             pending(&[

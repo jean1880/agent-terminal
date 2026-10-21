@@ -274,6 +274,13 @@ pub enum Event {
         fence: String,
         carried: usize,
         total: usize,
+        /// Delivery is stored explicitly: only a later `HandoffSeeded` carrying nothing (written
+        /// once the turn that carried it completed, or when a switch is rolled back) spends it, never
+        /// a completed turn alone (Claude's prompt-less init turn carries nothing). `false` for a
+        /// history written before this existed, where a completed turn still counts. Older builds
+        /// ignore the field.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        acknowledged: bool,
     },
     /// Reply to a control request (`Envelope::request` is the request id). Exactly one of
     /// `ok` / `error` is set; a successful reply with no payload is `ok: Some(Value::Null)`.
