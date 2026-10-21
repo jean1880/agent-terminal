@@ -502,7 +502,7 @@ impl Supervisor {
                             None,
                             true,
                             move |s| {
-                                s.record_child_native_session(&worker, driver, "", &native)?;
+                                s.record_child_native_session(&worker, driver, "default", &native)?;
                                 Ok(())
                             },
                         );
