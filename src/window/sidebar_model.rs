@@ -578,7 +578,7 @@ pub fn limit_over(event: &Event) -> bool {
     }
 }
 
-/// The "Continue in a new thread" button for a target from [`safe_handoff_target`].
+/// The "Continue in a new thread with…" button for a target from [`safe_handoff_target`].
 pub fn continue_label(target: Driver, unasked: bool) -> String {
     if unasked {
         format!(
@@ -620,6 +620,8 @@ pub enum ThreadAction {
         model: Option<String>,
         effort: Option<String>,
     },
+    Fork(String),
+    Compact(String),
     Rename(String),
     Archive(String),
     Unarchive(String),
@@ -661,6 +663,8 @@ impl ThreadAction {
                 model,
                 effort,
             } => full("switch", thread, *driver, model, effort),
+            Self::Fork(t) => simple("fork", t),
+            Self::Compact(t) => simple("compact", t),
             Self::Rename(t) => simple("rename", t),
             Self::Archive(t) => simple("archive", t),
             Self::Unarchive(t) => simple("unarchive", t),
@@ -702,6 +706,8 @@ impl ThreadAction {
                 model,
                 effort,
             }),
+            "fork" => simple(Self::Fork(thread)),
+            "compact" => simple(Self::Compact(thread)),
             "rename" => simple(Self::Rename(thread)),
             "archive" => simple(Self::Archive(thread)),
             "unarchive" => simple(Self::Unarchive(thread)),
@@ -743,7 +749,7 @@ pub struct MenuAgent {
 pub struct ThreadMenuInput {
     pub thread: String,
     pub archived: bool,
-    /// The thread has at least one message to hand over ("Continue in a new thread" needs one).
+    /// The thread has at least one message to hand over ("Continue in a new thread with…" needs one).
     pub has_messages: bool,
     /// Only enabled (and installed) agents appear.
     pub agents: Vec<MenuAgent>,
@@ -853,7 +859,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
     let thread = input.thread.clone();
     let t = thread.clone();
     let continue_in = by_agent(
-        "Continue in a new thread",
+        "Continue in a new thread with…",
         input.has_messages,
         &move |driver, model, effort| ThreadAction::ContinueIn {
             thread: t.clone(),
@@ -864,7 +870,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
     );
     let t = thread.clone();
     let switch_to = by_agent(
-        "Switch this thread to",
+        "Switch agent (stops the current turn)",
         true,
         &move |driver, model, effort| ThreadAction::SwitchTo {
             thread: t.clone(),
@@ -879,7 +885,20 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
         enabled: true,
     };
     vec![
-        MenuEntry::Section(vec![continue_in, switch_to]),
+        MenuEntry::Section(vec![
+            continue_in,
+            switch_to,
+            MenuEntry::Item {
+                label: "Fork thread".to_owned(),
+                action: ThreadAction::Fork(thread.clone()),
+                enabled: input.has_messages,
+            },
+            MenuEntry::Item {
+                label: "Compact into a new thread".to_owned(),
+                action: ThreadAction::Compact(thread.clone()),
+                enabled: input.has_messages,
+            },
+        ]),
         MenuEntry::Section(vec![
             item("Rename…", ThreadAction::Rename(thread.clone())),
             if input.archived {
@@ -1445,7 +1464,7 @@ mod tests {
             entries: agents,
             enabled,
             ..
-        } = submenu(&menu, "Continue in a new thread")
+        } = submenu(&menu, "Continue in a new thread with…")
         else {
             panic!("a submenu");
         };
@@ -1467,7 +1486,7 @@ mod tests {
         );
         // Plain labels: no emoji (a PopoverMenu submenu entry draws no icon).
         assert!(labels.iter().all(|l| l.is_ascii()));
-        let all = items(&[submenu(&menu, "Continue in a new thread").clone()]);
+        let all = items(&[submenu(&menu, "Continue in a new thread with…").clone()]);
         let claude: Vec<_> = all
             .iter()
             .filter(|(_, a, _)| {
@@ -1504,7 +1523,7 @@ mod tests {
             && matches!(a, ThreadAction::ContinueIn { driver: Driver::Codex, model: Some(m), effort: None, .. }
                 if m == "gpt")));
         // Switch uses the same agents with its own action.
-        let switch = items(&[submenu(&menu, "Switch this thread to").clone()]);
+        let switch = items(&[submenu(&menu, "Switch agent (stops the current turn)").clone()]);
         assert_eq!(switch.len(), all.len());
         assert!(switch
             .iter()
@@ -1530,16 +1549,19 @@ mod tests {
     #[test]
     fn continue_is_disabled_without_messages_and_empty_without_agents() {
         let menu = thread_menu(&input(false, false));
-        let cont = items(&[submenu(&menu, "Continue in a new thread").clone()]);
+        let cont = items(&[submenu(&menu, "Continue in a new thread with…").clone()]);
         assert!(!cont.is_empty() && cont.iter().all(|(_, _, on)| !on));
         // Switching in place does not need a history.
-        let switch = items(&[submenu(&menu, "Switch this thread to").clone()]);
+        let switch = items(&[submenu(&menu, "Switch agent (stops the current turn)").clone()]);
         assert!(switch.iter().all(|(_, _, on)| *on));
 
         let mut none = input(true, false);
         none.agents.clear();
         let menu = thread_menu(&none);
-        for label in ["Continue in a new thread", "Switch this thread to"] {
+        for label in [
+            "Continue in a new thread with…",
+            "Switch agent (stops the current turn)",
+        ] {
             assert!(matches!(
                 submenu(&menu, label),
                 MenuEntry::Submenu { enabled: false, entries, .. } if entries.is_empty()
@@ -1566,6 +1588,8 @@ mod tests {
         assert_eq!(
             labels(false),
             [
+                "Fork thread",
+                "Compact into a new thread",
                 "Rename…",
                 "Archive",
                 "Delete…",
@@ -1577,6 +1601,8 @@ mod tests {
         assert_eq!(
             labels(true),
             [
+                "Fork thread",
+                "Compact into a new thread",
                 "Rename…",
                 "Unarchive",
                 "Delete…",
@@ -1602,6 +1628,8 @@ mod tests {
                 model: None,
                 effort: None,
             },
+            ThreadAction::Fork("t".into()),
+            ThreadAction::Compact("t".into()),
             ThreadAction::Rename("t".into()),
             ThreadAction::Archive("t".into()),
             ThreadAction::Unarchive("t".into()),

@@ -5360,9 +5360,9 @@ impl AgentTerminalWindow {
         if let (Some(thread), Some(target)) = (self.current_thread(), target.as_ref()) {
             match crate::config::profile_driver(target) {
                 Some(driver) => {
-                    // Mid-turn, ask first; a thread with no session continues in a new one.
+                    // Mid-turn, ask first: switching stays in this thread and stops its turn.
                     let id = thread.clone();
-                    self.when_not_busy(&thread, move |imp| imp.switch_or_continue(&id, driver));
+                    self.when_not_busy(&thread, move |imp| imp.switch_in_place(&id, driver));
                 }
                 None => present_message(
                     &self.obj(),

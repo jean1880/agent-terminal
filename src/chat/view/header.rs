@@ -242,7 +242,9 @@ impl Header {
 
         let chip = gtk4::Button::new();
         chip.add_css_class("agent-chip");
-        chip.set_tooltip_text(Some("Switch model or agent (/model)"));
+        chip.set_tooltip_text(Some(
+            "Switch model or agent in this thread; stops the current turn (/model)",
+        ));
         let chip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let brand = gtk4::Image::new();
         brand.set_pixel_size(14);
@@ -525,8 +527,9 @@ impl Header {
         let name = format!("{} · {}", driver_name(driver), model_text);
         self.chip
             .update_property(&[gtk4::accessible::Property::Label(&name)]);
-        self.chip
-            .set_tooltip_text(Some(&format!("{name} · Switch model or agent (/model)")));
+        self.chip.set_tooltip_text(Some(&format!(
+            "{name} · Switch model or agent in this thread; stops the current turn (/model)"
+        )));
         self.fit_height();
     }
 
