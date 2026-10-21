@@ -837,6 +837,11 @@ impl ChatSession {
         self.inner.selected.borrow().clone()
     }
 
+    /// The reasoning effort the session runs at; `None` is the agent's own default.
+    pub fn selected_effort(&self) -> Option<String> {
+        self.inner.state.borrow().effort.clone()
+    }
+
     /// Adds a notice to the thread (stored and shown like any event).
     pub fn note(&self, text: impl Into<String>) {
         self.inner

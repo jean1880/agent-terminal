@@ -15,7 +15,7 @@ use std::rc::Rc;
 use agent_core::adapter::Driver;
 use gtk4::gio;
 
-use super::threads::{store_job, NewThread, Sidebar};
+use super::threads::{archive_notice, delete_notice, store_job, NewThread, Sidebar, WriteNotice};
 use super::*;
 use crate::availability::{AgentAvailability, Availability};
 use crate::chat::session::build_handoff;
@@ -495,38 +495,79 @@ impl AgentTerminalWindow {
 
     /// Hides (or brings back) a thread. Archiving closes its page; the thread stays in the store
     /// and behind the sidebar's "Show archived" toggle.
-    fn set_thread_archived(&self, thread: &str, archived: bool) {
+    pub(super) fn set_thread_archived(&self, thread: &str, archived: bool) {
         if let Some(owner) = super::threads::thread_owner(thread).filter(|w| w != &*self.obj()) {
             owner.imp().set_thread_archived(thread, archived);
             return;
         }
-        // Archiving ends a running turn like closing does: ask first, and do nothing if declined.
-        let key = RowKey::Thread(thread.to_owned());
-        if archived && self.row_is_busy(&key) {
-            let id = thread.to_owned();
-            self.confirm_stop_then(thread, move |imp| imp.archive_now(&id));
+        if !archived {
+            self.store_archived(thread, false, false);
             return;
         }
-        // Stored before the page closes: an archived thread is never discarded as blank.
-        self.store_archived(thread, archived);
-        if archived {
-            self.close_row_now(&key);
+        // Archiving ends a running turn and drops an unsent message like closing does: ask
+        // first, and do nothing if declined.
+        let key = RowKey::Thread(thread.to_owned());
+        if let Some(reasons) = self.row_close_reasons(&key) {
+            let id = thread.to_owned();
+            self.confirm_stop_then(thread, reasons, move |imp| imp.archive_now(&id));
+            return;
         }
+        self.archive_now(thread);
     }
 
+    /// Archives the thread and closes its page. Its toast says whether that stopped a turn
+    /// (busy as the page closes, not when the question was asked).
     fn archive_now(&self, thread: &str) {
-        self.store_archived(thread, true);
-        self.close_row_now(&RowKey::Thread(thread.to_owned()));
+        let key = RowKey::Thread(thread.to_owned());
+        let stopped = self.row_is_busy(&key);
+        // Stored before the page closes: an archived thread is never discarded as blank.
+        self.store_archived(thread, true, stopped);
+        self.close_row_now(&key);
     }
 
-    fn store_archived(&self, thread: &str, archived: bool) {
+    /// Archives (or brings back) the thread in the store, and says so once the writer has
+    /// answered: an archive's toast offers Undo, which brings the thread back into the list
+    /// (never its stopped turn).
+    fn store_archived(&self, thread: &str, archived: bool, stopped: bool) {
         let id = thread.to_owned();
-        self.write_store("archive the thread", move |s| s.set_archived(&id, archived));
-        self.show_toast(if archived {
-            "Thread archived (Show archived brings it back into view)"
-        } else {
-            "Thread restored"
-        });
+        let thread = thread.to_owned();
+        self.write_store_then(
+            if archived {
+                "archive the thread"
+            } else {
+                "restore the thread"
+            },
+            move |s| s.set_archived(&id, archived),
+            move |imp, outcome| {
+                let outcome = outcome.map(|r| r.map_err(|e| e.to_string()));
+                imp.show_write_notice(archive_notice(archived, stopped, outcome), move |imp| {
+                    imp.set_thread_archived(&thread, false);
+                });
+            },
+        );
+    }
+
+    /// Shows `notice`: a toast (with Undo running `undo`, when it offers one) or a dialog.
+    fn show_write_notice(&self, notice: WriteNotice, undo: impl Fn(&Self) + 'static) {
+        match notice {
+            WriteNotice::Toast { text, undo: false } => self.show_toast(&text),
+            WriteNotice::Toast { text, undo: true } => {
+                let toast = adw::Toast::builder()
+                    .title(text)
+                    .use_markup(false)
+                    .button_label("Undo")
+                    .timeout(10)
+                    .build();
+                let obj = self.obj().downgrade();
+                toast.connect_button_clicked(move |_| {
+                    if let Some(window) = obj.upgrade() {
+                        undo(window.imp());
+                    }
+                });
+                self.add_toast(toast);
+            }
+            WriteNotice::Failure { heading, body } => present_message(&self.obj(), heading, &body),
+        }
     }
 
     /// Asks before deleting: this removes the thread's history from Agent Terminal.
@@ -556,15 +597,26 @@ impl AgentTerminalWindow {
     }
 
     /// Closes the thread's page (ending its session) and removes it from the store.
-    fn delete_thread_now(&self, thread: &str) {
-        self.close_row_now(&RowKey::Thread(thread.to_owned()));
+    /// Says so once the writer has answered: "Thread deleted", or what failed.
+    pub(super) fn delete_thread_now(&self, thread: &str) {
+        // Running in any window: closing its page stops its agent, whatever the write does.
+        let stopped = super::threads::thread_owner(thread)
+            .and_then(|w| w.imp().slot_of(thread))
+            .is_some_and(|slot| slot.get().is_some());
+        self.close_row_for_delete(thread);
         let id = thread.to_owned();
-        // Closing a blank thread's page may have discarded it already: that is deleted too.
-        self.write_store("delete the thread", move |s| match s.delete_thread(&id) {
-            Err(agent_kit::store::StoreError::NotFound(_)) => Ok(()),
-            done => done,
-        });
-        self.show_toast("Thread deleted");
+        // Already gone (deleted elsewhere meanwhile) is deleted too.
+        self.write_store_then(
+            "delete the thread",
+            move |s| match s.delete_thread(&id) {
+                Err(agent_kit::store::StoreError::NotFound(_)) => Ok(()),
+                done => done,
+            },
+            move |imp, outcome| {
+                let outcome = outcome.map(|r| r.map_err(|e| e.to_string()));
+                imp.show_write_notice(delete_notice(stopped, outcome), |_| {});
+            },
+        );
     }
 
     // ---- folder ----
