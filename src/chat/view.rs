@@ -512,6 +512,14 @@ impl ChatView {
             .is_some_and(|inner| !inner.composer.text().trim().is_empty())
     }
 
+    /// Puts `text` in the composer, as typing it would (tests).
+    #[cfg(test)]
+    pub(crate) fn set_draft(&self, text: &str) {
+        if let Some(inner) = self.inner() {
+            inner.composer.set_text(text);
+        }
+    }
+
     /// Stops the thread's agent process and starts it again on the same conversation (a
     /// recovery tool: Restart Agent in the window menu).
     pub fn restart_agent(&self) {

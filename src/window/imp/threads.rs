@@ -312,6 +312,263 @@ pub(super) fn switch_warning(title: &str, driver: Driver) -> (String, String) {
     )
 }
 
+/// What closing a thread page would lose (the row's X, archive, the window): its running work
+/// ([`ChatTab::busy`]), its unsent draft, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CloseReasons {
+    pub(super) busy: bool,
+    pub(super) draft: bool,
+}
+
+/// Why closing a thread must ask first; `None` when nothing would be lost. A draft is its own
+/// reason, beside `busy`, which stays about work alone (idle suspension reads it).
+pub(super) fn close_reasons(busy: bool, draft: bool) -> Option<CloseReasons> {
+    (busy || draft).then_some(CloseReasons { busy, draft })
+}
+
+/// `“title”`, or "This thread" for an untitled one.
+fn thread_subject(title: &str) -> String {
+    if title.is_empty() {
+        "This thread".to_owned()
+    } else {
+        format!("“{title}”")
+    }
+}
+
+/// The question before closing (or archiving) one thread: its heading, body and the label of the
+/// destructive answer.
+pub(super) fn close_question(title: &str, reasons: CloseReasons) -> (String, String, &'static str) {
+    let subject = thread_subject(title);
+    match (reasons.busy, reasons.draft) {
+        (true, true) => (
+            "Stop the Running Turn and Close?".to_owned(),
+            format!(
+                "{subject} is working or waiting for you, and has an unsent message. Closing it \
+                 stops the agent, and any sub-agents, before it finishes, and discards the \
+                 message. Edits already made stay on disk."
+            ),
+            "Stop and Close",
+        ),
+        (true, false) => (
+            "Stop the Running Turn and Close?".to_owned(),
+            format!(
+                "{subject} is working or waiting for you. Closing it stops the agent, and any \
+                 sub-agents, before it finishes. Edits already made stay on disk."
+            ),
+            "Stop and Close",
+        ),
+        (false, _) => (
+            "Discard the Unsent Message?".to_owned(),
+            format!("{subject} has an unsent message. Closing the thread discards it."),
+            "Discard and Close",
+        ),
+    }
+}
+
+/// The window-close question for the threads that would lose something, as (title, reasons):
+/// its heading, body and the label of the destructive answer. `None` when the list is empty.
+pub(super) fn window_close_question(
+    threads: &[(String, CloseReasons)],
+) -> Option<(String, String, &'static str)> {
+    if threads.is_empty() {
+        return None;
+    }
+    let busy = threads.iter().filter(|(_, r)| r.busy).count();
+    let lines = threads
+        .iter()
+        .map(|(title, r)| {
+            let title = if title.is_empty() {
+                "New thread"
+            } else {
+                title
+            };
+            if r.draft {
+                format!("• {title} has an unsent message")
+            } else {
+                format!("• {title}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(if busy > 0 {
+        (
+            stop_heading(busy),
+            format!(
+                "Closing stops the agent, and any sub-agents, before they finish, and discards \
+                 unsent messages:\n\n{lines}\n\nEdits already made stay on disk."
+            ),
+            "Stop and Close",
+        )
+    } else {
+        (
+            if threads.len() == 1 {
+                "Discard the Unsent Message?".to_owned()
+            } else {
+                "Discard the Unsent Messages?".to_owned()
+            },
+            format!("Closing discards what has not been sent:\n\n{lines}"),
+            "Discard and Close",
+        )
+    })
+}
+
+/// What a discarded blank thread is recreated from (its toast's Undo), fixed when it was
+/// discarded: its agent, folder, profile, worktree, model, effort and mode (never dangerous
+/// permissive mode, which ends with its agent).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DiscardedThread {
+    driver: Driver,
+    dir: String,
+    profile_id: Option<String>,
+    worktree: Option<crate::worktree::WorktreeInfo>,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<Mode>,
+}
+
+impl DiscardedThread {
+    /// The thread to create again: the same folder (refused if it is gone, never replaced) and
+    /// the same choices, through the ordinary creation path.
+    pub(super) fn new_thread(&self) -> NewThread {
+        NewThread {
+            dir: Some(self.dir.clone()),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            mode: self.mode.map(Mode::session_safe),
+            profile_id: self.profile_id.clone(),
+            worktree: self.worktree.clone(),
+            ..NewThread::new(self.driver)
+        }
+    }
+}
+
+/// What a blank thread was stored with, read in the job that deletes it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StoredChoices {
+    pub(super) model: Option<String>,
+    pub(super) attributes: agent_kit::store::ThreadAttributes,
+    pub(super) mode: Option<Mode>,
+}
+
+impl DiscardedThread {
+    /// Fills in from the store what the page could not say. `live`: the page had a session, so
+    /// its model is the session's (`None` meaning the agent's own) and is kept. Without one the
+    /// model is the stored one, and a profile, worktree or mode the page does not know yet (it
+    /// closed before it was built) is the stored one too.
+    pub(super) fn with_stored(mut self, stored: StoredChoices, live: bool) -> Self {
+        if live {
+            return self;
+        }
+        self.model = stored_model(stored.model.as_deref());
+        self.profile_id = self.profile_id.or(stored.attributes.profile_id);
+        self.worktree = self.worktree.or(stored.attributes.worktree);
+        self.mode = self.mode.or(stored.mode).map(Mode::session_safe);
+        self
+    }
+}
+
+/// The [`DiscardedThread`] a blank thread page leaves: what its session runs with, else what
+/// the page knows; `true` with it when it had a session. What the page cannot say is read from
+/// the store as the thread is deleted ([`DiscardedThread::with_stored`]).
+fn discarded_thread(tab: &TabState, chat: &ChatTab) -> (DiscardedThread, bool) {
+    let session = chat.slot.get();
+    let spec = DiscardedThread {
+        driver: chat.driver,
+        dir: tab.dir.clone(),
+        profile_id: chat.profile_id.clone(),
+        worktree: tab.worktree.clone(),
+        model: session.as_ref().and_then(|s| s.selected_model()),
+        effort: session
+            .as_ref()
+            .map_or_else(|| chat.pending_effort.clone(), |s| s.selected_effort()),
+        mode: session
+            .as_ref()
+            .map(|s| s.wanted_mode())
+            .or(chat.chosen_mode)
+            .map(Mode::session_safe),
+    };
+    (spec, session.is_some())
+}
+
+/// What the user is told once a store write behind a thread action has answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WriteNotice {
+    /// A toast; `undo` offers the action's Undo.
+    Toast { text: String, undo: bool },
+    /// A dialog: the write did not land.
+    Failure { heading: &'static str, body: String },
+}
+
+/// The error text of a store write that did not answer in time.
+const STORE_LATE: &str = "the thread store did not answer in time (it may still be saved)";
+
+/// The notice for an archive (`archived`) or its undo, once written. `stopped`: archiving closed
+/// the thread mid-turn, which Undo cannot resume, so the toast says so (and Undo only brings the
+/// thread back into the list).
+pub(super) fn archive_notice(
+    archived: bool,
+    stopped: bool,
+    outcome: Option<Result<(), String>>,
+) -> WriteNotice {
+    match (outcome, archived) {
+        (Some(Ok(())), true) => WriteNotice::Toast {
+            text: if stopped {
+                "Archived; its running turn was stopped".to_owned()
+            } else {
+                "Thread archived".to_owned()
+            },
+            undo: true,
+        },
+        (Some(Ok(())), false) => WriteNotice::Toast {
+            text: "Thread restored".to_owned(),
+            undo: false,
+        },
+        (failed, archived) => {
+            let error = failed
+                .and_then(Result::err)
+                .unwrap_or_else(|| STORE_LATE.to_owned());
+            WriteNotice::Failure {
+                heading: if archived {
+                    "Could Not Archive the Thread"
+                } else {
+                    "Could Not Restore the Thread"
+                },
+                body: match (archived, stopped) {
+                    (true, true) => format!(
+                        "The agent was stopped, but the thread could not be archived: {error}"
+                    ),
+                    (true, false) => format!("The thread could not be archived: {error}"),
+                    (false, _) => format!("The thread could not be restored: {error}"),
+                },
+            }
+        }
+    }
+}
+
+/// The notice for a delete, once written. `stopped`: the thread's page was open, so its agent
+/// was stopped before the write, whatever became of it.
+pub(super) fn delete_notice(stopped: bool, outcome: Option<Result<(), String>>) -> WriteNotice {
+    match outcome {
+        Some(Ok(())) => WriteNotice::Toast {
+            text: "Thread deleted".to_owned(),
+            undo: false,
+        },
+        failed => {
+            let error = failed
+                .and_then(Result::err)
+                .unwrap_or_else(|| STORE_LATE.to_owned());
+            WriteNotice::Failure {
+                heading: "Could Not Delete the Thread",
+                body: if stopped {
+                    format!("The agent was stopped, but the thread could not be deleted: {error}")
+                } else {
+                    format!("The thread could not be deleted: {error}")
+                },
+            }
+        }
+    }
+}
+
 /// The desktop notification id for a thread waiting on an approval or a question.
 fn approval_notification_id(thread: &str) -> String {
     format!("approval-{thread}")
@@ -340,6 +597,15 @@ impl ChatTab {
     pub(super) fn busy(&self) -> bool {
         is_busy(self.running, !self.background.is_empty(), self.approval)
             || crate::delegation::supervisor().is_some_and(|s| s.root_busy(&self.thread))
+    }
+
+    /// What closing this thread's page would lose: its work ([`Self::busy`]) or its unsent
+    /// draft. `None`: nothing, so no question is asked.
+    pub(super) fn closing_loses(&self) -> Option<CloseReasons> {
+        close_reasons(
+            self.busy(),
+            self.view.as_ref().is_some_and(ChatView::has_draft),
+        )
     }
 }
 
@@ -684,6 +950,10 @@ thread_local! {
     static OPEN_LAYOUT_WRITES: LayoutWrites = LayoutWrites::default();
     static SCAN_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CHAT_RESTORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Threads whose page is closing for a delete or an archive: their detach discards nothing
+    /// and offers no Undo ([`AgentTerminalWindow::close_row_without_discard`]).
+    static NO_DISCARD: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 /// The app's one thread store, opened on first use. A store that cannot be opened falls back
@@ -1012,6 +1282,8 @@ struct CreatedThread {
     title: Option<String>,
     profile_id: Option<String>,
     worktree: Option<crate::worktree::WorktreeInfo>,
+    /// The mode it was created in (stored as its choice), known before its page is built.
+    mode: Option<Mode>,
 }
 
 /// Stores a NEW thread from `spec` under ids made beforehand (what the store writer runs): the
@@ -2608,6 +2880,20 @@ impl AgentTerminalWindow {
         what: &'static str,
         job: impl FnOnce(&Store) -> agent_kit::store::Result<()> + Send + 'static,
     ) {
+        self.write_store_then(what, job, |_, _| {});
+    }
+
+    /// [`Self::write_store`], then `answered` with the writer's receipt once it has one: what a
+    /// caller shows only once the write has landed (or failed). `None`: the writer is gone or
+    /// far behind (the write may still land; the list reloads if it does). A failure is logged
+    /// and the thread list reloaded before `answered` runs, which it does only while the window
+    /// is still there.
+    pub(super) fn write_store_then<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
+        answered: impl FnOnce(&Self, Option<agent_kit::store::Result<T>>) + 'static,
+    ) {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let reload = obj.clone();
@@ -2616,11 +2902,14 @@ impl AgentTerminalWindow {
                     obj.imp().reload_summaries();
                 }
             };
-            if let Some(Err(e)) = write_job_or_late(what, job, late).await {
+            let outcome = write_job_or_late(what, job, late).await;
+            if let Some(Err(e)) = &outcome {
                 warn!("Cannot {what}: {e}");
             }
             if let Some(obj) = obj.upgrade() {
-                obj.imp().reload_summaries();
+                let imp = obj.imp();
+                imp.reload_summaries();
+                answered(imp, outcome);
             }
         });
     }
@@ -3099,43 +3388,40 @@ impl AgentTerminalWindow {
             .any(|c| &c.thread == id && c.busy())
     }
 
-    /// On a window close request: when any thread is busy, asks once and returns true (the
-    /// close is held back). "Stop and Close" lets the next close request through, which stops
-    /// every session; Cancel leaves the window open. False when nothing is busy.
+    /// What closing `key`'s page would lose ([`ChatTab::closing_loses`]); `None` for a terminal
+    /// page or a thread with nothing to lose.
+    pub(super) fn row_close_reasons(&self, key: &RowKey) -> Option<CloseReasons> {
+        let RowKey::Thread(id) = key else {
+            return None;
+        };
+        self.tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| &c.thread == id)
+            .and_then(ChatTab::closing_loses)
+    }
+
+    /// On a window close request: when any thread is busy or holds an unsent message, asks once
+    /// and returns true (the close is held back). "Stop and Close" lets the next close request
+    /// through, which stops every session; Cancel leaves the window open. False when nothing
+    /// would be lost.
     pub(super) fn confirm_close_busy(&self) -> bool {
-        let titles: Vec<String> = self
+        let threads: Vec<(String, CloseReasons)> = self
             .tabs
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .filter(|c| c.busy())
-            .map(|c| {
-                if c.title.is_empty() {
-                    "New thread".to_owned()
-                } else {
-                    c.title.clone()
-                }
-            })
+            .filter_map(|c| Some((c.title.clone(), c.closing_loses()?)))
             .collect();
-        if titles.is_empty() {
+        let Some((heading, body, confirm)) = window_close_question(&threads) else {
             return false;
-        }
+        };
         if self.close_prompt_open.replace(true) {
             return true; // one question at a time
         }
-        let dialog = adw::AlertDialog::new(
-            Some(&stop_heading(titles.len())),
-            Some(&format!(
-                "Closing stops the agent, and any sub-agents, before they finish:\n\n{}\n\n\
-                 Edits already made stay on disk.",
-                titles
-                    .iter()
-                    .map(|t| format!("• {t}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )),
-        );
-        dialog.add_responses(&[("cancel", "Cancel"), ("stop", "Stop and Close")]);
+        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("stop", confirm)]);
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -3157,9 +3443,15 @@ impl AgentTerminalWindow {
         true
     }
 
-    /// Runs `then` once the user agrees to stop `thread`'s running turn (closing or archiving
-    /// ends its session). Cancelling does nothing.
-    pub(super) fn confirm_stop_then(&self, thread: &str, then: impl FnOnce(&Self) + 'static) {
+    /// Runs `then` once the user agrees to lose what `reasons` says closing `thread` loses (its
+    /// running turn, its unsent message: closing or archiving ends its session and its page).
+    /// Cancelling does nothing.
+    pub(super) fn confirm_stop_then(
+        &self,
+        thread: &str,
+        reasons: CloseReasons,
+        then: impl FnOnce(&Self) + 'static,
+    ) {
         // At most one question per thread: a second click on X while it is open does nothing.
         let first = self
             .tabs
@@ -3171,15 +3463,9 @@ impl AgentTerminalWindow {
         if !first {
             return;
         }
-        let title = self.thread_title_of(thread);
-        let dialog = adw::AlertDialog::new(
-            Some("Stop the Running Turn and Close?"),
-            Some(&format!(
-                "“{title}” is working or waiting for you. Closing it stops the agent, and any \
-                 sub-agents, before it finishes. Edits already made stay on disk."
-            )),
-        );
-        dialog.add_responses(&[("cancel", "Cancel"), ("stop", "Stop and Close")]);
+        let (heading, body, confirm) = close_question(&self.thread_title_of(thread), reasons);
+        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("stop", confirm)]);
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -3282,9 +3568,9 @@ impl AgentTerminalWindow {
                 return;
             }
         }
-        if let (true, RowKey::Thread(thread)) = (self.row_is_busy(key), key) {
+        if let (Some(reasons), RowKey::Thread(thread)) = (self.row_close_reasons(key), key) {
             let key = key.clone();
-            self.confirm_stop_then(thread, move |imp| imp.close_row_now(&key));
+            self.confirm_stop_then(thread, reasons, move |imp| imp.close_row_now(&key));
         } else {
             self.close_row_now(key);
         }
@@ -3441,18 +3727,75 @@ impl AgentTerminalWindow {
     }
 
     /// A thread page that looked blank was closed: deletes the thread if the store agrees it
-    /// holds nothing (checked behind every write already queued for it).
-    pub(super) fn discard_if_blank(&self, chat: &ChatTab) {
-        if self.is_closing() || !chat.looks_blank() {
+    /// holds nothing (checked behind every write already queued for it). Once it is deleted, a
+    /// toast offers Undo, which creates the thread again as it was (see [`DiscardedThread`]).
+    pub(super) fn discard_if_blank(&self, tab: &TabState) {
+        let Some(chat) = tab.chat.as_ref() else {
+            return;
+        };
+        if self.is_closing()
+            || !chat.looks_blank()
+            || NO_DISCARD.with(|d| d.borrow().contains(&chat.thread))
+        {
             return;
         }
+        let (spec, live) = discarded_thread(tab, chat);
         let id = chat.thread.clone();
-        self.write_store("discard a blank thread", move |s| {
-            if s.delete_if_blank(&id)? {
-                info!("Discarded blank thread {id}");
+        let thread = id.clone();
+        self.write_store_then(
+            "discard a blank thread",
+            // What it was stored with, once deleted; None when the store found something in it.
+            move |s| {
+                let stored = StoredChoices {
+                    model: s.thread_summary(&id)?.and_then(|t| t.model),
+                    attributes: s.thread_attributes(&id)?,
+                    mode: crate::chat::session::chosen_mode(
+                        s.events(&id, None, REPLAY_LIMIT)?.iter().map(|(_, e)| e),
+                    ),
+                };
+                Ok(s.delete_if_blank(&id)?.then_some(stored))
+            },
+            move |imp, outcome| {
+                if let Some(Ok(Some(stored))) = outcome {
+                    info!("Discarded blank thread {thread}");
+                    imp.offer_undo_discard(spec.with_stored(stored, live));
+                }
+            },
+        );
+    }
+
+    /// Closes `thread`'s page, in whichever window has it, for a delete or an archive: that
+    /// write decides the thread's fate, so its page's detach discards nothing (a discard racing
+    /// an archive could delete the thread archived) and never offers to undo a discard.
+    pub(super) fn close_row_without_discard(&self, thread: &str) {
+        NO_DISCARD.with(|d| d.borrow_mut().insert(thread.to_owned()));
+        // The page closes (and detaches) in place: `close-page` finishes at once.
+        self.close_row_now(&RowKey::Thread(thread.to_owned()));
+        NO_DISCARD.with(|d| d.borrow_mut().remove(thread));
+    }
+
+    /// The "Empty thread discarded" toast, whose Undo creates the thread again from `spec`.
+    fn offer_undo_discard(&self, spec: DiscardedThread) {
+        let toast = adw::Toast::builder()
+            .title("Empty thread discarded")
+            .use_markup(false)
+            .button_label("Undo")
+            .timeout(10)
+            .build();
+        let obj = self.obj().downgrade();
+        toast.connect_button_clicked(move |_| {
+            if let Some(window) = obj.upgrade() {
+                window.imp().undo_discard(&spec);
             }
-            Ok(())
         });
+        self.add_toast(toast);
+    }
+
+    /// Creates a discarded blank thread again, through the ordinary creation path: a folder that
+    /// is gone is refused there, and a failed write says so there.
+    pub(super) fn undo_discard(&self, spec: &DiscardedThread) -> Option<adw::TabPage> {
+        info!("Recreating a discarded blank thread");
+        self.create_chat_thread(spec.new_thread())
     }
 
     /// Shows the open pages, or the empty state when there are none. While the last session's
@@ -4998,6 +5341,8 @@ impl AgentTerminalWindow {
     /// shelves or composer; over the whole window when no thread is selected (empty state,
     /// terminal page).
     pub(super) fn add_toast(&self, toast: adw::Toast) {
+        #[cfg(test)]
+        self.test_toasts.borrow_mut().push(toast.clone());
         let selected = self
             .tab_view
             .borrow()
@@ -5773,6 +6118,7 @@ impl AgentTerminalWindow {
             title,
             profile_id,
             worktree,
+            mode,
         };
         if store.writer().is_none() {
             // In place (memory-only store, tests): the page opens at once.
@@ -5826,6 +6172,7 @@ impl AgentTerminalWindow {
             title,
             profile_id,
             worktree,
+            mode,
         } = created;
         self.reload_summaries();
         let page = self.open_thread(thread, false)?;
@@ -5840,6 +6187,8 @@ impl AgentTerminalWindow {
                 chat.pending_effort = effort;
                 chat.pending_handoff = handoff;
                 chat.profile_id = profile_id;
+                // Before the build reads it from history: a page closed sooner still knows it.
+                chat.chosen_mode = mode.map(Mode::session_safe);
                 if let Some(title) = title {
                     chat.title = title;
                 }
@@ -9352,5 +9701,523 @@ pub(super) mod tests {
         STORE_PATH.with(|p| *p.borrow_mut() = None);
         STORE.with(|s| *s.borrow_mut() = None);
         assert_eq!(writer.failures().0, 0);
+    }
+
+    #[test]
+    fn an_unsent_message_is_a_close_reason_of_its_own_beside_busy() {
+        let only = |busy, draft| CloseReasons { busy, draft };
+        assert_eq!(close_reasons(false, false), None, "nothing to lose");
+        assert_eq!(close_reasons(true, false), Some(only(true, false)));
+        assert_eq!(close_reasons(false, true), Some(only(false, true)));
+        assert_eq!(close_reasons(true, true), Some(only(true, true)));
+
+        let (heading, body, confirm) = close_question("Fix the build", only(false, true));
+        assert_eq!(heading, "Discard the Unsent Message?");
+        assert_eq!(
+            body,
+            "“Fix the build” has an unsent message. Closing the thread discards it."
+        );
+        assert_eq!(confirm, "Discard and Close");
+        let (_, untitled, _) = close_question("", only(false, true));
+        assert!(untitled.starts_with("This thread has an unsent message"));
+
+        // Busy alone reads as it always did.
+        let (heading, body, confirm) = close_question("Fix the build", only(true, false));
+        assert_eq!(heading, "Stop the Running Turn and Close?");
+        assert!(body.starts_with("“Fix the build” is working or waiting for you."));
+        assert!(!body.contains("unsent"));
+        assert_eq!(confirm, "Stop and Close");
+        let (_, both, confirm) = close_question("Fix the build", only(true, true));
+        assert!(both.contains("has an unsent message"), "{both}");
+        assert!(both.contains("stops the agent"), "{both}");
+        assert_eq!(confirm, "Stop and Close");
+    }
+
+    #[test]
+    fn the_window_close_question_lists_running_threads_and_unsent_messages() {
+        let r = |busy, draft| CloseReasons { busy, draft };
+        assert_eq!(window_close_question(&[]), None);
+        let (heading, body, confirm) =
+            window_close_question(&[("Notes".into(), r(false, true))]).unwrap();
+        assert_eq!(heading, "Discard the Unsent Message?");
+        assert!(body.contains("• Notes has an unsent message"), "{body}");
+        assert_eq!(confirm, "Discard and Close");
+        let (heading, _, _) = window_close_question(&[
+            ("Notes".into(), r(false, true)),
+            (String::new(), r(false, true)),
+        ])
+        .unwrap();
+        assert_eq!(heading, "Discard the Unsent Messages?");
+        // Any running thread makes it the stop question, counting only the running ones.
+        let (heading, body, confirm) = window_close_question(&[
+            ("Build".into(), r(true, false)),
+            (String::new(), r(false, true)),
+        ])
+        .unwrap();
+        assert_eq!(heading, stop_heading(1));
+        assert!(body.contains("• Build\n"), "{body}");
+        assert!(
+            body.contains("• New thread has an unsent message"),
+            "{body}"
+        );
+        assert_eq!(confirm, "Stop and Close");
+    }
+
+    #[test]
+    fn archive_and_delete_say_what_happened_only_from_the_writers_answer() {
+        let toast = |text: &str, undo| WriteNotice::Toast {
+            text: text.into(),
+            undo,
+        };
+        assert_eq!(
+            archive_notice(true, false, Some(Ok(()))),
+            toast("Thread archived", true)
+        );
+        assert_eq!(
+            archive_notice(true, true, Some(Ok(()))),
+            toast("Archived; its running turn was stopped", true)
+        );
+        assert_eq!(
+            archive_notice(false, true, Some(Ok(()))),
+            toast("Thread restored", false),
+            "Undo brings the thread back, and says nothing of resuming its turn"
+        );
+        let WriteNotice::Failure { body, .. } =
+            archive_notice(true, true, Some(Err("disk".into())))
+        else {
+            panic!("a failure");
+        };
+        assert_eq!(
+            body,
+            "The agent was stopped, but the thread could not be archived: disk"
+        );
+        let WriteNotice::Failure { body, .. } = archive_notice(true, false, None) else {
+            panic!("no answer is a failure");
+        };
+        assert!(body.starts_with("The thread could not be archived: the thread store"));
+
+        assert_eq!(
+            delete_notice(true, Some(Ok(()))),
+            toast("Thread deleted", false)
+        );
+        let WriteNotice::Failure { heading, body } =
+            delete_notice(true, Some(Err("locked".into())))
+        else {
+            panic!("a failure");
+        };
+        assert_eq!(heading, "Could Not Delete the Thread");
+        assert_eq!(
+            body,
+            "The agent was stopped, but the thread could not be deleted: locked"
+        );
+        let WriteNotice::Failure { body, .. } = delete_notice(false, Some(Err("locked".into())))
+        else {
+            panic!("a failure");
+        };
+        assert_eq!(body, "The thread could not be deleted: locked");
+    }
+
+    #[test]
+    fn a_discarded_thread_comes_back_with_its_choices_and_never_in_bypass() {
+        let worktree = crate::worktree::WorktreeInfo {
+            path: "/w/tree".into(),
+            branch: "feat/x".into(),
+            main_toplevel: "/w/main".into(),
+        };
+        let spec = DiscardedThread {
+            driver: Driver::Codex,
+            dir: "/w/tree".into(),
+            profile_id: Some("codex-work".into()),
+            worktree: Some(worktree.clone()),
+            model: Some("gpt-5".into()),
+            effort: Some("high".into()),
+            mode: Some(Mode::Bypass),
+        };
+        let new = spec.new_thread();
+        assert_eq!(new.driver, Driver::Codex);
+        assert_eq!(
+            new.dir.as_deref(),
+            Some("/w/tree"),
+            "the folder is explicit"
+        );
+        assert_eq!(new.profile_id.as_deref(), Some("codex-work"));
+        assert_eq!(new.worktree.as_ref(), Some(&worktree));
+        assert_eq!(new.model.as_deref(), Some("gpt-5"));
+        assert_eq!(new.effort.as_deref(), Some("high"));
+        assert_eq!(new.mode, Some(Mode::Ask), "never dangerous permissive mode");
+        assert!(new.prompt.is_none() && new.handoff.is_none() && new.title.is_none());
+        let plan = DiscardedThread {
+            mode: Some(Mode::Plan),
+            ..spec.clone()
+        };
+        assert_eq!(plan.new_thread().mode, Some(Mode::Plan));
+
+        // A page closed before it was built knows only its agent and folder: the store fills in
+        // the rest. A page with a session keeps its own, the session's model included.
+        let unbuilt = DiscardedThread {
+            profile_id: None,
+            worktree: None,
+            model: None,
+            effort: None,
+            mode: None,
+            ..spec.clone()
+        };
+        let stored = StoredChoices {
+            model: Some("default".into()),
+            attributes: agent_kit::store::ThreadAttributes {
+                profile_id: Some("codex-work".into()),
+                worktree: Some(worktree.clone()),
+            },
+            mode: Some(Mode::Bypass),
+        };
+        let filled = unbuilt.clone().with_stored(stored.clone(), false);
+        assert_eq!(filled.model, None, "the stored sentinel is the agent's own");
+        assert_eq!(filled.profile_id.as_deref(), Some("codex-work"));
+        assert_eq!(filled.worktree, Some(worktree));
+        assert_eq!(
+            filled.mode,
+            Some(Mode::Ask),
+            "never dangerous permissive mode"
+        );
+        let stored_opus = StoredChoices {
+            model: Some("opus".into()),
+            ..stored.clone()
+        };
+        assert_eq!(
+            unbuilt
+                .clone()
+                .with_stored(stored_opus, false)
+                .model
+                .as_deref(),
+            Some("opus")
+        );
+        assert_eq!(unbuilt.clone().with_stored(stored, true), unbuilt);
+    }
+
+    /// Through the store writer: an unsent message makes closing ask; a blank thread left is
+    /// discarded with a toast whose Undo makes it again as it was (two toasts at once each undo
+    /// their own); an archive's toast comes after the write and its Undo brings the thread back;
+    /// with the writer gone, an Undo and a delete say they failed.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn close_guards_ask_for_drafts_and_discards_and_archives_can_be_undone() {
+        use crate::testutil::{pump_until, settle};
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        crate::icons::register();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("threads.db");
+        let reader = Rc::new(Store::open(&path).expect("open"));
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        STORE.with(|s| *s.borrow_mut() = Some(reader.clone()));
+        STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+        WRITER.with(|w| *w.borrow_mut() = Some(writer.clone()));
+        let app = adw::Application::builder()
+            .application_id("org.test.CloseGuards")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let _hold = app.hold();
+        CHAT_RESTORED.with(|done| done.set(true));
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        imp.config.borrow_mut().profiles.push(Profile {
+            id: "claude-work".into(),
+            name: "Claude (work)".into(),
+            ..crate::config::new_agent_profile(Driver::Claude)
+        });
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path().to_string_lossy().into_owned();
+        let other = tempfile::tempdir().unwrap();
+        let other_dir = other.path().to_string_lossy().into_owned();
+        let exists = |id: &str| reader.thread_summary(id).ok().flatten().is_some();
+        let toasts = || -> Vec<adw::Toast> { imp.test_toasts.borrow().clone() };
+        let titles = || -> Vec<String> {
+            toasts()
+                .iter()
+                .map(|t| t.title().map(|s| s.to_string()).unwrap_or_default())
+                .collect()
+        };
+        // The thread whose page is shown once a creation has opened it.
+        let create = |new: NewThread| -> String {
+            let before = imp.current_thread();
+            assert!(imp.create_chat_thread(new).is_none(), "through the writer");
+            assert!(pump_until(&ctx, 10, || imp
+                .current_thread()
+                .is_some_and(|t| Some(&t) != before.as_ref())));
+            imp.current_thread().unwrap()
+        };
+        let built = |id: &str| {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .find(|c| c.thread == id)
+                .and_then(|c| c.view.clone())
+        };
+        // Answers the open dialog with `heading` by clicking `button`, as a user does.
+        let answer = |heading: &str, button: &str| {
+            let open = || {
+                adw::prelude::AdwApplicationWindowExt::visible_dialog(&window)
+                    .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+                    .filter(|d| d.heading().as_deref() == Some(heading))
+            };
+            assert!(pump_until(&ctx, 5, || open().is_some()), "asks: {heading}");
+            let dialog = open().expect("the dialog");
+            let target = crate::testutil::descendants(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+                .find(|b| {
+                    b.label().as_deref() == Some(button)
+                        || crate::testutil::descendants(b.upcast_ref())
+                            .iter()
+                            .any(|w| {
+                                w.downcast_ref::<gtk4::Label>()
+                                    .is_some_and(|l| l.text() == button)
+                            })
+                })
+                .unwrap_or_else(|| panic!("{heading} has a {button} button"));
+            assert!(pump_until(&ctx, 10, || target.is_mapped() && target.is_sensitive()));
+            settle(&ctx);
+            target.emit_clicked();
+            assert!(pump_until(&ctx, 10, || {
+                adw::prelude::AdwApplicationWindowExt::visible_dialog(&window)
+                    .is_none_or(|d| d != dialog.clone().upcast::<adw::Dialog>())
+            }));
+        };
+
+        // A blank thread with every choice a user can make before typing anything.
+        let first = create(NewThread {
+            dir: Some(dir.clone()),
+            profile_id: Some("claude-work".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            mode: Some(Mode::Plan),
+            ..NewThread::new(Driver::Claude)
+        });
+        assert!(pump_until(&ctx, 10, || built(&first).is_some()));
+        let view = built(&first).unwrap();
+
+        // An unsent message is a reason to ask, on its own; Cancel keeps the page.
+        let key = RowKey::Thread(first.clone());
+        assert_eq!(imp.row_close_reasons(&key), None);
+        view.set_draft("half a thought");
+        assert_eq!(
+            imp.row_close_reasons(&key),
+            Some(CloseReasons {
+                busy: false,
+                draft: true
+            })
+        );
+        assert!(!imp.row_is_busy(&key), "a draft is not work");
+        imp.close_row(&key);
+        answer("Discard the Unsent Message?", "Cancel");
+        assert!(
+            imp.page_of_thread(&first).is_some(),
+            "cancel keeps the page"
+        );
+        assert!(imp.confirm_close_busy(), "the window asks too");
+        answer("Discard the Unsent Message?", "Cancel");
+        view.set_draft("");
+
+        // Left blank: discarded once the store agrees, then the toast; a second one while the
+        // first toast is still up.
+        let second = create(NewThread {
+            dir: Some(other_dir.clone()),
+            ..NewThread::new(Driver::Claude)
+        });
+        assert!(pump_until(&ctx, 10, || !exists(&first)
+            && titles() == ["Empty thread discarded"]));
+        let named = create(NewThread {
+            title: Some("named".into()),
+            ..NewThread::new(Driver::Claude)
+        });
+        assert!(pump_until(&ctx, 10, || !exists(&second)
+            && titles()
+                == ["Empty thread discarded", "Empty thread discarded"]));
+        let undos = toasts();
+
+        // Each Undo makes its own thread again, as it was.
+        let threads_in = |d: &str| -> Vec<String> {
+            reader
+                .list_threads(true)
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.cwd == d)
+                .map(|t| t.id)
+                .collect()
+        };
+        undos[0].emit_by_name::<()>("button-clicked", &[]);
+        assert!(pump_until(&ctx, 10, || threads_in(&dir).len() == 1));
+        let again = threads_in(&dir).remove(0);
+        assert_ne!(again, first, "a new thread");
+        let summary = reader.thread_summary(&again).unwrap().unwrap();
+        assert_eq!(summary.model.as_deref(), Some("opus"));
+        let modes: Vec<Mode> = reader
+            .events(&again, None, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, e)| match e.event {
+                Event::ModeChosen { mode } => Some(mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes, [Mode::Plan]);
+        assert!(pump_until(&ctx, 10, || imp.tabs.borrow().iter().any(|t| {
+            t.chat.as_ref().is_some_and(|c| {
+                c.thread == again && c.profile_id.as_deref() == Some("claude-work")
+            }) && t.dir == dir
+        })));
+
+        // Archive: its toast comes once written, and Undo brings the thread back.
+        let archived = || reader.thread_summary(&named).unwrap().unwrap().archived;
+        imp.set_thread_archived(&named, true);
+        assert!(pump_until(&ctx, 10, || archived()
+            && titles().last().map(String::as_str)
+                == Some("Thread archived")));
+        assert!(imp.page_of_thread(&named).is_none(), "its page closed");
+        toasts()
+            .last()
+            .unwrap()
+            .emit_by_name::<()>("button-clicked", &[]);
+        assert!(pump_until(&ctx, 10, || !archived()
+            && titles().last().map(String::as_str)
+                == Some("Thread restored")));
+
+        // Deleting a blank thread is a delete: no discard, so nothing to undo.
+        let discards = || {
+            titles()
+                .iter()
+                .filter(|t| *t == "Empty thread discarded")
+                .count()
+        };
+        let doomed = create(NewThread::new(Driver::Claude));
+        assert!(
+            pump_until(&ctx, 10, || !exists(&again) && discards() == 3),
+            "the recreated thread, left blank, is discarded again"
+        );
+        imp.delete_thread_now(&doomed);
+        assert!(pump_until(&ctx, 10, || !exists(&doomed)
+            && titles().last().map(String::as_str)
+                == Some("Thread deleted")));
+        settle(&ctx);
+        assert_eq!(discards(), 3, "a deleted thread offers no Undo");
+
+        // Archiving a blank thread keeps it, archived: its page's close discards nothing.
+        let shelved = create(NewThread::new(Driver::Claude));
+        imp.set_thread_archived(&shelved, true);
+        assert!(pump_until(&ctx, 10, || reader
+            .thread_summary(&shelved)
+            .unwrap()
+            .is_some_and(|t| t.archived)
+            && titles().last().map(String::as_str)
+                == Some("Thread archived")));
+        settle(&ctx);
+        assert!(
+            exists(&shelved),
+            "an archived blank thread is never deleted"
+        );
+        assert_eq!(discards(), 3, "and offers no discard Undo");
+        // The guard itself, with no archive write to save the thread: a blank page closed this
+        // way queues no discard at all, so no write order can delete it.
+        let kept = create(NewThread::new(Driver::Claude));
+        imp.close_row_without_discard(&kept);
+        assert!(pump_until(&ctx, 5, || imp.page_of_thread(&kept).is_none()));
+        writer.flush(WORKER_FLUSH_WAIT);
+        settle(&ctx);
+        assert!(exists(&kept), "no discard was queued");
+        assert_eq!(discards(), 3);
+
+        // A page closed before it was ever built: Undo still gets back what the store held.
+        let tree = tempfile::tempdir().unwrap();
+        let tree_dir = tree.path().to_string_lossy().into_owned();
+        let info = crate::worktree::WorktreeInfo {
+            path: tree.path().to_path_buf(),
+            branch: "feat/y".into(),
+            main_toplevel: tree.path().join("main"),
+        };
+        let handle = app_handle();
+        let ids = NewThreadIds {
+            thread: handle.new_id().unwrap(),
+            provider: handle.new_id().unwrap(),
+        };
+        let unbuilt = ids.thread.clone();
+        let spec = NewThreadSpec {
+            model: Some("sonnet".into()),
+            mode: Some(Mode::Plan),
+            attributes: agent_kit::store::ThreadAttributes {
+                profile_id: Some("claude-work".into()),
+                worktree: Some(info.clone()),
+            },
+            ..NewThreadSpec::new(&tree_dir, Driver::Claude)
+        };
+        handle
+            .write("create a thread", Some(&unbuilt), move |s| {
+                record_new_thread_as(s, &ids, &spec)
+            })
+            .unwrap();
+        assert!(pump_until(&ctx, 10, || exists(&unbuilt)));
+        imp.reload_summaries();
+        assert!(imp.open_thread(&unbuilt, false).is_some());
+        assert!(built(&unbuilt).is_none(), "never shown, never built");
+        imp.close_row_now(&RowKey::Thread(unbuilt.clone()));
+        assert!(pump_until(&ctx, 10, || !exists(&unbuilt) && discards() == 4));
+        toasts()
+            .last()
+            .unwrap()
+            .emit_by_name::<()>("button-clicked", &[]);
+        assert!(pump_until(&ctx, 10, || threads_in(&tree_dir).len() == 1));
+        let back = threads_in(&tree_dir).remove(0);
+        assert!(pump_until(&ctx, 10, || imp.page_of_thread(&back).is_some()));
+        assert_eq!(
+            reader
+                .thread_summary(&back)
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("sonnet")
+        );
+        let modes: Vec<Mode> = reader
+            .events(&back, None, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, e)| match e.event {
+                Event::ModeChosen { mode } => Some(mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes, [Mode::Plan]);
+        let attributes = reader.thread_attributes(&back).unwrap();
+        assert_eq!(attributes.profile_id.as_deref(), Some("claude-work"));
+        assert_eq!(attributes.worktree.as_ref(), Some(&info));
+
+        // The writer gone: the second Undo says it could not make the thread, and a delete
+        // says it could not delete.
+        let pages = imp.thread_pages();
+        writer.shutdown(WORKER_FLUSH_WAIT);
+        undos[1].emit_by_name::<()>("button-clicked", &[]);
+        answer("The Thread Is Not Ready Yet", "OK");
+        assert!(threads_in(&other_dir).is_empty());
+        assert_eq!(imp.thread_pages(), pages, "no page for a thread not stored");
+        imp.delete_thread_now(&named);
+        answer("Could Not Delete the Thread", "OK");
+        assert!(exists(&named), "still there");
+
+        window.destroy();
+        settle(&ctx);
+        WRITER.with(|w| *w.borrow_mut() = None);
+        STORE_PATH.with(|p| *p.borrow_mut() = None);
+        STORE.with(|s| *s.borrow_mut() = None);
     }
 }

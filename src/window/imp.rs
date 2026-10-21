@@ -1239,6 +1239,9 @@ pub struct AgentTerminalWindow {
     /// Extra processes the next close waits on, as if they were threads' agents (tests).
     #[cfg(test)]
     test_stops: RefCell<Vec<closing::StopTarget>>,
+    /// Every toast shown, so a test can read it and press its button.
+    #[cfg(test)]
+    test_toasts: RefCell<Vec<adw::Toast>>,
     /// A change arrived while a reload was running: load again when it ends.
     summaries_stale: std::cell::Cell<bool>,
     /// The sidebar's "Show archived" toggle.
@@ -2629,7 +2632,7 @@ impl AgentTerminalWindow {
                             session.shutdown(!chat.unread);
                         }
                         imp.withdraw_thread_notifications(&chat.thread);
-                        imp.discard_if_blank(chat);
+                        imp.discard_if_blank(tab);
                     }
                     imp.withdraw_quota_notification(tab.key);
                     if let Some(worktree) = &tab.worktree {
