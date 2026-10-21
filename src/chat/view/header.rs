@@ -183,6 +183,8 @@ pub struct Header {
     usage_slot: gtk4::Box,
     subagent_slot: gtk4::Box,
     activity_text: gtk4::Label,
+    /// Process lifecycle hints stay visible when breakpoints hide ordinary work details.
+    lifecycle_text: gtk4::Label,
     spinner: gtk4::Spinner,
     /// The status the header shows now.
     shown: RefCell<Activity>,
@@ -320,6 +322,11 @@ impl Header {
         activity_text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         activity_text.set_max_width_chars(48);
         activity.append(&activity_text);
+        let lifecycle_text = label("", &["activity-text"]);
+        lifecycle_text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        lifecycle_text.set_max_width_chars(48);
+        lifecycle_text.set_visible(false);
+        activity.append(&lifecycle_text);
         activity.set_visible(false);
         root.append(&activity);
         let usage_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -453,6 +460,7 @@ impl Header {
             usage_slot,
             subagent_slot,
             activity_text,
+            lifecycle_text,
             spinner,
             shown: RefCell::new(Activity::Idle),
             gauge,
@@ -605,8 +613,9 @@ impl Header {
         })
     }
 
-    /// Shows what the thread is doing: the main agent working, only background work left (its
-    /// spinner in the background colour), finished, or nothing.
+    /// Shows what the thread is doing: its agent starting, resuming or paused, the main agent
+    /// working, only background work left (its spinner in the background colour), finished, or
+    /// nothing.
     pub fn set_activity(&self, activity: &Activity) {
         if *self.shown.borrow() == *activity {
             return;
@@ -614,7 +623,15 @@ impl Header {
         let text = activity.text();
         self.activity.set_visible(text.is_some());
         let text = text.unwrap_or_default();
-        self.activity_text.set_text(&text);
+        let lifecycle = matches!(
+            activity,
+            Activity::Starting | Activity::Resuming | Activity::Paused
+        );
+        self.lifecycle_text.set_visible(lifecycle);
+        self.lifecycle_text
+            .set_text(if lifecycle { &text } else { "" });
+        self.activity_text
+            .set_text(if lifecycle { "" } else { &text });
         self.activity
             .set_tooltip_text((!text.is_empty()).then_some(text.as_str()));
         let busy = activity.busy();
@@ -631,6 +648,7 @@ impl Header {
         for (class, on) in [
             ("activity-background", waiting),
             ("activity-finished", finished),
+            ("activity-paused", *activity == Activity::Paused),
         ] {
             if on {
                 self.activity.add_css_class(class);
@@ -651,7 +669,9 @@ impl Header {
     /// Whether the activity's words (not just its spinner) are showing (tests).
     #[cfg(test)]
     pub fn activity_words_shown(&self) -> bool {
-        self.activity.is_visible() && self.activity_text.is_visible()
+        self.activity.is_visible()
+            && ((!self.activity_text.text().is_empty() && self.activity_text.is_visible())
+                || self.lifecycle_text.is_visible())
     }
 
     /// The right edge of the last visible item of the strip, and the width the strip has, in px
@@ -674,9 +694,13 @@ impl Header {
     /// The status text the header shows, if any (tests).
     #[cfg(test)]
     pub fn activity_shown(&self) -> Option<String> {
-        self.activity
-            .is_visible()
-            .then(|| self.activity_text.text().to_string())
+        self.activity.is_visible().then(|| {
+            if self.lifecycle_text.is_visible() {
+                self.lifecycle_text.text().to_string()
+            } else {
+                self.activity_text.text().to_string()
+            }
+        })
     }
 
     pub fn set_gauge(&self, gauge: Option<&Gauge>) {

@@ -1264,6 +1264,9 @@ pub struct AgentTerminalWindow {
     /// The last session's threads are still being reopened: an empty tab view shows a loading
     /// skeleton, not the empty state.
     restoring_threads: std::cell::Cell<bool>,
+    /// The empty state's "Reopen N threads from your last session" button, hidden while there
+    /// is nothing to reopen.
+    reopen_button: RefCell<Option<gtk4::Button>>,
     /// The content below the header: the splash and skeleton, the welcome screen, and the
     /// shell (built at once, behind them).
     boot: RefCell<Option<Stack>>,
@@ -4463,6 +4466,21 @@ impl AgentTerminalWindow {
         behaviour.add(&cli_client_row);
         behaviour.add(&scrollback_row);
         behaviour.add(&suspend_row);
+        let outside_row = adw::SwitchRow::builder()
+            .title("Show Sessions Started Outside Agent Terminal")
+            .subtitle(
+                "List the agents' own recent sessions (started in a terminal or another tool) as \
+                 threads in the sidebar. Off: their session files are not scanned; threads \
+                 already listed stay",
+            )
+            .active(config.list_outside_sessions)
+            .build();
+        outside_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| obj.imp().set_list_outside_sessions(row.is_active())
+        ));
+        behaviour.add(&outside_row);
         terminal.add(&behaviour);
         dialog.add(&terminal);
 

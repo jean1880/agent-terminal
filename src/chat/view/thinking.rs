@@ -198,7 +198,14 @@ fn status_text(activity: &Activity, agent: &str, elapsed: Option<u64>) -> Option
             1 => "Waiting on 1 background task…".to_owned(),
             n => format!("Waiting on {n} background tasks…"),
         }),
-        Activity::Idle | Activity::Finished | Activity::Failed | Activity::Stopped => None,
+        // The agent's own start, resume and pause are the header's to say.
+        Activity::Idle
+        | Activity::Finished
+        | Activity::Failed
+        | Activity::Stopped
+        | Activity::Starting
+        | Activity::Resuming
+        | Activity::Paused => None,
     }
 }
 

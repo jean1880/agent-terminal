@@ -402,6 +402,14 @@ pub trait Adapter {
     fn argv(&self, session: &OpenSession) -> Vec<String>;
     /// Lines to write as soon as the process starts (Claude `initialize`); may be empty.
     fn handshake(&mut self) -> Vec<String>;
+    /// Whether the running process answered [`Adapter::handshake`] with a reply this adapter
+    /// accepted (Claude's and Codex's successful `initialize` response, which may produce no
+    /// event at all). Reset by `handshake`. Presentation only: the host shows the agent as
+    /// starting until this, a `SessionStarted` or a turn. `false` for an adapter whose
+    /// handshake has no reply (agy, whose `init` frame reports the session).
+    fn handshake_answered(&self) -> bool {
+        false
+    }
     /// Whether a prompt starts/queues work in the main session, including custom commands.
     /// Local controls and side processes override this so the host can mark submitted turns
     /// busy before the backend acknowledges them.

@@ -729,6 +729,11 @@ pub struct TerminalConfig {
     /// Reopen the chat threads open at the last close, showing the one that was in view. Off
     /// by default: the window starts with no thread open, the sidebar listing them all.
     pub reopen_last_thread: bool,
+    /// List the agents' own recent sessions (started in a terminal, or by another tool) as
+    /// threads in the sidebar, with a toast saying how many were added. On by default (an older
+    /// config opts in); off, the startup scan of the agents' session files does not run.
+    #[serde(default = "default_true")]
+    pub list_outside_sessions: bool,
     /// Automatically approve tools matching pattern rules (wildcards/prefixes).
     #[serde(default = "default_true")]
     pub pattern_auto_approval: bool,
@@ -1046,6 +1051,7 @@ impl Default for TerminalConfig {
             sidebar_collapsed: false,
             skip_load_animation: false,
             reopen_last_thread: false,
+            list_outside_sessions: true,
             pattern_auto_approval: true,
             confirm_rule_modification: true,
             suggest_quick_replies: true,
@@ -2747,6 +2753,10 @@ mod tests {
             !config.reopen_last_thread,
             "an older file starts with no thread open"
         );
+        assert!(
+            config.list_outside_sessions,
+            "an older file keeps listing the agents' own sessions"
+        );
         let claude = config.agent_profile(Driver::Claude).expect("claude");
         assert_eq!(claude.args, ["--verbose"]);
         assert!(!claude.disabled);
@@ -2769,6 +2779,7 @@ mod tests {
         config.sidebar_collapsed = true;
         config.skip_load_animation = true;
         config.reopen_last_thread = true;
+        config.list_outside_sessions = false;
         config.profiles[0].default_model = Some("opus".into());
         config.profiles[0].default_mode = Some(Mode::AcceptEdits);
         config.profiles[0].default_effort = Some("high".into());
@@ -2783,6 +2794,7 @@ mod tests {
         assert!(back.sidebar_collapsed);
         assert!(back.skip_load_animation);
         assert!(back.reopen_last_thread);
+        assert!(!back.list_outside_sessions, "turned off, it stays off");
         assert_eq!(back.profiles[0].default_model.as_deref(), Some("opus"));
         assert_eq!(back.profiles[0].default_mode, Some(Mode::AcceptEdits));
         assert_eq!(back.profiles[0].default_effort.as_deref(), Some("high"));

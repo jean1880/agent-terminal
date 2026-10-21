@@ -65,6 +65,8 @@ pub struct ClaudeAdapter {
     caps: Capabilities,
     counter: u64,
     init_id: Option<String>,
+    /// The process answered `init_id` with success ([`Adapter::handshake_answered`]).
+    init_answered: bool,
     session_started: bool,
     model: Option<String>,
     turn_open: bool,
@@ -131,6 +133,7 @@ impl ClaudeAdapter {
             caps: Capabilities::claude(),
             counter: 0,
             init_id: None,
+            init_answered: false,
             session_started: false,
             model: None,
             turn_open: false,
@@ -929,7 +932,8 @@ impl ClaudeAdapter {
             }
         }
         let body = body.unwrap_or(Value::Null);
-        if self.init_id.as_deref() == Some(id) {
+        if self.init_id.as_deref() == Some(id) && str_of(resp, "subtype") == Some("success") {
+            self.init_answered = true;
             if let Some(account) = crate::quota::claude_account(&body) {
                 out.push(Envelope::new(Event::QuotaUpdated {
                     account: Some(account),
@@ -1166,7 +1170,12 @@ impl Adapter for ClaudeAdapter {
         self.interrupt_pending = false;
         let id = self.next_id("init");
         self.init_id = Some(id.clone());
+        self.init_answered = false;
         vec![self.control_line(&id, json!({"subtype": "initialize"}))]
+    }
+
+    fn handshake_answered(&self) -> bool {
+        self.init_answered
     }
 
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
@@ -3319,6 +3328,38 @@ mod tests {
             v,
             json!({"type": "control_request", "request_id": "init-1", "request": {"subtype": "initialize"}})
         );
+    }
+
+    #[test]
+    fn only_a_successful_initialize_reply_answers_the_handshake() {
+        let reply = |subtype: &str, id: &str| {
+            json!({"type": "control_response", "response": {"subtype": subtype, "request_id": id}})
+                .to_string()
+        };
+        let mut a = ClaudeAdapter::new();
+        a.handshake();
+        assert!(!a.handshake_answered(), "nothing answered yet");
+        // Blank or malformed output, another request's reply and a refusal answer nothing.
+        for line in ["", "not json", "{\"type\":\"system\"}"] {
+            a.feed(line);
+        }
+        a.feed(&reply("success", "other-7"));
+        assert!(!a.handshake_answered());
+        a.feed(&reply("unexpected", "init-1"));
+        assert!(!a.handshake_answered(), "an unknown reply is not success");
+        a.feed(&reply("error", "init-1"));
+        assert!(!a.handshake_answered(), "a refused initialize");
+
+        let mut a = ClaudeAdapter::new();
+        a.handshake();
+        a.feed(&reply("success", "init-1"));
+        assert!(
+            a.handshake_answered(),
+            "a bare success, with no event of its own"
+        );
+        // A new process must answer again.
+        a.handshake();
+        assert!(!a.handshake_answered());
     }
 
     #[test]

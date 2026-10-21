@@ -291,6 +291,8 @@ pub struct CodexAdapter {
     next_id: u64,
     pending: HashMap<u64, Pending>,
     startup_failed: bool,
+    /// The process answered `initialize` with a result ([`Adapter::handshake_answered`]).
+    initialized: bool,
     thread_id: Option<String>,
     turn_id: Option<String>,
     turn_open: bool,
@@ -374,6 +376,7 @@ impl CodexAdapter {
             next_id: 0,
             pending: HashMap::new(),
             startup_failed: false,
+            initialized: false,
             thread_id: None,
             turn_id: None,
             turn_open: false,
@@ -2018,7 +2021,7 @@ impl CodexAdapter {
             .get("error")
             .map(|e| s(e, "message").map_or_else(|| e.to_string(), str::to_owned));
         match (pending, result, error) {
-            (Pending::Initialize, Some(_), _) => {}
+            (Pending::Initialize, Some(_), None) => self.initialized = true,
             (Pending::ChildConfig { method, mut params }, Some(result), _) => {
                 let names = result
                     .get("config")
@@ -2177,7 +2180,7 @@ impl CodexAdapter {
                     self.finish_effective_mode(out);
                 }
             }
-            (Pending::Initialize | Pending::ThreadStart, None, error) => {
+            (Pending::Initialize, _, error) | (Pending::ThreadStart, None, error) => {
                 self.fail_startup(
                     error.unwrap_or_else(|| "Codex thread startup failed".to_owned()),
                     out,
@@ -2294,6 +2297,7 @@ impl Adapter for CodexAdapter {
         self.next_id = 0;
         self.pending.clear();
         self.startup_failed = false;
+        self.initialized = false;
         self.thread_id = None;
         self.model_selected_during_start = false;
         self.selection_revision = 0;
@@ -2406,6 +2410,10 @@ impl Adapter for CodexAdapter {
             self.request(Pending::ThreadStart, method, Value::Object(params))
         };
         vec![init, initialized, thread]
+    }
+
+    fn handshake_answered(&self) -> bool {
+        self.initialized && !self.startup_failed
     }
 
     fn prompt_starts_turn(&self, text: &str) -> bool {
@@ -4273,6 +4281,39 @@ mod tests {
         );
         // No frame carries a "jsonrpc" field.
         assert!(lines.iter().all(|l| l.get("jsonrpc").is_none()));
+    }
+
+    #[test]
+    fn only_a_successful_initialize_result_answers_the_handshake() {
+        let start = || {
+            let mut a = CodexAdapter::new().client_version("3.0.0");
+            a.argv(&session(Mode::Ask, None));
+            a.handshake();
+            a
+        };
+        let mut a = start();
+        assert!(!a.handshake_answered());
+        // Blank or malformed output and another request's result answer nothing.
+        for line in ["", "not json", r#"{"method":"thread/started","params":{}}"#] {
+            a.feed(line);
+        }
+        assert!(!a.handshake_answered());
+        // A refused initialize.
+        a.feed(r#"{"id":1,"error":{"message":"unsupported client"}}"#);
+        assert!(!a.handshake_answered());
+
+        let mut a = start();
+        a.feed(r#"{"id":1,"result":{},"error":{"message":"failed"}}"#);
+        assert!(!a.handshake_answered(), "an error cannot also be a success");
+
+        // Success is silent: no event says the agent is up, only this.
+        let mut a = start();
+        let events = a.feed(r#"{"id":1,"result":{"userAgent":"codex"}}"#);
+        assert!(events.is_empty(), "{events:?}");
+        assert!(a.handshake_answered());
+        // A new process must answer again.
+        a.handshake();
+        assert!(!a.handshake_answered());
     }
 
     #[test]
