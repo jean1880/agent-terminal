@@ -772,18 +772,6 @@ impl ChatTab {
         )
     }
 
-    /// Where this thread's agent process is, for its sidebar row ([`thread_activity`]): the page
-    /// being built or its session started count as starting.
-    fn activity(&self) -> Option<ThreadActivity> {
-        let life = self.slot.get().map(|s| s.lifecycle()).unwrap_or_default();
-        thread_activity(
-            self.building || self.starting,
-            life.alive,
-            life.starting,
-            life.suspended,
-        )
-    }
-
     pub(super) fn reset_transfer_preparation(&mut self) {
         if self.view.is_none() {
             self.building = false;
