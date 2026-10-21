@@ -462,11 +462,9 @@ impl Supervisor {
         let approval = if spec.driver == Driver::Agy {
             let resolved = (self.services.resolve)(&spec.profile)
                 .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "agent unavailable"))?;
-            let hook = (self.services.hook_check)(crate::hook_config::HookTarget::new(
-                &resolved.env,
-                Some(spec.cwd.clone()),
-            ))
-            .await;
+            let target = crate::hook_config::HookTarget::new(&resolved.env, Some(spec.cwd.clone()));
+            let home = target.home.clone();
+            let hook = (self.services.hook_check)(target).await;
             hook.map_err(|_| {
                 error(
                     ErrorCode::ProviderUnavailable,
@@ -476,9 +474,11 @@ impl Supervisor {
             self.recheck_agy(&spec.worker).await?;
             crate::approval_server::ApprovalHandle::bind_child(
                 Ok(()),
+                self.rundir.path(),
                 &spec.thread,
                 &spec.cwd,
                 spec.mode.as_mode(),
+                home,
             )
             .map_err(|_| {
                 error(

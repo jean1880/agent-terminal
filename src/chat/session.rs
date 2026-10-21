@@ -6513,7 +6513,10 @@ mod tests {
             .expect("hook");
             let env = LaunchEnv {
                 env: vec![("HOME".into(), home.path().to_string_lossy().into_owned())],
-                unset: Vec::new(),
+                unset: crate::hook_config::CONFIG_REDIRECT_VARS
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             };
             let target = crate::hook_config::HookTarget::new(&env, Some(tmp.path().to_path_buf()));
             assert_eq!(

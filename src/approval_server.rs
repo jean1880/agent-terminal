@@ -784,23 +784,33 @@ impl ApprovalHandle {
         Self::bind_default(thread, workspace, mode)
     }
 
-    /// A supervised child's socket ([`Self::bind_checked`] for the child's own worktree `cwd`,
-    /// with the Always rules file). Fail closed: every call is denied until the session installs
-    /// the child's gate ([`Self::set_gate`], which `ChatSession::with_options` does). A child
-    /// never runs Bypass, so it is bound in Plan if asked for it.
+    /// A supervised child's socket in the supervisor's `dir` for the child's own worktree `cwd`
+    /// and `home` (with the Always rules file). Fail closed: every call is denied until the
+    /// session installs the child's gate ([`Self::set_gate`], which `ChatSession::with_options`
+    /// does). A child never runs Bypass, so it is bound in Plan if asked for it.
     #[cfg_attr(not(test), allow(dead_code))] // the child factory binds with it
     pub(crate) fn bind_child(
         hook: Result<(), String>,
+        dir: &Path,
         thread: &str,
         cwd: &Path,
         mode: Mode,
+        home: Option<PathBuf>,
     ) -> Result<Self, String> {
+        hook?;
         let mode = if mode == Mode::Bypass {
             Mode::Plan
         } else {
             mode
         };
-        let handle = Self::bind_checked(hook, thread, cwd, mode)?;
+        let hook_bin = std::env::current_exe()
+            .map_err(|e| format!("cannot resolve the running binary: {e}"))?;
+        let home = home.filter(|h| h.is_absolute());
+        let handle =
+            Self::bind_with_home(dir, thread, cwd, mode, DEFAULT_DEADLINE, hook_bin, home)?;
+        if let Some(path) = crate::always_allow::path() {
+            handle.use_always_rules(path);
+        }
         handle.inner.child.set(true);
         Ok(handle)
     }
@@ -2388,9 +2398,11 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tmp");
             assert!(ApprovalHandle::bind_child(
                 Err("not proven".into()),
+                tmp.path(),
                 "child",
                 tmp.path(),
-                Mode::Ask
+                Mode::Ask,
+                None,
             )
             .is_err());
             let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);

@@ -139,6 +139,13 @@ fn an_agy_child_gets_its_task_once_its_process_has_started() {
             "the agy task was not delivered: {state} {error:?}"
         );
         assert!(sup.state.borrow().workers[&worker].readback.ready);
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with("approval-")),
+            "child approval socket must be bound in the supervisor's runtime directory"
+        );
         stop(&sup).await;
     });
 }
