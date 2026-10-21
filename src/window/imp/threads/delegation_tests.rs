@@ -6,6 +6,11 @@ pub(in crate::window::imp::threads) fn cancelled_start_can_retry(
     window: &crate::window::AgentTerminalWindow,
 ) {
     let imp = window.imp();
+    let availability = AgentAvailability::shared();
+    let availability_before = availability.all();
+    for driver in Driver::ALL {
+        availability.set(driver, Availability::Missing);
+    }
     let page = imp
         .create_chat_thread(NewThread::new(Driver::Claude))
         .unwrap();
@@ -21,15 +26,13 @@ pub(in crate::window::imp::threads) fn cancelled_start_can_retry(
         .thread
         .clone();
     let slot = imp.slot_of(&thread).unwrap();
-    let mark_starting = || {
-        imp.tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|tab| tab.chat.as_mut())
-            .find(|chat| chat.thread == thread)
-            .unwrap()
-            .starting = true;
-    };
+    let ctx = glib::MainContext::default();
+    assert!(pump_until(&ctx, 5, || imp
+        .tabs
+        .borrow()
+        .iter()
+        .filter_map(|t| t.chat.as_ref())
+        .any(|c| c.thread == thread && c.view.is_some() && !c.building)));
     let starting = || {
         imp.tabs
             .borrow()
@@ -39,9 +42,38 @@ pub(in crate::window::imp::threads) fn cancelled_start_can_retry(
             .unwrap()
             .starting
     };
-    mark_starting();
-    let cancelled = PendingStart::new(&slot);
+    let cancelled = imp.prepare_session_start(&thread, &slot);
+    assert!(
+        starting(),
+        "the first start is reserved before preparation yields"
+    );
     assert!(cancelled.current(imp, &thread));
+    let provider_before = app_store().active_provider_thread(&thread).unwrap();
+    imp.switch_in_place(&thread, Driver::Codex);
+    assert!(
+        cancelled.current(imp, &thread),
+        "a parked switch does not replace the pending launch"
+    );
+    assert_eq!(
+        app_store().active_provider_thread(&thread).unwrap(),
+        provider_before
+    );
+    {
+        let mut tabs = imp.tabs.borrow_mut();
+        let chat = tabs
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+            .unwrap();
+        assert!(
+            !chat.rebinding,
+            "switching during the first start must not write another provider"
+        );
+        assert_eq!(
+            chat.pending_switch.take(),
+            Some((Driver::Codex, None, None))
+        );
+    }
     slot.interrupt(); // The real Stop path advances the same serial as mode/switch/transfer.
     assert!(!cancelled.current(imp, &thread));
     cancelled.clear_cancelled(imp, &thread);
@@ -49,8 +81,7 @@ pub(in crate::window::imp::threads) fn cancelled_start_can_retry(
         !starting(),
         "Stop during preparation must allow the next start"
     );
-    mark_starting();
-    let retry = PendingStart::new(&slot);
+    let retry = imp.prepare_session_start(&thread, &slot);
     assert!(
         retry.current(imp, &thread),
         "a cancelled serial must not poison retries"
@@ -60,7 +91,7 @@ pub(in crate::window::imp::threads) fn cancelled_start_can_retry(
         starting(),
         "a late old completion cannot clear a newer start"
     );
-    let newer = PendingStart::new(&slot);
+    let newer = imp.prepare_session_start(&thread, &slot);
     assert!(
         !retry.current(imp, &thread),
         "same-serial preparation was superseded"
@@ -73,6 +104,9 @@ pub(in crate::window::imp::threads) fn cancelled_start_can_retry(
     newer.clear_cancelled(imp, &thread);
     assert!(!starting());
     imp.close_row_now(&RowKey::Thread(thread));
+    for (driver, state) in availability_before {
+        availability.set(driver, state);
+    }
 }
 
 pub(in crate::window::imp::threads) fn transfer_keeps_live_view_routes(

@@ -5015,6 +5015,26 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// Reserves the first asynchronous start before delegation preparation can yield. A switch
+    /// must wait for that start just as it waits for a pending retry, rather than replacing the
+    /// provider while the old start still owns its launch data.
+    fn prepare_session_start(
+        &self,
+        thread: &str,
+        slot: &Rc<SessionSlot>,
+    ) -> delegation::PendingStart {
+        if let Some(chat) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread && Rc::ptr_eq(&c.slot, slot))
+        {
+            chat.starting = true;
+        }
+        delegation::PendingStart::new(slot)
+    }
+
     /// Starts the session of a thread whose view is built, and applies what was waiting for it.
     fn start_session(&self, page: &adw::TabPage, job: StartJob) {
         if !job.profile.available_for_delegation || cfg!(test) {
@@ -5025,7 +5045,7 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(&job.thread) else {
             return;
         };
-        let pending = delegation::PendingStart::new(&slot);
+        let pending = self.prepare_session_start(&job.thread, &slot);
         let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
             let supervisor = crate::delegation::ready().await;
