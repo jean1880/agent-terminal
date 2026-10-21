@@ -6,6 +6,58 @@ use agent_core::event::{
     StreamKind,
 };
 
+/// Process lifecycle hints survive the breakpoints that hide ordinary work details, including
+/// a wide window's narrower content pane when its sidebar is open.
+#[test]
+#[ignore = "native GTK layout; run alone in an isolated display"]
+fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
+    gtk4::init().expect("GTK init");
+    adw::init().expect("adw init");
+    crate::icons::register();
+    crate::load_css();
+    let ctx = glib::MainContext::default();
+    for width in [360, 650, 950, 1100] {
+        let header = header::Header::new();
+        header.set_agent(Driver::Claude, Some("claude-sonnet-5-5"), None, None);
+        let window = gtk4::Window::new();
+        window.set_default_size(width, 100);
+        window.set_child(Some(&header.bin));
+        window.present();
+        for activity in [
+            model::Activity::Paused,
+            model::Activity::Resuming,
+            model::Activity::Starting,
+        ] {
+            header.set_activity(&activity);
+            crate::testutil::settle(&ctx);
+            assert!(
+                header.activity_words_shown(),
+                "{activity:?} hidden at {width}px"
+            );
+            assert_eq!(header.activity_shown(), activity.text());
+            let (edge, available) = header.right_edge();
+            assert!(
+                edge <= available + 1.0,
+                "{activity:?} clipped at {width}px: {edge} > {available}"
+            );
+            assert!(
+                window.width() <= width,
+                "{activity:?} expanded the window at {width}px"
+            );
+        }
+        // Ordinary work details still yield to narrow layouts.
+        header.set_activity(&model::Activity::WaitingForWorkers {
+            names: vec!["worker".into()],
+        });
+        crate::testutil::settle(&ctx);
+        assert_eq!(header.activity_words_shown(), width > 976);
+        window.destroy();
+        while ctx.pending() {
+            ctx.iteration(false);
+        }
+    }
+}
+
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_ux_matrix() {
