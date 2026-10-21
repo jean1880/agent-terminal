@@ -513,7 +513,7 @@ pub struct WorkerSnapshot {
     pub delegation: Option<WorkerDelegation>,
 }
 
-/// What delegation knows about a worker (contract §2 `WorkerSummary`, cut to what the thread
+/// What delegation knows about a worker (`WorkerSummary`, cut to what the thread
 /// view shows).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDelegation {
@@ -552,7 +552,7 @@ pub enum WorkerState {
     Unknown,
 }
 
-/// Where a worker came from (delegation contract §2 `WorkerSummary.origin`).
+/// Where a worker came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerOrigin {

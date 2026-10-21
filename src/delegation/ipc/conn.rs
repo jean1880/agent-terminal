@@ -1,4 +1,4 @@
-//! Lane C: one connection's state machine (contract §4, P4 §4.2): the hello deadline, bounded
+//! One connection's state machine: the hello deadline, bounded
 //! frame reads, the outbox and its write deadline.
 //!
 //! ```text
@@ -8,7 +8,7 @@
 //! Authenticated --revoke--> Draining (flush `revoked` ≤ write deadline) → Closed
 //! ```
 //!
-//! Reads take at most what the P1 [`FrameDecoder`] wants, so a length is checked before any
+//! Reads take at most what the [`FrameDecoder`] wants, so a length is checked before any
 //! body is buffered and at most one frame is ever held. Each connection has a reader task, a
 //! hello timer, and a write pump while its outbox is non-empty; closing aborts all three.
 
@@ -31,7 +31,7 @@ use crate::delegation::seam::{ConnId, PeerFacts};
 
 /// The most read from the socket at once.
 const READ_CHUNK: usize = 64 * 1024;
-/// The frame length prefix (P1 `ipc::HEADER`).
+/// The frame length prefix.
 const HEADER: usize = 4;
 const PRIORITY: glib::Priority = glib::Priority::DEFAULT;
 

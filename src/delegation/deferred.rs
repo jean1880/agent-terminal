@@ -1,4 +1,4 @@
-//! Supervisor-owned delivery queues. Every write follows a durable reservation and E7.
+//! Supervisor-owned delivery queues. Every write follows a durable reservation and a fresh authority check.
 use super::seam::{DelegatedInput, DelegatedOutcome, InputSource};
 use super::supervisor::{error, parse_enum, Supervisor};
 use agent_core::delegation::authority::delivery_allowed;

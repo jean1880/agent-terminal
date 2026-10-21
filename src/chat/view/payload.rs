@@ -211,7 +211,7 @@ pub fn effective_settings(v: &Value) -> &Value {
     v.get("effective").unwrap_or(v)
 }
 
-/// A tool call's title in the one grammar every agent shares (`agent_core::tool_title`, W3.4):
+/// A tool call's title in the one grammar every agent shares (`agent_core::tool_title`):
 /// `Read <path>`, `Search <pattern>`, `Run <command>`, `Edit <path>`, `Create <path>`,
 /// `Fetch <url>`, `<server>/<tool>`. The card header, the approval preview and the sub-agent
 /// shelf all take their text from here, so they always agree. Streamed input that is not
@@ -630,7 +630,7 @@ mod tests {
             "an MCP title is <server>/<tool>; arguments are details"
         );
 
-        // Codex's wrapped command shows as typed (W3.4).
+        // Codex's wrapped command shows as typed.
         let (action, target) = card_title_and_summary(
             ItemKind::Command,
             "/usr/bin/zsh -lc 'ls -la'",

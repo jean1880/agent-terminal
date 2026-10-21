@@ -1,5 +1,4 @@
-//! Pure types of the cross-agent delegation runtime (`docs/delegation/contract-v1.md`,
-//! built as specified in `docs/delegation/p1-types.md`).
+//! Pure types of the cross-agent delegation runtime.
 //!
 //! No I/O, no clock and no randomness: the app supplies the bytes, times, ids, file listings
 //! and `/proc` text. Nothing here exposes a tool or changes an adapter.

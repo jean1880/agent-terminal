@@ -1,7 +1,7 @@
-//! Lane C: `/proc` facts for the agy L3 peer check and the census (contract §7 L3, P4 §4.3).
+//! `/proc` facts for the agy L3 peer check and the census.
 //!
 //! Blocking file reads: callers run them in `gio::spawn_blocking`, never on the main thread. The
-//! parsing (the ppid after the LAST `)`, the bridge argv) is P1's `agy_guard`; this module only
+//! parsing (the ppid after the LAST `)`, the bridge argv) is `agy_guard`; this module only
 //! reads the files and applies those helpers.
 
 use std::io::Read;

@@ -1247,7 +1247,7 @@ mod tests {
         assert_eq!(s.finish(&sk(0)).text, held);
     }
 
-    /// Review finding: a partial PEM marker or UTF-8 character counted against no limit.
+    /// Regression: a partial PEM marker or UTF-8 character counted against no limit.
     #[test]
     fn partial_markers_and_characters_count_against_the_limits() {
         let mut s: StreamSanitiser = StreamSanitiser::new(limits(0, 0));
@@ -1274,7 +1274,7 @@ mod tests {
         assert!(s.retained_bytes() > 0);
     }
 
-    /// Review finding: 64 full streams plus a partial marker on another key went past 4 MiB.
+    /// Regression: 64 full streams plus a partial marker on another key went past 4 MiB.
     #[test]
     fn the_aggregate_bound_holds_across_every_buffer() {
         let mut s: StreamSanitiser = StreamSanitiser::default();
@@ -1291,7 +1291,7 @@ mod tests {
         assert_eq!(s.finish(&sk(3)).text, full);
     }
 
-    /// Review finding: finished lines kept their buffers and every key kept an entry.
+    /// Regression: finished lines kept their buffers and every key kept an entry.
     #[test]
     fn idle_streams_release_their_entry_and_buffer() {
         // Far more keys than `max_streams`: none is refused, none keeps an entry.
@@ -1351,7 +1351,7 @@ mod tests {
         assert_eq!(out, "****0123\n");
     }
 
-    /// Review finding: refused and open-stream tables cloned keys of any size.
+    /// Regression: refused and open-stream tables cloned keys of any size.
     #[test]
     fn a_huge_key_is_stored_bounded() {
         let mut s: StreamSanitiser = StreamSanitiser::new(Limits {
@@ -1391,7 +1391,7 @@ mod tests {
         field(&key.worker) + field(&key.item) + field(&key.stream) + 8
     }
 
-    /// Review finding: identity came from the caller's `Hash`, so keys could alias. Keys that
+    /// Regression: identity came from the caller's `Hash`, so keys could alias. Keys that
     /// share everything a weak identity might look at (a long common prefix and the same
     /// length) stay separate streams: one's cancel or seal never touches the other.
     #[test]
@@ -1446,7 +1446,7 @@ mod tests {
         }
     }
 
-    /// Review finding: saturation republished the notice on every later call.
+    /// Regression: saturation republished the notice on every later call.
     #[test]
     fn saturation_is_noticed_once_then_silent() {
         let mut s: StreamSanitiser = StreamSanitiser::new(Limits {
@@ -1464,7 +1464,7 @@ mod tests {
         }
     }
 
-    /// Review finding: one huge chunk was copied whole before the limits applied.
+    /// Regression: one huge chunk was copied whole before the limits applied.
     #[test]
     fn one_huge_chunk_is_consumed_in_bounded_pieces() {
         let mut s: StreamSanitiser = StreamSanitiser::default();

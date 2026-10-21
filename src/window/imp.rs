@@ -3413,7 +3413,7 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 // Info, not debug: which CLIs ring at the end of a turn decides
                 // whether the bell or the quiet timer drives their checkpoints.
-                // Demote to debug once that is recorded (plan WP0.1, F4/F5).
+                // Demote to debug once the expected callbacks have been observed.
                 info!("Bell in tab \"{}\"", page.title());
                 if imp.config.borrow().checkpoints {
                     imp.request_checkpoint(&page, false);

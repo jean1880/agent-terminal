@@ -963,7 +963,7 @@ impl ReasoningRow {
             self.body.append(&l);
             labels.push(l);
         }
-        // Each paragraph is markdown (Codex summaries bold their headings, F17), rendered by the
+        // Each paragraph is markdown (Codex summaries bold their headings), rendered by the
         // transcript's own renderer, which escapes every piece of source text. Only a paragraph
         // whose source changed is parsed again.
         let mut sources = self.sources.borrow_mut();
@@ -2279,7 +2279,7 @@ impl ApprovalCard {
         for class in ["pending", "resolved", "expired", "denied"] {
             self.root.remove_css_class(class);
         }
-        // A refusal is never shown in the "allowed" green (F12).
+        // A refusal is never shown in the "allowed" green.
         if matches!(
             a.state,
             ApprovalState::Resolved(Decision::Deny | Decision::Cancel)
@@ -3319,7 +3319,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Plan W2: Codex cards carry Deny and a separate Stop turn; a refusal is styled as one.
+    /// Codex cards carry Deny and a separate Stop turn; a refusal is styled as one.
     fn codex_approval_card_checks() {
         let all = vec![
             Decision::Allow,
@@ -3393,7 +3393,7 @@ pub(crate) mod tests {
         assert!(!entry.has_css_class("error"));
         entry.set_text("");
         assert_eq!(enabled(&dialog), (true, true), "empty means the prefill");
-        // A4: only what no rule can hold is refused inline. A runner's command and its pattern
+        // Only what no rule can hold is refused inline. A runner's command and its pattern
         // are the user's to keep, for the session or for good.
         entry.set_text("cargo test");
         assert_eq!(enabled(&dialog), (true, true));
@@ -3408,7 +3408,7 @@ pub(crate) mod tests {
         assert!(pattern_error("write_to_file", "*.rs", "", Session).is_some());
         assert!(pattern_error("call_mcp_tool", "fs/read", "", Always).is_none());
         assert!(pattern_error("WebFetch", "x", "", Session).is_some());
-        // A4: no suggestion the checks would refuse.
+        // No suggestion the checks would refuse.
         for (tool, initial) in [
             ("write_to_file", "/w/src/a.rs"),
             ("command_execution", "cargo test --lib"),
@@ -3425,7 +3425,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Plan 2.6 (ui-audit #5, F15): a Codex command card shows the bare command and its folder,
+    /// A Codex command card shows the bare command and its folder,
     /// with the request's JSON behind a capped "Show raw"; a large input shows at most the cap;
     /// Claude's ExitPlanMode shows its plan as markdown, not JSON.
     fn approval_cards_show_the_command_and_cap_the_rest() {
@@ -3518,7 +3518,7 @@ pub(crate) mod tests {
         assert!(blocks.len() >= 2);
     }
 
-    /// Plan 2.3 (F7), from the W0 Codex frame: the rule dialog's entry holds the bare command,
+    /// From the Codex frame: the rule dialog's entry holds the bare command,
     /// not the wrapper and not the card's footer sentence.
     fn rule_dialog_prefills_the_bare_w0_command() {
         let params = include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl")
@@ -3735,7 +3735,7 @@ pub(crate) mod tests {
 
         // The always-allow dialog's suggestions are toggle buttons around option labels.
         let entry = gtk4::Entry::new();
-        // A read-only command: a runner gets no patterns to choose between (C1).
+        // A read-only command: a runner gets no patterns to choose between.
         let flow = suggestion_flow(&entry, "Bash", "git log --oneline").expect("suggestions");
         let toggles = crate::testutil::descendants(flow.upcast_ref())
             .iter()

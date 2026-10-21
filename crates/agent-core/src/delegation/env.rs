@@ -1,4 +1,4 @@
-//! Environment variable names of the delegation runtime (contract §5).
+//! Environment variable names of the delegation runtime.
 
 /// Absolute socket path. Not secret.
 pub const ENV_ENDPOINT: &str = "AGENT_TERMINAL_DELEGATION_ENDPOINT";
@@ -6,7 +6,7 @@ pub const ENV_ENDPOINT: &str = "AGENT_TERMINAL_DELEGATION_ENDPOINT";
 pub const ENV_INSTANCE: &str = "AGENT_TERMINAL_DELEGATION_INSTANCE";
 /// The capability token. **Secret.**
 pub const ENV_CAP: &str = "AGENT_TERMINAL_DELEGATION_CAP";
-/// The app's pid, decimal, for the bridge's lineage self-check (contract §1).
+/// The app's pid, decimal, for the bridge's lineage self-check.
 pub const ENV_APP_PID: &str = "AGENT_TERMINAL_DELEGATION_APP_PID";
 
 /// Stripped from every spawn's inherited environment before its own values are installed.

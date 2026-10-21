@@ -1,4 +1,4 @@
-//! The typed delegation store API (P3b): the write protocol of plan §5 over the P1 types.
+//! The typed delegation store API and its transactional write protocol.
 //!
 //! Every method here is **one transaction** ([`Store::atomically`]): all of it is stored, or none
 //! of it. The control writes (accept, reserve, record, complete, revoke, ACK) are meant to run as
@@ -16,7 +16,7 @@
 //!
 //! Recovery never re-executes anything: [`Store::reconcile_delegation_after_restart`] turns every
 //! reservation, submission and non-terminal run into `unknown`, and a replay of an `unknown`
-//! operation is `delivery_unknown` (contract §2), never a second dispatch.
+//! operation is `delivery_unknown`, never a second dispatch.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -63,7 +63,7 @@ use super::{Result, Store, StoreError};
 /// A contract refusal: committed as far as it records anything, and returned to the caller.
 pub type Verdict<T> = std::result::Result<T, ToolError>;
 
-/// Longest `PageEvent.summary` (contract §2), in bytes.
+/// Longest `PageEvent.summary`, in bytes.
 pub const MAX_EVENT_SUMMARY_BYTES: usize = 2 * 1024;
 /// Longest completion result carried into the parent's mailbox (a message's bound).
 pub const MAX_RESULT_BYTES: usize = 16 * 1024;
@@ -193,7 +193,7 @@ fn u64_of(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-/// An operation row as the P1 type.
+/// A typed operation row.
 fn stored_operation(row: &OperationRow) -> Result<StoredOperation> {
     Ok(StoredOperation {
         id: operation_id(&row.id)?,
@@ -270,7 +270,7 @@ pub enum AcceptPlan {
     Close,
 }
 
-/// Write protocol step 1: one acceptance.
+/// One acceptance.
 #[derive(Debug, Clone)]
 pub struct Accept {
     /// The authenticated caller (never from arguments).
@@ -305,11 +305,11 @@ pub struct AcceptedOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Accepted {
     New(AcceptedOp),
-    /// The key was already used for this very request: the contract §2 replay table.
+    /// The key was already used for this very request: replay the stored outcome.
     Replay(ReplayOutcome),
 }
 
-/// A reserved dispatch (write protocol step 2): exactly what to dispatch, from the store.
+/// A reserved dispatch: exactly what to dispatch, from the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reserved {
     pub operation: StoredOperation,
@@ -318,7 +318,7 @@ pub struct Reserved {
     pub message: Option<MessageId>,
 }
 
-/// An observed dispatch fact (write protocol step 4).
+/// An observed dispatch fact.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchFact {
     /// Written to the transport (never "consumed").
@@ -375,7 +375,7 @@ pub struct Published {
     pub stream_epoch: u64,
 }
 
-/// Write protocol step 5: a run's end.
+/// A run's end.
 #[derive(Debug, Clone)]
 pub struct Completion {
     pub run: RunId,
@@ -398,7 +398,7 @@ pub struct Completed {
     pub notification: Option<(MessageId, i64)>,
 }
 
-/// Write protocol step 6: a committed revocation.
+/// A committed revocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revoked {
     pub authority_epoch: u64,
@@ -414,7 +414,7 @@ pub struct Revoked {
     pub continuation_released: bool,
 }
 
-/// One read or wait page query (contract §3 page rules).
+/// One read or wait page query.
 #[derive(Debug, Clone)]
 pub struct PageQuery {
     pub root_worker: WorkerId,
@@ -444,7 +444,7 @@ pub struct PageOut {
     pub presented: Vec<MessageId>,
 }
 
-/// A mailbox ACK (contract §3 read `acknowledge`).
+/// A mailbox ACK .
 #[derive(Debug, Clone)]
 pub struct AckRequest {
     pub principal: WorkerId,
@@ -641,7 +641,7 @@ impl Store {
         })
     }
 
-    // ---- the idempotency front (contract §2 order) ----
+    // ---- the idempotency front ----
 
     fn idempotency_front(
         &self,
@@ -704,14 +704,14 @@ impl Store {
         }
     }
 
-    // ---- step 1: accept ----
+    // ---- accept ----
 
-    /// Write protocol step 1, in one transaction: the persisted epoch, the capacity counters and
+    /// The persisted epoch, the capacity counters and
     /// idempotency are checked; then the operation (canonical scrubbed request, frozen
     /// resolution, the receipt stored as its serialised JSON exactly as returned), the worker,
     /// message or run reservation, and the audit event with its links are inserted together.
     ///
-    /// A replay follows the contract §2 table by the stored dispatch state.
+    /// A replay uses the stored dispatch state.
     pub fn accept_delegation(&self, a: &Accept) -> Result<Verdict<Accepted>> {
         self.atomically(|s| s.accept_in_txn(a))
     }
@@ -1375,7 +1375,7 @@ impl Store {
         let mut cancelled = Vec::new();
         for m in self.messages_of_operation(&row.id)? {
             // Only a delivery that would drive a child is cancelled; a child→parent entry is
-            // mailbox data and stays as it is (contract §6).
+            // mailbox data and stays as it is.
             if !self.is_parent_to_child(&m)? {
                 continue;
             }
@@ -1409,9 +1409,9 @@ impl Store {
         Ok(cancelled)
     }
 
-    // ---- step 2: reserve dispatch ----
+    // ---- reserve dispatch ----
 
-    /// Write protocol step 2: reserves the dispatch of an accepted operation, after rechecking
+    /// Reserves the dispatch of an accepted operation, after rechecking
     /// the persisted epoch and the target. A stale epoch or a closed target fails the operation
     /// (committed) and is returned as the refusal. After this commits, recovery is conservative:
     /// a restart makes it `unknown`, never re-dispatched.
@@ -1467,9 +1467,9 @@ impl Store {
         }))
     }
 
-    // ---- step 4: record facts ----
+    // ---- record facts ----
 
-    /// Write protocol step 4: records an observed dispatch fact. A send's message follows
+    /// Records an observed dispatch fact. A send's message follows
     /// (`submitted`, `failed`, `unknown`) where `delivery_step` allows; a spawn's reserved run
     /// fails or becomes `unknown` with it. Never translates a pipe write into "consumed".
     pub fn record_delegation_dispatch(
@@ -1600,9 +1600,9 @@ impl Store {
         })
     }
 
-    // ---- step 5: complete ----
+    // ---- complete ----
 
-    /// Write protocol step 5, in one transaction: the run's terminal state, the worker's state,
+    /// The run's terminal state, the worker's state,
     /// the terminal event with its links, and the parent's mailbox notification (a `report`
     /// carrying the bounded, scrubbed result) with its own event and links.
     pub fn complete_delegation_run(&self, c: &Completion) -> Result<Completed> {
@@ -1680,9 +1680,9 @@ impl Store {
         })
     }
 
-    // ---- step 6: revoke ----
+    // ---- revoke ----
 
-    /// Write protocol step 6, in one transaction (contract §6): bumps the root's authority epoch
+    /// Bumps the root's authority epoch
     /// when the event revokes, fails every not-yet-reserved operation of the tree with
     /// `stale_epoch`, cancels queued parent→child sends, releases the continuation reservation,
     /// marks out-of-ceiling workers `restricted` and closes a closed subtree. The returned effect
@@ -2008,7 +2008,7 @@ impl Store {
         })
     }
 
-    /// Historical relinking (plan §3 "Atomic visibility"): the backfilled links and aliases and a
+    /// Historical relinking: the backfilled links and aliases and a
     /// stream-epoch bump in one transaction, so every cursor issued before it expires
     /// (`cursor_expired`) instead of silently missing membership behind it. Returns the new
     /// stream epoch.
@@ -2077,7 +2077,7 @@ impl Store {
 
     // ---- pages ----
 
-    /// One read or wait page (contract §3): units in committed seq order, one per seq (a
+    /// One read or wait page: units in committed seq order, one per seq (a
     /// message's seq is a message only), selected by agent_core's reservation and measured by its
     /// settle step, cursor bound to the filter and the stream epoch. Read-only, in one read
     /// snapshot, so it runs on any connection and never waits on the writer.
@@ -2356,7 +2356,7 @@ impl Store {
 
     // ---- mailbox ACK ----
 
-    /// A durable ACK (contract §3): idempotent on its key (a retry replays the stored outcome and
+    /// A durable ACK: idempotent on its key (a retry replays the stored outcome and
     /// never consumes newer messages). Each id is judged alone by `ack_eligible`: an invisible or
     /// unknown id is `not_found`, one not yet presented is `invalid_argument`
     /// (`not_presented`), and a rejected id consumes nothing else.
@@ -3243,7 +3243,7 @@ mod tests {
                 .len(),
             2
         );
-        // Two secrets that scrub alike are the same request (contract §2).
+        // Two secrets that scrub alike are the same request.
         // (The mask keeps the last 4 characters, so these share them.)
         let a = format!("use ghp_{}zzzz", "a".repeat(32));
         let b = format!("use ghp_{}zzzz", "b".repeat(32));

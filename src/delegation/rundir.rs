@@ -1,4 +1,4 @@
-//! Lane D: the verified runtime directory (§5.5, contract §5 "Claude overlay file").
+//! The verified runtime directory.
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};

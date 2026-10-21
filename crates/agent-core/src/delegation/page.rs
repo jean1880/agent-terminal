@@ -1,4 +1,4 @@
-//! Page cursors and page assembly by bytes (contract §3 page rules, "Selection, then
+//! Page cursors and page assembly by bytes (page rules, "Selection, then
 //! measurement").
 
 use serde_json::Value;
@@ -255,7 +255,7 @@ pub struct Assembled {
     pub truncated: bool,
 }
 
-/// Contract §3 "Selection, then measurement" for a read or wait page. The snapshot is always
+/// "Selection, then measurement" for a read or wait page. The snapshot is always
 /// in and counts first; units are whole and in seq order; the first unit is always taken;
 /// `render` builds the real page (cursor from `last_seq`, `truncated`) and its measured size
 /// decides.

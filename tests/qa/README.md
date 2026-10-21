@@ -185,7 +185,7 @@ user's approval per run.** Never run it in CI. Always `--dry-run` first.
   reported cwd is the sandbox.
 
 `--keep` retains the sandbox and the scrubbed frames. The check functions are proven
-against the W0 fixtures without quota: `python3 -m unittest tests/qa/test_live_smoke.py`.
+against the recorded fixtures without quota: `python3 -m unittest tests/qa/test_live_smoke.py`.
 
 Rollback: revert the CI/QA source changes and beta configuration together through
 their repositories' normal review/deployment process. Do not deploy or install

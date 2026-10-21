@@ -758,7 +758,7 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: @at_fg_strong; font-family: monospace; }
 .chat-panel .json-row .subtitle { font-family: monospace; }
 
-/* keyboard focus: one visible ring on every custom-drawn button (ui-audit #8) */
+/* keyboard focus: one visible ring on every custom-drawn button */
 .tool-card .card-header:focus-visible,
 .reasoning-toggle:focus-visible,
 .plan-toggle:focus-visible,

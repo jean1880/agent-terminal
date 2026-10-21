@@ -1,4 +1,4 @@
-//! Lane B: a session's typed delegated-input API (`docs/delegation/p4-supervisor.md` §3.4).
+//! A session's typed delegated-input API.
 //!
 //! Delegated input is never a user prompt: it is stored as `Event::DelegatedMessage` (never a
 //! `UserMessage`), labelled for the agent as data from another agent, and never enters the
@@ -84,12 +84,12 @@ impl ChatSession {
     /// Names the worker this session is (a root principal or a supervised child): the
     /// recipient recorded on every delegated message it is given. Until it is named,
     /// [`Self::deliver_delegated`] refuses rather than record a message with no recipient.
-    #[cfg_attr(not(test), allow(dead_code))] // the supervisor (Lane A) names its sessions
+    #[cfg_attr(not(test), allow(dead_code))] // the supervisor names its sessions
     pub(crate) fn set_delegation_worker(&self, worker: WorkerId) {
         *self.inner.worker.borrow_mut() = Some(worker);
     }
 
-    /// Delivers one reserved, E7-checked input (`StartTurn`, `WriteLive` or `SteerNow`).
+    /// Delivers one reserved, authority-checked input (`StartTurn`, `WriteLive` or `SteerNow`).
     pub(crate) fn deliver_delegated(&self, input: DelegatedInput) -> DelegatedOutcome {
         self.inner.deliver_delegated(input)
     }

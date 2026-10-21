@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in live smoke: assert the protocol CONTRACT FACTS of a real agent CLI (plan D7).
+"""Opt-in live smoke: assert the protocol behaviour of a real agent CLI.
 
   python3 tests/qa/live_smoke.py --agent claude|codex|agy [--dry-run]
 
@@ -11,7 +11,7 @@ Stdlib only, Python 3.11+. The CLI is driven inside a throwaway sandbox repo und
 temp dir (never $HOME; the cwd is passed explicitly and asserted). Spawning, framing and
 scrubbing come from tests/qa/record_frames.py, so every frame is masked before it is
 stored and the checks run on the same JSONL shape as tests/fixtures/real/*. The check
-functions are pure over that shape; test_live_smoke.py proves them against the W0
+functions are pure over that shape; test_live_smoke.py proves them against the recorded
 fixtures without spending quota.
 
 Contract facts asserted:
@@ -65,7 +65,7 @@ class SandboxError(Exception):
 
 def assert_sandbox(path):
     """Refuse any cwd that is not a live-smoke sandbox under the temp dir. Returns the
-    resolved path. The guard is what keeps a slip (W0's agy run used $HOME) from happening."""
+    resolved path. The guard is what keeps a slip (a recorded agy run used $HOME) from happening."""
     if not path or not os.path.isabs(str(path)):
         raise SandboxError(f"sandbox must be an absolute path, got {str(path)!r}")
     real = Path(path).resolve()

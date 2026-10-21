@@ -36,3 +36,6 @@ __pycache__/
 
 # Graphify knowledge graph: a local artefact, rebuilt by graphify-build
 graphify-out/
+
+# Agent plans are never part of the repository (make lint enforces it)
+/plans/

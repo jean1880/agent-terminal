@@ -1,8 +1,7 @@
 //! Claude Code adapter: `claude --input-format stream-json` plus the control protocol.
 //!
-//! A pure, sans-I/O state machine. The wire facts come from the Phase 0 probes
-//! (`plans/2026-10-06_v3-structured-agents.md`, "Phase 0 results") and are replayed against the
-//! recordings in `tests/fixtures/claude-*.ndjson`.
+//! A pure, sans-I/O state machine. The wire facts come from probes of the real CLI
+//! and are replayed against the recordings in `tests/fixtures/claude-*.ndjson`.
 //!
 //! Frames are read as untyped [`serde_json::Value`]s, so a field the CLI adds or drops never
 //! aborts the stream: anything this adapter does not map becomes [`Event::Unknown`] with the whole
@@ -814,10 +813,10 @@ impl ClaudeAdapter {
         let tool = str_of(req, "tool_name").unwrap_or("tool").to_owned();
         let tool_use_id = str_of(req, "tool_use_id").unwrap_or(request_id).to_owned();
         let input = req.get("input").cloned().unwrap_or(Value::Null);
-        // "Allow for session" and "Always allow" are the app's (plan D1): it records the rule
+        // "Allow for session" and "Always allow" are the app's: it records the rule
         // and answers later matching requests itself, so Claude's `permission_suggestions` are
         // never forwarded. The app narrows these options to what a rule can describe. Stop turn
-        // (Cancel) denies with `interrupt`, ending the turn (D4: the same five buttons).
+        // (Cancel) denies with `interrupt`, ending the turn.
         let options = vec![
             Decision::Allow,
             Decision::AllowForSession,
@@ -1203,7 +1202,7 @@ impl Adapter for ClaudeAdapter {
             } => {
                 let line = self.answer_line(&request, decision, updated_input, message)?;
                 // Stop turn: the deny carries `interrupt`, so the result that follows is the
-                // user's stop, like Command::Interrupt's (D4).
+                // user's stop, like Command::Interrupt's.
                 if decision == Decision::Cancel {
                     self.interrupt_pending = self.turn_open;
                 }
@@ -1419,7 +1418,7 @@ impl ClaudeAdapter {
                     "updatedInput".to_owned(),
                     updated_input.unwrap_or_else(|| p.input.clone()),
                 );
-                // Never `updatedPermissions`: the scope is the app's (D1). Claude gets no
+                // Never `updatedPermissions`: the scope is the app's. Claude gets no
                 // `setMode`, no `addRules` and no `addDirectories`, so its mode stays as the user
                 // set it and nothing is written to `.claude/settings.local.json`.
             }
@@ -1497,7 +1496,7 @@ fn control_request_body(control: &Control) -> Value {
     }
 }
 
-// ----- `--thinking-display summarized` (W3.2) -----
+// ----- `--thinking-display summarized` -----
 //
 // Without it Claude sends signature-only thinking blocks (nothing to read). The flag is hidden
 // (absent from `--help`), so it is passed only to versions known to accept it, and a CLI that
@@ -1506,8 +1505,8 @@ fn control_request_body(control: &Control) -> Value {
 /// The arguments that make Claude share (a summary of) its thinking as `thinking_delta` text.
 pub const THINKING_DISPLAY_ARGS: [&str; 2] = ["--thinking-display", "summarized"];
 
-/// The oldest Claude Code version known to accept [`THINKING_DISPLAY_ARGS`] (verified live in
-/// W0 on 2.1.293, `tests/fixtures/real/claude/thinking-and-touch.jsonl`).
+/// The oldest Claude Code version known to accept [`THINKING_DISPLAY_ARGS`], verified by
+/// `tests/fixtures/real/claude/thinking-and-touch.jsonl` recorded on 2.1.293.
 pub const THINKING_DISPLAY_MIN_VERSION: (u32, u32, u32) = (2, 1, 293);
 
 /// The first `major.minor.patch` in `text` (`claude --version` prints "2.1.293 (Claude Code)";
@@ -2282,7 +2281,7 @@ mod tests {
             && matches!(e.event, Event::ControlResult { error: None, .. })));
     }
 
-    /// D4: Claude's card offers Stop turn; answering it denies with `interrupt` and the error
+    /// Claude's card offers Stop turn; answering it denies with `interrupt` and the error
     /// result that follows ends the turn Interrupted, not Failed. Deny alone does not.
     #[test]
     fn stop_turn_on_an_approval_ends_the_turn_interrupted() {
@@ -3385,7 +3384,7 @@ mod tests {
     const W0_TOUCH: &str =
         include_str!("../../../tests/fixtures/real/claude/thinking-and-touch.jsonl");
 
-    /// Every frame the CLI sent in a W0 recording, fed in order.
+    /// Every frame the CLI sent in a recording, fed in order.
     fn replay_w0(fixture: &str) -> Vec<Envelope> {
         let mut a = ClaudeAdapter::new();
         fixture
@@ -3396,7 +3395,7 @@ mod tests {
             .collect()
     }
 
-    /// W3.1 contract, from the W0 frames of `--thinking-display summarized` on 2.1.293: each
+    /// Recorded frames of `--thinking-display summarized` on 2.1.293: each
     /// thinking block is one reasoning item that goes Streaming → Complete with non-empty text.
     #[test]
     fn w0_thinking_blocks_stream_then_complete_with_their_text() {
@@ -3478,7 +3477,7 @@ mod tests {
         assert!(matches!(stop[1].event, Event::ItemCompleted { .. }));
     }
 
-    /// W3.2: the version gate and the refusal check behind `--thinking-display summarized`.
+    /// The version gate and the refusal check behind `--thinking-display summarized`.
     #[test]
     fn thinking_display_is_gated_on_known_versions() {
         assert_eq!(parse_version("2.1.293 (Claude Code)"), Some((2, 1, 293)));
@@ -3498,7 +3497,7 @@ mod tests {
         ));
         assert!(!refuses_thinking_display("error: unknown option '--foo'"));
         assert!(!refuses_thinking_display("thinking-display summarized"));
-        // The W0 init frame names its version.
+        // The init frame names its version.
         let init = W0_TOUCH
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -3510,7 +3509,7 @@ mod tests {
         assert_eq!(THINKING_DISPLAY_ARGS, ["--thinking-display", "summarized"]);
     }
 
-    /// D1: session and always scope are the app's. Whatever Claude suggests (the W0 frame offers
+    /// Session and always scope are the app's. Whatever Claude suggests (the frame offers
     /// `addRules`, `addDirectories` and `setMode acceptEdits`), every allow is a plain allow with
     /// no `updatedPermissions`, so Claude's mode and settings files are never changed.
     #[test]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline checks for live_smoke.py: arguments, dry-run, the sandbox guard, and the
-assertion functions fed from the W0 fixtures. Spends no quota and spawns no agent."""
+assertion functions fed from the recorded fixtures. Spends no quota and spawns no agent."""
 
 import contextlib
 import copy
@@ -229,7 +229,7 @@ class AgyCheckTests(unittest.TestCase):
         self.assertEqual(failed(ls.agy_checks(self.rows)), [])
 
     def test_the_w0_cwd_slip_is_caught(self):
-        # W0's fixture recorded cwd "~" (the home directory): the sandbox check must flag it.
+        # The fixture recorded cwd "~" (the home directory): the sandbox check must flag it.
         self.assertIn("agy: init cwd is the sandbox", failed(ls.agy_checks(self.rows, W0_SANDBOX)))
 
     def test_cwd_in_the_sandbox_passes(self):

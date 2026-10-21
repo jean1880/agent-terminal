@@ -1,4 +1,4 @@
-//! Which worker, generation and run an event belongs to, and its sanitiser key (contract §10).
+//! Which worker, generation and run an event belongs to, and its sanitiser key.
 
 use super::ids::{ProcessGeneration, RunId, WorkerId};
 use crate::event::{Envelope, StreamKind};
@@ -30,7 +30,7 @@ fn stream_name(stream: StreamKind) -> &'static str {
 }
 
 impl Scope {
-    /// The concrete P2 key: worker handle, generation, `Envelope.item` and the stream kind in
+    /// The concrete key: worker handle, generation, `Envelope.item` and the stream kind in
     /// snake_case.
     pub fn stream_key(&self, item: &str, stream: StreamKind) -> StreamKey {
         StreamKey {

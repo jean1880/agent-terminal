@@ -1,7 +1,7 @@
 # Recorded agent streams
 
 Real NDJSON recorded on 2026-10-06 against `claude` 2.1.291 and `agy` 1.3.0, in a sandbox with an
-isolated `HOME`, by the Phase 0 probe (see `plans/2026-10-06_v3-structured-agents.md`).
+isolated `HOME`, by a probe of each CLI.
 
 Each line is `{"dir":"in"|"out"|"err","t_ms":N,"frame":<json>|{"raw":"…"}}`:
 - `in` is what the client wrote to the agent's stdin;

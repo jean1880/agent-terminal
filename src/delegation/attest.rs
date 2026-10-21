@@ -438,7 +438,7 @@ impl Supervisor {
         });
     }
     /// Same authority, fresh process credentials. A real concurrent revocation still latches
-    /// the tree and makes the later E7 check fail.
+    /// the tree and makes the later authority check fail.
     pub(super) fn rotate_before_stop(&self, worker: &WorkerId, generation: ProcessGeneration) {
         let (conn, session) = {
             let mut state = self.state.borrow_mut();

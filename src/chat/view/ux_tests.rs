@@ -55,7 +55,7 @@ fn native_ux_matrix() {
             );
         }
         // Text that cannot be broken on its own must wrap or ellipsize, never widen the thread
-        // (ui-audit #6): a switch divider with a 900-char model, a question with a 300-char
+        // A switch divider with a 900-char model, a question with a 300-char
         // option and chip, a plan with a 300-char step.
         history.extend([
             Envelope::new(Event::ModelChanged {
@@ -344,8 +344,8 @@ fn item_started(id: &str, kind: ItemKind, title: &str, input: serde_json::Value)
     .item(id)
 }
 
-/// Presses the visible text of every click target of the view and asserts its effect (ui-audit
-/// #1: a selectable label inside a button swallowed the press, so the button never fired).
+/// Presses the visible text of every click target of the view and asserts its effect.
+/// A selectable label inside a button must not swallow the press.
 /// GTK has no way to inject a pointer event, so a press is a pick at the text's centre (which
 /// must pass through to the button) followed by the button's own activation.
 #[test]
@@ -713,7 +713,7 @@ fn native_click_matrix() {
 
     // The always-allow dialog's suggestions: the text of one fills the pattern field.
     let entry = gtk4::Entry::new();
-    // A read-only command: a runner gets no patterns to choose between (C1).
+    // A read-only command: a runner gets no patterns to choose between.
     let flow = cards::suggestion_flow(&entry, "Bash", "git log --oneline").expect("flow");
     let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     holder.append(&entry);
@@ -746,7 +746,7 @@ fn native_click_matrix() {
     dialog.destroy();
 }
 
-/// A toast covers the transcript, never the shelves or the composer (ui-audit #4).
+/// A toast covers the transcript, never the shelves or the composer.
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_toasts_clear_the_composer() {
@@ -824,7 +824,7 @@ fn native_toasts_clear_the_composer() {
     }
 }
 
-/// The queue scene (ui-audit: the queue was never exercised): prompts waiting behind a running
+/// The queue scene: prompts waiting behind a running
 /// turn stay pinned under the growing reply, can be selected for copying, and stay inside the
 /// viewport at every width.
 #[test]

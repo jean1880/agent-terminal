@@ -757,7 +757,7 @@ mod tests {
         assert!(out.contains("****efgh"), "{out}");
     }
 
-    /// C4: credentials carried by command-line options and headers are masked in live text.
+    /// Credentials carried by command-line options and headers are masked in live text.
     #[test]
     fn credential_options_and_headers_are_masked() {
         for (text, leaked) in [
@@ -795,7 +795,7 @@ mod tests {
         }
         // Short passwords are never shown whole.
         assert!(!redact("curl -u a:pw1 https://x").contains("pw1"));
-        // D3: the offset comes from the colon, so a password equal to the user name goes too.
+        // The offset comes from the colon, so a password equal to the user name goes too.
         for (text, kept) in [
             ("curl -u admin:admin https://x", "curl -u admin:****"),
             ("curl -uroot:root https://x", "curl -uroot:****"),
@@ -804,12 +804,12 @@ mod tests {
             let out = redact(text);
             assert!(out.starts_with(kept), "{text}: {out}");
         }
-        // D3: quoted values with spaces are masked whole.
+        // Quoted values with spaces are masked whole.
         let out = redact("curl --user 'alice:two words here' https://x");
         assert!(!out.contains("two") && !out.contains("words"), "{out}");
         let out = redact("curl -H 'Cookie: a=\"b c\"; sid=SESSIONVALUE99' https://x");
         assert!(!out.contains("b c") && !out.contains("SESSIONVAL"), "{out}");
-        // D4: curl short-option clusters.
+        // Curl short-option clusters.
         for text in [
             "curl -su alice:DEMOPASS1 https://x",
             "curl -vualice:DEMOPASS1 https://x",
@@ -818,7 +818,7 @@ mod tests {
             assert!(!redact(text).contains("DEMOPASS1"), "{text}");
         }
         // Look-alikes stay readable.
-        // D5: `-u` and `-p` mean credentials only for the programs that use them that way.
+        // `-u` and `-p` mean credentials only for the programs that use them that way.
         for text in [
             "sort -u names.txt",
             "mkdir -p build/out",

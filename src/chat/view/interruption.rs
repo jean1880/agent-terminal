@@ -511,7 +511,7 @@ pub(crate) fn placed(button: &impl IsA<gtk4::Widget>) -> bool {
         .is_some_and(|child| &child == button.upcast_ref())
 }
 
-/// The shelf's one line for a pending approval: the call's card title (W3.4, `Run <command>`,
+/// The shelf's one line for a pending approval: the call's card title (`Run <command>`,
 /// `Edit <path>`, …), else the first file an edit names, else nothing.
 fn approval_preview(tool: &str, input: &serde_json::Value) -> String {
     if tool == permission::TOOL {

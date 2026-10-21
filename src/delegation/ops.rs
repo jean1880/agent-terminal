@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// Why a worker whose bridge connection closed needs a rebind (contract §6).
+/// Why a worker whose bridge connection closed needs a rebind.
 pub(super) const LOST_BRIDGE: &str =
     "the delegation bridge connection was lost; it rebinds before the next turn";
 

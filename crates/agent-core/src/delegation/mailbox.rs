@@ -1,4 +1,4 @@
-//! Messages between workers (contract §2 direction rules, §3 `cross_agent_send` and ACKs, §5
+//! Messages between workers (`cross_agent_send` and ACKs,
 //! `this_run` delivery).
 
 use std::collections::VecDeque;
@@ -13,7 +13,7 @@ use super::wire::{Delivery, ThisRunSupport};
 use crate::adapter::Driver;
 use crate::event::WorkerState;
 
-/// A message's kind (contract §2 `MessageKind`).
+/// A message's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
@@ -53,7 +53,7 @@ pub fn kind_allowed(dir: Direction, kind: MessageKind) -> bool {
     }
 }
 
-/// A message's delivery state (contract §2 `DeliveryState`).
+/// A message's delivery state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {

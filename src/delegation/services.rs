@@ -15,7 +15,7 @@ use crate::config::Profile;
 use crate::hook_config::HookTarget;
 use crate::model_tags_file::TagsState;
 
-/// The narrow app services the supervisor holds (built by Lane E from `window::imp::threads`).
+/// The narrow app services the supervisor holds (built from `window::imp::threads`).
 pub(crate) struct AppServices {
     pub handle: StoreHandle,
     /// `None`: memory or test store; jobs run in place.

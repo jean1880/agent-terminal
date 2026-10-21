@@ -645,7 +645,7 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
     });
 }
 
-/// Plan 2.5: a stored Codex thread id whose thread never completed a turn has no rollout. The
+/// A stored Codex thread id whose thread never completed a turn has no rollout. The
 /// reopened thread still works: the next prompt runs in a new Codex thread, carrying the
 /// thread's history as a handoff, with a notice, and only that completed turn stores the new id.
 #[test]
@@ -720,7 +720,7 @@ fn scripted_resume_with_no_rollout_continues_in_a_new_codex_thread() {
     });
 }
 
-/// Plan 2.7 (F19): an answered question card leaves "Sending…" for "Answered" once the adapter
+/// An answered question card leaves "Sending…" for "Answered" once the adapter
 /// has accepted the answer; the agent never acknowledges it. A refused answer stays sent.
 #[test]
 fn scripted_an_accepted_answer_moves_the_question_card_to_answered() {
@@ -830,7 +830,7 @@ fn scripted_a_message_mid_turn_steers_the_running_codex_turn() {
     });
 }
 
-/// Plan 2.5 (review): a turn that produced an item but never completed (the process died
+/// A turn that produced an item but never completed (the process died
 /// mid-command) still confirms the new Codex thread, so the next reopen resumes it.
 #[test]
 fn scripted_a_turn_with_an_item_confirms_the_new_codex_thread() {

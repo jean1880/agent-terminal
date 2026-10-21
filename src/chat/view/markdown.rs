@@ -136,7 +136,7 @@ impl Builder {
     }
 }
 
-/// One short passage of markdown as a single label's Pango markup (reasoning paragraphs, F17):
+/// One short passage of markdown as a single label's Pango markup (reasoning paragraphs):
 /// the same renderer as transcript messages, so `**Planning**` is bold with no markers. Every
 /// piece of source text is escaped by [`parse`]; code blocks become escaped monospace, rules
 /// nothing. Blocks are joined by line breaks.
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn passage_markup_renders_reasoning_markdown_and_escapes_the_rest() {
-        // F17: Codex summaries arrive as markdown; the markers must not show.
+        // Codex summaries arrive as markdown; the markers must not show.
         assert_eq!(
             passage_markup("**Planning** the listing"),
             "<b>Planning</b> the listing"

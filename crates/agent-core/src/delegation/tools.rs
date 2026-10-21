@@ -1,4 +1,4 @@
-//! The eight tools: names, descriptions and JSON Schemas (contract §1 and §3).
+//! The eight tools: names, descriptions and JSON Schemas.
 //!
 //! The schemas describe what [`super::wire::parse_request`] enforces; rmcp does not validate
 //! `inputSchema`, so the parser is the check and these are the documentation the model sees.
@@ -27,10 +27,10 @@ pub enum ToolName {
     CrossAgentClose,
 }
 
-/// What degraded mode serves (contract §1).
+/// What degraded mode serves.
 pub const DEGRADED_TOOLS: [ToolName; 1] = [ToolName::CrossAgentCapabilities];
 
-/// Contract §6: shown in Settings → Agents and as `capabilities.delegation_scope`'s
+/// Shown in Settings → Agents and as `capabilities.delegation_scope`'s
 /// explanation.
 pub const DELEGATION_SCOPE_TEXT: &str = "Depth and mode limits apply to agents started through agent-terminal. \
     Delegated agents cannot start their own built-in sub-agents, except Codex, whose built-in sub-agents run \
@@ -68,7 +68,7 @@ impl ToolName {
 
     /// Spawn, send, cancel and close. Read mutates only with `acknowledge`
     /// ([`super::wire::ToolRequest::is_mutating`]). Attestation is not limited to these: for
-    /// agy every tool is attested (contract §4).
+    /// agy every tool is attested.
     pub fn is_mutating(self) -> bool {
         match self {
             ToolName::CrossAgentSpawn
@@ -144,7 +144,7 @@ impl ToolName {
         }
     }
 
-    /// The input schema: `additionalProperties: false`, bounds per contract §3 (default
+    /// The input schema: `additionalProperties: false`, field bounds (default
     /// limits).
     pub fn input_schema(self) -> Value {
         input_schema_with(self, &Limits::default())

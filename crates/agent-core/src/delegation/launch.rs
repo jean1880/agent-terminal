@@ -1,4 +1,4 @@
-//! The per-provider launch mapping (contract §5): bridge env, the Claude overlay and
+//! The per-provider launch mapping: bridge env, the Claude overlay and
 //! arguments, the Codex thread config, and the child read-back checks.
 //!
 //! The token appears only under a server's `env`, never in argv, and a
@@ -24,7 +24,7 @@ pub struct DelegationBinding {
     pub token: CapabilityToken,
 }
 
-/// Codex's tool timeout for our server, above both bridge timeouts (contract §4).
+/// Codex's tool timeout for our server, above both bridge timeouts.
 pub const CODEX_TOOL_TIMEOUT_SEC: u64 = 60;
 
 /// Built-in Codex servers seen in every fixture; a child disables them.

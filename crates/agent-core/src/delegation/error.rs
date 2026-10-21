@@ -1,11 +1,11 @@
-//! Error codes and the tool error object (contract §3 "Error codes").
+//! Error codes and the tool error object.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Contract §3: 25 codes, plus `Unknown` for a code from a newer build.
+/// 25 codes, plus `Unknown` for a code from a newer build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -69,7 +69,7 @@ impl ErrorCode {
         ErrorCode::Unknown,
     ];
 
-    /// The contract §3 table: retry (with the same idempotency key) only for these.
+    /// Retry (with the same idempotency key) only for these.
     pub fn retryable(self) -> bool {
         match self {
             ErrorCode::CapacityReached
@@ -140,10 +140,10 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// Longest `ToolError.message`, in bytes (contract §2).
+/// Longest `ToolError.message`, in bytes.
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
 
-/// The error every tool returns (contract §2 `ToolError`). `message` must already be scrubbed;
+/// The error every tool returns. `message` must already be scrubbed;
 /// [`ToolError::new`] bounds it to [`MAX_ERROR_MESSAGE_BYTES`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolError {
@@ -191,7 +191,7 @@ impl ToolError {
         }
     }
 
-    /// Sets `details` (contract §2: an object or null, at most
+    /// Sets `details` (an object or null, at most
     /// [`MAX_ERROR_DETAILS_BYTES`](super::wire::MAX_ERROR_DETAILS_BYTES) serialised). `null`
     /// clears it. Anything else that breaks the contract is never sent: it is replaced whole
     /// (never cut) by `{"reason": "details_invalid" | "details_too_large"}`.

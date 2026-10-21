@@ -4,7 +4,7 @@ Each prompt selects a deterministic scenario. Server requests block progress unt
 the exact typed ID is answered; stdin/stdout are the real application transport.
 All frames are saved in the test's private directory for failure diagnostics.
 
-Delegation (P4) controls, as files in the test's directory:
+Delegation controls, as files in the test's directory:
 - `refuse-steer`: every `turn/steer` is refused (a strict steer that lost its turn);
 - `readback.json`: merged into the `thread/start`/`thread/resume` result, which otherwise
   reads back the `approvalPolicy` and `sandbox` the request asked for;

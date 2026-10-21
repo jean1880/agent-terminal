@@ -2060,7 +2060,7 @@ const SUMMARY_SQL: &str = "SELECT t.id, t.title, t.cwd, t.updated_at,
          (SELECT id FROM provider_threads q WHERE q.thread_id = t.id
           ORDER BY q.created_at DESC, q.rowid DESC LIMIT 1))";
 
-/// Excludes the hidden backing thread of a supervised child (contract §8.1: by join, not by a new
+/// Excludes the hidden backing thread of a supervised child (by join, not by a new
 /// column on `threads`). Root threads stay visible: a root worker never has a backing thread.
 const NOT_HIDDEN_CHILD: &str =
     "NOT EXISTS (SELECT 1 FROM delegation_workers w WHERE w.backing_thread_id = t.id)";
@@ -2278,7 +2278,7 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
         )?;
     }
     if current < 4 && target >= 4 {
-        // Strictly additive (contract §8.1): new tables, indexes and triggers on them only.
+        // Strictly additive: new tables, indexes and triggers on them only.
         conn.execute_batch(delegation::SCHEMA_V4)?;
     }
     if current < 5 && target >= 5 {
@@ -3907,7 +3907,7 @@ mod tests {
         s
     }
 
-    /// §6.4: the same randomised script (split secrets across 2-5 deltas, two interleaved
+    /// The same randomised script (split secrets across 2-5 deltas, two interleaved
     /// streams and threads, snapshots, interrupts, items started twice, never, or again after
     /// completing (reused ids), prompts, an import, overflow, too many items, injected append
     /// errors and panics, forgotten tails, and writer batches with failures, panics, a lost
@@ -4010,7 +4010,7 @@ mod tests {
             .any(|(_, _, _, json)| parts.iter().any(|p| json.contains(p)))
     }
 
-    /// B1: an item id that comes back (after its completion cleared its tail) already has rows;
+    /// An item id that comes back (after its completion cleared its tail) already has rows;
     /// a tail started anew would miss them, so it heals by the scan, which joins both lives.
     #[test]
     fn a_reused_item_id_heals_by_the_scan() {
@@ -4035,7 +4035,7 @@ mod tests {
         );
     }
 
-    /// A1: a delta that came before its item's start while the tails were full left no marker;
+    /// A delta that came before its item's start while the tails were full left no marker;
     /// the start that follows must still not trust a tail that lacks that row.
     #[test]
     fn a_delta_unseen_by_full_tails_is_not_vouched_for_later() {
@@ -4184,7 +4184,7 @@ mod tests {
         assert_eq!(before.checkpointed, before.wal_frames);
     }
 
-    /// The append benchmark (§1 E5, §2 WP4a): run it on a read-only snapshot of a real store,
+    /// The append benchmark: run it on a read-only snapshot of a real store,
     /// release build:
     /// `sqlite3 -readonly ~/.local/state/agent-terminal/threads.db ".backup /tmp/x/threads.db"`,
     /// then `AGENT_TERMINAL_BENCH_DB=/tmp/x/threads.db cargo test --release -p agent-kit

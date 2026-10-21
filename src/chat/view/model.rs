@@ -44,7 +44,7 @@ pub enum Body {
         streaming: bool,
         /// What the adapter last said of the block ([`Event::Reasoning`]), or `Replayed` once
         /// the view loaded it from history. `None`: the adapter said nothing (Codex, until it
-        /// maps its summaries; history stored before W3.1), so it follows `streaming`.
+        /// maps its summaries; older history), so it follows `streaming`.
         state: Option<ReasoningState>,
         label: ReasoningLabel,
     },
@@ -2029,7 +2029,7 @@ impl Transcript {
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
             Event::QuotaUpdated { .. } | Event::Unknown => {}
-            // Delegation events are not shown yet (no runtime emits them before P4).
+            // Delegation events are not shown yet.
             Event::DelegatedMessage { .. } | Event::WorkerLinked { .. } => {}
         }
         out
@@ -2471,7 +2471,7 @@ mod tests {
             .collect()
     }
 
-    /// W3.1/3.2: the recorded W0 Claude turn (`--thinking-display summarized` on 2.1.293),
+    /// The recorded Claude turn (`--thinking-display summarized` on 2.1.293),
     /// through the adapter into the model, renders each thinking block as a non-empty Complete
     /// "Thought process"; the same events loaded from the store render Replayed.
     #[test]

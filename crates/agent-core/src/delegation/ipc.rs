@@ -1,4 +1,4 @@
-//! The bridge ↔ supervisor IPC (contract §4): frames, a bounded decoder, and the server's
+//! The bridge ↔ supervisor IPC: frames, a bounded decoder, and the server's
 //! pure protocol checks. The app owns the socket, the timers and the authentication.
 
 use std::collections::BTreeSet;
@@ -18,9 +18,9 @@ use crate::adapter::Driver;
 
 /// The largest frame body, in bytes.
 pub const MAX_FRAME: usize = 1 << 20;
-/// Bridge side: connect, hello and welcome within this of process start (§1).
+/// Bridge side: connect, hello and welcome within this of process start.
 pub const WELCOME_DEADLINE_MS: u64 = 2_000;
-/// Bridge side: the one reconnect's own deadline, counted from the detected loss (§4).
+/// Bridge side: the one reconnect's own deadline, counted from the detected loss.
 pub const RECONNECT_DEADLINE_MS: u64 = 2_000;
 
 /// The frame length prefix.

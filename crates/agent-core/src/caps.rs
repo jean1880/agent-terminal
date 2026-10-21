@@ -1,5 +1,5 @@
 //! Per-agent capability matrix. The UI greys out what an agent cannot do instead of failing.
-//! Values are the verified Phase 0 behaviour (plans/2026-10-06_v3-structured-agents.md).
+//! Values are the behaviour verified against the real CLIs.
 
 use serde::{Deserialize, Serialize};
 
