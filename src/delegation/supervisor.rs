@@ -1482,6 +1482,57 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// Records what a subscriber was told, in order: `None` for a replayed event, `Some`
+    /// for a registry with the workers it listed.
+    #[derive(Default)]
+    struct Recorder {
+        log: RefCell<Vec<Option<Vec<WorkerId>>>>,
+    }
+    impl WorkerSubscriber for Recorder {
+        fn scoped(&self, _env: &agent_core::delegation::scope::ScopedEnvelope) {}
+        fn replayed(&self, _env: &agent_core::delegation::scope::ScopedEnvelope) {
+            self.log.borrow_mut().push(None);
+        }
+        fn registry(&self, _thread: &str, workers: &[WorkerSummary]) {
+            self.log
+                .borrow_mut()
+                .push(Some(workers.iter().map(|w| w.worker_id.clone()).collect()));
+        }
+    }
+    #[test]
+    fn replay_for_an_unprepared_root_lists_its_stored_workers_first() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            let live: Rc<dyn WorkerSubscriber> = Rc::new(Recorder::default());
+            sup.subscribe(&thread, Rc::downgrade(&live));
+            let receipt = sup
+                .spawn_worker(&root, spawn_request("stored"))
+                .await
+                .unwrap();
+            let worker = WorkerId::parse(receipt["worker_id"].as_str().unwrap()).unwrap();
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "completed").await;
+            // As after a restart, before the thread's agent is prepared again: the in-memory
+            // registry knows no workers for this thread.
+            let mapped = sup.state.borrow_mut().threads.remove(&thread).unwrap();
+            assert!(sup.summaries(&thread).is_empty());
+            let recorder = Rc::new(Recorder::default());
+            let erased: Rc<dyn WorkerSubscriber> = recorder.clone();
+            sup.subscribe(&thread, Rc::downgrade(&erased));
+            pump_until(|| recorder.log.borrow().iter().any(Option::is_none)).await;
+            let log = recorder.log.take();
+            let first_replay = log.iter().position(Option::is_none).unwrap();
+            assert!(
+                log[..first_replay]
+                    .iter()
+                    .flatten()
+                    .any(|workers| workers.contains(&worker)),
+                "the stored worker was listed before its history: {log:?}"
+            );
+            sup.state.borrow_mut().threads.insert(thread, mapped);
+            stop(&sup).await;
+        });
+    }
     #[test]
     fn production_start_reconciles_crash_without_replaying_or_signalling_old_process() {
         const MARKER: &str = "AGENT_TERMINAL_RESTART_FIXTURE";
@@ -2875,18 +2926,19 @@ impl Supervisor {
                 .services
                 .read(move |s| {
                     let Some(root) = s.delegation_root_of_thread(&thread)? else {
-                        return Ok::<_, agent_kit::store::StoreError>(Vec::new());
+                        return Ok::<_, agent_kit::store::StoreError>((None, Vec::new()));
                     };
                     let root_id = WorkerId::parse(&root.root_worker_id)
                         .map_err(|e| agent_kit::store::StoreError::Failed(e.to_string()))?;
-                    let mut out = Vec::new();
-                    let mut bytes = 0usize;
-                    for w in s
+                    let children = s
                         .delegation_workers_of_root(&root.id)?
                         .into_iter()
                         .filter(|w| w.parent_id.is_some())
-                    {
-                        let Some(thread) = w.backing_thread_id else {
+                        .collect::<Vec<_>>();
+                    let mut out = Vec::new();
+                    let mut bytes = 0usize;
+                    'workers: for w in &children {
+                        let Some(thread) = w.backing_thread_id.as_deref() else {
                             continue;
                         };
                         let Ok(worker) = WorkerId::parse(&w.id) else {
@@ -2896,7 +2948,7 @@ impl Supervisor {
                         let mut run = None;
                         let mut generation = ProcessGeneration(0);
                         'pages: loop {
-                            let page = s.events(&thread, after, 256)?;
+                            let page = s.events(thread, after, 256)?;
                             if page.is_empty() {
                                 break;
                             }
@@ -2914,7 +2966,7 @@ impl Supervisor {
                                 bytes += serde_json::to_vec(&envelope)?.len();
                                 if bytes > 4 * 1024 * 1024 || out.len() >= 4096 {
                                     out.push(agent_core::delegation::scope::ScopedEnvelope{scope:agent_core::delegation::scope::Scope{root:root_id.clone(),worker:worker.clone(),generation,run:run.clone()},envelope:agent_core::event::Envelope::new(agent_core::event::Event::Notice{text:format!("Inspector replay truncated before event {seq}; older history remains available through paginated worker read.")})});
-                                    return Ok(out);
+                                    break 'workers;
                                 }
                                 out.push(agent_core::delegation::scope::ScopedEnvelope {
                                     scope: agent_core::delegation::scope::Scope {
@@ -2928,10 +2980,29 @@ impl Supervisor {
                             }
                         }
                     }
-                    Ok(out)
+                    Ok((Some((root_id, children)), out))
                 })
                 .await;
-            if let (Some(sub), Some(Ok(history))) = (sub.upgrade(), history) {
+            if let (Some(sub), Some(Ok((stored, history)))) = (sub.upgrade(), history) {
+                // A root not yet prepared in this process has no workers in memory, so its
+                // replayed history would reach a view that cannot place it: list them first.
+                if let Some((root, children)) = stored {
+                    let mut workers = sup.summaries(&registered_thread);
+                    let missing = children
+                        .into_iter()
+                        .filter_map(|row| {
+                            let id = WorkerId::parse(&row.id).ok()?;
+                            if workers.iter().any(|w| w.worker_id == id) {
+                                return None;
+                            }
+                            sup.summary(&id, &sup.worker_rt(row, root.clone(), PathBuf::new()))
+                        })
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        workers.extend(missing);
+                        sub.registry(&registered_thread, &workers);
+                    }
+                }
                 for env in history {
                     sub.replayed(&env);
                 }
