@@ -533,8 +533,9 @@ Revision 3 added no code. Misdelivery is a delivery state
   - While the reconnect is pending, new calls wait for it within their own timeouts.
   - Claude and Codex: a token may be reused **sequentially** within its generation, so the reconnect succeeds unless
     the token was revoked.
-  - agy: the token is single-use, so the reconnect is always refused (§7 L4). The principal becomes `rebind_required`
-    (§6).
+  - agy: the token is single-use, so a reconnect could only be refused (§7 L4). The bridge therefore does not attempt
+    it: an agy principal's bridge is degraded as soon as the loss is detected. The supervisor marks the principal
+    `rebind_required` (§6) when the connection closes, with the reason recorded and persisted.
 - **Frames.** Each is tagged with `"t"`:
 
 ```jsonc
@@ -866,6 +867,9 @@ agy is stopped, and the status becomes `workspace_untrusted`.
   inside a process (agy.md D7).
 - **Hello window.** A token not consumed within 30 s of agy's spawn is revoked. The generation becomes
   `rebind_required`.
+- **Task start.** An agy child is given its task only once its process has spawned (the hook proof and launch guard
+  run first). A process that has not spawned within the 10 s startup deadline fails the worker, and so does any child
+  given a task whose turn does not open within 60 s; in both cases the worker's state reason says why.
 - **A hello that fails L3 is refused and consumes nothing.** The peer may not be a direct child of this agy, or not a
   bridge (below). Typical causes are a nested agent's process or a stray copy. The token stays valid for the legitimate
   bridge, and nothing is revoked. The supervisor logs the peer's pid and its argv (first 256 B, scrubbed) at warning

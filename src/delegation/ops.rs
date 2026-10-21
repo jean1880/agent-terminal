@@ -19,6 +19,11 @@ use gtk4::{gio, glib};
 use serde_json::{json, Value};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use tracing::{info, warn};
+
+/// Why a worker whose bridge connection closed needs a rebind (contract §6).
+pub(super) const LOST_BRIDGE: &str =
+    "the delegation bridge connection was lost; it rebinds before the next turn";
 
 /// `cross_agent_capabilities` with `refresh` waits at most this long for usage probes.
 const USAGE_REFRESH_WAIT: Duration = Duration::from_secs(20);
@@ -241,18 +246,31 @@ impl CallDispatcher for Supervisor {
         self.state.borrow_mut().waits.remove(&(conn, id));
     }
     fn closed(&self, conn: ConnId) {
-        let mut state = self.state.borrow_mut();
-        state.waits.retain(|(c, _), _| *c != conn);
-        if let Some(worker) = state.connections.remove(&conn) {
-            if let Some(w) = state.workers.get_mut(&worker) {
-                if let Some(t) = w.token.as_mut().filter(|t| t.live_conn == Some(conn)) {
-                    t.live_conn = None;
-                    if w.driver != Driver::Claude {
-                        w.row.delegation_status = "rebind_required".into();
-                    }
-                }
-            }
+        // A connection its own credential still held: the bridge went away (a rotation or a
+        // revocation takes the token first, so neither lands here). Claude's bridge may
+        // reconnect with the same token; the others cannot, so the worker needs a rebind, and
+        // says why, durably, where `list` and the worker dock can see it.
+        let lost = {
+            let mut state = self.state.borrow_mut();
+            state.waits.retain(|(c, _), _| *c != conn);
+            let worker = state.connections.remove(&conn);
+            worker.and_then(|worker| {
+                let w = state.workers.get_mut(&worker)?;
+                let t = w.token.as_mut().filter(|t| t.live_conn == Some(conn))?;
+                t.live_conn = None;
+                Some((worker, w.driver))
+            })
+        };
+        let Some((worker, driver)) = lost else {
+            return;
+        };
+        if driver == Driver::Claude {
+            info!(%worker, "delegation bridge disconnected; it may reconnect");
+            return;
         }
+        warn!(%worker, ?driver, "delegation bridge connection lost; rebind required");
+        self.set_status(&worker, "rebind_required", LOST_BRIDGE);
+        self.notify_registry();
     }
 }
 impl Supervisor {
@@ -405,6 +423,12 @@ impl Supervisor {
             Accepted::Replay(r) => return replay_value(r),
             Accepted::New(a) => a,
         };
+        info!(
+            caller = %caller,
+            worker = %r.worker_id,
+            runs = bound.len(),
+            "delegated cancel accepted"
+        );
         if bound.is_empty() {
             return Ok(a.receipt);
         }
@@ -540,6 +564,7 @@ impl Supervisor {
             Accepted::Replay(r) => return replay_value(r),
             Accepted::New(a) => a,
         };
+        info!(caller = %caller, worker = %r.worker_id, "delegated worker closed");
         self.revoke(&root, RevocationEvent::Close(r.worker_id.clone()))
             .await?;
         self.record_fact(a.operation, DispatchFact::Confirmed);
@@ -955,7 +980,7 @@ impl Supervisor {
         self.still_authorized(conn, &worker)?;
         match req {
             ToolRequest::Capabilities(r) => self.capabilities(conn, &worker, r).await,
-            ToolRequest::List(r) => self.list_workers(&worker, r),
+            ToolRequest::List(r) => self.list_workers(&worker, r).await,
             ToolRequest::Read(r) => self.read_page(&worker, r).await,
             ToolRequest::Wait(r) => self.wait_page(conn, call.id, &worker, r).await,
             ToolRequest::Spawn(r) => self.spawn_worker(&worker, r).await,
@@ -1212,50 +1237,87 @@ impl Supervisor {
         }
         false
     }
-    fn list_workers(&self, caller: &WorkerId, r: ListRequest) -> Result<Value, ToolError> {
+    /// `target` names the subtree root, which is never listed itself: a worker with no
+    /// children lists `[]`. Each worker's run is the store's active run, the same one `cancel`
+    /// checks, so a listed `run_id` is one `cancel(expected_run_id)` accepts (barring a real race
+    /// with the run's end, which `cancel` reports as `stale_run`).
+    async fn list_workers(&self, caller: &WorkerId, r: ListRequest) -> Result<Value, ToolError> {
         let target = r.target.clone().unwrap_or_else(|| caller.clone());
         if !self.visible(caller, &target, true) {
             return Err(error(ErrorCode::NotFound, "unknown worker"));
         }
-        let state = self.state.borrow();
-        let w = &state.workers[caller];
-        let root = &state.roots[&w.root];
         let filter = PageFilter {
             caller: caller.clone(),
             target: r.target,
             workers: Vec::new(),
             mailbox: false,
         };
-        let offset = match r.cursor {
-            Some(c) => {
-                decode_cursor(&c, &filter, root.row.stream_epoch.max(0) as u64)
-                    .map_err(|c| error(c, "invalid list cursor"))?
-                    .last_seq as usize
-            }
-            None => 0,
+        let (offset, ids, root_id, stream_epoch) = {
+            let state = self.state.borrow();
+            let w = &state.workers[caller];
+            let stream_epoch = state.roots[&w.root].row.stream_epoch.max(0) as u64;
+            let offset = match &r.cursor {
+                Some(c) => {
+                    self.check_cursor(caller, "cursor", c, &filter, stream_epoch)?
+                        .last_seq as usize
+                }
+                None => 0,
+            };
+            let mut ids = state
+                .workers
+                .keys()
+                .filter(|id| *id != &target && self.visible(&target, id, false))
+                .cloned()
+                .collect::<Vec<_>>();
+            ids.sort();
+            (offset, ids, w.root.clone(), stream_epoch)
         };
-        let mut ids = state
-            .workers
-            .keys()
-            .filter(|id| *id != &target && self.visible(&target, id, false))
-            .cloned()
-            .collect::<Vec<_>>();
-        ids.sort();
-        let values = ids
-            .iter()
+        // A page holds at most `limit` workers: look up only those, plus one so the page knows
+        // whether more remain (`truncated`).
+        let limit = r.limit.unwrap_or(50);
+        let ids = ids
+            .into_iter()
             .skip(offset)
-            .filter_map(|id| self.summary(id, &state.workers[id]))
-            .filter_map(|s| serde_json::to_value(s).ok())
+            .take(limit as usize + 1)
             .collect::<Vec<_>>();
-        let root_id = w.root.clone();
-        let stream_epoch = root.row.stream_epoch.max(0) as u64;
-        drop(state);
+        let lookup = ids.clone();
+        let runs = self
+            .services
+            .read(move |s| {
+                lookup
+                    .iter()
+                    .map(|id| s.active_delegation_run(id.as_str()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .ok_or_else(|| error(ErrorCode::PersistenceFailed, "cannot read delegated runs"))?
+            .map_err(|_| error(ErrorCode::PersistenceFailed, "cannot read delegated runs"))?;
+        let values = {
+            let state = self.state.borrow();
+            ids.iter()
+                .zip(runs)
+                .filter_map(|(id, run)| {
+                    let mut summary = self.summary(id, state.workers.get(id)?)?;
+                    let run = run.and_then(|row| {
+                        Some((
+                            agent_core::delegation::RunId::parse(&row.id).ok()?,
+                            parse_enum(&row.state)?,
+                        ))
+                    });
+                    summary.controls.cancel = run.is_some();
+                    summary.run_state = run.as_ref().map(|(_, s)| *s);
+                    summary.run_id = run.map(|(id, _)| id);
+                    Some(summary)
+                })
+                .filter_map(|s| serde_json::to_value(s).ok())
+                .collect::<Vec<_>>()
+        };
         let render = |workers: &[&Value], truncated: bool| json!({"api_version":1,"workers":workers,"next_cursor":if truncated{Some(encode_cursor(&CursorPayload{root:root_id.clone(),stream_epoch,last_seq:(offset+workers.len())as u64,filter_digest:filter_digest(&filter)}))}else{None},"truncated":truncated});
         let envelope = agent_core::delegation::page::Reservation::max_envelope(&render(&[], true));
         let (page, _) = agent_core::delegation::page::assemble_list(
             envelope,
             &values,
-            r.limit.unwrap_or(50),
+            limit,
             self.limits.output_budget as usize,
             render,
         )?;
@@ -1270,15 +1332,8 @@ impl Supervisor {
         bytes: Option<u32>,
         ack: Option<Value>,
     ) -> Result<Value, ToolError> {
+        self.check_page(caller, &filter, after.as_ref())?;
         let target = filter.target.as_ref().unwrap_or(caller);
-        if !self.visible(caller, target, true)
-            || filter
-                .workers
-                .iter()
-                .any(|w| !self.visible(caller, w, true))
-        {
-            return Err(error(ErrorCode::NotFound, "unknown worker"));
-        }
         let (root, scope, snapshot) = {
             let state = self.state.borrow();
             let root = state.workers[caller].root.clone();
@@ -1327,7 +1382,144 @@ impl Supervisor {
             .await?;
         Ok(out.page)
     }
+    /// What a page request can be refused for before anything is read or written: a target or
+    /// waited worker the caller cannot see, or a cursor issued for another filter or root.
+    /// `read` checks it before applying its acknowledgement, so a refused request records no
+    /// idempotency key and a corrected retry with the same key is not a conflict.
+    fn check_page(
+        &self,
+        caller: &WorkerId,
+        filter: &PageFilter,
+        after: Option<&agent_core::delegation::Cursor>,
+    ) -> Result<(), ToolError> {
+        let target = filter.target.as_ref().unwrap_or(caller);
+        if !self.visible(caller, target, true)
+            || filter
+                .workers
+                .iter()
+                .any(|w| !self.visible(caller, w, true))
+        {
+            return Err(error(ErrorCode::NotFound, "unknown worker"));
+        }
+        let Some(after) = after else {
+            return Ok(());
+        };
+        let stream_epoch = {
+            let state = self.state.borrow();
+            state.roots[&state.workers[caller].root]
+                .row
+                .stream_epoch
+                .max(0) as u64
+        };
+        // Expiry is the store's to decide: only a cursor that can never fit this call is refused.
+        match self.check_cursor(caller, "after", after, filter, stream_epoch) {
+            Err(e) if e.code == ErrorCode::InvalidArgument => Err(e),
+            _ => Ok(()),
+        }
+    }
+    /// Decodes a cursor for `filter`. One issued for another filter is refused naming that
+    /// filter when it is one this caller could have used (no target or one target, no waited
+    /// workers, one, all its children or all its descendants, either mailbox setting), so the
+    /// caller can repeat it; otherwise the error says it matches none of them.
+    pub(super) fn check_cursor(
+        &self,
+        caller: &WorkerId,
+        field: &str,
+        cursor: &agent_core::delegation::Cursor,
+        filter: &PageFilter,
+        stream_epoch: u64,
+    ) -> Result<CursorPayload, ToolError> {
+        let root = self.state.borrow().workers[caller].root.clone();
+        match decode_cursor(cursor, filter, stream_epoch) {
+            Ok(p) if p.root == root => return Ok(p),
+            Ok(_) => return Err(ToolError::invalid(field, "root")),
+            Err(ErrorCode::CursorExpired) => {
+                return Err(error(
+                    ErrorCode::CursorExpired,
+                    "the stream was reset; read again with no cursor",
+                ))
+            }
+            Err(_) => {}
+        }
+        let issued = self.cursor_candidates(caller).into_iter().find(|f| {
+            matches!(
+                decode_cursor(cursor, f, stream_epoch),
+                Ok(_) | Err(ErrorCode::CursorExpired)
+            )
+        });
+        let refused = match &issued {
+            Some(f) => ToolError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "invalid argument `{field}`: the cursor was issued for another filter ({}), \
+                     not this call's ({}); repeat that filter, or call again without `{field}`",
+                    describe_filter(f),
+                    describe_filter(filter)
+                ),
+            )
+            .with_detail("issued_for", filter_json(f)),
+            None => ToolError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "invalid argument `{field}`: the cursor is malformed or was issued for a \
+                     filter other than this call's ({}), for example a wait over several \
+                     chosen workers; repeat that exact filter, or call again without `{field}`",
+                    describe_filter(filter)
+                ),
+            ),
+        };
+        Err(refused
+            .with_detail("field", field)
+            .with_detail("reason", "filter")
+            .with_detail("expected", filter_json(filter)))
+    }
+    /// The filters this caller could have been issued a cursor for, as far as they can be
+    /// enumerated (a wait over an arbitrary set of workers cannot).
+    fn cursor_candidates(&self, caller: &WorkerId) -> Vec<PageFilter> {
+        let state = self.state.borrow();
+        let mut seen = state
+            .workers
+            .keys()
+            .filter(|id| self.visible(caller, id, true))
+            .cloned()
+            .collect::<Vec<_>>();
+        seen.sort();
+        let children = seen
+            .iter()
+            .filter(|id| state.workers[*id].row.parent_id.as_deref() == Some(caller.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let descendants = seen
+            .iter()
+            .filter(|id| *id != caller)
+            .cloned()
+            .collect::<Vec<_>>();
+        let filter = |target: Option<&WorkerId>, workers: Vec<WorkerId>, mailbox| PageFilter {
+            caller: caller.clone(),
+            target: target.cloned(),
+            workers,
+            mailbox,
+        };
+        let mut out = Vec::new();
+        for mailbox in [true, false] {
+            out.push(filter(None, Vec::new(), mailbox));
+            out.push(filter(None, children.clone(), mailbox));
+            out.push(filter(None, descendants.clone(), mailbox));
+            for id in &seen {
+                out.push(filter(Some(id), Vec::new(), mailbox));
+                out.push(filter(None, vec![id.clone()], mailbox));
+            }
+        }
+        out
+    }
     async fn read_page(&self, caller: &WorkerId, r: ReadRequest) -> Result<Value, ToolError> {
+        let filter = PageFilter {
+            caller: caller.clone(),
+            target: r.target.clone(),
+            workers: Vec::new(),
+            mailbox: true,
+        };
+        self.check_page(caller, &filter, r.after.as_ref())?;
         let ack = if r.acknowledge.is_some() {
             let a = AckRequest {
                 principal: caller.clone(),
@@ -1347,12 +1539,6 @@ impl Supervisor {
             )
         } else {
             None
-        };
-        let filter = PageFilter {
-            caller: caller.clone(),
-            target: r.target,
-            workers: Vec::new(),
-            mailbox: true,
         };
         self.page(caller, filter, r.after, r.max_events, r.max_bytes, ack)
             .await
@@ -1512,6 +1698,22 @@ impl Supervisor {
                 Ok(())
             });
     }
+}
+/// A page filter as the caller wrote it: `target`, `workers` and `mailbox`.
+fn describe_filter(f: &PageFilter) -> String {
+    let mut parts = Vec::new();
+    if let Some(t) = &f.target {
+        parts.push(format!("target {t}"));
+    }
+    if !f.workers.is_empty() {
+        let workers = f.workers.iter().map(WorkerId::as_str).collect::<Vec<_>>();
+        parts.push(format!("workers [{}]", workers.join(", ")));
+    }
+    parts.push(format!("mailbox {}", f.mailbox));
+    parts.join(", ")
+}
+fn filter_json(f: &PageFilter) -> Value {
+    json!({"target": f.target, "workers": f.workers, "mailbox": f.mailbox})
 }
 /// The home an agent launched with `env` sees, as `check_agy` derives it: the profile's own
 /// `HOME`, else the app's, unless the profile unsets it.

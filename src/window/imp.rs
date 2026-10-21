@@ -2597,6 +2597,11 @@ impl AgentTerminalWindow {
                     }
                 }
 
+                // A page being moved to another window. This cannot be vetoed here: the page has
+                // already left, so a busy root's turn and its sub-agents are stopped with it. No
+                // user path reaches this today (only tests call `transfer_page`); a future "Move
+                // to Window" must check `Supervisor::root_busy` (and live sub-agents) and ask
+                // before it calls `transfer_page`, never after.
                 if view.is_transferring_page() {
                     for tab in &leaving {
                         if let Some(chat) = &tab.chat {

@@ -246,12 +246,23 @@ mod tests {
         };
         let profiles = vec![profile.clone()];
         let cwd = dir.path().to_owned();
+        let switch = cwd.clone();
+        // An `opted-out` file turns delegation off for the fixture profile until it is removed.
+        let profiles = move || {
+            let mut profiles = profiles.clone();
+            if switch.join("opted-out").exists() {
+                for p in &mut profiles {
+                    p.available_for_delegation = false;
+                }
+            }
+            profiles
+        };
         let services = AppServices {
             handle: store.clone().into(),
             store_path: None,
             app_pid: std::process::id(),
             bridge_command: PathBuf::from("/usr/bin/agent-terminal"),
-            profiles: Rc::new(move || profiles.clone()),
+            profiles: Rc::new(profiles),
             resolve: Rc::new(move |_| {
                 if cwd.join("unavailable").exists() {
                     return None;
@@ -282,7 +293,12 @@ mod tests {
                     default_effort: None,
                 })
             }),
-            make_adapter: Rc::new(|_, _| Box::new(agent_core::claude::ClaudeAdapter::new())),
+            make_adapter: Rc::new(|driver, program| -> Box<dyn agent_core::adapter::Adapter> {
+                match driver {
+                    Driver::Agy => Box::new(agent_core::agy::AgyAdapter::new(program)),
+                    _ => Box::new(agent_core::claude::ClaudeAdapter::new()),
+                }
+            }),
             hook_check: Rc::new(move |_| {
                 Box::pin(async move {
                     if hook_proven {
@@ -985,7 +1001,7 @@ mod tests {
                 .services
                 .handle
                 .reader()
-                .add_provider_thread(&thread, "agy", "")
+                .add_provider_thread(&thread, "agy", "default")
                 .unwrap();
             let open = agent_core::adapter::OpenSession {
                 program: resolved.program.clone(),
@@ -2026,6 +2042,8 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
+    mod status_tests;
 }
 pub(crate) struct P1Routes;
 impl RouteTable for P1Routes {
@@ -2086,6 +2104,9 @@ pub(super) struct WorkerRt {
     pub pending: Option<super::seam::DelegatedInput>,
     pub dispatching: bool,
     pub readback: super::readback::Readback,
+    /// The last run whose turn the agent was seen to open: the task-start watchdog's evidence,
+    /// per run (a worker's state is inherited from its previous run until the new turn opens).
+    pub opened_run: Option<RunId>,
     pub cwd: PathBuf,
 }
 impl WorkerRt {
@@ -2110,6 +2131,9 @@ pub(super) struct Runtime {
     pub controls: HashMap<String, super::deferred::Delivery>,
     pub child_specs: HashMap<WorkerId, super::child::ChildSpec>,
     pub preparations: HashMap<String, u64>,
+    /// How long a task handed to a child may wait for its turn to open before the worker is
+    /// failed as stalled; `None` is [`super::deferred::TASK_START_DEADLINE`] (tests shorten it).
+    pub task_start_deadline: Option<std::time::Duration>,
 }
 pub(crate) struct Supervisor {
     pub(super) services: AppServices,
@@ -2653,6 +2677,7 @@ impl Supervisor {
             pending: None,
             dispatching: false,
             readback: super::readback::Readback::default(),
+            opened_run: None,
             cwd,
         }
     }

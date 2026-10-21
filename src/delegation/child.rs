@@ -323,6 +323,14 @@ impl Supervisor {
             .worker
             .clone()
             .ok_or_else(|| error(ErrorCode::InternalError, "spawn accepted without a worker"))?;
+        tracing::info!(
+            %worker,
+            parent = %caller,
+            ?driver,
+            mode = ?r.task_mode,
+            run = ?accepted.run.as_ref().map(|r| r.to_string()),
+            "delegated worker spawned"
+        );
         let lease = if let Some(plan) = lease_plan {
             match gtk4::gio::spawn_blocking(move || super::workspace::create_lease(&plan)).await {
                 Ok(Ok(l)) => Some(l),
@@ -423,10 +431,10 @@ impl Supervisor {
                         self.fail_worker(&worker, e);
                         return Ok(accepted.receipt);
                     }
+                    // agy's task waits for its process (`Readback::started`); Codex's for its
+                    // read-back; Claude's for its startup check.
                     if driver == Driver::Claude {
                         self.send_bootstrap(&worker);
-                    } else if driver == Driver::Agy {
-                        self.dispatch_pending(&worker);
                     }
                     self.arm_startup(&worker, ProcessGeneration(1));
                 }
@@ -768,6 +776,7 @@ impl Supervisor {
         });
     }
     pub(super) fn fail_worker(self: &Rc<Self>, worker: &WorkerId, e: ToolError) {
+        tracing::warn!(%worker, code = %e.code, reason = %e.message, "delegated worker failed");
         let data = {
             let mut state = self.state.borrow_mut();
             state.workers.get_mut(worker).map(|w| {

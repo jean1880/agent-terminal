@@ -219,6 +219,15 @@ impl DelegationHooks for Hooks {
                 std::time::Duration::from_millis(sup.limits.agy_hello_window_ms),
             );
         }
+        // An agy child takes its task only now that its process exists (`Readback::started`).
+        let step = sup
+            .state
+            .borrow_mut()
+            .workers
+            .get_mut(&self.worker)
+            .filter(|w| w.generation == generation && w.row.parent_id.is_some())
+            .map_or(super::readback::Step::Wait, |w| w.readback.started());
+        sup.readback_step(&self.worker, step);
     }
     fn process_stopping(&self, generation: ProcessGeneration) {
         let Some(sup) = self.supervisor.upgrade() else {
@@ -415,6 +424,7 @@ impl Supervisor {
                 w.token = None;
                 (w.root.clone(), w.session())
             };
+            tracing::warn!(%worker, "agy bridge never said hello within its window; rebind required");
             sup.set_status(
                 &worker,
                 "rebind_required",
