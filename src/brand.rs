@@ -163,9 +163,12 @@ pub fn dots() -> gtk4::Box {
 /// beside it says what is loading. With animations off the droplet rests at the top.
 pub fn drip(driver: Driver) -> gtk4::Overlay {
     let dot_class = format!("dot-{}", driver.info().key);
-    let drop = |extra: &str| {
+    let drop = |extra: Option<&str>| {
         let drop = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        for class in ["brand-dot", dot_class.as_str(), "drip-drop", extra] {
+        for class in ["brand-dot", dot_class.as_str(), "drip-drop"]
+            .into_iter()
+            .chain(extra)
+        {
             drop.add_css_class(class);
         }
         drop.set_halign(gtk4::Align::Center);
@@ -182,10 +185,10 @@ pub fn drip(driver: Driver) -> gtk4::Overlay {
     orbit.add_css_class("drip-orbit");
     orbit.set_halign(gtk4::Align::Center);
     orbit.set_valign(gtk4::Align::Start);
-    orbit.append(&drop(""));
+    orbit.append(&drop(None));
     overlay.add_overlay(&orbit);
     // The same droplet falling: it takes over at the top as the loop's one goes out.
-    overlay.add_overlay(&drop("drip-fall"));
+    overlay.add_overlay(&drop(Some("drip-fall")));
     // The ripple where it lands: a ring in the agent's colour, squashed flat as water seen at an
     // angle. Centred here; the stylesheet lowers it.
     let ripple = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -272,6 +275,23 @@ mod tests {
             assert!(light.contains(&line), "{line}");
         }
         assert_eq!(hex(rgb(Driver::Claude)), Driver::Claude.info().accent_hex);
+    }
+
+    /// GTK refuses an empty class with a critical: the looping droplet has no extra class and
+    /// must add none (every loading mark logged one).
+    #[test]
+    fn a_drip_adds_no_empty_class() {
+        gtk4::init().expect("GTK init");
+        let warnings = crate::testutil::GtkWarningCapture::start();
+        for driver in Driver::ALL {
+            let _ = drip(driver);
+        }
+        let empty: Vec<_> = warnings
+            .take()
+            .into_iter()
+            .filter(|w| w.contains("css_class"))
+            .collect();
+        assert!(empty.is_empty(), "{empty:?}");
     }
 
     /// The agents' colours have one source: no stylesheet or drawing code writes one out
