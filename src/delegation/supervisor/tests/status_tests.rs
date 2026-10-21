@@ -394,6 +394,20 @@ fn a_cursor_error_names_its_filter_and_a_refused_read_keeps_its_key() {
         )
         .await;
         assert_eq!(bad.code, ErrorCode::InvalidArgument);
+        // The refusal applied nothing and recorded nothing under the key.
+        let store = sup.services.handle.reader();
+        assert!(store
+            .delegation_message(message.as_str())
+            .unwrap()
+            .unwrap()
+            .acknowledged_at
+            .is_none());
+        for kind in ["ack", "read"] {
+            assert!(store
+                .delegation_operation_by_key(root.as_str(), kind, key.as_str())
+                .unwrap()
+                .is_none());
+        }
         let fixed = tool(
             &sup,
             ConnId(44),
@@ -418,6 +432,129 @@ fn a_cursor_error_names_its_filter_and_a_refused_read_keeps_its_key() {
         )
         .await;
         assert_eq!(childless["workers"], serde_json::json!([]));
+        stop(&sup).await;
+    });
+}
+
+fn follow_up(worker: &WorkerId, key: &str) -> SendRequest {
+    SendRequest {
+        target: Target::Worker(worker.clone()),
+        text: "follow-up".into(),
+        kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+        reply_to: None,
+        delivery: Delivery::NextTurn,
+        expected_run_id: None,
+        expected_authority_epoch: None,
+        idempotency_key: IdempotencyKey::parse(key).unwrap(),
+    }
+}
+
+/// A follow-up's run starts with the state its predecessor left (`waiting` after an
+/// interruption, `failed` after a failed turn); that state is no evidence that the new turn
+/// opened, so a silent follow-up is still a stall.
+#[test]
+fn a_silent_follow_up_is_a_stall_whatever_its_predecessor_left() {
+    for predecessor in ["interrupted", "failed"] {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let mut request = spawn_request(&format!("follow-{predecessor}"));
+            request.task = "hold".into();
+            let receipt = sup.spawn_worker(&root, request).await.unwrap();
+            let worker = spawned(&receipt);
+            pump_until(|| sup.state.borrow().workers[&worker].row.state == "running").await;
+            let first = sup.state.borrow().workers[&worker].run.clone().unwrap();
+            // A real interruption: the held turn ends interrupted, leaving `waiting`.
+            sup.cancel_bound_run(&worker, &first, "Delegated run cancelled");
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+            assert_eq!(sup.state.borrow().workers[&worker].row.state, "waiting");
+            if predecessor == "failed" {
+                // The fixture cannot fail a turn: leave the state a failed turn leaves.
+                sup.state
+                    .borrow_mut()
+                    .workers
+                    .get_mut(&worker)
+                    .unwrap()
+                    .row
+                    .state = "failed".into();
+            }
+            sup.state.borrow_mut().task_start_deadline = Some(Duration::from_millis(300));
+            std::fs::write(dir.path().join("silent-task"), "").unwrap();
+            sup.send_worker(&root, follow_up(&worker, &format!("silent-{predecessor}")))
+                .await
+                .unwrap();
+            pump_until(|| {
+                sup.state.borrow().workers[&worker]
+                    .row
+                    .delegation_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("did not start"))
+            })
+            .await;
+            assert!(sup.state.borrow().workers[&worker].run.is_none());
+            stop(&sup).await;
+        });
+    }
+}
+
+/// A cancel that lands after the task left `pending` but before it was delivered stays a
+/// cancel: the run ends interrupted and the worker is not failed (nor its authority revoked
+/// a second time).
+#[test]
+fn a_cancel_between_taking_the_task_and_delivering_it_stays_a_cancel() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        std::fs::write(dir.path().join("hold-bootstrap"), "").unwrap();
+        let receipt = sup
+            .spawn_worker(&root, spawn_request("cancel-gap"))
+            .await
+            .unwrap();
+        let worker = spawned(&receipt);
+        let run =
+            agent_core::delegation::RunId::parse(receipt["run_id"].as_str().unwrap()).unwrap();
+        pump_until(|| {
+            std::fs::read_to_string(dir.path().join("frames.ndjson"))
+                .is_ok_and(|log| log.contains("startup check"))
+        })
+        .await;
+        assert!(sup.state.borrow().workers[&worker].pending.is_some());
+        // No await between these: the delivery is scheduled with the task taken, and the cancel
+        // lands before it runs.
+        {
+            // The startup check counts as passed, as it has when a task is taken for delivery.
+            let mut state = sup.state.borrow_mut();
+            let readback = &mut state.workers.get_mut(&worker).unwrap().readback;
+            readback.ready = true;
+            readback.bootstrap = false;
+        }
+        sup.dispatch_pending(&worker);
+        assert!(sup.state.borrow().workers[&worker].pending.is_none());
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        let (state, error) =
+            settled_dispatch(&sup, receipt["operation_id"].as_str().unwrap()).await;
+        assert_eq!(state, "failed");
+        assert!(error.unwrap().contains("stale_run"));
+        pump_until(|| {
+            sup.services
+                .handle
+                .reader()
+                .delegation_run(run.as_str())
+                .unwrap()
+                // The dispatch fact may end it first (as for a cancelled pending task).
+                .is_some_and(|r| matches!(r.state.as_str(), "interrupted" | "failed"))
+        })
+        .await;
+        {
+            let state = sup.state.borrow();
+            let w = &state.workers[&worker];
+            assert!(w.run.is_none());
+            assert_eq!(w.row.state, "waiting", "the cancel became a failure");
+            assert!(
+                w.row.delegation_reason.is_none(),
+                "{:?}",
+                w.row.delegation_reason
+            );
+        }
+        std::fs::remove_file(dir.path().join("hold-bootstrap")).unwrap();
         stop(&sup).await;
     });
 }

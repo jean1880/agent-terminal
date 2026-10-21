@@ -17,6 +17,14 @@ use tracing::{info, warn};
 /// How long a task handed to a child may wait for its turn to open (see `arm_task_start`).
 pub(super) const TASK_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The run a delivery starts (`None` for a live write or steer, which start none), whether the
+/// delivery reserved it itself, and the process generation it was meant for.
+struct Dispatch {
+    run: Option<RunId>,
+    fresh: bool,
+    generation: agent_core::delegation::ProcessGeneration,
+}
+
 #[derive(Clone)]
 pub(super) struct Delivery {
     pub worker: WorkerId,
@@ -324,15 +332,26 @@ impl Supervisor {
                 }
             }
         }
-        let prior = self
+        let Some((prior, generation)) = self
             .state
             .borrow()
             .workers
             .get(&entry.worker)
-            .and_then(|w| w.run.clone());
-        // The run this delivery reserved itself, which it must end if nothing reaches the agent.
-        let fresh = match self.reserve_run(&entry).await {
-            Ok(run) => run.filter(|r| prior.as_ref() != Some(r)),
+            .map(|w| (w.run.clone(), w.generation))
+        else {
+            self.record_fact(
+                entry.input.operation,
+                DispatchFact::Failed(error(ErrorCode::NotFound, "unknown worker")),
+            );
+            return;
+        };
+        // The run this delivery starts, and whether it reserved that run itself.
+        let used = match self.reserve_run(&entry).await {
+            Ok(run) => Dispatch {
+                fresh: run.is_some() && run != prior,
+                run,
+                generation,
+            },
             Err(e) => {
                 if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
                     w.dispatching = false;
@@ -356,14 +375,14 @@ impl Supervisor {
             entry.input.epoch,
             expected,
         ) {
-            self.fail_dispatch(&entry, fresh, e);
+            self.fail_dispatch(&entry, &used, e);
             return;
         }
         let session = self.child_session(&entry.worker);
         let Some(session) = session else {
             self.fail_dispatch(
                 &entry,
-                fresh,
+                &used,
                 error(ErrorCode::ProviderUnavailable, "child session unavailable"),
             );
             return;
@@ -376,7 +395,7 @@ impl Supervisor {
         let turn_started = matches!(outcome, DelegatedOutcome::TurnStarted);
         match outcome {
             DelegatedOutcome::Refused(c) => {
-                self.fail_dispatch(&entry, fresh, error(c, "session refused delegated input"));
+                self.fail_dispatch(&entry, &used, error(c, "session refused delegated input"));
                 return;
             }
             DelegatedOutcome::SteerSent { tag } => {
@@ -583,7 +602,12 @@ impl Supervisor {
     /// run it would have started ends with it, in memory and in the store alike, so `list` (which
     /// reads the store's run, as `cancel` does) never names a run that is already over. A spawn's
     /// task that cannot be delivered leaves the worker nothing to do: the worker fails, saying why.
-    fn fail_dispatch(self: &Rc<Self>, entry: &Delivery, fresh: Option<RunId>, e: ToolError) {
+    ///
+    /// The handling is scoped to the delivery's own run and process generation. If either moved
+    /// on, or the worker was closed, that path owns the outcome and nothing else is done. A
+    /// cancel that landed after the task left `pending` (so `cancel_bound_run` could not end it)
+    /// ends the run as interrupted, as a cancel does, and never turns into a worker failure.
+    fn fail_dispatch(self: &Rc<Self>, entry: &Delivery, used: &Dispatch, e: ToolError) {
         warn!(
             worker = %entry.worker,
             operation = %entry.input.operation,
@@ -599,28 +623,70 @@ impl Supervisor {
             entry.input.operation.clone(),
             DispatchFact::Failed(e.clone()),
         );
-        if matches!(entry.input.source, InputSource::Task) {
+        let Some(run) = used.run.clone() else {
+            return;
+        };
+        let (current, stopping) = {
+            let state = self.state.borrow();
+            state
+                .workers
+                .get(&entry.worker)
+                .map_or((false, false), |w| {
+                    (
+                        w.generation == used.generation
+                            && w.run.as_ref() == Some(&run)
+                            && w.row.state != "closed",
+                        w.row.state == "stopping",
+                    )
+                })
+        };
+        if !current {
+            return;
+        }
+        let task = matches!(entry.input.source, InputSource::Task);
+        // Only a run this delivery owns (the task's, or one it reserved) and whose turn never
+        // opened is ended here; a cancel of a live turn ends that turn itself.
+        if stopping && !(task || used.fresh) {
+            return;
+        }
+        if task && !stopping {
             let reason = format!("its task could not be delivered: {}", e.message);
             self.fail_worker(&entry.worker, error(e.code, &reason));
             return;
         }
-        let Some(run) = fresh else {
-            return;
-        };
-        let ended = self
-            .state
-            .borrow_mut()
-            .workers
-            .get_mut(&entry.worker)
-            .filter(|w| w.run.as_ref() == Some(&run))
-            .map(|w| w.last_run = w.run.take())
-            .is_some();
-        if !ended {
+        if !task && !used.fresh {
             return;
         }
-        let reason = e.code.as_str().to_owned();
+        // The run ends: interrupted by the cancel that stopped it, or failed with the
+        // delivery. (A spawn's run may already be failed by the dispatch fact above, in the
+        // writer's order; a run that already ended is left as it is.)
+        let (run_state, worker_state) = if stopping {
+            ("interrupted", Some("waiting"))
+        } else {
+            ("failed", None)
+        };
+        if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
+            w.last_run = w.run.take();
+            if let Some(state) = worker_state {
+                w.row.state = state.into();
+            }
+        }
+        if stopping && task {
+            // As `cancel_bound_run` does with a task still pending: a child that never got
+            // its task is stopped.
+            if let Some(session) = self.child_session(&entry.worker) {
+                session.shutdown(true);
+            }
+        }
+        let worker = entry.worker.clone();
+        let reason = if stopping {
+            "cancelled".to_owned()
+        } else {
+            e.code.as_str().to_owned()
+        };
         self.services
             .write("end undelivered delegated run", None, true, move |s| {
+                let at = super::supervisor::now();
                 if s.delegation_run(run.as_str())?.is_some_and(|r| {
                     !matches!(
                         r.state.as_str(),
@@ -629,22 +695,31 @@ impl Supervisor {
                 }) {
                     s.set_delegation_run_state(
                         run.as_str(),
-                        "failed",
+                        run_state,
                         None,
                         Some(&reason),
                         None,
-                        super::supervisor::now(),
+                        at,
                     )?;
+                }
+                if let Some(state) = worker_state {
+                    if s.delegation_worker(worker.as_str())?
+                        .is_some_and(|w| w.state != "closed")
+                    {
+                        s.set_delegation_worker_state(worker.as_str(), state, None, at)?;
+                    }
                 }
                 Ok(())
             });
         self.notify_registry();
-        self.drain_deferred(&entry.worker);
+        if !task {
+            self.drain_deferred(&entry.worker);
+        }
     }
     /// A task handed to the agent must open its turn within the deadline, or the worker is
     /// stalled: it fails with that reason (stopping its process and ending its run) rather than
-    /// staying `starting` with nothing to show. A turn that opened (`running`, `waiting`) or a
-    /// run that already ended is left alone.
+    /// staying `starting` with nothing to show. A run whose turn opened (`opened_run`), a run
+    /// that already ended, and a worker being cancelled or closed are left alone.
     fn arm_task_start(self: &Rc<Self>, worker: &WorkerId, run: &RunId) {
         let deadline = self
             .state
@@ -668,13 +743,13 @@ impl Supervisor {
             let Some(sup) = sup.upgrade() else {
                 return;
             };
+            // Evidence is per run: a follow-up inherits `waiting` or `failed` from the run
+            // before it until its own turn opens, so the worker's state proves nothing here.
             let stalled = sup.state.borrow().workers.get(&worker).is_some_and(|w| {
                 w.generation == generation
                     && w.run.as_ref() == Some(&run)
-                    && !matches!(
-                        w.row.state.as_str(),
-                        "running" | "waiting" | "stopping" | "failed" | "closed"
-                    )
+                    && w.opened_run.as_ref() != Some(&run)
+                    && !matches!(w.row.state.as_str(), "stopping" | "closed")
             });
             if stalled {
                 warn!(%worker, %run, ?deadline, "delegated task never started; worker stalled");

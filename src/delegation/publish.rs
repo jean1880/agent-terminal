@@ -438,7 +438,8 @@ impl Supervisor {
                     Event::TurnStarted { .. }
                         if !bootstrap && !w.readback.failed && w.run == scope.run =>
                     {
-                        w.row.state = "running".into()
+                        w.row.state = "running".into();
+                        w.opened_run = scope.run.clone();
                     }
                     Event::ApprovalRequested { .. } => w.row.state = "waiting".into(),
                     Event::ApprovalResolved { .. } => w.row.state = "running".into(),

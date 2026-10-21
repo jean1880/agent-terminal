@@ -1001,7 +1001,7 @@ mod tests {
                 .services
                 .handle
                 .reader()
-                .add_provider_thread(&thread, "agy", "")
+                .add_provider_thread(&thread, "agy", "default")
                 .unwrap();
             let open = agent_core::adapter::OpenSession {
                 program: resolved.program.clone(),
@@ -2104,6 +2104,9 @@ pub(super) struct WorkerRt {
     pub pending: Option<super::seam::DelegatedInput>,
     pub dispatching: bool,
     pub readback: super::readback::Readback,
+    /// The last run whose turn the agent was seen to open: the task-start watchdog's evidence,
+    /// per run (a worker's state is inherited from its previous run until the new turn opens).
+    pub opened_run: Option<RunId>,
     pub cwd: PathBuf,
 }
 impl WorkerRt {
@@ -2674,6 +2677,7 @@ impl Supervisor {
             pending: None,
             dispatching: false,
             readback: super::readback::Readback::default(),
+            opened_run: None,
             cwd,
         }
     }

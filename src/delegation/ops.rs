@@ -1272,7 +1272,14 @@ impl Supervisor {
             ids.sort();
             (offset, ids, w.root.clone(), stream_epoch)
         };
-        let ids = ids.into_iter().skip(offset).collect::<Vec<_>>();
+        // A page holds at most `limit` workers: look up only those, plus one so the page knows
+        // whether more remain (`truncated`).
+        let limit = r.limit.unwrap_or(50);
+        let ids = ids
+            .into_iter()
+            .skip(offset)
+            .take(limit as usize + 1)
+            .collect::<Vec<_>>();
         let lookup = ids.clone();
         let runs = self
             .services
@@ -1310,7 +1317,7 @@ impl Supervisor {
         let (page, _) = agent_core::delegation::page::assemble_list(
             envelope,
             &values,
-            r.limit.unwrap_or(50),
+            limit,
             self.limits.output_budget as usize,
             render,
         )?;
