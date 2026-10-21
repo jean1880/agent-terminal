@@ -17,7 +17,6 @@ use gtk4::gio;
 
 use super::threads::{archive_notice, delete_notice, store_job, NewThread, Sidebar, WriteNotice};
 use super::*;
-use crate::availability::{AgentAvailability, Availability};
 use crate::chat::session::build_handoff;
 use crate::chat::ChatBackend;
 use crate::model_catalog::ModelCatalog;
@@ -30,21 +29,6 @@ use crate::window::sidebar_model::{
 const ACTION: &str = "win.thread-menu";
 /// The never-enabled twin that disabled items point at.
 const ACTION_OFF: &str = "win.thread-menu-off";
-
-#[derive(Debug, PartialEq, Eq)]
-enum SwitchRoute {
-    Switch,
-    Park,
-    Continue,
-}
-
-fn switch_route(has_session: bool, own: &Availability) -> SwitchRoute {
-    match (has_session, own) {
-        (true, _) => SwitchRoute::Switch,
-        (false, Availability::Ready(_) | Availability::Detecting) => SwitchRoute::Park,
-        (false, Availability::Missing | Availability::Disabled) => SwitchRoute::Continue,
-    }
-}
 
 /// A `gio::Menu` for `entries`: sections as sections, submenus as submenus, items as items. A
 /// disabled submenu (nothing to hand over, no agent ready) is a greyed-out item: GTK cannot
@@ -263,6 +247,7 @@ impl AgentTerminalWindow {
             };
             let menu = to_gio_menu(&thread_menu(&input));
             let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            popover.set_tooltip_text(Some("Switch changes the agent in this thread and stops its current turn. Continue, Fork and Compact create a new thread with a handoff."));
             popover.set_has_arrow(false);
             popover.set_halign(gtk4::Align::Start);
             popover.set_parent(&list);
@@ -291,6 +276,20 @@ impl AgentTerminalWindow {
                 model,
                 effort,
             } => self.switch_thread_to(&thread, driver, model, effort),
+            ThreadAction::Fork(ref thread) | ThreadAction::Compact(ref thread) => {
+                let compact = matches!(action, ThreadAction::Compact(_));
+                if let Some(summary) = self.summary_of(thread) {
+                    let driver = self.slot_of(thread).map(|s| s.driver()).or_else(|| {
+                        summary
+                            .driver
+                            .as_deref()
+                            .and_then(crate::window::sidebar_model::parse_driver)
+                    });
+                    if let Some(driver) = driver {
+                        self.fork_thread(thread, driver, Some(summary.cwd), compact);
+                    }
+                }
+            }
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
             ThreadAction::Archive(thread) => self.set_thread_archived(&thread, true),
             ThreadAction::Unarchive(thread) => self.set_thread_archived(&thread, false),
@@ -390,7 +389,9 @@ impl AgentTerminalWindow {
     }
 
     /// This thread, in place, on `driver`/`model`/`effort` (the header picker's switch). A thread
-    /// that is not built yet is opened first and switched as soon as its session exists.
+    /// that is not open is opened first. One with no session is switched as soon as its session
+    /// or build allows, or moved to `driver` at once when its own agent cannot start one
+    /// ([`Self::switch_in_place_with`]); it is never forked.
     fn switch_thread_to(
         &self,
         thread: &str,
@@ -409,33 +410,17 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
-        let route = switch_route(
-            slot.get().is_some(),
-            &AgentAvailability::shared().get(slot.driver()),
-        );
-        if route == SwitchRoute::Continue {
-            self.switch_or_continue_with(thread, driver, model, effort);
+        if slot.get().is_none() {
+            self.switch_in_place_with(thread, driver, model, effort);
             return;
         }
-        if route == SwitchRoute::Switch {
-            // Mid-turn, ask first: the switch stops the turn.
-            let id = thread.to_owned();
-            self.when_not_busy(thread, move |imp| {
-                if let Some(session) = imp.slot_of(&id).and_then(|s| s.get()) {
-                    session.switch(driver, model.clone(), effort.clone());
-                }
-            });
-            return;
-        }
-        if let Some(chat) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .filter_map(|t| t.chat.as_mut())
-            .find(|c| c.thread == thread)
-        {
-            chat.pending_switch = Some((driver, model, effort));
-        }
+        // Mid-turn, ask first: the switch stops the turn.
+        let id = thread.to_owned();
+        self.when_not_busy(thread, move |imp| {
+            if let Some(session) = imp.slot_of(&id).and_then(|s| s.get()) {
+                session.switch(driver, model.clone(), effort.clone());
+            }
+        });
     }
 
     // ---- rename ----
@@ -655,18 +640,7 @@ fn continued_title(source: &str, driver: Driver) -> String {
 pub(super) mod tests {
     use super::*;
 
-    #[test]
-    fn switching_a_thread_whose_agent_is_missing_forks() {
-        for (state, without_session) in [
-            (Availability::Ready("/bin/claude".into()), SwitchRoute::Park),
-            (Availability::Detecting, SwitchRoute::Park),
-            (Availability::Missing, SwitchRoute::Continue),
-            (Availability::Disabled, SwitchRoute::Continue),
-        ] {
-            assert_eq!(switch_route(false, &state), without_session, "{state:?}");
-            assert_eq!(switch_route(true, &state), SwitchRoute::Switch, "{state:?}");
-        }
-    }
+    use crate::availability::Availability;
     use crate::window::sidebar_model::MenuAgent;
 
     #[test]
@@ -701,7 +675,12 @@ pub(super) mod tests {
             .expect("the first section holds Continue in and Switch");
         assert_eq!(
             gio_menu_labels_of(&section),
-            ["Continue in a new thread", "Switch this thread to"]
+            [
+                "Continue in a new thread with…",
+                "Switch agent (stops the current turn)",
+                "Fork thread",
+                "Compact into a new thread"
+            ]
         );
         let housekeeping = model.item_link(1, "section").expect("second section");
         assert_eq!(
@@ -750,7 +729,12 @@ pub(super) mod tests {
         let section = model.item_link(0, "section").expect("first section");
         assert_eq!(
             gio_menu_labels_of(&section),
-            ["Continue in a new thread", "Switch this thread to"]
+            [
+                "Continue in a new thread with…",
+                "Switch agent (stops the current turn)",
+                "Fork thread",
+                "Compact into a new thread"
+            ]
         );
         for index in 0..2 {
             assert!(section.item_link(index, "submenu").is_none(), "{index}");
@@ -1037,12 +1021,36 @@ pub(super) mod tests {
             Some((Driver::Codex, Some("gpt-5".into()), None)),
             "building the view while detecting must keep the parked switch"
         );
+        // The scan then finds the thread's own agent missing: the parked switch is not dropped
+        // (nor turned into a new thread), the thread itself moves to Codex.
+        let threads_before = open_threads();
         availability.set(Driver::Claude, Availability::Missing);
         assert_eq!(
             chat_of(&thread).and_then(|c| c.2),
             None,
-            "a definitive scan failure must cancel the parked switch"
+            "the parked switch is taken, never left for a later install to apply"
         );
+        settle(&|| chat_of(&thread).is_some_and(|c| c.1 == Driver::Codex));
+        assert_eq!(
+            imp.slot_of(&thread).map(|s| s.driver()),
+            Some(Driver::Codex)
+        );
+        assert!(
+            open_threads().is_subset(&threads_before),
+            "switching in place never forks"
+        );
+        let providers = app_store().provider_threads(&thread).expect("providers");
+        let active = app_store()
+            .active_provider_thread(&thread)
+            .expect("active")
+            .expect("one is active");
+        let active = providers
+            .iter()
+            .find(|p| p.id == active)
+            .expect("the active provider");
+        assert_eq!(active.driver, "codex");
+        assert_eq!(active.model, "gpt-5");
+        assert_eq!(active.native_id, None, "nothing of Claude's is resumed");
         availability.set(Driver::Claude, own_before);
 
         // Delete: the page closes and the thread leaves the store, its history with it.

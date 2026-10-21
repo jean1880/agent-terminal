@@ -63,6 +63,60 @@ fn keep_pending_switch(read_ok: bool, own: &Availability) -> bool {
     read_ok && matches!(own, Availability::Detecting)
 }
 
+/// How an in-place agent switch reaches a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SwitchRoute {
+    /// Its session switches itself (a stopped or suspended one too: it restarts on the new one).
+    Live,
+    /// Kept in `pending_switch` until the session starting on the thread's own agent, or the
+    /// build in flight, settles; applied then.
+    Park,
+    /// No session will start on the thread's own agent: the thread moves to the new one now.
+    Rebind,
+}
+
+/// [`SwitchRoute`] for a thread with or without a session, its page `building` or not, and its
+/// own agent `own`. A build in flight read the thread for its old agent, so a rebind waits for
+/// it (the build applies the parked switch when it finds the agent unavailable).
+pub(super) fn switch_route(has_session: bool, building: bool, own: &Availability) -> SwitchRoute {
+    match (has_session, own) {
+        (true, _) => SwitchRoute::Live,
+        (false, Availability::Detecting) => SwitchRoute::Park,
+        (false, _) if building => SwitchRoute::Park,
+        (false, _) => SwitchRoute::Rebind,
+    }
+}
+
+/// Moves `thread`, which no session runs, from `from` to `target` in the store, in one
+/// transaction: a new provider thread for `target` with no native session and `model` (else the
+/// agent's default), made active, then the thread's budgeted, redacted handoff
+/// ([`build_handoff`]) and its notice ([`crate::chat::session::switched_handoff_events`]), for
+/// the new agent's session to re-arm. Another agent's native id or model is never carried.
+/// Returns the handoff (carrying nothing for a thread with no messages).
+fn rebind_thread(
+    store: &Store,
+    thread: &str,
+    from: Driver,
+    target: Driver,
+    model: Option<&str>,
+) -> agent_kit::store::Result<crate::chat::session::Handoff> {
+    let messages = store.transcript_messages(thread)?;
+    let handoff = build_handoff(
+        &messages,
+        &format!("{} thread {thread}", driver_label(from)),
+    );
+    store.atomically(|s| {
+        let pt = s.add_provider_thread(thread, driver_key(target), model.unwrap_or("default"))?;
+        s.set_active_provider_thread(thread, &pt)?;
+        s.set_thread_profile(thread, None)?;
+        for env in crate::chat::session::switched_handoff_events(&handoff, target) {
+            s.append_event(thread, Some(&pt), &env)?;
+        }
+        Ok(())
+    })?;
+    Ok(handoff)
+}
+
 fn scan_is_current(generation: u64) -> bool {
     SCAN_GENERATION.with(|current| generation == current.get())
 }
@@ -672,6 +726,9 @@ pub(super) struct ChatTab {
     /// A switch (agent, model, effort) to apply once the session exists (the thread menu's
     /// "Switch this thread to" on a thread that is not built yet).
     pub(super) pending_switch: Option<(Driver, Option<String>, Option<String>)>,
+    /// An in-place switch of a thread no session runs is being written (its new provider
+    /// thread and handoff): no build starts, and no other switch is taken, until it lands.
+    rebinding: bool,
     /// The banner is showing because the thread's agent is missing or off (not a rate limit).
     unavailable: bool,
     /// A session start is in flight for a view that was built without one (its agent was not
@@ -700,6 +757,19 @@ impl ChatTab {
             || self.pending_prompt.is_some()
             || self.pending_handoff
             || self.pending_switch.is_some()
+            || self.rebinding
+    }
+
+    /// Where this thread's agent process is, for its sidebar row ([`thread_activity`]): the page
+    /// being built or its session started count as starting.
+    fn activity(&self) -> Option<ThreadActivity> {
+        let life = self.slot.get().map(|s| s.lifecycle()).unwrap_or_default();
+        thread_activity(
+            self.building || self.starting,
+            life.alive,
+            life.starting,
+            life.suspended,
+        )
     }
 
     /// Where this thread's agent process is, for its sidebar row ([`thread_activity`]): the page
@@ -731,6 +801,7 @@ impl ChatTab {
             && self.pending_prompt.is_none()
             && !self.pending_handoff
             && self.pending_switch.is_none()
+            && !self.rebinding
             && !self.view.as_ref().is_some_and(ChatView::has_draft)
     }
 }
@@ -751,7 +822,9 @@ pub(super) struct SessionSlot {
     /// The view, to tell the user when a prompt cannot go anywhere yet (the thread's agent is
     /// not Ready, so no session exists). Weak: the view owns this slot.
     view: RefCell<Option<glib::WeakRef<ChatView>>>,
-    driver: Driver,
+    /// The thread's agent while no session runs it: moved by an in-place switch made before
+    /// any session started ([`AgentTerminalWindow::rebind_unstarted`]).
+    driver: std::cell::Cell<Driver>,
     model: Option<String>,
     mode: Mode,
 }
@@ -768,7 +841,7 @@ impl SessionSlot {
     pub(super) fn driver(&self) -> Driver {
         match self.get() {
             Some(s) => s.status().driver,
-            None => self.driver,
+            None => self.driver.get(),
         }
     }
 }
@@ -817,7 +890,7 @@ impl ChatBackend for SessionSlot {
                     view.apply(&Envelope::new(Event::Error {
                         message: format!(
                             "{} is not running for this thread yet, so the message was not sent.",
-                            driver_label(self.driver)
+                            driver_label(self.driver.get())
                         ),
                     }));
                 }
@@ -915,14 +988,14 @@ impl ChatBackend for SessionSlot {
         match self.get() {
             Some(s) => s.status(),
             None => SessionStatus {
-                driver: self.driver,
+                driver: self.driver.get(),
                 model: self.model.clone(),
                 pending_model: None,
                 effort: None,
                 mode: self.mode,
                 running_turn: false,
                 alive: false,
-                capabilities: agent_core::caps::Capabilities::of(self.driver),
+                capabilities: agent_core::caps::Capabilities::of(self.driver.get()),
                 commands: Vec::new(),
             },
         }
@@ -938,6 +1011,26 @@ impl ChatBackend for SessionSlot {
 // ---------------------------------------------------------------------------------------------
 // App-wide state: the store and the resolved agent binaries
 // ---------------------------------------------------------------------------------------------
+
+/// Settings carried to a new thread. Bypass is always reduced to its safe mode.
+#[derive(Debug, PartialEq, Eq)]
+struct CarriedSettings {
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<Mode>,
+}
+
+fn carried_settings(
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<Mode>,
+) -> CarriedSettings {
+    CarriedSettings {
+        model,
+        effort,
+        mode: mode.map(Mode::session_safe),
+    }
+}
 
 /// A chat agent's binary and its profile's environment, resolved off the main thread.
 #[derive(Debug, Clone, Default)]
@@ -1335,7 +1428,14 @@ impl NewThreadSpec {
 }
 
 /// What a thread made by `create_chat_thread` carries into its page once it is stored.
+pub(super) enum CreationNotice {
+    New,
+    Fork,
+    Compact(String),
+}
+
 struct CreatedThread {
+    notice: Option<CreationNotice>,
     driver: Driver,
     prompt: Option<String>,
     effort: Option<String>,
@@ -1389,6 +1489,19 @@ fn carried_profile(
     source_profile.filter(|_| source_driver == Some(target))
 }
 
+/// A closed source has no page attributes: its stored provider must identify the target agent
+/// before its profile can be inherited. Missing or foreign providers carry no profile.
+fn carried_stored_profile(loaded: &LoadedThread, target: Driver) -> Option<String> {
+    carried_profile(
+        loaded
+            .provider
+            .as_ref()
+            .and_then(|p| Driver::from_key(&p.driver)),
+        loaded.attributes.profile_id.clone(),
+        target,
+    )
+}
+
 /// Whether a thread's profile ends with `event`, from its agent `driver`. `profile_runs` is the
 /// agent the thread's profile runs (`None`: no profile; `Some(None)`: one that is gone, which
 /// [`crate::config::TerminalConfig::thread_profile`] already passes over). Only another agent
@@ -1434,6 +1547,7 @@ pub(super) type PendingNewThread = std::boxed::Box<dyn FnOnce(Driver) -> NewThre
 /// [`crate::utils::resolve_new_thread_dir`]'s: `dir`, else the chosen profile's, else `here`,
 /// else the agent's profile's, else the starting directory.
 pub(super) struct NewThread {
+    pub(super) notice: Option<CreationNotice>,
     pub(super) driver: Driver,
     /// A folder the user picked for this thread (a picker, a worktree, a folder's row, the
     /// thread forked): refused if it no longer exists, never replaced.
@@ -1461,6 +1575,7 @@ impl NewThread {
     pub(super) fn new(driver: Driver) -> Self {
         Self {
             driver,
+            notice: None,
             dir: None,
             here: None,
             prompt: None,
@@ -4513,7 +4628,7 @@ impl AgentTerminalWindow {
             worker_diffs: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
             view: RefCell::new(None),
-            driver,
+            driver: std::cell::Cell::new(driver),
             model: None,
             mode,
         });
@@ -4588,6 +4703,7 @@ impl AgentTerminalWindow {
                 chosen_mode: None,
                 pending_effort: None,
                 pending_switch: None,
+                rebinding: false,
                 unavailable: false,
                 starting: false,
                 diffs,
@@ -4629,6 +4745,11 @@ impl AgentTerminalWindow {
                         view.focus_composer();
                     });
                 }
+                return;
+            }
+            // An in-place switch is being written: the build reads the thread once it has
+            // landed (`finish_rebind` builds it then), never the agent it is leaving.
+            if chat.rebinding {
                 return;
             }
             chat.building = true;
@@ -4877,16 +4998,18 @@ impl AgentTerminalWindow {
                 "Thread {thread} opened without a session: {} is not ready",
                 driver_label(driver)
             );
-            if let Some(chat) = self
+            // A switch parked while the thread was being built: its own agent will not start
+            // it (still being detected excepted), so the thread moves to the new agent now.
+            let parked = self
                 .tabs
                 .borrow_mut()
                 .iter_mut()
                 .find(|t| &t.page == page)
                 .and_then(|t| t.chat.as_mut())
-            {
-                if !keep_pending_switch(true, &AgentAvailability::shared().get(driver)) {
-                    chat.pending_switch = None;
-                }
+                .filter(|_| !keep_pending_switch(true, &AgentAvailability::shared().get(driver)))
+                .and_then(|chat| chat.pending_switch.take());
+            if let Some((target, model, effort)) = parked {
+                self.switch_in_place_with(&thread, target, model, effort);
             }
             self.update_unavailable_banners();
             // Built, with no agent to start: the row stops spinning.
@@ -4904,6 +5027,26 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// Reserves the first asynchronous start before delegation preparation can yield. A switch
+    /// must wait for that start just as it waits for a pending retry, rather than replacing the
+    /// provider while the old start still owns its launch data.
+    fn prepare_session_start(
+        &self,
+        thread: &str,
+        slot: &Rc<SessionSlot>,
+    ) -> delegation::PendingStart {
+        if let Some(chat) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread && Rc::ptr_eq(&c.slot, slot))
+        {
+            chat.starting = true;
+        }
+        delegation::PendingStart::new(slot)
+    }
+
     /// Starts the session of a thread whose view is built, and applies what was waiting for it.
     fn start_session(&self, page: &adw::TabPage, job: StartJob) {
         if !job.profile.available_for_delegation || cfg!(test) {
@@ -4914,7 +5057,7 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(&job.thread) else {
             return;
         };
-        let pending = delegation::PendingStart::new(&slot);
+        let pending = self.prepare_session_start(&job.thread, &slot);
         let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
             let supervisor = crate::delegation::ready().await;
@@ -5805,20 +5948,22 @@ impl AgentTerminalWindow {
             self.agy_cannot_ask_for(thread),
         );
         match target {
-            Some((target, false)) => self.switch_or_continue(thread, target),
+            Some((target, false)) => self.switch_in_place(thread, target),
             Some((target, true)) => self.confirm_unasked_switch(thread, target),
             None => self.show_toast("No other agent is installed and enabled"),
         }
     }
 
-    /// Switches `thread` to `target` in place; a thread with no session (its agent is missing or
-    /// switched off) has nothing to switch, so it continues in a new thread on `target`, with
-    /// the same handoff a fork carries, and says so.
-    pub(super) fn switch_or_continue(&self, thread: &str, target: Driver) {
-        self.switch_or_continue_with(thread, target, None, None);
+    /// Switches `thread` (open in this window) to `target` in place, on the agent's default model.
+    pub(super) fn switch_in_place(&self, thread: &str, target: Driver) {
+        self.switch_in_place_with(thread, target, None, None);
     }
 
-    pub(super) fn switch_or_continue_with(
+    /// Switches `thread` (open in this window) to `target`/`model`/`effort` in place, whatever
+    /// state it is in; never by forking it. A live session (stopped or suspended included)
+    /// switches itself. Without one, the switch waits for the session or build in flight
+    /// ([`switch_route`]), else the thread moves to `target` now ([`Self::rebind_unstarted`]).
+    pub(super) fn switch_in_place_with(
         &self,
         thread: &str,
         target: Driver,
@@ -5832,19 +5977,156 @@ impl AgentTerminalWindow {
             slot.switch(target, model, effort);
             return;
         }
-        let dir = self.page_of_thread(thread).and_then(|p| {
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|t| t.page == p)
-                .map(|t| t.dir.clone())
-        });
-        self.fork_thread_with(thread, target, dir, model, effort);
-        self.show_toast(&format!(
-            "{} is not running here: continued in a new {} thread",
-            driver_label(slot.driver()),
+        let own = AgentAvailability::shared().get(slot.driver());
+        let route = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(chat) = tabs
+                .iter_mut()
+                .filter_map(|t| t.chat.as_mut())
+                .find(|c| c.thread == thread)
+            else {
+                return;
+            };
+            if chat.rebinding {
+                None
+            } else {
+                let route = switch_route(false, chat.building || chat.starting, &own);
+                if route == SwitchRoute::Park {
+                    chat.pending_switch = Some((target, model.clone(), effort.clone()));
+                }
+                Some(route)
+            }
+        };
+        match route {
+            None => self.show_toast("This thread is already switching agent"),
+            Some(SwitchRoute::Rebind) if target == slot.driver() => self.show_toast(&format!(
+                "{} is not available, so this thread's model cannot be changed",
+                driver_label(target)
+            )),
+            Some(SwitchRoute::Rebind) => self.rebind_unstarted(thread, target, model, effort),
+            Some(SwitchRoute::Live | SwitchRoute::Park) => {}
+        }
+    }
+
+    /// Moves `thread`, which no session runs and whose own agent will not start one, to
+    /// `target` in place: a new provider thread (no native session, `model` or the agent's
+    /// default: nothing of the old agent's is resumed) made active, with the thread's redacted,
+    /// budgeted handoff stored for the new agent ([`rebind_thread`]). Nothing builds or starts
+    /// the thread until that has landed (`rebinding`); then the page follows ([`Self::finish_rebind`]).
+    fn rebind_unstarted(
+        &self,
+        thread: &str,
+        target: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let from = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(chat) = tabs
+                .iter_mut()
+                .filter_map(|t| t.chat.as_mut())
+                .find(|c| c.thread == thread)
+            else {
+                return;
+            };
+            chat.rebinding = true;
+            chat.pending_switch = None;
+            chat.slot.driver()
+        };
+        info!(
+            "Switching thread {thread} from {} to {} before any session ran it",
+            driver_label(from),
             driver_label(target)
-        ));
+        );
+        let id = thread.to_owned();
+        let thread = thread.to_owned();
+        self.write_store_then(
+            "switch the thread's agent",
+            move |store| rebind_thread(store, &id, from, target, model.as_deref()),
+            move |imp, outcome| imp.finish_rebind(&thread, target, effort, outcome),
+        );
+    }
+
+    /// The page side of [`Self::rebind_unstarted`], once the writer has answered: on success the
+    /// page runs `target` (its session starts when that agent is Ready, with the stored handoff
+    /// armed); on failure it stays as it was, and says why.
+    fn finish_rebind(
+        &self,
+        thread: &str,
+        target: Driver,
+        effort: Option<String>,
+        outcome: Option<agent_kit::store::Result<crate::chat::session::Handoff>>,
+    ) {
+        let label = driver_label(target);
+        let landed = {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs
+                .iter_mut()
+                .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == thread))
+            else {
+                return; // closed meanwhile: the store has the switch, a reopen reads it
+            };
+            let page = tab.page.clone();
+            let Some(chat) = tab.chat.as_mut() else {
+                return;
+            };
+            // An unanswered write may still land. Keep starts blocked until a reopen reads
+            // its provider, rather than starting the old agent on the new agent's native id.
+            chat.rebinding = outcome.is_none();
+            match outcome {
+                Some(Ok(handoff)) => {
+                    chat.driver = target;
+                    chat.profile_id = None;
+                    chat.slot.driver.set(target);
+                    chat.pending_effort = effort;
+                    let notices = crate::chat::session::switched_handoff_events(&handoff, target);
+                    if handoff.carried > 0 {
+                        chat.stored_handoff = Some(handoff);
+                        chat.pending_handoff = true;
+                    }
+                    Ok((page, chat.view.clone(), notices))
+                }
+                Some(Err(e)) => Err(format!("Could not switch this thread to {label}: {e}")),
+                None => Err(format!(
+                    "The switch to {label} was not confirmed by the store. Reopen the thread to \
+                     see which agent it is on."
+                )),
+            }
+        };
+        let (page, view, notices) = match landed {
+            Ok(landed) => landed,
+            Err(message) => {
+                self.show_toast(&message);
+                return;
+            }
+        };
+        match view {
+            // Built: say so where the user is looking, then start it if its agent is Ready.
+            Some(view) => {
+                for env in notices
+                    .iter()
+                    .filter(|e| matches!(e.event, Event::Notice { .. }))
+                {
+                    view.apply(env);
+                }
+                view.refresh_status();
+                self.update_unavailable_banners();
+                self.start_pending_sessions();
+            }
+            // Not built: the build waited for this (`ensure_built`); it reads the new agent now.
+            None => {
+                let shown = self
+                    .tab_view
+                    .borrow()
+                    .as_ref()
+                    .and_then(|v| v.selected_page())
+                    .is_some_and(|p| p == page);
+                if shown {
+                    self.ensure_built(&page);
+                }
+            }
+        }
+        self.for_each_window(|window| window.refresh_sidebar());
     }
 
     /// The thread of the page in view, if it is a chat thread.
@@ -5940,7 +6222,7 @@ impl AgentTerminalWindow {
                 .await;
             window.imp().unasked_prompt_open.set(false);
             if response == "continue" {
-                window.imp().switch_or_continue(&thread, target);
+                window.imp().switch_in_place(&thread, target);
             }
         });
     }
@@ -5959,10 +6241,7 @@ impl AgentTerminalWindow {
         match action {
             // In this thread's folder unless a more specific one applies; it may be gone.
             ViewAction::NewThread => {
-                self.new_chat_thread_with(Some(slot.driver()), move |driver| NewThread {
-                    here: dir,
-                    ..NewThread::new(driver)
-                });
+                self.new_from_thread(thread, slot.driver(), dir);
             }
             // A named target is the user's own choice; a bare /handoff picks one like the banner.
             // Mid-turn, either asks first (when_not_busy): the switch stops the turn.
@@ -5970,15 +6249,14 @@ impl AgentTerminalWindow {
                 target: Some(target),
             } => {
                 let (id, target) = (thread.to_owned(), *target);
-                self.when_not_busy(thread, move |imp| imp.switch_or_continue(&id, target));
+                self.when_not_busy(thread, move |imp| imp.switch_in_place(&id, target));
             }
             ViewAction::Handoff { target: None } => {
                 let id = thread.to_owned();
                 self.when_not_busy(thread, move |imp| imp.continue_rate_limited(&id));
             }
-            ViewAction::Fork | ViewAction::CompactByHandoff => {
-                self.fork_thread(thread, slot.driver(), dir);
-            }
+            ViewAction::Fork => self.fork_thread(thread, slot.driver(), dir, false),
+            ViewAction::CompactByHandoff => self.fork_thread(thread, slot.driver(), dir, true),
             ViewAction::Rewind => {
                 if let Some(page) = self.page_of_thread(thread) {
                     self.rewind(&page);
@@ -5998,12 +6276,88 @@ impl AgentTerminalWindow {
     /// this one, its mode and its model. The source thread is only read: its transcript comes
     /// off the main thread, and the handoff travels with the NEW thread's own record
     /// (`NewThread::handoff`), never through whichever page happens to be selected.
-    fn fork_thread(&self, thread: &str, driver: Driver, dir: Option<String>) {
-        let model = self
-            .slot_of(thread)
-            .and_then(|s| s.get())
-            .and_then(|s| s.selected_model());
-        self.fork_thread_with(thread, driver, dir, model, None);
+    fn new_from_thread(&self, thread: &str, driver: Driver, dir: Option<String>) {
+        let live = self.thread_carry_settings(thread);
+        let thread = thread.to_owned();
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let loaded = store_job(move |store| load_thread(store, &thread, None)).await;
+            let Some(obj) = obj.upgrade() else { return };
+            let loaded = match loaded {
+                Some(Ok(loaded)) => loaded,
+                Some(Err(e)) => {
+                    present_message(&obj, "Cannot Create a Thread", &e.to_string());
+                    return;
+                }
+                None => {
+                    obj.imp().show_toast("Cannot read the source thread");
+                    return;
+                }
+            };
+            let settings = carried_settings(
+                live.model.or_else(|| {
+                    loaded
+                        .provider
+                        .as_ref()
+                        .and_then(|p| stored_model(Some(&p.model)))
+                }),
+                None,
+                live.mode.or_else(|| {
+                    crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
+                }),
+            );
+            obj.imp().create_chat_thread(NewThread {
+                here: dir,
+                model: settings.model,
+                mode: settings.mode,
+                profile_id: loaded.attributes.profile_id,
+                notice: Some(CreationNotice::New),
+                ..NewThread::new(driver)
+            });
+        });
+    }
+
+    fn thread_carry_settings(&self, thread: &str) -> CarriedSettings {
+        let tabs = self.tabs.borrow();
+        let chat = tabs
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread);
+        match chat {
+            Some(chat) => {
+                let session = chat.slot.get();
+                carried_settings(
+                    session.as_ref().and_then(|s| s.selected_model()),
+                    session
+                        .as_ref()
+                        .map_or_else(|| chat.pending_effort.clone(), |s| s.selected_effort()),
+                    session
+                        .as_ref()
+                        .map(|s| s.wanted_mode())
+                        .or(chat.chosen_mode)
+                        .or_else(|| chat.view.as_ref().and_then(ChatView::replayed_mode)),
+                )
+            }
+            None => carried_settings(None, None, None),
+        }
+    }
+
+    pub(super) fn fork_thread(
+        &self,
+        thread: &str,
+        driver: Driver,
+        dir: Option<String>,
+        compact: bool,
+    ) {
+        let settings = self.thread_carry_settings(thread);
+        self.fork_thread_with(
+            thread,
+            driver,
+            dir,
+            settings.model,
+            settings.effort,
+            compact,
+        );
     }
 
     fn fork_thread_with(
@@ -6013,6 +6367,7 @@ impl AgentTerminalWindow {
         dir: Option<String>,
         model: Option<String>,
         effort: Option<String>,
+        compact: bool,
     ) {
         let (title, source_driver, source_profile) = self
             .tabs
@@ -6033,23 +6388,25 @@ impl AgentTerminalWindow {
         } else {
             format!("“{title}”")
         };
-        let session = self.slot_of(thread).and_then(|s| s.get());
-        let mode = session.as_ref().map(|s| s.wanted_mode());
+        let mode = self.thread_carry_settings(thread).mode;
         let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
         glib::MainContext::default().spawn_local(async move {
             let loaded = store_job({
                 let thread = thread.clone();
                 move |store| {
-                    store
-                        .transcript_messages(&thread)
-                        .map(|messages| build_handoff(&messages, &format!("thread {thread}")))
+                    let loaded = load_thread(store, &thread, None)?;
+                    let messages = store.transcript_messages(&thread)?;
+                    Ok::<_, agent_kit::store::StoreError>((
+                        build_handoff(&messages, &format!("thread {thread}")),
+                        loaded,
+                    ))
                 }
             })
             .await;
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
-            let handoff = match loaded {
-                Some(Ok(handoff)) => handoff,
+            let (handoff, loaded) = match loaded {
+                Some(Ok(value)) => value,
                 Some(Err(e)) => {
                     present_message(&obj, "Cannot Fork the Thread", &e.to_string());
                     return;
@@ -6059,13 +6416,31 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
+            let settings = carried_settings(
+                model.or_else(|| {
+                    loaded
+                        .provider
+                        .as_ref()
+                        .and_then(|p| stored_model(Some(&p.model)))
+                }),
+                effort,
+                mode.or_else(|| {
+                    crate::chat::session::chosen_mode(loaded.history.iter().map(|(_, e)| e))
+                }),
+            );
+            let profile_id = profile_id.or_else(|| carried_stored_profile(&loaded, driver));
             imp.create_chat_thread(NewThread {
                 dir,
-                model,
-                effort,
-                mode,
+                model: settings.model,
+                effort: settings.effort,
+                mode: settings.mode,
                 handoff: Some((handoff, source)),
                 profile_id,
+                notice: Some(if compact {
+                    CreationNotice::Compact(thread)
+                } else {
+                    CreationNotice::Fork
+                }),
                 ..NewThread::new(driver)
             });
         });
@@ -6332,6 +6707,7 @@ impl AgentTerminalWindow {
             return None;
         }
         let NewThread {
+            notice,
             driver,
             prompt,
             model,
@@ -6388,6 +6764,7 @@ impl AgentTerminalWindow {
             Ok(())
         };
         let created = CreatedThread {
+            notice,
             driver,
             prompt,
             effort,
@@ -6442,6 +6819,7 @@ impl AgentTerminalWindow {
     /// carries for its first start. Returns its page.
     fn open_created(&self, thread: &str, created: CreatedThread) -> Option<adw::TabPage> {
         let CreatedThread {
+            notice,
             driver,
             prompt,
             effort,
@@ -6475,6 +6853,30 @@ impl AgentTerminalWindow {
             page.set_tooltip(&tab_tooltip(Some(&branch), None));
         }
         self.open_thread(thread, true);
+        match notice {
+            Some(CreationNotice::New) => {
+                self.show_toast("New thread: kept the model and safe mode")
+            }
+            Some(CreationNotice::Fork) => {
+                self.show_toast("Forked thread: kept the model, effort and safe mode")
+            }
+            Some(CreationNotice::Compact(source)) => {
+                let toast = adw::Toast::builder()
+                    .title("Compacted into a new thread; kept the model, effort and safe mode")
+                    .use_markup(false)
+                    .button_label("Archive the original")
+                    .timeout(15)
+                    .build();
+                let obj = self.obj().downgrade();
+                toast.connect_button_clicked(move |_| {
+                    if let Some(obj) = obj.upgrade() {
+                        obj.imp().set_thread_archived(&source, true);
+                    }
+                });
+                self.add_toast(toast);
+            }
+            None => {}
+        }
         Some(page)
     }
 
@@ -7075,6 +7477,7 @@ impl AgentTerminalWindow {
     fn update_unavailable_banners(&self) {
         let availability = AgentAvailability::shared();
         let hook_target = cached_agy_hook_target(None);
+        let mut rebinds = Vec::new();
         let mut tabs = self.tabs.borrow_mut();
         for tab in tabs.iter_mut() {
             let Some(chat) = tab.chat.as_mut() else {
@@ -7092,10 +7495,13 @@ impl AgentTerminalWindow {
             let other = safe_handoff_target(driver, |d| availability.is_ready(d), cannot_ask);
             match unavailable_banner(driver, &state, other.map(|(d, _)| d)) {
                 Some((title, button)) => {
-                    // A scan that answered Missing/Disabled ends a parked switch; installing
-                    // or enabling the agent later must not apply an old startup request.
-                    if chat.slot.get().is_none() {
-                        chat.pending_switch = None;
+                    // A scan that answered Missing/Disabled settles a parked switch: the thread
+                    // moves to the agent the user picked now (a build in flight does it once it
+                    // lands), so installing or enabling its old agent later applies nothing.
+                    if chat.slot.get().is_none() && !chat.building && !chat.starting {
+                        if let Some(parked) = chat.pending_switch.take() {
+                            rebinds.push((chat.thread.clone(), parked));
+                        }
                     }
                     // An agy that would edit unasked says so on the button.
                     let button = match other {
@@ -7113,6 +7519,10 @@ impl AgentTerminalWindow {
                 }
                 None => {}
             }
+        }
+        drop(tabs);
+        for (thread, (target, model, effort)) in rebinds {
+            self.switch_in_place_with(&thread, target, model, effort);
         }
     }
 
@@ -7134,6 +7544,7 @@ impl AgentTerminalWindow {
                 let driver = chat.slot.driver();
                 if chat.view.is_none()
                     || chat.starting
+                    || chat.rebinding
                     || chat.slot.get().is_some()
                     || !availability.is_ready(driver)
                 {
@@ -7205,11 +7616,12 @@ impl AgentTerminalWindow {
                     return;
                 }
                 let own = AgentAvailability::shared().get(driver);
-                let keep_switch = keep_pending_switch(provider.is_some(), &own);
+                let read_ok = provider.is_some();
+                let keep_switch = keep_pending_switch(read_ok, &own);
                 let ready = own.is_ready() && resolved.program.is_some();
                 let Some(provider) = provider.filter(|_| ready) else {
                     // Gone again while resolving, or the store failed: wait for the next change.
-                    if let Some(chat) = obj
+                    let parked = if let Some(chat) = obj
                         .imp()
                         .tabs
                         .borrow_mut()
@@ -7218,10 +7630,22 @@ impl AgentTerminalWindow {
                         .and_then(|t| t.chat.as_mut())
                     {
                         chat.starting = false;
-                        if !keep_switch {
+                        if !read_ok {
                             chat.pending_switch = None;
+                            None
+                        } else if !keep_switch {
+                            chat.pending_switch.take()
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
+                    if let Some((target, model, effort)) = parked {
+                        obj.imp()
+                            .switch_in_place_with(&thread, target, model, effort);
                     }
+                    obj.imp().update_unavailable_banners();
                     return;
                 };
                 obj.imp().start_session(
@@ -7270,6 +7694,207 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_failed_custom_profile_does_not_strand_a_switch_while_its_driver_is_ready() {
+        gtk4::init().unwrap();
+        adw::init().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
+        let app = adw::Application::builder()
+            .application_id("org.test.SwitchFailedProfile")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .tab_view
+            .borrow()
+            .is_some()));
+        CHAT_RESTORED.with(|done| done.set(true));
+        let availability = AgentAvailability::shared();
+        for driver in Driver::ALL {
+            availability.set(driver, Availability::Missing);
+        }
+        let mut profile = crate::config::new_agent_profile(Driver::Claude);
+        profile.id = "unavailable-custom-claude".into();
+        profile.command = "/nonexistent/custom-claude".into();
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (profile.command.clone(), profile.env_file.clone()),
+                ResolvedAgent::default(),
+            )
+        });
+        window
+            .imp()
+            .config
+            .borrow_mut()
+            .profiles
+            .push(profile.clone());
+        let folder = tempfile::tempdir().unwrap();
+        window
+            .imp()
+            .create_chat_thread(NewThread {
+                dir: Some(folder.path().to_string_lossy().into_owned()),
+                profile_id: Some(profile.id.clone()),
+                ..NewThread::new(Driver::Claude)
+            })
+            .unwrap();
+        let thread = window.imp().current_thread().unwrap();
+        let built = || {
+            window
+                .imp()
+                .tabs
+                .borrow()
+                .iter()
+                .filter_map(|t| t.chat.as_ref())
+                .any(|c| c.thread == thread && c.view.is_some() && !c.building && !c.starting)
+        };
+        assert!(crate::testutil::pump_until(&ctx, 5, built));
+        assert!(window.imp().slot_of(&thread).unwrap().get().is_none());
+        let before = app_store().list_threads(false).unwrap().len();
+        availability.set(
+            Driver::Claude,
+            Availability::Ready("/fixture/default-claude".into()),
+        );
+        window.imp().switch_in_place(&thread, Driver::Codex);
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .imp()
+            .slot_of(&thread)
+            .unwrap()
+            .driver()
+            == Driver::Codex));
+        assert_eq!(app_store().list_threads(false).unwrap().len(), before);
+        assert_eq!(
+            load_provider(&app_store(), &thread)
+                .unwrap()
+                .unwrap()
+                .driver,
+            "codex"
+        );
+        assert_eq!(
+            app_store().thread_attributes(&thread).unwrap().profile_id,
+            None
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    #[test]
+    fn switch_routes_serialize_builds_and_never_fork_missing_agents() {
+        for own in [
+            Availability::Detecting,
+            Availability::Ready("fixture".into()),
+            Availability::Missing,
+            Availability::Disabled,
+        ] {
+            for building in [false, true] {
+                assert_eq!(switch_route(true, building, &own), SwitchRoute::Live);
+                let expected = if building || matches!(own, Availability::Detecting) {
+                    SwitchRoute::Park
+                } else {
+                    SwitchRoute::Rebind
+                };
+                assert_eq!(switch_route(false, building, &own), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn carried_settings_keep_model_effort_and_only_safe_modes() {
+        for mode in [Mode::Ask, Mode::Plan, Mode::AcceptEdits, Mode::Bypass] {
+            let carried =
+                carried_settings(Some("chosen-model".into()), Some("high".into()), Some(mode));
+            assert_eq!(carried.model.as_deref(), Some("chosen-model"));
+            assert_eq!(carried.effort.as_deref(), Some("high"));
+            assert_eq!(carried.mode, Some(mode.session_safe()));
+            assert_ne!(carried.mode, Some(Mode::Bypass));
+        }
+        assert_eq!(
+            carried_settings(None, None, None),
+            CarriedSettings {
+                model: None,
+                effort: None,
+                mode: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_unstarted_switch_keeps_the_thread_and_clears_foreign_resume_and_profile() {
+        let store = Store::open_in_memory().unwrap();
+        let thread = store.create_thread("/workspace", Some("source")).unwrap();
+        let old = store
+            .add_provider_thread(&thread, "claude", "old-model")
+            .unwrap();
+        store.set_native_id(&old, "native-claude").unwrap();
+        store.set_active_provider_thread(&thread, &old).unwrap();
+        store
+            .set_thread_profile(&thread, Some("custom-claude"))
+            .unwrap();
+        let before = store.list_threads(false).unwrap().len();
+        let handoff = rebind_thread(
+            &store,
+            &thread,
+            Driver::Claude,
+            Driver::Codex,
+            Some("new-model"),
+        )
+        .unwrap();
+        assert_eq!(handoff.carried, 0);
+        assert_eq!(store.list_threads(false).unwrap().len(), before);
+        let provider = load_provider(&store, &thread).unwrap().unwrap();
+        assert_eq!(provider.driver, "codex");
+        assert_eq!(provider.model, "new-model");
+        assert_eq!(provider.native_id, None);
+        assert_eq!(store.thread_attributes(&thread).unwrap().profile_id, None);
+        assert!(store.events(&thread, None, 100).unwrap().iter().any(
+            |(_, env)| matches!(&env.event, Event::Notice { text } if text == "Switched to Codex")
+        ));
+    }
+
+    #[test]
+    fn a_historical_switch_stores_one_recoverable_handoff_on_the_new_provider() {
+        let store = Store::open_in_memory().unwrap();
+        let thread = store.create_thread("/workspace", Some("history")).unwrap();
+        let old = store
+            .add_provider_thread(&thread, "claude", "old-model")
+            .unwrap();
+        store.set_native_id(&old, "native-claude").unwrap();
+        store.set_active_provider_thread(&thread, &old).unwrap();
+        store
+            .append_user_message(&thread, Some(&old), "Continue the original task")
+            .unwrap();
+        let handoff = rebind_thread(&store, &thread, Driver::Claude, Driver::Codex, None).unwrap();
+        assert_eq!(handoff.carried, 1);
+        let history: Vec<_> = store
+            .events(&thread, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, Event::HandoffSeeded { .. }))
+                .count(),
+            1
+        );
+        let owed = crate::chat::session::undelivered_handoff(&history).unwrap();
+        assert!(owed.summary.contains("Continue the original task"));
+        let provider = load_provider(&store, &thread).unwrap().unwrap();
+        assert_eq!(provider.native_id, None);
+        assert_eq!(provider.model, "default");
+        assert!(store
+            .events_by_agent(&thread, None, 100)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.envelope.event, Event::HandoffSeeded { .. }))
+            .all(|e| e.driver.as_deref() == Some("codex")));
+    }
 
     /// The idle sweep stops an agent only with suspension on, the thread out of sight, nothing
     /// holding it, and at least the configured minutes unseen.
@@ -8807,7 +9432,7 @@ pub(super) mod tests {
             worker_diffs: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
             view: RefCell::new(None),
-            driver: Driver::Agy,
+            driver: std::cell::Cell::new(Driver::Agy),
             model: Some("gemini".into()),
             mode: Mode::Plan,
         };
@@ -8823,7 +9448,7 @@ pub(super) mod tests {
             worker_diffs: RefCell::new(HashMap::new()),
             session: RefCell::new(None),
             view: RefCell::new(None),
-            driver: Driver::Codex,
+            driver: std::cell::Cell::new(Driver::Codex),
             model: None,
             mode: Mode::Ask,
         };
@@ -9832,6 +10457,71 @@ pub(super) mod tests {
         assert_eq!(carried_profile(None, work(), Driver::Claude), None);
         assert_eq!(
             carried_profile(Some(Driver::Claude), None, Driver::Claude),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unopened_source_carries_its_stored_profile_only_to_the_same_agent() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store.create_thread("/w", Some("source")).unwrap();
+        let provider = store
+            .add_provider_thread(&source, "claude", "source-model")
+            .unwrap();
+        store
+            .set_active_provider_thread(&source, &provider)
+            .unwrap();
+        store
+            .set_thread_profile(&source, Some("claude-work"))
+            .unwrap();
+        let loaded = load_thread(&store, &source, None).unwrap();
+        for (target, expected) in [(Driver::Claude, Some("claude-work")), (Driver::Codex, None)] {
+            let ids = NewThreadIds {
+                thread: store.new_id().unwrap(),
+                provider: store.new_id().unwrap(),
+            };
+            record_new_thread_as(
+                &store,
+                &ids,
+                &NewThreadSpec {
+                    attributes: agent_kit::store::ThreadAttributes {
+                        profile_id: carried_stored_profile(&loaded, target),
+                        ..Default::default()
+                    },
+                    ..NewThreadSpec::new("/w", target)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                store
+                    .thread_attributes(&ids.thread)
+                    .unwrap()
+                    .profile_id
+                    .as_deref(),
+                expected
+            );
+            assert_eq!(
+                load_provider(&store, &ids.thread).unwrap().unwrap().driver,
+                driver_key(target)
+            );
+        }
+        assert_eq!(
+            store
+                .thread_attributes(&source)
+                .unwrap()
+                .profile_id
+                .as_deref(),
+            Some("claude-work")
+        );
+        let unbound = store.create_thread("/w", Some("no provider")).unwrap();
+        store
+            .set_thread_profile(&unbound, Some("claude-work"))
+            .unwrap();
+        assert_eq!(
+            carried_stored_profile(
+                &load_thread(&store, &unbound, None).unwrap(),
+                Driver::Claude
+            ),
             None
         );
     }

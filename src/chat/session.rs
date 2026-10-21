@@ -5144,6 +5144,24 @@ pub(crate) fn seeded_handoff_events(handoff: &Handoff, source: &str) -> Vec<Enve
     ]
 }
 
+/// What a thread switched in place to `driver` before any session ran it is stored with: the
+/// `HandoffSeeded` the new agent's session re-arms from history, then the same notice a live
+/// switch shows. Carrying nothing, only "Switched to <agent>".
+pub(crate) fn switched_handoff_events(handoff: &Handoff, driver: Driver) -> Vec<Envelope> {
+    let label = driver_label(driver);
+    if handoff.carried == 0 {
+        return vec![Envelope::new(Event::Notice {
+            text: format!("Switched to {label}"),
+        })];
+    }
+    vec![
+        handoff_seeded(handoff),
+        Envelope::new(Event::Notice {
+            text: handoff_notice(&format!("in {label}"), handoff),
+        }),
+    ]
+}
+
 /// What a handoff carried, said plainly: all of the thread, or how much of it (the budget keeps
 /// the first request and the most recent work), and what never travels. `place` reads after
 /// "Continuing": "in Codex", "from “title”".

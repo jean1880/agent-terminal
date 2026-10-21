@@ -2410,7 +2410,7 @@ pub(crate) mod tests {
         }));
         assert_eq!(
             tooltip(),
-            "Claude · sonnet · Switch model or agent (/model)"
+            "Claude · sonnet · Switch model or agent in this thread; stops the current turn (/model)"
         );
 
         backend.status.borrow_mut().pending_model = Some("opus".into());
@@ -2419,7 +2419,7 @@ pub(crate) mod tests {
         }));
         assert_eq!(
             tooltip(),
-            "Claude · sonnet → opus (pending) · Switch model or agent (/model)"
+            "Claude · sonnet → opus (pending) · Switch model or agent in this thread; stops the current turn (/model)"
         );
         assert!(chip.has_css_class("pending"), "a pending switch pulses");
         {
@@ -2433,7 +2433,7 @@ pub(crate) mod tests {
         }));
         assert_eq!(
             tooltip(),
-            "Claude · opus · high · Switch model or agent (/model)",
+            "Claude · opus · high · Switch model or agent in this thread; stops the current turn (/model)",
             "the chip names the effort, which has no other place to show"
         );
         assert!(!chip.has_css_class("pending"), "a settled switch rests");
@@ -2449,7 +2449,10 @@ pub(crate) mod tests {
             model: "unavailable".into(),
             message: "Model is unavailable".into(),
         }));
-        assert_eq!(tooltip(), "Claude · opus · Switch model or agent (/model)");
+        assert_eq!(
+            tooltip(),
+            "Claude · opus · Switch model or agent in this thread; stops the current turn (/model)"
+        );
 
         // The reducer still remembers Claude's model while the replacement provider starts.
         // A pending Codex selection must not make that old model look like a Codex model.
@@ -2463,7 +2466,7 @@ pub(crate) mod tests {
         }));
         assert_eq!(
             tooltip(),
-            "Codex · gpt-5-codex (pending) · Switch model or agent (/model)"
+            "Codex · gpt-5-codex (pending) · Switch model or agent in this thread; stops the current turn (/model)"
         );
         {
             let mut status = backend.status.borrow_mut();
@@ -2475,7 +2478,7 @@ pub(crate) mod tests {
         }));
         assert_eq!(
             tooltip(),
-            "Codex · gpt-5-codex · Switch model or agent (/model)"
+            "Codex · gpt-5-codex · Switch model or agent in this thread; stops the current turn (/model)"
         );
     }
 
