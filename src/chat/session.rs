@@ -260,9 +260,12 @@ struct Inner {
     /// The pending handoff went out with the prompt now running: not sent again unless that turn
     /// ends without completing.
     handoff_in_flight: Cell<bool>,
-    /// The agent produced something since the prompt carrying the handoff went out: the next
-    /// completed turn is the one that carried it ([`handoff_turn_end`]).
-    handoff_answered: Cell<bool>,
+    /// Which turn the prompt carrying the handoff is in, while it is in flight
+    /// ([`handoff_turn_end`]).
+    handoff_turn: Cell<HandoffTurn>,
+    /// The `result` being read ends a turn Claude ran itself for a finished background task
+    /// (`origin.kind` "task-notification"), not one a prompt of ours started.
+    turn_from_task: Cell<bool>,
     /// The agent a switch left, until the new one reports a session (see [`Previous`]).
     rollback: RefCell<Option<Previous>>,
     /// The thread's model was retired by its agent: the next prompt first moves to this one.
@@ -713,7 +716,8 @@ impl ChatSession {
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
             handoff_in_flight: Cell::new(false),
-            handoff_answered: Cell::new(false),
+            handoff_turn: Cell::new(HandoffTurn::Waiting),
+            turn_from_task: Cell::new(false),
             rollback: RefCell::new(None),
             retired: RefCell::new(None),
             selected: RefCell::new(selected),
@@ -1053,6 +1057,11 @@ impl Inner {
                     self.set_model(m);
                 }
                 self.state.borrow_mut().running_turn = true;
+                // The first turn to start after the prompt carrying the handoff went out is the
+                // one that may carry it ([`handoff_turn_end`] judges it as it ends).
+                if self.handoff_in_flight.get() && self.handoff_turn.get() == HandoffTurn::Waiting {
+                    self.handoff_turn.set(HandoffTurn::Open { answered: false });
+                }
                 self.last_enriched_step.set(None);
                 let native = self.adapter.borrow().active_turn();
                 *self.native_turn.borrow_mut() = native.clone();
@@ -1078,17 +1087,17 @@ impl Inner {
                 }
                 // Codex's turn-scoped permission grants ended with the turn.
                 self.codex_turn_grant_paths.borrow_mut().clear();
-                // A completed turn that answered is the proof the new agent read the handoff it
-                // carried. A completed turn with no answer since the prompt went out is not the
-                // one that carried it (Claude's prompt-less init turn, completing before the
-                // prompt sent early is read): it stays in flight for the turn that does. Any other
-                // end (failed, interrupted, the process died) leaves it for the next prompt.
-                match handoff_turn_end(
+                // Only the turn of the prompt that carried the handoff spends it, and only when
+                // it completed with a top-level answer: see `handoff_turn_end`.
+                let end = handoff_turn_end(
                     self.handoff_in_flight.get(),
-                    self.handoff_answered.get(),
+                    self.handoff_turn.get(),
                     *state,
-                ) {
-                    HandoffTurnEnd::NotCarried | HandoffTurnEnd::StillInFlight => {}
+                    self.turn_from_task.replace(false),
+                );
+                match end {
+                    HandoffTurnEnd::NotCarried => {}
+                    HandoffTurnEnd::StillInFlight => self.handoff_turn.set(HandoffTurn::Waiting),
                     HandoffTurnEnd::Undelivered => self.handoff_in_flight.set(false),
                     HandoffTurnEnd::Delivered => {
                         self.handoff_in_flight.set(false);
@@ -1108,9 +1117,14 @@ impl Inner {
             }
             // The agent produced an item: Codex has recorded the turn, so the thread can be
             // resumed even if this turn never completes (2.5).
-            Event::ItemStarted { kind, .. } if *kind != ItemKind::UserMessage => {
-                if self.handoff_in_flight.get() {
-                    self.handoff_answered.set(true);
+            Event::ItemStarted { kind, parent, .. } if *kind != ItemKind::UserMessage => {
+                // A top-level answer in the turn that may carry the handoff. A background
+                // sub-agent's item (it has a parent, and outlives the turn that launched it) says
+                // nothing about our prompt.
+                if parent.is_none() {
+                    if let HandoffTurn::Open { .. } = self.handoff_turn.get() {
+                        self.handoff_turn.set(HandoffTurn::Open { answered: true });
+                    }
                 }
                 self.confirm_provisional_native();
             }
@@ -1933,6 +1947,16 @@ impl Inner {
                 }
             }
         }
+        // A turn Claude ran itself for a finished background task is not one our prompt
+        // started: its end never spends a handoff (`handoff_turn_end`). Read from the frame,
+        // which says where the turn came from; the TurnCompleted it becomes does not.
+        self.turn_from_task.set(
+            !stderr
+                && line.contains("task-notification")
+                && serde_json::from_str::<serde_json::Value>(line).is_ok_and(|frame| {
+                    frame["type"] == "result" && frame["origin"]["kind"] == "task-notification"
+                }),
+        );
         let envelopes = if stderr {
             self.adapter.borrow_mut().feed_stderr(line)
         } else {
@@ -3209,8 +3233,13 @@ impl Inner {
         }
         if accepted && handoff.is_some() {
             self.handoff_in_flight.set(true);
-            // Nothing has answered it yet: only an answer marks the turn that carried it.
-            self.handoff_answered.set(false);
+            // Sent into an open turn (a startup turn waiting for its prompt), that turn takes it
+            // in; else the turn that carries it has not started yet.
+            self.handoff_turn.set(if was_running {
+                HandoffTurn::Open { answered: false }
+            } else {
+                HandoffTurn::Waiting
+            });
         }
         accepted
     }
@@ -4891,28 +4920,68 @@ pub(crate) fn undelivered_handoff<'a>(
     pending
 }
 
+/// Where the prompt carrying the handoff is, while it is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffTurn {
+    /// Sent (or a turn ended that was not its own): no turn has started since.
+    Waiting,
+    /// The first turn to start after it was sent, and whether that turn produced a top-level
+    /// item (an answer, a tool call; never a background sub-agent's).
+    Open { answered: bool },
+}
+
 /// What a turn ending means for the handoff a prompt carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandoffTurnEnd {
     /// No handoff was in flight.
     NotCarried,
-    /// Completed with no answer since the prompt went out: not the turn that carried it (Claude's
-    /// prompt-less init turn). Still in flight, never acknowledged.
+    /// Not the turn that carried it: it stays in flight for the next turn to start.
     StillInFlight,
-    /// Failed or interrupted: the next prompt carries it again.
+    /// The next prompt carries it again.
     Undelivered,
-    /// Completed after an answer: the agent had it. Acknowledged ([`handoff_spent`]).
+    /// The agent had it. Acknowledged ([`handoff_spent`]).
     Delivered,
 }
 
-/// [`HandoffTurnEnd`] for a turn ending in `state`, with a handoff `in_flight` and `answered` or
-/// not since its prompt went out.
-fn handoff_turn_end(in_flight: bool, answered: bool, state: TurnState) -> HandoffTurnEnd {
-    match (in_flight, state, answered) {
-        (false, _, _) => HandoffTurnEnd::NotCarried,
-        (true, TurnState::Completed, true) => HandoffTurnEnd::Delivered,
-        (true, TurnState::Completed, false) => HandoffTurnEnd::StillInFlight,
-        (true, _, _) => HandoffTurnEnd::Undelivered,
+/// [`HandoffTurnEnd`] for a turn ending in `state`, with a handoff `in_flight` whose prompt is
+/// `turn`; `from_task` when the agent ran the turn itself (Claude's task-notification turn).
+///
+/// The correlation: sent with no turn open, the first turn to start afterwards is the one that
+/// reads it; sent into an open turn (a startup turn waiting for its prompt), that turn takes it in
+/// (Claude folds a line written mid-turn into it). That turn spends it only when it completes with
+/// a top-level item after the prompt went out. Dispatch is not held until a startup turn ends: a
+/// startup turn may wait for the prompt to end (it would never send), and a real Claude may run
+/// none (the W0 recording opens its first turn only after the prompt). Every case the stream
+/// cannot tie to our prompt
+/// keeps the handoff, deliberately preferring to send it again (a duplicate costs tokens) over
+/// spending it wrongly (the agent would lose the context):
+/// - no turn started since it was sent: a completed `result` (a stray one) leaves it in flight,
+///   a failed one sends it again;
+/// - a completed turn with no top-level item (Claude's prompt-less startup turn): not ours,
+///   still in flight for the next turn to start;
+/// - a turn the agent ran itself (a task notification), which may have taken our prompt in or
+///   not: sent again with the next prompt;
+/// - failed or interrupted: sent again with the next prompt.
+fn handoff_turn_end(
+    in_flight: bool,
+    turn: HandoffTurn,
+    state: TurnState,
+    from_task: bool,
+) -> HandoffTurnEnd {
+    if !in_flight {
+        return HandoffTurnEnd::NotCarried;
+    }
+    match (turn, state, from_task) {
+        (HandoffTurn::Waiting, TurnState::Completed, _) => HandoffTurnEnd::StillInFlight,
+        (HandoffTurn::Waiting, _, _) => HandoffTurnEnd::Undelivered,
+        (HandoffTurn::Open { .. }, _, true) => HandoffTurnEnd::Undelivered,
+        (HandoffTurn::Open { answered: true }, TurnState::Completed, false) => {
+            HandoffTurnEnd::Delivered
+        }
+        (HandoffTurn::Open { answered: false }, TurnState::Completed, false) => {
+            HandoffTurnEnd::StillInFlight
+        }
+        (HandoffTurn::Open { .. }, _, false) => HandoffTurnEnd::Undelivered,
     }
 }
 
@@ -5420,7 +5489,8 @@ mod tests {
         )
     }
 
-    /// [`idle_claude`] that answers each prompt with a line of text before its result.
+    /// [`idle_claude`] that answers each prompt as a real Claude does: an `init` opening the
+    /// turn, a line of text, then its result.
     fn answering_claude(dir: &Path) -> OpenSession {
         scripted(
             dir,
@@ -5429,6 +5499,7 @@ mod tests {
              echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
              while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
              case \"$line\" in *'\"type\":\"user\"'*) \
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'; \
              echo '{\"type\":\"assistant\",\"uuid\":\"u1\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'; \
              echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
         )
@@ -5714,11 +5785,11 @@ mod tests {
         });
     }
 
-    /// A prompt carrying the handoff is sent before Claude's init; the prompt-less init turn
-    /// completes, then Claude exits before answering the prompt. That init turn is not the one
-    /// that carried the handoff: nothing is acknowledged, and a reopen still owes it.
-    #[test]
-    fn an_init_turn_completing_before_the_prompted_one_does_not_spend_the_handoff() {
+    /// A Claude that takes a prompt carrying the handoff before its init, writes `turn` (the
+    /// frames of one turn that is not the prompt's own), then exits before answering the prompt.
+    /// Nothing may be acknowledged: a reopen still owes the handoff. `shown` must hold for one
+    /// event, so the fixture provably played its part.
+    fn early_prompt_then_another_turn_then_exit(turn: &str, shown: fn(&Event) -> bool) {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
@@ -5740,16 +5811,15 @@ mod tests {
                     .map(|(_, e)| e)
                     .collect()
             };
-            // Takes the early prompt, completes its prompt-less init turn, and dies before
-            // answering the prompt.
             let open = scripted(
                 tmp.path(),
-                "IFS= read -r handshake\n\
-                 IFS= read -r line\n\
-                 printf '%s\\n' \"$line\" >> \"$D/prompts.log\"\n\
-                 echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
-                 echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
-                 exit 0",
+                &format!(
+                    "IFS= read -r handshake\n\
+                     IFS= read -r line\n\
+                     printf '%s\\n' \"$line\" >> \"$D/prompts.log\"\n\
+                     {turn}\n\
+                     exit 0"
+                ),
             );
             let (sink, seen) = make_sink();
             let session = ChatSession::new(
@@ -5770,8 +5840,9 @@ mod tests {
                         ..
                     }
                 )) && !session.status().alive),
-                "the init turn never completed, or the agent never exited"
+                "the other turn never completed, or the agent never exited"
             );
+            assert!(has(&seen, shown), "the fixture did not play its part");
             assert!(lines(tmp.path().join("prompts.log"))
                 .iter()
                 .any(|l| l.contains("earlier context")));
@@ -5779,7 +5850,7 @@ mod tests {
                 !history()
                     .iter()
                     .any(|e| matches!(e.event, Event::HandoffSeeded { carried: 0, .. })),
-                "the init turn is not the one that carried it"
+                "that turn is not the one that carried it"
             );
             assert_eq!(
                 undelivered_handoff(&history()),
@@ -5789,29 +5860,70 @@ mod tests {
         });
     }
 
+    const CLAUDE_INIT: &str = "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'";
+    const CLAUDE_RESULT: &str =
+        "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'";
+
+    /// Claude's prompt-less startup turn completes before the early prompt is read.
+    #[test]
+    fn an_init_turn_completing_before_the_prompted_one_does_not_spend_the_handoff() {
+        early_prompt_then_another_turn_then_exit(&format!("{CLAUDE_INIT}\n{CLAUDE_RESULT}"), |e| {
+            matches!(e, Event::TurnStarted { .. })
+        });
+    }
+
+    /// (a) A background sub-agent's item (it has a parent) arrives in that startup turn: it is
+    /// no answer to our prompt.
+    #[test]
+    fn a_background_childs_item_is_no_answer_to_the_handoff() {
+        let child = "echo '{\"type\":\"assistant\",\"uuid\":\"sub1\",\"parent_tool_use_id\":\"toolu_bg\",\"message\":{\"id\":\"m-sub1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_child\",\"name\":\"Read\",\"input\":{\"file_path\":\"/x\"}}]}}'";
+        early_prompt_then_another_turn_then_exit(
+            &format!("{CLAUDE_INIT}\n{child}\n{CLAUDE_RESULT}"),
+            |e| {
+                matches!(
+                    e,
+                    Event::ItemStarted {
+                        parent: Some(_),
+                        ..
+                    }
+                )
+            },
+        );
+    }
+
+    /// (b) A turn Claude runs itself for a finished background task answers and completes while
+    /// the handoff is in flight: it is not our prompt's turn.
+    #[test]
+    fn a_task_notification_turn_does_not_spend_the_handoff() {
+        let answer = "echo '{\"type\":\"assistant\",\"uuid\":\"u1\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"The task finished.\"}]}}'";
+        let result = "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"origin\":{\"kind\":\"task-notification\",\"producer\":\"session-task\"}}'";
+        early_prompt_then_another_turn_then_exit(
+            &format!("{CLAUDE_INIT}\n{answer}\n{result}"),
+            |e| matches!(e, Event::ItemStarted { parent: None, kind, .. } if *kind != ItemKind::UserMessage),
+        );
+    }
+
     #[test]
     fn a_turn_spends_the_handoff_only_once_it_answered() {
+        use HandoffTurn::{Open, Waiting};
         use HandoffTurnEnd as E;
-        assert_eq!(
-            handoff_turn_end(false, true, TurnState::Completed),
-            E::NotCarried
-        );
-        assert_eq!(
-            handoff_turn_end(true, false, TurnState::Completed),
-            E::StillInFlight
-        );
-        assert_eq!(
-            handoff_turn_end(true, true, TurnState::Completed),
-            E::Delivered
-        );
-        assert_eq!(
-            handoff_turn_end(true, true, TurnState::Interrupted),
-            E::Undelivered
-        );
-        assert_eq!(
-            handoff_turn_end(true, false, TurnState::Failed),
-            E::Undelivered
-        );
+        use TurnState::{Completed, Failed, Interrupted};
+        let end =
+            |in_flight, turn, state, from_task| handoff_turn_end(in_flight, turn, state, from_task);
+        let answered = Open { answered: true };
+        let silent = Open { answered: false };
+        assert_eq!(end(false, answered, Completed, false), E::NotCarried);
+        // Its own turn, answered and completed: delivered.
+        assert_eq!(end(true, answered, Completed, false), E::Delivered);
+        // A turn with no top-level answer (a prompt-less startup turn): not its own.
+        assert_eq!(end(true, silent, Completed, false), E::StillInFlight);
+        // No turn started since it was sent: a stray result.
+        assert_eq!(end(true, Waiting, Completed, false), E::StillInFlight);
+        assert_eq!(end(true, Waiting, Failed, false), E::Undelivered);
+        // A turn the agent ran itself: never spends it, sent again.
+        assert_eq!(end(true, answered, Completed, true), E::Undelivered);
+        assert_eq!(end(true, answered, Interrupted, false), E::Undelivered);
+        assert_eq!(end(true, silent, Failed, false), E::Undelivered);
     }
 
     #[test]
@@ -7165,7 +7277,11 @@ mod tests {
                 stored(&store).is_some(),
                 "an unanswered turn spends nothing"
             );
-            // A completed turn that answered spends it, in the session and in the store.
+            // The turn of that prompt, completed with an answer, spends it, in the session and
+            // in the store.
+            session
+                .inner
+                .emit(Envelope::new(Event::TurnStarted { model: None }));
             session.inner.emit(
                 Envelope::new(Event::ItemStarted {
                     kind: ItemKind::AssistantMessage,
