@@ -694,7 +694,12 @@ fn redact_assignments(line: &str) -> (String, bool) {
             i += 1;
             continue;
         }
+        // Blanks may stand on either side of the separator (`NAME = value`, `"name" : "value"`):
+        // a name is never missed for them, or its value would be kept whole.
         let mut name_end = i;
+        while name_end > 0 && matches!(bytes[name_end - 1], b' ' | b'\t') {
+            name_end -= 1;
+        }
         if name_end > 0 && matches!(bytes[name_end - 1], b'"' | b'\'') {
             name_end -= 1;
         }
@@ -708,7 +713,15 @@ fn redact_assignments(line: &str) -> (String, bool) {
         }
 
         let mut value_start = i + 1;
-        while value_start < len && bytes[value_start] == b' ' {
+        // Two-byte separators: `NAME := value` (Go, make) and `'name' => 'value'` (PHP, Ruby,
+        // Perl). Not `==`: a comparison assigns nothing.
+        if matches!(
+            (bytes[i], bytes.get(value_start)),
+            (b':', Some(b'=')) | (b'=', Some(b'>'))
+        ) {
+            value_start += 1;
+        }
+        while value_start < len && matches!(bytes[value_start], b' ' | b'\t') {
             value_start += 1;
         }
         let quote = match bytes.get(value_start) {
@@ -880,10 +893,78 @@ mod tests {
         assert!(redact_keyed("note", "ghp_abcdefghijklmnopqrstuvwxyz0123").starts_with("****"));
     }
 
+    /// Blanks around the separator never hide a secret: each of these leaked whole before.
+    #[test]
+    fn spaced_assignments_are_masked_too() {
+        for (text, leaked, kept) in [
+            (
+                "DB_PASSWORD = hunter2hunter2xyz",
+                "hunter2hunter2",
+                "DB_PASSWORD = ****2xyz",
+            ),
+            (
+                "DB_PASSWORD =hunter2hunter2xyz",
+                "hunter2hunter2",
+                "DB_PASSWORD =****2xyz",
+            ),
+            (
+                "DB_PASSWORD\t=\thunter2hunter2xyz",
+                "hunter2hunter2",
+                "DB_PASSWORD\t=\t****2xyz",
+            ),
+            (
+                "api_key : \"plainvalue123abc\"",
+                "plainvalue123",
+                "api_key : \"****3abc\"",
+            ),
+            (
+                "\"api_key\" : \"plainvalue123abc\"",
+                "plainvalue123",
+                "\"api_key\" : \"****3abc\"",
+            ),
+            // Low-entropy values: a detector-shaped fixture trips the secret scanners.
+            (
+                "export SECRET_TOKEN = tokentokentoken1",
+                "tokentokentoken",
+                "SECRET_TOKEN = ****ken1",
+            ),
+            (
+                "client_secret  :  secretsecret5678",
+                "secretsecret",
+                "client_secret  :  ****5678",
+            ),
+            (
+                "DB_PASSWORD := hunter2hunter2xyz",
+                "hunter2hunter2",
+                "DB_PASSWORD := ****2xyz",
+            ),
+            (
+                "'password' => 'hunter2hunter2xyz'",
+                "hunter2hunter2",
+                "'password' => '****2xyz'",
+            ),
+            (
+                "password=>hunter2hunter2xyz",
+                "hunter2hunter2",
+                "password=>****2xyz",
+            ),
+        ] {
+            let out = redact(text);
+            assert!(
+                !out.contains(leaked),
+                "{leaked} leaked from {text:?}: {out}"
+            );
+            assert!(out.contains(kept), "{text:?} -> {out}");
+        }
+    }
+
     #[test]
     fn harmless_assignments_survive() {
         let text = "keyboard=us\nPATH=/usr/bin:/bin\nname: agent-terminal";
         assert_eq!(redact(text), text);
+        // Spaced, a harmless name or a comparison is still left alone.
+        let spaced = "keyboard = us\nname : agent-terminal\nif password == other {";
+        assert_eq!(redact(spaced), spaced);
     }
 
     #[test]

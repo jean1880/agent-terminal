@@ -954,6 +954,29 @@ mod tests {
         }
     }
 
+    /// Blanks or a two-byte separator between a secret's name and its value: cut anywhere,
+    /// the stream still publishes exactly `redact`, and never the value. (Not in `fixtures()`,
+    /// whose outputs `BASELINE` freezes from before these shapes were masked.)
+    #[test]
+    fn spaced_and_two_byte_assignments_stream_like_redact() {
+        for (text, leaked) in [
+            ("DB_PASSWORD = hunter2hunter2xyz next\n", "hunter2hunter2"),
+            ("\"api_key\" :\t\"plainvalue123abc\", x\n", "plainvalue123"),
+            ("DB_PASSWORD := hunter2hunter2xyz\n", "hunter2hunter2"),
+            ("'password' => 'hunter2hunter2xyz'\n", "hunter2hunter2"),
+        ] {
+            let expected = redact(text);
+            assert!(!expected.contains(leaked), "{expected:?}");
+            let cuts = boundaries(text);
+            for &i in &cuts {
+                for &j in cuts.iter().filter(|&&j| j >= i) {
+                    let out = run(&[&text[..i], &text[i..j], &text[j..]]);
+                    assert_eq!(out, expected, "split at {i},{j}: {text:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn char_by_char_publishes_exactly_redact() {
         for (text, _) in fixtures() {
