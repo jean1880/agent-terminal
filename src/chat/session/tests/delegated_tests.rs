@@ -862,6 +862,61 @@ fn agy_final_launch_refusal_exposes_no_process_or_successful_facts() {
     });
 }
 
+/// A message sent into a start whose launch is then refused is kept, said so, and goes first
+/// when the agent next starts: never dropped with the refused start's writes.
+#[test]
+fn a_refused_launch_keeps_its_message_and_sends_it_first_next_time() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &tmp.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        hooks.refuse_spawn.set(true);
+        let session = ChatSession::with_options(
+            Box::new(AgyAdapter::new("agy")),
+            scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            LaunchEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        session.send_prompt("the kept message");
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        assert!(!tmp.path().join("args.log").exists(), "nothing spawned");
+        let kept_notice = || {
+            has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("did not reach the agent")),
+            )
+        };
+        assert!(kept_notice(), "the user is told the message was kept");
+
+        // The cause is fixed: the next message starts the agent, the kept one goes first, and
+        // the new one waits behind it (this agent never ends its turn).
+        hooks.refuse_spawn.set(false);
+        session.send_prompt("the next message");
+        let stdin = tmp.path().join("stdin.log");
+        let written = || std::fs::read_to_string(&stdin).unwrap_or_default();
+        assert!(
+            pump_until(ctx, 10, || written().contains("the kept message")),
+            "the kept message reached the agent: {:?}",
+            written()
+        );
+        assert!(
+            !written().contains("the next message"),
+            "the new message waits behind the kept one: {:?}",
+            written()
+        );
+    });
+}
+
 #[test]
 fn shutdown_cancels_a_pending_proof_even_if_the_process_is_already_dead() {
     in_loop(|ctx| {
@@ -872,6 +927,7 @@ fn shutdown_cancels_a_pending_proof_even_if_the_process_is_already_dead() {
         *session.inner.starting.borrow_mut() = Some(PendingStart {
             generation,
             writes: vec!["must not reach a replacement process".to_owned()],
+            prompts: Vec::new(),
         });
         let process_generation = session.process_generation();
         session.shutdown(false);

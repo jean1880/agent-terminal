@@ -135,10 +135,12 @@ fn set_test_hook_check(check: HookCheck) {
     TEST_HOOK_CHECK.with(|slot| *slot.borrow_mut() = Some(check));
 }
 
-/// An agy process waiting on its fresh hook proof: what was written to it meanwhile, in order.
+/// An agy process waiting on its fresh hook proof: what was written to it meanwhile, in order,
+/// and the prompts behind those writes, kept if the start is refused or fails to spawn.
 struct PendingStart {
     generation: u64,
     writes: Vec<String>,
+    prompts: Vec<Sent>,
 }
 
 fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
@@ -1498,6 +1500,7 @@ impl Inner {
         *self.starting.borrow_mut() = Some(PendingStart {
             generation,
             writes: Vec::new(),
+            prompts: Vec::new(),
         });
         self.state.borrow_mut().alive = true;
         self.notify_lifecycle();
@@ -1545,7 +1548,7 @@ impl Inner {
         if self.generation.get() != generation || self.stopping.get() {
             return;
         }
-        self.spawn_spec_with_writes(generation, spec, pending.writes);
+        self.spawn_spec_with_writes(generation, spec, pending.writes, pending.prompts);
     }
 
     /// The hook could not be proven right before a start: agy runs without the skip flag and
@@ -1600,7 +1603,7 @@ impl Inner {
     }
 
     fn spawn_spec(self: &Rc<Self>, generation: u64, spec: SpawnSpec) {
-        self.spawn_spec_with_writes(generation, spec, Vec::new());
+        self.spawn_spec_with_writes(generation, spec, Vec::new(), Vec::new());
     }
 
     fn spawn_spec_with_writes(
@@ -1608,10 +1611,11 @@ impl Inner {
         generation: u64,
         mut spec: SpawnSpec,
         writes: Vec<String>,
+        prompts: Vec<Sent>,
     ) {
         if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
             self.spawn_spec_now(generation, spec, None);
-            self.flush_start_writes(generation, writes);
+            self.flush_or_keep(generation, writes, prompts);
             return;
         }
         let Some(hooks) = self.hooks.clone() else {
@@ -1655,7 +1659,11 @@ impl Inner {
                     .iter()
                     .any(|arg| arg == "--dangerously-skip-permissions"),
         };
-        *self.starting.borrow_mut() = Some(PendingStart { generation, writes });
+        *self.starting.borrow_mut() = Some(PendingStart {
+            generation,
+            writes,
+            prompts,
+        });
         self.state.borrow_mut().alive = true;
         let cwd = spec.cwd.clone();
         let weak = Rc::downgrade(self);
@@ -1713,6 +1721,7 @@ impl Inner {
                 ));
                 if inner.generation.get() == generation {
                     inner.finish_process(Some(1), false);
+                    inner.keep_unsent_prompts(pending.prompts);
                 }
                 return;
             }
@@ -1720,12 +1729,51 @@ impl Inner {
                 inner.error("The agent's configuration redirect environment changed during its launch check; it was not started.");
                 if inner.generation.get() == generation {
                     inner.finish_process(Some(1), false);
+                    inner.keep_unsent_prompts(pending.prompts);
                 }
                 return;
             }
             inner.spawn_spec_now(generation, spec, Some(facts));
-            inner.flush_start_writes(generation, pending.writes);
+            inner.flush_or_keep(generation, pending.writes, pending.prompts);
         });
+    }
+
+    /// After a held start's spawn: its writes go to the process, or, when it did not spawn, the
+    /// prompts behind them are kept. A start that was stopped or replaced meanwhile drops both,
+    /// as a stop always did.
+    fn flush_or_keep(&self, generation: u64, writes: Vec<String>, prompts: Vec<Sent>) {
+        if self.generation.get() != generation {
+            return;
+        }
+        if self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()) {
+            self.flush_start_writes(generation, writes);
+        } else {
+            self.keep_unsent_prompts(prompts);
+        }
+    }
+
+    /// Prompts that never reached an agent (its launch was refused, or it did not spawn): held,
+    /// in order, ahead of anything sent later, and sent when the agent next starts. Said, not
+    /// stored: they live in memory only, and a stored promise could outlast them.
+    fn keep_unsent_prompts(&self, prompts: Vec<Sent>) {
+        if prompts.is_empty() {
+            return;
+        }
+        let kept = prompts.len();
+        self.held_retries.borrow_mut().extend(prompts);
+        self.prompt_in_flight.set(false);
+        self.deliver(&Envelope::new(Event::Notice {
+            text: if kept == 1 {
+                "Your message did not reach the agent. It is kept, and goes first when the agent \
+                 next starts."
+                    .to_owned()
+            } else {
+                format!(
+                    "Your {kept} messages did not reach the agent. They are kept, and go first \
+                     when the agent next starts."
+                )
+            },
+        }));
     }
 
     fn flush_start_writes(&self, generation: u64, writes: Vec<String>) {
@@ -3218,9 +3266,13 @@ impl Inner {
             self.queue_prompt(text);
             return;
         }
+        // Anything already waiting goes first: queued messages, and prompts a refused or failed
+        // start kept (`held_retries`).
+        let waiting =
+            !self.queued_prompts.borrow().is_empty() || !self.held_retries.borrow().is_empty();
         if self.dispatching_queue.get()
             || self.delivering.get()
-            || !self.state.borrow().running_turn && !self.queued_prompts.borrow().is_empty()
+            || !self.state.borrow().running_turn && waiting
         {
             self.queue_prompt(text);
             self.dispatch_queued_prompt();
@@ -3336,6 +3388,17 @@ impl Inner {
         if accepted {
             self.prompted.set(true);
             self.remember_pre_init_prompt(sent, handoff.clone());
+            // Written into a start that has not spawned yet: kept with it, so a refused or
+            // failed launch can hold the prompt instead of dropping it with the writes.
+            let live = self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
+            if !live {
+                if let Some(pending) = self.starting.borrow_mut().as_mut() {
+                    pending.prompts.push(Sent {
+                        text: sent.to_owned(),
+                        handoff: handoff.clone(),
+                    });
+                }
+            }
         }
         if !accepted && starts_turn {
             self.state.borrow_mut().running_turn = was_running;
