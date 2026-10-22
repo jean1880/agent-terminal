@@ -299,6 +299,48 @@ fn source_names(codex: bool) -> &'static str {
     }
 }
 
+/// A sync button's label and whether it can be pressed.
+#[derive(Debug, PartialEq, Eq)]
+struct SyncButton {
+    label: &'static str,
+    sensitive: bool,
+}
+
+/// The import and export buttons for a status. "Synced" is only claimed for what was
+/// checked: when Codex's rules could not be read, the import side says "Not Checked".
+fn sync_button_states(
+    status: &crate::always_allow::PermissionSyncStatus,
+) -> (SyncButton, SyncButton) {
+    let import = if status.unimported_count > 0 {
+        SyncButton {
+            label: "Import Now",
+            sensitive: true,
+        }
+    } else if status.is_unknown() {
+        SyncButton {
+            label: "Not Checked",
+            sensitive: false,
+        }
+    } else {
+        SyncButton {
+            label: "Synced",
+            sensitive: false,
+        }
+    };
+    let export = if status.unexported_count > 0 {
+        SyncButton {
+            label: "Export Now",
+            sensitive: true,
+        }
+    } else {
+        SyncButton {
+            label: "Synced",
+            sensitive: false,
+        }
+    };
+    (import, export)
+}
+
 impl AgentTerminalWindow {
     pub(super) fn flush_agent_edits(&self) {
         let timers: Vec<_> = self
@@ -1058,7 +1100,8 @@ impl AgentTerminalWindow {
             "One-way export: push Agent Terminal's saved rules to permissions.toml and agent \
              configurations"
         };
-        if status.is_out_of_sync() {
+        let (import_state, export_state) = sync_button_states(status);
+        if status.needs_attention() {
             warning_row.set_subtitle(&status.summary());
             warning_row.set_visible(true);
 
@@ -1074,14 +1117,18 @@ impl AgentTerminalWindow {
                     },
                     source_names(codex)
                 ));
-                import_btn.set_sensitive(true);
-                import_btn.set_label("Import Now");
+            } else if status.is_unknown() {
+                import_row.add_css_class("warning");
+                import_row.set_subtitle(&format!(
+                    "Codex's rules could not be read, so nothing was checked for import from {}",
+                    source_names(codex)
+                ));
             } else {
                 import_row.remove_css_class("warning");
                 import_row.set_subtitle(&import_idle);
-                import_btn.set_sensitive(false);
-                import_btn.set_label("Synced");
             }
+            import_btn.set_sensitive(import_state.sensitive);
+            import_btn.set_label(import_state.label);
 
             if status.unexported_count > 0 {
                 export_row.add_css_class("warning");
@@ -1094,25 +1141,23 @@ impl AgentTerminalWindow {
                         "s"
                     }
                 ));
-                export_btn.set_sensitive(true);
-                export_btn.set_label("Export Now");
             } else {
                 export_row.remove_css_class("warning");
                 export_row.set_subtitle(export_idle);
-                export_btn.set_sensitive(false);
-                export_btn.set_label("Synced");
             }
+            export_btn.set_sensitive(export_state.sensitive);
+            export_btn.set_label(export_state.label);
         } else {
             warning_row.set_visible(false);
             import_row.remove_css_class("warning");
             import_row.set_subtitle(&import_idle);
-            import_btn.set_sensitive(false);
-            import_btn.set_label("Synced");
+            import_btn.set_sensitive(import_state.sensitive);
+            import_btn.set_label(import_state.label);
 
             export_row.remove_css_class("warning");
             export_row.set_subtitle(export_idle);
-            export_btn.set_sensitive(false);
-            export_btn.set_label("Synced");
+            export_btn.set_sensitive(export_state.sensitive);
+            export_btn.set_label(export_state.label);
         }
     }
 
@@ -1296,7 +1341,7 @@ impl AgentTerminalWindow {
         } = view;
         let subtitle = if let Some(blocked) = blocked {
             blocked
-        } else if status.is_out_of_sync() {
+        } else if status.needs_attention() {
             format!(
                 "Warning: {}. Rules that automatically approve matching commands and tools.",
                 status.summary()
@@ -2331,6 +2376,30 @@ fn detect_agent(command: &str) -> Result<String, String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn sync_buttons_never_claim_synced_for_unread_codex_rules() {
+        use crate::always_allow::PermissionSyncStatus;
+        let label = |s: &PermissionSyncStatus| {
+            let (i, e) = sync_button_states(s);
+            (i.label, i.sensitive, e.label, e.sensitive)
+        };
+        assert_eq!(
+            label(&PermissionSyncStatus::default()),
+            ("Synced", false, "Synced", false)
+        );
+        let refused = PermissionSyncStatus {
+            codex_refused: Some("unreadable".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(label(&refused), ("Not Checked", false, "Synced", false));
+        let counted = PermissionSyncStatus {
+            unimported_count: 1,
+            unexported_count: 2,
+            ..refused
+        };
+        assert_eq!(label(&counted), ("Import Now", true, "Export Now", true));
+    }
 
     #[test]
     fn ready_summary_names_the_ready_agents_or_warns() {
