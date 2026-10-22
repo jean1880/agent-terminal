@@ -507,6 +507,9 @@ struct ServerInner {
     pending: RefCell<HashMap<String, Pending>>,
     /// Expiring a process also invalidates grants whose reply is still being written.
     response_generation: Cell<u64>,
+    /// Connections the accept loop has taken: a test's signal that one was accepted.
+    #[cfg(test)]
+    accepted: Cell<usize>,
     mode: Cell<Mode>,
     workspaces: Vec<PathBuf>,
     /// The user's home, for the dotfile rule of [`sensitive_target`]; `None` applies no such rule.
@@ -685,6 +688,8 @@ impl ApprovalHandle {
             sink: RefCell::new(None),
             pending: RefCell::new(HashMap::new()),
             response_generation: Cell::new(0),
+            #[cfg(test)]
+            accepted: Cell::new(0),
             mode: Cell::new(mode),
             workspaces: vec![workspace.to_owned()],
             home,
@@ -1209,11 +1214,18 @@ fn spawn_accept_loop(weak: Weak<ServerInner>, listener: gio::SocketListener) {
         loop {
             match listener.accept_future().await {
                 Ok((conn, _)) => {
-                    if weak.strong_count() == 0 {
+                    // The agent this connection came from is the one current now, at accept,
+                    // not whenever `serve` is first polled: an `expire_all` in between must
+                    // still be seen.
+                    let Some(generation) = weak.upgrade().map(|i| {
+                        #[cfg(test)]
+                        i.accepted.set(i.accepted.get() + 1);
+                        i.response_generation.get()
+                    }) else {
                         deny(conn, "agent-terminal session closed");
                         break;
-                    }
-                    glib::spawn_future_local(serve(weak.clone(), conn));
+                    };
+                    glib::spawn_future_local(serve(weak.clone(), conn, generation));
                 }
                 Err(e)
                     if e.matches(gio::IOErrorEnum::Closed)
@@ -1294,7 +1306,10 @@ fn deny(conn: gio::SocketConnection, reason: &str) {
     );
 }
 
-async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
+/// `generation`: the server's response generation when the connection was accepted. An
+/// `expire_all` since then means the agent it came from is gone, and its request must not
+/// become a card.
+async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection, generation: u64) {
     let data = gio::DataInputStream::new(&conn.input_stream());
     let line =
         match glib::future_with_timeout(QUERY_TIMEOUT, data.read_line_future(IO_PRIORITY)).await {
@@ -1304,6 +1319,9 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     let Some(inner) = weak.upgrade() else {
         return deny(conn, "agent-terminal session closed");
     };
+    if inner.response_generation.get() != generation {
+        return deny(conn, "the agent restarted");
+    }
     let query = match approval::parse_query(&line) {
         Ok(q) if !q.id.is_empty() => q,
         _ => return deny(conn, "malformed approval request"),
@@ -2866,6 +2884,66 @@ mod tests {
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
             assert_eq!(seen.borrow()[3].event, Event::ApprovalExpired);
+        });
+    }
+
+    #[test]
+    fn a_request_read_after_its_agent_expired_is_denied_without_a_card() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            // The hook connects; the server accepts and waits for its line.
+            let mut s = UnixStream::connect(handle.socket_path()).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(15)))
+                .expect("timeout");
+            assert!(
+                pump_until(ctx, 5, || handle.inner.accepted.get() == 1),
+                "the server accepted the connection"
+            );
+            // The agent exits before the line arrives.
+            handle.expire_all("the agent exited");
+            let line = approval::encode_query(&with_id(cmd("ls"), "x1")).expect("encode");
+            writeln!(s, "{line}").expect("send");
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reply = String::new();
+                BufReader::new(s).read_line(&mut reply).expect("reply");
+                tx.send(reply).expect("deliver");
+            });
+            let r = wait_reply(ctx, &rx);
+            assert_eq!(r.decision, Decision::Deny);
+            assert_eq!(r.reason.as_deref(), Some("the agent restarted"));
+            assert!(request_id(&seen).is_none(), "no card for a dead agent");
+            assert!(!handle.has_pending("x1"));
+        });
+    }
+
+    /// The generation is the one current at accept: an `expire_all` after the accept but before
+    /// the request is handled at all still refuses it.
+    #[test]
+    fn a_request_accepted_before_its_agent_expired_is_denied_even_if_not_yet_served() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            let mut s = UnixStream::connect(handle.socket_path()).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(15)))
+                .expect("timeout");
+            // The line is already there when the server gets to the connection.
+            let line = approval::encode_query(&with_id(cmd("ls"), "x2")).expect("encode");
+            writeln!(s, "{line}").expect("send");
+            // Accepted (`serve` is only scheduled), then the agent exits.
+            assert!(pump_until(ctx, 5, || handle.inner.accepted.get() == 1));
+            handle.expire_all("the agent exited");
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reply = String::new();
+                BufReader::new(s).read_line(&mut reply).expect("reply");
+                tx.send(reply).expect("deliver");
+            });
+            let r = wait_reply(ctx, &rx);
+            assert_eq!(r.decision, Decision::Deny);
+            assert!(request_id(&seen).is_none(), "no card for a dead agent");
+            assert!(!handle.has_pending("x2"));
         });
     }
 

@@ -243,6 +243,10 @@ pub(crate) trait DelegationHooks {
     /// After a successful spawn: the supervisor keeps `watch` until it reports
     /// `StopPhase::Exited`.
     fn process_started(&self, generation: ProcessGeneration, pid: Option<i32>, watch: ExitWatch);
+    /// The binding taken for `generation` will never reach a process: its launch was refused,
+    /// failed to spawn, or was stopped first. No exit will ever be observed for it, so what
+    /// [`Self::binding`] issued (its token, its overlay file) is released now. Never blocks.
+    fn launch_abandoned(&self, _generation: ProcessGeneration) {}
     /// The session closed this generation out (`finish_process`, which also runs for a deliberate
     /// stop). This is NOT an observed exit: kill the token and end runs, but free no process slot
     /// and unlink nothing.

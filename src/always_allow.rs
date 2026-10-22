@@ -3365,7 +3365,35 @@ impl PermissionSyncStatus {
         self.unimported_count > 0 || self.unexported_count > 0
     }
 
+    /// Whether Codex's own rules could not be read, so the import side is unchecked: neither
+    /// in sync nor out of it.
+    pub fn is_unknown(&self) -> bool {
+        self.codex_refused.is_some()
+    }
+
+    /// Whether the user should be told something: a difference, or something unchecked.
+    pub fn needs_attention(&self) -> bool {
+        self.is_out_of_sync() || self.is_unknown()
+    }
+
     pub fn summary(&self) -> String {
+        let counts = self.counts_summary();
+        match &self.codex_refused {
+            None => counts,
+            Some(reason) => {
+                let unknown = format!(
+                    "Codex's rules could not be read ({reason}), so whether they are in sync is unknown"
+                );
+                if self.is_out_of_sync() {
+                    format!("{counts}. {unknown}")
+                } else {
+                    unknown
+                }
+            }
+        }
+    }
+
+    fn counts_summary(&self) -> String {
         match (self.unimported_count, self.unexported_count) {
             (0, 0) => "Permission rules are in sync with agent configurations".to_string(),
             (i, 0) => format!(
@@ -5185,6 +5213,35 @@ mcp = [
         assert_eq!(status.unexported_count, 0, "{status:?}");
         assert_eq!(status.unimported_count, 0, "{status:?}");
         assert!(!status.is_out_of_sync());
+        assert!(!status.is_unknown());
+        assert!(!status.needs_attention());
+    }
+
+    #[test]
+    fn unreadable_codex_rules_are_unknown_not_in_sync() {
+        let refused = PermissionSyncStatus {
+            codex_refused: Some("the file is unreadable".to_string()),
+            ..Default::default()
+        };
+        assert!(refused.is_unknown());
+        assert!(!refused.is_out_of_sync());
+        assert!(refused.needs_attention());
+        let summary = refused.summary();
+        assert!(!summary.contains("are in sync with"), "{summary}");
+        assert!(summary.contains("could not be read (the file is unreadable)"));
+        assert!(summary.contains("unknown"));
+
+        let both = PermissionSyncStatus {
+            unimported_count: 2,
+            codex_refused: Some("the file is unreadable".to_string()),
+            ..Default::default()
+        };
+        let summary = both.summary();
+        assert!(
+            summary.contains("2 external rules are not imported"),
+            "{summary}"
+        );
+        assert!(summary.contains("unknown"), "{summary}");
     }
 
     // ---- Codex rules ----

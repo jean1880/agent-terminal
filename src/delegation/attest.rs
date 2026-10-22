@@ -161,12 +161,42 @@ impl DelegationHooks for Hooks {
             pid: None,
             issued: Instant::now(),
         });
-        // The watch is attached only after a successful spawn. Keep the overlay until then.
-        w.pending_overlay = prep.overlay;
+        // The watch is attached only after a successful spawn. Keep the overlay until then. One
+        // still pending belongs to an earlier start that never spawned: nothing else removes it.
+        let stale = std::mem::replace(&mut w.pending_overlay, prep.overlay);
         w.row.delegation_status = "available".into();
         w.observed = ObservedCalls::new(sup.salt, sup.limits.observed_calls as usize);
         w.seen_calls.clear();
+        if let Some(path) = stale {
+            gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+        }
         Some(prep.launch)
+    }
+    fn launch_abandoned(&self, generation: ProcessGeneration) {
+        let Some(sup) = self.supervisor.upgrade() else {
+            return;
+        };
+        let overlay = {
+            let mut state = sup.state.borrow_mut();
+            let Some(w) = state.workers.get_mut(&self.worker) else {
+                return;
+            };
+            // A generation that did start reports its own exit; only an unspawned one is ours.
+            if w.generations.contains_key(&generation) {
+                return;
+            }
+            // Its token was never presented by a process: nothing can still be using it.
+            if w.token
+                .as_ref()
+                .is_some_and(|t| t.generation == generation && t.pid.is_none())
+            {
+                w.token = None;
+            }
+            w.pending_overlay.take()
+        };
+        if let Some(path) = overlay {
+            gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+        }
     }
     fn process_started(&self, generation: ProcessGeneration, pid: Option<i32>, watch: ExitWatch) {
         let Some(sup) = self.supervisor.upgrade() else {
@@ -580,10 +610,14 @@ fn observe_calls(
         Driver::Agy => {
             let p = v.get("step_update").unwrap_or(v);
             let params = p.pointer("/tool_info/parameters");
+            // agy builds have spelt these parameters in more than one case; any of them is the
+            // same call, still only ever read from agy's own stream.
+            let param = |names: &[&str]| -> Option<&Value> {
+                let params = params?;
+                names.iter().find_map(|n| params.get(*n))
+            };
             if p.get("tool_name").and_then(Value::as_str) != Some("call_mcp_tool")
-                || params
-                    .and_then(|p| p.get("ServerName"))
-                    .and_then(Value::as_str)
+                || param(&["ServerName", "server_name", "serverName"]).and_then(Value::as_str)
                     != Some("agent_terminal")
             {
                 return;
@@ -593,10 +627,8 @@ fn observe_calls(
                     .or_else(|| v.get("conversation_id"))
                     .and_then(Value::as_str),
                 p["step_index"].as_u64(),
-                params
-                    .and_then(|p| p.get("ToolName"))
-                    .and_then(Value::as_str),
-                params.and_then(|p| p.get("Arguments")),
+                param(&["ToolName", "tool_name", "toolName"]).and_then(Value::as_str),
+                param(&["Arguments", "arguments"]),
             ) {
                 record(
                     InvocationKey::Agy {
@@ -608,5 +640,63 @@ fn observe_calls(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An agy `call_mcp_tool` step for `params`, at step `index`.
+    fn agy_step(index: u64, params: Value) -> Value {
+        json!({"event": "step_update", "conversation_id": "c1", "step_update": {
+            "conversation_id": "c1", "state": "ACTIVE", "step_index": index,
+            "step_type": "tool", "tool_name": "call_mcp_tool",
+            "tool_info": {"parameters": params}}})
+    }
+
+    fn observed(steps: &[Value]) -> usize {
+        use std::hash::{BuildHasher, Hasher};
+        let limits = agent_core::delegation::Limits::default();
+        // A fresh salt per run, as the supervisor's own is.
+        let salt: [u8; 16] = std::array::from_fn(|i| {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_usize(i);
+            h.finish().to_le_bytes()[0]
+        });
+        let mut calls = ObservedCalls::new(salt, limits.observed_calls as usize);
+        let mut seen = std::collections::VecDeque::new();
+        for step in steps {
+            observe_calls(&mut calls, &mut seen, Driver::Agy, step, &limits);
+        }
+        calls.len()
+    }
+
+    /// The same call is observed whichever case agy spells its parameters in, and a call to
+    /// another server never is.
+    #[test]
+    fn agy_calls_are_observed_in_every_parameter_spelling() {
+        let args = json!({"after": "c1"});
+        for (server, tool, arguments) in [
+            ("ServerName", "ToolName", "Arguments"),
+            ("server_name", "tool_name", "arguments"),
+            ("serverName", "toolName", "arguments"),
+        ] {
+            let step = agy_step(
+                1,
+                json!({server: "agent_terminal", tool: "cross_agent_read", arguments: args}),
+            );
+            assert_eq!(observed(&[step]), 1, "{server}/{tool}/{arguments}");
+        }
+        let elsewhere = agy_step(
+            2,
+            json!({"server_name": "other", "tool_name": "cross_agent_read", "arguments": args}),
+        );
+        assert_eq!(
+            observed(&[elsewhere]),
+            0,
+            "another server's call is not ours"
+        );
     }
 }

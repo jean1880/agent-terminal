@@ -135,10 +135,13 @@ fn set_test_hook_check(check: HookCheck) {
     TEST_HOOK_CHECK.with(|slot| *slot.borrow_mut() = Some(check));
 }
 
-/// An agy process waiting on its fresh hook proof: what was written to it meanwhile, in order.
+/// An agy process waiting on its fresh hook proof: what was written to it meanwhile, in order,
+/// and the user messages behind those writes, as the user wrote them: a start that ends without
+/// a process (refused, failed to spawn, torn down) queues them again rather than dropping them.
 struct PendingStart {
     generation: u64,
     writes: Vec<String>,
+    prompts: Vec<QueuedPrompt>,
 }
 
 fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
@@ -383,6 +386,17 @@ struct Inner {
     worker: RefCell<Option<agent_core::delegation::WorkerId>>,
     /// This launch consumed a prepared binding; same-name user MCP servers confer no trust.
     bound_generation: Cell<bool>,
+    /// The process generation a binding was taken for whose process has not spawned yet. A
+    /// start that ends without one releases the binding (`DelegationHooks::launch_abandoned`).
+    unspawned_binding: Cell<Option<u64>>,
+    /// Set while a busy switch or restart stops the process and carries its unfinished task to
+    /// the next one itself (the handoff and the continuation): a message still waiting in a
+    /// start that never spawned is part of that task, so it is not also queued again.
+    carrying_task: Cell<bool>,
+    /// The stored messages such a switch took over, held until its continuation is sent (they
+    /// are in the transcript its handoff carries). A switch that sends none (it rolled back, or
+    /// the replacement is not running) queues them again.
+    carried_unsent: RefCell<Vec<QueuedPrompt>>,
     /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
     /// adapter's exit envelopes reach neither the view nor the store.
     quiet_exit: Cell<bool>,
@@ -794,6 +808,9 @@ impl ChatSession {
             ask_only: RefCell::new(HashSet::new()),
             worker: RefCell::new(None),
             bound_generation: Cell::new(false),
+            unspawned_binding: Cell::new(None),
+            carrying_task: Cell::new(false),
+            carried_unsent: RefCell::new(Vec::new()),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
             reported: Cell::new(false),
@@ -1069,6 +1086,7 @@ impl Inner {
             } => {
                 // The agent is up: a switch to it can no longer roll back.
                 *self.rollback.borrow_mut() = None;
+                self.confirm_carried();
                 self.mark_up();
                 if !native_id.is_empty() {
                     let pt = self.provider_thread.borrow().clone();
@@ -1106,6 +1124,7 @@ impl Inner {
                 // An agent that runs turns has started, whether or not it reported a session:
                 // an exit from here on is an ordinary one, not a failed switch.
                 *self.rollback.borrow_mut() = None;
+                self.confirm_carried();
                 self.mark_up();
                 if let Some(m) = model {
                     self.set_model(m);
@@ -1398,8 +1417,14 @@ impl Inner {
         // supervisor did not stage takes none, so it gets no token (fail closed).
         let driver = self.adapter.borrow().driver();
         let next = ProcessGeneration(self.process_generation.get() + 1);
+        // A binding an earlier launch took and never spawned is released before another is
+        // taken.
+        self.abandon_unspawned_binding();
         let binding = self.hooks.as_ref().and_then(|h| h.binding(driver, next));
         self.bound_generation.set(binding.is_some());
+        if binding.is_some() {
+            self.unspawned_binding.set(Some(next.0));
+        }
         self.open.borrow_mut().delegation = binding.as_ref().and_then(|b| b.open.clone());
         let open = self.open.borrow();
         let mut argv = self.adapter.borrow().argv(&open);
@@ -1498,6 +1523,7 @@ impl Inner {
         *self.starting.borrow_mut() = Some(PendingStart {
             generation,
             writes: Vec::new(),
+            prompts: Vec::new(),
         });
         self.state.borrow_mut().alive = true;
         self.notify_lifecycle();
@@ -1545,7 +1571,7 @@ impl Inner {
         if self.generation.get() != generation || self.stopping.get() {
             return;
         }
-        self.spawn_spec_with_writes(generation, spec, pending.writes);
+        self.spawn_spec_with_writes(generation, spec, pending.writes, pending.prompts);
     }
 
     /// The hook could not be proven right before a start: agy runs without the skip flag and
@@ -1600,7 +1626,7 @@ impl Inner {
     }
 
     fn spawn_spec(self: &Rc<Self>, generation: u64, spec: SpawnSpec) {
-        self.spawn_spec_with_writes(generation, spec, Vec::new());
+        self.spawn_spec_with_writes(generation, spec, Vec::new(), Vec::new());
     }
 
     fn spawn_spec_with_writes(
@@ -1608,10 +1634,11 @@ impl Inner {
         generation: u64,
         mut spec: SpawnSpec,
         writes: Vec<String>,
+        prompts: Vec<QueuedPrompt>,
     ) {
         if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
             self.spawn_spec_now(generation, spec, None);
-            self.flush_start_writes(generation, writes);
+            self.flush_or_keep(generation, writes, prompts);
             return;
         }
         let Some(hooks) = self.hooks.clone() else {
@@ -1655,7 +1682,11 @@ impl Inner {
                     .iter()
                     .any(|arg| arg == "--dangerously-skip-permissions"),
         };
-        *self.starting.borrow_mut() = Some(PendingStart { generation, writes });
+        *self.starting.borrow_mut() = Some(PendingStart {
+            generation,
+            writes,
+            prompts,
+        });
         self.state.borrow_mut().alive = true;
         let cwd = spec.cwd.clone();
         let weak = Rc::downgrade(self);
@@ -1713,6 +1744,7 @@ impl Inner {
                 ));
                 if inner.generation.get() == generation {
                     inner.finish_process(Some(1), false);
+                    inner.keep_unsent_prompts(pending.prompts);
                 }
                 return;
             }
@@ -1720,12 +1752,65 @@ impl Inner {
                 inner.error("The agent's configuration redirect environment changed during its launch check; it was not started.");
                 if inner.generation.get() == generation {
                     inner.finish_process(Some(1), false);
+                    inner.keep_unsent_prompts(pending.prompts);
                 }
                 return;
             }
             inner.spawn_spec_now(generation, spec, Some(facts));
-            inner.flush_start_writes(generation, pending.writes);
+            inner.flush_or_keep(generation, pending.writes, pending.prompts);
         });
+    }
+
+    /// After a held start's spawn: its writes go to the process, or, when it did not spawn (a
+    /// failed spawn may already have rolled back to the previous agent), the messages behind
+    /// them are queued again.
+    fn flush_or_keep(&self, generation: u64, writes: Vec<String>, prompts: Vec<QueuedPrompt>) {
+        let spawned = self.generation.get() == generation
+            && self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
+        if spawned {
+            self.flush_start_writes(generation, writes);
+        } else {
+            self.keep_unsent_prompts(prompts);
+        }
+    }
+
+    /// User messages that never reached an agent (its start was refused, did not spawn, or was
+    /// torn down by anything but the user's own stop): queued again, in order and ahead of
+    /// anything newer, as the user wrote them. Sent the ordinary way when the agent next starts,
+    /// so whichever agent and handoff are current then apply. The notice is said, not stored:
+    /// the queue lives in memory only, and a stored promise could outlast it.
+    fn keep_unsent_prompts(&self, prompts: Vec<QueuedPrompt>) {
+        if prompts.is_empty() {
+            return;
+        }
+        let kept = prompts.len();
+        // Their turn never opened: nothing is running, and the next message must queue behind.
+        self.state.borrow_mut().running_turn = false;
+        for queued in prompts.into_iter().rev() {
+            self.hold_queued_prompt(queued);
+        }
+        self.deliver(&Envelope::new(Event::Notice {
+            text: if kept == 1 {
+                "Your message did not reach the agent. It is kept, and goes first when the agent \
+                 next starts."
+                    .to_owned()
+            } else {
+                format!(
+                    "Your {kept} messages did not reach the agent. They are kept, and go first \
+                     when the agent next starts."
+                )
+            },
+        }));
+    }
+
+    /// A binding taken for a start that ended without a process (refused, failed to spawn, or
+    /// stopped first) is released: no exit will ever be observed for it to end it otherwise.
+    fn abandon_unspawned_binding(&self) {
+        if let Some(generation) = self.unspawned_binding.take() {
+            if let Some(hooks) = &self.hooks {
+                hooks.launch_abandoned(ProcessGeneration(generation));
+            }
+        }
     }
 
     fn flush_start_writes(&self, generation: u64, writes: Vec<String>) {
@@ -1771,6 +1856,8 @@ impl Inner {
             Ok(proc) => {
                 let process_generation = self.process_generation.get() + 1;
                 self.process_generation.set(process_generation);
+                // Its binding reached a process, whose exit ends it.
+                self.unspawned_binding.set(None);
                 *self.launch_facts.borrow_mut() = facts;
                 let (pid, watch) = (proc.pid(), proc.exit_watch());
                 {
@@ -1789,7 +1876,13 @@ impl Inner {
                 }
             }
             Err(e) => {
-                self.state.borrow_mut().alive = false;
+                {
+                    // No process, so no turn: a prompt written into the start opened none.
+                    let mut state = self.state.borrow_mut();
+                    state.alive = false;
+                    state.running_turn = false;
+                }
+                self.abandon_unspawned_binding();
                 // Nothing will complete a turn: a pending handoff goes out with the next prompt.
                 self.handoff_in_flight.set(false);
                 // A switch's new agent that cannot even be spawned: back to the old one. Taken
@@ -2091,12 +2184,18 @@ impl Inner {
                 }
                 let weak = Rc::downgrade(self);
                 let generation = self.generation.get();
+                let process_generation = self.process_generation.get();
                 let grace = self.canary_grace.get();
                 glib::spawn_future_local(async move {
                     glib::timeout_future(grace).await;
                     let Some(inner) = weak.upgrade() else { return };
-                    if inner.generation.get() != generation {
-                        return; // that process is already gone
+                    // That process is already gone: replaced, or stopped or exited, which leaves
+                    // `generation` as it was. A dead agy runs no more tools to gate.
+                    if inner.generation.get() != generation
+                        || inner.process_generation.get() != process_generation
+                        || !inner.state.borrow().alive
+                    {
+                        return;
                     }
                     if inner.approval().is_some_and(|a| a.consume_query(tools)) {
                         return;
@@ -2622,8 +2721,20 @@ impl Inner {
     /// open turn was interrupted, never failed.
     fn finish_process(&self, code: Option<i32>, deliberate: bool) {
         self.deferred_mode.set(None);
-        // A start still waiting on its hook proof never spawns, and what it held is dropped.
-        *self.starting.borrow_mut() = None;
+        // A start still waiting on its checks never spawns: its writes and delegation binding go,
+        // and its user messages queue again (unless the user's own stop cleared them first).
+        let unsent = self.starting.borrow_mut().take().map(|p| {
+            if !self.carrying_task.get() {
+                return p.prompts;
+            }
+            // A busy switch is stopping this start: its stored messages are in the transcript
+            // the switch's handoff carries, so the switch holds them until its continuation is
+            // sent. One that could not be stored is not in it, and queues again.
+            let (carried, rest): (Vec<_>, Vec<_>) = p.prompts.into_iter().partition(|q| q.stored);
+            self.carried_unsent.borrow_mut().extend(carried);
+            rest
+        });
+        self.abandon_unspawned_binding();
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
                     // Synthetic: `stop_current` gets here before the process is gone. The supervisor kills
@@ -2681,6 +2792,10 @@ impl Inner {
                     .publish
                     .cancel_generation(ProcessGeneration(process_generation));
             }
+        }
+        // Last, once the exit has settled the turn: the start's messages wait for the next one.
+        if let Some(unsent) = unsent {
+            self.keep_unsent_prompts(unsent);
         }
     }
 
@@ -2976,8 +3091,12 @@ impl Inner {
                         None => false,
                     };
                     // A start still waiting on its hook proof ends the way an interrupted agy
-                    // does (it exits): what it held is dropped, and the next prompt restarts it.
+                    // does (it exits): what it held is dropped, its messages included (the user
+                    // stopped them), and the next prompt restarts it.
                     if !interrupted && self.starting.borrow().is_some() {
+                        if let Some(pending) = self.starting.borrow_mut().as_mut() {
+                            pending.prompts.clear();
+                        }
                         self.stop_current();
                     }
                 }
@@ -3212,9 +3331,13 @@ impl Inner {
             self.queue_prompt(text);
             return;
         }
+        // Anything already waiting goes first: queued messages, and prompts a refused or failed
+        // start kept (`held_retries`).
+        let waiting =
+            !self.queued_prompts.borrow().is_empty() || !self.held_retries.borrow().is_empty();
         if self.dispatching_queue.get()
             || self.delivering.get()
-            || !self.state.borrow().running_turn && !self.queued_prompts.borrow().is_empty()
+            || !self.state.borrow().running_turn && waiting
         {
             self.queue_prompt(text);
             self.dispatch_queued_prompt();
@@ -3275,12 +3398,26 @@ impl Inner {
             None => text.to_owned(),
         };
         self.prompt_in_flight.set(true);
-        if !self.dispatch_sent_prompt(&sent, handoff) {
-            self.hold_queued_prompt(QueuedPrompt {
-                item_id: item,
-                text: text.to_owned(),
-                stored,
-            });
+        let queued = QueuedPrompt {
+            item_id: item,
+            text: text.to_owned(),
+            stored,
+        };
+        if self.dispatch_sent_prompt(&sent, handoff) {
+            self.note_unspawned_prompt(queued);
+        } else {
+            self.hold_queued_prompt(queued);
+        }
+    }
+
+    /// A user message just written into a start that has not spawned yet: kept with that start,
+    /// so one that ends without a process queues it again instead of dropping it.
+    fn note_unspawned_prompt(&self, queued: QueuedPrompt) {
+        if self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()) {
+            return;
+        }
+        if let Some(pending) = self.starting.borrow_mut().as_mut() {
+            pending.prompts.push(queued);
         }
     }
 
@@ -3459,13 +3596,15 @@ impl Inner {
                 None => queued.text.clone(),
             };
             self.prompt_in_flight.set(true);
+            let queued = QueuedPrompt {
+                stored: true,
+                ..queued
+            };
             if !self.dispatch_sent_prompt(&sent, handoff) {
-                self.hold_queued_prompt(QueuedPrompt {
-                    stored: true,
-                    ..queued
-                });
+                self.hold_queued_prompt(queued);
                 return;
             }
+            self.note_unspawned_prompt(queued);
             // A local slash command can finish synchronously. Drain its next turn iteratively.
             if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false) {
                 return;
@@ -3733,7 +3872,15 @@ impl Inner {
             self.defer_mode(mode);
             return;
         }
-        if self.command(Command::SetMode { mode }) {
+        // A restart that carries the unfinished task forward (the handoff below and its
+        // continuation) does not also queue a message still waiting in an unspawned start.
+        let accepted = {
+            let _carrying = handoff
+                .is_some()
+                .then(|| ScopedFlag::set(&self.carrying_task));
+            self.command(Command::SetMode { mode })
+        };
+        if accepted {
             if let Some(a) = self.approval() {
                 a.set_mode(mode);
             }
@@ -3743,6 +3890,9 @@ impl Inner {
                 }
                 self.continue_after_switch(Driver::Agy);
             }
+        } else {
+            // Refused: whatever a stop took over has no continuation to carry it.
+            self.settle_carried(false);
         }
     }
 
@@ -3903,12 +4053,15 @@ impl Inner {
                     return;
                 }
             };
-            self.respawn(&OpenSessionDelta {
-                model: Some(target_model),
-                effort,
-                mode: None,
-                resume: native,
-            });
+            {
+                let _carrying = ScopedFlag::set(&self.carrying_task);
+                self.respawn(&OpenSessionDelta {
+                    model: Some(target_model),
+                    effort,
+                    mode: None,
+                    resume: native,
+                });
+            }
             if handoff.carried > 0 {
                 self.arm_handoff(handoff);
             }
@@ -3985,7 +4138,12 @@ impl Inner {
                 }
             }
             Transition::CreateWithHandoff => {
-                self.create_with_handoff(driver, model, effort);
+                {
+                    // Busy, the switch's continuation carries the unfinished task; idle, nothing
+                    // does, and a message still waiting is queued again for the new agent.
+                    let _carrying = running.then(|| ScopedFlag::set(&self.carrying_task));
+                    self.create_with_handoff(driver, model, effort);
+                }
                 if running {
                     self.continue_after_switch(driver);
                 }
@@ -4000,11 +4158,36 @@ impl Inner {
     /// A confirmed busy switch continues the task once on the replacement process. The
     /// provider's native history (or the pending handoff) supplies the original request;
     /// replaying that request could repeat tool actions that already completed.
+    ///
+    /// Messages the switch took over from a start that never spawned (`carried_unsent`) are
+    /// settled here: carried by the continuation when it goes, queued again when it does not.
     fn continue_after_switch(self: &Rc<Self>, driver: Driver) {
-        if self.adapter.borrow().driver() != driver || !self.state.borrow().alive {
+        let sent = self.adapter.borrow().driver() == driver && self.state.borrow().alive;
+        if sent {
+            self.send_prompt_now(super::SWITCH_CONTINUATION);
+        }
+        self.settle_carried(sent);
+    }
+
+    /// Ends the switch's hold on `carried_unsent`: dropped when its continuation went (the
+    /// handoff carries them), queued again when it did not (they reached no agent).
+    ///
+    /// A replacement that can still roll back (it has not started: `rollback` is set) keeps the
+    /// hold: its rollback queues them again (the handoff goes with it), and its start lets them
+    /// go ([`Self::confirm_carried`]).
+    fn settle_carried(&self, continued: bool) {
+        if continued && self.rollback.borrow().is_some() {
             return;
         }
-        self.send_prompt_now(super::SWITCH_CONTINUATION);
+        let carried = self.carried_unsent.take();
+        if !continued {
+            self.keep_unsent_prompts(carried);
+        }
+    }
+
+    /// The replacement started: the task it carried, held messages included, is its own now.
+    fn confirm_carried(&self) {
+        self.carried_unsent.borrow_mut().clear();
     }
 
     fn create_with_handoff(
@@ -4246,6 +4429,10 @@ impl Inner {
             self.hookless_notice();
         }
         self.start_process();
+        // Messages the failed switch took over reached no agent, and its handoff is gone: the
+        // old agent gets them as they were written.
+        let carried = self.carried_unsent.take();
+        self.keep_unsent_prompts(carried);
     }
 
     fn status(&self) -> SessionStatus {
@@ -8696,6 +8883,53 @@ mod tests {
             assert!(session.status().alive);
             assert!(!socket.exists(), "the approval socket is closed");
         });
+    }
+
+    /// A tool step whose agy is gone before the grace ends (it exited, or the thread was stopped)
+    /// trips nothing: the canary watches a running process, and must not start one in Plan mode.
+    #[test]
+    fn the_canary_never_restarts_an_agy_that_already_stopped() {
+        for stop_it in [false, true] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, seen) = make_sink();
+                let handle = bound_handle(tmp.path());
+                // Exits on its own, or lives until the test stops it.
+                let tail = if stop_it { "\nexec sleep 30" } else { "" };
+                let open = scripted(tmp.path(), &format!("echo '{STEP}'{tail}"));
+                let session = ChatSession::new(
+                    Box::new(AgyAdapter::new("agy")),
+                    open,
+                    store,
+                    thread,
+                    sink,
+                    Some(handle),
+                );
+                session.set_canary_grace(Duration::from_millis(200));
+                let started = |seen: &Seen| has(seen, |e| matches!(e, Event::ItemStarted { .. }));
+                assert!(pump_until(ctx, 15, || started(&seen)), "no tool step");
+                if stop_it {
+                    session.inner.stop_current();
+                }
+                assert!(
+                    pump_until(ctx, 15, || !session.status().alive),
+                    "agy still running"
+                );
+                // Well past the grace: nothing trips, nothing starts again.
+                assert!(
+                    !pump_until(ctx, 1, || hook_missing_error(&seen)),
+                    "the canary tripped on a stopped agy (stop_it: {stop_it})"
+                );
+                assert_eq!(
+                    lines(tmp.path().join("args.log")).len(),
+                    1,
+                    "agy was started again (stop_it: {stop_it})"
+                );
+                assert!(!session.status().alive);
+            });
+        }
     }
 
     #[test]

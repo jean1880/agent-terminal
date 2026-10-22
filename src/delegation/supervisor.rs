@@ -840,8 +840,11 @@ mod tests {
             .unwrap();
             assert_ne!(watch.phase(), crate::agent_proc::StopPhase::Exited);
             pump_until(|| watch.phase() == crate::agent_proc::StopPhase::Exited).await;
-            assert!(sup.state.borrow().workers[&worker].run.is_none());
+            // The exit is observed in the same notification that reports it.
             assert!(sup.state.borrow().workers[&worker].generations.is_empty());
+            // The run ends only once its interrupted turn has committed, a store round trip
+            // that can land after the exit.
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             stop(&sup).await;
         });
     }
@@ -920,6 +923,53 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// A launch that never reached a process releases what its binding issued: the bearer-token
+    /// overlay file is removed and the never-presented token ends, and only its own token.
+    #[test]
+    fn an_abandoned_launch_removes_its_overlay_and_token() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            let hooks = super::super::attest::Hooks {
+                supervisor: Rc::downgrade(&sup),
+                worker: root.clone(),
+            };
+            let plant = |name: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, "{}").unwrap();
+                let epoch = sup.epoch(&root).unwrap();
+                let mut state = sup.state.borrow_mut();
+                let w = state.workers.get_mut(&root).unwrap();
+                w.pending_overlay = Some(path.clone());
+                w.token = Some(TokenSlot {
+                    epoch,
+                    generation: ProcessGeneration(9),
+                    token: CapabilityToken::from_random([9; 32]),
+                    consumed_by: None,
+                    live_conn: None,
+                    pid: None,
+                    issued: Instant::now(),
+                });
+                path
+            };
+            // Never spawned: the overlay goes and the token ends.
+            let overlay = plant("abandoned.json");
+            hooks.launch_abandoned(ProcessGeneration(9));
+            pump_until(|| !overlay.exists()).await;
+            assert!(sup.state.borrow().workers[&root].token.is_none());
+            assert!(sup.state.borrow().workers[&root].pending_overlay.is_none());
+
+            // A token issued for another generation is not this launch's to end.
+            let overlay = plant("other.json");
+            hooks.launch_abandoned(ProcessGeneration(8));
+            pump_until(|| !overlay.exists()).await;
+            assert!(
+                sup.state.borrow().workers[&root].token.is_some(),
+                "generation 9's token outlives generation 8's abandoned launch"
+            );
+            stop(&sup).await;
+        });
+    }
+
     #[test]
     fn an_unusable_agy_registration_starts_the_root_unbound_and_unavailable() {
         in_context(async {
@@ -3234,6 +3284,10 @@ impl Supervisor {
             if effect.bump {
                 for w in state.workers.values_mut().filter(|w| &w.root == root) {
                     if let Some(path) = w.staged.take().and_then(|b| b.overlay) {
+                        overlays.push(path);
+                    }
+                    // Bound to a launch whose process never started: no exit will remove it.
+                    if let Some(path) = w.pending_overlay.take() {
                         overlays.push(path);
                     }
                 }
