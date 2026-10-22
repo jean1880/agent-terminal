@@ -964,10 +964,10 @@ On first launch, settings at `~/.config/antigravity-terminal/config.json` are co
 
 ## Contributing
 
-1. Branch: `git checkout -b feat/cool-new-thing`.
-2. Keep it green: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`
-   and `cargo test --workspace`.
-3. Commit using [Conventional Commits](https://www.conventionalcommits.org/).
+Bug reports, ideas and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers
+reporting a bug, setting up a build, testing and opening a pull request. Everyone taking part
+follows the [Code of Conduct](CODE_OF_CONDUCT.md). Report security problems privately, as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 
