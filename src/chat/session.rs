@@ -2091,12 +2091,18 @@ impl Inner {
                 }
                 let weak = Rc::downgrade(self);
                 let generation = self.generation.get();
+                let process_generation = self.process_generation.get();
                 let grace = self.canary_grace.get();
                 glib::spawn_future_local(async move {
                     glib::timeout_future(grace).await;
                     let Some(inner) = weak.upgrade() else { return };
-                    if inner.generation.get() != generation {
-                        return; // that process is already gone
+                    // That process is already gone: replaced, or stopped or exited, which leaves
+                    // `generation` as it was. A dead agy runs no more tools to gate.
+                    if inner.generation.get() != generation
+                        || inner.process_generation.get() != process_generation
+                        || !inner.state.borrow().alive
+                    {
+                        return;
                     }
                     if inner.approval().is_some_and(|a| a.consume_query(tools)) {
                         return;
@@ -8696,6 +8702,53 @@ mod tests {
             assert!(session.status().alive);
             assert!(!socket.exists(), "the approval socket is closed");
         });
+    }
+
+    /// A tool step whose agy is gone before the grace ends (it exited, or the thread was stopped)
+    /// trips nothing: the canary watches a running process, and must not start one in Plan mode.
+    #[test]
+    fn the_canary_never_restarts_an_agy_that_already_stopped() {
+        for stop_it in [false, true] {
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, seen) = make_sink();
+                let handle = bound_handle(tmp.path());
+                // Exits on its own, or lives until the test stops it.
+                let tail = if stop_it { "\nexec sleep 30" } else { "" };
+                let open = scripted(tmp.path(), &format!("echo '{STEP}'{tail}"));
+                let session = ChatSession::new(
+                    Box::new(AgyAdapter::new("agy")),
+                    open,
+                    store,
+                    thread,
+                    sink,
+                    Some(handle),
+                );
+                session.set_canary_grace(Duration::from_millis(200));
+                let started = |seen: &Seen| has(seen, |e| matches!(e, Event::ItemStarted { .. }));
+                assert!(pump_until(ctx, 15, || started(&seen)), "no tool step");
+                if stop_it {
+                    session.inner.stop_current();
+                }
+                assert!(
+                    pump_until(ctx, 15, || !session.status().alive),
+                    "agy still running"
+                );
+                // Well past the grace: nothing trips, nothing starts again.
+                assert!(
+                    !pump_until(ctx, 1, || hook_missing_error(&seen)),
+                    "the canary tripped on a stopped agy (stop_it: {stop_it})"
+                );
+                assert_eq!(
+                    lines(tmp.path().join("args.log")).len(),
+                    1,
+                    "agy was started again (stop_it: {stop_it})"
+                );
+                assert!(!session.status().alive);
+            });
+        }
     }
 
     #[test]
