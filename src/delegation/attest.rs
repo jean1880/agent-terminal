@@ -660,12 +660,11 @@ mod tests {
         use std::hash::{BuildHasher, Hasher};
         let limits = agent_core::delegation::Limits::default();
         // A fresh salt per run, as the supervisor's own is.
-        let mut salt = [0u8; 16];
-        for (i, byte) in salt.iter_mut().enumerate() {
+        let salt: [u8; 16] = std::array::from_fn(|i| {
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
             h.write_usize(i);
-            *byte = h.finish().to_le_bytes()[0];
-        }
+            h.finish().to_le_bytes()[0]
+        });
         let mut calls = ObservedCalls::new(salt, limits.observed_calls as usize);
         let mut seen = std::collections::VecDeque::new();
         for step in steps {
