@@ -123,6 +123,16 @@ Architectural mandates, standards, and workflows for this codebase.
   clean worktree that no open tab is in, runs `git worktree remove` without
   `--force`, and never deletes the branch. Names reaching git are refused if
   they start with `-`, and paths follow `--`.
+- **Uninstall removes everything the app put there, and only that**: `agent-terminal
+  --uninstall` (also `make uninstall` and Settings → General) asks whether to remove the
+  configuration and data (default yes); `agent_kit::uninstall` decides what that is. Its folders
+  are removed only when real, owned by the user and named as the app's. Another tool's file is
+  only reverted through what the app recorded (the agy registration journal, the Codex export
+  header), never edited otherwise. In repositories only `refs/agent-terminal/*` and
+  `<git dir>/agent-terminal` go, never a worktree or branch. It never runs while an instance
+  does (the CLI refuses; Settings waits for `app.run()` to return). A package's maintainer
+  scripts never touch a home folder: they only say where the data stays. A new place the app
+  writes must be added to `uninstall::candidate_folders` or `plan`, with a test.
 - **Checkpoints never touch the user's git state**: snapshots go through a
   private index file under the git dir, and are recorded only as refs under
   `refs/agent-terminal/`, created with an empty old value so none is
@@ -294,7 +304,8 @@ The graph is a snapshot: confirm what it says in the source before editing. Refr
    (`apt.nuvek.ca`), which builds every pushed commit. A manual `make install`
    shadows the apt-delivered package in PATH, so the machine silently keeps
    running a stale build. If you need it for isolated testing, run
-   `make uninstall` immediately afterwards.
+   `make uninstall UNINSTALL_ARGS=--keep-data` immediately afterwards: the data is per user,
+   shared with the packaged app, and without a terminal the uninstall refuses to guess.
 
 ## 📦 Packaging
 

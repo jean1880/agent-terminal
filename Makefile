@@ -45,7 +45,8 @@ help:
 	@echo "  make build                - Build the release binary"
 	@echo "  make start-local          - Build and run the app locally (debug)"
 	@echo "  make install              - Install binary and desktop entry locally"
-	@echo "  make uninstall            - Remove local installation and assets"
+	@echo "  make uninstall            - Remove the local install; asks whether to remove configuration and data too"
+	@echo "                              (UNINSTALL_ARGS=--yes or --keep-data answers it)"
 	@echo "  make package              - Generate a .deb package using cargo-deb"
 	@echo "  make clean                - Remove build artifacts"
 	@echo "  make test                 - Run the test suite (parallel, about 35 s)"
@@ -103,14 +104,18 @@ install: build
 	-gtk4-update-icon-cache -q -t -f $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
 	@echo "Done! You can now launch Agent Terminal from your menu."
 
+# The installed binary does the work (`--uninstall`): it asks whether to remove the configuration
+# and data too (default yes), then removes its own files. UNINSTALL_ARGS=--yes or --keep-data
+# answers for it. A binary too old to know the flag only gets its three files removed.
+UNINSTALL_ARGS ?=
 uninstall:
-	@echo "Uninstalling $(APP_NAME) from $(LOCAL_BIN)..."
-	rm -f $(LOCAL_BIN)/$(APP_NAME)
-	@echo "Removing icon from $(HOME)/.local/share/icons..."
-	rm -f $(LOCAL_ICON)
-	@echo "Removing desktop entry..."
-	rm -f $(LOCAL_DESKTOP)
-	@echo "Uninstall complete."
+	@if [ -x "$(LOCAL_BIN)/$(APP_NAME)" ] && "$(LOCAL_BIN)/$(APP_NAME)" --uninstall --help >/dev/null 2>&1; then \
+		"$(LOCAL_BIN)/$(APP_NAME)" --uninstall $(UNINSTALL_ARGS); \
+	else \
+		echo "Removing $(LOCAL_BIN)/$(APP_NAME), its icon and desktop entry..."; \
+		rm -f "$(LOCAL_BIN)/$(APP_NAME)" "$(LOCAL_ICON)" "$(LOCAL_DESKTOP)"; \
+		echo "Your configuration and data were kept: ~/.config/agent-terminal, ~/.local/state/agent-terminal, ~/.cache/agent-terminal."; \
+	fi
 
 clean:
 	@echo "Cleaning project..."

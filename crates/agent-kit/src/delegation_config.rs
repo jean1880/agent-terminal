@@ -787,6 +787,58 @@ pub fn undo(home: &Path, state: &Path) -> Result<(), String> {
     }
 }
 
+/// What [`remove_owned`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// The registration and the allow rules the app added were removed.
+    Removed,
+    /// Nothing of the app's was there to remove.
+    NothingToRemove,
+    /// Left alone: no recovery journal proves the app made it (another tool, or the user, did).
+    NotOurs,
+}
+
+/// Removes the managed agy registration for good (uninstall): the `agent_terminal` server and
+/// the allow rules the app added, keeping everything else. Acts only when the app's recovery
+/// journal in `state` exists, and takes the command from the registered entry, so a registration
+/// made by another binary path is still removed and one made by another tool never is.
+pub fn remove_owned(home: &Path, state: &Path) -> Result<Removal, String> {
+    let canonical = fs::canonicalize(home).map_err(|_| fail("cannot resolve the selected home"))?;
+    if read(&canonical, &state.join(JOURNAL), 16 * MAX_FILE)?.is_none() {
+        return Ok(Removal::NotOurs);
+    }
+    let mcp = read(
+        &canonical,
+        &canonical.join(".gemini/config/mcp_config.json"),
+        MAX_FILE,
+    )?;
+    let registered = object(mcp.as_deref())?
+        .get("mcpServers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .cloned();
+    let command = match registered {
+        None => std::env::current_exe().map_err(|_| fail("cannot locate this executable"))?,
+        Some(entry) => match (
+            entry.get("command").and_then(Value::as_str),
+            entry.get("args"),
+        ) {
+            (Some(command), Some(args))
+                if Path::new(command).is_absolute()
+                    && *args == json!([BRIDGE_ARG])
+                    && entry.as_object().is_some_and(|o| o.len() == 2) =>
+            {
+                PathBuf::from(command)
+            }
+            _ => return Ok(Removal::NotOurs),
+        },
+    };
+    let plan = preview(home, state, &command, Action::Remove)?;
+    if !plan.changed() {
+        return Ok(Removal::NothingToRemove);
+    }
+    apply(plan).map(|()| Removal::Removed)
+}
+
 /// Non-quota diagnostic of the actual installed headless shim in the selected environment.
 /// Bindings are stripped after profile overrides: this proves the MCP lifecycle and expected
 /// unbound behaviour, not a provider's authentication, route admission or live capability.
@@ -1072,6 +1124,47 @@ mod tests {
             json!([ALLOW_RULES[0], "Read"])
         );
         assert_eq!(value["later"], "é🙂");
+    }
+
+    #[test]
+    fn uninstall_removes_only_a_registration_the_journal_proves_ours() {
+        let (_tmp, home, state) = paths();
+        let mcp = home.join(".gemini/config/mcp_config.json");
+        let settings = home.join(".gemini/antigravity-cli/settings.json");
+        // Registered by another tool (agent-sync, by hand): no journal, so never touched.
+        let foreign =
+            json!({"mcpServers":{"agent_terminal":{"command":"/opt/x","args":[BRIDGE_ARG]}}})
+                .to_string();
+        put(&home, &mcp, Some(&foreign)).unwrap();
+        assert_eq!(remove_owned(&home, &state).unwrap(), Removal::NotOurs);
+        assert_eq!(fs::read_to_string(&mcp).unwrap(), foreign);
+        fs::remove_file(&mcp).unwrap();
+
+        // Ours, made by a binary at another path than this test's: still removed, with only the
+        // rules the app added; the user's own rule and server stay.
+        put(
+            &home,
+            &settings,
+            Some(&json!({"permissions":{"allow":["Read"]}}).to_string()),
+        )
+        .unwrap();
+        put(
+            &home,
+            &mcp,
+            Some(&json!({"mcpServers":{"mine":{"command":"keep"}}}).to_string()),
+        )
+        .unwrap();
+        let command = Path::new("/usr/bin/agent-terminal");
+        apply(preview(&home, &state, command, Action::Configure).unwrap()).unwrap();
+        assert_eq!(remove_owned(&home, &state).unwrap(), Removal::Removed);
+        let servers = object(read(&home, &mcp, MAX_FILE).unwrap().as_deref()).unwrap();
+        assert_eq!(servers, json!({"mcpServers":{"mine":{"command":"keep"}}}));
+        let rules = object(read(&home, &settings, MAX_FILE).unwrap().as_deref()).unwrap();
+        assert_eq!(rules["permissions"]["allow"], json!(["Read"]));
+        assert_eq!(
+            remove_owned(&home, &state).unwrap(),
+            Removal::NothingToRemove
+        );
     }
 
     #[test]
