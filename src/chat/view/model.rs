@@ -222,6 +222,18 @@ impl SubagentSummary {
         }
     }
 
+    /// Whether it is at work right now. A delegated worker between runs (its last turn done or
+    /// interrupted, waiting for its parent's next message) is active but not running: only a
+    /// worker with a current run is.
+    pub fn running(&self) -> bool {
+        match &self.delegation {
+            Some(delegation) if self.lifecycle.is_some() => {
+                delegation.run.is_some() && self.active()
+            }
+            _ => self.active(),
+        }
+    }
+
     pub fn finished(&self) -> bool {
         match self.lifecycle {
             Some(WorkerState::Unknown) => false,
@@ -899,9 +911,47 @@ impl Transcript {
         self.last_model.as_deref()
     }
 
+    /// Every sub-agent of the thread whatever started it: [`Self::subagents`], plus `supervised`,
+    /// the delegation registry's workers. Registry handles are canonical; a linked snapshot of a
+    /// supervised worker in this stream must not make a second row for it.
+    pub fn subagents_with(&self, supervised: Vec<SubagentSummary>) -> Vec<SubagentSummary> {
+        let mut agents = self.subagents();
+        agents.retain(|agent| {
+            !agent.delegation.as_ref().is_some_and(|delegation| {
+                supervised
+                    .iter()
+                    .any(|worker| worker.id == delegation.worker_id.as_str())
+            })
+        });
+        agents.extend(supervised);
+        agents
+    }
+
+    /// The agents the thread's running sub-agents are on (any route: the agent's own, the
+    /// provider's workers, the delegation registry's `supervised`), each once, in slot order.
+    pub fn running_drivers(&self, supervised: Vec<SubagentSummary>) -> Vec<Driver> {
+        let agents = self.subagents_with(supervised);
+        Driver::ALL
+            .into_iter()
+            .filter(|&driver| {
+                agents
+                    .iter()
+                    .any(|agent| agent.running() && agent.driver == Some(driver))
+            })
+            .collect()
+    }
+
     /// The thread's status. `main_running`: the main agent's turn runs (the model's own view of
-    /// it, or the backend's).
+    /// it, or the backend's). The view counts delegated workers too ([`Self::activity_with`]).
+    #[cfg(test)]
     pub fn activity(&self, main_running: bool) -> Activity {
+        self.activity_with(main_running, Vec::new())
+    }
+
+    /// [`Self::activity`], counting `supervised` (the delegation registry's workers) as the
+    /// thread's sub-agents: a parent whose turn is over while a delegated worker runs is waiting
+    /// on it, not finished.
+    pub fn activity_with(&self, main_running: bool, supervised: Vec<SubagentSummary>) -> Activity {
         if let Some(pending) = self.pending_interruption() {
             return match pending {
                 PendingInterruption::Approval { .. } => Activity::NeedsApproval,
@@ -910,7 +960,7 @@ impl Transcript {
                 }
             };
         }
-        let agents = self.subagents();
+        let agents = self.subagents_with(supervised);
         if main_running && !self.waiting_for.is_empty() {
             return Activity::WaitingForWorkers {
                 names: self
@@ -960,14 +1010,19 @@ impl Transcript {
     /// Everything running in the background: the agent's task list, then the provider's workers
     /// still at work (a worker's id is its sub-agent item's).
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
-        self.background_with(&self.subagents())
+        self.background_tasks_with(Vec::new())
+    }
+
+    /// [`Self::background_tasks`], with the delegation registry's workers.
+    pub fn background_tasks_with(&self, supervised: Vec<SubagentSummary>) -> Vec<BackgroundTask> {
+        self.background_with(&self.subagents_with(supervised))
     }
 
     fn background_with(&self, agents: &[SubagentSummary]) -> Vec<BackgroundTask> {
         let mut background = self.background.clone();
         for worker in agents
             .iter()
-            .filter(|a| a.lifecycle.is_some() && a.active())
+            .filter(|a| a.lifecycle.is_some() && a.running())
         {
             background.push(BackgroundTask {
                 id: worker.id.clone(),
@@ -3337,6 +3392,25 @@ mod tests {
             Some("task")
         );
         assert_eq!(t.get("orphan").and_then(|i| i.parent.as_deref()), None);
+    }
+
+    /// The agent's own sub-agent runs on its agent: the dots light that agent while it runs, and
+    /// no other.
+    #[test]
+    fn running_drivers_follow_the_agents_own_sub_agents() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        assert!(t.running_drivers(Vec::new()).is_empty());
+        t.apply(&started("task", ItemKind::Subagent, None), Driver::Claude);
+        assert_eq!(t.running_drivers(Vec::new()), [Driver::Claude]);
+        let done = Envelope::new(Event::ItemCompleted {
+            status: ItemStatus::Completed,
+            output: None,
+            error: None,
+        })
+        .item("task");
+        t.apply(&done, Driver::Claude);
+        assert!(t.running_drivers(Vec::new()).is_empty());
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! `@brand_claude`, `@brand_agy` and `@brand_codex`, and Rust drawing reads [`rgb`]. They are
 //! not themed: they say which agent it is, under every theme. A light window (only the desktop's
 //! own theme can be one) gets them darkened just enough to stay legible ([`rgb_on_light`]).
-//! [`dots`] is the icon's three dots as widgets, one of them lit by [`set_lead`].
+//! [`dots`] is the icon's three dots as widgets, one of them lit by [`set_lead`] (or every agent
+//! at work, by [`set_working`]).
 //!
 //! CSS transitions and animations, and Stack/Revealer transitions, stop by themselves when the
 //! desktop turns animations off (`gtk-enable-animations`). Anything drawn on its own frame clock
@@ -140,7 +141,7 @@ pub fn install() {
 }
 
 /// The app icon's three cursor dots as widgets, one per agent in slot order (`Driver::ALL`):
-/// each a `brand-dot` in its agent's colour. [`set_lead`] lights one.
+/// each a `brand-dot` in its agent's colour. [`set_lead`] lights one, [`set_working`] several.
 pub fn dots() -> gtk4::Box {
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
     row.add_css_class("brand-dots");
@@ -218,6 +219,32 @@ pub fn set_lead(dots: &gtk4::Box, lead: Option<Driver>) {
             None => {
                 dot.remove_css_class("lead");
                 dot.remove_css_class("dimmed");
+            }
+        }
+        child = dot.next_sibling();
+    }
+}
+
+/// Lights every agent at work in a [`dots`] row: `lead` (the thread's own agent) as
+/// [`set_lead`] does, each other driver in `also` as `working`, and dims the rest. A driver in
+/// both is the lead. Only dimmed dots lose their colour, so a thread whose Claude waits on an
+/// agy sub-agent shows both lit.
+pub fn set_working(dots: &gtk4::Box, lead: Driver, also: &[Driver]) {
+    let mut child = dots.first_child();
+    for driver in Driver::ALL {
+        let Some(dot) = child else { return };
+        let state = if driver == lead {
+            "lead"
+        } else if also.contains(&driver) {
+            "working"
+        } else {
+            "dimmed"
+        };
+        for class in ["lead", "working", "dimmed"] {
+            if class == state {
+                dot.add_css_class(class);
+            } else {
+                dot.remove_css_class(class);
             }
         }
         child = dot.next_sibling();
