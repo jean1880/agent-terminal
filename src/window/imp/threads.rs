@@ -5531,7 +5531,8 @@ impl AgentTerminalWindow {
                     // A dead session runs nothing in the background either.
                     chat.background.clear();
                     chat.workers_active = 0;
-                    chat.child_asks = ChildAsks::default();
+                    // Its delegated sub-agents' asks stay: they outlive a restart of the root's
+                    // process, and the registry drops those of workers that ended.
                     chat.approval = false;
                     withdraw_ask = true;
                     After::Sidebar
@@ -5608,6 +5609,9 @@ impl AgentTerminalWindow {
                 }
                 _ => After::Nothing,
             };
+            // The notification is the thread's, its sub-agents' asks included: the agent's own
+            // answer or turn end leaves it while a sub-agent still waits on the user.
+            withdraw_ask &= !chat.child_asks.any();
             // A switch to the other agent recolours the row.
             match after {
                 After::Nothing if switched => After::Sidebar,
@@ -6184,6 +6188,7 @@ impl AgentTerminalWindow {
                 busy_reason(
                     c.running,
                     c.background.len() + c.workers_active,
+                    crate::delegation::supervisor().is_some_and(|s| s.root_busy(&c.thread)),
                     c.waiting_on_user(),
                 )
                 .map(|why| (c.driver, why))

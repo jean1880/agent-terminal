@@ -725,7 +725,7 @@ mod tests {
                     error: None,
                     cost_usd: None,
                 }),
-                999,
+                (999, None),
                 false,
                 None,
             );

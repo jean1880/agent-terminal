@@ -146,9 +146,15 @@ impl ChildAsks {
     }
 }
 
-/// Why a switch must ask before it stops this thread's work.
-pub fn busy_reason(running: bool, background: usize, approval: bool) -> Option<String> {
-    if !is_busy(running, background > 0, approval) {
+/// Why a switch must ask before it stops this thread's work. `delegated`: sub-agents the
+/// thread started through delegation are still at work.
+pub fn busy_reason(
+    running: bool,
+    background: usize,
+    delegated: bool,
+    approval: bool,
+) -> Option<String> {
+    if !is_busy(running, background > 0 || delegated, approval) {
         return None;
     }
     let mut reasons = Vec::new();
@@ -159,6 +165,9 @@ pub fn busy_reason(running: bool, background: usize, approval: bool) -> Option<S
         0 => {}
         1 => reasons.push("1 background task will stop".to_owned()),
         n => reasons.push(format!("{n} background tasks will stop")),
+    }
+    if delegated {
+        reasons.push("Its sub-agents' work will stop".to_owned());
     }
     if approval {
         reasons
@@ -974,7 +983,7 @@ mod tests {
         for running in [false, true] {
             for background in [0, 2] {
                 for approval in [false, true] {
-                    let reason = busy_reason(running, background, approval);
+                    let reason = busy_reason(running, background, false, approval);
                     assert_eq!(reason.is_some(), is_busy(running, background > 0, approval));
                     if background > 0 {
                         assert!(reason.unwrap().contains("2 background tasks will stop"));
@@ -982,9 +991,12 @@ mod tests {
                 }
             }
         }
-        assert!(busy_reason(false, 1, false)
+        assert!(busy_reason(false, 1, false, false)
             .unwrap()
             .contains("1 background task will stop"));
+        // Delegated sub-agents at work, nothing else: the switch still asks, and says why.
+        assert!(busy_reason(false, 0, true, false)
+            .is_some_and(|why| why.contains("sub-agents' work will stop")));
     }
 
     #[test]

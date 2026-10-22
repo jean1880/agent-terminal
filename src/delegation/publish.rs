@@ -11,7 +11,22 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
-type Receipt = std::sync::mpsc::Receiver<agent_kit::store::Result<i64>>;
+/// The event's sequence number and, for a run's completion, the parent's report message: the
+/// row that carries the result, so the parent's wake is skipped exactly when a page showed it.
+/// How a page could have shown a run's end to the parent: by its report message, the row with
+/// the result (a page showing only the "turn completed" event has not shown it), else by the
+/// event.
+fn shown_by(
+    seq: i64,
+    report: Option<agent_core::delegation::MessageId>,
+) -> agent_core::delegation::wake::Shown {
+    use agent_core::delegation::wake::Shown;
+    report.map_or(Shown::Event(seq), Shown::Message)
+}
+
+type Receipt = std::sync::mpsc::Receiver<
+    agent_kit::store::Result<(i64, Option<agent_core::delegation::MessageId>)>,
+>;
 struct PendingPublication {
     scope: Scope,
     envelope: Envelope,
@@ -159,7 +174,9 @@ impl Publisher {
                             completion.worker_state = agent_core::event::WorkerState::Closed;
                         }
                     }
-                    return s.complete_delegation_run(&completion).map(|c| c.event.seq);
+                    return s
+                        .complete_delegation_run(&completion)
+                        .map(|c| (c.event.seq, c.notification.map(|(id, _)| id)));
                 }
             }
             if event.links.is_empty() {
@@ -168,8 +185,9 @@ impl Publisher {
                     event.provider_thread.as_deref(),
                     &event.envelope,
                 )
+                .map(|seq| (seq, None))
             } else {
-                s.publish_delegation_event(&event).map(|p| p.seq)
+                s.publish_delegation_event(&event).map(|p| (p.seq, None))
             }
         };
         let receipt = if let Some(writer) = sup.services.handle.writer() {
@@ -222,11 +240,11 @@ impl Publisher {
                     return;
                 };
                 match result {
-                    Ok(seq) => sup.on_child_envelope(
+                    Ok(stored) => sup.on_child_envelope(
                         &worker,
                         next.scope,
                         next.envelope,
-                        seq,
+                        stored,
                         next.bootstrap,
                         next.result.as_deref(),
                     ),
@@ -434,7 +452,8 @@ impl Supervisor {
         worker: &WorkerId,
         scope: Scope,
         env: Envelope,
-        seq: i64,
+        // The event's sequence number, and a completion's report message (see `Receipt`).
+        (seq, report): (i64, Option<agent_core::delegation::MessageId>),
         bootstrap: bool,
         result: Option<&str>,
     ) {
@@ -545,7 +564,7 @@ impl Supervisor {
                 worker,
                 wake_outcome(state),
                 result.unwrap_or_default(),
-                agent_core::delegation::wake::Shown::Event(seq),
+                shown_by(seq, report),
             );
         }
         let scoped = ScopedEnvelope {
@@ -645,7 +664,10 @@ impl Supervisor {
                     &worker,
                     wake_outcome(state),
                     reported.as_deref().unwrap_or_default(),
-                    agent_core::delegation::wake::Shown::Event(completed.event.seq),
+                    shown_by(
+                        completed.event.seq,
+                        completed.notification.map(|(id, _)| id),
+                    ),
                 );
                 if let Some(w) = sup
                     .state

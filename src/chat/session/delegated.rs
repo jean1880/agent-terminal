@@ -86,6 +86,11 @@ impl ChatSession {
         self.inner.wakes_held.set(true);
     }
 
+    /// Whether the user stopped this root and has not spoken to it since.
+    pub(crate) fn wakes_held(&self) -> bool {
+        self.inner.wakes_held.get()
+    }
+
     /// The exact provider-facing body, shared with receipt correlation. Rendering is pure and
     /// never writes input or consumes a launch binding.
     pub(crate) fn render_delegated_input(input: &DelegatedInput) -> String {
@@ -241,23 +246,19 @@ impl Inner {
         if !self.root_prompt_allowed() || !self.apply_retired() || self.wake_busy() {
             return WakeOutcome::Busy;
         }
-        let generation = self.generation.get();
+        info!("waking the agent with its sub-agents' news");
+        self.prompt_in_flight.set(true);
+        if !self.dispatch_sent_prompt(text, None) {
+            self.prompt_in_flight.set(false);
+            return WakeOutcome::Busy;
+        }
+        self.auto_wakes.set(self.auto_wakes.get().saturating_add(1));
+        // Posted only once the turn is sent: a send refused is offered again, and must not leave
+        // a notice behind each time. The agent's reply comes later, so the notice still leads it.
         self.emit(Envelope::new(Event::Notice {
             text: text.to_owned(),
         }));
-        // The sink can close, stop or switch this session.
-        if generation != self.generation.get() || self.wake_busy() {
-            return WakeOutcome::Busy;
-        }
-        info!("waking the agent with its sub-agents' news");
-        self.prompt_in_flight.set(true);
-        if self.dispatch_sent_prompt(text, None) {
-            self.auto_wakes.set(self.auto_wakes.get().saturating_add(1));
-            WakeOutcome::Started
-        } else {
-            self.prompt_in_flight.set(false);
-            WakeOutcome::Busy
-        }
+        WakeOutcome::Started
     }
 
     fn deliver_delegated(self: &Rc<Self>, input: DelegatedInput) -> DelegatedOutcome {

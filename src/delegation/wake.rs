@@ -63,6 +63,17 @@ impl Supervisor {
             if state.shutting_down || state.roots.get(&root).is_none_or(|r| r.closed) {
                 return;
             }
+            // Stopped by the user: news that lands after the stop (a child's end the store had
+            // not yet confirmed when the user stopped) is not queued either, or the user's next
+            // message would let it through. It stays in the root's mailbox.
+            if state
+                .workers
+                .get(&root)
+                .and_then(WorkerRt::session)
+                .is_some_and(|session| session.wakes_held())
+            {
+                return;
+            }
             if !state.wakes.entry(root.clone()).or_default().push(item) {
                 return;
             }
