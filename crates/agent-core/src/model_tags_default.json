@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "vocabulary": {
+    "bulk": "high-volume sweeps where cost per token matters",
+    "code": "writes/refactors code",
+    "deep-reasoning": "architecture, RCA, ambiguous multi-step problems",
+    "fast": "low latency, short tasks",
+    "high-effort": "top-cost model: reserve for work that needs it",
+    "long-context": "large repos/logs in one pass",
+    "research": "web/doc research and synthesis",
+    "review": "adversarial checking of someone else's work",
+    "vision": "reads images/screenshots"
+  },
+  "models": [
+    {
+      "match": "*fable*",
+      "driver": null,
+      "tier": "deep",
+      "tags": [
+        "deep-reasoning",
+        "research",
+        "long-context",
+        "vision",
+        "high-effort"
+      ],
+      "best_for": "hardest reasoning and long-horizon agentic work"
+    },
+    {
+      "match": "*opus*",
+      "driver": null,
+      "tier": "deep",
+      "tags": [
+        "code",
+        "review",
+        "deep-reasoning",
+        "long-context",
+        "vision"
+      ],
+      "best_for": "long-running agentic coding, design, hard bugs, final review"
+    },
+    {
+      "match": "*sonnet*",
+      "driver": null,
+      "tier": "standard",
+      "tags": [
+        "code",
+        "review",
+        "fast",
+        "long-context",
+        "vision"
+      ],
+      "best_for": "everyday implementer: best speed/intelligence balance"
+    },
+    {
+      "match": "*haiku*",
+      "driver": null,
+      "tier": "fast",
+      "tags": [
+        "fast",
+        "bulk",
+        "long-context",
+        "vision"
+      ],
+      "best_for": "high-volume, low-latency search, extraction, routing"
+    },
+    {
+      "match": "*-astra",
+      "driver": "codex",
+      "tier": "deep",
+      "tags": [
+        "deep-reasoning",
+        "code",
+        "review",
+        "research",
+        "long-context",
+        "high-effort"
+      ],
+      "best_for": "OpenAI flagship for the hardest work"
+    },
+    {
+      "match": "*-sol",
+      "driver": "codex",
+      "tier": "standard",
+      "tags": [
+        "code",
+        "review",
+        "deep-reasoning",
+        "research",
+        "long-context"
+      ],
+      "best_for": "hard coding and review; the recommended Codex checker"
+    },
+    {
+      "match": "*-terra",
+      "driver": "codex",
+      "tier": "standard",
+      "tags": [
+        "code",
+        "fast"
+      ],
+      "best_for": "everyday feature work, debugging, routine refactors"
+    },
+    {
+      "match": "*-luna",
+      "driver": "codex",
+      "tier": "fast",
+      "tags": [
+        "fast",
+        "bulk"
+      ],
+      "best_for": "cheap repeatable tasks: extraction, categorizing, short edits"
+    },
+    {
+      "match": "gemini-4*",
+      "driver": null,
+      "tier": "deep",
+      "tags": [
+        "code",
+        "deep-reasoning",
+        "research",
+        "long-context",
+        "vision"
+      ],
+      "best_for": "Google's top model: big-context sweeps, second opinion"
+    },
+    {
+      "match": "*flash*",
+      "driver": null,
+      "tier": "fast",
+      "tags": [
+        "fast",
+        "bulk",
+        "long-context",
+        "vision"
+      ],
+      "best_for": "cheap fast 1M-context bulk sweeps and diagnostics"
+    },
+    {
+      "match": "gpt-oss*",
+      "driver": null,
+      "tier": "fast",
+      "tags": [
+        "bulk",
+        "fast"
+      ],
+      "best_for": "open-weight 120B, ~128K context; cheap bulk, no vision"
+    }
+  ],
+  "effort_policy": {
+    "ladder": [
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "fast": "low",
+    "standard": "medium",
+    "deep": "high",
+    "reserved": [
+      "xhigh",
+      "max",
+      "ultra"
+    ]
+  }
+}

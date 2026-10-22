@@ -714,7 +714,7 @@ fn capabilities_output() -> Value {
             "tag_vocabulary": {"type": "object", "additionalProperties": {"type": "string"},
                                "description": "Model tag -> what it means."},
             "tags_status": {"type": "string",
-                            "description": "Why models carry no tags; absent when tags loaded."},
+                            "description": "Why the user's tag file was not used (built-in tags apply); absent when it was, or there is none."},
             "effort_policy": effort_policy_schema()
         },
         "required": ["api_version", "caller", "authority_epoch", "delegation_scope", "profiles",
