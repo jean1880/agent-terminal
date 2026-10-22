@@ -1600,3 +1600,64 @@ fn a_root_is_woken_by_news_only_when_idle_within_the_cap_and_never_after_a_stop(
         session.shutdown(false);
     });
 }
+
+/// A wake whose send is refused posts no notice (the supervisor offers it again each second,
+/// and each offer would otherwise leave one); the retry that is sent posts exactly one.
+#[test]
+fn a_refused_wake_posts_no_notice_and_its_retry_posts_one() {
+    use crate::chat::session::WakeOutcome;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(|e| matches!(&e.event, Event::Notice { text } if text == "news"))
+                .count()
+        };
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && session.status().alive
+            && !session.status().running_turn));
+
+        // `start_wake`'s own gate passes; the send's gate refuses it.
+        hooks
+            .hold_after_check
+            .set(Some(hooks.prompt_checks.get() + 1));
+        for _ in 0..3 {
+            assert_eq!(session.wake_with("news"), WakeOutcome::Busy);
+        }
+        assert_eq!(notices(), 0, "a refused send leaves no notice");
+        assert!(!session.status().running_turn);
+        assert!(!session.inner.prompt_in_flight.get());
+        assert_eq!(session.inner.auto_wakes.get(), 0);
+
+        hooks.hold_after_check.set(None);
+        assert_eq!(session.wake_with("news"), WakeOutcome::Started);
+        assert_eq!(notices(), 1);
+        assert!(pump_until(ctx, 10, || prompts().contains("news")));
+        assert!(pump_until(ctx, 10, || !session.status().running_turn));
+        assert_eq!(notices(), 1, "exactly one notice for the one wake");
+        session.shutdown(false);
+    });
+}

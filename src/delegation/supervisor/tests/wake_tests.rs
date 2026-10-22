@@ -318,3 +318,177 @@ fn a_stopped_root_is_not_woken() {
         stop(&sup).await;
     });
 }
+
+fn pending(sup: &Rc<Supervisor>, root: &WorkerId) -> usize {
+    sup.state
+        .borrow()
+        .wakes
+        .get(root)
+        .map_or(0, |q| q.pending())
+}
+
+/// A read scoped to one child, with its mailbox, also presents another child's completion
+/// report: that child's result was shown, so it is not told again.
+#[test]
+fn a_report_presented_by_a_page_scoped_to_another_child_is_not_told_again() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        connect(&sup, &root, ConnId(43)).await;
+        r.hold(true);
+        r.session.send_prompt("spawn two");
+        pump_until(|| r.prompts().contains("spawn two")).await;
+        let w1 = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-scoped-1"))
+                .await
+                .unwrap(),
+        );
+        let w2 = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-scoped-2"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &w1).await;
+        completed(&sup, &w2).await;
+        // Both completions are queued (their reports committed) before the read.
+        pump_until(|| pending(&sup, &root) == 2).await;
+        let read = tool(
+            &sup,
+            ConnId(43),
+            1,
+            ToolRequest::Read(ReadRequest {
+                target: Some(w1.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let reporters: Vec<&str> = read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == "report")
+            .filter_map(|m| m["from"].as_str())
+            .collect();
+        assert!(reporters.contains(&w2.as_str()), "{read:#}");
+        assert_eq!(pending(&sup, &root), 0, "both reports were presented");
+        release(&sup, &r).await;
+        settle().await;
+        assert!(
+            !r.prompts().contains(w2.as_str()),
+            "w2's report was already presented: {}",
+            r.prompts()
+        );
+        assert_eq!(r.wakes(), 0);
+        assert!(r.notices().is_empty());
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}
+
+/// A page cut after a child's "turn completed" event and before its report never showed the
+/// result: the root is still woken with it.
+#[test]
+fn a_page_that_showed_only_the_completion_event_still_wakes_with_the_result() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        connect(&sup, &root, ConnId(44)).await;
+        r.hold(true);
+        r.session.send_prompt("spawn and peek");
+        pump_until(|| r.prompts().contains("spawn and peek")).await;
+        let worker = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-events-only"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &worker).await;
+        pump_until(|| pending(&sup, &root) == 1).await;
+        // Paged one unit at a time, the read stops at the task run's "turn completed" (the
+        // bootstrap turn's is the first): the report after it is never shown.
+        let mut after = None;
+        let mut completions = 0;
+        for id in 1..64 {
+            let page = tool(
+                &sup,
+                ConnId(44),
+                id,
+                ToolRequest::Read(ReadRequest {
+                    target: Some(worker.clone()),
+                    after: after.clone(),
+                    max_events: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert!(
+                page["messages"].as_array().is_none_or(|m| m.is_empty()),
+                "the report was reached: {page:#}"
+            );
+            after = Some(
+                agent_core::delegation::Cursor::parse(page["next_cursor"].as_str().unwrap())
+                    .unwrap(),
+            );
+            if page.to_string().contains("turn completed") {
+                completions += 1;
+                if completions == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(completions, 2, "the run's end was shown");
+        assert_eq!(pending(&sup, &root), 1, "the result itself was not shown");
+        release(&sup, &r).await;
+        pump_until(|| r.wakes() == 1).await;
+        assert!(r
+            .prompts()
+            .contains(&format!("{worker}) finished: completed.")));
+        settle().await;
+        assert_eq!(r.wakes(), 1);
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}
+
+/// News that lands after the user stopped the root (a completion the store confirmed just
+/// after the stop) is not kept: the user's next message and the end of its turn do not let it
+/// through.
+#[test]
+fn news_landing_after_a_stop_never_wakes_the_root_once_the_user_speaks() {
+    use agent_core::delegation::wake::{Outcome, Shown};
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        r.hold(true);
+        r.session.send_prompt("start some work");
+        pump_until(|| r.prompts().contains("start some work")).await;
+        let worker = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-late"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &worker).await;
+        sup.root_stop(&r.thread);
+        assert!(r.session.wakes_held());
+        // The late completion lands now.
+        sup.queue_wake(
+            &worker,
+            Outcome::Completed,
+            "stale pre-stop result",
+            Shown::Event(i64::MAX),
+        );
+        assert_eq!(pending(&sup, &root), 0, "not queued while stopped");
+        release(&sup, &r).await;
+        // The user speaks again, which ends the hold, and that turn ends.
+        let ended = r.turns_ended();
+        r.session.send_prompt("next request");
+        assert!(!r.session.wakes_held());
+        pump_until(|| r.turns_ended() > ended && !r.session.status().running_turn).await;
+        sup.on_root_turn_end(&r.thread);
+        settle().await;
+        assert_eq!(r.wakes(), 0, "{}", r.prompts());
+        assert!(!r.prompts().contains("stale pre-stop result"));
+        assert!(r.notices().is_empty());
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}
