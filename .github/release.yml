@@ -1,0 +1,18 @@
+# Categories for GitHub's generated release notes (the "Generate release notes" button, or
+# `gh api repos/jean1880/agent-terminal/releases/generate-notes -f tag_name=vX.Y.Z`). The release
+# workflow publishes docs/releases/<tag>.md, not these: they are a list of merged pull requests to
+# start writing it from. A pull request lands in the first category whose label it carries.
+changelog:
+  exclude:
+    labels: [duplicate, invalid, wontfix]
+  categories:
+    - title: Features
+      labels: [enhancement]
+    - title: Fixes
+      labels: [bug]
+    - title: Documentation
+      labels: [documentation]
+    - title: Dependencies
+      labels: [dependencies]
+    - title: Other changes
+      labels: ["*"]
