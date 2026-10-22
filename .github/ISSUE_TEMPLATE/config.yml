@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-issue-config.json
+blank_issues_enabled: false
+contact_links:
+  - name: Security policy
+    url: https://github.com/jean1880/agent-terminal/blob/master/SECURITY.md
+    about: What counts as a vulnerability here, and how to report one with the bug report form.
+  - name: Troubleshooting
+    url: https://github.com/jean1880/agent-terminal#troubleshooting
+    about: Answers to common problems (logs, sign-in, local builds, agy editing in Plan mode).
+  - name: Contributing guide
+    url: https://github.com/jean1880/agent-terminal/blob/master/CONTRIBUTING.md
+    about: How to report bugs, propose changes and open a pull request.

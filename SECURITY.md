@@ -6,12 +6,15 @@ Only the latest release (and `master`) receives security fixes.
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/jean1880/agent-terminal/security/advisories/new),
-not in a public issue. Include the version, the steps to reproduce and the impact you expect.
+There is no private channel yet, so report vulnerabilities in a
+[public issue](https://github.com/jean1880/agent-terminal/issues/new?template=bug_report.yml)
+with `security:` at the start of its title. This section will say so when a private channel exists.
 
-You should get an acknowledgement within a week. Once a fix is released, the advisory is published
-with credit to the reporter unless you prefer otherwise.
+Include the version, the steps to reproduce and the impact you expect. Describe the problem rather
+than posting a ready-to-use exploit, and leave out real secrets, tokens and hostnames.
+
+You should get an acknowledgement within a week. The release notes of the fix credit the reporter
+unless you prefer otherwise.
 
 ## Scope
 
