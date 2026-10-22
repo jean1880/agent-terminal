@@ -134,9 +134,23 @@ pub fn claude_child_args(mode: TaskMode, overlay_path: &str) -> Vec<String> {
     .collect()
 }
 
-/// A root: only `--mcp-config <overlay>` (no `--strict-mcp-config`).
+/// What a root Claude is told about the other agents, appended to its system prompt. Claude
+/// otherwise reaches for its built-in sub-agents first: it is never told the others exist, and
+/// their tools may be deferred until searched for. Kept short: it is in every turn's context.
+pub const CLAUDE_ROOT_PROMPT: &str = "agent-terminal: other agents (Codex, Antigravity/Gemini, \
+     other Claude profiles) can be your sub-agents through the agent_terminal MCP tools; load \
+     them if deferred. Before using your built-in sub-agents for independent work or a review, \
+     call cross_agent_capabilities and start the best fit (model tags, then lowest usage.load) \
+     with cross_agent_spawn. Results come back to you.";
+
+/// A root: `--mcp-config <overlay>` (no `--strict-mcp-config`), and [`CLAUDE_ROOT_PROMPT`].
 pub fn claude_parent_args(overlay_path: &str) -> Vec<String> {
-    vec!["--mcp-config".to_owned(), overlay_path.to_owned()]
+    vec![
+        "--mcp-config".to_owned(),
+        overlay_path.to_owned(),
+        "--append-system-prompt".to_owned(),
+        CLAUDE_ROOT_PROMPT.to_owned(),
+    ]
 }
 
 /// Claude asks `can_use_tool` for our server with `source: "dynamic"`: the host allows it and
@@ -306,8 +320,18 @@ mod tests {
         assert!(write.last().is_some_and(|t| t.contains("Bash")));
         assert_eq!(
             claude_parent_args("/run/o.json"),
-            vec!["--mcp-config".to_owned(), "/run/o.json".to_owned()]
+            vec![
+                "--mcp-config".to_owned(),
+                "/run/o.json".to_owned(),
+                "--append-system-prompt".to_owned(),
+                CLAUDE_ROOT_PROMPT.to_owned()
+            ]
         );
+        // In every turn's context: it stays short, and names the tools it points to.
+        assert!(CLAUDE_ROOT_PROMPT.len() < 400, "{}", CLAUDE_ROOT_PROMPT.len());
+        for tool in ["cross_agent_capabilities", "cross_agent_spawn"] {
+            assert!(CLAUDE_ROOT_PROMPT.contains(tool), "{tool}");
+        }
         for args in [plan, write] {
             assert!(!args.iter().any(|a| a.contains("atdc_")));
             assert!(!args
