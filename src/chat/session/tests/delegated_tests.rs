@@ -818,9 +818,16 @@ fn agy_final_launch_guard_holds_writes_and_records_only_actual_generation_facts(
                 };
                 assert!(stdin_has(ctx, tmp.path(), expected));
                 if outcome == 2 {
+                    // The rebound start's held writes never reach the replacement; the user's
+                    // message behind them does, once, encoded afresh, ahead of the newer one.
                     let stdin =
                         std::fs::read_to_string(tmp.path().join("stdin.log")).expect("input");
-                    assert!(!stdin.contains("held during final launch check"));
+                    let held = "held during final launch check";
+                    assert_eq!(stdin.matches(held).count(), 1, "{stdin:?}");
+                    assert!(
+                        stdin.find(held) < stdin.find("replacement prompt"),
+                        "{stdin:?}"
+                    );
                 }
                 let actual = session.delegation_launch_facts().expect("successful facts");
                 assert_eq!(actual.generation, ProcessGeneration(8));
@@ -920,6 +927,124 @@ fn a_refused_launch_keeps_its_message_and_sends_it_first_next_time() {
             "the new message waits behind the kept one: {:?}",
             written()
         );
+    });
+}
+
+/// An agy session with delegation hooks, for the tests below; `program` replaces the shell
+/// that runs the scripted agent (a missing one fails every spawn, the first included).
+fn held_agy(
+    tmp: &std::path::Path,
+    hooks: &Rc<TestHooks>,
+    program: Option<&str>,
+) -> (Rc<ChatSession>, Seen) {
+    let store = Rc::new(Store::open_in_memory().expect("store"));
+    let thread = fresh(&store, &tmp.to_string_lossy());
+    let (sink, seen) = make_sink();
+    let mut open = scripted(tmp, "cat > \"$D/stdin.log\"");
+    if let Some(program) = program {
+        open.program = program.into();
+    }
+    let session = ChatSession::with_options(
+        Box::new(AgyAdapter::new("agy")),
+        open,
+        SessionStore::from(store),
+        thread,
+        sink,
+        Err(None),
+        LaunchEnv::default(),
+        SessionOptions {
+            generation_base: ProcessGeneration(0),
+            hooks: Some(hooks.clone()),
+            child: None,
+        },
+    );
+    (session, seen)
+}
+
+/// A start torn down while its check runs (the supervisor failing the worker shuts the session
+/// down; a switch stops it) queues its message again; the user's own stop drops it.
+#[test]
+fn a_torn_down_start_keeps_its_message_and_a_user_stop_drops_it() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let hooks = Rc::new(TestHooks::default());
+        hooks.hold_spawn.set(true);
+        let (session, _seen) = held_agy(tmp.path(), &hooks, None);
+        session.send_prompt("kept through the teardown");
+        assert!(pump_until(ctx, 10, || !hooks
+            .launch_checks
+            .borrow()
+            .is_empty()));
+        session.inner.stop_current();
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        hooks.hold_spawn.set(false);
+        session.send_prompt("sent after it");
+        let stdin = tmp.path().join("stdin.log");
+        let written = || std::fs::read_to_string(&stdin).unwrap_or_default();
+        assert!(
+            pump_until(ctx, 10, || written().contains("kept through the teardown")),
+            "{:?}",
+            written()
+        );
+        assert!(!written().contains("sent after it"), "{:?}", written());
+
+        // The user's stop of a start still waiting drops what it held.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let hooks = Rc::new(TestHooks::default());
+        hooks.hold_spawn.set(true);
+        let (session, _seen) = held_agy(tmp.path(), &hooks, None);
+        session.send_prompt("stopped by the user");
+        assert!(pump_until(ctx, 10, || !hooks
+            .launch_checks
+            .borrow()
+            .is_empty()));
+        session.interrupt();
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        hooks.hold_spawn.set(false);
+        session.send_prompt("after the stop");
+        let stdin = tmp.path().join("stdin.log");
+        let written = || std::fs::read_to_string(&stdin).unwrap_or_default();
+        assert!(pump_until(ctx, 10, || written().contains("after the stop")));
+        assert!(
+            !written().contains("stopped by the user"),
+            "{:?}",
+            written()
+        );
+    });
+}
+
+/// A start that fails to spawn opens no turn: its message is queued, and a newer one waits
+/// behind it rather than starting the next process ahead of it.
+#[test]
+fn a_failed_spawn_keeps_its_message_ahead_of_newer_ones() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let hooks = Rc::new(TestHooks::default());
+        let (session, seen) = held_agy(
+            tmp.path(),
+            &hooks,
+            Some("/nonexistent/agent-terminal-test-agy"),
+        );
+        session.send_prompt("first, through a failed spawn");
+        assert!(pump_until(ctx, 10, || {
+            has(
+                &seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("did not reach the agent")),
+            )
+        }));
+        assert!(!session.status().alive);
+        assert!(!session.inner.state.borrow().running_turn, "no turn opened");
+        session.inner.open.borrow_mut().program = "/bin/sh".into();
+        session.send_prompt("second");
+        let stdin = tmp.path().join("stdin.log");
+        let written = || std::fs::read_to_string(&stdin).unwrap_or_default();
+        assert!(
+            pump_until(ctx, 10, || written()
+                .contains("first, through a failed spawn")),
+            "{:?}",
+            written()
+        );
+        assert!(!written().contains("second"), "{:?}", written());
     });
 }
 

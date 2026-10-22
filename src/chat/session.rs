@@ -136,11 +136,12 @@ fn set_test_hook_check(check: HookCheck) {
 }
 
 /// An agy process waiting on its fresh hook proof: what was written to it meanwhile, in order,
-/// and the prompts behind those writes, kept if the start is refused or fails to spawn.
+/// and the user messages behind those writes, as the user wrote them: a start that ends without
+/// a process (refused, failed to spawn, torn down) queues them again rather than dropping them.
 struct PendingStart {
     generation: u64,
     writes: Vec<String>,
-    prompts: Vec<Sent>,
+    prompts: Vec<QueuedPrompt>,
 }
 
 fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
@@ -1621,7 +1622,7 @@ impl Inner {
         generation: u64,
         mut spec: SpawnSpec,
         writes: Vec<String>,
-        prompts: Vec<Sent>,
+        prompts: Vec<QueuedPrompt>,
     ) {
         if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
             self.spawn_spec_now(generation, spec, None);
@@ -1748,30 +1749,34 @@ impl Inner {
         });
     }
 
-    /// After a held start's spawn: its writes go to the process, or, when it did not spawn, the
-    /// prompts behind them are kept. A start that was stopped or replaced meanwhile drops both,
-    /// as a stop always did.
-    fn flush_or_keep(&self, generation: u64, writes: Vec<String>, prompts: Vec<Sent>) {
-        if self.generation.get() != generation {
-            return;
-        }
-        if self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()) {
+    /// After a held start's spawn: its writes go to the process, or, when it did not spawn (a
+    /// failed spawn may already have rolled back to the previous agent), the messages behind
+    /// them are queued again.
+    fn flush_or_keep(&self, generation: u64, writes: Vec<String>, prompts: Vec<QueuedPrompt>) {
+        let spawned = self.generation.get() == generation
+            && self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
+        if spawned {
             self.flush_start_writes(generation, writes);
         } else {
             self.keep_unsent_prompts(prompts);
         }
     }
 
-    /// Prompts that never reached an agent (its launch was refused, or it did not spawn): held,
-    /// in order, ahead of anything sent later, and sent when the agent next starts. Said, not
-    /// stored: they live in memory only, and a stored promise could outlast them.
-    fn keep_unsent_prompts(&self, prompts: Vec<Sent>) {
+    /// User messages that never reached an agent (its start was refused, did not spawn, or was
+    /// torn down by anything but the user's own stop): queued again, in order and ahead of
+    /// anything newer, as the user wrote them. Sent the ordinary way when the agent next starts,
+    /// so whichever agent and handoff are current then apply. The notice is said, not stored:
+    /// the queue lives in memory only, and a stored promise could outlast it.
+    fn keep_unsent_prompts(&self, prompts: Vec<QueuedPrompt>) {
         if prompts.is_empty() {
             return;
         }
         let kept = prompts.len();
-        self.held_retries.borrow_mut().extend(prompts);
-        self.prompt_in_flight.set(false);
+        // Their turn never opened: nothing is running, and the next message must queue behind.
+        self.state.borrow_mut().running_turn = false;
+        for queued in prompts.into_iter().rev() {
+            self.hold_queued_prompt(queued);
+        }
         self.deliver(&Envelope::new(Event::Notice {
             text: if kept == 1 {
                 "Your message did not reach the agent. It is kept, and goes first when the agent \
@@ -1859,7 +1864,12 @@ impl Inner {
                 }
             }
             Err(e) => {
-                self.state.borrow_mut().alive = false;
+                {
+                    // No process, so no turn: a prompt written into the start opened none.
+                    let mut state = self.state.borrow_mut();
+                    state.alive = false;
+                    state.running_turn = false;
+                }
                 self.abandon_unspawned_binding();
                 // Nothing will complete a turn: a pending handoff goes out with the next prompt.
                 self.handoff_in_flight.set(false);
@@ -2699,9 +2709,9 @@ impl Inner {
     /// open turn was interrupted, never failed.
     fn finish_process(&self, code: Option<i32>, deliberate: bool) {
         self.deferred_mode.set(None);
-        // A start still waiting on its hook proof never spawns, and what it held is dropped,
-        // its delegation binding included.
-        *self.starting.borrow_mut() = None;
+        // A start still waiting on its checks never spawns: its writes and delegation binding go,
+        // and its user messages queue again (unless the user's own stop cleared them first).
+        let unsent = self.starting.borrow_mut().take().map(|p| p.prompts);
         self.abandon_unspawned_binding();
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
@@ -2760,6 +2770,10 @@ impl Inner {
                     .publish
                     .cancel_generation(ProcessGeneration(process_generation));
             }
+        }
+        // Last, once the exit has settled the turn: the start's messages wait for the next one.
+        if let Some(unsent) = unsent {
+            self.keep_unsent_prompts(unsent);
         }
     }
 
@@ -3055,8 +3069,12 @@ impl Inner {
                         None => false,
                     };
                     // A start still waiting on its hook proof ends the way an interrupted agy
-                    // does (it exits): what it held is dropped, and the next prompt restarts it.
+                    // does (it exits): what it held is dropped, its messages included (the user
+                    // stopped them), and the next prompt restarts it.
                     if !interrupted && self.starting.borrow().is_some() {
+                        if let Some(pending) = self.starting.borrow_mut().as_mut() {
+                            pending.prompts.clear();
+                        }
                         self.stop_current();
                     }
                 }
@@ -3358,12 +3376,26 @@ impl Inner {
             None => text.to_owned(),
         };
         self.prompt_in_flight.set(true);
-        if !self.dispatch_sent_prompt(&sent, handoff) {
-            self.hold_queued_prompt(QueuedPrompt {
-                item_id: item,
-                text: text.to_owned(),
-                stored,
-            });
+        let queued = QueuedPrompt {
+            item_id: item,
+            text: text.to_owned(),
+            stored,
+        };
+        if self.dispatch_sent_prompt(&sent, handoff) {
+            self.note_unspawned_prompt(queued);
+        } else {
+            self.hold_queued_prompt(queued);
+        }
+    }
+
+    /// A user message just written into a start that has not spawned yet: kept with that start,
+    /// so one that ends without a process queues it again instead of dropping it.
+    fn note_unspawned_prompt(&self, queued: QueuedPrompt) {
+        if self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()) {
+            return;
+        }
+        if let Some(pending) = self.starting.borrow_mut().as_mut() {
+            pending.prompts.push(queued);
         }
     }
 
@@ -3413,17 +3445,6 @@ impl Inner {
         if accepted {
             self.prompted.set(true);
             self.remember_pre_init_prompt(sent, handoff.clone());
-            // Written into a start that has not spawned yet: kept with it, so a refused or
-            // failed launch can hold the prompt instead of dropping it with the writes.
-            let live = self.proc.borrow().as_ref().is_some_and(|p| p.is_alive());
-            if !live {
-                if let Some(pending) = self.starting.borrow_mut().as_mut() {
-                    pending.prompts.push(Sent {
-                        text: sent.to_owned(),
-                        handoff: handoff.clone(),
-                    });
-                }
-            }
         }
         if !accepted && starts_turn {
             self.state.borrow_mut().running_turn = was_running;
@@ -3553,13 +3574,15 @@ impl Inner {
                 None => queued.text.clone(),
             };
             self.prompt_in_flight.set(true);
+            let queued = QueuedPrompt {
+                stored: true,
+                ..queued
+            };
             if !self.dispatch_sent_prompt(&sent, handoff) {
-                self.hold_queued_prompt(QueuedPrompt {
-                    stored: true,
-                    ..queued
-                });
+                self.hold_queued_prompt(queued);
                 return;
             }
+            self.note_unspawned_prompt(queued);
             // A local slash command can finish synchronously. Drain its next turn iteratively.
             if self.state.borrow().running_turn || !self.queued_dispatch_pending.replace(false) {
                 return;
