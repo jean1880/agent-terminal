@@ -610,10 +610,14 @@ fn observe_calls(
         Driver::Agy => {
             let p = v.get("step_update").unwrap_or(v);
             let params = p.pointer("/tool_info/parameters");
+            // agy builds have spelt these parameters in more than one case; any of them is the
+            // same call, still only ever read from agy's own stream.
+            let param = |names: &[&str]| -> Option<&Value> {
+                let params = params?;
+                names.iter().find_map(|n| params.get(*n))
+            };
             if p.get("tool_name").and_then(Value::as_str) != Some("call_mcp_tool")
-                || params
-                    .and_then(|p| p.get("ServerName"))
-                    .and_then(Value::as_str)
+                || param(&["ServerName", "server_name", "serverName"]).and_then(Value::as_str)
                     != Some("agent_terminal")
             {
                 return;
@@ -623,10 +627,8 @@ fn observe_calls(
                     .or_else(|| v.get("conversation_id"))
                     .and_then(Value::as_str),
                 p["step_index"].as_u64(),
-                params
-                    .and_then(|p| p.get("ToolName"))
-                    .and_then(Value::as_str),
-                params.and_then(|p| p.get("Arguments")),
+                param(&["ToolName", "tool_name", "toolName"]).and_then(Value::as_str),
+                param(&["Arguments", "arguments"]),
             ) {
                 record(
                     InvocationKey::Agy {
@@ -638,5 +640,56 @@ fn observe_calls(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An agy `call_mcp_tool` step for `params`, at step `index`.
+    fn agy_step(index: u64, params: Value) -> Value {
+        json!({"event": "step_update", "conversation_id": "c1", "step_update": {
+            "conversation_id": "c1", "state": "ACTIVE", "step_index": index,
+            "step_type": "tool", "tool_name": "call_mcp_tool",
+            "tool_info": {"parameters": params}}})
+    }
+
+    fn observed(steps: &[Value]) -> usize {
+        let limits = agent_core::delegation::Limits::default();
+        let mut calls = ObservedCalls::new([1; 16], limits.observed_calls as usize);
+        let mut seen = std::collections::VecDeque::new();
+        for step in steps {
+            observe_calls(&mut calls, &mut seen, Driver::Agy, step, &limits);
+        }
+        calls.len()
+    }
+
+    /// The same call is observed whichever case agy spells its parameters in, and a call to
+    /// another server never is.
+    #[test]
+    fn agy_calls_are_observed_in_every_parameter_spelling() {
+        let args = json!({"after": "c1"});
+        for (server, tool, arguments) in [
+            ("ServerName", "ToolName", "Arguments"),
+            ("server_name", "tool_name", "arguments"),
+            ("serverName", "toolName", "arguments"),
+        ] {
+            let step = agy_step(
+                1,
+                json!({server: "agent_terminal", tool: "cross_agent_read", arguments: args}),
+            );
+            assert_eq!(observed(&[step]), 1, "{server}/{tool}/{arguments}");
+        }
+        let elsewhere = agy_step(
+            2,
+            json!({"server_name": "other", "tool_name": "cross_agent_read", "arguments": args}),
+        );
+        assert_eq!(
+            observed(&[elsewhere]),
+            0,
+            "another server's call is not ours"
+        );
     }
 }
