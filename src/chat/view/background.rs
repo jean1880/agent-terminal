@@ -168,7 +168,6 @@ pub struct TaskOutputPanel {
     status: gtk4::Label,
     note: gtk4::Label,
     buffer: gtk4::TextBuffer,
-    scroller: gtk4::ScrolledWindow,
     /// A read is out: the next poll waits for it.
     in_flight: Cell<bool>,
     /// The task has left the list; one last read, then the poll stops.
@@ -211,6 +210,8 @@ impl TaskOutputPanel {
         scroller.set_vexpand(true);
         scroller.add_css_class("code-block");
         scroller.set_child(Some(&view));
+        // Opens on the newest output and follows it live.
+        super::follow::follow_end(&scroller);
         body.append(&scroller);
         let note = label("", &["dim-label", "caption"]);
         note.set_xalign(0.0);
@@ -226,7 +227,6 @@ impl TaskOutputPanel {
             status,
             note,
             buffer,
-            scroller,
             in_flight: Cell::new(false),
             ended: Cell::new(false),
             closed: Cell::new(false),
@@ -292,15 +292,13 @@ impl TaskOutputPanel {
                     return;
                 }
                 let text = plain_text(&out.text);
+                // The scroller follows the end itself (`follow::follow_end`). New output is
+                // appended rather than the whole text replaced, which would empty the view for a
+                // moment and throw a reader who scrolled up back to the end.
                 if shown != text {
-                    let adj = self.scroller.vadjustment();
-                    let following = adj.value() + adj.page_size() >= adj.upper() - 4.0;
-                    self.buffer.set_text(&text);
-                    if following {
-                        let mut end = self.buffer.end_iter();
-                        if let Some(view) = self.scroller.child().and_downcast::<gtk4::TextView>() {
-                            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
-                        }
+                    match text.strip_prefix(shown.as_str()) {
+                        Some(added) => self.buffer.insert(&mut self.buffer.end_iter(), added),
+                        None => self.buffer.set_text(&text),
                     }
                 }
                 self.status.set_text(if text.is_empty() {

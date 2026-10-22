@@ -489,6 +489,8 @@ impl SubagentPanel {
         scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scroller.set_vexpand(true);
         scroller.set_child(Some(&body));
+        // Opens on the sub-agent's latest step and follows it live.
+        super::follow::follow_end(&scroller);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&scroller));

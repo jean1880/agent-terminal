@@ -19,6 +19,7 @@ mod cards;
 mod composer;
 mod delegation;
 pub mod demo;
+mod follow;
 mod difftext;
 mod form_card;
 mod form_draft;
@@ -2947,6 +2948,7 @@ pub(crate) mod tests {
         interruption::tests::the_shelf_holds_requests_it_must_not_grant_unseen();
         requests_ui_checks();
         thinking_strip_follows_the_turn();
+        follow::tests::a_followed_scroller_tracks_its_end_until_the_user_scrolls_up();
         composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
         panels::tests::changing_effort_does_not_switch_until_row_activation();
         panels::tests::a_reconnect_in_flight_shows_on_its_row();
