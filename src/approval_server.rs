@@ -1295,6 +1295,11 @@ fn deny(conn: gio::SocketConnection, reason: &str) {
 }
 
 async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
+    // The agent this connection came from: an `expire_all` while its line is read means that
+    // process is gone, and its request must not become a card.
+    let Some(generation) = weak.upgrade().map(|i| i.response_generation.get()) else {
+        return deny(conn, "agent-terminal session closed");
+    };
     let data = gio::DataInputStream::new(&conn.input_stream());
     let line =
         match glib::future_with_timeout(QUERY_TIMEOUT, data.read_line_future(IO_PRIORITY)).await {
@@ -1304,6 +1309,9 @@ async fn serve(weak: Weak<ServerInner>, conn: gio::SocketConnection) {
     let Some(inner) = weak.upgrade() else {
         return deny(conn, "agent-terminal session closed");
     };
+    if inner.response_generation.get() != generation {
+        return deny(conn, "the agent restarted");
+    }
     let query = match approval::parse_query(&line) {
         Ok(q) if !q.id.is_empty() => q,
         _ => return deny(conn, "malformed approval request"),
@@ -2866,6 +2874,35 @@ mod tests {
             assert_eq!(wait_reply(ctx, &rx).decision, Decision::Deny);
             assert!(pump_until(ctx, 10, || seen.borrow().len() == 4));
             assert_eq!(seen.borrow()[3].event, Event::ApprovalExpired);
+        });
+    }
+
+    #[test]
+    fn a_request_read_after_its_agent_expired_is_denied_without_a_card() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (handle, seen) = bound(tmp.path(), Mode::Ask, DEFAULT_DEADLINE);
+            // The hook connects; the server accepts and waits for its line.
+            let mut s = UnixStream::connect(handle.socket_path()).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(15)))
+                .expect("timeout");
+            let started = std::time::Instant::now();
+            pump_until(ctx, 5, || started.elapsed() >= Duration::from_millis(300));
+            // The agent exits before the line arrives.
+            handle.expire_all("the agent exited");
+            let line = approval::encode_query(&with_id(cmd("ls"), "x1")).expect("encode");
+            writeln!(s, "{line}").expect("send");
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reply = String::new();
+                BufReader::new(s).read_line(&mut reply).expect("reply");
+                tx.send(reply).expect("deliver");
+            });
+            let r = wait_reply(ctx, &rx);
+            assert_eq!(r.decision, Decision::Deny);
+            assert_eq!(r.reason.as_deref(), Some("the agent restarted"));
+            assert!(request_id(&seen).is_none(), "no card for a dead agent");
+            assert!(!handle.has_pending("x1"));
         });
     }
 
