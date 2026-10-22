@@ -840,8 +840,11 @@ mod tests {
             .unwrap();
             assert_ne!(watch.phase(), crate::agent_proc::StopPhase::Exited);
             pump_until(|| watch.phase() == crate::agent_proc::StopPhase::Exited).await;
-            assert!(sup.state.borrow().workers[&worker].run.is_none());
+            // The exit is observed in the same notification that reports it.
             assert!(sup.state.borrow().workers[&worker].generations.is_empty());
+            // The run ends only once its interrupted turn has committed, a store round trip
+            // that can land after the exit.
+            pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
             stop(&sup).await;
         });
     }
