@@ -192,24 +192,41 @@ pub fn codex_child_servers_ok(started: &[String]) -> bool {
     started.len() == 1 && started[0] == SERVER_NAME
 }
 
-/// `mcp-<app-pid>-<worker>-<gen>.json`.
-pub fn overlay_file_name(app_pid: u32, worker: &WorkerId, generation: ProcessGeneration) -> String {
-    format!("mcp-{app_pid}-{worker}-{}.json", generation.0)
+/// `mcp-<app-pid>-<worker>-<gen>-<attempt>.json`. The attempt makes each launch's file its own:
+/// a launch that never started does not advance the generation, and the file of an abandoned
+/// attempt may still be on its way out when the next attempt writes.
+pub fn overlay_file_name(
+    app_pid: u32,
+    worker: &WorkerId,
+    generation: ProcessGeneration,
+    attempt: u64,
+) -> String {
+    format!("mcp-{app_pid}-{worker}-{}-{attempt}.json", generation.0)
 }
 
-/// The app pid of an overlay file name, or `None` for any other name.
+/// The app pid of an overlay file name (this form, or the earlier one without an attempt), or
+/// `None` for any other name.
 pub fn overlay_sweep_candidate(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("mcp-")?.strip_suffix(".json")?;
     let (pid, rest) = rest.split_once('-')?;
-    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !number(pid) {
         return None;
     }
-    let (worker, generation) = rest.rsplit_once('-')?;
+    let (head, last) = rest.rsplit_once('-')?;
+    if !number(last) {
+        return None;
+    }
+    // `<worker>-<gen>-<attempt>`, else the earlier `<worker>-<gen>`.
+    let worker = match head.rsplit_once('-') {
+        Some((worker, generation)) if number(generation) && WorkerId::parse(worker).is_ok() => {
+            generation.parse::<u64>().ok()?;
+            worker
+        }
+        _ => head,
+    };
     WorkerId::parse(worker).ok()?;
-    if generation.is_empty() || !generation.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    generation.parse::<u64>().ok()?;
+    last.parse::<u64>().ok()?;
     pid.parse().ok()
 }
 
@@ -395,16 +412,23 @@ mod tests {
     #[test]
     fn overlay_names_round_trip() {
         let w = WorkerId::parse("w_abcdefgh").expect("valid");
-        let name = overlay_file_name(4242, &w, ProcessGeneration(3));
-        assert_eq!(name, "mcp-4242-w_abcdefgh-3.json");
+        let name = overlay_file_name(4242, &w, ProcessGeneration(3), 17);
+        assert_eq!(name, "mcp-4242-w_abcdefgh-3-17.json");
         assert_eq!(overlay_sweep_candidate(&name), Some(4242));
+        // An earlier version's name, without the attempt, is still swept.
+        assert_eq!(
+            overlay_sweep_candidate("mcp-4242-w_abcdefgh-3.json"),
+            Some(4242)
+        );
         for foreign in [
             "mcp.json",
-            "mcp-x-w_abcdefgh-3.json",
+            "mcp-x-w_abcdefgh-3-1.json",
+            "mcp-4242-w_abc-3-1.json",
             "mcp-4242-w_abc-3.json",
             "mcp-4242-w_abcdefgh-.json",
-            "mcp-4242-w_abcdefgh-3.txt",
-            "other-4242-w_abcdefgh-3.json",
+            "mcp-4242-w_abcdefgh-3-.json",
+            "mcp-4242-w_abcdefgh-3-1.txt",
+            "other-4242-w_abcdefgh-3-1.json",
         ] {
             assert_eq!(overlay_sweep_candidate(foreign), None, "{foreign}");
         }

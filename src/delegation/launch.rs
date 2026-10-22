@@ -34,11 +34,19 @@ fn utf8(path: &Path, what: &str) -> Result<String, String> {
 /// Mints the token and, for Claude, writes the overlay (`O_EXCL|O_NOFOLLOW`, `0600`). Blocking:
 /// run in `gio::spawn_blocking`.
 pub(crate) fn prepare_binding(req: &BindingRequest) -> Result<PreparedBinding, String> {
-    prepare_with(req, random_bytes()?)
+    // Each attempt names its own overlay (`overlay_file_name`); unique within this app process,
+    // whose pid the name also carries.
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    prepare_with(req, random_bytes()?, attempt)
 }
 
-/// [`prepare_binding`] with the random bytes given (tests pin them to find the token).
-fn prepare_with(req: &BindingRequest, random: [u8; 32]) -> Result<PreparedBinding, String> {
+/// [`prepare_binding`] with the random bytes and attempt given (tests pin them).
+fn prepare_with(
+    req: &BindingRequest,
+    random: [u8; 32],
+    attempt: u64,
+) -> Result<PreparedBinding, String> {
     if !req.bridge_command.is_absolute() || !req.endpoint.is_absolute() {
         return Err("the bridge command and the endpoint must be absolute paths".to_owned());
     }
@@ -62,7 +70,7 @@ fn prepare_with(req: &BindingRequest, random: [u8; 32]) -> Result<PreparedBindin
                         .ok_or_else(|| "a Claude child binding needs its task mode".to_owned()),
                 }
             };
-            let name = overlay_file_name(req.app_pid, &req.worker, req.generation);
+            let name = overlay_file_name(req.app_pid, &req.worker, req.generation, attempt);
             let path = req.rundir.path().join(name);
             let path_str = utf8(&path, "overlay")?;
             // Built before the file exists, so a refusal leaves nothing behind.
@@ -216,11 +224,11 @@ mod tests {
             if role == Role::Child {
                 req.generation = ProcessGeneration(3);
             }
-            let p = prepare_binding(&req).expect("prepared");
+            let p = prepare_with(&req, random_bytes().expect("random"), 5).expect("prepared");
             let path = p.overlay.clone().expect("overlay");
             assert_eq!(
                 path.file_name().and_then(|n| n.to_str()),
-                Some(overlay_file_name(4242, &req.worker, req.generation).as_str())
+                Some(overlay_file_name(4242, &req.worker, req.generation, 5).as_str())
             );
             let meta = std::fs::symlink_metadata(&path).expect("lstat");
             assert!(meta.is_file());
@@ -300,16 +308,32 @@ mod tests {
         let req = request(Driver::Claude, Role::Root, dir.clone());
         let path = dir
             .path()
-            .join(overlay_file_name(4242, &req.worker, req.generation));
+            .join(overlay_file_name(4242, &req.worker, req.generation, 1));
         std::fs::write(&path, b"old").expect("write");
-        assert!(prepare_with(&req, [1; 32]).is_err());
+        assert!(prepare_with(&req, [1; 32], 1).is_err());
         assert_eq!(std::fs::read(&path).expect("read"), b"old");
         std::fs::remove_file(&path).expect("rm");
 
         let target = tmp.path().join("elsewhere.json");
         std::os::unix::fs::symlink(&target, &path).expect("symlink");
-        assert!(prepare_with(&req, [1; 32]).is_err());
+        assert!(prepare_with(&req, [1; 32], 1).is_err());
         assert!(!target.exists(), "nothing written through the link");
+    }
+
+    /// Two attempts at the same generation (the first never started; its file may still be on
+    /// its way out) each get their own overlay, so the second is never refused for the first's.
+    #[test]
+    fn each_attempt_at_a_generation_gets_its_own_overlay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = private_rundir(tmp.path());
+        let req = request(Driver::Claude, Role::Root, dir);
+        let first = prepare_binding(&req).expect("first");
+        let second = prepare_binding(&req).expect("second, while the first's file is still there");
+        let (a, b) = (first.overlay.expect("a"), second.overlay.expect("b"));
+        assert_ne!(a, b);
+        assert!(a.exists() && b.exists());
+        unlink_overlay(&a);
+        unlink_overlay(&b);
     }
 
     #[test]
@@ -319,7 +343,7 @@ mod tests {
         let link = tmp.path().join("linked");
         std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
         let req = request(Driver::Claude, Role::Root, RuntimeDir::from_verified(link));
-        let err = prepare_with(&req, [1; 32]).expect_err("refused");
+        let err = prepare_with(&req, [1; 32], 1).expect_err("refused");
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(
             std::fs::read_dir(real.path()).map(|d| d.count()).ok(),
@@ -333,7 +357,7 @@ mod tests {
         let dir = private_rundir(tmp.path());
         let mut req = request(Driver::Claude, Role::Child, dir.clone());
         req.task_mode = None;
-        assert!(prepare_with(&req, [1; 32]).is_err());
+        assert!(prepare_with(&req, [1; 32], 1).is_err());
         assert_eq!(
             std::fs::read_dir(dir.path()).map(|d| d.count()).ok(),
             Some(0)
