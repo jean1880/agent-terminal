@@ -31,8 +31,8 @@ Everyone taking part is expected to follow the [Code of Conduct](CODE_OF_CONDUCT
   or [`help wanted`](https://github.com/jean1880/agent-terminal/labels/help%20wanted). Say in
   the issue that you're taking it, so two people don't do the same work.
 
-**Security problems are not reported in issues.** Follow [SECURITY.md](SECURITY.md) and use
-GitHub's private vulnerability reporting.
+**Security problems** go in a public issue for now, as [SECURITY.md](SECURITY.md) describes:
+put `security:` at the start of the title, and leave out ready-to-use exploits and real secrets.
 
 ## Reporting a bug
 

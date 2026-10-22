@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for taking the time to report this. A bug that can be reproduced gets fixed first.
 
-        - **A security problem?** Don't file it here. Use [private vulnerability reporting](https://github.com/jean1880/agent-terminal/security/advisories/new) (see [SECURITY.md](https://github.com/jean1880/agent-terminal/blob/master/SECURITY.md)).
+        - **A security problem?** Report it here, with `security:` at the start of the title. Describe the problem, but leave out ready-to-use exploits and real secrets (see [SECURITY.md](https://github.com/jean1880/agent-terminal/blob/master/SECURITY.md)).
         - **A problem in `claude`, `agy` or `codex` itself?** If it also happens when you run that CLI directly, report it to its vendor.
 
   - type: checkboxes
