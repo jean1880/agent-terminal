@@ -49,8 +49,11 @@ Architectural mandates, standards, and workflows for this codebase.
     and every persisted event), `event` (the canonical provider-neutral event
     stream), `caps` (per-agent capability matrix), `adapter` (the sans-I/O
     adapter contract), `git_command` (a `git`/`gh` command line read as its operation for the
-    approval card: a reading aid, never a gate; the card still shows the command) and the
-    per-agent adapters and pure policies built on it.
+    approval card: a reading aid, never a gate; the card still shows the command),
+    `agent_command` (a shell command that launches an agent CLI, `cross-agent`, `claude -p`,
+    `codex exec` or `agy -p`, read from a command line or a shell tool's input, so it can be shown
+    as a sub-agent; a reading aid too, though a delegated child's authority refuses what it
+    recognises) and the per-agent adapters and pure policies built on it.
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
