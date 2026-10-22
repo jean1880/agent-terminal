@@ -186,7 +186,8 @@ Architectural mandates, standards, and workflows for this codebase.
   (`suspend_idle_threads`) asks `ChatSession::suspend_if_idle`, which stops the agent process
   only when nothing would be lost (`Inner::suspend_blocker`: no turn, queue, approval, permission
   card, model change, handoff, rebind, Codex session grants, unresumable Codex thread, no
-  conversation yet, Bypass, delegated worker; the window adds background work, delegated runs and
+  conversation yet, Bypass, delegated worker, active provider workers; the window adds background
+  work, delegated runs, a delegated sub-agent's open question and
   pending sends). A delegation root suspends only with its hooks' consent
   (`DelegationHooks::suspending`): a planned rotation (`rotate_before_stop`), so nothing is
   revoked, and the rebind around its resume posts no notice; it also refuses while sub-agents are

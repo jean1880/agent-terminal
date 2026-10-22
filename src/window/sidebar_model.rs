@@ -106,6 +106,46 @@ pub fn is_busy(running: bool, background: bool, approval: bool) -> bool {
     running || background || approval
 }
 
+/// Approvals, questions and forms that delegated sub-agents wait on, per sub-agent, so the
+/// root thread asks for the user as it would for its own. A resolution names its request when it
+/// has one; without one, everything that sub-agent waits on is withdrawn.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChildAsks {
+    asks: std::collections::HashSet<(String, String)>,
+}
+
+impl ChildAsks {
+    pub fn requested(&mut self, worker: &str, request: Option<&str>) {
+        self.asks
+            .insert((worker.to_owned(), request.unwrap_or_default().to_owned()));
+    }
+
+    pub fn resolved(&mut self, worker: &str, request: Option<&str>) {
+        match request {
+            Some(request) => {
+                self.asks.remove(&(worker.to_owned(), request.to_owned()));
+                // A request recorded without its id is withdrawn by any resolution.
+                self.asks.remove(&(worker.to_owned(), String::new()));
+            }
+            None => self.worker_ended(worker),
+        }
+    }
+
+    /// The sub-agent's turn or process ended: nothing it asked can still be answered.
+    pub fn worker_ended(&mut self, worker: &str) {
+        self.asks.retain(|(w, _)| w != worker);
+    }
+
+    /// Keeps only what the listed (still active) sub-agents wait on.
+    pub fn retain_workers(&mut self, active: &[&str]) {
+        self.asks.retain(|(w, _)| active.contains(&w.as_str()));
+    }
+
+    pub fn any(&self) -> bool {
+        !self.asks.is_empty()
+    }
+}
+
 /// Why a switch must ask before it stops this thread's work.
 pub fn busy_reason(running: bool, background: usize, approval: bool) -> Option<String> {
     if !is_busy(running, background > 0, approval) {
@@ -238,7 +278,8 @@ pub fn held_finish_due(held: bool, running: bool, background: bool) -> bool {
 /// The tooltip of a spinning row: its badge's, plus what runs in the background.
 pub fn row_tooltip(badge: Badge, background: &[String]) -> String {
     match (badge, background.is_empty()) {
-        (Badge::Background, _) => background_tooltip(background),
+        (Badge::Background, true) => badge.tooltip().to_owned(),
+        (Badge::Background, false) => background_tooltip(background),
         (_, true) => badge.tooltip().to_owned(),
         (_, false) => format!("{}; {}", badge.tooltip(), background_tooltip(background)),
     }
@@ -1737,6 +1778,39 @@ mod tests {
             row_tooltip(Badge::Background, &bg),
             "1 background task running: Review the diff"
         );
+    }
+
+    #[test]
+    fn a_row_with_only_unnamed_background_work_still_explains_its_badge() {
+        assert_eq!(
+            row_tooltip(Badge::Background, &[]),
+            "Background tasks running"
+        );
+    }
+
+    #[test]
+    fn child_asks_follow_each_sub_agent_request() {
+        let mut asks = ChildAsks::default();
+        assert!(!asks.any());
+        asks.requested("w1", Some("r1"));
+        asks.requested("w1", Some("r2"));
+        asks.requested("w2", None);
+        asks.resolved("w1", Some("r1"));
+        assert!(asks.any());
+        asks.resolved("w1", Some("r2"));
+        // An id-less request is withdrawn by any resolution from that sub-agent.
+        asks.resolved("w2", Some("x"));
+        assert!(!asks.any());
+        asks.requested("w1", Some("r1"));
+        asks.requested("w1", Some("r2"));
+        asks.resolved("w1", None);
+        assert!(!asks.any());
+        asks.requested("w1", Some("r1"));
+        asks.requested("w2", Some("r1"));
+        asks.worker_ended("w1");
+        assert!(asks.any());
+        asks.retain_workers(&["w1"]);
+        assert!(!asks.any());
     }
 
     #[test]

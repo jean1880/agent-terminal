@@ -552,6 +552,17 @@ pub enum WorkerState {
     Unknown,
 }
 
+impl WorkerState {
+    /// Whether the worker may still be doing work: only an observed exit ends one, so a stop
+    /// in progress still counts.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Waiting | Self::Stopping
+        )
+    }
+}
+
 /// Where a worker came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -369,6 +369,9 @@ struct Inner {
     native_turn: RefCell<Option<String>>,
     /// Open approval requests by the id the view knows them by, so revocation can end them.
     open_approvals: RefCell<Vec<String>>,
+    /// Provider workers (Codex sub-agents) the agent last listed as still active: they run in
+    /// the agent's process, so stopping it to save memory would end them.
+    active_workers: Cell<usize>,
     /// Original tool/input for a final authority check immediately before answering a card.
     approval_inputs: RefCell<HashMap<String, (String, serde_json::Value)>>,
     /// Requests a child's gate let through only as a card with no grant (`AskOnly`).
@@ -779,6 +782,7 @@ impl ChatSession {
             rebinding: Cell::new(false),
             native_turn: RefCell::new(None),
             open_approvals: RefCell::new(Vec::new()),
+            active_workers: Cell::new(0),
             approval_inputs: RefCell::new(HashMap::new()),
             ask_only: RefCell::new(HashSet::new()),
             worker: RefCell::new(None),
@@ -1252,6 +1256,10 @@ impl Inner {
                         open.push(req.clone());
                     }
                 }
+            }
+            Event::WorkersUpdated { workers, .. } => {
+                self.active_workers
+                    .set(workers.iter().filter(|w| w.state.is_active()).count());
             }
             Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
                 if let Some(req) = &env.request {
@@ -2654,6 +2662,7 @@ impl Inner {
             a.expire_all("the agent exited");
         }
         self.open_approvals.borrow_mut().clear();
+        self.active_workers.set(0);
         self.approval_inputs.borrow_mut().clear();
         self.ask_only.borrow_mut().clear();
         self.bound_generation.set(false);
@@ -2706,6 +2715,7 @@ impl Inner {
                 "Codex session grants",
             ),
             (self.child.is_some(), "a delegated worker"),
+            (self.active_workers.get() > 0, "active provider workers"),
             (
                 !self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()),
                 "no live process",
@@ -6263,6 +6273,45 @@ mod tests {
                 Some("Codex session grants")
             );
             session.inner.codex_grants.borrow_mut().clear();
+            // Provider workers live in the agent's process: stopping it would end them, even
+            // with no turn running. Only an observed exit lets go.
+            let workers = |state| {
+                Envelope::new(Event::WorkersUpdated {
+                    workers: vec![agent_core::event::WorkerSnapshot {
+                        id: "w1".into(),
+                        name: None,
+                        task: None,
+                        state,
+                        activity: None,
+                        delegation: None,
+                    }],
+                    waiting_for: Vec::new(),
+                })
+            };
+            session
+                .inner
+                .emit(workers(agent_core::event::WorkerState::Running));
+            assert_eq!(
+                session.inner.suspend_blocker(),
+                Some("active provider workers")
+            );
+            assert!(!session.suspend_if_idle(), "a running worker keeps it up");
+            session
+                .inner
+                .emit(workers(agent_core::event::WorkerState::Stopping));
+            assert_eq!(
+                session.inner.suspend_blocker(),
+                Some("active provider workers"),
+                "a stop in progress is still active"
+            );
+            session
+                .inner
+                .emit(workers(agent_core::event::WorkerState::Completed));
+            assert_eq!(
+                session.inner.suspend_blocker(),
+                None,
+                "settled workers let go"
+            );
             session.inner.state.borrow_mut().mode = Mode::Bypass;
             assert!(
                 !session.suspend_if_idle(),

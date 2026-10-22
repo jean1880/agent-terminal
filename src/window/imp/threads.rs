@@ -41,7 +41,7 @@ use crate::window::sidebar_model::{
     forbids_unasked_edits, held_finish_due, is_busy, limit_over, needs_attention, parse_driver,
     react, redraw_for, relative_time, resume_as, row_tooltip, safe_handoff_target,
     sidebar_sections, stop_heading, stored_model, thread_title, turn_finishes_thread, Attention,
-    Badge, FolderGroup, OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
+    Badge, ChildAsks, FolderGroup, OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
     reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
@@ -652,8 +652,24 @@ impl ChatTab {
     /// Whether closing this thread would cut work short. The one place the close question
     /// (the row's X, archive, the window) decides; extend it for background work.
     pub(super) fn busy(&self) -> bool {
-        is_busy(self.running, !self.background.is_empty(), self.approval)
-            || crate::delegation::supervisor().is_some_and(|s| s.root_busy(&self.thread))
+        is_busy(
+            self.running,
+            self.background_work(false),
+            self.waiting_on_user(),
+        ) || crate::delegation::supervisor().is_some_and(|s| s.root_busy(&self.thread))
+    }
+
+    /// Whether anything this thread's agent started still runs behind its turn: background
+    /// tasks, provider sub-agents (Codex workers) or, as `delegated` says, delegated workers
+    /// ([`Supervisor::root_busy`]).
+    pub(super) fn background_work(&self, delegated: bool) -> bool {
+        !self.background.is_empty() || self.workers_active > 0 || delegated
+    }
+
+    /// Whether the thread waits for the user: its own approval or question, or one a delegated
+    /// sub-agent raised.
+    pub(super) fn waiting_on_user(&self) -> bool {
+        self.approval || self.child_asks.any()
     }
 
     /// What closing this thread's page would lose: its work ([`Self::busy`]) or its unsent
@@ -695,6 +711,10 @@ pub(super) struct ChatTab {
     /// following, once the list empties (`release_held_finish`).
     finish_held: bool,
     pub(super) approval: bool,
+    /// Provider sub-agents (Codex workers) the agent's registry lists as still active.
+    workers_active: usize,
+    /// What delegated sub-agents wait on the user for, shown on this thread as its own.
+    child_asks: ChildAsks,
     rate_limited: bool,
     pub(super) unread: bool,
     /// A "stop and close?" question is already on screen for this thread.
@@ -3010,8 +3030,10 @@ impl AgentTerminalWindow {
                 let badge = match chat {
                     Some(c) => badge_for(
                         c.running,
-                        !c.background.is_empty(),
-                        c.approval,
+                        c.background_work(
+                            crate::delegation::supervisor().is_some_and(|s| s.root_busy(&c.thread)),
+                        ),
+                        c.waiting_on_user(),
                         c.rate_limited,
                         c.unread,
                     ),
@@ -4676,6 +4698,8 @@ impl AgentTerminalWindow {
                 background: Vec::new(),
                 finish_held: false,
                 approval: false,
+                workers_active: 0,
+                child_asks: ChildAsks::default(),
                 rate_limited: false,
                 // A restored thread that was never shown keeps the store's unread mark. Same
                 // rule as a closed row in `sidebar_rows`: an empty thread (updated_at 0) has
@@ -5371,6 +5395,10 @@ impl AgentTerminalWindow {
         let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
         let focused = self.obj().is_active();
         let delegated_work = crate::delegation::supervisor().is_some_and(|s| s.root_busy(thread));
+        // Background work just ended with a finish held: released after this dispatch (an
+        // exiting session empties the list just before its SessionExited, which drops the hold:
+        // a close or a switch is not a finish).
+        let mut release_held = false;
         // Set by the arms below, acted on after the tab borrow is released.
         let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
         let mut withdraw_ask = false;
@@ -5453,8 +5481,7 @@ impl AgentTerminalWindow {
                         // With sub-agents or background commands still going the thread is not
                         // finished: no mark and no "finished" yet. Claude runs another turn to read
                         // their results, and that one finishes the thread.
-                        let finished =
-                            turn_finishes_thread(!chat.background.is_empty() || delegated_work);
+                        let finished = turn_finishes_thread(chat.background_work(delegated_work));
                         let r = react(
                             Attention::TurnDone,
                             in_view,
@@ -5479,22 +5506,22 @@ impl AgentTerminalWindow {
                 }
                 Event::BackgroundTasks { tasks } => {
                     chat.background = tasks.clone();
-                    if held_finish_due(
+                    release_held = held_finish_due(
                         chat.finish_held,
                         chat.running,
-                        !chat.background.is_empty() || delegated_work,
-                    ) {
-                        // Released after this dispatch: an exiting session empties the list just
-                        // before its SessionExited, which drops the hold (a close or a switch is
-                        // not a finish).
-                        let weak = self.obj().downgrade();
-                        let thread = thread.to_owned();
-                        glib::idle_add_local_once(move || {
-                            if let Some(obj) = weak.upgrade() {
-                                obj.imp().release_held_finish(&thread);
-                            }
-                        });
-                    }
+                        chat.background_work(delegated_work),
+                    );
+                    After::Sidebar
+                }
+                // Provider sub-agents (Codex workers) outlive the main turn like background
+                // tasks do: they hold the finish, the close question and idle suspension.
+                Event::WorkersUpdated { workers, .. } => {
+                    chat.workers_active = workers.iter().filter(|w| w.state.is_active()).count();
+                    release_held = held_finish_due(
+                        chat.finish_held,
+                        chat.running,
+                        chat.background_work(delegated_work),
+                    );
                     After::Sidebar
                 }
                 Event::SessionExited { .. } => {
@@ -5503,6 +5530,8 @@ impl AgentTerminalWindow {
                     chat.finish_held = false;
                     // A dead session runs nothing in the background either.
                     chat.background.clear();
+                    chat.workers_active = 0;
+                    chat.child_asks = ChildAsks::default();
                     chat.approval = false;
                     withdraw_ask = true;
                     After::Sidebar
@@ -5589,6 +5618,15 @@ impl AgentTerminalWindow {
             if let Some(app) = self.obj().application() {
                 app.withdraw_notification(&approval_notification_id(thread));
             }
+        }
+        if release_held {
+            let weak = self.obj().downgrade();
+            let thread = thread.to_owned();
+            glib::idle_add_local_once(move || {
+                if let Some(obj) = weak.upgrade() {
+                    obj.imp().release_held_finish(&thread);
+                }
+            });
         }
         if clear_profile {
             let id = thread.to_owned();
@@ -5690,7 +5728,7 @@ impl AgentTerminalWindow {
             let Some(chat) = tab.chat.as_mut() else {
                 return;
             };
-            if !held_finish_due(chat.finish_held, chat.running, !chat.background.is_empty()) {
+            if !held_finish_due(chat.finish_held, chat.running, chat.background_work(false)) {
                 return;
             }
             chat.finish_held = false;
@@ -6143,7 +6181,12 @@ impl AgentTerminalWindow {
             .filter_map(|t| t.chat.as_ref())
             .find(|c| c.thread == thread && c.busy())
             .and_then(|c| {
-                busy_reason(c.running, c.background.len(), c.approval).map(|why| (c.driver, why))
+                busy_reason(
+                    c.running,
+                    c.background.len() + c.workers_active,
+                    c.waiting_on_user(),
+                )
+                .map(|why| (c.driver, why))
             });
         let Some((from, why)) = busy else {
             then(self);
