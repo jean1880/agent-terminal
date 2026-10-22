@@ -59,7 +59,33 @@ fn message_id(input: &DelegatedInput) -> Option<MessageId> {
     }
 }
 
+/// What became of sub-agent news offered to a root session ([`ChatSession::wake_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeOutcome {
+    /// Posted as a notice, and a turn started with it.
+    Started,
+    /// Posted as a notice only: the agent was woken too many times in a row without the user.
+    Noticed,
+    /// A prompt cannot be sent now; offer it again later.
+    Busy,
+    /// Never: the user stopped this root and has not spoken since, or it is not a root.
+    Held,
+}
+
 impl ChatSession {
+    /// Offers a root the framed, redacted news of its sub-agents (`wake::frame`). If nothing
+    /// is in the way it is posted to the thread as a notice and starts a turn as the agent's
+    /// input; a suspended process is resumed for it. Never queued here: on `Busy` the
+    /// supervisor keeps it and offers it again.
+    pub(crate) fn wake_with(&self, text: &str) -> WakeOutcome {
+        self.inner.wake_with(text)
+    }
+
+    /// The user stopped this root: no sub-agent news wakes it until the user speaks again.
+    pub(crate) fn hold_wakes(&self) {
+        self.inner.wakes_held.set(true);
+    }
+
     /// The exact provider-facing body, shared with receipt correlation. Rendering is pure and
     /// never writes input or consumes a launch binding.
     pub(crate) fn render_delegated_input(input: &DelegatedInput) -> String {
@@ -150,6 +176,90 @@ impl ChatSession {
 }
 
 impl Inner {
+    /// The user wrote to the agent: the run of automatic wakes ends, and a stop is over.
+    pub(super) fn user_spoke(&self) {
+        self.auto_wakes.set(0);
+        self.wakes_held.set(false);
+    }
+
+    /// Whether a wake turn must wait: anything the user's own prompt would queue behind or
+    /// that a turn would cut short. A pending handoff waits for the user's next real prompt to
+    /// carry it, since a handoff frames what rides with it as the user's message. Dangerous
+    /// permissive mode never runs a turn nobody asked for. A dead process is restarted only from
+    /// idle suspension; one that exited on its own waits for the user.
+    fn wake_busy(&self) -> bool {
+        let state = self.state.borrow();
+        let process_gone = !state.alive && !self.suspended.get();
+        state.running_turn
+            || state.mode == Mode::Bypass
+            || process_gone
+            || self.prompt_in_flight.get()
+            || self.starting.borrow().is_some()
+            || self.stopping.get()
+            || self.rebinding.get()
+            || self.delivering.get()
+            || self.dispatching_queue.get()
+            || self.queued_dispatch_pending.get()
+            || !self.queued_prompts.borrow().is_empty()
+            || !self.held_retries.borrow().is_empty()
+            || !self.open_approvals.borrow().is_empty()
+            || !self.codex_permissions.borrow().is_empty()
+            || !self.held_permissions.borrow().is_empty()
+            || self.pending_model.borrow().is_some()
+            || self.rollback.borrow().is_some()
+            || self.pending_handoff.borrow().is_some()
+            || self.handoff_in_flight.get()
+    }
+
+    fn wake_with(self: &Rc<Self>, text: &str) -> WakeOutcome {
+        use agent_core::delegation::wake::{capped_notice, decide, Decision, ParentState};
+        let state = if self.child.is_some() || self.wakes_held.get() {
+            ParentState::Stopped
+        } else if self.wake_busy() {
+            ParentState::Busy
+        } else {
+            ParentState::Idle
+        };
+        match decide(state, 1, self.auto_wakes.get()) {
+            Decision::Nothing | Decision::Drop => WakeOutcome::Held,
+            Decision::Hold => WakeOutcome::Busy,
+            Decision::NoticeOnly => {
+                self.emit(Envelope::new(Event::Notice {
+                    text: capped_notice(text),
+                }));
+                WakeOutcome::Noticed
+            }
+            Decision::Wake => self.start_wake(text),
+        }
+    }
+
+    /// Posts `text` as a notice and sends it as a prompt, as `send_prompt_now` does a user's,
+    /// but stored only as that notice: it is the app speaking, never the user.
+    fn start_wake(self: &Rc<Self>, text: &str) -> WakeOutcome {
+        // A delegation root may need a rebind first (after suspension, its credentials were
+        // rotated): the hook starts it and says no; the supervisor offers the news again.
+        if !self.root_prompt_allowed() || !self.apply_retired() || self.wake_busy() {
+            return WakeOutcome::Busy;
+        }
+        let generation = self.generation.get();
+        self.emit(Envelope::new(Event::Notice {
+            text: text.to_owned(),
+        }));
+        // The sink can close, stop or switch this session.
+        if generation != self.generation.get() || self.wake_busy() {
+            return WakeOutcome::Busy;
+        }
+        info!("waking the agent with its sub-agents' news");
+        self.prompt_in_flight.set(true);
+        if self.dispatch_sent_prompt(text, None) {
+            self.auto_wakes.set(self.auto_wakes.get().saturating_add(1));
+            WakeOutcome::Started
+        } else {
+            self.prompt_in_flight.set(false);
+            WakeOutcome::Busy
+        }
+    }
+
     fn deliver_delegated(self: &Rc<Self>, input: DelegatedInput) -> DelegatedOutcome {
         let driver = self.adapter.borrow().driver();
         // Only what the session can write now; the supervisor owns every other plan.

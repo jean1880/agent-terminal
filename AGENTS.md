@@ -177,6 +177,13 @@ Architectural mandates, standards, and workflows for this codebase.
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path.
+- **A root hears its sub-agents without polling, and never after a stop**: a child's finished
+  run, failure or message to its root is posted in the root's thread as the app's notice and
+  starts a turn with it (`delegation/wake.rs`, decided in `agent_core::delegation::wake`):
+  redacted before it is cut to `WAKE_BUDGET`, coalesced, held while the root is busy, never sent
+  again once a `cross_agent_wait`/`read` page showed it, a notice only after
+  `MAX_CONSECUTIVE_WAKES` wakes without the user, and dropped once the user stops the root (until
+  the user speaks) or its thread closes.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is

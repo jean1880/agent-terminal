@@ -1348,7 +1348,7 @@ impl Supervisor {
                     }
                 })
                 .cloned()
-                .collect();
+                .collect::<Vec<_>>();
             let snapshot = filter
                 .target
                 .as_ref()
@@ -1356,6 +1356,7 @@ impl Supervisor {
                 .and_then(|s| serde_json::to_value(s).ok());
             (root, scope, snapshot)
         };
+        let shown_scope = scope.clone();
         let query = PageQuery {
             root_worker: root,
             filter,
@@ -1373,6 +1374,8 @@ impl Supervisor {
             .await
             .ok_or_else(|| error(ErrorCode::PersistenceFailed, "cannot read delegation page"))?
             .map_err(|_| error(ErrorCode::PersistenceFailed, "cannot read delegation page"))??;
+        // What this page shows its caller is never woken for again.
+        self.wake_shown(caller, &shown_scope, out.last_seq, &out.presented);
         let ids = out.presented;
         let principal = caller.clone();
         self.services

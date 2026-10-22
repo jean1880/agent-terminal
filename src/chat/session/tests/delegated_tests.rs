@@ -1504,3 +1504,99 @@ fn a_delegation_root_suspends_only_with_its_hooks_consent() {
         );
     });
 }
+
+/// Sub-agent news offered to a root: it waits while a turn runs, resumes a suspended process,
+/// starts a turn shown as the app's notice (never a user message), is only a notice once the
+/// agent was woken too often without the user, and never wakes a root the user stopped. The
+/// user speaking ends both.
+#[test]
+fn a_root_is_woken_by_news_only_when_idle_within_the_cap_and_never_after_a_stop() {
+    use crate::chat::session::WakeOutcome;
+    use agent_core::delegation::wake::MAX_CONSECUTIVE_WAKES;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        hooks.allow_suspend.set(true);
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            bare_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let idle = |s: &ChatSession| s.status().alive && !s.status().running_turn;
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && idle(&session)));
+        session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || session.inner.has_conversation.get()
+            && idle(&session)));
+
+        // A running turn is never cut into.
+        session.send_prompt("second");
+        assert!(session.status().running_turn);
+        assert_eq!(session.wake_with("news while busy"), WakeOutcome::Busy);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+        assert!(!prompts().contains("news while busy"));
+
+        // A suspended process is resumed for the news.
+        assert!(session.suspend_if_idle());
+        assert_eq!(
+            session.wake_with("news after a pause"),
+            WakeOutcome::Started
+        );
+        assert!(pump_until(ctx, 10, || prompts().contains("news after a pause")));
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text == "news after a pause"
+        )));
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::ContentSnapshot { text, .. } if text.contains("news after a pause")
+        )));
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // Past the cap, a notice only.
+        session.inner.auto_wakes.set(MAX_CONSECUTIVE_WAKES);
+        assert_eq!(session.wake_with("news past the cap"), WakeOutcome::Noticed);
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.starts_with("news past the cap")
+                && text.contains("Not sent to the agent")
+        )));
+        assert!(!session.status().running_turn);
+        assert!(!prompts().contains("news past the cap"));
+
+        // The user speaking resets the count.
+        session.send_prompt("go on");
+        assert!(pump_until(ctx, 10, || idle(&session)));
+        assert_eq!(session.wake_with("news in a new run"), WakeOutcome::Started);
+        assert_eq!(session.inner.auto_wakes.get(), 1);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // A stopped root takes none until the user speaks again.
+        session.hold_wakes();
+        assert_eq!(session.wake_with("news after a stop"), WakeOutcome::Held);
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("news after a stop")
+        )));
+        session.send_prompt("carry on");
+        assert!(pump_until(ctx, 10, || idle(&session)));
+        assert_eq!(session.wake_with("news later"), WakeOutcome::Started);
+        session.shutdown(false);
+    });
+}

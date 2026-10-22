@@ -40,6 +40,8 @@ mod codex_policy;
 mod delegated;
 mod reply_questions;
 
+pub(crate) use delegated::WakeOutcome;
+
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{
     run_side, AgentEnv, AgentProcess, ExitWatch, SpawnSpec, StopPhase, AGY_TIMEOUT,
@@ -406,6 +408,11 @@ struct Inner {
     has_conversation: Cell<bool>,
     /// The running process has taken a prompt (reset by every start).
     prompted: Cell<bool>,
+    /// Turns started by sub-agent news since the user last spoke (see
+    /// [`agent_core::delegation::wake::MAX_CONSECUTIVE_WAKES`]).
+    auto_wakes: Cell<u32>,
+    /// The user stopped this root: no sub-agent news wakes it until the user speaks again.
+    wakes_held: Cell<bool>,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -795,6 +802,8 @@ impl ChatSession {
             lifecycle_listener: RefCell::new(None),
             has_conversation: Cell::new(false),
             prompted: Cell::new(false),
+            auto_wakes: Cell::new(0),
+            wakes_held: Cell::new(false),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -5250,14 +5259,17 @@ pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> Han
 
 impl ChatBackend for ChatSession {
     fn send_prompt(&self, text: &str) {
+        self.inner.user_spoke();
         self.inner.send_prompt(text);
     }
 
     fn queue_prompt(&self, text: &str) {
+        self.inner.user_spoke();
         self.inner.queue_prompt(text);
     }
 
     fn steer_prompt(&self, text: &str) {
+        self.inner.user_spoke();
         self.inner.steer_prompt(text);
     }
 

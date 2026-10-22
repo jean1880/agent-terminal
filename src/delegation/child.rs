@@ -669,7 +669,7 @@ impl Supervisor {
         });
     }
     pub(super) async fn persist_worker_failure(
-        &self,
+        self: &Rc<Self>,
         worker: WorkerId,
         run: Option<agent_core::delegation::RunId>,
         operation: Option<agent_core::delegation::OperationId>,
@@ -677,16 +677,19 @@ impl Supervisor {
     ) {
         // The failure is a lifecycle event on the worker's page, so its parent learns why
         // without the journal; a worker never registered in memory has no page to show it on.
+        let reason = format!("worker failed: {}", e.message);
         let notice = self.publication(
             &worker,
             agent_core::event::Envelope::new(agent_core::event::Event::Notice {
-                text: format!("worker failed: {}", e.message),
+                text: reason.clone(),
             }),
             Some(EventCategory::Lifecycle),
         );
+        let failed_worker = worker.clone();
         let failed = self
             .services
             .durable("fail delegated worker", move |s| {
+                let mut published = None;
                 let at = super::supervisor::now();
                 if let Some(run) = run {
                     if s.delegation_run(run.as_str())?.is_some_and(|r| {
@@ -710,17 +713,25 @@ impl Supervisor {
                 {
                     s.set_delegation_worker_state(worker.as_str(), "failed", Some(&e.message), at)?;
                     if let Some(notice) = &notice {
-                        s.publish_delegation_event(notice)?;
+                        published = Some(s.publish_delegation_event(notice)?.seq);
                     }
                 }
                 if let Some(operation) = operation {
                     s.record_delegation_dispatch(&operation, &DispatchFact::Failed(e))?;
                 }
-                Ok(())
+                Ok(published)
             })
             .await;
-        if failed.is_err() {
-            (self.services.report)("Delegated worker stopped, but its failure state could not be committed. Its durable outcome remains unknown.");
+        match failed {
+            // Its parent hears why, as from the failure event on its page.
+            Ok(Some(seq)) => self.queue_wake(
+                &failed_worker,
+                agent_core::delegation::wake::Outcome::Failed,
+                &reason,
+                agent_core::delegation::wake::Shown::Event(seq),
+            ),
+            Ok(None) => {}
+            Err(_) => (self.services.report)("Delegated worker stopped, but its failure state could not be committed. Its durable outcome remains unknown."),
         }
     }
     /// Ends the open run of each stopped worker as interrupted, unless it already ended. Call

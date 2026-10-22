@@ -18,6 +18,8 @@ struct PendingPublication {
     receipt: Receipt,
     bytes: usize,
     bootstrap: bool,
+    /// A run's terminal event: the result it carries, for the parent's wake.
+    result: Option<String>,
 }
 
 pub(super) struct Publisher {
@@ -140,6 +142,7 @@ impl Publisher {
             return;
         }
         let terminal = completion.is_some();
+        let result = completion.as_ref().and_then(|c| c.result.clone());
         let job = move |s: &agent_kit::store::Store| {
             if let Some(mut completion) = completion {
                 let terminal = s.delegation_run(completion.run.as_str())?.is_some_and(|r| {
@@ -187,6 +190,7 @@ impl Publisher {
             receipt,
             bytes,
             bootstrap,
+            result,
         });
         if self.publishing.replace(true) {
             return;
@@ -224,6 +228,7 @@ impl Publisher {
                         next.envelope,
                         seq,
                         next.bootstrap,
+                        next.result.as_deref(),
                     ),
                     Err(_) => {
                         failed.set(true);
@@ -351,6 +356,15 @@ impl ChildPublish for Publisher {
         self.flush(generation, None, true);
     }
 }
+/// A run's end, as its parent's wake says it.
+fn wake_outcome(state: TurnState) -> agent_core::delegation::wake::Outcome {
+    use agent_core::delegation::wake::Outcome;
+    match state {
+        TurnState::Completed => Outcome::Completed,
+        TurnState::Interrupted => Outcome::Interrupted,
+        TurnState::Failed => Outcome::Failed,
+    }
+}
 pub(super) fn category(event: &Event) -> Option<EventCategory> {
     Some(match event {
         Event::SessionStarted { .. }
@@ -422,6 +436,7 @@ impl Supervisor {
         env: Envelope,
         seq: i64,
         bootstrap: bool,
+        result: Option<&str>,
     ) {
         let mut ended = None;
         {
@@ -520,12 +535,18 @@ impl Supervisor {
             }
         }
         if let Some((state, usage)) = ended {
-            let _ = (state, usage);
+            let _ = usage;
             self.state
                 .borrow_mut()
                 .controls
                 .retain(|_, entry| &entry.worker != worker);
             self.drain_deferred(worker);
+            self.queue_wake(
+                worker,
+                wake_outcome(state),
+                result.unwrap_or_default(),
+                agent_core::delegation::wake::Shown::Event(seq),
+            );
         }
         let scoped = ScopedEnvelope {
             scope,
@@ -606,8 +627,9 @@ impl Supervisor {
         let worker = worker.clone();
         let stored_worker = worker.clone();
         let completed_run = completion.run.clone();
+        let reported = completion.result.clone();
         gtk4::glib::spawn_future_local(async move {
-            if sup
+            if let Ok(completed) = sup
                 .services
                 .durable("complete delegated run", move |s| {
                     if s.delegation_worker(stored_worker.as_str())?
@@ -618,8 +640,13 @@ impl Supervisor {
                     s.complete_delegation_run(&completion)
                 })
                 .await
-                .is_ok()
             {
+                sup.queue_wake(
+                    &worker,
+                    wake_outcome(state),
+                    reported.as_deref().unwrap_or_default(),
+                    agent_core::delegation::wake::Shown::Event(completed.event.seq),
+                );
                 if let Some(w) = sup
                     .state
                     .borrow_mut()
