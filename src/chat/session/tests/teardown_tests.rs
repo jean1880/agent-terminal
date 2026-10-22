@@ -198,6 +198,55 @@ fn a_switch_sends_an_unspawned_message_exactly_once() {
     });
 }
 
+/// A replacement that spawns, takes the continuation, then exits before it ever starts rolls
+/// back too: the message the switch held is queued again for the old agent, once. A replacement
+/// that does start lets it go.
+#[test]
+fn a_replacement_that_dies_before_starting_gives_the_message_back() {
+    in_loop(|_| {
+        let log: Log = Rc::default();
+        let (store, thread, session, _) = queued_session(Driver::Agy, &log);
+        session.send_prompt("first");
+        plant_unspawned(&store, &thread, &session, "append one line", true);
+        session.switch(Driver::Claude, Some("sonnet".into()), None);
+        assert_eq!(session.status().driver, Driver::Claude);
+        assert_eq!(session.inner.carried_unsent.borrow().len(), 1, "held");
+        // Exits before any session or turn started: the switch fails.
+        session
+            .inner
+            .on_exit(session.inner.generation.get(), Some(1));
+        assert_eq!(session.status().driver, Driver::Agy, "rolled back");
+        let queued = |text: &str| {
+            session
+                .inner
+                .queued_prompts
+                .borrow()
+                .iter()
+                .filter(|q| q.text == text)
+                .count()
+        };
+        assert_eq!(queued("append one line"), 1);
+        assert!(session.inner.carried_unsent.borrow().is_empty());
+        session.shutdown(false);
+    });
+    in_loop(|_| {
+        let log: Log = Rc::default();
+        let (store, thread, session, _) = queued_session(Driver::Agy, &log);
+        session.send_prompt("first");
+        plant_unspawned(&store, &thread, &session, "append one line", true);
+        session.switch(Driver::Claude, Some("sonnet".into()), None);
+        session
+            .inner
+            .apply(&Envelope::new(Event::TurnStarted { model: None }));
+        assert!(
+            session.inner.carried_unsent.borrow().is_empty(),
+            "a started replacement owns the task"
+        );
+        assert!(session.inner.queued_prompts.borrow().is_empty());
+        session.shutdown(false);
+    });
+}
+
 /// A busy switch whose replacement cannot spawn rolls back to the old agent and sends no
 /// continuation: the message it took over is queued again, never lost.
 #[test]

@@ -1086,6 +1086,7 @@ impl Inner {
             } => {
                 // The agent is up: a switch to it can no longer roll back.
                 *self.rollback.borrow_mut() = None;
+                self.confirm_carried();
                 self.mark_up();
                 if !native_id.is_empty() {
                     let pt = self.provider_thread.borrow().clone();
@@ -1123,6 +1124,7 @@ impl Inner {
                 // An agent that runs turns has started, whether or not it reported a session:
                 // an exit from here on is an ordinary one, not a failed switch.
                 *self.rollback.borrow_mut() = None;
+                self.confirm_carried();
                 self.mark_up();
                 if let Some(m) = model {
                     self.set_model(m);
@@ -3888,9 +3890,10 @@ impl Inner {
                 }
                 self.continue_after_switch(Driver::Agy);
             }
+        } else {
+            // Refused: whatever a stop took over has no continuation to carry it.
+            self.settle_carried(false);
         }
-        // Taken over, but no continuation carried them: they wait for the next start.
-        self.settle_carried(false);
     }
 
     fn defer_mode(&self, mode: Mode) {
@@ -4147,8 +4150,6 @@ impl Inner {
             }
             Transition::Reject(reason) => self.error(reason),
         }
-        // Anything the switch took over and no continuation carried waits for the next agent.
-        self.settle_carried(false);
         if !running {
             self.dispatch_queued_prompt();
         }
@@ -4170,11 +4171,23 @@ impl Inner {
 
     /// Ends the switch's hold on `carried_unsent`: dropped when its continuation went (the
     /// handoff carries them), queued again when it did not (they reached no agent).
+    ///
+    /// A replacement that can still roll back (it has not started: `rollback` is set) keeps the
+    /// hold: its rollback queues them again (the handoff goes with it), and its start lets them
+    /// go ([`Self::confirm_carried`]).
     fn settle_carried(&self, continued: bool) {
+        if continued && self.rollback.borrow().is_some() {
+            return;
+        }
         let carried = self.carried_unsent.take();
         if !continued {
             self.keep_unsent_prompts(carried);
         }
+    }
+
+    /// The replacement started: the task it carried, held messages included, is its own now.
+    fn confirm_carried(&self) {
+        self.carried_unsent.borrow_mut().clear();
     }
 
     fn create_with_handoff(
@@ -4416,6 +4429,10 @@ impl Inner {
             self.hookless_notice();
         }
         self.start_process();
+        // Messages the failed switch took over reached no agent, and its handoff is gone: the
+        // old agent gets them as they were written.
+        let carried = self.carried_unsent.take();
+        self.keep_unsent_prompts(carried);
     }
 
     fn status(&self) -> SessionStatus {
