@@ -95,47 +95,95 @@ fn a_busy_switch_writes_one_prompt_per_turn() {
     });
 }
 
-/// A message waiting in a start that never spawned: as `note_unspawned_prompt` records one.
-fn plant_unspawned(session: &ChatSession, text: &str) {
+/// A message waiting in a start that never spawned, as `note_unspawned_prompt` records one:
+/// stored in the thread when `stored`, as a sent message is.
+fn plant_unspawned(
+    store: &Store,
+    thread: &ThreadId,
+    session: &ChatSession,
+    text: &str,
+    stored: bool,
+) {
+    let item_id = if stored {
+        let pt = pt_of(store, thread);
+        store
+            .append_user_message(thread, Some(&pt), text)
+            .expect("store")
+    } else {
+        "unstored".into()
+    };
     *session.inner.starting.borrow_mut() = Some(PendingStart {
         generation: session.inner.generation.get(),
         writes: Vec::new(),
         prompts: vec![QueuedPrompt {
-            item_id: "unspawned".into(),
+            item_id,
             text: text.into(),
-            stored: true,
+            stored,
         }],
     });
 }
 
-/// A busy switch carries the unfinished task itself (handoff and continuation): a message
-/// waiting in an unspawned start is part of it and is never also queued and sent again. An
-/// idle switch carries nothing, so the message is queued for the new agent.
+fn sent_alone(log: &Log, text: &str) -> usize {
+    prompts(log).iter().filter(|p| p.as_str() == text).count()
+}
+
+/// A busy switch carries the unfinished task itself (handoff and continuation): a stored
+/// message waiting in an unspawned start is in its handoff, and never also sent on its own.
+/// One that could not be stored is not in it, so it goes after the continuation. An idle switch
+/// carries nothing, so the message goes to the new agent, once.
 #[test]
 fn a_switch_sends_an_unspawned_message_exactly_once() {
     in_loop(|_| {
         let log: Log = Rc::default();
-        let (_, _, session, _) = queued_session(Driver::Agy, &log);
+        let (store, thread, session, _) = queued_session(Driver::Agy, &log);
         session.send_prompt("first");
-        plant_unspawned(&session, "append one line");
+        plant_unspawned(&store, &thread, &session, "append one line", true);
         assert!(session.status().running_turn);
         session.switch(Driver::Claude, Some("sonnet".into()), None);
+        assert!(session.inner.queued_prompts.borrow().is_empty());
         assert!(
-            session.inner.queued_prompts.borrow().is_empty(),
-            "the continuation carries it"
+            session
+                .inner
+                .pending_handoff
+                .borrow()
+                .as_ref()
+                .is_some_and(|h| h.summary.contains("append one line")),
+            "the replacement gets it through the handoff"
         );
         turn_completed(&session, TurnState::Completed);
-        let sent = prompts(&log);
-        assert!(
-            !sent.iter().any(|p| p == "append one line"),
-            "never sent again on its own: {sent:?}"
+        assert_eq!(
+            sent_alone(&log, "append one line"),
+            0,
+            "{:?}",
+            prompts(&log)
         );
         session.shutdown(false);
     });
     in_loop(|_| {
         let log: Log = Rc::default();
-        let (_, _, session, _) = queued_session(Driver::Agy, &log);
-        plant_unspawned(&session, "append one line");
+        let (store, thread, session, _) = queued_session(Driver::Agy, &log);
+        session.send_prompt("first");
+        plant_unspawned(&store, &thread, &session, "never stored", false);
+        session.switch(Driver::Claude, Some("sonnet".into()), None);
+        assert_eq!(
+            session.inner.queued_prompts.borrow().len(),
+            1,
+            "not in the handoff, so it queues"
+        );
+        turn_completed(&session, TurnState::Completed);
+        assert!(
+            prompts(&log)
+                .last()
+                .is_some_and(|p| p.ends_with("never stored")),
+            "{:?}",
+            prompts(&log)
+        );
+        session.shutdown(false);
+    });
+    in_loop(|_| {
+        let log: Log = Rc::default();
+        let (store, thread, session, _) = queued_session(Driver::Agy, &log);
+        plant_unspawned(&store, &thread, &session, "append one line", true);
         assert!(!session.status().running_turn);
         session.switch(Driver::Claude, Some("sonnet".into()), None);
         let sent = prompts(&log);
@@ -145,6 +193,40 @@ fn a_switch_sends_an_unspawned_message_exactly_once() {
                 .count(),
             1,
             "an idle switch sends it once, to the new agent: {sent:?}"
+        );
+        session.shutdown(false);
+    });
+}
+
+/// A busy switch whose replacement cannot spawn rolls back to the old agent and sends no
+/// continuation: the message it took over is queued again, never lost.
+#[test]
+fn a_switch_that_rolls_back_keeps_the_unspawned_message() {
+    in_loop(|_| {
+        let log: Log = Rc::default();
+        let (store, thread, session, _) = queued_session(Driver::Agy, &log);
+        let factory_log = log.clone();
+        session.set_adapter_factory(Rc::new(move |d| {
+            launch_of(if d == Driver::Claude {
+                FakeAdapter::unspawnable(d, &factory_log)
+            } else {
+                FakeAdapter::writing_with_open_turn(d, &factory_log)
+            })
+        }));
+        session.send_prompt("first");
+        plant_unspawned(&store, &thread, &session, "append one line", true);
+        session.switch(Driver::Claude, Some("sonnet".into()), None);
+        assert_eq!(session.status().driver, Driver::Agy, "rolled back");
+        assert_eq!(
+            session
+                .inner
+                .queued_prompts
+                .borrow()
+                .iter()
+                .filter(|q| q.text == "append one line")
+                .count(),
+            1,
+            "queued again for the old agent"
         );
         session.shutdown(false);
     });

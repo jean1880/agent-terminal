@@ -393,6 +393,10 @@ struct Inner {
     /// the next one itself (the handoff and the continuation): a message still waiting in a
     /// start that never spawned is part of that task, so it is not also queued again.
     carrying_task: Cell<bool>,
+    /// The stored messages such a switch took over, held until its continuation is sent (they
+    /// are in the transcript its handoff carries). A switch that sends none (it rolled back, or
+    /// the replacement is not running) queues them again.
+    carried_unsent: RefCell<Vec<QueuedPrompt>>,
     /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
     /// adapter's exit envelopes reach neither the view nor the store.
     quiet_exit: Cell<bool>,
@@ -806,6 +810,7 @@ impl ChatSession {
             bound_generation: Cell::new(false),
             unspawned_binding: Cell::new(None),
             carrying_task: Cell::new(false),
+            carried_unsent: RefCell::new(Vec::new()),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
             reported: Cell::new(false),
@@ -2716,12 +2721,17 @@ impl Inner {
         self.deferred_mode.set(None);
         // A start still waiting on its checks never spawns: its writes and delegation binding go,
         // and its user messages queue again (unless the user's own stop cleared them first).
-        let unsent = self
-            .starting
-            .borrow_mut()
-            .take()
-            .map(|p| p.prompts)
-            .filter(|_| !self.carrying_task.get());
+        let unsent = self.starting.borrow_mut().take().map(|p| {
+            if !self.carrying_task.get() {
+                return p.prompts;
+            }
+            // A busy switch is stopping this start: its stored messages are in the transcript
+            // the switch's handoff carries, so the switch holds them until its continuation is
+            // sent. One that could not be stored is not in it, and queues again.
+            let (carried, rest): (Vec<_>, Vec<_>) = p.prompts.into_iter().partition(|q| q.stored);
+            self.carried_unsent.borrow_mut().extend(carried);
+            rest
+        });
         self.abandon_unspawned_binding();
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
@@ -3879,6 +3889,8 @@ impl Inner {
                 self.continue_after_switch(Driver::Agy);
             }
         }
+        // Taken over, but no continuation carried them: they wait for the next start.
+        self.settle_carried(false);
     }
 
     fn defer_mode(&self, mode: Mode) {
@@ -4135,6 +4147,8 @@ impl Inner {
             }
             Transition::Reject(reason) => self.error(reason),
         }
+        // Anything the switch took over and no continuation carried waits for the next agent.
+        self.settle_carried(false);
         if !running {
             self.dispatch_queued_prompt();
         }
@@ -4143,11 +4157,24 @@ impl Inner {
     /// A confirmed busy switch continues the task once on the replacement process. The
     /// provider's native history (or the pending handoff) supplies the original request;
     /// replaying that request could repeat tool actions that already completed.
+    ///
+    /// Messages the switch took over from a start that never spawned (`carried_unsent`) are
+    /// settled here: carried by the continuation when it goes, queued again when it does not.
     fn continue_after_switch(self: &Rc<Self>, driver: Driver) {
-        if self.adapter.borrow().driver() != driver || !self.state.borrow().alive {
-            return;
+        let sent = self.adapter.borrow().driver() == driver && self.state.borrow().alive;
+        if sent {
+            self.send_prompt_now(super::SWITCH_CONTINUATION);
         }
-        self.send_prompt_now(super::SWITCH_CONTINUATION);
+        self.settle_carried(sent);
+    }
+
+    /// Ends the switch's hold on `carried_unsent`: dropped when its continuation went (the
+    /// handoff carries them), queued again when it did not (they reached no agent).
+    fn settle_carried(&self, continued: bool) {
+        let carried = self.carried_unsent.take();
+        if !continued {
+            self.keep_unsent_prompts(carried);
+        }
     }
 
     fn create_with_handoff(
