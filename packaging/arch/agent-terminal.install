@@ -1,0 +1,11 @@
+# pacman runs this as root for the whole machine; it never touches a user's home, so removing the
+# package keeps every user's configuration and data. `agent-terminal --uninstall` asks about them.
+# Keep this text in step with packaging/debian/postrm and the rpm's post_uninstall_script.
+post_remove() {
+    cat <<'EOF'
+Agent Terminal was removed. Unless you removed it with `agent-terminal --uninstall`, each
+user's configuration and data are still in their home folder:
+  ~/.config/agent-terminal  ~/.local/state/agent-terminal  ~/.cache/agent-terminal
+Delete those folders to remove them.
+EOF
+}

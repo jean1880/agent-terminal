@@ -123,6 +123,38 @@ Those releases are also immutable: once published, their packages and tag cannot
 See [Building from source](#building-from-source). Then run `make install` to install
 into `~/.local` (binary, icon and desktop entry), and `make uninstall` to remove it.
 
+### Uninstalling
+
+Use **Settings → General → Uninstall Agent Terminal…**, or quit the app and run:
+
+```bash
+agent-terminal --uninstall
+```
+
+It lists what it found and asks whether to remove your configuration and data too. The answer
+defaults to yes, unless another copy stays installed (a `make install` copy beside the package,
+or the reverse): both use the same data, so the default is then to keep it. Then it removes the program the way it was installed: `apt`, `dnf` or `pacman`
+(asking for your password), or the `make install` files. `--yes` answers yes without asking, and
+`--keep-data` keeps your configuration and data. Run it as yourself, not with `sudo`: your
+configuration is in your home folder, and it asks for the password itself.
+
+Your configuration and data include:
+
+- your settings (`~/.config/agent-terminal`)
+- threads, approval rules and hand-off briefs (`~/.local/state/agent-terminal`)
+- caches (`~/.cache/agent-terminal`)
+- the turn checkpoints (`refs/agent-terminal/*`) in each repository a thread ran in
+- the `agent_terminal` MCP server and the allow rules Agent Terminal added to Antigravity, and
+  the rules file it exported to Codex
+
+Your own settings in those tools are kept. Your worktrees and branches are never touched. If you
+pasted [agy's approval hook](#agys-approval-hook) into `~/.gemini/config/hooks.json`, remove
+that entry yourself: it does nothing without Agent Terminal.
+
+Removing the package directly (`sudo apt remove agent-terminal`) keeps every user's
+configuration and data, because a package never touches a home folder. Delete the folders
+above to remove them.
+
 ### The agents themselves
 
 Install at least one agent CLI; the [first start](#1-first-start) checks you are signed in
@@ -487,6 +519,7 @@ agent-terminal [OPTIONS]
 | `-r`, `--resume SESSION_ID` | Open a thread resuming that Claude or agy session, in the folder it was recorded in. |
 | `-d`, `--dir DIR` | With `--resume`: resume in `DIR` instead of looking the folder up. |
 | `-h`, `--help` | Show the options (`--help-all` adds GTK's own). |
+| `--uninstall [--yes \| --keep-data]` | Remove Agent Terminal, asking whether to remove your configuration and data too. Must come first; see [Uninstalling](#uninstalling). |
 | `--approval-hook` | Internal: agy's approval hook runs this. Not for direct use. |
 | `--chat-demo` | Open a window showing a scripted chat, with no agent running. |
 

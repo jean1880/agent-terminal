@@ -123,7 +123,9 @@ at a scratch folder. To try the interface with no agent running, use the demo mo
 
 Don't use `make install` on a machine that has the packaged app installed. It puts a second
 copy earlier in your `PATH`, and that copy is then never updated. Run `make uninstall` when
-you're done with it.
+you're done with it. It asks whether to remove your configuration and data too. With the
+packaged app installed the default is to keep them, since both copies share them (or pass
+`UNINSTALL_ARGS=--keep-data`).
 
 ## Making a change
 

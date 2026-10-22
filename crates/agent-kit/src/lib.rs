@@ -20,5 +20,6 @@ pub mod restore;
 pub mod sessions;
 pub mod store;
 pub mod store_writer;
+pub mod uninstall;
 pub mod update;
 pub mod worktree;

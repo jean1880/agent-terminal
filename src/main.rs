@@ -39,6 +39,7 @@ pub mod terminal_stub;
 #[cfg(test)]
 mod testutil;
 mod theme;
+mod uninstall;
 mod usage_file;
 mod utils;
 mod window;
@@ -65,6 +66,12 @@ fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("--approval-hook") {
         approval_hook::main();
         return glib::ExitCode::SUCCESS;
+    }
+    // A terminal conversation, not an instance: before logging, so the journal's lines do not
+    // interleave with its questions.
+    if std::env::args().nth(1).as_deref() == Some("--uninstall") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        return uninstall::cli(&rest);
     }
     init_logging();
 
@@ -103,6 +110,16 @@ fn main() -> glib::ExitCode {
         glib::OptionArg::String,
         "Directory to resume in (default: where the session was recorded)",
         Some("DIR"),
+    );
+    // Listed for --help only: `main` handles it before the application starts.
+    app.add_main_option(
+        "uninstall",
+        glib::Char::from(b'\0'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Remove Agent Terminal, asking whether to remove your configuration and data too \
+         (must come first; --uninstall --help for its options)",
+        None,
     );
     app.connect_handle_local_options(check_local_options);
     app.connect_command_line(handle_command_line);
@@ -247,7 +264,20 @@ fn main() -> glib::ExitCode {
         window::close_store_writer(std::time::Duration::from_secs(5));
     });
 
+    // A Settings uninstall quits as soon as its last window has gone: a background hold must not
+    // keep the process (and the request) alive until some unrelated later quit.
+    app.connect_window_removed(|app, _| {
+        if uninstall::pending() && app.windows().is_empty() {
+            info!("uninstall: last window closed, quitting");
+            app.quit();
+        }
+    });
+
     app.connect_activate(|app| {
+        if uninstall::pending() {
+            info!("Activation refused: Agent Terminal is being uninstalled");
+            return;
+        }
         info!("Application activated: creating window");
         let window = AgentTerminalWindow::new(app);
         info!("Window created, presenting...");
@@ -258,6 +288,8 @@ fn main() -> glib::ExitCode {
     info!("Running application loop...");
     let exit_code = app.run();
     info!("Application loop exited with code: {:?}", exit_code);
+    // A Settings uninstall: every window has closed, the agents and the store with them.
+    uninstall::after_quit();
     exit_code
 }
 
@@ -285,6 +317,11 @@ fn check_local_options(
         eprintln!("agent-terminal: {message}");
         Break(glib::ExitCode::from(USAGE_ERROR))
     };
+
+    // Reaching here means it was not first, and `main` only takes it there.
+    if options.contains("uninstall") {
+        return usage_error("--uninstall must be the first argument".to_string());
+    }
 
     let resume = options.lookup::<String>("resume").ok().flatten();
     let dir = options.lookup::<String>("dir").ok().flatten();
@@ -325,6 +362,10 @@ fn handle_command_line(
     app: &adw::Application,
     cmdline: &gio::ApplicationCommandLine,
 ) -> glib::ExitCode {
+    if uninstall::pending() {
+        warn!("Launch refused: Agent Terminal is being uninstalled");
+        return glib::ExitCode::FAILURE;
+    }
     let options = cmdline.options_dict();
     let Some(resume) = options.lookup::<String>("resume").ok().flatten() else {
         app.activate();

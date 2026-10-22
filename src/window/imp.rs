@@ -10,6 +10,7 @@ mod pack_animation;
 mod setup;
 mod thread_menu;
 mod threads;
+mod uninstall_prefs;
 
 pub(crate) use threads::{close_store_writer, flush_store_for_panic};
 
@@ -4425,6 +4426,7 @@ impl AgentTerminalWindow {
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);
         general.add(&replies);
+        general.add(&self.uninstall_group());
         dialog.add(&general);
 
         self.add_agents_page(&dialog);
