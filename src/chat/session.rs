@@ -389,6 +389,10 @@ struct Inner {
     /// The process generation a binding was taken for whose process has not spawned yet. A
     /// start that ends without one releases the binding (`DelegationHooks::launch_abandoned`).
     unspawned_binding: Cell<Option<u64>>,
+    /// Set while a busy switch or restart stops the process and carries its unfinished task to
+    /// the next one itself (the handoff and the continuation): a message still waiting in a
+    /// start that never spawned is part of that task, so it is not also queued again.
+    carrying_task: Cell<bool>,
     /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
     /// adapter's exit envelopes reach neither the view nor the store.
     quiet_exit: Cell<bool>,
@@ -801,6 +805,7 @@ impl ChatSession {
             worker: RefCell::new(None),
             bound_generation: Cell::new(false),
             unspawned_binding: Cell::new(None),
+            carrying_task: Cell::new(false),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
             reported: Cell::new(false),
@@ -2711,7 +2716,12 @@ impl Inner {
         self.deferred_mode.set(None);
         // A start still waiting on its checks never spawns: its writes and delegation binding go,
         // and its user messages queue again (unless the user's own stop cleared them first).
-        let unsent = self.starting.borrow_mut().take().map(|p| p.prompts);
+        let unsent = self
+            .starting
+            .borrow_mut()
+            .take()
+            .map(|p| p.prompts)
+            .filter(|_| !self.carrying_task.get());
         self.abandon_unspawned_binding();
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
@@ -3850,7 +3860,15 @@ impl Inner {
             self.defer_mode(mode);
             return;
         }
-        if self.command(Command::SetMode { mode }) {
+        // A restart that carries the unfinished task forward (the handoff below and its
+        // continuation) does not also queue a message still waiting in an unspawned start.
+        let accepted = {
+            let _carrying = handoff
+                .is_some()
+                .then(|| ScopedFlag::set(&self.carrying_task));
+            self.command(Command::SetMode { mode })
+        };
+        if accepted {
             if let Some(a) = self.approval() {
                 a.set_mode(mode);
             }
@@ -4020,12 +4038,15 @@ impl Inner {
                     return;
                 }
             };
-            self.respawn(&OpenSessionDelta {
-                model: Some(target_model),
-                effort,
-                mode: None,
-                resume: native,
-            });
+            {
+                let _carrying = ScopedFlag::set(&self.carrying_task);
+                self.respawn(&OpenSessionDelta {
+                    model: Some(target_model),
+                    effort,
+                    mode: None,
+                    resume: native,
+                });
+            }
             if handoff.carried > 0 {
                 self.arm_handoff(handoff);
             }
@@ -4102,7 +4123,12 @@ impl Inner {
                 }
             }
             Transition::CreateWithHandoff => {
-                self.create_with_handoff(driver, model, effort);
+                {
+                    // Busy, the switch's continuation carries the unfinished task; idle, nothing
+                    // does, and a message still waiting is queued again for the new agent.
+                    let _carrying = running.then(|| ScopedFlag::set(&self.carrying_task));
+                    self.create_with_handoff(driver, model, effort);
+                }
                 if running {
                     self.continue_after_switch(driver);
                 }

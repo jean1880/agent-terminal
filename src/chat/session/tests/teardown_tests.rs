@@ -95,6 +95,61 @@ fn a_busy_switch_writes_one_prompt_per_turn() {
     });
 }
 
+/// A message waiting in a start that never spawned: as `note_unspawned_prompt` records one.
+fn plant_unspawned(session: &ChatSession, text: &str) {
+    *session.inner.starting.borrow_mut() = Some(PendingStart {
+        generation: session.inner.generation.get(),
+        writes: Vec::new(),
+        prompts: vec![QueuedPrompt {
+            item_id: "unspawned".into(),
+            text: text.into(),
+            stored: true,
+        }],
+    });
+}
+
+/// A busy switch carries the unfinished task itself (handoff and continuation): a message
+/// waiting in an unspawned start is part of it and is never also queued and sent again. An
+/// idle switch carries nothing, so the message is queued for the new agent.
+#[test]
+fn a_switch_sends_an_unspawned_message_exactly_once() {
+    in_loop(|_| {
+        let log: Log = Rc::default();
+        let (_, _, session, _) = queued_session(Driver::Agy, &log);
+        session.send_prompt("first");
+        plant_unspawned(&session, "append one line");
+        assert!(session.status().running_turn);
+        session.switch(Driver::Claude, Some("sonnet".into()), None);
+        assert!(
+            session.inner.queued_prompts.borrow().is_empty(),
+            "the continuation carries it"
+        );
+        turn_completed(&session, TurnState::Completed);
+        let sent = prompts(&log);
+        assert!(
+            !sent.iter().any(|p| p == "append one line"),
+            "never sent again on its own: {sent:?}"
+        );
+        session.shutdown(false);
+    });
+    in_loop(|_| {
+        let log: Log = Rc::default();
+        let (_, _, session, _) = queued_session(Driver::Agy, &log);
+        plant_unspawned(&session, "append one line");
+        assert!(!session.status().running_turn);
+        session.switch(Driver::Claude, Some("sonnet".into()), None);
+        let sent = prompts(&log);
+        assert_eq!(
+            sent.iter()
+                .filter(|p| p.ends_with("append one line"))
+                .count(),
+            1,
+            "an idle switch sends it once, to the new agent: {sent:?}"
+        );
+        session.shutdown(false);
+    });
+}
+
 #[test]
 fn shutdown_with_a_queue_spawns_nothing() {
     in_loop(|_| {
