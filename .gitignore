@@ -16,6 +16,7 @@ desktop.ini
 *.swo
 *~
 .idea/
+.vscode/
 .env
 .env.*
 !.env.example
@@ -33,6 +34,7 @@ __pycache__/
 
 # Agent overlays and local settings
 .claude/
+.gemini/skills/
 
 # Graphify knowledge graph: a local artefact, rebuilt by graphify-build
 graphify-out/
