@@ -546,11 +546,14 @@ impl SubagentPanel {
         let Body::Tool(tool) = &item.body else {
             return;
         };
+        // An agent launched from the shell was asked through its command line.
+        let launched = super::model::shell_launch(tool).and_then(|launch| launch.task);
         let prompt = tool
             .input
             .as_ref()
             .and_then(|i| i.get("prompt"))
             .and_then(serde_json::Value::as_str)
+            .or(launched.as_deref())
             .unwrap_or("")
             .trim();
         set_if_changed(&self.asked_text, prompt);

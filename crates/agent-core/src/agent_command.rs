@@ -63,6 +63,13 @@ pub fn from_tool_input(tool: &str, input: &Value) -> Option<AgentCommand> {
     if !matches!(tool, "Bash" | "bash" | "command_execution" | "run_command") {
         return None;
     }
+    from_command_input(input)
+}
+
+/// The agent launch in the input of a call already known to be a shell command (an
+/// `ItemKind::Command` item, whichever driver's tool it was): [`from_tool_input`] without the
+/// tool name.
+pub fn from_command_input(input: &Value) -> Option<AgentCommand> {
     for key in ["CommandLine", "command", "cmd"] {
         match input.get(key) {
             Some(Value::String(s)) if !s.trim().is_empty() => return parse(s),
