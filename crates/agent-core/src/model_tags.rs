@@ -456,7 +456,10 @@ mod tests {
         assert_eq!(tags.vocabulary["code"], "mine");
         assert!(tags.lookup(Driver::Claude, "haiku").is_some());
         assert!(tags.vocabulary.contains_key("bulk"));
-        assert!(tags.effort_policy.is_some(), "none of its own: the built-in one");
+        assert!(
+            tags.effort_policy.is_some(),
+            "none of its own: the built-in one"
+        );
     }
 
     fn win(used: f64) -> QuotaWindow {

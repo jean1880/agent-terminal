@@ -328,7 +328,11 @@ mod tests {
             ]
         );
         // In every turn's context: it stays short, and names the tools it points to.
-        assert!(CLAUDE_ROOT_PROMPT.len() < 400, "{}", CLAUDE_ROOT_PROMPT.len());
+        assert!(
+            CLAUDE_ROOT_PROMPT.len() < 400,
+            "{}",
+            CLAUDE_ROOT_PROMPT.len()
+        );
         for tool in ["cross_agent_capabilities", "cross_agent_spawn"] {
             assert!(CLAUDE_ROOT_PROMPT.contains(tool), "{tool}");
         }
