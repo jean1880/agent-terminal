@@ -527,7 +527,8 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
 }
 .thinking-dot.dot-agy { animation-delay: 150ms; }
 .thinking-dot.dot-codex { animation-delay: 300ms; }
-/* The agent at work hops a little higher than the two keeping it company. */
+/* Every agent at work is lit (brand.rs `set_working`): the thread's own, and each agent its
+   running sub-agents are on; the rest are dimmed. The thread's own agent hops a little higher. */
 @keyframes thinking-bounce-lead {
     0% { transform: none; }
     15% { transform: translateY(-7px) scale(1.18, 0.9); }

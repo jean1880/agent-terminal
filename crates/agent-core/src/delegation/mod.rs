@@ -21,6 +21,7 @@ pub mod route;
 pub mod scope;
 pub mod token;
 pub mod tools;
+pub mod wake;
 pub mod wire;
 
 /// The control contract version (IPC hello negotiates `min..=max`; v1 accepts exactly 1).

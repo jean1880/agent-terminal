@@ -197,6 +197,12 @@ enum Pending {
         method: String,
         params: Value,
     },
+    /// A delegation root's `config/read`, for the user's own developer instructions, which its
+    /// `thread/start` or `thread/resume` (`method`, `params`) adds the delegation note to.
+    RootConfig {
+        method: String,
+        params: Value,
+    },
     /// `thread/start` or `thread/resume`.
     ThreadStart,
     TurnStart(SubmittedModel),
@@ -2010,6 +2016,7 @@ impl CodexAdapter {
                 pending,
                 Pending::Initialize
                     | Pending::ChildConfig { .. }
+                    | Pending::RootConfig { .. }
                     | Pending::ThreadStart
                     | Pending::TurnStart(_)
             )
@@ -2086,6 +2093,31 @@ impl CodexAdapter {
                 }
                 config.insert("features.multi_agent".into(), Value::Bool(false));
                 config.insert("features.multi_agent_v2".into(), Value::Bool(false));
+                if method == "thread/resume" {
+                    let mut fallback = params.clone();
+                    if let Some(map) = fallback.as_object_mut() {
+                        map.remove("threadId");
+                        map.remove("excludeTurns");
+                    }
+                    self.resume_fallback = Some(fallback);
+                }
+                let line = self.request(Pending::ThreadStart, &method, params);
+                self.write(line);
+            }
+            // The note is a hint: an unreadable config starts the thread without it, rather than
+            // failing (and the user's own instructions are never replaced by it alone).
+            (Pending::RootConfig { method, mut params }, result, _) => {
+                if let Some(result) = result {
+                    let own = result
+                        .pointer("/config/developer_instructions")
+                        .and_then(Value::as_str);
+                    if let Some(map) = params.as_object_mut() {
+                        map.insert(
+                            "developerInstructions".into(),
+                            json!(crate::delegation::launch::codex_root_instructions(own)),
+                        );
+                    }
+                }
                 if method == "thread/resume" {
                     let mut fallback = params.clone();
                     if let Some(map) = fallback.as_object_mut() {
@@ -2400,6 +2432,17 @@ impl Adapter for CodexAdapter {
         let thread = if bound_child {
             self.request(
                 Pending::ChildConfig {
+                    method: method.to_owned(),
+                    params: Value::Object(params),
+                },
+                "config/read",
+                json!({"includeLayers": false, "cwd": self.cwd}),
+            )
+        } else if binding.is_some() {
+            // A delegation root is told about the other agents (`launch::ROOT_PROMPT`), after
+            // whatever developer instructions the user's own config gives it.
+            self.request(
+                Pending::RootConfig {
                     method: method.to_owned(),
                     params: Value::Object(params),
                 },
@@ -3889,11 +3932,26 @@ mod tests {
 
     #[test]
     fn a_bound_root_keeps_ambient_servers_and_reapplies_its_bridge_on_resume() {
+        use crate::delegation::launch::ROOT_PROMPT;
         for resume in [None, Some("saved-thread")] {
             let mut root = CodexAdapter::new();
             root.argv(&bound_session(resume));
             let lines = root.handshake();
-            let start: Value = serde_json::from_str(&lines[2]).expect("start");
+            // It reads its effective config first, to keep the user's developer instructions.
+            let query: Value = serde_json::from_str(&lines[2]).expect("config/read");
+            assert_eq!(query["method"], "config/read");
+            root.feed(
+                &json!({"id": query["id"], "result": {"config": {
+                    "developer_instructions": "Be terse."
+                }}})
+                .to_string(),
+            );
+            let start = one_write(root.drain_outbox().actions);
+            assert_eq!(
+                start["params"]["developerInstructions"],
+                format!("Be terse.\n\n{ROOT_PROMPT}"),
+                "the user's own instructions, then the note"
+            );
             assert_eq!(
                 start["method"],
                 if resume.is_some() {
@@ -3909,6 +3967,22 @@ mod tests {
             );
             assert!(config.get("mcp_servers.codex_apps.enabled").is_none());
         }
+        // An unreadable config is no reason to fail: the thread starts without the note.
+        let mut root = CodexAdapter::new();
+        root.argv(&bound_session(None));
+        let lines = root.handshake();
+        let query: Value = serde_json::from_str(&lines[2]).expect("config/read");
+        root.feed(&json!({"id": query["id"], "error": {"message": "nope"}}).to_string());
+        let start = one_write(root.drain_outbox().actions);
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("developerInstructions").is_none());
+        // An unbound root is told nothing: it has no delegation tools to point to.
+        let mut plain = CodexAdapter::new();
+        plain.argv(&session(Mode::Ask, None));
+        let lines = plain.handshake();
+        let start: Value = serde_json::from_str(&lines[2]).expect("start");
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("developerInstructions").is_none());
     }
 
     #[test]

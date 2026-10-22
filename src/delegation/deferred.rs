@@ -174,6 +174,15 @@ impl Supervisor {
             Accepted::New(a) => a,
         };
         if direction == Direction::ChildToParent {
+            // Queued for the parent's mailbox; a root also hears it without asking.
+            if let Some(id) = a.message.clone() {
+                self.queue_wake(
+                    caller,
+                    agent_core::delegation::wake::Outcome::Message,
+                    &r.text,
+                    agent_core::delegation::wake::Shown::Message(id),
+                );
+            }
             return Ok(a.receipt);
         }
         let id = a

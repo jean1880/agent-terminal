@@ -13,7 +13,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
 use super::cards::{RowEvent, RowSink};
-use super::model::{SubagentSummary, ToolStatus, Transcript};
+use super::model::{Activity, PendingInterruption, SubagentSummary, ToolStatus, Transcript};
 use super::subagents::SubagentPanel;
 use super::{ChatView, Inner};
 use crate::chat::{DiffAsk, WorkerAction};
@@ -177,6 +177,25 @@ impl Worker {
 impl Workers {
     pub(super) fn summaries(&self) -> Vec<SubagentSummary> {
         self.records.iter().map(Worker::summary).collect()
+    }
+
+    pub(super) fn has_worker(&self, id: &str) -> bool {
+        self.worker(id).is_some()
+    }
+
+    /// What a worker waits on the user for, as the parent's status says it: an approval
+    /// (`NeedsApproval`) before a question or form (`NeedsAnswer`); `None` when none waits.
+    /// A worker's requests count as its parent's own: the thread is held up either way.
+    pub(super) fn needs_user(&self) -> Option<Activity> {
+        let mut needs = None;
+        for history in self.records.iter().flat_map(|worker| &worker.histories) {
+            match history.model.pending_interruption() {
+                Some(PendingInterruption::Approval { .. }) => return Some(Activity::NeedsApproval),
+                Some(_) => needs = Some(Activity::NeedsAnswer),
+                None => {}
+            }
+        }
+        needs
     }
 
     fn worker(&self, id: &str) -> Option<&Worker> {
@@ -525,6 +544,8 @@ impl Inner {
         gtk4::glib::idle_add_local_once(move || {
             if let Some(inner) = weak.upgrade() {
                 inner.worker_flush_queued.set(false);
+                // A worker's run starting or ending changes the parent's status and dots too.
+                inner.refresh_status();
                 inner.refresh_subagents(&[]);
                 inner.refresh_worker_inspector();
             }
@@ -1271,6 +1292,11 @@ pub(crate) mod tests {
             .item("native-edit"),
         });
         inner.refresh_subagents(&[]);
+        // A worker's request holds up its parent as the parent's own would, and the worker's
+        // agent is lit beside the parent's.
+        inner.refresh_status();
+        assert_eq!(inner.thinking.shown().as_deref(), Some("Needs approval"));
+        assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "working"]);
         assert!(inner.open_worker("w_workerAA"));
         let inspector = inner.worker_inspector.borrow().clone().expect("inspector");
         assert_eq!(
@@ -1340,5 +1366,19 @@ pub(crate) mod tests {
             inner.model.borrow().order().is_empty(),
             "child rows never enter root transcript"
         );
+        // The parent's own turn is not running, but its worker's is: the parent waits on it.
+        inner.refresh_status();
+        assert_eq!(
+            inner.thinking.shown().as_deref(),
+            Some("Waiting on 1 background task…")
+        );
+        assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "working"]);
+        // Between runs a worker is idle: its agent dims, and nothing holds the parent.
+        let mut idle = summary("w_workerAA", "r_secondRun");
+        idle.run_id = None;
+        idle.state = WorkerState::Waiting;
+        subscriber.registry("root-thread", &[idle]);
+        inner.refresh_status();
+        assert_eq!(inner.thinking.shown(), None);
     }
 }

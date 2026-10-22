@@ -105,6 +105,20 @@ impl WorkerSubscriber for ThreadWorkerSubscriber {
                     .insert(event.scope.clone(), source.clone());
                 Some(source)
             });
+            // A sub-agent's approval or question is the root thread's to show: its sidebar row,
+            // notification and busy state, as for its own.
+            if let Some(thread) = slot.thread.clone() {
+                if event.scope.worker != event.scope.root {
+                    if let Some(change) = ChildAskChange::of(&event.scope, &event.envelope) {
+                        // Deferred: the supervisor is publishing this event.
+                        glib::idle_add_local_once(move || {
+                            if let Some(window) = thread_owner(&thread) {
+                                window.imp().apply_child_ask(&thread, change);
+                            }
+                        });
+                    }
+                }
+            }
             if let Some(diffs) = diffs {
                 match &event.envelope.event {
                     Event::TurnStarted { .. } => {
@@ -136,12 +150,63 @@ impl WorkerSubscriber for ThreadWorkerSubscriber {
             // re-entering the supervisor while it publishes the registry.
             let window = window.downgrade();
             let root = root.to_owned();
+            let active: Vec<String> = workers
+                .iter()
+                .filter(|w| w.state.is_active())
+                .map(|w| w.worker_id.to_string())
+                .collect();
             glib::idle_add_local_once(move || {
                 if let Some(window) = window.upgrade() {
+                    window
+                        .imp()
+                        .apply_child_ask(&root, ChildAskChange::Active(active));
                     window.imp().refresh_sidebar();
                     window.imp().release_held_finish(&root);
                 }
             });
+        }
+    }
+}
+
+/// What a delegated sub-agent's event does to the root thread's wait for the user.
+enum ChildAskChange {
+    /// An approval, question or form the sub-agent waits on (`question`: not an approval).
+    Asked {
+        worker: String,
+        request: Option<String>,
+        question: bool,
+    },
+    /// An answer, or a withdrawal. `request` names which, when the event does.
+    Resolved {
+        worker: String,
+        request: Option<String>,
+    },
+    /// The sub-agent's turn or process ended.
+    Ended { worker: String },
+    /// The sub-agents still active, from the registry: any other asks are stale.
+    Active(Vec<String>),
+}
+
+impl ChildAskChange {
+    fn of(scope: &Scope, envelope: &agent_core::event::Envelope) -> Option<Self> {
+        let worker = scope.worker.to_string();
+        let request = envelope.request.clone();
+        match &envelope.event {
+            ev if is_interruption(ev) => Some(Self::Asked {
+                worker,
+                request,
+                question: matches!(
+                    ev,
+                    Event::QuestionRequested { .. } | Event::FormRequested { .. }
+                ),
+            }),
+            Event::ApprovalResolved { .. }
+            | Event::QuestionResolved { .. }
+            | Event::FormResolved { .. } => Some(Self::Resolved { worker, request }),
+            Event::ApprovalExpired | Event::TurnCompleted { .. } | Event::SessionExited { .. } => {
+                Some(Self::Ended { worker })
+            }
+            _ => None,
         }
     }
 }
@@ -263,6 +328,71 @@ pub(super) fn stop_target(stop: ChildStop) -> super::super::closing::StopTarget 
 }
 
 impl AgentTerminalWindow {
+    /// Applies a delegated sub-agent's wait for the user to its root thread: the row's approval
+    /// badge, the desktop notification and the unread mark a thread's own approval gets, and
+    /// their withdrawal once nothing is left to answer.
+    fn apply_child_ask(&self, thread: &str, change: ChildAskChange) {
+        let in_view = self.selected_row_key() == Some(RowKey::Thread(thread.to_owned()));
+        let focused = self.obj().is_active();
+        let mut notify: Option<(adw::TabPage, bool)> = None;
+        let withdraw;
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let Some(tab) = tabs
+                .iter_mut()
+                .find(|t| t.chat.as_ref().is_some_and(|c| c.thread == thread))
+            else {
+                return;
+            };
+            let page = tab.page.clone();
+            let Some(chat) = tab.chat.as_mut() else {
+                return;
+            };
+            let before = chat.child_asks.clone();
+            match change {
+                ChildAskChange::Asked {
+                    worker,
+                    request,
+                    question,
+                } => {
+                    chat.child_asks.requested(&worker, request.as_deref());
+                    let r = react(Attention::Asked, in_view, focused, false);
+                    chat.unread |= r.unread;
+                    if r.notify {
+                        notify = Some((page, question));
+                    }
+                }
+                ChildAskChange::Resolved { worker, request } => {
+                    chat.child_asks.resolved(&worker, request.as_deref());
+                }
+                ChildAskChange::Ended { worker } => chat.child_asks.worker_ended(&worker),
+                ChildAskChange::Active(active) => {
+                    let active: Vec<&str> = active.iter().map(String::as_str).collect();
+                    chat.child_asks.retain_workers(&active);
+                }
+            }
+            if notify.is_none() && chat.child_asks == before {
+                return;
+            }
+            withdraw = !chat.waiting_on_user();
+        }
+        if withdraw {
+            if let Some(app) = self.obj().application() {
+                app.withdraw_notification(&approval_notification_id(thread));
+            }
+        }
+        if let Some((page, question)) = notify {
+            let heading = if question {
+                "A thread has a question"
+            } else {
+                "A thread needs approval"
+            };
+            self.notify_thread(&page, &approval_notification_id(thread), heading);
+            self.bump_thread_attention_toast(&page, thread, question);
+        }
+        self.refresh_sidebar();
+    }
+
     pub(in crate::window::imp) fn start_transferred_threads(&self) {
         let pages: Vec<_> = self
             .tabs

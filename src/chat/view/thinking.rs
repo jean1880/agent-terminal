@@ -1,6 +1,6 @@
 //! The strip just above the composer that shows the agent is at work: the app icon's three
-//! cursor dots bouncing in turn (the startup splash's wave, see `window/loading.css`) beside a
-//! short status. It slides in when a turn starts and out when the thread settles, so the
+//! cursor dots bouncing in turn (the startup splash's wave, see `window/loading.css`), every
+//! agent at work in the thread (its own and its sub-agents') lit, beside a short status. It slides in when a turn starts and out when the thread settles, so the
 //! composer moves smoothly rather than jumping.
 
 use std::cell::{Cell, RefCell};
@@ -97,10 +97,11 @@ impl ThinkingStrip {
     }
 
     /// Follows the thread: shown while its turn runs or background work it waits on does,
-    /// hidden once it settles. `driver`: the agent at work, whose dot leads.
-    pub fn set(&self, activity: &Activity, driver: Driver) {
+    /// hidden once it settles. `driver`: the thread's agent, whose dot leads; `sub_agents`: the
+    /// agents its running sub-agents are on (any route), whose dots are lit beside it.
+    pub fn set(&self, activity: &Activity, driver: Driver, sub_agents: &[Driver]) {
         let agent = super::cards::driver_name(driver);
-        crate::brand::set_lead(&self.dots, Some(driver));
+        crate::brand::set_working(&self.dots, driver, sub_agents);
         *self.inner.current_activity.borrow_mut() = activity.clone();
         *self.inner.current_agent.borrow_mut() = agent.to_owned();
 
@@ -154,7 +155,7 @@ impl ThinkingStrip {
             .then(|| self.inner.label.text().to_string())
     }
 
-    /// Each dot's classes beyond its colour: `lead`, `dimmed` or none (tests).
+    /// Each dot's classes beyond its colour: `lead`, `working`, `dimmed` or none (tests).
     #[cfg(test)]
     pub fn dot_states(&self) -> Vec<&'static str> {
         let mut states = Vec::new();
@@ -162,6 +163,8 @@ impl ThinkingStrip {
         while let Some(d) = dot {
             states.push(if d.has_css_class("lead") {
                 "lead"
+            } else if d.has_css_class("working") {
+                "working"
             } else if d.has_css_class("dimmed") {
                 "dimmed"
             } else {

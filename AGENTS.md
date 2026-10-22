@@ -49,8 +49,11 @@ Architectural mandates, standards, and workflows for this codebase.
     and every persisted event), `event` (the canonical provider-neutral event
     stream), `caps` (per-agent capability matrix), `adapter` (the sans-I/O
     adapter contract), `git_command` (a `git`/`gh` command line read as its operation for the
-    approval card: a reading aid, never a gate; the card still shows the command) and the
-    per-agent adapters and pure policies built on it.
+    approval card: a reading aid, never a gate; the card still shows the command),
+    `agent_command` (a shell command that launches an agent CLI, `cross-agent`, `claude -p`,
+    `codex exec` or `agy -p`, read from a command line or a shell tool's input, so it can be shown
+    as a sub-agent; a reading aid too, though a delegated child's authority refuses what it
+    recognises) and the per-agent adapters and pure policies built on it.
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -174,6 +177,13 @@ Architectural mandates, standards, and workflows for this codebase.
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path.
+- **A root hears its sub-agents without polling, and never after a stop**: a child's finished
+  run, failure or message to its root is posted in the root's thread as the app's notice and
+  starts a turn with it (`delegation/wake.rs`, decided in `agent_core::delegation::wake`):
+  redacted before it is cut to `WAKE_BUDGET`, coalesced, held while the root is busy, never sent
+  again once a `cross_agent_wait`/`read` page showed it, a notice only after
+  `MAX_CONSECUTIVE_WAKES` wakes without the user, and dropped once the user stops the root (until
+  the user speaks) or its thread closes.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is
@@ -186,7 +196,8 @@ Architectural mandates, standards, and workflows for this codebase.
   (`suspend_idle_threads`) asks `ChatSession::suspend_if_idle`, which stops the agent process
   only when nothing would be lost (`Inner::suspend_blocker`: no turn, queue, approval, permission
   card, model change, handoff, rebind, Codex session grants, unresumable Codex thread, no
-  conversation yet, Bypass, delegated worker; the window adds background work, delegated runs and
+  conversation yet, Bypass, delegated worker, active provider workers; the window adds background
+  work, delegated runs, a delegated sub-agent's open question and
   pending sends). A delegation root suspends only with its hooks' consent
   (`DelegationHooks::suspending`): a planned rotation (`rotate_before_stop`), so nothing is
   revoked, and the rebind around its resume posts no notice; it also refuses while sub-agents are

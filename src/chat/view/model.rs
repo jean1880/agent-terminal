@@ -161,6 +161,20 @@ pub fn reasoning_view(
     }
 }
 
+/// The agent a command card launches, read from its input (structured, else the streamed text
+/// once it parses); `None` for anything else.
+pub(super) fn shell_launch(tool: &Tool) -> Option<agent_core::agent_command::AgentCommand> {
+    if tool.kind != ItemKind::Command {
+        return None;
+    }
+    let input = tool
+        .input
+        .clone()
+        .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+        .or_else(|| serde_json::from_str(&tool.input_text).ok())?;
+    agent_core::agent_command::from_command_input(&input)
+}
+
 /// Empty plans and wholly completed plans do not occupy the active-work shelf.
 pub(super) fn plan_is_active(steps: &[PlanStep]) -> bool {
     steps
@@ -222,6 +236,18 @@ impl SubagentSummary {
         }
     }
 
+    /// Whether it is at work right now. A delegated worker between runs (its last turn done or
+    /// interrupted, waiting for its parent's next message) is active but not running: only a
+    /// worker with a current run is.
+    pub fn running(&self) -> bool {
+        match &self.delegation {
+            Some(delegation) if self.lifecycle.is_some() => {
+                delegation.run.is_some() && self.active()
+            }
+            _ => self.active(),
+        }
+    }
+
     pub fn finished(&self) -> bool {
         match self.lifecycle {
             Some(WorkerState::Unknown) => false,
@@ -249,6 +275,32 @@ impl SubagentSummary {
                 ToolStatus::Interrupted => "stopped",
             },
         }
+    }
+
+    /// A shell command that launches an agent (`cross-agent agy …`, `claude -p …`): a sub-agent
+    /// no delegation tool announced, on the agent it launched. `None` for any other command.
+    fn of_shell(item: &Item, tool: &Tool) -> Option<Self> {
+        let launch = shell_launch(tool)?;
+        let label = launch.driver.info().label;
+        let name = match &launch.model {
+            Some(model) => format!("{label} · {model} (shell)"),
+            None => format!("{label} (shell)"),
+        };
+        Some(Self {
+            id: item.id.clone(),
+            name,
+            task: launch
+                .task
+                .as_deref()
+                .and_then(|task| task.lines().map(str::trim).find(|l| !l.is_empty()))
+                .map_or_else(|| tool.title.clone(), str::to_owned),
+            status: tool.status,
+            steps: 0,
+            lifecycle: None,
+            activity: None,
+            driver: Some(launch.driver),
+            delegation: None,
+        })
     }
 
     fn of(item: &Item, tool: &Tool) -> Self {
@@ -848,7 +900,8 @@ impl Transcript {
         false
     }
 
-    /// Every sub-agent the thread started, nested ones included, in the order they began.
+    /// Every sub-agent the thread started, nested ones and agents its shell commands launched
+    /// included, in the order they began.
     pub fn subagents(&self) -> Vec<SubagentSummary> {
         let mut out = Vec::new();
         let mut stack: Vec<&ItemId> = self.order.iter().rev().collect();
@@ -859,6 +912,8 @@ impl Transcript {
             if let Body::Tool(t) = &item.body {
                 if t.kind == ItemKind::Subagent {
                     out.push(SubagentSummary::of(item, t));
+                } else if let Some(shell) = SubagentSummary::of_shell(item, t) {
+                    out.push(shell);
                 }
             }
             stack.extend(item.children.iter().rev());
@@ -875,6 +930,7 @@ impl Transcript {
                 .delegation
                 .as_ref()
                 .map(|delegation| delegation.driver)
+                .or(worker.driver)
                 .or(self.last_driver);
         }
         out
@@ -899,9 +955,47 @@ impl Transcript {
         self.last_model.as_deref()
     }
 
+    /// Every sub-agent of the thread whatever started it: [`Self::subagents`], plus `supervised`,
+    /// the delegation registry's workers. Registry handles are canonical; a linked snapshot of a
+    /// supervised worker in this stream must not make a second row for it.
+    pub fn subagents_with(&self, supervised: Vec<SubagentSummary>) -> Vec<SubagentSummary> {
+        let mut agents = self.subagents();
+        agents.retain(|agent| {
+            !agent.delegation.as_ref().is_some_and(|delegation| {
+                supervised
+                    .iter()
+                    .any(|worker| worker.id == delegation.worker_id.as_str())
+            })
+        });
+        agents.extend(supervised);
+        agents
+    }
+
+    /// The agents the thread's running sub-agents are on (any route: the agent's own, the
+    /// provider's workers, the delegation registry's `supervised`), each once, in slot order.
+    pub fn running_drivers(&self, supervised: Vec<SubagentSummary>) -> Vec<Driver> {
+        let agents = self.subagents_with(supervised);
+        Driver::ALL
+            .into_iter()
+            .filter(|&driver| {
+                agents
+                    .iter()
+                    .any(|agent| agent.running() && agent.driver == Some(driver))
+            })
+            .collect()
+    }
+
     /// The thread's status. `main_running`: the main agent's turn runs (the model's own view of
-    /// it, or the backend's).
+    /// it, or the backend's). The view counts delegated workers too ([`Self::activity_with`]).
+    #[cfg(test)]
     pub fn activity(&self, main_running: bool) -> Activity {
+        self.activity_with(main_running, Vec::new())
+    }
+
+    /// [`Self::activity`], counting `supervised` (the delegation registry's workers) as the
+    /// thread's sub-agents: a parent whose turn is over while a delegated worker runs is waiting
+    /// on it, not finished.
+    pub fn activity_with(&self, main_running: bool, supervised: Vec<SubagentSummary>) -> Activity {
         if let Some(pending) = self.pending_interruption() {
             return match pending {
                 PendingInterruption::Approval { .. } => Activity::NeedsApproval,
@@ -910,7 +1004,7 @@ impl Transcript {
                 }
             };
         }
-        let agents = self.subagents();
+        let agents = self.subagents_with(supervised);
         if main_running && !self.waiting_for.is_empty() {
             return Activity::WaitingForWorkers {
                 names: self
@@ -960,14 +1054,19 @@ impl Transcript {
     /// Everything running in the background: the agent's task list, then the provider's workers
     /// still at work (a worker's id is its sub-agent item's).
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
-        self.background_with(&self.subagents())
+        self.background_tasks_with(Vec::new())
+    }
+
+    /// [`Self::background_tasks`], with the delegation registry's workers.
+    pub fn background_tasks_with(&self, supervised: Vec<SubagentSummary>) -> Vec<BackgroundTask> {
+        self.background_with(&self.subagents_with(supervised))
     }
 
     fn background_with(&self, agents: &[SubagentSummary]) -> Vec<BackgroundTask> {
         let mut background = self.background.clone();
         for worker in agents
             .iter()
-            .filter(|a| a.lifecycle.is_some() && a.active())
+            .filter(|a| a.lifecycle.is_some() && a.running())
         {
             background.push(BackgroundTask {
                 id: worker.id.clone(),
@@ -3337,6 +3436,63 @@ mod tests {
             Some("task")
         );
         assert_eq!(t.get("orphan").and_then(|i| i.parent.as_deref()), None);
+    }
+
+    /// The agent's own sub-agent runs on its agent: the dots light that agent while it runs, and
+    /// no other.
+    #[test]
+    fn running_drivers_follow_the_agents_own_sub_agents() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        assert!(t.running_drivers(Vec::new()).is_empty());
+        t.apply(&started("task", ItemKind::Subagent, None), Driver::Claude);
+        assert_eq!(t.running_drivers(Vec::new()), [Driver::Claude]);
+        let done = Envelope::new(Event::ItemCompleted {
+            status: ItemStatus::Completed,
+            output: None,
+            error: None,
+        })
+        .item("task");
+        t.apply(&done, Driver::Claude);
+        assert!(t.running_drivers(Vec::new()).is_empty());
+    }
+
+    /// An agent the thread's agent launches from its shell is its sub-agent, on the agent it
+    /// launched; any other command is not.
+    #[test]
+    fn a_shell_launched_agent_is_a_sub_agent() {
+        let mut t = Transcript::new();
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        let command = |id: &str, line: &str| {
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "Bash".into(),
+                input: Some(serde_json::json!({ "command": line })),
+                parent: None,
+            })
+            .item(id)
+        };
+        t.apply(&command("ls", "ls -la"), Driver::Claude);
+        assert!(t.subagents().is_empty());
+        t.apply(
+            &command("x", "cross-agent agy -m gemini-4-argon \"Review the diff\""),
+            Driver::Claude,
+        );
+        let agents = t.subagents();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].driver, Some(Driver::Agy));
+        assert_eq!(agents[0].name, "Antigravity · gemini-4-argon (shell)");
+        assert_eq!(agents[0].task, "Review the diff");
+        assert_eq!(t.running_drivers(Vec::new()), [Driver::Agy]);
+        let done = Envelope::new(Event::ItemCompleted {
+            status: ItemStatus::Completed,
+            output: Some("Looks good.".into()),
+            error: None,
+        })
+        .item("x");
+        t.apply(&done, Driver::Claude);
+        assert!(t.running_drivers(Vec::new()).is_empty());
+        assert_eq!(t.subagents()[0].status, ToolStatus::Completed);
     }
 
     #[test]

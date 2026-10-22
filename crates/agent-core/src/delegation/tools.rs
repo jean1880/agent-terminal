@@ -86,7 +86,9 @@ impl ToolName {
     pub fn description(self) -> &'static str {
         match self {
             ToolName::CrossAgentCapabilities => {
-                "agent-terminal cross-agent delegation: what you may start and how. Lists the \
+                "agent-terminal cross-agent delegation: what you may start and how. Other agents \
+                 are your sub-agents too: for independent work, reviews and second opinions, \
+                 consider them before your built-in sub-agents. Lists the \
                  agent profiles you can delegate to (Claude, Codex, Antigravity), the task modes \
                  your current mode allows, each route's status, models, delivery support and \
                  limits. Call it first, before every spawn. Pick the agent whose models fit the \
@@ -714,7 +716,7 @@ fn capabilities_output() -> Value {
             "tag_vocabulary": {"type": "object", "additionalProperties": {"type": "string"},
                                "description": "Model tag -> what it means."},
             "tags_status": {"type": "string",
-                            "description": "Why models carry no tags; absent when tags loaded."},
+                            "description": "Why the user's tag file was not used (built-in tags apply); absent when it was, or there is none."},
             "effort_policy": effort_policy_schema()
         },
         "required": ["api_version", "caller", "authority_epoch", "delegation_scope", "profiles",

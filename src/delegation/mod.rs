@@ -25,6 +25,7 @@ mod rundir;
 pub(crate) mod services;
 pub(crate) mod supervisor;
 mod waits;
+mod wake;
 mod workspace;
 
 pub(crate) use services::AppServices;

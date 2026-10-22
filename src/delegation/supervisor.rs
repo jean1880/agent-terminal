@@ -725,8 +725,9 @@ mod tests {
                     error: None,
                     cost_usd: None,
                 }),
-                999,
+                (999, None),
                 false,
+                None,
             );
             assert_eq!(
                 sup.state.borrow().workers[&worker].run.as_ref(),
@@ -2044,6 +2045,8 @@ mod tests {
     }
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
+    /// A root is told its sub-agents' results without polling for them.
+    mod wake_tests;
 }
 pub(crate) struct P1Routes;
 impl RouteTable for P1Routes {
@@ -2134,6 +2137,11 @@ pub(super) struct Runtime {
     /// How long a task handed to a child may wait for its turn to open before the worker is
     /// failed as stalled; `None` is [`super::deferred::TASK_START_DEADLINE`] (tests shorten it).
     pub task_start_deadline: Option<std::time::Duration>,
+    /// Per root, its children's news not yet given to it, and what it was already shown
+    /// (see `wake.rs`).
+    pub wakes: HashMap<WorkerId, agent_core::delegation::wake::Queue>,
+    /// Roots with a wake attempt already scheduled.
+    pub wake_armed: HashSet<WorkerId>,
 }
 pub(crate) struct Supervisor {
     pub(super) services: AppServices,
@@ -2786,17 +2794,22 @@ impl Supervisor {
         w.staged = Some(prep);
         Ok(())
     }
-    pub(crate) fn attach_root_session(&self, thread: &str, session: Weak<ChatSession>) {
-        let mut state = self.state.borrow_mut();
-        let Some(id) = state.threads.get(thread).cloned() else {
-            return;
-        };
-        if let Some(w) = state.workers.get_mut(&id) {
-            w.root_session = session;
-            if let Some(s) = w.root_session.upgrade() {
-                w.mode = s.effective_mode().session_safe();
+    pub(crate) fn attach_root_session(self: &Rc<Self>, thread: &str, session: Weak<ChatSession>) {
+        let id = {
+            let mut state = self.state.borrow_mut();
+            let Some(id) = state.threads.get(thread).cloned() else {
+                return;
+            };
+            if let Some(w) = state.workers.get_mut(&id) {
+                w.root_session = session;
+                if let Some(s) = w.root_session.upgrade() {
+                    w.mode = s.effective_mode().session_safe();
+                }
             }
-        }
+            id
+        };
+        // News that waited for the thread to open.
+        self.schedule_wake(&id, super::wake::WAKE_COALESCE);
     }
     pub(crate) fn before_root_turn(self: &Rc<Self>, thread: &str) -> RootTurnGate {
         let needed = {
@@ -2849,10 +2862,12 @@ impl Supervisor {
         });
         RootTurnGate::Deferred
     }
-    pub(crate) fn on_root_turn_end(&self, thread: &str) {
+    pub(crate) fn on_root_turn_end(self: &Rc<Self>, thread: &str) {
         let id = self.state.borrow().threads.get(thread).cloned();
         if let Some(id) = id {
             self.release_waits(&id);
+            // What the turn did not wait for is told now, once the session has settled.
+            self.schedule_wake(&id, super::wake::WAKE_COALESCE);
         }
     }
     pub(crate) fn root_stop(self: &Rc<Self>, thread: &str) {
@@ -2869,7 +2884,10 @@ impl Supervisor {
                 .workers
                 .get(&root)
                 .and_then(WorkerRt::session);
+            // A stopped root is not woken by its sub-agents' news until the user speaks again.
+            self.forget_wakes(&root);
             if let Some(session) = session {
+                session.hold_wakes();
                 session.interrupt_run();
             }
             self.begin_revoke(&root, RevocationEvent::RootStop);

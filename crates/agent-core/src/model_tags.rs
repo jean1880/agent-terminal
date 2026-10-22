@@ -1,7 +1,8 @@
 //! What each model is good for, and how much of an agent's plan is left: the pure half of
 //! `cross_agent_capabilities`' `models[].tags` and `usage.headroom`.
 //!
-//! The tag file (`model-tags.json`, contract v1) is authored elsewhere and only read here. Reading
+//! Every install has the [`built_in`] tags; a user's tag file (`model-tags.json`, contract v1),
+//! authored elsewhere and only read here, goes [`ModelTags::over`] them. Reading
 //! is lenient: unknown fields are ignored, unknown tags kept, an entry that cannot match (no
 //! `match`, a driver this build does not know) skipped. Only a file that is not a v1 object with
 //! a `models` array is refused, and the caller then lists models with no tags and says why.
@@ -366,7 +367,30 @@ pub fn parse(json: &str) -> Result<ModelTags, String> {
     })
 }
 
+/// The tags every install starts with, so delegation can choose models with no tag file at all:
+/// the families each agent ships (by name pattern, so new versions match), and an effort policy.
+const BUILT_IN_JSON: &str = include_str!("model_tags_default.json");
+
+/// [`BUILT_IN_JSON`], read. Empty only if it failed to parse, which its test rules out.
+pub fn built_in() -> ModelTags {
+    parse(BUILT_IN_JSON).unwrap_or_default()
+}
+
 impl ModelTags {
+    /// These tags (a user's file) over `base` (the built-in ones): their entries are looked up
+    /// first, their vocabulary and effort policy win, and `base` fills in what they leave out.
+    pub fn over(self, base: ModelTags) -> ModelTags {
+        let mut vocabulary = base.vocabulary;
+        vocabulary.extend(self.vocabulary);
+        let mut entries = self.entries;
+        entries.extend(base.entries);
+        ModelTags {
+            vocabulary,
+            entries,
+            effort_policy: self.effort_policy.or(base.effort_policy),
+        }
+    }
+
     /// The first entry, in file order, whose pattern matches `id` and whose driver (if any) is
     /// `driver`.
     pub fn lookup(&self, driver: Driver, id: &str) -> Option<&TagEntry> {
@@ -393,6 +417,50 @@ impl ModelTags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With no tag file, every agent's model families still carry a tier and tags, and there is
+    /// an effort policy: delegation can choose on any install.
+    #[test]
+    fn the_built_in_tags_cover_every_agents_families() {
+        let tags = parse(BUILT_IN_JSON).expect("the built-in tags parse");
+        assert!(tags.effort_policy.is_some());
+        for (driver, id) in [
+            (Driver::Claude, "claude-opus-5-5"),
+            (Driver::Claude, "sonnet"),
+            (Driver::Claude, "haiku"),
+            (Driver::Agy, "gemini-3.8-flash"),
+            (Driver::Agy, "gemini-4-argon"),
+            (Driver::Codex, "gpt-6.1-sol"),
+            (Driver::Codex, "gpt-6-luna"),
+        ] {
+            let entry = tags.lookup(driver, id).unwrap_or_else(|| panic!("{id}"));
+            assert!(entry.tier.is_some() && !entry.tags.is_empty(), "{id}");
+            for tag in &entry.tags {
+                assert!(tags.vocabulary.contains_key(tag), "{id}: {tag} undefined");
+            }
+        }
+    }
+
+    /// A user's file goes over the built-in tags: its entries are found first and its
+    /// vocabulary wins, while what it leaves out still comes from the built-in ones.
+    #[test]
+    fn a_users_tags_go_over_the_built_in_ones() {
+        let user = parse(
+            r#"{"version": 1, "vocabulary": {"code": "mine"},
+                "models": [{"match": "*opus*", "tier": "fast", "tags": ["code"]}]}"#,
+        )
+        .expect("user");
+        let tags = user.over(built_in());
+        let opus = tags.lookup(Driver::Claude, "opus").expect("opus");
+        assert_eq!(opus.tier.as_deref(), Some("fast"));
+        assert_eq!(tags.vocabulary["code"], "mine");
+        assert!(tags.lookup(Driver::Claude, "haiku").is_some());
+        assert!(tags.vocabulary.contains_key("bulk"));
+        assert!(
+            tags.effort_policy.is_some(),
+            "none of its own: the built-in one"
+        );
+    }
 
     fn win(used: f64) -> QuotaWindow {
         QuotaWindow {

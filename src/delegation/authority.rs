@@ -206,6 +206,14 @@ impl ApprovalGate for ChildAuthority {
             return GateVerdict::Deny { reason };
         }
         let effect = effect(self.params.driver, tool, input);
+        // A shell command that launches an agent CLI is a nested sub-agent by another route.
+        if effect == Effect::Exec
+            && agent_core::agent_command::from_tool_input(tool, input).is_some()
+        {
+            return GateVerdict::Deny {
+                reason: "delegated agents cannot start their own sub-agents".to_owned(),
+            };
+        }
         match effect {
             Effect::Delegate => {
                 return GateVerdict::Deny {
@@ -552,6 +560,70 @@ mod tests {
                 &json!({}),
                 None
             )));
+        }
+    }
+
+    #[test]
+    fn a_shell_command_that_launches_an_agent_is_a_nested_sub_agent() {
+        let f = Fixture::new();
+        let launches = |driver: Driver| -> Vec<(&'static str, Value)> {
+            let (tool, key) = match driver {
+                Driver::Claude => ("Bash", "command"),
+                Driver::Codex => ("command_execution", "command"),
+                Driver::Agy => ("run_command", "CommandLine"),
+            };
+            [
+                "cross-agent claude \"review\"",
+                "cd /w && timeout 600 codex exec 'go'",
+                "bash -lc 'agy -p x'",
+                "FOO=1 claude -p x | tee out",
+            ]
+            .iter()
+            .map(|c| (tool, json!({ key: c })))
+            .collect()
+        };
+        for driver in DRIVERS {
+            for mode in TaskMode::ALL {
+                let gate = f.gate(driver, mode);
+                for (tool, input) in launches(driver) {
+                    match gate.judge(tool, &input, None) {
+                        GateVerdict::Deny { reason } => assert_eq!(
+                            reason, "delegated agents cannot start their own sub-agents",
+                            "{driver:?} {mode:?} {input}"
+                        ),
+                        v => panic!("{driver:?} {mode:?} {input}: {v:?}"),
+                    }
+                }
+            }
+        }
+        // Codex also sends its command as an argv.
+        let gate = f.gate(Driver::Codex, TaskMode::AcceptEdits);
+        let argv = json!({"command": ["bash", "-lc", "codex exec x"]});
+        assert!(is_deny(&gate.judge("command_execution", &argv, None)));
+    }
+
+    #[test]
+    fn ordinary_commands_and_mentions_of_agents_still_defer() {
+        let f = Fixture::new();
+        for driver in DRIVERS {
+            let gate = f.gate(driver, TaskMode::AcceptEdits);
+            let (tool, key) = match driver {
+                Driver::Claude => ("Bash", "command"),
+                Driver::Codex => ("command_execution", "command"),
+                Driver::Agy => ("run_command", "CommandLine"),
+            };
+            for command in [
+                "ls",
+                "echo \"claude -p\"",
+                "which codex",
+                "claude --version",
+            ] {
+                assert_eq!(
+                    gate.judge(tool, &json!({ key: command }), None),
+                    GateVerdict::Defer,
+                    "{driver:?} {command}"
+                );
+            }
         }
     }
 

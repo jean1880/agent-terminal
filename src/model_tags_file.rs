@@ -1,8 +1,9 @@
 //! The model tag file (`TerminalConfig::model_tags_path`, by default
 //! `~/.config/agent-terminal/model-tags.json`), read off the main thread and cached until its
-//! modification time or size changes. Parsing is [`agent_core::model_tags::parse`]; a missing or
-//! refused file is never an error to the caller, only a reason (`status`) its models carry no
-//! tags.
+//! modification time or size changes. Parsing is [`agent_core::model_tags::parse`]. The file
+//! goes over the built-in tags ([`agent_core::model_tags::built_in`]), so every install has tags:
+//! a missing file is not worth a word, and a refused one is never an error to the caller, only a
+//! reason (`status`) the built-in tags apply alone.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::time::SystemTime;
 
 use agent_core::delegation::error::truncate_bytes;
 use agent_core::delegation::wire::MAX_TAGS_STATUS_BYTES;
-use agent_core::model_tags::{parse, ModelTags};
+use agent_core::model_tags::{built_in, parse, ModelTags};
 use gtk4::gio;
 
 /// A larger file is refused unread.
@@ -21,7 +22,8 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Default)]
 pub struct TagsState {
     pub tags: Option<Arc<ModelTags>>,
-    /// Why `tags` is `None`.
+    /// Why the user's file is not in `tags` (the built-in tags apply alone); `None` when it is,
+    /// or there is none.
     pub status: Option<String>,
 }
 
@@ -44,7 +46,7 @@ pub fn read(path: &Path, known: Option<Stamp>) -> Reading {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Reading::Loaded(None, refused("no model tag file (model-tags.json)"));
+            return Reading::Loaded(None, with_tags(None, None));
         }
         Err(e) => {
             return Reading::Loaded(
@@ -68,10 +70,7 @@ pub fn read(path: &Path, known: Option<Stamp>) -> Reading {
     }
     let state = match std::fs::read_to_string(path) {
         Ok(text) => match parse(&text) {
-            Ok(tags) => TagsState {
-                tags: Some(Arc::new(tags)),
-                status: None,
-            },
+            Ok(tags) => with_tags(Some(tags), None),
             Err(why) => refused(&format!("model tag file refused: {why}")),
         },
         Err(e) => refused(&format!("model tag file unreadable: {}", e.kind())),
@@ -79,11 +78,23 @@ pub fn read(path: &Path, known: Option<Stamp>) -> Reading {
     Reading::Loaded(Some(stamp), state)
 }
 
-fn refused(why: &str) -> TagsState {
+/// The built-in tags, with `user`'s over them, and `status` saying why there is no `user`.
+fn with_tags(user: Option<ModelTags>, status: Option<String>) -> TagsState {
+    let base = built_in();
     TagsState {
-        tags: None,
-        status: Some(truncate_bytes(why, MAX_TAGS_STATUS_BYTES).to_owned()),
+        tags: Some(Arc::new(match user {
+            Some(user) => user.over(base),
+            None => base,
+        })),
+        status,
     }
+}
+
+fn refused(why: &str) -> TagsState {
+    with_tags(
+        None,
+        Some(truncate_bytes(why, MAX_TAGS_STATUS_BYTES).to_owned()),
+    )
 }
 
 /// What an `Unchanged` reading of `path` stands for: the cached state, when the cache still holds
@@ -132,23 +143,20 @@ mod tests {
         "models": [{"match": "*opus*", "tags": ["code"], "tier": "deep"}]}"#;
 
     #[test]
-    fn a_missing_or_refused_file_says_why_and_a_good_one_loads() {
+    fn a_missing_or_refused_file_leaves_the_built_in_tags_and_a_good_one_goes_over_them() {
         let dir = tempfile::tempdir().expect("tmp");
         let path = dir.path().join("model-tags.json");
         let Reading::Loaded(None, missing) = read(&path, None) else {
             panic!("missing file");
         };
-        assert!(missing.tags.is_none());
-        assert_eq!(
-            missing.status.as_deref(),
-            Some("no model tag file (model-tags.json)")
-        );
+        assert_eq!(missing.tags.as_deref(), Some(&built_in()));
+        assert_eq!(missing.status, None, "no file is not worth a word");
 
         std::fs::write(&path, r#"{"version": 9, "models": []}"#).expect("write");
         let Reading::Loaded(Some(_), bad) = read(&path, None) else {
             panic!("bad file");
         };
-        assert!(bad.tags.is_none());
+        assert_eq!(bad.tags.as_deref(), Some(&built_in()));
         assert!(bad
             .status
             .as_deref()
@@ -161,6 +169,17 @@ mod tests {
         assert!(good.status.is_none());
         let tags = good.tags.expect("tags");
         assert_eq!(tags.vocabulary["code"], "writes code");
+        assert_eq!(
+            tags.lookup(agent_core::adapter::Driver::Claude, "opus")
+                .and_then(|e| e.tier.as_deref()),
+            Some("deep"),
+            "the file's entry first"
+        );
+        assert!(
+            tags.lookup(agent_core::adapter::Driver::Codex, "gpt-6-luna")
+                .is_some(),
+            "the built-in ones fill in the rest"
+        );
         assert!(matches!(read(&path, Some(stamp)), Reading::Unchanged));
 
         std::fs::write(&path, "x".repeat(MAX_FILE_BYTES as usize + 1)).expect("write");
@@ -180,7 +199,7 @@ mod tests {
         let last = (a.clone(), None, loaded);
         assert!(cached_state(Some(&last), &a).tags.is_some());
         let other = cached_state(Some(&last), Path::new("/b/model-tags.json"));
-        assert!(other.tags.is_none());
+        assert_eq!(other.tags.as_deref(), Some(&built_in()));
         assert_eq!(other.status.as_deref(), Some("model tag file not loaded"));
         assert_eq!(
             cached_state(None, &a).status.as_deref(),
@@ -213,7 +232,8 @@ mod tests {
             );
             std::fs::remove_file(&path).expect("rm");
             let gone = ctx.block_on(cache.current(path.clone()));
-            assert!(gone.tags.is_none() && gone.status.is_some());
+            assert_eq!(gone.tags.as_deref(), Some(&built_in()));
+            assert_eq!(gone.status, None);
         });
     }
 }

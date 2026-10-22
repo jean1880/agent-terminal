@@ -20,6 +20,7 @@ mod composer;
 mod delegation;
 pub mod demo;
 mod difftext;
+mod follow;
 mod form_card;
 mod form_draft;
 mod git_card;
@@ -745,18 +746,7 @@ impl Inner {
     /// updating the `changed` ones), from the model.
     fn refresh_subagents(&self, changed: &[String]) {
         let model = self.model.borrow();
-        let mut agents = model.subagents();
-        let supervised = self.delegation.borrow().summaries();
-        // Registry handles are canonical; a linked snapshot in the root stream must not
-        // create a second row for the same supervised worker.
-        agents.retain(|agent| {
-            !agent.delegation.as_ref().is_some_and(|delegation| {
-                supervised
-                    .iter()
-                    .any(|worker| worker.id == delegation.worker_id.as_str())
-            })
-        });
-        agents.extend(supervised);
+        let agents = model.subagents_with(self.delegation.borrow().summaries());
         // Every sub-agent the thread started: the running ones first, then the finished ones
         // with how they ended (a replayed thread, or one whose sub-agents are all done, still
         // lists them).
@@ -884,7 +874,8 @@ impl Inner {
         if task.kind == BackgroundTaskKind::Agent {
             // Claude's tasks name their `Agent` call; a provider worker is its own item.
             let id = task.tool_use_id.as_deref().unwrap_or(&task.id);
-            let known = self.model.borrow().subagents().iter().any(|a| a.id == id);
+            let known = self.model.borrow().subagents().iter().any(|a| a.id == id)
+                || self.delegation.borrow().has_worker(id);
             return known.then(|| BackgroundTarget::Subagent(id.to_owned()));
         }
         self.backend
@@ -896,7 +887,10 @@ impl Inner {
 
     /// The strip's background task list, from the model.
     fn refresh_background(&self) {
-        let tasks = self.model.borrow().background_tasks();
+        let tasks = self
+            .model
+            .borrow()
+            .background_tasks_with(self.delegation.borrow().summaries());
         let listed = tasks
             .into_iter()
             .map(|task| background::ListedTask {
@@ -1005,8 +999,24 @@ impl Inner {
     fn refresh_status(&self) {
         let status = self.backend.status();
         let running = status.running_turn || self.model.borrow().running;
-        // The header counts background work too; the stop button follows the main turn only.
-        let activity = self.model.borrow().activity(running);
+        // The header counts background work too, delegated workers included; the stop button
+        // follows the main turn only.
+        let (activity, sub_agents) = {
+            let model = self.model.borrow();
+            let workers = self.delegation.borrow();
+            let supervised = workers.summaries();
+            // A worker waiting on the user holds up the thread as the agent's own request would;
+            // an approval outranks a question, whoever asks.
+            let activity = match (
+                model.activity_with(running, supervised.clone()),
+                workers.needs_user(),
+            ) {
+                (own @ model::Activity::NeedsApproval, _) => own,
+                (_, Some(needs)) => needs,
+                (own, None) => own,
+            };
+            (activity, model.running_drivers(supervised))
+        };
         // The agent's own start, resume or pause shows in the header only: the strip by the
         // composer keeps the turn's own activity.
         let lifecycle = self.backend.lifecycle();
@@ -1017,7 +1027,7 @@ impl Inner {
             agent_core::caps::Feature::InterruptKeepsProcess,
             cards::driver_name(status.driver),
         );
-        self.thinking.set(&activity, status.driver);
+        self.thinking.set(&activity, status.driver, &sub_agents);
         self.refresh_background();
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
@@ -2938,6 +2948,7 @@ pub(crate) mod tests {
         interruption::tests::the_shelf_holds_requests_it_must_not_grant_unseen();
         requests_ui_checks();
         thinking_strip_follows_the_turn();
+        follow::tests::a_followed_scroller_tracks_its_end_until_the_user_scrolls_up();
         composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
         panels::tests::changing_effort_does_not_switch_until_row_activation();
         panels::tests::a_reconnect_in_flight_shows_on_its_row();

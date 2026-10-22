@@ -7,6 +7,7 @@
 //! THIRD_PARTY.md at the repository root.
 
 pub mod adapter;
+pub mod agent_command;
 pub mod agy;
 pub mod approval;
 pub mod caps;
