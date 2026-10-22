@@ -134,22 +134,33 @@ pub fn claude_child_args(mode: TaskMode, overlay_path: &str) -> Vec<String> {
     .collect()
 }
 
-/// What a root Claude is told about the other agents, appended to its system prompt. Claude
-/// otherwise reaches for its built-in sub-agents first: it is never told the others exist, and
-/// their tools may be deferred until searched for. Kept short: it is in every turn's context.
-pub const CLAUDE_ROOT_PROMPT: &str = "agent-terminal: other agents (Codex, Antigravity/Gemini, \
-     other Claude profiles) can be your sub-agents through the agent_terminal MCP tools; load \
+/// What a root agent is told about the other agents: appended to Claude's system prompt, added
+/// to Codex's developer instructions (agy has neither; its tool descriptions carry a line of
+/// it). An agent otherwise reaches for its built-in sub-agents first: it is never told the
+/// others exist, and their tools may be deferred until searched for. Kept short: it is in every
+/// turn's context.
+pub const ROOT_PROMPT: &str = "agent-terminal: other agents (Claude, Codex, Antigravity/Gemini, \
+     other profiles of yours) can be your sub-agents through the agent_terminal MCP tools; load \
      them if deferred. Before using your built-in sub-agents for independent work or a review, \
      call cross_agent_capabilities and start the best fit (model tags, then lowest usage.load) \
      with cross_agent_spawn. Results come back to you.";
 
-/// A root: `--mcp-config <overlay>` (no `--strict-mcp-config`), and [`CLAUDE_ROOT_PROMPT`].
+/// A root Codex's developer instructions: the user's own (`developer_instructions` in its
+/// effective config, which the thread's would otherwise replace), then [`ROOT_PROMPT`].
+pub fn codex_root_instructions(own: Option<&str>) -> String {
+    match own.map(str::trim).filter(|own| !own.is_empty()) {
+        Some(own) => format!("{own}\n\n{ROOT_PROMPT}"),
+        None => ROOT_PROMPT.to_owned(),
+    }
+}
+
+/// A root: `--mcp-config <overlay>` (no `--strict-mcp-config`), and [`ROOT_PROMPT`].
 pub fn claude_parent_args(overlay_path: &str) -> Vec<String> {
     vec![
         "--mcp-config".to_owned(),
         overlay_path.to_owned(),
         "--append-system-prompt".to_owned(),
-        CLAUDE_ROOT_PROMPT.to_owned(),
+        ROOT_PROMPT.to_owned(),
     ]
 }
 
@@ -324,18 +335,21 @@ mod tests {
                 "--mcp-config".to_owned(),
                 "/run/o.json".to_owned(),
                 "--append-system-prompt".to_owned(),
-                CLAUDE_ROOT_PROMPT.to_owned()
+                ROOT_PROMPT.to_owned()
             ]
         );
         // In every turn's context: it stays short, and names the tools it points to.
-        assert!(
-            CLAUDE_ROOT_PROMPT.len() < 400,
-            "{}",
-            CLAUDE_ROOT_PROMPT.len()
-        );
+        assert!(ROOT_PROMPT.len() < 400, "{}", ROOT_PROMPT.len());
         for tool in ["cross_agent_capabilities", "cross_agent_spawn"] {
-            assert!(CLAUDE_ROOT_PROMPT.contains(tool), "{tool}");
+            assert!(ROOT_PROMPT.contains(tool), "{tool}");
         }
+        // A Codex root keeps the user's own developer instructions, ahead of the note.
+        assert_eq!(codex_root_instructions(None), ROOT_PROMPT);
+        assert_eq!(codex_root_instructions(Some("  ")), ROOT_PROMPT);
+        assert_eq!(
+            codex_root_instructions(Some("Be terse.\n")),
+            format!("Be terse.\n\n{ROOT_PROMPT}")
+        );
         for args in [plan, write] {
             assert!(!args.iter().any(|a| a.contains("atdc_")));
             assert!(!args
