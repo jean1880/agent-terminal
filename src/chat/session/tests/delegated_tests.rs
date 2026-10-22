@@ -113,6 +113,8 @@ struct TestHooks {
     /// What `suspending` answers, and each generation it was asked about.
     allow_suspend: Cell<bool>,
     suspend_asks: RefCell<Vec<u64>>,
+    /// Each generation whose binding was released without a process.
+    abandoned: RefCell<Vec<u64>>,
 }
 
 impl DelegationHooks for TestHooks {
@@ -158,6 +160,10 @@ impl DelegationHooks for TestHooks {
 
     fn process_started(&self, generation: ProcessGeneration, pid: Option<i32>, watch: ExitWatch) {
         self.started.borrow_mut().push((generation.0, pid, watch));
+    }
+
+    fn launch_abandoned(&self, generation: ProcessGeneration) {
+        self.abandoned.borrow_mut().push(generation.0);
     }
 
     fn process_stopping(&self, generation: ProcessGeneration) {
@@ -1336,6 +1342,63 @@ fn every_generation_keeps_its_exit_watch_until_it_has_exited() {
             .session
             .exit_watches()
             .is_empty()));
+    });
+}
+
+/// A binding taken for a start that never spawned is released (its token and overlay file
+/// would otherwise outlive it), and only then: a start that spawns keeps its binding until
+/// the process's own exit ends it.
+#[test]
+fn a_refused_launch_releases_its_binding_and_a_spawned_one_keeps_it() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &tmp.path().to_string_lossy());
+        let (sink, _seen) = make_sink();
+        let hooks = Rc::new(TestHooks::default());
+        let stage = || {
+            *hooks.staged.borrow_mut() = Some((
+                1,
+                LaunchBinding {
+                    open: None,
+                    env: vec![("AGENT_TERMINAL_DELEGATION_ENDPOINT".into(), "/run/x".into())],
+                    argv_tail: Vec::new(),
+                },
+            ));
+        };
+        stage();
+        hooks.refuse_spawn.set(true);
+        let session = ChatSession::with_options(
+            Box::new(AgyAdapter::new("agy")),
+            scripted(tmp.path(), "cat > \"$D/stdin.log\""),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            LaunchEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        session.send_prompt("refused");
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        assert_eq!(
+            *hooks.abandoned.borrow(),
+            vec![1],
+            "the refused start's binding"
+        );
+
+        stage();
+        hooks.refuse_spawn.set(false);
+        session.send_prompt("spawned");
+        assert!(pump_until(ctx, 10, || !hooks.started.borrow().is_empty()));
+        assert_eq!(
+            *hooks.abandoned.borrow(),
+            vec![1],
+            "a spawned start's binding is not released by the session"
+        );
     });
 }
 

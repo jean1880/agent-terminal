@@ -161,12 +161,42 @@ impl DelegationHooks for Hooks {
             pid: None,
             issued: Instant::now(),
         });
-        // The watch is attached only after a successful spawn. Keep the overlay until then.
-        w.pending_overlay = prep.overlay;
+        // The watch is attached only after a successful spawn. Keep the overlay until then. One
+        // still pending belongs to an earlier start that never spawned: nothing else removes it.
+        let stale = std::mem::replace(&mut w.pending_overlay, prep.overlay);
         w.row.delegation_status = "available".into();
         w.observed = ObservedCalls::new(sup.salt, sup.limits.observed_calls as usize);
         w.seen_calls.clear();
+        if let Some(path) = stale {
+            gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+        }
         Some(prep.launch)
+    }
+    fn launch_abandoned(&self, generation: ProcessGeneration) {
+        let Some(sup) = self.supervisor.upgrade() else {
+            return;
+        };
+        let overlay = {
+            let mut state = sup.state.borrow_mut();
+            let Some(w) = state.workers.get_mut(&self.worker) else {
+                return;
+            };
+            // A generation that did start reports its own exit; only an unspawned one is ours.
+            if w.generations.contains_key(&generation) {
+                return;
+            }
+            // Its token was never presented by a process: nothing can still be using it.
+            if w.token
+                .as_ref()
+                .is_some_and(|t| t.generation == generation && t.pid.is_none())
+            {
+                w.token = None;
+            }
+            w.pending_overlay.take()
+        };
+        if let Some(path) = overlay {
+            gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+        }
     }
     fn process_started(&self, generation: ProcessGeneration, pid: Option<i32>, watch: ExitWatch) {
         let Some(sup) = self.supervisor.upgrade() else {

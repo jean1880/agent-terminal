@@ -385,6 +385,9 @@ struct Inner {
     worker: RefCell<Option<agent_core::delegation::WorkerId>>,
     /// This launch consumed a prepared binding; same-name user MCP servers confer no trust.
     bound_generation: Cell<bool>,
+    /// The process generation a binding was taken for whose process has not spawned yet. A
+    /// start that ends without one releases the binding (`DelegationHooks::launch_abandoned`).
+    unspawned_binding: Cell<Option<u64>>,
     /// Set while [`Inner::suspend`] stops the process: its exit is not the thread's news, so the
     /// adapter's exit envelopes reach neither the view nor the store.
     quiet_exit: Cell<bool>,
@@ -796,6 +799,7 @@ impl ChatSession {
             ask_only: RefCell::new(HashSet::new()),
             worker: RefCell::new(None),
             bound_generation: Cell::new(false),
+            unspawned_binding: Cell::new(None),
             quiet_exit: Cell::new(false),
             suspended: Cell::new(false),
             reported: Cell::new(false),
@@ -1400,8 +1404,14 @@ impl Inner {
         // supervisor did not stage takes none, so it gets no token (fail closed).
         let driver = self.adapter.borrow().driver();
         let next = ProcessGeneration(self.process_generation.get() + 1);
+        // A binding an earlier launch took and never spawned is released before another is
+        // taken.
+        self.abandon_unspawned_binding();
         let binding = self.hooks.as_ref().and_then(|h| h.binding(driver, next));
         self.bound_generation.set(binding.is_some());
+        if binding.is_some() {
+            self.unspawned_binding.set(Some(next.0));
+        }
         self.open.borrow_mut().delegation = binding.as_ref().and_then(|b| b.open.clone());
         let open = self.open.borrow();
         let mut argv = self.adapter.borrow().argv(&open);
@@ -1776,6 +1786,16 @@ impl Inner {
         }));
     }
 
+    /// A binding taken for a start that ended without a process (refused, failed to spawn, or
+    /// stopped first) is released: no exit will ever be observed for it to end it otherwise.
+    fn abandon_unspawned_binding(&self) {
+        if let Some(generation) = self.unspawned_binding.take() {
+            if let Some(hooks) = &self.hooks {
+                hooks.launch_abandoned(ProcessGeneration(generation));
+            }
+        }
+    }
+
     fn flush_start_writes(&self, generation: u64, writes: Vec<String>) {
         if self.generation.get() == generation {
             if let Some(proc) = self.proc.borrow().as_ref().filter(|p| p.is_alive()) {
@@ -1819,6 +1839,8 @@ impl Inner {
             Ok(proc) => {
                 let process_generation = self.process_generation.get() + 1;
                 self.process_generation.set(process_generation);
+                // Its binding reached a process, whose exit ends it.
+                self.unspawned_binding.set(None);
                 *self.launch_facts.borrow_mut() = facts;
                 let (pid, watch) = (proc.pid(), proc.exit_watch());
                 {
@@ -1838,6 +1860,7 @@ impl Inner {
             }
             Err(e) => {
                 self.state.borrow_mut().alive = false;
+                self.abandon_unspawned_binding();
                 // Nothing will complete a turn: a pending handoff goes out with the next prompt.
                 self.handoff_in_flight.set(false);
                 // A switch's new agent that cannot even be spawned: back to the old one. Taken
@@ -2676,8 +2699,10 @@ impl Inner {
     /// open turn was interrupted, never failed.
     fn finish_process(&self, code: Option<i32>, deliberate: bool) {
         self.deferred_mode.set(None);
-        // A start still waiting on its hook proof never spawns, and what it held is dropped.
+        // A start still waiting on its hook proof never spawns, and what it held is dropped,
+        // its delegation binding included.
         *self.starting.borrow_mut() = None;
+        self.abandon_unspawned_binding();
         let proc = self.proc.borrow_mut().take();
         drop(proc); // terminates it when it is still running
                     // Synthetic: `stop_current` gets here before the process is gone. The supervisor kills
