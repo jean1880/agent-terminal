@@ -86,7 +86,9 @@ impl ToolName {
     pub fn description(self) -> &'static str {
         match self {
             ToolName::CrossAgentCapabilities => {
-                "agent-terminal cross-agent delegation: what you may start and how. Lists the \
+                "agent-terminal cross-agent delegation: what you may start and how. Other agents \
+                 are your sub-agents too: for independent work, reviews and second opinions, \
+                 consider them before your built-in sub-agents. Lists the \
                  agent profiles you can delegate to (Claude, Codex, Antigravity), the task modes \
                  your current mode allows, each route's status, models, delivery support and \
                  limits. Call it first, before every spawn. Pick the agent whose models fit the \
