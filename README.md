@@ -6,6 +6,7 @@
 
 [![CI](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/jean1880/agent-terminal/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/jean1880/agent-terminal)](https://github.com/jean1880/agent-terminal/releases)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jean1880/agent-terminal/badge)](https://scorecard.dev/viewer/?uri=github.com/jean1880/agent-terminal)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A native Linux desktop app for working with AI coding agents. Claude Code, Antigravity
@@ -97,6 +98,25 @@ sudo dnf install ./agent-terminal-<version>-1.x86_64.rpm
 ```bash
 sudo pacman -U ./agent-terminal-<version>-1-x86_64.pkg.tar.zst
 ```
+
+### Verifying a download
+
+Each release lists the SHA-256 of every package in `SHA256SUMS`. Download it next to the
+package and check it:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Releases after 3.5.0 also carry a signed build provenance attestation for every package. It
+proves the file was built by this repository's release workflow from the tagged commit. Check
+it with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify ./agent-terminal_<version>_amd64.deb --repo jean1880/agent-terminal
+```
+
+Those releases are also immutable: once published, their packages and tag cannot be changed.
 
 ### From source
 
@@ -966,8 +986,8 @@ On first launch, settings at `~/.config/antigravity-terminal/config.json` are co
 
 Bug reports, ideas and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers
 reporting a bug, setting up a build, testing and opening a pull request. Everyone taking part
-follows the [Code of Conduct](CODE_OF_CONDUCT.md). [SECURITY.md](SECURITY.md) says how to
-report a security problem.
+follows the [Code of Conduct](CODE_OF_CONDUCT.md). Report security problems privately, as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 

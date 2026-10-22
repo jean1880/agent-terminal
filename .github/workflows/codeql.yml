@@ -12,6 +12,11 @@ on:
     - cron: "23 6 * * 1"
   workflow_dispatch:
 
+# A newer push to a pull request cancels its older run; any other run is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
