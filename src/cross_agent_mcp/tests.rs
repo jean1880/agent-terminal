@@ -54,6 +54,39 @@ async fn accept(listener: &UnixListener) -> UnixStream {
     socket
 }
 
+/// A socket for the app's side of the IPC and a client started at `started` that dials it.
+/// Nothing is answered: each test accepts (and says hello back) itself. The folder holding the
+/// socket lives as long as the returned guard.
+fn listening_client(started: Instant) -> (tempfile::TempDir, UnixListener, Client) {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join("ipc.sock");
+    let listener = UnixListener::bind(&path).expect("bind");
+    let client = Client::start(Ok(test_support::config(path)), started);
+    (temp, listener, client)
+}
+
+type PeerReader = BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>;
+type PeerWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+/// Serves `bridge` over an in-memory pipe and returns the serving task and the MCP client's
+/// ends of the pipe. Nothing is sent: each test drives the lifecycle itself.
+fn serve_bridge(bridge: Bridge) -> (tokio::task::JoinHandle<impl Sized>, PeerReader, PeerWriter) {
+    let (server, peer) = tokio::io::duplex(MAX_FRAME);
+    let (read, write) = tokio::io::split(server);
+    let transport =
+        BoundedTransport::with_io(read, write).with_cancellations(bridge.cancellations.clone());
+    let serving = tokio::spawn(async move {
+        bridge
+            .serve(transport)
+            .await
+            .expect("serve")
+            .waiting()
+            .await
+    });
+    let (read, write) = tokio::io::split(peer);
+    (serving, BufReader::new(read), write)
+}
+
 fn call(id: u64) -> Call {
     Call {
         id,
@@ -127,10 +160,7 @@ fn oversized_ids_reply_with_null_and_do_not_reach_sdk() {
 #[test]
 fn hello_is_eager_and_calls_multiplex_without_reordering_results() {
     runtime().block_on(async {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("ipc.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let client = Client::start(Ok(test_support::config(path)), Instant::now());
+        let (_temp, listener, client) = listening_client(Instant::now());
         // No tools/list or call has happened: hello must already arrive.
         let mut socket = tokio::time::timeout(Duration::from_millis(500), accept(&listener))
             .await
@@ -167,10 +197,7 @@ fn hello_is_eager_and_calls_multiplex_without_reordering_results() {
 #[test]
 fn cancelling_an_mcp_handler_releases_its_ipc_wait() {
     runtime().block_on(async {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("ipc.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let client = Client::start(Ok(test_support::config(path)), Instant::now());
+        let (_temp, listener, client) = listening_client(Instant::now());
         let mut socket = accept(&listener).await;
         let running = tokio::spawn(async move { client.call(call(7)).await });
         assert!(matches!(
@@ -189,10 +216,7 @@ fn cancelling_an_mcp_handler_releases_its_ipc_wait() {
 #[test]
 fn losing_a_call_never_replays_it_and_reconnects_only_once() {
     runtime().block_on(async {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("ipc.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let client = Client::start(Ok(test_support::config(path)), Instant::now());
+        let (_temp, listener, client) = listening_client(Instant::now());
         let mut socket = accept(&listener).await;
         let caller = client.clone();
         let running = tokio::spawn(async move { caller.call(call(1)).await });
@@ -233,10 +257,7 @@ fn losing_a_call_never_replays_it_and_reconnects_only_once() {
 #[test]
 fn an_agy_bridge_never_reconnects_with_its_spent_capability() {
     runtime().block_on(async {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("ipc.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let client = Client::start(Ok(test_support::config(path)), Instant::now());
+        let (_temp, listener, client) = listening_client(Instant::now());
         let (mut socket, _) = listener.accept().await.expect("accept");
         assert!(matches!(
             test_support::read(&mut socket).await,
@@ -266,13 +287,7 @@ fn an_agy_bridge_never_reconnects_with_its_spent_capability() {
 #[test]
 fn welcome_deadline_starts_at_process_start() {
     runtime().block_on(async {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("ipc.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let client = Client::start(
-            Ok(test_support::config(path)),
-            Instant::now() - Duration::from_secs(3),
-        );
+        let (_temp, listener, client) = listening_client(Instant::now() - Duration::from_secs(3));
         let _accept = tokio::spawn(async move {
             let _ = listener.accept().await;
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -298,12 +313,7 @@ async fn read_json(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Value
 fn rmcp_lifecycle_and_degraded_tool_errors_are_structured() {
     runtime().block_on(async {
         let bridge = Bridge::new(Client::start(Err(super::unavailable("not launched by the app")), Instant::now()));
-        let (server, peer) = tokio::io::duplex(MAX_FRAME);
-        let (read, write) = tokio::io::split(server);
-        let transport = BoundedTransport::with_io(read, write).with_cancellations(bridge.cancellations.clone());
-        let serving = tokio::spawn(async move { bridge.serve(transport).await.expect("serve").waiting().await });
-        let (reader, mut writer) = tokio::io::split(peer);
-        let mut reader = BufReader::new(reader);
+        let (serving, mut reader, mut writer) = serve_bridge(bridge);
         writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n").await.expect("init");
         let initialised = read_json(&mut reader).await;
         assert_eq!(initialised["result"]["serverInfo"]["name"], "agent-terminal");
@@ -339,12 +349,7 @@ fn sdk_rejections_before_handler_registration_do_not_leak_cancellations() {
     runtime().block_on(async {
         let bridge = Bridge::new(Client::start(Err(super::unavailable("unbound")), Instant::now()));
         let cancellations = bridge.cancellations.clone();
-        let (server, peer) = tokio::io::duplex(MAX_FRAME);
-        let (read, write) = tokio::io::split(server);
-        let transport = BoundedTransport::with_io(read, write).with_cancellations(cancellations.clone());
-        let serving = tokio::spawn(async move { bridge.serve(transport).await.expect("serve").waiting().await });
-        let (read, mut write) = tokio::io::split(peer);
-        let mut read = BufReader::new(read);
+        let (serving, mut read, mut write) = serve_bridge(bridge);
         let meta = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28", "io.modelcontextprotocol/clientCapabilities":{}, "io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"}});
         write_json(&mut write, json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}})).await;
         assert!(read_json(&mut read).await.get("result").is_some());
@@ -396,18 +401,9 @@ fn cancelled_request_guard_cannot_remove_a_later_reused_id() {
 #[test]
 fn discover_metadata_and_cancellation_work_without_initialize() {
     runtime().block_on(async {
-        let temp = tempfile::tempdir().expect("temp");
-        let path = temp.path().join("ipc.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let client = Client::start(Ok(test_support::config(path)), Instant::now());
+        let (_temp, listener, client) = listening_client(Instant::now());
         let mut socket = accept(&listener).await;
-        let bridge = Bridge::new(client);
-        let (server, peer) = tokio::io::duplex(MAX_FRAME);
-        let (read, write) = tokio::io::split(server);
-        let transport = BoundedTransport::with_io(read, write).with_cancellations(bridge.cancellations.clone());
-        let serving = tokio::spawn(async move { bridge.serve(transport).await.expect("serve").waiting().await });
-        let (read, mut write) = tokio::io::split(peer);
-        let mut read = BufReader::new(read);
+        let (serving, mut read, mut write) = serve_bridge(Bridge::new(client));
         let meta = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28", "io.modelcontextprotocol/clientCapabilities":{}, "io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"}});
         write_json(&mut write, json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}})).await;
         let discovered = read_json(&mut read).await;
