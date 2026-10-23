@@ -7,7 +7,7 @@
 //! ~1–7 ms of layout and ~1 ms more for its render nodes. Hidden threads (each shown once first, as
 //! in the app) add nothing: `AdwTabView` lays out only the visible page.
 
-use super::tests::{native_init, pump_until, status_of, SwitchableBackend};
+use super::tests::{native_init, pump_until, StubBackend};
 use super::*;
 use agent_core::event::{ItemKind, ItemStatus, StreamKind};
 use std::time::{Duration, Instant};
@@ -35,38 +35,20 @@ fn history(n: usize) -> Vec<Envelope> {
                 format!("{PARA}\n\n{PARA}\n\n- {PARA}\n- one more point\n\n{PARA}"),
             )
         };
-        out.push(
-            Envelope::new(Event::ItemStarted {
-                kind,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item(&id),
-        );
-        out.push(
-            Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text,
-            })
-            .item(&id),
-        );
-        out.push(
-            Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: None,
-                error: None,
-            })
-            .item(&id),
-        );
+        out.push(Envelope::item_started(&id, kind, "", None, None));
+        out.push(Envelope::snapshot(&id, StreamKind::Assistant, text));
+        out.push(Envelope::item_completed(
+            &id,
+            ItemStatus::Completed,
+            None,
+            None,
+        ));
     }
     out
 }
 
 fn chat(n: usize) -> ChatView {
-    let view = ChatView::new(Rc::new(SwitchableBackend {
-        status: RefCell::new(status_of(Driver::Claude)),
-    }));
+    let view = ChatView::new(StubBackend::new(Driver::Claude));
     view.replay(&history(n));
     view
 }

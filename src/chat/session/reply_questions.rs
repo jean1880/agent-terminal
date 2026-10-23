@@ -208,21 +208,11 @@ mod tests {
     use super::*;
 
     fn started(kind: ItemKind, id: &str) -> Envelope {
-        Envelope::new(Event::ItemStarted {
-            kind,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item(id)
+        Envelope::item_started(id, kind, "", None, None)
     }
 
     fn text(id: &str, text: &str) -> Envelope {
-        Envelope::new(Event::ContentDelta {
-            stream: StreamKind::Assistant,
-            text: text.into(),
-        })
-        .item(id)
+        Envelope::delta(id, StreamKind::Assistant, text)
     }
 
     const ASKS: &str = "Which do you prefer?\n\n- Keep it\n- Drop it";
@@ -285,13 +275,8 @@ mod tests {
 
     #[test]
     fn a_sub_agents_message_is_not_the_reply() {
-        let nested = Envelope::new(Event::ItemStarted {
-            kind: ItemKind::AssistantMessage,
-            title: String::new(),
-            input: None,
-            parent: Some("tool1".into()),
-        })
-        .item("sub");
+        let nested =
+            Envelope::item_started("sub", ItemKind::AssistantMessage, "", None, Some("tool1"));
         let t = turn(&[
             started(ItemKind::AssistantMessage, "a1"),
             text("a1", "Done."),
@@ -349,11 +334,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_replaces_the_deltas() {
-        let snapshot = Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Assistant,
-            text: ASKS.into(),
-        })
-        .item("a1");
+        let snapshot = Envelope::snapshot("a1", StreamKind::Assistant, ASKS);
         let t = turn(&[
             started(ItemKind::AssistantMessage, "a1"),
             text("a1", "partial"),
@@ -382,20 +363,17 @@ mod tests {
 /// The hook end to end: events through a live session to the view's sink and the store.
 #[cfg(test)]
 mod session_tests {
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     use agent_core::adapter::Adapter;
     use agent_core::event::{Envelope, Event, ItemKind, QuestionSource, StreamKind, TurnState};
     use agent_kit::store::Store;
 
+    use crate::chat::session::tests::{make_sink, Seen};
     use crate::chat::session::ChatSession;
-    use crate::chat::EnvelopeSink;
-    use crate::testutil::{in_loop, pump_until};
+    use crate::testutil::{in_loop, open_session, pump_until};
 
     const ASKS: &str = "Which do you prefer?\n\n- Keep it\n- Drop it";
-
-    type Seen = Rc<RefCell<Vec<Envelope>>>;
 
     /// A session over an inert process, its sink log and its store.
     fn session(
@@ -407,21 +385,12 @@ mod session_tests {
         let thread = store
             .create_thread(&dir.to_string_lossy(), Some("t"))
             .expect("thread");
-        let seen: Seen = Rc::default();
-        let log = seen.clone();
-        let sink: EnvelopeSink = Rc::new(move |e: &Envelope| log.borrow_mut().push(e.clone()));
-        let open = agent_core::adapter::OpenSession {
-            program: "/bin/sh".into(),
-            extra_args: vec!["-c".into(), "cat > /dev/null".into()],
-            cwd: dir.to_string_lossy().into_owned(),
-            model: None,
-            effort: None,
-            mode: agent_core::adapter::Mode::Ask,
-            resume: None,
-            new_session_id: None,
-            approval_hook: false,
-            delegation: None,
-        };
+        let (sink, seen) = make_sink();
+        let open = open_session(
+            "/bin/sh",
+            vec!["-c".into(), "cat > /dev/null".into()],
+            dir.to_string_lossy().into_owned(),
+        );
         let session = ChatSession::new(adapter, open, store.clone(), thread.clone(), sink, None);
         assert!(pump_until(ctx, 10, || session.inner.state.borrow().alive));
         (session, seen, store, thread)
@@ -440,28 +409,15 @@ mod session_tests {
                 .request("q1"),
             );
         }
-        emit(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::AssistantMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("a1"),
-        );
-        emit(
-            Envelope::new(Event::ContentDelta {
-                stream: StreamKind::Assistant,
-                text: text.into(),
-            })
-            .item("a1"),
-        );
-        emit(Envelope::new(Event::TurnCompleted {
-            state,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        emit(Envelope::item_started(
+            "a1",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        emit(Envelope::delta("a1", StreamKind::Assistant, text));
+        emit(Envelope::turn_completed(state, None));
     }
 
     fn reply_offers(seen: &Seen) -> Vec<Envelope> {

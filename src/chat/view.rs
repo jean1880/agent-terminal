@@ -862,11 +862,18 @@ impl Inner {
                 }
             }
         });
-        // A dialog needs a window to sit on; a view that is not in one (yet) has nowhere to show it.
-        if let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) {
-            adw::prelude::AdwDialogExt::present(panel.dialog(), Some(&parent));
-        }
+        self.present_dialog(panel.dialog());
         *self.subagent_panel.borrow_mut() = Some(panel);
+    }
+
+    /// Presents `dialog` on the view's window. False when the view is not in one (yet): a dialog
+    /// needs a window to sit on.
+    pub(super) fn present_dialog(&self, dialog: &adw::Dialog) -> bool {
+        let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) else {
+            return false;
+        };
+        adw::prelude::AdwDialogExt::present(dialog, Some(&parent));
+        true
     }
 
     /// Where a background task leads: its sub-agent's panel, or its output (`None`: nothing).
@@ -913,10 +920,9 @@ impl Inner {
     /// the dialog closes or the task has ended (then once more, for its last lines).
     fn open_task_output(self: &Rc<Self>, task: &BackgroundTask) {
         let panel = background::TaskOutputPanel::new(task);
-        let Some(parent) = self.widget.upgrade().filter(|w| w.root().is_some()) else {
+        if !self.present_dialog(panel.dialog()) {
             return;
-        };
-        adw::prelude::AdwDialogExt::present(panel.dialog(), Some(&parent));
+        }
         *self.task_panel.borrow_mut() = Some(panel.clone());
         if self.poll_task_output(&panel) == glib::ControlFlow::Break {
             return;
@@ -1025,7 +1031,7 @@ impl Inner {
             .set_activity(&activity.clone().with_lifecycle(lifecycle));
         let stop_note = status.capabilities.unsupported_note(
             agent_core::caps::Feature::InterruptKeepsProcess,
-            cards::driver_name(status.driver),
+            status.driver.info().label,
         );
         self.thinking.set(&activity, status.driver, &sub_agents);
         self.refresh_background();
@@ -1129,7 +1135,7 @@ impl Inner {
         if mode == Mode::Ask {
             if let Some(note) = caps.unsupported_note(
                 agent_core::caps::Feature::LiveApprovals,
-                cards::driver_name(self.backend.status().driver),
+                self.backend.status().driver.info().label,
             ) {
                 let changes = self.model.borrow_mut().push_notice(note, Tone::Warning);
                 self.handle(changes);
@@ -1315,7 +1321,7 @@ impl Inner {
                         format!(
                             "{} has no compaction command, so the conversation continues in a \
                              new thread with a budgeted summary.",
-                            cards::driver_name(status.driver)
+                            status.driver.info().label
                         ),
                         Tone::Info,
                     );
@@ -1349,7 +1355,7 @@ impl Inner {
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
             BuiltinAction::Help => {
                 let changes = self.model.borrow_mut().push_notice(
-                    help_text(&status.capabilities, cards::driver_name(status.driver)),
+                    help_text(&status.capabilities, status.driver.info().label),
                     Tone::Info,
                 );
                 self.handle(changes);
@@ -1377,7 +1383,7 @@ fn unavailable_builtin_note(text: &str, status: &SessionStatus) -> Option<String
     }
     status
         .capabilities
-        .unsupported_note(feature, cards::driver_name(status.driver))
+        .unsupported_note(feature, status.driver.info().label)
 }
 
 /// The `/help` text: the built-ins this agent can back, then the ones it cannot (with why), then
@@ -1575,7 +1581,7 @@ fn placeholder_text(status: &SessionStatus) -> String {
     }
     format!(
         "Message {}  ·  {}",
-        cards::driver_name(status.driver),
+        status.driver.info().label,
         tips.join("  ·  ")
     )
 }
@@ -1656,28 +1662,11 @@ pub(crate) mod tests {
     use super::*;
     use agent_core::event::Decision;
 
-    /// GTK, libadwaita, the bundled icons and the stylesheet, as the app sets them up: for the
-    /// native tests that present windows.
-    pub(super) fn native_init() -> glib::MainContext {
-        gtk4::init().expect("GTK must be available for the native gate");
-        adw::init().expect("libadwaita init");
-        crate::icons::register();
-        crate::load_css();
-        glib::MainContext::default()
-    }
+    pub(super) use crate::testutil::native_init;
 
     /// Iterates the main loop until `cond` holds; false after 5 s.
     pub(super) fn pump_until(ctx: &glib::MainContext, cond: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !cond() {
-            if std::time::Instant::now() > deadline {
-                return false;
-            }
-            if !ctx.iteration(false) {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        true
+        crate::testutil::pump_until(ctx, 5, cond)
     }
 
     pub(super) fn status_of(driver: Driver) -> SessionStatus {
@@ -1721,7 +1710,7 @@ pub(crate) mod tests {
         use adw::prelude::AdwWindowExt;
         gtk4::init().expect("GTK init");
         adw::init().expect("adw init");
-        let backend = AnswerLog::new(Driver::Agy);
+        let backend = StubBackend::fixed(Driver::Agy);
         {
             let mut status = backend.status.borrow_mut();
             status.mode = Mode::Plan;
@@ -1849,18 +1838,7 @@ pub(crate) mod tests {
         let received = events.clone();
         let session = crate::chat::session::ChatSession::new(
             Box::new(agent_core::claude::ClaudeAdapter::new()),
-            agent_core::adapter::OpenSession {
-                program: "/bin/cat".into(),
-                extra_args: Vec::new(),
-                cwd: "/".into(),
-                model: None,
-                effort: None,
-                mode: Mode::Ask,
-                resume: None,
-                new_session_id: None,
-                approval_hook: false,
-                delegation: None,
-            },
+            crate::testutil::open_session("/bin/cat", Vec::new(), "/"),
             store.clone(),
             thread.clone(),
             Rc::new(move |env| received.borrow_mut().push(env.clone())),
@@ -1993,23 +1971,108 @@ pub(crate) mod tests {
         assert_eq!(stored.len(), before);
     }
 
-    /// A backend whose status the test changes, as a session does on a switch.
-    pub(super) struct SwitchableBackend {
+    /// A backend for view tests: it records what the view asks of it (prompts, controls with
+    /// distinct request ids, approvals, forms, modes) and answers as the test sets it.
+    pub(super) struct StubBackend {
         pub(super) status: RefCell<SessionStatus>,
+        /// Prompts sent, queued or steered.
+        pub(super) sent: RefCell<Vec<String>>,
+        pub(super) controls: RefCell<Vec<(String, Control)>>,
+        pub(super) approvals: RefCell<Vec<(String, Decision)>>,
+        pub(super) forms: RefCell<
+            Vec<(
+                String,
+                agent_core::form::FormAction,
+                Option<serde_json::Value>,
+            )>,
+        >,
+        pub(super) modes: RefCell<Vec<Mode>>,
+        /// Answer `false` to `respond_form`, as an adapter that refused it does.
+        pub(super) refuse_form: Cell<bool>,
+        /// A switch takes the new agent's status, as a session does.
+        pub(super) switch_updates_status: Cell<bool>,
+        /// Fail the test if questions are answered over the protocol.
+        pub(super) panic_on_answer: Cell<bool>,
     }
 
-    impl ChatBackend for SwitchableBackend {
-        fn send_prompt(&self, _: &str) {}
+    impl StubBackend {
+        /// On `driver`; a switch changes its status.
+        pub(super) fn new(driver: Driver) -> Rc<Self> {
+            Self::with_status(status_of(driver))
+        }
+
+        /// With `status`; a switch changes it.
+        pub(super) fn with_status(status: SessionStatus) -> Rc<Self> {
+            Rc::new(Self {
+                status: RefCell::new(status),
+                sent: RefCell::default(),
+                controls: RefCell::default(),
+                approvals: RefCell::default(),
+                forms: RefCell::default(),
+                modes: RefCell::default(),
+                refuse_form: Cell::new(false),
+                switch_updates_status: Cell::new(true),
+                panic_on_answer: Cell::new(false),
+            })
+        }
+
+        /// On `driver` whatever is switched to.
+        pub(super) fn fixed(driver: Driver) -> Rc<Self> {
+            let backend = Self::new(driver);
+            backend.switch_updates_status.set(false);
+            backend
+        }
+
+        /// The request id of the first control `wanted` matches.
+        pub(super) fn asked(&self, wanted: impl Fn(&Control) -> bool) -> Option<String> {
+            self.controls
+                .borrow()
+                .iter()
+                .find(|(_, c)| wanted(c))
+                .map(|(id, _)| id.clone())
+        }
+    }
+
+    impl ChatBackend for StubBackend {
+        fn send_prompt(&self, text: &str) {
+            self.sent.borrow_mut().push(text.to_owned());
+        }
         fn interrupt(&self) {}
-        fn respond_approval(&self, _: &str, _: Decision) {}
-        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
+        fn respond_approval(&self, request: &str, decision: Decision) {
+            self.approvals
+                .borrow_mut()
+                .push((request.to_owned(), decision));
+        }
+        fn answer_questions(&self, _: &str, _: serde_json::Value) {
+            assert!(
+                !self.panic_on_answer.get(),
+                "a reply question is answered by a prompt, never over the protocol"
+            );
+        }
+        fn respond_form(
+            &self,
+            request: &str,
+            action: agent_core::form::FormAction,
+            content: Option<serde_json::Value>,
+        ) -> bool {
+            self.forms
+                .borrow_mut()
+                .push((request.to_owned(), action, content));
+            !self.refuse_form.get()
+        }
         fn switch(&self, driver: Driver, _: Option<String>, _: Option<String>) {
-            *self.status.borrow_mut() = status_of(driver);
+            if self.switch_updates_status.get() {
+                *self.status.borrow_mut() = status_of(driver);
+            }
         }
         fn reload_session(&self) {}
-        fn set_mode(&self, _: Mode) {}
-        fn control(&self, _: Control) -> String {
-            String::new()
+        fn set_mode(&self, mode: Mode) {
+            self.modes.borrow_mut().push(mode);
+        }
+        fn control(&self, control: Control) -> String {
+            let id = format!("ctl-{}", self.controls.borrow().len() + 1);
+            self.controls.borrow_mut().push((id.clone(), control));
+            id
         }
         fn status(&self) -> SessionStatus {
             self.status.borrow().clone()
@@ -2044,17 +2107,8 @@ pub(crate) mod tests {
                 }],
             })
         };
-        let finished = |state| {
-            Envelope::new(Event::TurnCompleted {
-                state,
-                usage: None,
-                cost_usd: None,
-                error: None,
-            })
-        };
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Codex)),
-        });
+        let finished = |state| Envelope::turn_completed(state, None);
+        let backend = StubBackend::new(Driver::Codex);
         let view = ChatView::new(backend.clone());
         let window = gtk4::Window::new();
         window.set_default_size(560, 700);
@@ -2212,9 +2266,7 @@ pub(crate) mod tests {
         };
         let mut dead = status_of(Driver::Claude);
         dead.alive = false;
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(dead),
-        }));
+        let view = ChatView::new(StubBackend::with_status(dead));
         view.replay(&[
             Envelope::new(Event::TurnStarted { model: None }),
             Envelope::new(Event::ApprovalRequested {
@@ -2227,13 +2279,13 @@ pub(crate) mod tests {
                 remembers: None,
             })
             .request("r1"),
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Subagent,
-                title: "Agent".into(),
-                input: Some(serde_json::json!({"subagent_type": "Explore"})),
-                parent: None,
-            })
-            .item("agent1"),
+            Envelope::item_started(
+                "agent1",
+                ItemKind::Subagent,
+                "Agent",
+                Some(serde_json::json!({"subagent_type": "Explore"})),
+                None,
+            ),
             Envelope::new(Event::BackgroundTasks {
                 tasks: vec![BackgroundTask {
                     id: "t1".into(),
@@ -2284,24 +2336,14 @@ pub(crate) mod tests {
     /// Live, your message and the first row after it fade in, and later rows just appear;
     /// opening the thread again (a replay) builds every row without an entrance.
     fn live_rows_make_an_entrance_and_replayed_rows_do_not() {
-        use agent_core::event::{Event, ItemKind};
-        let started = |id: &str, kind: ItemKind| {
-            Envelope::new(Event::ItemStarted {
-                kind,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item(id)
-        };
+        use agent_core::event::ItemKind;
+        let started = |id: &str, kind: ItemKind| Envelope::item_started(id, kind, "", None, None);
         let envs = [
             started("u1", ItemKind::UserMessage),
             started("t1", ItemKind::Command),
             started("t2", ItemKind::Command),
         ];
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let entering = |view: &ChatView, id: &str| {
             view.inner()
                 .and_then(|i| {
@@ -2328,19 +2370,15 @@ pub(crate) mod tests {
     /// so the command's result reads after "Allowed", not before it.
     fn approval_row_precedes_its_step() {
         use agent_core::event::{Event, ItemKind, ResponseCapability};
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
-        view.apply(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Command,
-                title: "Bash".into(),
-                input: Some(serde_json::json!({"command": "cargo test"})),
-                parent: None,
-            })
-            .item("t1"),
-        );
+        view.apply(&Envelope::item_started(
+            "t1",
+            ItemKind::Command,
+            "Bash",
+            Some(serde_json::json!({"command": "cargo test"})),
+            None,
+        ));
         view.apply(
             &Envelope::new(Event::ApprovalRequested {
                 tool: "Bash".into(),
@@ -2373,9 +2411,7 @@ pub(crate) mod tests {
     /// The dots above the composer show while a turn runs, name the agent, and go when it ends.
     fn thinking_strip_follows_the_turn() {
         use agent_core::event::{Event, TurnState};
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend.clone());
         let inner = view.inner().expect("a built view");
         assert_eq!(inner.thinking.shown(), None, "a new thread shows nothing");
@@ -2397,21 +2433,14 @@ pub(crate) mod tests {
         );
         // The agent at work leads the wave; the other two keep it company, dimmed.
         assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "dimmed"]);
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::turn_completed(TurnState::Completed, None));
         assert_eq!(inner.thinking.shown(), None, "gone once the turn ends");
     }
 
     fn model_chip_follows_pending_acceptance_and_rejection() {
         let mut status = status_of(Driver::Claude);
         status.model = Some("sonnet".into());
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status),
-        });
+        let backend = StubBackend::with_status(status);
         let view = ChatView::new(backend.clone());
         let chip = view.inner().expect("view").header.chip.clone();
         let tooltip = || chip.tooltip_text().expect("model tooltip").to_string();
@@ -2520,74 +2549,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A backend that remembers how the user answered an approval or a form.
-    pub(super) struct AnswerLog {
-        pub(super) status: RefCell<SessionStatus>,
-        modes: RefCell<Vec<Mode>>,
-        pub(super) approvals: RefCell<Vec<(String, Decision)>>,
-        /// Answer `false` to `respond_form`, as an adapter that refused it does.
-        pub(super) refuse: Cell<bool>,
-        pub(super) forms: RefCell<
-            Vec<(
-                String,
-                agent_core::form::FormAction,
-                Option<serde_json::Value>,
-            )>,
-        >,
-    }
-
-    impl AnswerLog {
-        pub(super) fn new(driver: Driver) -> Rc<Self> {
-            Rc::new(Self {
-                status: RefCell::new(status_of(driver)),
-                modes: RefCell::default(),
-                approvals: RefCell::default(),
-                refuse: Cell::new(false),
-                forms: RefCell::default(),
-            })
-        }
-    }
-
-    impl ChatBackend for AnswerLog {
-        fn send_prompt(&self, _: &str) {}
-        fn interrupt(&self) {}
-        fn respond_approval(&self, request: &str, decision: Decision) {
-            self.approvals
-                .borrow_mut()
-                .push((request.to_owned(), decision));
-        }
-        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
-        fn respond_form(
-            &self,
-            request: &str,
-            action: agent_core::form::FormAction,
-            content: Option<serde_json::Value>,
-        ) -> bool {
-            self.forms
-                .borrow_mut()
-                .push((request.to_owned(), action, content));
-            !self.refuse.get()
-        }
-        fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
-        fn reload_session(&self) {}
-        fn set_mode(&self, mode: Mode) {
-            self.modes.borrow_mut().push(mode);
-        }
-        fn control(&self, _: Control) -> String {
-            String::new()
-        }
-        fn status(&self) -> SessionStatus {
-            self.status.borrow().clone()
-        }
-    }
-
     /// Forms and permission requests through the whole view: the shelf, the thread's status,
     /// the composer's hint, the answer reaching the backend, and the "Extra access" chip.
     pub(crate) fn requests_ui_checks() {
         use agent_core::form::{FieldInput, Form, FormAction, FormField};
         use serde_json::json;
 
-        let backend = AnswerLog::new(Driver::Codex);
+        let backend = StubBackend::fixed(Driver::Codex);
         let view = ChatView::new(backend.clone());
         let inner = view.inner().expect("inner");
         let hint = || inner.composer.placeholder_text();
@@ -2636,7 +2604,7 @@ pub(crate) mod tests {
         assert!(backend.forms.borrow().is_empty(), "invalid: nothing sent");
         entry.set_text("octo");
         // An answer the adapter refuses must not strand the card at "Sending…".
-        backend.refuse.set(true);
+        backend.refuse_form.set(true);
         entry.emit_activate();
         let ctx = glib::MainContext::default();
         while ctx.iteration(false) {}
@@ -2658,7 +2626,7 @@ pub(crate) mod tests {
             inner.interruption.revealer.reveals_child(),
             "still waiting on the user"
         );
-        backend.refuse.set(false);
+        backend.refuse_form.set(false);
         entry.emit_activate();
         assert_eq!(
             backend.forms.borrow()[1],
@@ -2744,23 +2712,21 @@ pub(crate) mod tests {
     /// Ctrl+Shift+A: every sub-agent card opens when any is closed, then all close; a thread
     /// with none lets the key through.
     fn all_subagent_cards_toggle_together() {
-        use agent_core::event::{Event, ItemKind};
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        use agent_core::event::ItemKind;
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         assert!(
             !inner.toggle_all_subagents(),
             "no sub-agents: the key goes through"
         );
         let agent = |id: &str| {
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Subagent,
-                title: "Agent".into(),
-                input: Some(serde_json::json!({"subagent_type": "Explore"})),
-                parent: None,
-            })
-            .item(id)
+            Envelope::item_started(
+                id,
+                ItemKind::Subagent,
+                "Agent",
+                Some(serde_json::json!({"subagent_type": "Explore"})),
+                None,
+            )
         };
         view.replay(&[agent("a1"), agent("a2")]);
         let expanded = |inner: &Inner| {
@@ -2785,16 +2751,10 @@ pub(crate) mod tests {
     /// A replay builds the newest rows at once and the rest of the window on idle, around a row
     /// streamed in meanwhile; jumping to a row not built yet builds the window first.
     fn replay_fills_the_window_in_steps() {
-        use agent_core::event::{Event, ItemKind};
+        use agent_core::event::ItemKind;
         use transcript::{FIRST_PAINT, WINDOW};
         let step = |id: &str| {
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Command,
-                title: format!("echo {id}"),
-                input: None,
-                parent: None,
-            })
-            .item(id)
+            Envelope::item_started(id, ItemKind::Command, format!("echo {id}"), None, None)
         };
         let history: Vec<Envelope> = (0..WINDOW + 50).map(|i| step(&format!("s{i}"))).collect();
         let pump = || {
@@ -2802,9 +2762,7 @@ pub(crate) mod tests {
             while ctx.iteration(false) {}
         };
 
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         view.replay(&history);
         assert_eq!(inner.transcript.materialised(), FIRST_PAINT);
@@ -2818,9 +2776,7 @@ pub(crate) mod tests {
         );
         assert!(!built("s50"), "nothing older than the window");
 
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         view.replay(&history);
         inner.transcript.scroll_to_card("s60");
@@ -2838,18 +2794,14 @@ pub(crate) mod tests {
 
         // A reset while a fill is pending cancels it and starts over; a view dropped mid-fill
         // leaves nothing behind that runs.
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         view.replay(&history);
         inner.transcript.reset(&inner.model.borrow());
         assert_eq!(inner.transcript.materialised(), FIRST_PAINT);
         pump();
         assert_eq!(inner.transcript.materialised(), WINDOW);
-        let dropped = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let dropped = ChatView::new(StubBackend::new(Driver::Claude));
         dropped.replay(&history);
         drop(dropped);
         pump();
@@ -2860,15 +2812,9 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "presents a window; run on a private display"]
     fn a_jump_to_an_unbuilt_card_lands_on_it() {
-        use agent_core::event::{Event, ItemKind};
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
-        crate::icons::register();
-        crate::load_css();
-        let ctx = glib::MainContext::default();
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        use agent_core::event::ItemKind;
+        let ctx = crate::testutil::native_init();
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let window = gtk4::Window::new();
         window.set_default_size(560, 460);
         window.set_child(Some(&view));
@@ -2876,13 +2822,13 @@ pub(crate) mod tests {
         let inner = view.inner().expect("view");
         let history: Vec<Envelope> = (0..transcript::WINDOW + 50)
             .map(|i| {
-                Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::Command,
-                    title: format!("echo s{i}"),
-                    input: None,
-                    parent: None,
-                })
-                .item(format!("s{i}"))
+                Envelope::item_started(
+                    format!("s{i}"),
+                    ItemKind::Command,
+                    format!("echo s{i}"),
+                    None,
+                    None,
+                )
             })
             .collect();
         view.replay(&history);
@@ -2921,9 +2867,7 @@ pub(crate) mod tests {
 
     /// The model picker in a real window (a libadwaita one, so the dialog sits in its host).
     fn escape_closes_the_model_picker() {
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let window = adw::Window::new();
         window.set_default_size(560, 700);
@@ -2967,9 +2911,7 @@ pub(crate) mod tests {
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
         subagents::tests::names_are_never_squeezed_into_a_column();
         delegation::tests::ui_checks();
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend.clone());
         // A focus-chasing viewport scrolled back up to a spent card and let go of the bottom.
         assert!(
@@ -3071,12 +3013,7 @@ pub(crate) mod tests {
                 shown(),
                 (Some("Working…, plus 2 in the background".into()), true)
             );
-            view.sink()(&Envelope::new(Event::TurnCompleted {
-                state: TurnState::Completed,
-                usage: None,
-                cost_usd: None,
-                error: None,
-            }));
+            view.sink()(&Envelope::turn_completed(TurnState::Completed, None));
             assert_eq!(
                 shown(),
                 (
@@ -3133,11 +3070,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "presents a window; run on a private display"]
     fn the_newest_row_stays_in_view_while_following() {
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
-        crate::icons::register();
-        crate::load_css();
-        let ctx = glib::MainContext::default();
+        let ctx = crate::testutil::native_init();
         let backend = demo::demo_backend();
         let view = ChatView::new(backend.clone());
         backend.connect(view.sink());
@@ -3216,9 +3149,7 @@ pub(crate) mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         };
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let window = gtk4::Window::new();
         window.set_default_size(500, 400);
@@ -3494,26 +3425,20 @@ pub(crate) mod tests {
             b_stream(&env);
         };
         both(Envelope::new(Event::TurnStarted { model: None }));
-        both(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Subagent,
-                title: "Task".into(),
-                input: Some(
-                    serde_json::json!({"subagent_type": "Explore", "description": "Map the crate"}),
-                ),
-                parent: None,
-            })
-            .item("bg1"),
-        );
-        both(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::FileRead,
-                title: "Read".into(),
-                input: Some(serde_json::json!({"file_path": "src/main.rs"})),
-                parent: Some("bg1".into()),
-            })
-            .item("bg1-read"),
-        );
+        both(Envelope::item_started(
+            "bg1",
+            ItemKind::Subagent,
+            "Task",
+            Some(serde_json::json!({"subagent_type": "Explore", "description": "Map the crate"})),
+            None,
+        ));
+        both(Envelope::item_started(
+            "bg1-read",
+            ItemKind::FileRead,
+            "Read",
+            Some(serde_json::json!({"file_path": "src/main.rs"})),
+            Some("bg1"),
+        ));
         pump(1_000);
         show_b();
         pump(2_500);
@@ -3531,28 +3456,22 @@ pub(crate) mod tests {
         // It finishes, and the turn ends, while B is hidden again.
         hide_b();
         pump(300);
-        both(
-            Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: Some("mapped".into()),
-                error: None,
-            })
-            .item("bg1-read"),
-        );
-        both(
-            Envelope::new(Event::ItemCompleted {
-                status: ItemStatus::Completed,
-                output: Some("done".into()),
-                error: None,
-            })
-            .item("bg1"),
-        );
-        both(Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        both(Envelope::item_completed(
+            "bg1-read",
+            ItemStatus::Completed,
+            Some("mapped"),
+            None,
+        ));
+        both(Envelope::item_completed(
+            "bg1",
+            ItemStatus::Completed,
+            Some("done"),
+            None,
+        ));
+        both(Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         pump(1_000);
         show_b();
 
@@ -3624,40 +3543,28 @@ pub(crate) mod tests {
     /// A thinking block whose text never streams (the model withheld it) must not end as an
     /// empty, openable "Thought process"; one with text stays openable.
     pub(crate) fn reasoning_ui_checks() {
-        use agent_core::event::{Event, ItemKind, ItemStatus, StreamKind};
+        use agent_core::event::{ItemKind, ItemStatus, StreamKind};
 
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let sink = view.sink();
         let think = |id: &str, text: Option<&str>| {
-            sink(
-                &Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::Reasoning,
-                    title: "Thinking".into(),
-                    input: None,
-                    parent: None,
-                })
-                .item(id),
-            );
+            sink(&Envelope::item_started(
+                id,
+                ItemKind::Reasoning,
+                "Thinking",
+                None,
+                None,
+            ));
             if let Some(text) = text {
-                sink(
-                    &Envelope::new(Event::ContentDelta {
-                        stream: StreamKind::Reasoning,
-                        text: text.into(),
-                    })
-                    .item(id),
-                );
+                sink(&Envelope::delta(id, StreamKind::Reasoning, text));
             }
-            sink(
-                &Envelope::new(Event::ItemCompleted {
-                    status: ItemStatus::Completed,
-                    output: None,
-                    error: None,
-                })
-                .item(id),
-            );
+            sink(&Envelope::item_completed(
+                id,
+                ItemStatus::Completed,
+                None,
+                None,
+            ));
         };
         think("withheld", None);
         think("shared", Some("weighing two options"));
@@ -3684,23 +3591,15 @@ pub(crate) mod tests {
         // Streaming must not re-lay out the whole block per frame: a collapsed card holds no
         // text, and an open one changes only its last paragraph's label.
         let delta = |text: &str| {
-            sink(
-                &Envelope::new(Event::ContentDelta {
-                    stream: StreamKind::Reasoning,
-                    text: text.into(),
-                })
-                .item("long"),
-            );
+            sink(&Envelope::delta("long", StreamKind::Reasoning, text));
         };
-        sink(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Reasoning,
-                title: "Thinking".into(),
-                input: None,
-                parent: None,
-            })
-            .item("long"),
-        );
+        sink(&Envelope::item_started(
+            "long",
+            ItemKind::Reasoning,
+            "Thinking",
+            None,
+            None,
+        ));
         delta("first thought.\n\nsecond");
         while ctx.iteration(false) {}
         let labels = |id: &str| {
@@ -3752,61 +3651,45 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "presents a window; run on a private display"]
     fn long_tool_titles_keep_user_messages_inside_the_viewport() {
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
-        crate::icons::register();
-        crate::load_css();
-        let ctx = glib::MainContext::default();
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Codex)),
-        }));
+        let ctx = crate::testutil::native_init();
+        let view = ChatView::new(StubBackend::new(Driver::Codex));
         let command = format!("git show {}", "a".repeat(820));
         let mut history = demo::DemoBackend::stress_history(180);
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: agent_core::event::ItemKind::Command,
-                title: command.clone(),
-                input: Some(serde_json::json!({"command": command})),
-                parent: None,
-            })
-            .item("wide-command"),
-        );
-        history.push(
-            Envelope::new(Event::ItemCompleted {
-                status: agent_core::event::ItemStatus::Completed,
-                output: Some("done".into()),
-                error: None,
-            })
-            .item("wide-command"),
-        );
+        history.push(Envelope::item_started(
+            "wide-command",
+            agent_core::event::ItemKind::Command,
+            command.clone(),
+            Some(serde_json::json!({"command": command})),
+            None,
+        ));
+        history.push(Envelope::item_completed(
+            "wide-command",
+            agent_core::event::ItemStatus::Completed,
+            Some("done"),
+            None,
+        ));
         let path = format!("src/{}.rs", "x".repeat(820));
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: agent_core::event::ItemKind::FileChange,
-                title: path.clone(),
-                input: Some(serde_json::json!([{
-                    "path": path, "kind": {"type": "add"}, "diff": "+example"
-                }])),
-                parent: None,
-            })
-            .item("wide-file"),
-        );
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: agent_core::event::ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("visible-user"),
-        );
-        history.push(
-            Envelope::new(Event::ContentSnapshot {
-                stream: agent_core::event::StreamKind::Assistant,
-                text: "Can you still see this message?".into(),
-            })
-            .item("visible-user"),
-        );
+        history.push(Envelope::item_started(
+            "wide-file",
+            agent_core::event::ItemKind::FileChange,
+            path.clone(),
+            Some(serde_json::json!([{
+                "path": path, "kind": {"type": "add"}, "diff": "+example"
+            }])),
+            None,
+        ));
+        history.push(Envelope::item_started(
+            "visible-user",
+            agent_core::event::ItemKind::UserMessage,
+            "",
+            None,
+            None,
+        ));
+        history.push(Envelope::snapshot(
+            "visible-user",
+            agent_core::event::StreamKind::Assistant,
+            "Can you still see this message?",
+        ));
         view.replay(&history);
         let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         holder.append(&view);
@@ -3861,9 +3744,7 @@ pub(crate) mod tests {
         use std::time::{Duration, Instant};
         gtk4::init().expect("GTK init");
         let ctx = glib::MainContext::default();
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let window = gtk4::Window::new();
         window.set_default_size(900, 700);
@@ -3919,15 +3800,13 @@ pub(crate) mod tests {
             "the model weighs whether the cache invalidation belongs in the reducer or the view ";
         for (round, expanded) in [(0, false), (1, true)] {
             let id = format!("think-{round}");
-            sink(
-                &Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::Reasoning,
-                    title: "Thinking".into(),
-                    input: None,
-                    parent: None,
-                })
-                .item(&id),
-            );
+            sink(&Envelope::item_started(
+                &id,
+                ItemKind::Reasoning,
+                "Thinking",
+                None,
+                None,
+            ));
             pump(50);
             if expanded {
                 if let Some(inner) = view.inner() {
@@ -3950,13 +3829,7 @@ pub(crate) mod tests {
                     chunk.push_str("\n\n");
                 }
                 let t = Instant::now();
-                sink(
-                    &Envelope::new(Event::ContentDelta {
-                        stream: StreamKind::Reasoning,
-                        text: chunk,
-                    })
-                    .item(&id),
-                );
+                sink(&Envelope::delta(&id, StreamKind::Reasoning, chunk));
                 while ctx.iteration(false) {}
                 apply.push(t.elapsed().as_secs_f64() * 1e3);
                 // The size request the next frame pays for what changed.
@@ -3986,14 +3859,12 @@ pub(crate) mod tests {
             eprintln!("  delta handling: {}", pct(&mut apply));
             eprintln!("  size request:   {}", pct(&mut measure));
             eprintln!("  frames:         {}", pct(&mut frames.borrow_mut()));
-            sink(
-                &Envelope::new(Event::ItemCompleted {
-                    status: agent_core::event::ItemStatus::Completed,
-                    output: None,
-                    error: None,
-                })
-                .item(&id),
-            );
+            sink(&Envelope::item_completed(
+                &id,
+                agent_core::event::ItemStatus::Completed,
+                None,
+                None,
+            ));
             pump(200);
         }
 
@@ -4022,12 +3893,12 @@ pub(crate) mod tests {
             .append_event(
                 &thread,
                 None,
-                &Envelope::new(Event::ItemCompleted {
-                    status: agent_core::event::ItemStatus::Completed,
-                    output: None,
-                    error: None,
-                })
-                .item("msg:0"),
+                &Envelope::item_completed(
+                    "msg:0",
+                    agent_core::event::ItemStatus::Completed,
+                    None,
+                    None,
+                ),
             )
             .expect("append");
         eprintln!(
@@ -4059,12 +3930,10 @@ pub(crate) mod tests {
     /// The sub-agent explorer: the header lists the thread's sub-agents, and an open panel
     /// follows the one it shows as new steps arrive.
     pub(crate) fn subagent_ui_checks() {
-        use agent_core::event::{Event, ItemKind};
+        use agent_core::event::ItemKind;
         use serde_json::json;
 
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let inner = view.inner().expect("inner");
         let ctx = glib::MainContext::default();
@@ -4077,15 +3946,7 @@ pub(crate) mod tests {
 
         let sink = view.sink();
         let step = |id: &str, kind: ItemKind, parent: Option<&str>, input| {
-            sink(
-                &Envelope::new(Event::ItemStarted {
-                    kind,
-                    title: "Task".into(),
-                    input,
-                    parent: parent.map(str::to_owned),
-                })
-                .item(id),
-            );
+            sink(&Envelope::item_started(id, kind, "Task", input, parent));
         };
         step(
             "agent1",
@@ -4124,14 +3985,12 @@ pub(crate) mod tests {
         pump();
         // Done: it stays listed, after the running one and labelled done, and the panel the
         // user opened stays.
-        sink(
-            &Envelope::new(Event::ItemCompleted {
-                status: agent_core::event::ItemStatus::Completed,
-                output: Some("mapped".into()),
-                error: None,
-            })
-            .item("agent1"),
-        );
+        sink(&Envelope::item_completed(
+            "agent1",
+            agent_core::event::ItemStatus::Completed,
+            Some("mapped"),
+            None,
+        ));
         pump();
         let (visible, count, ids) = inner.subagent_button.state();
         assert!(visible, "a finished sub-agent keeps the button");
@@ -4144,23 +4003,21 @@ pub(crate) mod tests {
         assert_eq!(panel().steps_shown(), 2, "the open panel keeps showing it");
 
         // A replayed thread whose sub-agent finished long ago still lists it.
-        let replayed = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let replayed = ChatView::new(StubBackend::new(Driver::Claude));
         replayed.replay(&[
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Subagent,
-                title: "Task".into(),
-                input: Some(json!({"subagent_type": "Explore", "description": "Old work"})),
-                parent: None,
-            })
-            .item("old"),
-            Envelope::new(Event::ItemCompleted {
-                status: agent_core::event::ItemStatus::Completed,
-                output: Some("found it".into()),
-                error: None,
-            })
-            .item("old"),
+            Envelope::item_started(
+                "old",
+                ItemKind::Subagent,
+                "Task",
+                Some(json!({"subagent_type": "Explore", "description": "Old work"})),
+                None,
+            ),
+            Envelope::item_completed(
+                "old",
+                agent_core::event::ItemStatus::Completed,
+                Some("found it"),
+                None,
+            ),
         ]);
         pump();
         let r = replayed.inner().expect("replayed view");
@@ -4181,9 +4038,7 @@ pub(crate) mod tests {
         use agent_kit::filediff::{Origin, Shown};
         use serde_json::json;
 
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let diff_text = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
         let source = Rc::new(FakeDiffs {
@@ -4200,24 +4055,20 @@ pub(crate) mod tests {
         view.set_diff_source(source.clone());
         let sink = view.sink();
         let edit_input = json!({"file_path": "/w/src/a.rs", "old_string": "b", "new_string": "B"});
-        sink(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::FileChange,
-                title: "Edit".into(),
-                input: Some(edit_input.clone()),
-                parent: None,
-            })
-            .item("edit1"),
-        );
-        sink(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::Command,
-                title: "ls".into(),
-                input: Some(json!({"command": "ls"})),
-                parent: None,
-            })
-            .item("cmd1"),
-        );
+        sink(&Envelope::item_started(
+            "edit1",
+            ItemKind::FileChange,
+            "Edit",
+            Some(edit_input.clone()),
+            None,
+        ));
+        sink(&Envelope::item_started(
+            "cmd1",
+            ItemKind::Command,
+            "ls",
+            Some(json!({"command": "ls"})),
+            None,
+        ));
         let inner = view.inner().expect("inner");
         let card = |id: &str| {
             inner.transcript.with_row(id, |row| match row {
@@ -4280,15 +4131,13 @@ pub(crate) mod tests {
             reply: Err("No diff is available for this edit.".to_owned()),
         });
         view.set_diff_source(failing);
-        sink(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::FileChange,
-                title: "Write".into(),
-                input: None,
-                parent: None,
-            })
-            .item("edit2"),
-        );
+        sink(&Envelope::item_started(
+            "edit2",
+            ItemKind::FileChange,
+            "Write",
+            None,
+            None,
+        ));
         inner.transcript.with_row("edit2", |row| {
             if let cards::Row::Tool(c) = row {
                 c.click_view_diff();
@@ -4365,13 +4214,15 @@ pub(crate) mod tests {
         assert_eq!(remembers("approval:r1"), None);
 
         // A Codex file-change approval carries no diff itself; the item it names has it.
-        sink(&Envelope::new(Event::ItemStarted {
-            kind: ItemKind::FileChange,
-            title: "a.rs".into(),
-            input: Some(json!([{"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-o\n+n\n"}])),
-            parent: None,
-        })
-        .item("cx1"));
+        sink(&Envelope::item_started(
+            "cx1",
+            ItemKind::FileChange,
+            "a.rs",
+            Some(
+                json!([{"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-o\n+n\n"}]),
+            ),
+            None,
+        ));
         sink(
             &Envelope::new(Event::ApprovalRequested {
                 tool: "file_change".into(),
@@ -4487,7 +4338,7 @@ pub(crate) mod tests {
         use agent_core::caps::Capabilities;
         for driver in Driver::ALL {
             let caps = Capabilities::of(driver);
-            let name = cards::driver_name(driver);
+            let name = driver.info().label;
             let help = help_text(&caps, name);
             let status = SessionStatus {
                 driver,

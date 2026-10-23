@@ -27,15 +27,9 @@ fn text(v: &Value, key: &str) -> Option<String> {
 
 /// Follows nested `response` objects until `key` is found (bare payload, `{response: ..}`
 /// envelope or a whole recorded frame).
+/// The first level where `key` is present wins, whatever its type.
 fn find_in_response<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
-    let mut cur = v;
-    for _ in 0..4 {
-        if let Some(found) = cur.get(key) {
-            return Some(found);
-        }
-        cur = cur.get("response")?;
-    }
-    None
+    crate::adapter::response_chain(v).find_map(|cur| cur.get(key))
 }
 
 /// Claude's per-turn windows: `rate_limit_event.rate_limit_info`
@@ -394,6 +388,7 @@ pub fn resets_in_text(secs_left: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
     use serde_json::json;
 
     #[test]
@@ -497,10 +492,9 @@ mod tests {
     const TURN: &str = include_str!("../tests/fixtures/claude-turn-approval.ndjson");
     const CONTROLS: &str = include_str!("../tests/fixtures/claude-controls-slash.ndjson");
 
-    fn frames(fixture: &str) -> impl Iterator<Item = Value> + '_ {
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    fn frames(fixture: &str) -> impl Iterator<Item = Value> {
+        records(fixture, Malformed::Skip)
+            .into_iter()
             .map(|r| r["frame"].clone())
     }
 

@@ -1,6 +1,6 @@
 //! Authenticated tools and the durable acceptance/reservation/write protocol.
 use super::seam::{CallDispatcher, ConnId, LocalFuture, PeerFacts, ProcFacts};
-use super::supervisor::{error, opted_in, parse_enum, Supervisor};
+use super::supervisor::{error, opted_in, Supervisor};
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::{ceiling, permits, RevocationEvent, TaskMode};
 use agent_core::delegation::correlation::{attestation_arguments, Attestation};
@@ -14,6 +14,7 @@ use agent_core::delegation::page::{
 use agent_core::delegation::route::{ChildBridge, DelegationCaps, RouteQuery};
 use agent_core::delegation::wire::*;
 use agent_core::delegation::{AuthorityEpoch, ErrorCode, OperationId, ToolError, WorkerId};
+use agent_core::serde_name::parse_lenient;
 use agent_kit::store::delegation_typed::*;
 use gtk4::{gio, glib};
 use serde_json::{json, Value};
@@ -85,11 +86,7 @@ impl CallDispatcher for Supervisor {
             {
                 let state = sup.state.borrow();
                 let w = &state.workers[&worker];
-                if w.row.parent_id.is_some()
-                    && w.token.as_ref().is_none_or(|t| {
-                        t.epoch.0 != state.roots[&w.root].row.authority_epoch.max(0) as u64
-                    })
-                {
+                if w.row.parent_id.is_some() && !state.token_current(w) {
                     return Err(error(
                         ErrorCode::StaleEpoch,
                         "child credential belongs to an older authority epoch",
@@ -280,14 +277,14 @@ impl Supervisor {
         request: &ToolRequest,
     ) -> Result<Option<Value>, ToolError> {
         use agent_core::delegation::operation::{
-            canonical_request, idempotency, replay, IdempotencyDecision, StoredOperation,
+            canonical_request, idempotency, replay, IdempotencyDecision, OperationKind,
+            StoredOperation,
         };
-        let (key, expected) = match request {
-            ToolRequest::Spawn(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            ToolRequest::Send(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            ToolRequest::Cancel(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            ToolRequest::Close(r) => (&r.idempotency_key, r.expected_authority_epoch),
-            _ => return Ok(None),
+        // An acknowledging read has a key too, but its replay is the read path's own.
+        let Some((key, expected)) = agent_kit::store::delegation_typed::key_and_epoch(request)
+            .filter(|_| !matches!(request, ToolRequest::Read(_)))
+        else {
+            return Ok(None);
         };
         let epoch = self.epoch(caller)?;
         if expected.is_some_and(|e| e != epoch.0) {
@@ -295,12 +292,10 @@ impl Supervisor {
         }
         let principal = caller.to_string();
         let key = key.to_string();
-        let kind = request
-            .tool()
-            .as_str()
-            .strip_prefix("cross_agent_")
-            .unwrap_or("unknown")
-            .to_owned();
+        let kind = OperationKind::of(request).map_or_else(
+            || "unknown".to_owned(),
+            |k| super::supervisor::enum_value(&k),
+        );
         let row = self
             .services
             .read(move |s| s.delegation_operation_by_key(&principal, &kind, &key))
@@ -327,17 +322,17 @@ impl Supervisor {
         let op = StoredOperation {
             id: OperationId::parse(&row.id)
                 .map_err(|_| error(ErrorCode::InternalError, "stored operation id is invalid"))?,
-            kind: parse_enum(&row.kind).ok_or_else(|| {
+            kind: parse_lenient(&row.kind).ok_or_else(|| {
                 error(ErrorCode::InternalError, "stored operation kind is invalid")
             })?,
-            epoch: AuthorityEpoch(row.authority_epoch.max(0) as u64),
+            epoch: AuthorityEpoch::from_stored(row.authority_epoch),
             canonical: agent_core::delegation::operation::CanonicalRequest::from_stored(
                 row.canonical_request,
             ),
             resolution: serde_json::from_str(&row.resolution_json)
                 .map_err(|_| error(ErrorCode::InternalError, "stored resolution is invalid"))?,
             receipt: Some(parse(&row.receipt_json)?),
-            dispatch: parse_enum(&row.dispatch_state)
+            dispatch: parse_lenient(&row.dispatch_state)
                 .ok_or_else(|| error(ErrorCode::InternalError, "stored dispatch state invalid"))?,
             error: row
                 .error_json
@@ -404,20 +399,18 @@ impl Supervisor {
                 .collect::<Vec<_>>();
             (root, bound)
         };
-        let a = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Cancel(r.clone()),
-            resolution: Resolution {
+        let a = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Cancel(r.clone()),
+            Resolution {
                 target: Some(r.worker_id.clone()),
                 bound_runs: bound.clone(),
                 base_commit: None,
             },
-            plan: AcceptPlan::Cancel,
-            warnings: Vec::new(),
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+            AcceptPlan::Cancel,
+            Vec::new(),
+        );
         let (a, _) = self.accept(a, !bound.is_empty()).await?;
         let a = match a {
             Accepted::Replay(r) => return replay_value(r),
@@ -546,19 +539,17 @@ impl Supervisor {
             ));
         }
         let root = self.state.borrow().workers[caller].root.clone();
-        let a = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Close(r.clone()),
-            resolution: Resolution {
+        let a = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Close(r.clone()),
+            Resolution {
                 target: Some(r.worker_id.clone()),
                 ..Default::default()
             },
-            plan: AcceptPlan::Close,
-            warnings: Vec::new(),
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+            AcceptPlan::Close,
+            Vec::new(),
+        );
         let (a, _) = self.accept(a, true).await?;
         let a = match a {
             Accepted::Replay(r) => return replay_value(r),
@@ -635,48 +626,46 @@ impl Supervisor {
         if !self.scope_is_current(scope) {
             return;
         }
-        let worker = scope.worker.clone();
-        let caller = self.state.borrow().workers[&worker]
-            .row
-            .parent_id
-            .as_deref()
-            .and_then(|p| WorkerId::parse(p).ok());
-        let Some(caller) = caller else {
-            return;
-        };
         let expected_run_id = scope.run.clone();
-        let sup = self.clone();
-        glib::spawn_future_local(async move {
-            let Ok(key) = agent_core::delegation::IdempotencyKey::parse(&format!(
-                "human-{}",
-                glib::uuid_string_random()
-            )) else {
-                return;
-            };
+        self.act_as_parent(&scope.worker, move |sup, caller, worker, key| async move {
             let r = CancelRequest {
                 worker_id: worker,
                 expected_run_id,
                 expected_authority_epoch: None,
                 idempotency_key: key,
             };
-            if let Err(e) = sup.cancel_worker_call(&caller, r).await {
-                (sup.services.report)(&e.to_string());
-            }
+            sup.cancel_worker_call(&caller, r).await
         });
     }
     pub(crate) fn close_human(self: &Rc<Self>, scope: &agent_core::delegation::scope::Scope) {
         if !self.scope_is_current(scope) {
             return;
         }
-        let worker = scope.worker.clone();
-        let caller = self.state.borrow().workers[&worker]
-            .row
-            .parent_id
-            .as_deref()
-            .and_then(|p| WorkerId::parse(p).ok());
+        self.act_as_parent(&scope.worker, |sup, caller, worker, key| async move {
+            let r = CloseRequest {
+                worker_id: worker,
+                expected_authority_epoch: None,
+                idempotency_key: key,
+            };
+            sup.close_worker_call(&caller, r).await
+        });
+    }
+    /// Runs `act` for the user, as `worker`'s parent, under a fresh `human-<uuid>` key, and
+    /// reports a refusal. A worker with no parent (a root) is left alone.
+    pub(super) fn act_as_parent<F, Fut>(self: &Rc<Self>, worker: &WorkerId, act: F)
+    where
+        F: FnOnce(Rc<Self>, WorkerId, WorkerId, agent_core::delegation::IdempotencyKey) -> Fut
+            + 'static,
+        Fut: std::future::Future<Output = Result<Value, ToolError>>,
+    {
+        let caller = {
+            let state = self.state.borrow();
+            state.workers.get(worker).and_then(|w| w.row.parent())
+        };
         let Some(caller) = caller else {
             return;
         };
+        let worker = worker.clone();
         let sup = self.clone();
         glib::spawn_future_local(async move {
             let Ok(key) = agent_core::delegation::IdempotencyKey::parse(&format!(
@@ -685,12 +674,7 @@ impl Supervisor {
             )) else {
                 return;
             };
-            let r = CloseRequest {
-                worker_id: worker,
-                expected_authority_epoch: None,
-                idempotency_key: key,
-            };
-            if let Err(e) = sup.close_worker_call(&caller, r).await {
+            if let Err(e) = act(sup.clone(), caller, worker, key).await {
                 (sup.services.report)(&e.to_string());
             }
         });
@@ -741,6 +725,41 @@ impl Supervisor {
         }
         result
     }
+    /// Refuses `worker` if the agy bridge that presented its capability no longer passes the
+    /// process census. A capability not yet presented has no bridge to check.
+    async fn bridge_census_unchanged(&self, worker: &WorkerId) -> Result<(), ToolError> {
+        let peer_info = {
+            let state = self.state.borrow();
+            state
+                .workers
+                .get(worker)
+                .and_then(|w| w.token.as_ref())
+                .and_then(|t| t.pid.zip(t.consumed_by))
+        };
+        let Some((pid, peer)) = peer_info else {
+            return Ok(());
+        };
+        let bridge = self.services.bridge_command.clone();
+        let valid = gio::spawn_blocking(move || {
+            use std::os::unix::fs::MetadataExt;
+            let facts = super::ipc::peer::RealProc;
+            std::fs::metadata(bridge).ok().is_some_and(|m| {
+                agent_core::delegation::agy_guard::census_ok(
+                    &super::ipc::peer::census(&facts, pid, (m.dev(), m.ino())),
+                    peer,
+                )
+            })
+        })
+        .await
+        .unwrap_or(false);
+        if !valid {
+            return Err(error(
+                ErrorCode::WorkspaceUntrusted,
+                "agy bridge process census changed",
+            ));
+        }
+        Ok(())
+    }
     async fn check_agy(&self, worker: &WorkerId) -> Result<(), ToolError> {
         if !self.profile_available(worker) {
             return Err(error(ErrorCode::ProviderUnavailable, "profile unavailable"));
@@ -767,35 +786,7 @@ impl Supervisor {
             ));
         }
         if let Some(actual) = actual {
-            let peer_info = {
-                let state = self.state.borrow();
-                state
-                    .workers
-                    .get(worker)
-                    .and_then(|w| w.token.as_ref())
-                    .and_then(|t| t.pid.zip(t.consumed_by))
-            };
-            if let Some((pid, peer)) = peer_info {
-                let bridge = self.services.bridge_command.clone();
-                let valid = gio::spawn_blocking(move || {
-                    use std::os::unix::fs::MetadataExt;
-                    let facts = super::ipc::peer::RealProc;
-                    std::fs::metadata(bridge).ok().is_some_and(|m| {
-                        agent_core::delegation::agy_guard::census_ok(
-                            &super::ipc::peer::census(&facts, pid, (m.dev(), m.ino())),
-                            peer,
-                        )
-                    })
-                })
-                .await
-                .unwrap_or(false);
-                if !valid {
-                    return Err(error(
-                        ErrorCode::WorkspaceUntrusted,
-                        "agy bridge process census changed",
-                    ));
-                }
-            }
+            self.bridge_census_unchanged(worker).await?;
             return self.check_agy_launch_facts(actual).await;
         }
         let (profile, cwd) = {
@@ -818,46 +809,18 @@ impl Supervisor {
         ))
         .await
         .is_err();
-        let peer_info = {
-            let state = self.state.borrow();
-            state
-                .workers
-                .get(worker)
-                .and_then(|w| w.token.as_ref())
-                .and_then(|t| t.pid.zip(t.consumed_by))
-        };
-        if let Some((pid, peer)) = peer_info {
-            let bridge = self.services.bridge_command.clone();
-            let valid = gio::spawn_blocking(move || {
-                use std::os::unix::fs::MetadataExt;
-                let facts = super::ipc::peer::RealProc;
-                std::fs::metadata(bridge).ok().is_some_and(|m| {
-                    agent_core::delegation::agy_guard::census_ok(
-                        &super::ipc::peer::census(&facts, pid, (m.dev(), m.ino())),
-                        peer,
-                    )
-                })
-            })
-            .await
-            .unwrap_or(false);
-            if !valid {
-                return Err(error(
-                    ErrorCode::WorkspaceUntrusted,
-                    "agy bridge process census changed",
-                ));
-            }
-        }
+        self.bridge_census_unchanged(worker).await?;
         let limits = self.limits;
         let bridge_command = self.services.bridge_command.clone();
         gio::spawn_blocking(move || {
-            let mut env = std::env::vars()
-                .filter(|(k, _)| !resolved.env.unset.contains(k))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            env.extend(resolved.env.env);
-            let home = env
-                .get("HOME")
-                .map(std::path::PathBuf::from)
+            // The child's environment as it is spawned; a variable that is not UTF-8 is read
+            // lossily rather than panicking, and such a HOME proves no home.
+            let child = crate::agent_home::child_env(&resolved.env);
+            let home = crate::agent_home::home_in_child(&child)
                 .ok_or_else(|| error(ErrorCode::WorkspaceUntrusted, "agent home unavailable"))?;
+            let env = child
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
             managed_registration_ready(&home, &bridge_command)?;
             let input = super::agy_l2::L2Input {
                 argv: std::iter::once(resolved.program)
@@ -1049,15 +1012,10 @@ impl Supervisor {
         }
         let epoch = self.epoch(worker)?;
         let state = self.state.borrow();
-        let stale = state.workers.get(worker).is_none_or(|w| {
-            w.row.parent_id.is_some()
-                && w.token.as_ref().is_none_or(|t| {
-                    state
-                        .roots
-                        .get(&w.root)
-                        .is_none_or(|r| t.epoch.0 != r.row.authority_epoch.max(0) as u64)
-                })
-        });
+        let stale = state
+            .workers
+            .get(worker)
+            .is_none_or(|w| w.row.parent_id.is_some() && !state.token_current(w));
         if stale {
             return Err(error(
                 ErrorCode::StaleEpoch,
@@ -1229,11 +1187,7 @@ impl Supervisor {
             if &w == caller {
                 return include_self || caller != target;
             }
-            current = state
-                .workers
-                .get(&w)
-                .and_then(|w| w.row.parent_id.as_deref())
-                .and_then(|p| WorkerId::parse(p).ok());
+            current = state.workers.get(&w).and_then(|w| w.row.parent());
         }
         false
     }
@@ -1301,7 +1255,7 @@ impl Supervisor {
                     let run = run.and_then(|row| {
                         Some((
                             agent_core::delegation::RunId::parse(&row.id).ok()?,
-                            parse_enum(&row.state)?,
+                            parse_lenient(&row.state)?,
                         ))
                     });
                     summary.controls.cancel = run.is_some();
@@ -1604,6 +1558,28 @@ impl Supervisor {
             glib::timeout_future(Duration::from_millis(25)).await;
         }
     }
+    /// `request` from `caller`, ready for [`Self::accept`]: the limits, the live processes of
+    /// `root` and the operations being dispatched are read now.
+    pub(super) fn accept_request(
+        &self,
+        caller: &WorkerId,
+        root: &WorkerId,
+        request: ToolRequest,
+        resolution: Resolution,
+        plan: AcceptPlan,
+        warnings: Vec<Warning>,
+    ) -> Accept {
+        Accept {
+            principal: caller.clone(),
+            request,
+            resolution,
+            plan,
+            warnings,
+            limits: self.limits,
+            live_processes: self.usage(root).live_processes,
+            dispatching: self.state.borrow().dispatching.clone(),
+        }
+    }
     pub(super) async fn accept(
         &self,
         a: Accept,
@@ -1673,7 +1649,7 @@ impl Supervisor {
             }
         }
         if w.row.parent_id.as_deref() == Some(from.as_str()) {
-            let mode = w.row.task_mode.as_deref().and_then(parse_enum::<TaskMode>);
+            let mode = w.row.task_mode_kind();
             if mode.is_none_or(|m| !permits(self.principal_mode(from), m)) {
                 return Err(error(
                     ErrorCode::AuthorityDenied,
@@ -1686,18 +1662,7 @@ impl Supervisor {
     pub(super) fn record_fact(&self, op: OperationId, fact: DispatchFact) {
         self.services
             .write("record delegated dispatch", None, true, move |s| {
-                let target = match &fact {
-                    DispatchFact::Submitted => "submitted",
-                    DispatchFact::Confirmed => "confirmed",
-                    DispatchFact::Unknown => "unknown",
-                    DispatchFact::Failed(_) => "failed",
-                };
-                if s.delegation_operation(op.as_str())?
-                    .is_some_and(|o| o.dispatch_state == target)
-                {
-                    return Ok(());
-                }
-                s.record_delegation_dispatch(&op, &fact)?;
+                s.record_delegation_dispatch_once(&op, &fact)?;
                 Ok(())
             });
     }
@@ -1718,20 +1683,11 @@ fn describe_filter(f: &PageFilter) -> String {
 fn filter_json(f: &PageFilter) -> Value {
     json!({"target": f.target, "workers": f.workers, "mailbox": f.mailbox})
 }
-/// The home an agent launched with `env` sees, as `check_agy` derives it: the profile's own
-/// `HOME`, else the app's, unless the profile unsets it.
+/// The home an agent launched with `env` sees, as its approval socket proves it
+/// ([`crate::agent_home::effective_home`]). A home it cannot prove (none, relative, with `..`)
+/// refuses the check.
 fn agent_home(env: &crate::agent_proc::AgentEnv) -> Result<std::path::PathBuf, ToolError> {
-    env.env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "HOME")
-        .map(|(_, v)| v.clone())
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|_| !env.unset.iter().any(|k| k == "HOME"))
-        })
-        .map(std::path::PathBuf::from)
+    crate::agent_home::effective_home(env)
         .ok_or_else(|| error(ErrorCode::WorkspaceUntrusted, "agent home unavailable"))
 }
 pub(super) fn managed_registration_ready(
@@ -1768,5 +1724,31 @@ pub(super) fn replay_value(r: ReplayOutcome) -> Result<Value, ToolError> {
             ErrorCode::CapacityReached,
             "operation dispatch is in progress; retry the same key",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_proc::AgentEnv;
+
+    #[test]
+    fn the_registration_home_is_the_one_the_approval_socket_proves() {
+        let home = |value: &str| AgentEnv {
+            env: vec![("HOME".into(), value.into())],
+            unset: vec![],
+        };
+        assert_eq!(
+            agent_home(&home("/profile/home")).ok(),
+            Some("/profile/home".into())
+        );
+        for value in ["/app/../profile", "relative", ""] {
+            assert!(agent_home(&home(value)).is_err(), "{value}");
+        }
+        let unset = AgentEnv {
+            env: vec![],
+            unset: vec!["HOME".into()],
+        };
+        assert!(agent_home(&unset).is_err());
     }
 }

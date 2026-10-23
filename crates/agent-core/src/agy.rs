@@ -18,6 +18,7 @@ use crate::adapter::{
     Outbox,
 };
 use crate::caps::Capabilities;
+use crate::delegation::agy_guard;
 use crate::event::{
     Envelope, Event, ItemKind, ItemStatus, ReasoningLabel, ReasoningState, StreamKind, TurnState,
     Usage,
@@ -44,12 +45,6 @@ static ADAPTER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The flag the adapter alone decides on (it is the hook's fail-safe, see [`Adapter::argv`]).
 const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
 
-/// Undocumented agy flags that move its whole configuration directory (hooks, MCP servers,
-/// settings) away from `$HOME/.gemini`, the one the app's hook proof reads. Verified live for
-/// `--gemini_dir=` (agy 1.3.5). Both take a
-/// value, inline (`=`) or as the next argument.
-const CONFIG_DIR_FLAGS: [&str; 2] = ["gemini_dir", "app_data_dir"];
-
 /// What a profile argument is to the adapter's launch decisions.
 #[derive(Debug, PartialEq, Eq)]
 enum ProfileArg {
@@ -63,20 +58,19 @@ enum ProfileArg {
 
 /// agy is a Go binary: its flag parser takes one or two leading dashes and an optional
 /// `=value`. Names are compared with `-` and `_` treated alike, so near-spellings are caught too.
+/// The undocumented config-directory flags ([`agy_guard::CONFIG_DIR_FLAGS`]) move agy's whole
+/// configuration (hooks, MCP servers, settings) away from `$HOME/.gemini`, the one the app's
+/// hook proof reads (verified live for `--gemini_dir=`, agy 1.3.5); they take a value, inline
+/// or as the next argument.
 fn classify_profile_arg(arg: &str) -> ProfileArg {
-    let Some(flag) = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) else {
+    let Some((name, inline_value)) = agy_guard::flag_name(arg) else {
         return ProfileArg::Keep;
     };
-    let (name, inline_value) = match flag.split_once('=') {
-        Some((name, _)) => (name, true),
-        None => (flag, false),
-    };
-    let name = name.replace('-', "_");
     if name == SKIP_PERMISSIONS.trim_start_matches('-').replace('-', "_") {
         // A boolean flag: it never consumes the next argument.
         return ProfileArg::Drop;
     }
-    if CONFIG_DIR_FLAGS.contains(&name.as_str()) {
+    if agy_guard::CONFIG_DIR_FLAGS.contains(&name.as_str()) {
         return if inline_value {
             ProfileArg::Drop
         } else {
@@ -238,19 +232,7 @@ impl AgyAdapter {
         title: String,
         input: Option<Value>,
     ) {
-        if self.open_items.iter().any(|i| i == id) {
-            return;
-        }
-        self.open_items.push(id.to_owned());
-        out.push(
-            Envelope::new(Event::ItemStarted {
-                kind,
-                title,
-                input,
-                parent: None,
-            })
-            .item(id),
-        );
+        crate::adapter::start_open_item(&mut self.open_items, out, id, kind, title, input);
     }
 
     /// Opens a thinking item. agy hands over each thinking block whole (its transcript has it,
@@ -719,34 +701,26 @@ impl Adapter for AgyAdapter {
     }
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-        let raw: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return vec![unknown(Value::String(line.to_owned()))],
-        };
-        let Ok(frame) = serde_json::from_value::<Frame>(raw.clone()) else {
-            return vec![unknown(raw)];
-        };
-        let mut out = Vec::new();
-        match frame.event.as_str() {
-            "init" => self.on_init(&frame, &mut out),
-            "step_update" => match &frame.step_update {
-                Some(step) => self.on_step(step, &mut out),
-                None => out.push(env(Event::Unknown)),
-            },
-            "result" => match &frame.result {
-                Some(result) => self.on_result(result, &mut out),
-                None => out.push(env(Event::Unknown)),
-            },
-            _ => out.push(env(Event::Unknown)),
-        }
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(raw);
-        }
-        out
+        crate::adapter::map_json_frame(line.trim(), |raw| {
+            // A frame that is JSON but not agy's shape is Unknown, keeping the parsed JSON.
+            let Ok(frame) = serde_json::from_value::<Frame>(raw.clone()) else {
+                return vec![env(Event::Unknown)];
+            };
+            let mut out = Vec::new();
+            match frame.event.as_str() {
+                "init" => self.on_init(&frame, &mut out),
+                "step_update" => match &frame.step_update {
+                    Some(step) => self.on_step(step, &mut out),
+                    None => out.push(env(Event::Unknown)),
+                },
+                "result" => match &frame.result {
+                    Some(result) => self.on_result(result, &mut out),
+                    None => out.push(env(Event::Unknown)),
+                },
+                _ => out.push(env(Event::Unknown)),
+            }
+            out
+        })
     }
 
     fn feed_stderr(&mut self, line: &str) -> Vec<Envelope> {
@@ -888,10 +862,6 @@ fn thinking_text(id: &str, text: &str) -> Envelope {
         text: text.to_owned(),
     })
     .item(id)
-}
-
-fn unknown(raw: Value) -> Envelope {
-    Envelope::new(Event::Unknown).raw(raw)
 }
 
 fn tool_kind(name: &str) -> ItemKind {
@@ -1124,6 +1094,7 @@ impl From<&AgyUsage> for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, stdout_frames, Malformed};
 
     const EDIT: &str = include_str!("../tests/fixtures/agy-edit.ndjson");
     const HOOK: &str = include_str!("../tests/fixtures/agy-hook-approval.ndjson");
@@ -1135,8 +1106,7 @@ mod tests {
     fn replay(fixture: &str) -> Vec<Envelope> {
         let mut adapter = AgyAdapter::default();
         let mut events = Vec::new();
-        for line in fixture.lines() {
-            let rec: Value = serde_json::from_str(line).expect("fixture line");
+        for rec in records(fixture, Malformed::Panic) {
             let frame = &rec["frame"];
             match rec["dir"].as_str() {
                 Some("out") => events.extend(adapter.feed(&frame.to_string())),
@@ -1252,15 +1222,21 @@ mod tests {
         assert!(last.raw.is_some());
     }
 
+    /// Asks for the context usage and takes what the adapter answered itself.
+    fn context_usage(adapter: &mut AgyAdapter, id: &str) -> Outbox {
+        adapter
+            .encode(Command::Control {
+                id: id.into(),
+                control: Control::ContextUsage,
+            })
+            .expect("control");
+        adapter.drain_outbox()
+    }
+
     #[test]
     fn context_usage_control_reports_input_tokens() {
         let mut a = AgyAdapter::default();
-        a.encode(Command::Control {
-            id: "cu1".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
-        let outbox = a.drain_outbox();
+        let outbox = context_usage(&mut a, "cu1");
         assert_eq!(outbox.events.len(), 1);
         assert!(matches!(
             &outbox.events[0].event,
@@ -1271,12 +1247,7 @@ mod tests {
             r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":1000,"output_tokens":200}}}"#,
         );
 
-        a.encode(Command::Control {
-            id: "cu2".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
-        let outbox = a.drain_outbox();
+        let outbox = context_usage(&mut a, "cu2");
         assert_eq!(outbox.events.len(), 2);
         assert!(matches!(
             &outbox.events[0].event,
@@ -1312,12 +1283,7 @@ mod tests {
                 &json!({"event": "result", "result": {"status": "SUCCESS", "usage": usage}})
                     .to_string(),
             );
-            a.encode(Command::Control {
-                id: "context".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
-            let out = a.drain_outbox();
+            let out = context_usage(&mut a, "context");
             assert!(
                 matches!(&out.events[0].event, Event::UsageUpdated { used, .. } if *used == expected)
             );
@@ -1332,18 +1298,10 @@ mod tests {
     fn agy_context_uses_the_last_model_call_instead_of_the_turn_total() {
         let mut a = AgyAdapter::default();
         for (fixture, expected) in [(EDIT, 14035), (HOOK, 12771)] {
-            for line in fixture.lines() {
-                let rec: Value = serde_json::from_str(line).expect("fixture");
-                if rec["dir"] == "out" {
-                    a.feed(&rec["frame"].to_string());
-                }
+            for frame in stdout_frames(fixture, Malformed::Panic) {
+                a.feed(&frame);
             }
-            a.encode(Command::Control {
-                id: "context".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
-            let out = a.drain_outbox();
+            let out = context_usage(&mut a, "context");
             assert!(
                 matches!(&out.events[0].event, Event::UsageUpdated { used, .. } if *used == expected)
             );
@@ -1363,25 +1321,15 @@ mod tests {
             );
         }
         a.feed(r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":20000,"output_tokens":5000}}}"#);
-        a.encode(Command::Control {
-            id: "smaller".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
         assert!(matches!(
-            &a.drain_outbox().events[0].event,
+            &context_usage(&mut a, "smaller").events[0].event,
             Event::UsageUpdated { used: 500, .. }
         ));
 
         // A later result-only turn uses its own input, rather than the previous turn's step.
         a.feed(r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":800,"output_tokens":100}}}"#);
-        a.encode(Command::Control {
-            id: "fallback".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
         assert!(matches!(
-            &a.drain_outbox().events[0].event,
+            &context_usage(&mut a, "fallback").events[0].event,
             Event::UsageUpdated { used: 800, .. }
         ));
     }
@@ -1402,25 +1350,15 @@ mod tests {
                 })
                 .expect("prompt");
             }
-            a.encode(Command::Control {
-                id: "retained".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
             assert!(matches!(
-                &a.drain_outbox().events[0].event,
+                &context_usage(&mut a, "retained").events[0].event,
                 Event::UsageUpdated { used: 1000, .. }
             ));
             a.feed(
                 r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":800}}}"#,
             );
-            a.encode(Command::Control {
-                id: "fallback".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
             assert!(matches!(
-                &a.drain_outbox().events[0].event,
+                &context_usage(&mut a, "fallback").events[0].event,
                 Event::UsageUpdated { used: 800, .. }
             ));
         }

@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::{revocation, RevocationEffect, RevocationEvent, TaskMode};
-use agent_core::delegation::error::{ErrorCode, ToolError};
+use agent_core::delegation::error::{truncate_bytes, ErrorCode, ToolError};
 use agent_core::delegation::identity::Identity;
 use agent_core::delegation::ids::{
     Cursor, IdempotencyKey, MessageId, OperationId, ProfileId, RunId, WorkerId,
@@ -134,7 +134,8 @@ fn parse_id<T>(
     parse(s).map_err(|e| StoreError::Failed(format!("stored {what} `{s}` is not a handle: {e}")))
 }
 
-fn worker_id(s: &str) -> Result<WorkerId> {
+/// A stored worker id read back as a handle; a malformed one is an error, never a guess.
+pub fn worker_id(s: &str) -> Result<WorkerId> {
     parse_id("worker", s, WorkerId::parse)
 }
 
@@ -150,18 +151,6 @@ fn operation_id(s: &str) -> Result<OperationId> {
     parse_id("operation", s, OperationId::parse)
 }
 
-/// `s` cut to at most `max` bytes at a character boundary.
-fn cut(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_owned()
-}
-
 fn illegal(what: &str) -> StoreError {
     StoreError::Failed(format!("illegal delegation transition: {what}"))
 }
@@ -170,8 +159,9 @@ fn rfc3339_ms(ms: i64) -> String {
     agent_core::quota::epoch_to_rfc3339(ms.div_euclid(1000))
 }
 
-/// The idempotency key and expected epoch of a mutating request.
-fn key_and_epoch(req: &ToolRequest) -> Option<(&IdempotencyKey, Option<u64>)> {
+/// The idempotency key and expected epoch of a mutating request: spawn, send, cancel, close,
+/// and a read that acknowledges with a key. `None` for anything else.
+pub fn key_and_epoch(req: &ToolRequest) -> Option<(&IdempotencyKey, Option<u64>)> {
     match req {
         ToolRequest::Spawn(r) => Some((&r.idempotency_key, r.expected_authority_epoch)),
         ToolRequest::Send(r) => Some((&r.idempotency_key, r.expected_authority_epoch)),
@@ -193,8 +183,9 @@ fn u64_of(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-/// A typed operation row.
-fn stored_operation(row: &OperationRow) -> Result<StoredOperation> {
+/// An operation row read back typed, for the idempotency check. A stored value this build cannot
+/// read is an error, never a guess.
+pub fn stored_operation(row: &OperationRow) -> Result<StoredOperation> {
     Ok(StoredOperation {
         id: operation_id(&row.id)?,
         kind: parse_name("operation kind", &row.kind)?,
@@ -487,6 +478,19 @@ enum Front {
 // ---------------------------------------------------------------------------------------------
 
 impl Store {
+    /// The operation `principal_worker` stored under an idempotency key for `kind`, across all
+    /// epochs, read back typed ([`stored_operation`]).
+    pub fn delegation_stored_operation_by_key(
+        &self,
+        principal_worker: &str,
+        kind: OperationKind,
+        idempotency_key: &str,
+    ) -> Result<Option<StoredOperation>> {
+        self.delegation_operation_by_key(principal_worker, &name_of(&kind), idempotency_key)?
+            .map(|row| stored_operation(&row))
+            .transpose()
+    }
+
     /// A fresh random handle suffix (24 hex digits): no table, no lock.
     fn handle_suffix(&self) -> Result<String> {
         Ok(self
@@ -663,10 +667,8 @@ impl Store {
             ))));
         };
         let canonical = canonical_request(request, redact);
-        let existing = self
-            .delegation_operation_by_key(&principal.id, &name_of(&kind), key.as_str())?
-            .map(|row| stored_operation(&row))
-            .transpose()?;
+        let existing =
+            self.delegation_stored_operation_by_key(&principal.id, kind, key.as_str())?;
         let current = agent_core::delegation::ids::AuthorityEpoch(u64_of(root.authority_epoch));
         let decision = idempotency(
             existing.as_ref(),
@@ -1469,6 +1471,32 @@ impl Store {
 
     // ---- record facts ----
 
+    /// [`Store::record_delegation_dispatch`], unless the operation's dispatch state already is
+    /// the one `fact` leads to (`submitted`, `confirmed`, `unknown` or `failed`): a fact already
+    /// recorded is not recorded again. Returns whether it recorded it. One unit, so it may run
+    /// inside the caller's [`Store::atomically`].
+    pub fn record_delegation_dispatch_once(
+        &self,
+        op: &OperationId,
+        fact: &DispatchFact,
+    ) -> Result<bool> {
+        let target = match fact {
+            DispatchFact::Submitted => "submitted",
+            DispatchFact::Confirmed => "confirmed",
+            DispatchFact::Unknown => "unknown",
+            DispatchFact::Failed(_) => "failed",
+        };
+        self.atomically(|s| {
+            if s.delegation_operation(op.as_str())?
+                .is_some_and(|o| o.dispatch_state == target)
+            {
+                return Ok(false);
+            }
+            s.record_delegation_dispatch(op, fact)?;
+            Ok(true)
+        })
+    }
+
     /// Records an observed dispatch fact. A send's message follows
     /// (`submitted`, `failed`, `unknown`) where `delivery_step` allows; a spawn's reserved run
     /// fails or becomes `unknown` with it. Never translates a pipe write into "consumed".
@@ -1653,7 +1681,7 @@ impl Store {
                     recipient_worker_id: parent.clone(),
                     kind: name_of(&MessageKind::Report),
                     reply_to: None,
-                    body: cut(&redact(result), MAX_RESULT_BYTES),
+                    body: truncate_bytes(&redact(result), MAX_RESULT_BYTES).to_owned(),
                     delivery_policy: name_of(&Delivery::Auto),
                     target_run_id: None,
                     delivery_state: name_of(&DeliveryState::Queued),
@@ -2917,7 +2945,10 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
         Event::ContentDelta { .. } | Event::ContentSnapshot { .. } => ("activity".to_owned(), None),
         other => (super::event_kind(other), None),
     };
-    (cut(&redact(&text), MAX_EVENT_SUMMARY_BYTES), state)
+    (
+        truncate_bytes(&redact(&text), MAX_EVENT_SUMMARY_BYTES).to_owned(),
+        state,
+    )
 }
 
 #[cfg(test)]
@@ -3215,6 +3246,46 @@ mod tests {
         assert_eq!(
             e.details.as_ref().expect("details")["replayed"],
             json!(true)
+        );
+    }
+
+    #[test]
+    fn a_dispatch_fact_is_recorded_once_and_the_operation_reads_back_by_key() {
+        let f = fx();
+        let first = spawn(&f.s, &f.root.worker, "k1");
+        let by_key = |key: &str| {
+            f.s.delegation_stored_operation_by_key(
+                f.root.worker.as_str(),
+                OperationKind::Spawn,
+                key,
+            )
+            .expect("q")
+        };
+        assert_eq!(by_key("k1").expect("stored").id, first.operation);
+        assert!(by_key("k2").is_none());
+        f.s.reserve_delegation_dispatch(&first.operation)
+            .expect("s")
+            .expect("ok");
+        // Inside the caller's own unit, as the app runs it.
+        let recorded = f.s.atomically(|s| {
+            s.record_delegation_dispatch_once(&first.operation, &DispatchFact::Submitted)
+        });
+        assert!(recorded.expect("first"));
+        assert!(!f
+            .s
+            .record_delegation_dispatch_once(&first.operation, &DispatchFact::Submitted)
+            .expect("again"));
+        assert_eq!(
+            by_key("k1").expect("stored").dispatch,
+            OperationState::Submitted
+        );
+        assert!(f
+            .s
+            .record_delegation_dispatch_once(&first.operation, &DispatchFact::Confirmed)
+            .expect("confirmed"));
+        assert_eq!(
+            by_key("k1").expect("stored").dispatch,
+            OperationState::Confirmed
         );
     }
 

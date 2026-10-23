@@ -1387,47 +1387,21 @@ mod tests {
         use super::super::*;
         use std::fs;
 
-        /// Fixture-side git: hermetic config, a fixed identity, no hooks.
-        fn sh(dir: &Path, args: &[&str]) -> String {
-            let output = Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "init.defaultBranch=main",
-                ])
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
 
         fn new_repo() -> Option<tempfile::TempDir> {
-            if !git_installed() {
-                eprintln!("git not installed; skipping");
+            if !git_or_skip() {
                 return None;
             }
             let dir = tempfile::tempdir().unwrap();
-            sh(dir.path(), &["init", "-q"]);
-            fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-            fs::write(dir.path().join("gone.txt"), "bye\n").unwrap();
-            fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
-            sh(dir.path(), &["add", "."]);
-            sh(dir.path(), &["commit", "-q", "-m", "init"]);
+            init_repo_at(
+                dir.path(),
+                &[
+                    ("a.txt", b"one\n"),
+                    ("gone.txt", b"bye\n"),
+                    (".gitignore", b"ignored/\n"),
+                ],
+            );
             Some(dir)
         }
 

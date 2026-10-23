@@ -124,7 +124,8 @@ impl Frame {
     }
 }
 
-fn ease_in_out(t: f64) -> f64 {
+/// Smooth cubic ease-in-out curve, `t` clamped to 0..=1.
+pub(super) fn ease_in_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
         4.0 * t * t * t
@@ -285,11 +286,6 @@ fn rounded_rect(cr: &cairo::Context, (x, y, w, h): (f64, f64, f64, f64), r: f64)
     cr.close_path();
 }
 
-fn rgb(hex: u32) -> (f64, f64, f64) {
-    let c = |shift: u32| f64::from((hex >> shift) & 0xff) / 255.0;
-    (c(16), c(8), c(0))
-}
-
 fn draw_dot(cr: &cairo::Context, i: usize, pose: &DotPose) {
     if pose.scale <= 0.001 || pose.place == DotPlace::Hidden {
         return;
@@ -359,7 +355,7 @@ pub fn draw_frame(cr: &cairo::Context, width: f64, height: f64, frame: &Frame) {
     let _ = cr.save();
     cr.translate(0.0, 5.0);
     bubble_path(cr);
-    let (r, g, b) = rgb(0x0d0a16);
+    let crate::palette::Rgb(r, g, b) = crate::palette::Rgb::from_hex(0x0d0a16);
     cr.set_source_rgba(r, g, b, 0.55);
     let _ = cr.fill();
     let _ = cr.restore();
@@ -367,9 +363,9 @@ pub fn draw_frame(cr: &cairo::Context, width: f64, height: f64, frame: &Frame) {
     // Body and rim.
     bubble_path(cr);
     let rim = cairo::LinearGradient::new(0.0, 14.0, 0.0, 117.0);
-    let (r, g, b) = rgb(0xa08cff);
+    let crate::palette::Rgb(r, g, b) = crate::palette::Rgb::from_hex(0xa08cff);
     rim.add_color_stop_rgb(0.0, r, g, b);
-    let (r, g, b) = rgb(0x5a44c8);
+    let crate::palette::Rgb(r, g, b) = crate::palette::Rgb::from_hex(0x5a44c8);
     rim.add_color_stop_rgb(1.0, r, g, b);
     let _ = cr.set_source(&rim);
     let _ = cr.fill();
@@ -382,9 +378,9 @@ pub fn draw_frame(cr: &cairo::Context, width: f64, height: f64, frame: &Frame) {
         cr.clip();
         rounded_rect(cr, SCREEN, SCREEN_R);
         let screen = cairo::LinearGradient::new(0.0, SCREEN.1, 0.0, SCREEN.1 + SCREEN.3);
-        let (r, g, b) = rgb(0x2b2442);
+        let crate::palette::Rgb(r, g, b) = crate::palette::Rgb::from_hex(0x2b2442);
         screen.add_color_stop_rgb(0.0, r, g, b);
-        let (r, g, b) = rgb(0x181425);
+        let crate::palette::Rgb(r, g, b) = crate::palette::Rgb::from_hex(0x181425);
         screen.add_color_stop_rgb(1.0, r, g, b);
         let _ = cr.set_source(&screen);
         let _ = cr.fill();
@@ -396,7 +392,7 @@ pub fn draw_frame(cr: &cairo::Context, width: f64, height: f64, frame: &Frame) {
         cr.move_to(34.0, 43.0);
         cr.line_to(50.0, 56.0);
         cr.line_to(34.0, 69.0);
-        let (r, g, b) = rgb(0xc8c8ff);
+        let crate::palette::Rgb(r, g, b) = crate::palette::Rgb::from_hex(0xc8c8ff);
         cr.set_source_rgb(r, g, b);
         cr.set_line_width(8.0);
         cr.set_line_cap(cairo::LineCap::Round);

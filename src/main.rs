@@ -25,6 +25,7 @@ mod codex_probe;
 pub mod config;
 mod cross_agent_mcp;
 mod delegation;
+mod dialogs;
 mod diff_tool;
 mod environment_review;
 mod freshness;
@@ -34,6 +35,7 @@ mod model_catalog;
 mod model_tags_file;
 mod palette;
 mod probe;
+mod style;
 #[cfg(not(feature = "terminal"))]
 pub mod terminal_stub;
 #[cfg(test)]

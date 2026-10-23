@@ -1,6 +1,7 @@
 //! Native layout matrix using synthetic transcripts and observable frame conditions.
-use super::tests::{status_of, SwitchableBackend};
+use super::tests::StubBackend;
 use super::*;
+use crate::testutil::settle;
 use agent_core::event::{
     Decision, ItemKind, PlanStep, Question, QuestionOption, ResponseCapability, StepStatus,
     StreamKind,
@@ -11,11 +12,7 @@ use agent_core::event::{
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
-    gtk4::init().expect("GTK init");
-    adw::init().expect("adw init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     for width in [360, 650, 950, 1100] {
         let header = header::Header::new();
         header.set_agent(Driver::Claude, Some("claude-sonnet-5-5"), None, None);
@@ -61,11 +58,7 @@ fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_ux_matrix() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     for (width, scale, pane_open) in [
         (360, 1.0, false),
         (560, 1.0, true),
@@ -74,9 +67,7 @@ fn native_ux_matrix() {
         (560, 2.0, false),
         (950, 2.0, true),
     ] {
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Codex)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Codex));
         view.set_text_scale(scale);
         let mut history = demo::DemoBackend::stress_history(220);
         for (id, kind, text) in [
@@ -96,15 +87,13 @@ fn native_ux_matrix() {
                 format!("src/{}.rs", "c".repeat(900)),
             ),
         ] {
-            history.push(
-                Envelope::new(Event::ItemStarted {
-                    kind,
-                    title: text.clone(),
-                    input: Some(serde_json::json!({"command": text, "file_path": text})),
-                    parent: None,
-                })
-                .item(id),
-            );
+            history.push(Envelope::item_started(
+                id,
+                kind,
+                text.clone(),
+                Some(serde_json::json!({"command": text, "file_path": text})),
+                None,
+            ));
         }
         // Text that cannot be broken on its own must wrap or ellipsize, never widen the thread
         // A switch divider with a 900-char model, a question with a 300-char
@@ -150,42 +139,34 @@ fn native_ux_matrix() {
             })
             .request("wide-question"),
         ]);
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::AssistantMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("markdown"),
-        );
-        history.push(
-            Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text: format!(
-                    "A link: https://example.invalid/{}\n\n```rust\n{}\n```",
-                    "d".repeat(900),
-                    "e".repeat(900)
-                ),
-            })
-            .item("markdown"),
-        );
-        history.push(
-            Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("user"),
-        );
-        history.push(
-            Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text: format!("Visible message {}", "f".repeat(900)),
-            })
-            .item("user"),
-        );
+        history.push(Envelope::item_started(
+            "markdown",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        history.push(Envelope::snapshot(
+            "markdown",
+            StreamKind::Assistant,
+            format!(
+                "A link: https://example.invalid/{}\n\n```rust\n{}\n```",
+                "d".repeat(900),
+                "e".repeat(900)
+            ),
+        ));
+        history.push(Envelope::item_started(
+            "user",
+            ItemKind::UserMessage,
+            "",
+            None,
+            None,
+        ));
+        history.push(Envelope::snapshot(
+            "user",
+            StreamKind::Assistant,
+            format!("Visible message {}", "f".repeat(900)),
+        ));
         view.replay(&history);
         let side = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         side.set_size_request(140, -1);
@@ -314,11 +295,6 @@ fn shown_view(
     (window, view)
 }
 
-/// Lets layout, scrolling and idle work run.
-fn settle(ctx: &glib::MainContext) {
-    crate::testutil::settle(ctx);
-}
-
 /// Where a press at the centre of `w` lands in `window`. A selectable label there would claim
 /// the press (a caret), so the press must pass through to `target`: the button, row or toggle
 /// that owns it. Returns what was hit when it is not.
@@ -387,13 +363,7 @@ fn ancestor<T: IsA<gtk4::Widget>>(w: &impl IsA<gtk4::Widget>) -> T {
 }
 
 fn item_started(id: &str, kind: ItemKind, title: &str, input: serde_json::Value) -> Envelope {
-    Envelope::new(Event::ItemStarted {
-        kind,
-        title: title.into(),
-        input: Some(input),
-        parent: None,
-    })
-    .item(id)
+    Envelope::item_started(id, kind, title, Some(input), None)
 }
 
 /// Presses the visible text of every click target of the view and asserts its effect.
@@ -403,11 +373,7 @@ fn item_started(id: &str, kind: ItemKind, title: &str, input: serde_json::Value)
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_click_matrix() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
 
     // A tool card, a thought, a plan and a question, fresh in one thread.
     let tools = vec![
@@ -417,30 +383,20 @@ fn native_click_matrix() {
             "Bash",
             serde_json::json!({"command": "cargo test --workspace"}),
         ),
-        Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: Some("ok".into()),
-            error: None,
-        })
-        .item("cmd"),
-        Envelope::new(Event::ItemStarted {
-            kind: ItemKind::Reasoning,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item("think"),
-        Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Reasoning,
-            text: "Weighing the options.".into(),
-        })
-        .item("think"),
-        Envelope::new(Event::ItemCompleted {
-            status: agent_core::event::ItemStatus::Completed,
-            output: None,
-            error: None,
-        })
-        .item("think"),
+        Envelope::item_completed(
+            "cmd",
+            agent_core::event::ItemStatus::Completed,
+            Some("ok"),
+            None,
+        ),
+        Envelope::item_started("think", ItemKind::Reasoning, "", None, None),
+        Envelope::snapshot("think", StreamKind::Reasoning, "Weighing the options."),
+        Envelope::item_completed(
+            "think",
+            agent_core::event::ItemStatus::Completed,
+            None,
+            None,
+        ),
     ];
     // A plan and a running sub-agent: the header's counter and a row on the shelf.
     let mut working = vec![
@@ -720,18 +676,12 @@ fn native_click_matrix() {
 
     // The composer's send button sends the draft; a code block's Copy button confirms.
     let code = vec![
-        Envelope::new(Event::ItemStarted {
-            kind: ItemKind::AssistantMessage,
-            title: String::new(),
-            input: None,
-            parent: None,
-        })
-        .item("answer"),
-        Envelope::new(Event::ContentSnapshot {
-            stream: StreamKind::Assistant,
-            text: "Here:\n\n```rust\nfn main() {}\n```".into(),
-        })
-        .item("answer"),
+        Envelope::item_started("answer", ItemKind::AssistantMessage, "", None, None),
+        Envelope::snapshot(
+            "answer",
+            StreamKind::Assistant,
+            "Here:\n\n```rust\nfn main() {}\n```",
+        ),
     ];
     let (window, view) = shown_view(1100, &code, &ctx);
     let inner = view.inner().expect("view");
@@ -802,11 +752,7 @@ fn native_click_matrix() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_toasts_clear_the_composer() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     // A plan, a running sub-agent and an open question: the shelves are all up.
     let mut history = vec![
         Envelope::new(Event::TurnStarted { model: None }),
@@ -882,11 +828,7 @@ fn native_toasts_clear_the_composer() {
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_queue_stays_pinned_and_contained() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
+    let ctx = crate::testutil::native_init();
     for width in [360, 900] {
         let (window, view) = shown_view(width, &demo::queue_envelopes(), &ctx);
         let inner = view.inner().expect("view");
@@ -921,15 +863,13 @@ fn native_queue_stays_pinned_and_contained() {
         assert_eq!(queued.len(), 2, "two queued rows at {width}px");
         assert!(queued.iter().all(|l| l.is_selectable()));
         // A new reply lands above the queue, not below it.
-        view.apply(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::AssistantMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item("late-reply"),
-        );
+        view.apply(&Envelope::item_started(
+            "late-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
         let model = inner.model.borrow();
         let order = model.order();
         assert_eq!(
@@ -943,50 +883,15 @@ fn native_queue_stays_pinned_and_contained() {
     }
 }
 
-/// A backend that remembers every prompt sent to it.
-struct PromptLog {
-    status: SessionStatus,
-    sent: RefCell<Vec<String>>,
-}
-
-impl ChatBackend for PromptLog {
-    fn send_prompt(&self, text: &str) {
-        self.sent.borrow_mut().push(text.to_owned());
-    }
-    fn queue_prompt(&self, text: &str) {
-        self.sent.borrow_mut().push(text.to_owned());
-    }
-    fn interrupt(&self) {}
-    fn respond_approval(&self, _: &str, _: Decision) {}
-    fn answer_questions(&self, _: &str, _: serde_json::Value) {
-        panic!("a reply question is answered by a prompt, never over the protocol");
-    }
-    fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
-    fn reload_session(&self) {}
-    fn set_mode(&self, _: Mode) {}
-    fn control(&self, _: Control) -> String {
-        String::new()
-    }
-    fn status(&self) -> SessionStatus {
-        self.status.clone()
-    }
-}
-
 /// Quick-reply chips under a finished reply: a click puts the exact option in the composer, with
 /// the cursor after it and the focus there, and sends nothing; the chips are no interruption;
 /// Dismiss and "Don't suggest these" both take them away, the latter telling the window.
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
-    crate::icons::register();
-    crate::load_css();
-    let ctx = glib::MainContext::default();
-    let backend = Rc::new(PromptLog {
-        status: status_of(Driver::Codex),
-        sent: RefCell::default(),
-    });
+    let ctx = crate::testutil::native_init();
+    let backend = StubBackend::fixed(Driver::Codex);
+    backend.panic_on_answer.set(true);
     let view = ChatView::new(backend.clone());
     let actions: Rc<RefCell<Vec<String>>> = Rc::default();
     let log = actions.clone();
@@ -1010,21 +915,15 @@ fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
         ] {
             view.apply(&Envelope::new(event).item("a1"));
         }
-        view.apply(
-            &Envelope::new(Event::ContentSnapshot {
-                stream: StreamKind::Assistant,
-                text:
-                    "Two layouts fit.\n\nWhich do you prefer?\n\n- Tabs on top\n- Tabs on the side"
-                        .into(),
-            })
-            .item("a1"),
-        );
-        view.apply(&Envelope::new(Event::TurnCompleted {
-            state: agent_core::event::TurnState::Completed,
-            usage: None,
-            cost_usd: None,
-            error: None,
-        }));
+        view.apply(&Envelope::snapshot(
+            "a1",
+            StreamKind::Assistant,
+            "Two layouts fit.\n\nWhich do you prefer?\n\n- Tabs on top\n- Tabs on the side",
+        ));
+        view.apply(&Envelope::turn_completed(
+            agent_core::event::TurnState::Completed,
+            None,
+        ));
         view.apply(
             &Envelope::new(Event::QuestionRequested {
                 source: agent_core::event::QuestionSource::Reply,

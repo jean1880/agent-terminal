@@ -285,7 +285,7 @@ fn text(v: &Value, key: &str, max: usize) -> Option<String> {
 }
 
 fn driver_of(name: &str) -> Option<Driver> {
-    serde_json::from_value(Value::String(name.to_owned())).ok()
+    crate::serde_name::parse_lenient(name)
 }
 
 fn entry(v: &Value) -> Option<TagEntry> {

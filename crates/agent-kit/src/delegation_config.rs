@@ -198,8 +198,7 @@ fn check_path(
     {
         return Err(fail("registration path is outside the selected home"));
     }
-    // SAFETY: geteuid has no preconditions.
-    let owner = unsafe { libc::geteuid() };
+    let owner = crate::fsutil::effective_uid();
     let mut current = home.to_path_buf();
     let parts = path
         .strip_prefix(home)
@@ -258,8 +257,7 @@ fn check_path(
 fn repair(repairs: &[Repair]) -> Result<(), String> {
     let mut ordered: Vec<_> = repairs.iter().collect();
     ordered.sort_by_key(|r| r.path.components().count());
-    // SAFETY: geteuid has no preconditions.
-    let owner = unsafe { libc::geteuid() };
+    let owner = crate::fsutil::effective_uid();
     for r in ordered {
         let changed = || {
             format!(

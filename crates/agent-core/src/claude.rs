@@ -96,6 +96,8 @@ pub struct ClaudeAdapter {
     tasks: Vec<BackgroundTask>,
     /// Background task id → the tool call that started it (`task_started`).
     task_tools: HashMap<String, String>,
+    /// Sub-agent tool-use id → the model last reported for it ([`Event::SubagentModel`]).
+    subagent_models: HashMap<String, String>,
     seen: HashSet<String>,
     // Requests in flight.
     pending: HashMap<String, PendingApproval>,
@@ -153,6 +155,7 @@ impl ClaudeAdapter {
             background_children: HashMap::new(),
             tasks: Vec::new(),
             task_tools: HashMap::new(),
+            subagent_models: HashMap::new(),
             seen: HashSet::new(),
             pending: HashMap::new(),
             pending_controls: HashSet::new(),
@@ -176,6 +179,27 @@ impl ClaudeAdapter {
     fn control_line(&mut self, id: &str, request: Value) -> String {
         self.pending_controls.insert(id.to_owned());
         json!({"type": "control_request", "request_id": id, "request": request}).to_string()
+    }
+
+    /// [`Event::SubagentModel`] for sub-agent `id`, the first time `model` is reported for it and
+    /// on a change. Claude's `<synthetic>` placeholder and a blank are no model.
+    fn subagent_model(&mut self, id: &str, model: Option<&str>) -> Option<Envelope> {
+        let model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && *m != "<synthetic>")?;
+        if self.subagent_models.get(id).map(String::as_str) == Some(model) {
+            return None;
+        }
+        if self.subagent_models.len() >= SEEN_CAP {
+            self.subagent_models.clear();
+        }
+        self.subagent_models.insert(id.to_owned(), model.to_owned());
+        Some(
+            Envelope::new(Event::SubagentModel {
+                model: model.to_owned(),
+            })
+            .item(id),
+        )
     }
 
     /// First sighting of `key` returns true; a replay returns false.
@@ -631,6 +655,18 @@ impl ClaudeAdapter {
         let parent = str_of(v, "parent_tool_use_id").map(str::to_owned);
         let msg_id = str_of(msg, "id").unwrap_or_default().to_owned();
         let mut out = Vec::new();
+        // A sub-agent's own messages name the model it runs on. A replayed frame is an old
+        // observation: only a frame seen for the first time may update it. A frame with no
+        // uuid cannot be told from a replay, so it counts (the model is still sent only when
+        // it changes); a frame that names no model leaves its uuid free.
+        if let Some(parent) = &parent {
+            let model = str_of(msg, "model")
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && *m != "<synthetic>");
+            if model.is_some() && (uuid.is_empty() || self.first_time(format!("{uuid}#model"))) {
+                out.extend(self.subagent_model(parent, model));
+            }
+        }
         for (pos, block) in content.iter().enumerate() {
             let index = {
                 let n = self.snap_counts.entry(msg_id.clone()).or_insert(0);
@@ -754,11 +790,19 @@ impl ClaudeAdapter {
                 .collect();
             // The frame-level result metadata describes a frame's single result.
             let async_launch = results.len() == 1 && is_async_launch(v);
+            // A sub-agent's result names the model it ran on, which a transcript (whose
+            // sub-agent messages are elsewhere) has no other record of.
+            let resolved = if results.len() == 1 {
+                resolved_model(v)
+            } else {
+                None
+            };
             let had_results = !results.is_empty();
             for b in results {
                 let Some(id) = str_of(b, "tool_use_id") else {
                     continue;
                 };
+                out.extend(self.subagent_model(id, resolved));
                 // A backgrounded sub-agent answers its `Agent` call at once with internal
                 // "launched" metadata; the item stays open until its `task_notification`.
                 // `task_started` says so first; the structured result is the fallback.
@@ -1293,18 +1337,8 @@ impl Adapter for ClaudeAdapter {
     }
 
     fn feed(&mut self, line: &str) -> Vec<Envelope> {
-        if line.trim().is_empty() {
-            return Vec::new();
-        }
-        let Ok(frame) = serde_json::from_str::<Value>(line) else {
-            return vec![Envelope::new(Event::Unknown).raw(Value::String(line.to_owned()))];
-        };
-        let mut out = self.map_frame(&frame);
-        // One copy of the frame per line, on the first envelope only.
-        if let Some(first) = out.first_mut() {
-            first.raw = Some(frame);
-        }
-        out
+        // The line as given, untrimmed, is what a malformed one keeps.
+        crate::adapter::map_json_frame(line, |frame| self.map_frame(frame))
     }
 
     fn drain_outbox(&mut self) -> Outbox {
@@ -1588,6 +1622,14 @@ pub(crate) fn is_async_launch(record: &Value) -> bool {
         })
 }
 
+/// The model a sub-agent's result says it ran on (`toolUseResult.resolvedModel`).
+fn resolved_model(record: &Value) -> Option<&str> {
+    ["tool_use_result", "toolUseResult"]
+        .iter()
+        .filter_map(|k| record.get(*k))
+        .find_map(|r| str_of(r, "resolvedModel"))
+}
+
 /// A background task's `task_type`. Seen: `local_agent`, `local_bash`, `bash`.
 fn task_kind(task_type: &str) -> BackgroundTaskKind {
     match task_type {
@@ -1764,6 +1806,7 @@ fn questions_of(input: &Value) -> Vec<Question> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{stdout_frames, Malformed};
 
     #[test]
     fn only_a_refused_rate_limit_is_reported() {
@@ -1803,11 +1846,8 @@ mod tests {
     fn replay(fixture: &str) -> (ClaudeAdapter, Vec<Envelope>) {
         let mut a = ClaudeAdapter::new();
         let mut out = Vec::new();
-        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
-            let rec: Value = serde_json::from_str(line).expect("fixture line is JSON");
-            if str_of(&rec, "dir") == Some("out") {
-                out.extend(a.feed(&rec["frame"].to_string()));
-            }
+        for frame in stdout_frames(fixture, Malformed::Panic) {
+            out.extend(a.feed(&frame));
         }
         (a, out)
     }
@@ -2513,12 +2553,13 @@ mod tests {
                 Event::ItemStarted { .. } => "start",
                 Event::ContentSnapshot { .. } => "snap",
                 Event::ItemCompleted { .. } => "done",
+                Event::SubagentModel { .. } => "model",
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, ["start", "snap", "done", "start"]);
+        assert_eq!(kinds, ["model", "start", "snap", "done", "start"]);
         assert!(matches!(
-            &out[3].event,
+            &out[4].event,
             Event::ItemStarted { kind: ItemKind::Command, parent: Some(p), .. } if p == "toolu_parent"
         ));
         // A replay of the same frame is ignored.
@@ -2578,14 +2619,7 @@ mod tests {
                 decision: Decision::Cancel
             }
         ));
-        assert!(a
-            .encode(Command::Approve {
-                request: "r1".into(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            })
-            .is_err());
+        assert!(a.encode(approve(Decision::Allow, "r1")).is_err());
     }
 
     #[test]
@@ -2707,6 +2741,167 @@ mod tests {
     }
 
     // ----- sub-agents (shapes from claude 2.1.29x stream-json captures, ids shortened) -----
+
+    fn model_frame(uuid: &str, parent: Option<&str>, model: &str) -> String {
+        json!({"type": "assistant", "uuid": uuid, "parent_tool_use_id": parent,
+            "message": {"id": format!("m-{uuid}"), "role": "assistant", "model": model,
+                "content": [{"type": "text", "text": "working"}]}})
+        .to_string()
+    }
+
+    fn reported_models(out: &[Envelope]) -> Vec<(String, String)> {
+        out.iter()
+            .filter_map(|e| match &e.event {
+                Event::SubagentModel { model } => {
+                    Some((e.item.clone().unwrap_or_default(), model.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sub_agent_reports_its_model_once_and_again_only_on_a_change() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        let first = a.feed(&model_frame("s1", Some("toolu_a"), "claude-haiku-5-5"));
+        assert_eq!(
+            reported_models(&first),
+            [("toolu_a".to_owned(), "claude-haiku-5-5".to_owned())]
+        );
+        assert!(
+            matches!(first[0].event, Event::SubagentModel { .. }),
+            "before its steps"
+        );
+        let same = a.feed(&model_frame("s2", Some("toolu_a"), "claude-haiku-5-5"));
+        assert!(
+            reported_models(&same).is_empty(),
+            "the same model is not repeated"
+        );
+        let changed = a.feed(&model_frame("s3", Some("toolu_a"), "claude-sonnet-5-5"));
+        assert_eq!(
+            reported_models(&changed),
+            [("toolu_a".to_owned(), "claude-sonnet-5-5".to_owned())]
+        );
+        // The main thread's own model is the session's, not a sub-agent's.
+        let main = a.feed(&model_frame("m1", None, "claude-opus-5-5"));
+        assert!(reported_models(&main).is_empty());
+    }
+
+    #[test]
+    fn a_replayed_sub_agent_frame_never_brings_back_an_older_model() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        let first = model_frame("s1", Some("toolu_a"), "claude-haiku-5-5");
+        let mut reported = reported_models(&a.feed(&first));
+        reported.extend(reported_models(&a.feed(&model_frame(
+            "s2",
+            Some("toolu_a"),
+            "claude-sonnet-5-5",
+        ))));
+        reported.extend(reported_models(&a.feed(&first)));
+        assert_eq!(
+            reported,
+            [
+                ("toolu_a".to_owned(), "claude-haiku-5-5".to_owned()),
+                ("toolu_a".to_owned(), "claude-sonnet-5-5".to_owned()),
+            ],
+            "the replay of s1 reports nothing"
+        );
+    }
+
+    #[test]
+    fn uuid_less_sub_agent_frames_each_report_their_own_model() {
+        let frame = |parent: &str, model: Option<&str>| {
+            let mut message = json!({"id": format!("m-{parent}"), "role": "assistant",
+                "content": [{"type": "text", "text": "working"}]});
+            if let Some(model) = model {
+                message["model"] = json!(model);
+            }
+            json!({"type": "assistant", "parent_tool_use_id": parent, "message": message})
+                .to_string()
+        };
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        a.feed(&agent_call("toolu_b", false));
+        let mut reported = reported_models(&a.feed(&frame("toolu_a", Some("claude-haiku-5-5"))));
+        reported.extend(reported_models(&a.feed(&frame("toolu_b", None))));
+        reported.extend(reported_models(
+            &a.feed(&frame("toolu_b", Some("claude-sonnet-5-5"))),
+        ));
+        reported.extend(reported_models(
+            &a.feed(&frame("toolu_a", Some("claude-haiku-5-5"))),
+        ));
+        assert_eq!(
+            reported,
+            [
+                ("toolu_a".to_owned(), "claude-haiku-5-5".to_owned()),
+                ("toolu_b".to_owned(), "claude-sonnet-5-5".to_owned()),
+            ],
+            "each sub-agent reports once; a frame without a model blocks nothing"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_or_blank_model_is_not_reported() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        let synthetic = a.feed(&model_frame("s1", Some("toolu_a"), "<synthetic>"));
+        assert!(reported_models(&synthetic).is_empty());
+        let blank = a.feed(&model_frame("s2", Some("toolu_a"), " "));
+        assert!(reported_models(&blank).is_empty());
+    }
+
+    #[test]
+    fn a_nested_sub_agent_reports_its_model_on_its_own_item() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_outer", false));
+        let inner_call = json!({"type": "assistant", "uuid": "u-inner",
+            "parent_tool_use_id": "toolu_outer",
+            "message": {"id": "m-inner", "role": "assistant", "model": "claude-sonnet-5-5",
+                "content": [{"type": "tool_use", "id": "toolu_inner", "name": "Agent",
+                    "input": {"description": "Inner", "prompt": "p"}}]}})
+        .to_string();
+        let out = a.feed(&inner_call);
+        assert_eq!(
+            reported_models(&out),
+            [("toolu_outer".to_owned(), "claude-sonnet-5-5".to_owned())]
+        );
+        let out = a.feed(&model_frame("i1", Some("toolu_inner"), "claude-haiku-5-5"));
+        assert_eq!(
+            reported_models(&out),
+            [("toolu_inner".to_owned(), "claude-haiku-5-5".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_sub_agent_result_reports_its_resolved_model() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&agent_call("toolu_a", false));
+        let result = json!({"type": "user", "uuid": "r-a", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "toolu_a", "content": [{"type": "text", "text": "OK"}]}]},
+            "tool_use_result": {"status": "completed", "agentId": "ag1",
+                "resolvedModel": "claude-haiku-5-5"}})
+        .to_string();
+        let out = a.feed(&result);
+        assert_eq!(
+            reported_models(&out),
+            [("toolu_a".to_owned(), "claude-haiku-5-5".to_owned())]
+        );
+        assert!(
+            matches!(
+                out.last().map(|e| &e.event),
+                Some(Event::ItemCompleted { .. })
+            ),
+            "the card still completes"
+        );
+        // Its messages already named that model: a later result does not repeat it.
+        let mut b = ClaudeAdapter::new();
+        b.feed(&agent_call("toolu_a", false));
+        b.feed(&model_frame("s1", Some("toolu_a"), "claude-haiku-5-5"));
+        assert!(reported_models(&b.feed(&result)).is_empty());
+    }
 
     fn agent_call(id: &str, background: bool) -> String {
         json!({"type": "assistant", "uuid": format!("u-{id}"), "parent_tool_use_id": null,
@@ -3428,11 +3623,9 @@ mod tests {
     /// Every frame the CLI sent in a recording, fed in order.
     fn replay_w0(fixture: &str) -> Vec<Envelope> {
         let mut a = ClaudeAdapter::new();
-        fixture
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|rec| rec["dir"] == "out")
-            .flat_map(|rec| a.feed(&rec["frame"].to_string()))
+        stdout_frames(fixture, Malformed::Skip)
+            .iter()
+            .flat_map(|frame| a.feed(frame))
             .collect()
     }
 
@@ -3614,15 +3807,7 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         pending_edit(&mut a);
         assert_eq!(
-            written(
-                &mut a,
-                Command::Approve {
-                    request: "r1".into(),
-                    decision: Decision::Allow,
-                    updated_input: None,
-                    message: None,
-                }
-            ),
+            written(&mut a, approve(Decision::Allow, "r1")),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
                 "response": {"behavior": "allow", "updatedInput": {"file_path": "/x"}, "toolUseID": "tu1"}}})
         );
@@ -3656,27 +3841,14 @@ mod tests {
         );
         pending_edit(&mut a);
         assert_eq!(
-            written(
-                &mut a,
-                Command::Approve {
-                    request: "r1".into(),
-                    decision: Decision::Cancel,
-                    updated_input: None,
-                    message: None,
-                }
-            ),
+            written(&mut a, approve(Decision::Cancel, "r1")),
             json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1",
                 "response": {"behavior": "deny", "message": "The user denied this request",
                     "interrupt": true, "toolUseID": "tu1"}}})
         );
         // Answered requests are gone.
         assert!(matches!(
-            a.encode(Command::Approve {
-                request: "r1".into(),
-                decision: Decision::Allow,
-                updated_input: None,
-                message: None,
-            }),
+            a.encode(approve(Decision::Allow, "r1")),
             Err(AdapterError::Invalid(_))
         ));
     }

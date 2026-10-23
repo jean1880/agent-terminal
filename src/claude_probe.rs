@@ -18,15 +18,14 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-use agent_core::catalog::{parse_claude_initialize, CatalogModel};
-use agent_core::event::{Account, QuotaWindow};
+use agent_core::catalog::parse_claude_initialize;
 use agent_core::quota::{claude_account, claude_signed_out, claude_usage};
 use gtk4::glib;
 use serde_json::Value;
 use tracing::warn;
 
 use crate::agent_proc::{AgentEnv, AgentProcess, SpawnSpec};
-use crate::probe::{InFlight, ProbeTarget};
+use crate::probe::{InFlight, ProbeReading, ProbeTarget};
 
 const INIT_ID: &str = "catalog-1";
 const USAGE_ID: &str = "catalog-usage";
@@ -41,11 +40,8 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClaudeProbe {
-    pub models: Vec<CatalogModel>,
-    pub account: Option<Account>,
-    pub windows: Vec<QuotaWindow>,
-    /// No one is signed in (a fresh install, or a login that was removed).
-    pub signed_out: bool,
+    /// What `initialize` and `get_usage` answered.
+    pub reading: ProbeReading,
     /// `claude --version`, when it answered with one.
     pub version: Option<String>,
 }
@@ -221,10 +217,12 @@ pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
         .map(|u| claude_usage(&u))
         .unwrap_or_default();
     Ok(ClaudeProbe {
-        models: parse_claude_initialize(&init),
-        account: claude_account(&init),
-        windows,
-        signed_out: claude_signed_out(&init),
+        reading: ProbeReading {
+            models: parse_claude_initialize(&init),
+            account: claude_account(&init),
+            windows,
+            signed_out: claude_signed_out(&init),
+        },
         version,
     })
 }
@@ -242,43 +240,30 @@ pub fn probe_shared(program: &str, env: &AgentEnv, done: impl FnOnce(&ProbeResul
         program: program.to_owned(),
         env: env.clone(),
     };
-    if !IN_FLIGHT.with(|f| f.join(&target, done)) {
-        return;
-    }
-    glib::spawn_future_local(async move {
-        let mut next = Some(target);
-        while let Some(target) = next {
+    InFlight::request(
+        &IN_FLIGHT,
+        target,
+        |target| async move {
             let result = probe_claude(&target.program, &target.env).await;
             if let Err(why) = &result {
                 warn!(why, "claude probe failed");
             }
-            next = IN_FLIGHT.with(|f| f.finish(&result));
-        }
-    });
+            result
+        },
+        done,
+    );
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
     use super::*;
-    use crate::testutil::{in_loop, pump_until};
+    use crate::probe::fixtures::{fake_script, run_to_end, serve_concurrently};
 
     /// A stand-in for `claude` (never the real one).
     pub(crate) fn fake_claude(dir: &Path, body: &str) -> String {
-        let path = dir.join("fake-claude");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(&path)
-            .unwrap();
-        f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
-            .unwrap();
-        path.display().to_string()
+        fake_script(dir, "fake-claude", body)
     }
 
     const INIT_REPLY: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"catalog-1","response":{"account":{"email":"user@example.com","subscriptionType":"Claude Pro","apiProvider":"firstParty"},"models":[{"value":"opus","displayName":"Opus","supportedEffortLevels":["low","high"]}]}}}"#;
@@ -291,22 +276,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn run_probe(program: String) -> ProbeResult {
-        in_loop(|ctx| {
-            let out = Rc::new(RefCell::new(None));
-            let o = out.clone();
-            glib::spawn_future_local(async move {
-                *o.borrow_mut() = Some(probe_claude(&program, &AgentEnv::default()).await);
-            });
-            assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
-            let r = out.borrow_mut().take().unwrap();
-            r
+        run_to_end(15, async move {
+            probe_claude(&program, &AgentEnv::default()).await
         })
     }
 
     #[test]
     fn probe_reads_models_account_and_usage_from_one_process() {
         let dir = tempfile::tempdir().unwrap();
-        let p = run_probe(fake_claude(dir.path(), &answering())).expect("probe");
+        let p = run_probe(fake_claude(dir.path(), &answering()))
+            .expect("probe")
+            .reading;
         assert_eq!(p.models.len(), 1);
         assert_eq!(p.models[0].efforts, ["low", "high"]);
         assert_eq!(p.account.expect("account").label, "user@example.com");
@@ -319,7 +299,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Answers initialize, then exits: get_usage never comes back.
         let body = format!("read line\necho '{INIT_REPLY}'\nread line\nexit 0");
-        let p = run_probe(fake_claude(dir.path(), &body)).expect("probe");
+        let p = run_probe(fake_claude(dir.path(), &body))
+            .expect("probe")
+            .reading;
         assert_eq!(p.models.len(), 1);
         assert!(p.windows.is_empty());
     }
@@ -338,18 +320,9 @@ pub(crate) mod tests {
         };
         let run = |env: AgentEnv| {
             let program = program.clone();
-            in_loop(|ctx| {
-                let out = Rc::new(RefCell::new(None));
-                let o = out.clone();
-                glib::spawn_future_local(async move {
-                    *o.borrow_mut() = Some(probe_claude(&program, &env).await);
-                });
-                assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
-                let r = out.borrow_mut().take().unwrap();
-                r
-            })
+            run_to_end(15, async move { probe_claude(&program, &env).await })
         };
-        assert_eq!(run(env).expect("probe").models.len(), 1);
+        assert_eq!(run(env).expect("probe").reading.models.len(), 1);
         assert!(
             run(AgentEnv::default()).is_err(),
             "without the env it is silent"
@@ -380,19 +353,9 @@ pub(crate) mod tests {
             answering()
         );
         let program = fake_claude(dir.path(), &body);
-        let got = in_loop(|ctx| {
-            let got = Rc::new(Cell::new(0));
-            for _ in 0..3 {
-                let got = got.clone();
-                probe_shared(&program, &AgentEnv::default(), move |r| {
-                    assert!(r.is_ok());
-                    got.set(got.get() + 1);
-                });
-            }
-            assert!(pump_until(ctx, 15, || got.get() == 3), "callers not served");
-            got.get()
+        serve_concurrently(15, 3, |done| {
+            probe_shared(&program, &AgentEnv::default(), move |r| done(r.is_ok()));
         });
-        assert_eq!(got, 3);
         let launches = std::fs::read_to_string(count).unwrap();
         assert_eq!(launches.lines().count(), 1, "one process for three callers");
     }

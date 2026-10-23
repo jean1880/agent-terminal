@@ -11,6 +11,8 @@
 //! the positionals after it may be misread), and anything that is not plain text (a control,
 //! bidi or zero-width character) gives no reading at all.
 
+use crate::shell_words::basename;
+
 /// The program the command runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -150,16 +152,7 @@ impl GitAction {
 /// Whether `s` is safe to show as text: no control (a line break aside: commit messages have
 /// them), bidi or zero-width characters.
 fn plain(s: &str) -> bool {
-    !s.chars().any(|c| {
-        (c.is_control() && c != '\n')
-            || matches!(c,
-                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
-    })
-}
-
-fn basename(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
+    !crate::text::has_control_or_bidi(s, &['\n'])
 }
 
 /// Reads `argv` as a `git` or `gh` command. `None`: it is neither, names no subcommand, or holds

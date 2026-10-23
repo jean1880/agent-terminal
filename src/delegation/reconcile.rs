@@ -1,7 +1,7 @@
 //! Startup reconciliation never dispatches or signals an old pid.
 use super::services::AppServices;
-use super::supervisor::{parse_enum, Supervisor};
-use agent_core::delegation::authority::{TaskMode, WorkspaceScope};
+use super::supervisor::Supervisor;
+use agent_core::delegation::authority::WorkspaceScope;
 use agent_core::delegation::ToolError;
 use agent_core::delegation::{ProcessGeneration, RunId, WorkerId};
 use std::path::PathBuf;
@@ -35,11 +35,9 @@ impl Supervisor {
             };
             let (Some(thread), Some(parent), Some(driver), Some(mode)) = (
                 row.backing_thread_id.clone(),
-                row.parent_id
-                    .as_deref()
-                    .and_then(|p| WorkerId::parse(p).ok()),
-                parse_enum::<agent_core::adapter::Driver>(&row.driver),
-                row.task_mode.as_deref().and_then(parse_enum::<TaskMode>),
+                row.parent(),
+                row.driver_kind(),
+                row.task_mode_kind(),
             ) else {
                 continue;
             };
@@ -129,7 +127,7 @@ impl Supervisor {
             if let Some(w) = state.workers.get_mut(&worker) {
                 w.cwd = cwd;
                 if let Some(run) = last {
-                    w.generation = ProcessGeneration(run.process_generation.max(0) as u64);
+                    w.generation = ProcessGeneration::from_stored(run.process_generation);
                     w.last_run = RunId::parse(&run.id).ok();
                 }
             }

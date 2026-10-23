@@ -57,74 +57,6 @@ fn parse_handle(s: &str, prefix: &str) -> Result<(), IdError> {
     Ok(())
 }
 
-macro_rules! handle {
-    ($(#[$doc:meta])* $name:ident, $prefix:literal) => {
-        $(#[$doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-        #[serde(try_from = "String", into = "String")]
-        pub struct $name(String);
-
-        impl $name {
-            pub const PREFIX: &'static str = $prefix;
-
-            pub fn parse(s: &str) -> Result<Self, IdError> {
-                parse_handle(s, Self::PREFIX)?;
-                Ok(Self(s.to_owned()))
-            }
-
-            /// The handle with this random suffix (the app draws it; 8..=40 alphanumerics).
-            pub fn from_suffix(suffix: &str) -> Result<Self, IdError> {
-                Self::parse(&format!("{}{}", Self::PREFIX, suffix))
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl TryFrom<String> for $name {
-            type Error = IdError;
-            fn try_from(s: String) -> Result<Self, IdError> {
-                parse_handle(&s, Self::PREFIX)?;
-                Ok(Self(s))
-            }
-        }
-
-        impl From<$name> for String {
-            fn from(id: $name) -> String {
-                id.0
-            }
-        }
-    };
-}
-
-handle!(
-    /// A worker: a root session or a supervised child (`w_…`).
-    WorkerId,
-    "w_"
-);
-handle!(
-    /// One run (turn) of a worker (`r_…`).
-    RunId,
-    "r_"
-);
-handle!(
-    /// One mailbox message (`m_…`).
-    MessageId,
-    "m_"
-);
-handle!(
-    /// One accepted mutation (`op_…`).
-    OperationId,
-    "op_"
-);
-
 macro_rules! checked_string {
     ($(#[$doc:meta])* $name:ident, $check:expr) => {
         $(#[$doc])*
@@ -166,6 +98,44 @@ macro_rules! checked_string {
         }
     };
 }
+
+/// A handle: a [`checked_string!`] whose check is [`parse_handle`] with its prefix, plus the
+/// prefix and a constructor from the random suffix.
+macro_rules! handle {
+    ($(#[$doc:meta])* $name:ident, $prefix:literal) => {
+        checked_string!($(#[$doc])* $name, |s| parse_handle(s, $prefix));
+
+        impl $name {
+            pub const PREFIX: &'static str = $prefix;
+
+            /// The handle with this random suffix (the app draws it; 8..=40 alphanumerics).
+            pub fn from_suffix(suffix: &str) -> Result<Self, IdError> {
+                Self::parse(&format!("{}{}", Self::PREFIX, suffix))
+            }
+        }
+    };
+}
+
+handle!(
+    /// A worker: a root session or a supervised child (`w_…`).
+    WorkerId,
+    "w_"
+);
+handle!(
+    /// One run (turn) of a worker (`r_…`).
+    RunId,
+    "r_"
+);
+handle!(
+    /// One mailbox message (`m_…`).
+    MessageId,
+    "m_"
+);
+handle!(
+    /// One accepted mutation (`op_…`).
+    OperationId,
+    "op_"
+);
 
 /// Longest cursor, in bytes.
 pub const MAX_CURSOR_BYTES: usize = 256;
@@ -228,9 +198,37 @@ pub struct AuthorityEpoch(pub u64);
 #[serde(transparent)]
 pub struct ProcessGeneration(pub u64);
 
+impl AuthorityEpoch {
+    /// The epoch a store row holds: a negative value (never written) reads as 0.
+    pub fn from_stored(stored: i64) -> Self {
+        Self(stored.max(0) as u64)
+    }
+}
+
+impl ProcessGeneration {
+    /// The generation after this one.
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// The generation a store row holds: a negative value (never written) reads as 0.
+    pub fn from_stored(stored: i64) -> Self {
+        Self(stored.max(0) as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_counters_clamp_at_zero() {
+        assert_eq!(AuthorityEpoch::from_stored(-3), AuthorityEpoch(0));
+        assert_eq!(AuthorityEpoch::from_stored(4), AuthorityEpoch(4));
+        assert_eq!(ProcessGeneration::from_stored(-1), ProcessGeneration(0));
+        assert_eq!(ProcessGeneration::from_stored(7), ProcessGeneration(7));
+        assert_eq!(ProcessGeneration(7).next(), ProcessGeneration(8));
+    }
 
     #[test]
     fn handles_accept_the_documented_shapes() {

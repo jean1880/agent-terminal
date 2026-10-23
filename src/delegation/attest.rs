@@ -25,12 +25,8 @@ pub(super) fn sanitise_identity(identity: &mut agent_core::delegation::identity:
             .into_iter()
             .flatten()
         {
-            *text = agent_core::redact::redact(text);
-            let mut end = max.min(text.len());
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
+            let redacted = agent_core::redact::redact(text);
+            *text = agent_core::text::truncate_bytes(&redacted, max).to_owned();
         }
     }
 }
@@ -152,15 +148,7 @@ impl DelegationHooks for Hooks {
             return None;
         }
         let prep = w.staged.take()?;
-        w.token = Some(TokenSlot {
-            epoch,
-            generation,
-            token: prep.token.clone(),
-            consumed_by: None,
-            live_conn: None,
-            pid: None,
-            issued: Instant::now(),
-        });
+        w.token = Some(TokenSlot::new(epoch, generation, prep.token.clone(), None));
         // The watch is attached only after a successful spawn. Keep the overlay until then. One
         // still pending belongs to an earlier start that never spawned: nothing else removes it.
         let stale = std::mem::replace(&mut w.pending_overlay, prep.overlay);

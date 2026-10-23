@@ -416,41 +416,13 @@ mod tests {
 
     mod repo {
         use super::super::*;
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
         use std::fs;
         use std::path::PathBuf;
-        use std::process::Command;
-
-        fn sh(dir: &Path, args: &[&str]) {
-            let output = Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "init.defaultBranch=main",
-                ])
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
 
         /// A clone of a local bare "remote", on `main`, with one commit pushed.
         fn new_clone() -> Option<(tempfile::TempDir, PathBuf)> {
-            if !crate::git::git_installed() {
-                eprintln!("git not installed; skipping");
+            if !git_or_skip() {
                 return None;
             }
             let tmp = tempfile::tempdir().unwrap();
@@ -459,10 +431,7 @@ mod tests {
             sh(&bare, &["init", "-q", "--bare"]);
             let work = tmp.path().join("work");
             fs::create_dir_all(&work).unwrap();
-            sh(&work, &["init", "-q"]);
-            fs::write(work.join("a.txt"), "a\n").unwrap();
-            sh(&work, &["add", "."]);
-            sh(&work, &["commit", "-q", "-m", "init"]);
+            init_repo_at(&work, &[("a.txt", b"a\n")]);
             sh(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
             sh(&work, &["push", "-q", "-u", "origin", "main"]);
             sh(&work, &["remote", "set-head", "origin", "main"]);

@@ -35,15 +35,9 @@ pub struct CatalogModel {
 
 /// Finds the `models` array in an `initialize` control response, whether given as the bare
 /// payload, the `{response: {...}}` envelope, or the whole recorded frame.
+/// A `models` that is not an array is passed over, and the search goes on.
 fn models_array(v: &Value) -> Option<&Vec<Value>> {
-    let mut cur = v;
-    for _ in 0..4 {
-        if let Some(a) = cur.get("models").and_then(Value::as_array) {
-            return Some(a);
-        }
-        cur = cur.get("response")?;
-    }
-    None
+    crate::adapter::response_chain(v).find_map(|cur| cur.get("models").and_then(Value::as_array))
 }
 
 /// Claude's models from the `initialize` control response payload.
@@ -421,14 +415,14 @@ pub fn group_for_picker<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{records, Malformed};
 
     const CONTROLS: &str = include_str!("../tests/fixtures/claude-controls-slash.ndjson");
 
     /// The recorded `init-1` frame (`dir: out`), whole.
     fn init_frame() -> Value {
-        CONTROLS
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        records(CONTROLS, Malformed::Skip)
+            .into_iter()
             .find(|r| r.pointer("/frame/response/request_id") == Some(&Value::from("init-1")))
             .expect("init-1 response in the fixture")["frame"]
             .clone()

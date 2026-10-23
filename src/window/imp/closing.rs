@@ -584,14 +584,7 @@ mod tests {
         adw::init().expect("libadwaita init");
         crate::icons::register();
         crate::load_css();
-        let config_home = tempfile::tempdir().expect("tmp");
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.Closing")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>)
-            .expect("registering a non-unique application");
+        let app = crate::window::imp::test_support::test_app("org.test.Closing", false);
         // Keep the app (and so the windows' lifecycle) independent of the window count.
         let _hold = app.hold();
         let ctx = glib::MainContext::default();

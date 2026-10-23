@@ -35,6 +35,7 @@ use std::time::SystemTime;
 
 use agent_core::codex_rules;
 use agent_core::event::Decision;
+use agent_core::shell_words::{basename, is_assignment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -114,19 +115,6 @@ pub fn simple_command_tokens(command: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(tokens)
-}
-
-/// `NAME=value`: an environment assignment when it leads a command.
-pub(crate) fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty()
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
-fn basename(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
 }
 
 /// A shell given a command line to run (`bash -c …`, `zsh -lc …`, `sh -ec …`).
@@ -2403,11 +2391,7 @@ impl CodexTarget {
 /// `path` with the home folder shown as `~` (the full path under test, where there is none).
 fn tilde(path: &Path) -> String {
     match home_dir(None) {
-        Some(home) => match path.strip_prefix(&home) {
-            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => path.display().to_string(),
-        },
+        Some(home) => agent_kit::paths::tilde(path, &home),
         None => path.display().to_string(),
     }
 }

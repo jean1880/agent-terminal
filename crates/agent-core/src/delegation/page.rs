@@ -8,6 +8,7 @@ use super::ids::{Cursor, WorkerId};
 use super::mailbox::fnv1a_128;
 use super::token::{b64url_decode, b64url_encode};
 use super::wire::{escaped_len, transport_cost};
+use crate::text::json_len;
 
 /// What a cursor was issued for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,10 +130,6 @@ pub enum UnitKind {
 pub struct Reservation {
     pub json: usize,
     pub transport: usize,
-}
-
-fn json_len(v: &Value) -> usize {
-    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
 }
 
 impl Reservation {

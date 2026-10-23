@@ -129,6 +129,11 @@ pub(in crate::window::imp::threads) fn transfer_keeps_live_view_routes(
     destination.imp().finish_shell(None);
     destination.imp().reveal_shell();
     destination.present();
+    // A window no open thread is registered to is still searched for tabs in a workspace.
+    assert!(
+        super::every_window().contains(&destination),
+        "a window without threads is checked before a workspace is removed"
+    );
     let session = slot.get().unwrap();
     let page = source.imp().page_of_thread(thread).unwrap();
     let chat_view = source

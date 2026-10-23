@@ -1,6 +1,6 @@
 //! Supervisor-owned delivery queues. Every write follows a durable reservation and a fresh authority check.
 use super::seam::{DelegatedInput, DelegatedOutcome, InputSource};
-use super::supervisor::{error, parse_enum, Supervisor};
+use super::supervisor::{error, Supervisor};
 use agent_core::delegation::authority::delivery_allowed;
 use agent_core::delegation::mailbox::{
     plan_delivery, DeliveryPlan, DeliveryState, Direction, TargetRuntime,
@@ -78,9 +78,7 @@ impl Supervisor {
             let target = match &r.target {
                 Target::Parent => from
                     .row
-                    .parent_id
-                    .as_deref()
-                    .and_then(|id| WorkerId::parse(id).ok())
+                    .parent()
                     .ok_or_else(|| error(ErrorCode::NotFound, "root has no parent"))?,
                 Target::Worker(id) => id.clone(),
             };
@@ -105,7 +103,7 @@ impl Supervisor {
                 dir,
                 r.kind,
                 self.principal_mode(caller),
-                to.row.task_mode.as_deref().and_then(parse_enum),
+                to.row.task_mode_kind(),
             )
             .map_err(|c| error(c, "delivery exceeds authority"))?;
             (target, dir)
@@ -135,9 +133,7 @@ impl Supervisor {
                     || w.generations.is_empty()
                     || !w.readback.ready
                     || w.row.delegation_status == "rebind_required"
-                    || w.token.as_ref().is_none_or(|t| {
-                        t.epoch.0 != state.roots[&w.root].row.authority_epoch.max(0) as u64
-                    }))
+                    || !state.token_current(w))
         };
         let needs_queue = matches!(plan, DeliveryPlan::QueueNextTurn) || needs_rebind;
         let live = match &plan {
@@ -146,14 +142,15 @@ impl Supervisor {
             _ => None,
         };
         let root = self.state.borrow().workers[caller].root.clone();
-        let a = Accept {
-            principal: caller.clone(),
-            request: ToolRequest::Send(r.clone()),
-            resolution: agent_core::delegation::operation::Resolution {
+        let a = self.accept_request(
+            caller,
+            &root,
+            ToolRequest::Send(r.clone()),
+            agent_core::delegation::operation::Resolution {
                 target: Some(target.clone()),
                 ..Default::default()
             },
-            plan: AcceptPlan::Send(SendPlan {
+            AcceptPlan::Send(SendPlan {
                 initial: if needs_queue {
                     DeliveryState::QueuedNextTurn
                 } else {
@@ -161,11 +158,8 @@ impl Supervisor {
                 },
                 target_run: live,
             }),
-            warnings: Vec::new(),
-            limits: self.limits,
-            live_processes: self.usage(&root).live_processes,
-            dispatching: self.state.borrow().dispatching.clone(),
-        };
+            Vec::new(),
+        );
         let (accepted, _) = self
             .accept(a, !needs_queue && direction == Direction::ParentToChild)
             .await?;
@@ -697,21 +691,7 @@ impl Supervisor {
             .write("end undelivered delegated run", None, true, move |s| {
                 s.atomically(|s| {
                     let at = super::supervisor::now();
-                    if s.delegation_run(run.as_str())?.is_some_and(|r| {
-                        !matches!(
-                            r.state.as_str(),
-                            "completed" | "interrupted" | "failed" | "unknown"
-                        )
-                    }) {
-                        s.set_delegation_run_state(
-                            run.as_str(),
-                            run_state,
-                            None,
-                            Some(&reason),
-                            None,
-                            at,
-                        )?;
-                    }
+                    s.end_delegation_run_if_open(run.as_str(), run_state, Some(&reason), at)?;
                     if let Some(state) = worker_state {
                         if s.delegation_worker(worker.as_str())?
                             .is_some_and(|w| w.state != "closed")
@@ -720,12 +700,7 @@ impl Supervisor {
                         }
                     }
                     // As `record_fact` does: a fact already recorded is not recorded again.
-                    if !s
-                        .delegation_operation(operation.as_str())?
-                        .is_some_and(|o| o.dispatch_state == "failed")
-                    {
-                        s.record_delegation_dispatch(&operation, &fact)?;
-                    }
+                    s.record_delegation_dispatch_once(&operation, &fact)?;
                     Ok(())
                 })
             });
@@ -792,29 +767,8 @@ impl Supervisor {
         });
     }
     pub(super) fn queue_human(self: &Rc<Self>, worker: &WorkerId, text: &str) {
-        let caller = {
-            let state = self.state.borrow();
-            state
-                .workers
-                .get(worker)
-                .and_then(|w| w.row.parent_id.as_deref())
-                .and_then(|p| WorkerId::parse(p).ok())
-        };
-        let Some(caller) = caller else {
-            return;
-        };
-        let worker = worker.clone();
         let text = text.to_owned();
-        let sup = self.clone();
-        gtk4::glib::spawn_future_local(async move {
-            let key = agent_core::delegation::IdempotencyKey::parse(&format!(
-                "human-{}",
-                gtk4::glib::uuid_string_random()
-            ))
-            .ok();
-            let Some(key) = key else {
-                return;
-            };
+        self.act_as_parent(worker, |sup, caller, worker, key| async move {
             let r = SendRequest {
                 target: Target::Worker(worker),
                 text,
@@ -825,9 +779,7 @@ impl Supervisor {
                 expected_authority_epoch: None,
                 idempotency_key: key,
             };
-            if let Err(e) = sup.send_worker(&caller, r).await {
-                (sup.services.report)(&e.to_string());
-            }
+            sup.send_worker(&caller, r).await
         });
     }
 }

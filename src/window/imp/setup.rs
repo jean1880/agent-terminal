@@ -270,14 +270,7 @@ mod tests {
         adw::init().expect("libadwaita init");
         crate::icons::register();
         crate::load_css();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.Welcome")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>)
-            .expect("registering a non-unique application");
+        let app = crate::window::imp::test_support::test_app("org.test.Welcome", false);
         let ctx = glib::MainContext::default();
         for (width, height) in [(360, 640), (360, 480), (600, 420), (900, 800)] {
             let window = super::super::super::AgentTerminalWindow::new(&app);

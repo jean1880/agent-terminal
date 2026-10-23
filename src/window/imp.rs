@@ -12,11 +12,18 @@ mod thread_menu;
 mod threads;
 mod uninstall_prefs;
 
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(super) mod test_support;
+
+use threads::{blocking_or, off_main};
+
 pub(crate) use threads::{close_store_writer, flush_store_for_panic};
 
 use super::diff_panel::DiffPanel;
 use super::loading;
 use crate::config::{Profile, SessionFormat};
+use crate::dialogs::confirm_dialog;
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
 use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory, Launch};
@@ -451,16 +458,35 @@ async fn repo_present(dir: String, thread: Option<String>) -> Option<bool> {
     let Some(tid) = thread else {
         return Some(false);
     };
-    let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
+    thread_enclosing_repo(tid).await.map(|repo| repo.is_some())
+}
+
+/// The repository the files `thread`'s edits touched are in, read from the store and
+/// discovered off the main thread. A store that does not answer gives no rows, so no
+/// repository; `None`: the discovery thread panicked.
+async fn thread_enclosing_repo(thread: String) -> Option<Option<std::path::PathBuf>> {
+    let envelopes = threads::store_job(move |s| s.events(&thread, None, 500))
         .await
         .and_then(Result::ok)
         .unwrap_or_default();
     let paths = crate::diff::touched_paths_from_envelopes(
         &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
     );
-    gtk4::gio::spawn_blocking(move || crate::diff::discover_enclosing_repo(&paths).is_some())
+    gtk4::gio::spawn_blocking(move || crate::diff::discover_enclosing_repo(&paths))
         .await
         .ok()
+}
+
+/// Where the external diff tool runs for a panel file: the top of `dir`'s repository, else of
+/// the file's, else `dir` itself. Blocking: run it off the main thread.
+fn diff_tool_working_dir(dir: &str, file: &str) -> std::path::PathBuf {
+    if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(dir)) {
+        repo.toplevel
+    } else if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(file)) {
+        repo.toplevel
+    } else {
+        std::path::PathBuf::from(dir)
+    }
 }
 
 /// The main checkout of the repository `dir` is in, and the branch `dir` has checked out.
@@ -585,6 +611,14 @@ impl TabState {
     /// The session this tab is running, if the terminal knows it.
     fn known_session_id(&self) -> Option<&str> {
         self.session_id.as_deref().or(self.pinned_id.as_deref())
+    }
+
+    /// The repository this tab's diffs and branch come from: the one its session was found
+    /// to run in, else its own folder.
+    fn repo_dir(&self) -> String {
+        self.discovered_repo
+            .clone()
+            .unwrap_or_else(|| self.dir.clone())
     }
 }
 
@@ -1031,11 +1065,7 @@ async fn resolve_active_profile(
 
 /// Presents a one-button informational dialog anchored to `parent`.
 fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &str) {
-    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
-    dialog.add_response("ok", "OK");
-    dialog.set_default_response(Some("ok"));
-    dialog.set_close_response("ok");
-    dialog.present(Some(parent.upcast_ref::<gtk4::Widget>()));
+    present_message_over(parent, heading, body);
 }
 
 /// A thread's subtitle: its folder, and the branch checked out when the repository's remote is
@@ -1366,6 +1396,65 @@ impl ApplicationWindowImpl for AgentTerminalWindow {}
 impl AdwApplicationWindowImpl for AgentTerminalWindow {}
 
 impl AgentTerminalWindow {
+    /// The page in view, once the window has its tab view.
+    fn selected_page(&self) -> Option<adw::TabPage> {
+        self.tab_view
+            .borrow()
+            .as_ref()
+            .and_then(|v| v.selected_page())
+    }
+
+    /// Whether `page` is the page in view.
+    fn is_selected(&self, page: &adw::TabPage) -> bool {
+        self.selected_page().is_some_and(|p| &p == page)
+    }
+
+    /// Runs `f` on `page`'s registry entry, if it has one. The registry stays borrowed while
+    /// `f` runs, so `f` returns owned data and never calls back into the window.
+    fn with_page_tab<R>(&self, page: &adw::TabPage, f: impl FnOnce(&TabState) -> R) -> Option<R> {
+        self.tabs.borrow().iter().find(|t| &t.page == page).map(f)
+    }
+
+    /// [`Self::with_page_tab`], mutably.
+    fn with_page_tab_mut<R>(
+        &self,
+        page: &adw::TabPage,
+        f: impl FnOnce(&mut TabState) -> R,
+    ) -> Option<R> {
+        self.tabs
+            .borrow_mut()
+            .iter_mut()
+            .find(|t| &t.page == page)
+            .map(f)
+    }
+
+    /// Runs `f` on the registry entry whose diff panel is rooted at `root`, as
+    /// [`Self::with_page_tab`] does.
+    fn tab_by_panel<R>(&self, root: &gtk4::Box, f: impl FnOnce(&TabState) -> R) -> Option<R> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|t| t.diff_panel.root == *root)
+            .map(f)
+    }
+
+    /// Asks `dialog` over this window, then runs `answered` with whether it was answered
+    /// `accept_id`, whichever the answer. The window is held while the question is open;
+    /// nothing is asked once it is gone.
+    fn ask(
+        &self,
+        dialog: adw::AlertDialog,
+        accept_id: &'static str,
+        answered: impl FnOnce(&Self, bool) + 'static,
+    ) {
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let yes = crate::dialogs::confirmed(&dialog, &window, accept_id).await;
+            answered(window.imp(), yes);
+        });
+    }
+
     /// Tells the user, once, that their settings file could not be used.
     /// Deferred to idle so the dialog has a presented window to attach to.
     fn report_config_problem(&self) {
@@ -1388,12 +1477,7 @@ impl AgentTerminalWindow {
                 return;
             }
             let imp = window.imp();
-            let selected = imp
-                .tab_view
-                .borrow()
-                .as_ref()
-                .and_then(|view| view.selected_page());
-            if let Some(page) = selected {
+            if let Some(page) = imp.selected_page() {
                 imp.acknowledge_bell(&page);
             }
         });
@@ -1402,9 +1486,7 @@ impl AgentTerminalWindow {
     /// Clears `page`'s pending bell, and withdraws the bell notification once
     /// no tab in any window is still waiting on it.
     fn acknowledge_bell(&self, page: &adw::TabPage) {
-        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| &t.page == page) {
-            tab.bell_pending = false;
-        }
+        self.with_page_tab_mut(page, |tab| tab.bell_pending = false);
         self.withdraw_bell_if_answered();
     }
 
@@ -1550,15 +1632,13 @@ impl AgentTerminalWindow {
 
     /// Returns the terminal of the currently selected tab, if any.
     fn current_terminal(&self) -> Option<Terminal> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        self.tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
+        let page = self.selected_page()?;
+        self.with_page_tab(&page, |t| {
             // A thread's drawer shell counts only while it has the keyboard: copy, paste and
             // search otherwise belong to the chat.
-            .filter(|t| t.chat.is_none() || t.terminal.has_focus())
-            .map(|t| t.terminal.clone())
+            (t.chat.is_none() || t.terminal.has_focus()).then(|| t.terminal.clone())
+        })
+        .flatten()
     }
 
     /// Applies a closure to every open tab's terminal.
@@ -1589,61 +1669,88 @@ impl AgentTerminalWindow {
 
     /// The launch directory of the currently selected tab, if tracked.
     fn current_dir(&self) -> Option<String> {
-        let page = self.tab_view.borrow().as_ref()?.selected_page()?;
-        self.tabs
+        let page = self.selected_page()?;
+        self.with_page_tab(&page, |t| t.dir.clone())
+    }
+
+    /// Adds the window action `name`, which runs `f` (the window held weakly), and returns it.
+    fn add_win_action(&self, name: &str, f: impl Fn(&Self) + 'static) -> gtk4::gio::SimpleAction {
+        let action = gtk4::gio::SimpleAction::new(name, None);
+        let obj = self.obj();
+        action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, _| f(obj.imp())
+        ));
+        obj.add_action(&action);
+        action
+    }
+
+    /// Adds the window action `name`, targeted by a profile name, which runs `f` with that
+    /// profile. A missing name or an unknown profile is logged and does nothing.
+    fn add_profile_action(
+        &self,
+        name: &'static str,
+        f: impl Fn(&Self, Profile) + 'static,
+    ) -> gtk4::gio::SimpleAction {
+        let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
+        let obj = self.obj();
+        action.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
+                    warn!("{name} activated without a profile name");
+                    return;
+                };
+                let imp = obj.imp();
+                let profile = imp.profile_named(&profile_name);
+                match profile {
+                    Some(profile) => f(imp, profile),
+                    None => warn!("No profile named '{profile_name}'"),
+                }
+            }
+        ));
+        obj.add_action(&action);
+        action
+    }
+
+    /// The configured profile called `name`.
+    fn profile_named(&self, name: &str) -> Option<Profile> {
+        self.config
             .borrow()
+            .profiles
             .iter()
-            .find(|t| t.page == page)
-            .map(|t| t.dir.clone())
+            .find(|p| p.name == name)
+            .cloned()
     }
 
     /// Sets up GAction handlers for context menu items.
     fn setup_actions(&self) {
         let obj = self.obj();
 
-        // Copy Action
-        let copy_action = gtk4::gio::SimpleAction::new("copy", None);
-        copy_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                if let Some(terminal) = obj.imp().current_terminal() {
-                    debug!("Action: Copy");
-                    terminal.copy_clipboard_format(Format::Text);
-                } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&obj) {
-                    let _ = focus.activate_action("clipboard.copy", None);
-                }
+        self.add_win_action("copy", |imp| {
+            if let Some(terminal) = imp.current_terminal() {
+                debug!("Action: Copy");
+                terminal.copy_clipboard_format(Format::Text);
+            } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&*imp.obj()) {
+                let _ = focus.activate_action("clipboard.copy", None);
             }
-        ));
-        obj.add_action(&copy_action);
-
-        // Paste Action
-        let paste_action = gtk4::gio::SimpleAction::new("paste", None);
-        paste_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                if let Some(terminal) = obj.imp().current_terminal() {
-                    debug!("Action: Paste");
-                    terminal.paste_clipboard();
-                } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&obj) {
-                    let _ = focus.activate_action("clipboard.paste", None);
-                }
+        });
+        self.add_win_action("paste", |imp| {
+            if let Some(terminal) = imp.current_terminal() {
+                debug!("Action: Paste");
+                terminal.paste_clipboard();
+            } else if let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&*imp.obj()) {
+                let _ = focus.activate_action("clipboard.paste", None);
             }
-        ));
-        obj.add_action(&paste_action);
+        });
 
         // New Tab Action (bound to Ctrl+Shift+T in main.rs)
-        let new_tab_action = gtk4::gio::SimpleAction::new("new-tab", None);
-        new_tab_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: New Tab");
-                obj.imp().new_tab();
-            }
-        ));
-        obj.add_action(&new_tab_action);
+        self.add_win_action("new-tab", |imp| {
+            debug!("Action: New Tab");
+            imp.new_tab();
+        });
 
         // Zoom, search and tab navigation as window actions rather than key
         // handlers on the terminal widget. Anything bound to the terminal is
@@ -1651,73 +1758,38 @@ impl AgentTerminalWindow {
         // search entry — which is why copy, paste and zoom used to stop working
         // in exactly the situations where you would reach for them.
         for (name, delta) in [("zoom-in", 0.1_f64), ("zoom-out", -0.1)] {
-            let action = gtk4::gio::SimpleAction::new(name, None);
-            action.connect_activate(glib::clone!(
-                #[weak]
-                obj,
-                move |_, _| {
-                    let imp = obj.imp();
-                    let current = imp.config.borrow().font_scale;
-                    // Floor rather than clamp to zero: a scale of 0 renders an
-                    // invisible terminal with no obvious way back.
-                    imp.set_font_scale((current + delta).clamp(0.5, 3.0));
-                }
-            ));
-            obj.add_action(&action);
+            self.add_win_action(name, move |imp| {
+                let current = imp.config.borrow().font_scale;
+                // Floor rather than clamp to zero: a scale of 0 renders an
+                // invisible terminal with no obvious way back.
+                imp.set_font_scale((current + delta).clamp(0.5, 3.0));
+            });
         }
-
-        let zoom_reset = gtk4::gio::SimpleAction::new("zoom-reset", None);
-        zoom_reset.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().set_font_scale(1.0)
-        ));
-        obj.add_action(&zoom_reset);
-
-        let search_action = gtk4::gio::SimpleAction::new("search", None);
-        search_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().toggle_search()
-        ));
-        obj.add_action(&search_action);
-
-        let close_tab = gtk4::gio::SimpleAction::new("close-tab", None);
-        close_tab.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                // Through the same door as the sidebar's X, so a running thread asks first.
-                let imp = obj.imp();
-                if let Some(key) = imp.selected_row_key() {
-                    imp.close_row(&key);
-                }
+        self.add_win_action("zoom-reset", |imp| imp.set_font_scale(1.0));
+        self.add_win_action("search", Self::toggle_search);
+        self.add_win_action("close-tab", |imp| {
+            // Through the same door as the sidebar's X, so a running thread asks first.
+            if let Some(key) = imp.selected_row_key() {
+                imp.close_row(&key);
             }
-        ));
-        obj.add_action(&close_tab);
+        });
 
         for (name, forward) in [("next-tab", true), ("previous-tab", false)] {
-            let action = gtk4::gio::SimpleAction::new(name, None);
-            action.connect_activate(glib::clone!(
-                #[weak]
-                obj,
-                move |_, _| {
-                    if let Some(view) = obj.imp().tab_view.borrow().as_ref() {
-                        // select_next_page stops at the end; wrap explicitly so
-                        // cycling works the way it does in every other terminal.
-                        let moved = if forward {
-                            view.select_next_page()
-                        } else {
-                            view.select_previous_page()
-                        };
-                        if !moved && view.n_pages() > 0 {
-                            let wrap = if forward { 0 } else { view.n_pages() - 1 };
-                            view.set_selected_page(&view.nth_page(wrap));
-                        }
+            self.add_win_action(name, move |imp| {
+                if let Some(view) = imp.tab_view.borrow().as_ref() {
+                    // select_next_page stops at the end; wrap explicitly so
+                    // cycling works the way it does in every other terminal.
+                    let moved = if forward {
+                        view.select_next_page()
+                    } else {
+                        view.select_previous_page()
+                    };
+                    if !moved && view.n_pages() > 0 {
+                        let wrap = if forward { 0 } else { view.n_pages() - 1 };
+                        view.set_selected_page(&view.nth_page(wrap));
                     }
                 }
-            ));
-            obj.add_action(&action);
+            });
         }
 
         // Alt+1..9 jump straight to a tab. Parameterised so one action covers all
@@ -1750,75 +1822,27 @@ impl AgentTerminalWindow {
         // by profile name rather than index, so the menus stay correct if the
         // profile list changes underneath them.
         for (name, in_folder) in [("new-tab-profile", false), ("new-tab-folder-profile", true)] {
-            let action = gtk4::gio::SimpleAction::new(name, Some(&String::static_variant_type()));
-            action.connect_activate(glib::clone!(
-                #[weak]
-                obj,
-                move |_, target| {
-                    let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
-                        warn!("{name} activated without a profile name");
-                        return;
-                    };
-                    let imp = obj.imp();
-                    let profile = imp
-                        .config
-                        .borrow()
-                        .profiles
-                        .iter()
-                        .find(|p| p.name == profile_name)
-                        .cloned();
-                    match profile {
-                        Some(profile) if in_folder => imp.new_tab_in_folder(Some(profile)),
-                        Some(profile) => imp.new_tab_with_profile(&profile),
-                        None => warn!("No profile named '{profile_name}'"),
-                    }
+            self.add_profile_action(name, move |imp, profile| {
+                if in_folder {
+                    imp.new_tab_in_folder(Some(profile));
+                } else {
+                    imp.new_tab_with_profile(&profile);
                 }
-            ));
-            obj.add_action(&action);
+            });
         }
 
         // New Thread in Isolated Git Worktree, as the active profile or a named one.
         // Disabled (greyed out in menus) if git is not installed on the system.
-        let new_tab_worktree = gtk4::gio::SimpleAction::new("new-tab-worktree", None);
         let git_available = agent_kit::git::git_installed();
-        new_tab_worktree.set_enabled(git_available);
-        new_tab_worktree.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: New Thread in Isolated Git Worktree");
-                obj.imp().new_tab_in_worktree(None);
-            }
-        ));
-        obj.add_action(&new_tab_worktree);
-        let new_tab_worktree_as = gtk4::gio::SimpleAction::new(
-            "new-tab-worktree-profile",
-            Some(&String::static_variant_type()),
-        );
-        new_tab_worktree_as.set_enabled(git_available);
-        new_tab_worktree_as.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, target| {
-                let Some(profile_name) = target.and_then(|t| t.get::<String>()) else {
-                    warn!("new-tab-worktree-profile activated without a profile name");
-                    return;
-                };
-                let imp = obj.imp();
-                let profile = imp
-                    .config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == profile_name)
-                    .cloned();
-                match profile {
-                    Some(profile) => imp.new_tab_in_worktree(Some(profile)),
-                    None => warn!("No profile named '{profile_name}'"),
-                }
-            }
-        ));
-        obj.add_action(&new_tab_worktree_as);
+        self.add_win_action("new-tab-worktree", |imp| {
+            debug!("Action: New Thread in Isolated Git Worktree");
+            imp.new_tab_in_worktree(None);
+        })
+        .set_enabled(git_available);
+        self.add_profile_action("new-tab-worktree-profile", |imp, profile| {
+            imp.new_tab_in_worktree(Some(profile));
+        })
+        .set_enabled(git_available);
 
         // Ctrl+Alt+1..9 open the Nth profile, so switching CLI (e.g. to Gemini
         // when Claude runs out of tokens) needs no menu. Indexed because an
@@ -1847,72 +1871,29 @@ impl AgentTerminalWindow {
         // Restart Session Action. restart_tab already existed with exactly the
         // right semantics but was reachable only as a side effect of closing the
         // settings dialog — there was no way to ask for it directly.
-        let restart_action = gtk4::gio::SimpleAction::new("restart-tab", None);
-        restart_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Restart Session");
-                let imp = obj.imp();
-                let page = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page());
-                if let Some(page) = page {
-                    imp.restart_tab(&page);
-                }
+        self.add_win_action("restart-tab", |imp| {
+            debug!("Action: Restart Session");
+            if let Some(page) = imp.selected_page() {
+                imp.restart_tab(&page);
             }
-        ));
-        obj.add_action(&restart_action);
+        });
 
         // Checkpoint the current tab's working tree now, whatever the setting:
         // asking is an explicit choice.
-        let checkpoint_action = gtk4::gio::SimpleAction::new("checkpoint-now", None);
-        checkpoint_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Checkpoint Now");
-                let imp = obj.imp();
-                let page = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page());
-                if let Some(page) = page {
-                    imp.request_checkpoint(&page, true);
-                }
+        self.add_win_action("checkpoint-now", |imp| {
+            debug!("Action: Checkpoint Now");
+            if let Some(page) = imp.selected_page() {
+                imp.request_checkpoint(&page, true);
             }
-        ));
-        obj.add_action(&checkpoint_action);
-
-        let toggle_diff = gtk4::gio::SimpleAction::new("toggle-diff", None);
-        toggle_diff.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Toggle Diff Panel");
-                obj.imp().toggle_diff_panel();
-            }
-        ));
-        obj.add_action(&toggle_diff);
+        });
+        self.add_win_action("toggle-diff", |imp| {
+            debug!("Action: Toggle Diff Panel");
+            imp.toggle_diff_panel();
+        });
 
         // 3.0: the thread sidebar and a thread's terminal drawer.
-        let toggle_sidebar = gtk4::gio::SimpleAction::new("toggle-sidebar", None);
-        toggle_sidebar.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().toggle_sidebar()
-        ));
-        obj.add_action(&toggle_sidebar);
-        let toggle_drawer = gtk4::gio::SimpleAction::new("toggle-drawer", None);
-        toggle_drawer.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().toggle_drawer()
-        ));
-        obj.add_action(&toggle_drawer);
+        self.add_win_action("toggle-sidebar", Self::toggle_sidebar);
+        self.add_win_action("toggle-drawer", Self::toggle_drawer);
 
         // New Thread With <agent>, by driver key.
         let new_thread_agent =
@@ -1929,13 +1910,7 @@ impl AgentTerminalWindow {
         ));
         obj.add_action(&new_thread_agent);
 
-        let review = gtk4::gio::SimpleAction::new("review-environment", None);
-        review.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| obj.imp().review_current_environment()
-        ));
-        obj.add_action(&review);
+        self.add_win_action("review-environment", Self::review_current_environment);
 
         // New Terminal Thread as <profile>: the 2.x terminal page, for any profile.
         let new_terminal = gtk4::gio::SimpleAction::new(
@@ -1950,14 +1925,7 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
-                let profile = imp
-                    .config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == name)
-                    .cloned();
-                match profile {
+                match imp.profile_named(&name) {
                     Some(profile) => {
                         let dir = profile_tab_dir(profile.dir.as_deref(), imp.current_dir());
                         imp.add_terminal_tab(Some(&profile), dir.as_deref());
@@ -1969,50 +1937,24 @@ impl AgentTerminalWindow {
         obj.add_action(&new_terminal);
 
         // New Tab in Folder Action (opens a folder picker)
-        let new_tab_folder_action = gtk4::gio::SimpleAction::new("new-tab-folder", None);
-        new_tab_folder_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: New Tab in Folder");
-                obj.imp().new_tab_in_folder(None);
-            }
-        ));
-        obj.add_action(&new_tab_folder_action);
+        self.add_win_action("new-tab-folder", |imp| {
+            debug!("Action: New Tab in Folder");
+            imp.new_tab_in_folder(None);
+        });
 
         // Resume Session Action (prompts for a session ID)
-        let resume_action = gtk4::gio::SimpleAction::new("resume-session", None);
-        resume_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Resume Session");
-                obj.imp().show_session_browser(None);
-            }
-        ));
-        obj.add_action(&resume_action);
-
-        let preferences_action = gtk4::gio::SimpleAction::new("preferences", None);
-        preferences_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Preferences");
-                obj.imp().show_preferences();
-            }
-        ));
-        obj.add_action(&preferences_action);
-
-        let shortcuts_action = gtk4::gio::SimpleAction::new("shortcuts", None);
-        shortcuts_action.connect_activate(glib::clone!(
-            #[weak]
-            obj,
-            move |_, _| {
-                debug!("Action: Keyboard Shortcuts");
-                obj.imp().show_shortcuts();
-            }
-        ));
-        obj.add_action(&shortcuts_action);
+        self.add_win_action("resume-session", |imp| {
+            debug!("Action: Resume Session");
+            imp.show_session_browser(None);
+        });
+        self.add_win_action("preferences", |imp| {
+            debug!("Action: Preferences");
+            imp.show_preferences();
+        });
+        self.add_win_action("shortcuts", |imp| {
+            debug!("Action: Keyboard Shortcuts");
+            imp.show_shortcuts();
+        });
 
         let updates_action = gtk4::gio::SimpleAction::new("check-updates", None);
         updates_action.connect_activate(glib::clone!(
@@ -2128,12 +2070,13 @@ impl AgentTerminalWindow {
                 let source = indicator.source.clone();
                 // A configured command is arbitrary and may block; it never runs
                 // on the main thread.
-                let state =
-                    gtk4::gio::spawn_blocking(move || crate::utils::read_indicator(&source))
-                        .await
-                        .unwrap_or_else(|_| crate::utils::IndicatorState::Unknown {
-                            reason: "Indicator check panicked".to_string(),
-                        });
+                let state = blocking_or(
+                    move || crate::utils::read_indicator(&source),
+                    crate::utils::IndicatorState::Unknown {
+                        reason: "Indicator check panicked".to_string(),
+                    },
+                )
+                .await;
                 in_flight.set(false);
 
                 let (icon, css, tooltip) = match &state {
@@ -2222,12 +2165,14 @@ impl AgentTerminalWindow {
         // SendToTerminal types content into a live agent's stdin. That was a
         // default affordance when the only source was one hard-coded file; with
         // user-configurable sources it has to be an explicit, previewed choice.
-        let dialog = adw::AlertDialog::new(Some(&indicator.label), Some(&body));
-        dialog.add_response("close", "Close");
-        dialog.add_response("send", "Send to Session");
-        dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("close"));
-        dialog.set_close_response("close");
+        let dialog = confirm_dialog(
+            &indicator.label,
+            &body,
+            ("close", "Close"),
+            ("send", "Send to Session"),
+            adw::ResponseAppearance::Suggested,
+            false,
+        );
 
         let detail = detail.to_string();
         dialog.connect_response(
@@ -2698,10 +2643,8 @@ impl AgentTerminalWindow {
                     imp.acknowledge_bell(&page);
                     // A thread page titles the window itself (title and folder).
                     if imp
-                        .tabs
-                        .borrow()
-                        .iter()
-                        .any(|t| t.page == page && t.chat.is_some())
+                        .with_page_tab(&page, |t| t.chat.is_some())
+                        .unwrap_or(false)
                     {
                         return;
                     }
@@ -2900,14 +2843,16 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             glib::timeout_future_seconds(STARTUP_UPDATE_DELAY_SECS).await;
-            let result = gtk4::gio::spawn_blocking(move || {
-                agent_kit::update::fetch_latest(
-                    &slug,
-                    concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
-                )
-            })
-            .await
-            .unwrap_or_else(|_| Err("the update check stopped unexpectedly".to_owned()));
+            let result = blocking_or(
+                move || {
+                    agent_kit::update::fetch_latest(
+                        &slug,
+                        concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                    )
+                },
+                Err("the update check stopped unexpectedly".to_owned()),
+            )
+            .await;
             let newer = match result {
                 Ok(release)
                     if agent_kit::update::is_newer(env!("CARGO_PKG_VERSION"), &release.tag) =>
@@ -2964,21 +2909,21 @@ impl AgentTerminalWindow {
         let slug = agent_kit::update::github_slug(env!("CARGO_PKG_REPOSITORY"));
         // The menu closes at once and the answer can take seconds: say the check runs, until
         // its answer replaces this.
-        let checking = adw::Toast::builder()
-            .title("Checking for updates…")
-            .timeout(0)
-            .build();
-        self.add_toast(checking.clone());
+        let checking = self.progress_toast("Checking for updates…");
         glib::MainContext::default().spawn_local(async move {
             let result = match slug {
-                Some(slug) => gtk4::gio::spawn_blocking(move || {
-                    agent_kit::update::fetch_latest(
-                        &slug,
-                        concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                Some(slug) => {
+                    blocking_or(
+                        move || {
+                            agent_kit::update::fetch_latest(
+                                &slug,
+                                concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+                            )
+                        },
+                        Err("The update check stopped unexpectedly.".to_owned()),
                     )
-                })
-                .await
-                .unwrap_or_else(|_| Err("The update check stopped unexpectedly.".to_owned())),
+                    .await
+                }
                 None => Err("This build names no GitHub repository to check.".to_owned()),
             };
             checking.dismiss();
@@ -3005,13 +2950,17 @@ impl AgentTerminalWindow {
         let dialog = match result {
             Ok(release) if agent_kit::update::is_newer(current, &release.tag) => {
                 let version = release.tag.trim_start_matches('v');
-                let dialog = adw::AlertDialog::builder()
-                    .heading(format!("Agent Terminal {version} is available"))
-                    .body(format!(
+                let dialog = confirm_dialog(
+                    &format!("Agent Terminal {version} is available"),
+                    &format!(
                         "You have {current}. Installed from a package repository (apt, dnf, \
                          pacman)? Update it there instead."
-                    ))
-                    .build();
+                    ),
+                    ("close", "Not Now"),
+                    ("download", "Download"),
+                    adw::ResponseAppearance::Suggested,
+                    true,
+                );
                 if !release.notes.trim().is_empty() {
                     let notes = Label::builder()
                         .use_markup(true)
@@ -3030,9 +2979,6 @@ impl AgentTerminalWindow {
                         .build();
                     dialog.set_extra_child(Some(&scroll));
                 }
-                dialog.add_responses(&[("close", "Not Now"), ("download", "Download")]);
-                dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
-                dialog.set_default_response(Some("download"));
                 let url = release.url;
                 let window = self.obj().downgrade();
                 dialog.connect_response(None, move |_, response| {
@@ -3382,13 +3328,7 @@ impl AgentTerminalWindow {
                     return;
                 };
                 let imp = obj.imp();
-                let is_active = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|view| view.selected_page())
-                    .as_ref()
-                    == Some(&page);
+                let is_active = imp.is_selected(&page);
                 if !is_active {
                     return;
                 }
@@ -3422,13 +3362,7 @@ impl AgentTerminalWindow {
                 if imp.config.borrow().checkpoints {
                     imp.request_checkpoint(&page, false);
                 }
-                let is_selected = imp
-                    .tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|view| view.selected_page())
-                    .as_ref()
-                    == Some(&page);
+                let is_selected = imp.is_selected(&page);
                 // The tab in view of a focused window is already being looked
                 // at. The tab in view of a window in the background is not:
                 // that is the "finished while I was elsewhere" case the
@@ -3505,12 +3439,7 @@ impl AgentTerminalWindow {
         let thread_in_view = self
             .thread_selected_by_restore
             .get()
-            .then(|| {
-                self.tab_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|v| v.selected_page())
-            })
+            .then(|| self.selected_page())
             .flatten();
         let mut missing = Vec::new();
         for tab in &state.tabs {
@@ -3563,10 +3492,7 @@ impl AgentTerminalWindow {
 
         // Among the tabs saved (terminal pages only), as `restore_previous_session` reads it.
         let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page())
+            .selected_page()
             .and_then(|page| {
                 self.tabs
                     .borrow()
@@ -3613,15 +3539,10 @@ impl AgentTerminalWindow {
         // which opens a second window rather than showing this tab.
         // Marked pending under the borrow, sent after it: GApplication is not
         // called into with a tab borrowed.
-        let key = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .map(|t| {
-                t.bell_pending = true;
-                t.key
-            });
+        let key = self.with_page_tab_mut(page, |t| {
+            t.bell_pending = true;
+            t.key
+        });
         if let Some(key) = key {
             notification
                 .set_default_action_and_target_value("app.show-tab", Some(&key.to_variant()));
@@ -3638,12 +3559,7 @@ impl AgentTerminalWindow {
 
     /// Reveals the current tab's search bar and puts the cursor in it.
     fn toggle_search(&self) {
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
         let tabs = self.tabs.borrow();
@@ -3700,11 +3616,8 @@ impl AgentTerminalWindow {
         };
         // A thread keeps its page: its agent process restarts on the same conversation.
         let chat = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .and_then(|t| t.chat.as_ref().map(|c| c.view.clone()));
+            .with_page_tab(page, |t| t.chat.as_ref().map(|c| c.view.clone()))
+            .flatten();
         if let Some(view) = chat {
             if let Some(view) = view {
                 view.restart_agent();
@@ -3712,11 +3625,9 @@ impl AgentTerminalWindow {
             return;
         }
         let (dir, session_id, profile) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| (Some(t.dir.clone()), t.session_id.clone(), t.profile.clone()))
+            .with_page_tab(page, |t| {
+                (Some(t.dir.clone()), t.session_id.clone(), t.profile.clone())
+            })
             .unwrap_or_default();
         info!("Restarting session in {:?}", dir);
         match session_id {
@@ -5181,11 +5092,10 @@ impl AgentTerminalWindow {
             #[weak]
             empty,
             async move {
-                let listing = gtk4::gio::spawn_blocking(move || {
+                let listing = off_main("Listing sessions", move || {
                     crate::utils::list_sessions_in(format, &store, title_pointer.as_deref())
                 })
-                .await
-                .unwrap_or_else(|_| Err("Listing sessions panicked".to_string()));
+                .await;
 
                 let found = match listing {
                     Ok(found) => found,
@@ -5263,17 +5173,16 @@ impl AgentTerminalWindow {
             Some(name) => format!("Resume {name} Session"),
             None => "Resume Session".to_string(),
         };
-        let dialog = adw::AlertDialog::new(
-            Some(&heading),
-            Some("Opens a new tab that resumes the session with this ID."),
+        let dialog = confirm_dialog(
+            &heading,
+            "Opens a new tab that resumes the session with this ID.",
+            ("cancel", "Cancel"),
+            ("resume", "Resume"),
+            adw::ResponseAppearance::Suggested,
+            true,
         );
         dialog.set_extra_child(Some(&entry));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("resume", "Resume");
-        dialog.set_response_appearance("resume", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("resume", false);
-        dialog.set_default_response(Some("resume"));
-        dialog.set_close_response("cancel");
 
         entry.connect_changed(glib::clone!(
             #[weak]
@@ -5348,13 +5257,7 @@ impl AgentTerminalWindow {
     /// named in the new session's opening prompt. The source tab is left as it
     /// is, so its session can be resumed once its quota resets.
     fn continue_in(&self, target_name: &str) {
-        let target = self
-            .config
-            .borrow()
-            .profiles
-            .iter()
-            .find(|p| p.name == target_name)
-            .cloned();
+        let target = self.profile_named(target_name);
         // A thread hands itself over in place: budgeted, fenced, redacted, shown as a switch
         // divider. That needs no prompt arguments (the handoff rides on the next message), so it
         // comes before the check a terminal tab's hand-off needs. Ceiling: the switch launches
@@ -5388,12 +5291,7 @@ impl AgentTerminalWindow {
             );
             return;
         };
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
 
@@ -5403,14 +5301,10 @@ impl AgentTerminalWindow {
                 warn!("Hand-off asked for a tab that is not tracked");
                 return;
             };
-            let source = tab.profile.as_deref().and_then(|name| {
-                self.config
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == name)
-                    .cloned()
-            });
+            let source = tab
+                .profile
+                .as_deref()
+                .and_then(|name| self.profile_named(name));
             let since_ms = tab
                 .started_at
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5470,7 +5364,7 @@ impl AgentTerminalWindow {
                 let to = target.name.clone();
                 let from_for_brief = from.clone();
                 let tab_dir = dir.clone();
-                let written = gtk4::gio::spawn_blocking(move || {
+                let written = off_main("Writing the brief", move || {
                     use crate::handoff::*;
                     // An AGY tab's ID is AGY's own choice; find the session it
                     // recorded in this directory since the tab opened.
@@ -5500,8 +5394,7 @@ impl AgentTerminalWindow {
                         &render_brief(&input),
                     )
                 })
-                .await
-                .unwrap_or_else(|_| Err("Writing the brief panicked".to_string()));
+                .await;
 
                 match written {
                     Ok(path) => {
@@ -5640,11 +5533,11 @@ impl AgentTerminalWindow {
         };
         let child = page.child();
         glib::MainContext::default().spawn_local(async move {
-            let result = gtk4::gio::spawn_blocking(move || run_checkpoint(&dir, key, &label))
-                .await
-                .unwrap_or_else(|_| {
-                    CheckpointResult::Failed("the checkpoint thread panicked".to_string())
-                });
+            let result = blocking_or(
+                move || run_checkpoint(&dir, key, &label),
+                CheckpointResult::Failed("the checkpoint thread panicked".to_string()),
+            )
+            .await;
             // Looked up afterwards, not captured: the tab may have been
             // dragged to another window meanwhile, or closed.
             let Some(obj) = window_of(&child) else {
@@ -5732,15 +5625,17 @@ impl AgentTerminalWindow {
         if let Some(cmd) = &self.config.borrow().turn_command {
             if let Some(prog) = cmd.first() {
                 let prog = prog.clone();
-                let (sess, dir) = {
-                    let tabs = self.tabs.borrow();
-                    let tab = tabs.iter().find(|t| &t.page == page);
-                    (
-                        tab.and_then(|t| t.session_id.clone().or_else(|| t.pinned_id.clone()))
-                            .unwrap_or_default(),
-                        tab.map(|t| t.dir.clone()).unwrap_or_default(),
-                    )
-                };
+                let (sess, dir) = self
+                    .with_page_tab(page, |t| {
+                        (
+                            t.session_id
+                                .clone()
+                                .or_else(|| t.pinned_id.clone())
+                                .unwrap_or_default(),
+                            t.dir.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 let args: Vec<String> = cmd[1..]
                     .iter()
                     .map(|arg| arg.replace("{id}", &sess).replace("{dir}", &dir))
@@ -5776,13 +5671,7 @@ impl AgentTerminalWindow {
                 return;
             };
             let imp = obj.imp();
-            let page = imp
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.diff_panel.root == root)
-                .map(|t| t.page.clone());
-            if let Some(page) = page {
+            if let Some(page) = imp.tab_by_panel(&root, |t| t.page.clone()) {
                 imp.refresh_diff(&page);
             }
         });
@@ -5803,11 +5692,7 @@ impl AgentTerminalWindow {
             };
             let title = obj
                 .imp()
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.diff_panel.root == root)
-                .map(|t| t.page.title().to_string())
+                .tab_by_panel(&root, |t| t.page.title().to_string())
                 .unwrap_or_else(|| "Agent Terminal".to_owned());
             popped.pop_out(obj.upcast_ref(), &title);
         });
@@ -5836,12 +5721,7 @@ impl AgentTerminalWindow {
                 return;
             };
             let imp = obj.imp();
-            let page = imp
-                .tabs
-                .borrow()
-                .iter()
-                .find(|t| t.diff_panel.root == root)
-                .map(|t| t.page.clone());
+            let page = imp.tab_by_panel(&root, |t| t.page.clone());
             let to = match base_of.base() {
                 crate::diff::DiffBase::ThisTab => "how they were when this tab started",
                 _ => "how they were before the last turn",
@@ -5886,21 +5766,10 @@ impl AgentTerminalWindow {
     /// Shows or hides the current tab's diff panel. The choice also becomes
     /// the default for new tabs.
     fn toggle_diff_panel(&self) {
-        let Some(page) = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page())
-        else {
+        let Some(page) = self.selected_page() else {
             return;
         };
-        let Some(panel) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.page == page)
-            .map(|t| t.diff_panel.clone())
-        else {
+        let Some(panel) = self.with_page_tab(&page, |t| t.diff_panel.clone()) else {
             return;
         };
         // A panel in its own window is on show already: bring that window up.
@@ -5920,20 +5789,14 @@ impl AgentTerminalWindow {
 
     /// Recomputes `page`'s diff off the main thread, if its panel is showing.
     fn refresh_diff(&self, page: &adw::TabPage) {
-        let Some((dir, key, thread_id, panel)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| {
-                (
-                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
-                    t.key,
-                    t.chat.as_ref().map(|c| c.thread.clone()),
-                    t.diff_panel.clone(),
-                )
-            })
-        else {
+        let Some((dir, key, thread_id, panel)) = self.with_page_tab(page, |t| {
+            (
+                t.repo_dir(),
+                t.key,
+                t.chat.as_ref().map(|c| c.thread.clone()),
+                t.diff_panel.clone(),
+            )
+        }) else {
             return;
         };
         if !panel.is_shown() {
@@ -5946,29 +5809,20 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
-            let initial = gtk4::gio::spawn_blocking({
+            let initial = off_main("the diff thread", {
                 let dir = dir.clone();
                 move || crate::git::tab_diff(std::path::Path::new(&dir), key, base)
             })
-            .await
-            .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+            .await;
 
             let (result, repo_dir) = match (initial, thread_id) {
                 (Ok(crate::git::DiffOutcome::NotRepo), Some(tid)) => {
-                    let envelopes = threads::store_job(move |s| s.events(&tid, None, 500))
-                        .await
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
-                    let paths = crate::diff::touched_paths_from_envelopes(
-                        &envelopes.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
-                    );
-                    if let Some(repo_dir) = crate::diff::discover_enclosing_repo(&paths) {
+                    if let Some(Some(repo_dir)) = thread_enclosing_repo(tid).await {
                         let diffed = repo_dir.clone();
-                        let result = gtk4::gio::spawn_blocking(move || {
+                        let result = off_main("the diff thread", move || {
                             crate::git::tab_diff(&diffed, key, base)
                         })
-                        .await
-                        .unwrap_or_else(|_| Err("the diff thread panicked".to_string()));
+                        .await;
                         (result, repo_dir)
                     } else {
                         (Ok(crate::git::DiffOutcome::NotRepo), dir.into())
@@ -5986,9 +5840,10 @@ impl AgentTerminalWindow {
             // only; it never fetches).
             let pr = if in_repo {
                 Some(
-                    gtk4::gio::spawn_blocking(move || agent_kit::github::pr_state(&repo_dir))
-                        .await
-                        .unwrap_or_else(|_| Err("reading the branch panicked".to_string())),
+                    off_main("reading the branch", move || {
+                        agent_kit::github::pr_state(&repo_dir)
+                    })
+                    .await,
                 )
             } else {
                 None
@@ -6004,18 +5859,9 @@ impl AgentTerminalWindow {
     /// the Changes toggle to match. The last answer stays on show meanwhile.
     pub(super) fn refresh_repo_presence(&self, page: &adw::TabPage) {
         self.sync_diff_toggle();
-        let Some((dir, thread_id)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page)
-            .map(|t| {
-                (
-                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
-                    t.chat.as_ref().map(|c| c.thread.clone()),
-                )
-            })
-        else {
+        let Some((dir, thread_id)) = self.with_page_tab(page, |t| {
+            (t.repo_dir(), t.chat.as_ref().map(|c| c.thread.clone()))
+        }) else {
             return;
         };
         let obj = self.obj().downgrade();
@@ -6035,12 +5881,8 @@ impl AgentTerminalWindow {
         let Some(present) = presence else {
             return;
         };
-        let Some((was, panel)) = self
-            .tabs
-            .borrow_mut()
-            .iter_mut()
-            .find(|t| &t.page == page)
-            .map(|t| (t.in_repo.replace(present), t.diff_panel.clone()))
+        let Some((was, panel)) =
+            self.with_page_tab_mut(page, |t| (t.in_repo.replace(present), t.diff_panel.clone()))
         else {
             return;
         };
@@ -6060,16 +5902,10 @@ impl AgentTerminalWindow {
     /// Shows the Changes toggle, and enables its action, only while a page is on show that is
     /// not known to be outside a repository.
     pub(super) fn sync_diff_toggle(&self) {
-        let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page());
+        let selected = self.selected_page();
         let usable = selected.is_some_and(|page| {
-            self.tabs
-                .borrow()
-                .iter()
-                .any(|t| t.page == page && t.in_repo != Some(false))
+            self.with_page_tab(&page, |t| t.in_repo != Some(false))
+                .unwrap_or(false)
         });
         if let Some(toggle) = self.diff_toggle.borrow().as_ref() {
             let fits = toggle.first_child().is_some_and(|b| b.is_visible());
@@ -6088,22 +5924,18 @@ impl AgentTerminalWindow {
     /// thread still on show ([`thread_subtitle`]).
     pub(super) fn refresh_branch(&self, page: &adw::TabPage) {
         let Some(dir) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page && t.chat.is_some())
-            .map(|t| t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()))
+            .with_page_tab(page, |t| t.chat.is_some().then(|| t.repo_dir()))
+            .flatten()
         else {
             return;
         };
         let obj = self.obj().downgrade();
         let page = page.clone();
         glib::MainContext::default().spawn_local(async move {
-            let read = gtk4::gio::spawn_blocking(move || {
+            let read = off_main("reading the branch", move || {
                 agent_kit::github::pr_state(std::path::Path::new(&dir))
             })
-            .await
-            .unwrap_or_else(|_| Err("reading the branch panicked".to_string()));
+            .await;
             if let Some(obj) = obj.upgrade() {
                 obj.imp().show_branch(&page, Some(&read));
             }
@@ -6117,20 +5949,12 @@ impl AgentTerminalWindow {
         page: &adw::TabPage,
         branch: Option<&Result<agent_kit::github::PrOutcome, String>>,
     ) {
-        let selected = self
-            .tab_view
-            .borrow()
-            .as_ref()
-            .and_then(|v| v.selected_page());
-        if selected.as_ref() != Some(page) {
+        if !self.is_selected(page) {
             return;
         }
         let Some(dir) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| &t.page == page && t.chat.is_some())
-            .map(|t| t.dir.clone())
+            .with_page_tab(page, |t| t.chat.is_some().then(|| t.dir.clone()))
+            .flatten()
         else {
             return;
         };
@@ -6146,19 +5970,9 @@ impl AgentTerminalWindow {
     /// A branch whose commits are not all on its remote is pushed first (never forced), once the
     /// user confirms it; one never pushed can only be pushed, since its page would be empty.
     fn open_pull_request(&self, panel_root: &gtk4::Box, state: agent_kit::github::PrState) {
-        let Some((page, dir, panel)) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.diff_panel.root == *panel_root)
-            .map(|t| {
-                (
-                    t.page.clone(),
-                    t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()),
-                    t.diff_panel.clone(),
-                )
-            })
-        else {
+        let Some((page, dir, panel)) = self.tab_by_panel(panel_root, |t| {
+            (t.page.clone(), t.repo_dir(), t.diff_panel.clone())
+        }) else {
             return;
         };
         let Some(url) = state.compare_url() else {
@@ -6236,11 +6050,10 @@ impl AgentTerminalWindow {
                 panel.set_pushing(true);
                 glib::MainContext::default().spawn_local(async move {
                     let branch = state.branch.clone();
-                    let pushed = gtk4::gio::spawn_blocking(move || {
+                    let pushed = off_main("the push", move || {
                         agent_kit::github::push_branch(std::path::Path::new(&dir), &state)
                     })
-                    .await
-                    .unwrap_or_else(|_| Err("the push panicked".to_string()));
+                    .await;
                     panel.set_pushing(false);
                     let Some(obj) = obj.upgrade() else { return };
                     match pushed {
@@ -6269,28 +6082,23 @@ impl AgentTerminalWindow {
             self.show_toast(crate::diff_tool::NO_TOOL_HINT);
             return;
         };
-        let Some(dir) = self
-            .tabs
-            .borrow()
-            .iter()
-            .find(|t| t.diff_panel.root == *panel_root)
-            .map(|t| t.discovered_repo.clone().unwrap_or_else(|| t.dir.clone()))
-        else {
+        let Some(dir) = self.tab_by_panel(panel_root, TabState::repo_dir) else {
             return;
         };
         let new_side = match file.to_checkpoint {
             Some(rev) => crate::diff_tool::NewSide::Rev(rev),
             None => crate::diff_tool::NewSide::Working,
         };
-        let working_dir = if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(&dir)) {
-            repo.toplevel
-        } else if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(&file.path)) {
-            repo.toplevel
-        } else {
-            std::path::PathBuf::from(dir)
-        };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
+            let working_dir = blocking_or(
+                {
+                    let (dir, path) = (dir.clone(), file.path.clone());
+                    move || diff_tool_working_dir(&dir, &path)
+                },
+                std::path::PathBuf::from(dir),
+            )
+            .await;
             let result =
                 crate::diff_tool::open_from_dir(tool, working_dir, file.path, file.from, new_side)
                     .await;
@@ -6423,17 +6231,15 @@ impl AgentTerminalWindow {
         form.append(&problem);
         form.append(&note);
 
-        let dialog = adw::AlertDialog::new(
-            Some("New Thread in Isolated Git Worktree"),
-            Some(
-                "Creates a new Git branch and an isolated checkout folder so the agent \
-                 can experiment without modifying your current branch or uncommitted work.",
-            ),
+        let dialog = confirm_dialog(
+            "New Thread in Isolated Git Worktree",
+            "Creates a new Git branch and an isolated checkout folder so the agent can \
+             experiment without modifying your current branch or uncommitted work.",
+            ("cancel", "Cancel"),
+            ("create", "Create"),
+            adw::ResponseAppearance::Suggested,
+            true,
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-        dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("create"));
-        dialog.set_close_response("cancel");
         dialog.set_response_enabled("create", false);
         dialog.set_extra_child(Some(&form));
 
@@ -6485,12 +6291,11 @@ impl AgentTerminalWindow {
                                 return;
                             }
                             glib::MainContext::default().spawn_local(async move {
-                                let checked = gtk4::gio::spawn_blocking(move || {
+                                let checked = off_main("the check", move || {
                                     crate::worktree::check_new_branch(&main, &name)?;
                                     crate::worktree::resolve_base(&main, &start).map(|_| ())
                                 })
-                                .await
-                                .unwrap_or_else(|_| Err("the check panicked".to_string()));
+                                .await;
                                 if generation.get() != current {
                                     return;
                                 }
@@ -6551,9 +6356,8 @@ impl AgentTerminalWindow {
                         let Some(path) = picked.ok().and_then(|f| f.path()) else {
                             return;
                         };
-                        let found = gtk4::gio::spawn_blocking(move || worktree_repo(&path))
-                            .await
-                            .unwrap_or_else(|_| Err("the repository check panicked".to_string()));
+                        let found =
+                            off_main("the repository check", move || worktree_repo(&path)).await;
                         match found {
                             Ok((main, current)) => {
                                 repo_problem.set_text("");
@@ -6598,13 +6402,12 @@ impl AgentTerminalWindow {
                     main_toplevel: main.clone(),
                 };
                 // Checked again: the repository may have moved on since.
-                let created = gtk4::gio::spawn_blocking(move || {
+                let created = off_main("creating the worktree", move || {
                     crate::worktree::check_new_branch(&main, &name)?;
                     let commit = crate::worktree::resolve_base(&main, &start)?;
                     crate::worktree::add(&main, &name, &path, &commit)
                 })
-                .await
-                .unwrap_or_else(|_| Err("creating the worktree panicked".to_string()));
+                .await;
                 match created {
                     Ok(()) => {
                         info!(
@@ -6671,14 +6474,13 @@ impl AgentTerminalWindow {
                 // The worktree may have come back from the store (a reopened thread): it is
                 // offered only while git still has it, at that path and on that branch.
                 let checked = info.clone();
-                let clean = gtk4::gio::spawn_blocking(move || {
+                let clean = off_main("the status check", move || {
                     if !crate::worktree::is_registered(&checked)? {
                         return Err("it is no longer a registered worktree on its branch".into());
                     }
                     crate::worktree::is_clean(&checked.path)
                 })
-                .await
-                .unwrap_or_else(|_| Err("the status check panicked".to_string()));
+                .await;
                 match clean {
                     Ok(true) => {}
                     Ok(false) => {
@@ -6693,18 +6495,13 @@ impl AgentTerminalWindow {
                         return;
                     }
                 }
-                let toast = adw::Toast::builder()
-                    .title(format!("Worktree ⎇ {} is clean", info.branch))
-                    .use_markup(false)
-                    .button_label("Remove")
-                    .timeout(10)
-                    .build();
-                toast.connect_button_clicked(glib::clone!(
-                    #[weak]
-                    obj,
-                    move |_| obj.imp().remove_worktree(info.clone())
-                ));
-                obj.imp().add_toast(toast);
+                obj.imp().action_toast(
+                    &format!("Worktree ⎇ {} is clean", info.branch),
+                    "Remove",
+                    10,
+                    adw::ToastPriority::Normal,
+                    move |imp| imp.remove_worktree(info.clone()),
+                );
             }
         ));
     }
@@ -6740,10 +6537,10 @@ impl AgentTerminalWindow {
             obj,
             async move {
                 let (main, path) = (info.main_toplevel.clone(), info.path.clone());
-                let removed =
-                    gtk4::gio::spawn_blocking(move || crate::worktree::remove(&main, &path))
-                        .await
-                        .unwrap_or_else(|_| Err("removing the worktree panicked".to_string()));
+                let removed = off_main("removing the worktree", move || {
+                    crate::worktree::remove(&main, &path)
+                })
+                .await;
                 match removed {
                     Ok(()) => {
                         info!("Removed worktree {}", info.path.display());
@@ -6762,16 +6559,10 @@ impl AgentTerminalWindow {
     /// `target` would do, and does it only if confirmed. `to` finishes
     /// "Puts … back to" in the confirmation.
     fn confirm_restore(&self, page: &adw::TabPage, target: String, to: &'static str) {
-        let Some((dir, key, mid_turn)) =
-            self.tabs
-                .borrow()
-                .iter()
-                .find(|t| &t.page == page)
-                .map(|t| {
-                    let quiet_for = t.last_output.get().elapsed();
-                    (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
-                })
-        else {
+        let Some((dir, key, mid_turn)) = self.with_page_tab(page, |t| {
+            let quiet_for = t.last_output.get().elapsed();
+            (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
+        }) else {
             return;
         };
         let obj = self.obj();
@@ -6780,14 +6571,13 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             async move {
-                let prepared = gtk4::gio::spawn_blocking(move || {
+                let prepared = off_main("preparing the undo", move || {
                     let repo = crate::git::discover(std::path::Path::new(&dir))?
                         .ok_or_else(|| "This tab's folder is not in a repository".to_string())?;
                     let plan = crate::restore::prepare(&repo, key, &target)?;
                     Ok::<_, String>((repo, plan))
                 })
-                .await
-                .unwrap_or_else(|_| Err("preparing the undo panicked".to_string()));
+                .await;
                 let (repo, plan) = match prepared {
                     Ok(prepared) => prepared,
                     Err(err) => {
@@ -6801,7 +6591,14 @@ impl AgentTerminalWindow {
                     return;
                 }
 
-                let dialog = adw::AlertDialog::new(Some("Undo These Changes?"), None);
+                let dialog = confirm_dialog(
+                    "Undo These Changes?",
+                    "",
+                    ("cancel", "Cancel"),
+                    ("restore", "Undo Changes"),
+                    adw::ResponseAppearance::Destructive,
+                    false,
+                );
                 let text = Label::builder()
                     .label(crate::restore::summary(&plan, to, mid_turn))
                     .wrap(true)
@@ -6817,14 +6614,7 @@ impl AgentTerminalWindow {
                     .child(&text)
                     .build();
                 dialog.set_extra_child(Some(&scroll));
-                dialog.add_responses(&[("cancel", "Cancel"), ("restore", "Undo Changes")]);
-                dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
-                dialog.set_default_response(Some("cancel"));
-                dialog.set_close_response("cancel");
-                let response = dialog
-                    .choose_future(Some(obj.upcast_ref::<gtk4::Widget>()))
-                    .await;
-                if response != "restore" {
+                if !crate::dialogs::confirmed(&dialog, &obj, "restore").await {
                     // Cancelled: the undo point is not needed.
                     gtk4::gio::spawn_blocking(move || crate::restore::discard(&repo, &plan.pinned));
                     return;
@@ -6832,36 +6622,29 @@ impl AgentTerminalWindow {
 
                 let pinned = plan.pinned.commit.clone();
                 // The confirmation is gone and a large tree takes a moment: say it runs.
-                let undoing = adw::Toast::builder()
-                    .title("Undoing changes…")
-                    .timeout(0)
-                    .build();
-                obj.imp().add_toast(undoing.clone());
-                let done = gtk4::gio::spawn_blocking(move || crate::restore::apply(&repo, &plan))
-                    .await
-                    .unwrap_or_else(|_| Err("the undo panicked".to_string()));
+                let undoing = obj.imp().progress_toast("Undoing changes…");
+                let done = off_main("the undo", move || crate::restore::apply(&repo, &plan)).await;
                 undoing.dismiss();
                 let imp = obj.imp();
                 match done {
                     Ok(done) if done.mismatched.is_empty() && done.refused.is_empty() => {
                         info!("Restored a tab's working tree; undo point {pinned}");
-                        let toast = adw::Toast::builder()
-                            .title("Changes undone")
-                            .button_label("Undo")
-                            .timeout(15)
-                            .build();
-                        toast.connect_button_clicked(glib::clone!(
-                            #[weak]
-                            obj,
-                            #[weak]
-                            page,
-                            move |_| obj.imp().confirm_restore(
-                                &page,
-                                pinned.clone(),
-                                "how they were before the undo"
-                            )
-                        ));
-                        imp.add_toast(toast);
+                        let page = page.downgrade();
+                        imp.action_toast(
+                            "Changes undone",
+                            "Undo",
+                            15,
+                            adw::ToastPriority::Normal,
+                            move |imp| {
+                                if let Some(page) = page.upgrade() {
+                                    imp.confirm_restore(
+                                        &page,
+                                        pinned.clone(),
+                                        "how they were before the undo",
+                                    );
+                                }
+                            },
+                        );
                     }
                     Ok(done) => {
                         warn!(
@@ -7045,13 +6828,7 @@ impl AgentTerminalWindow {
                     tab.quota_banner.set_revealed(true);
                     // The tab in view shows its banner; a marker there would
                     // stay lit until the user switched away and back.
-                    let in_view = self
-                        .tab_view
-                        .borrow()
-                        .as_ref()
-                        .and_then(|view| view.selected_page())
-                        .as_ref()
-                        == Some(page);
+                    let in_view = self.is_selected(page);
                     if !in_view {
                         page.set_needs_attention(true);
                     }
@@ -7273,6 +7050,82 @@ mod tests {
         assert!(indicator_log_at_info(Some(Ok), Problem));
         assert!(indicator_log_at_info(Some(Problem), Unreadable));
         assert!(indicator_log_at_info(Some(Unreadable), Ok));
+    }
+
+    #[test]
+    fn a_thread_outside_a_repository_finds_the_one_its_session_ran_in() {
+        let repo = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status();
+        if !ran.is_ok_and(|s| s.success()) {
+            eprintln!("git is not available; skipping");
+            return;
+        }
+        let inside = repo.path().join("src");
+        std::fs::create_dir(&inside).unwrap();
+        let store = threads::app_store();
+        let thread = store.create_thread("/", None).unwrap();
+        store
+            .append_event(
+                &thread,
+                None,
+                &agent_core::event::Envelope::new(agent_core::event::Event::SessionStarted {
+                    native_id: "s-1".into(),
+                    model: None,
+                    cwd: Some(inside.to_string_lossy().into_owned()),
+                }),
+            )
+            .unwrap();
+        let ctx = glib::MainContext::default();
+        let found = ctx
+            .block_on(thread_enclosing_repo(thread.to_string()))
+            .expect("the discovery thread answered")
+            .expect("the session's repository");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            repo.path().canonicalize().unwrap()
+        );
+        // A thread with no rows has nothing to search.
+        assert_eq!(
+            ctx.block_on(thread_enclosing_repo("absent".into())),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn the_diff_tool_runs_in_the_tab_repository_then_the_file_one_then_the_tab_folder() {
+        let repo = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status();
+        if !ran.is_ok_and(|s| s.success()) {
+            eprintln!("git is not available; skipping");
+            return;
+        }
+        let top = repo.path().canonicalize().unwrap();
+        let inside = repo.path().join("sub");
+        std::fs::create_dir(&inside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_dir = outside.path().to_string_lossy().into_owned();
+        let canon = |p: std::path::PathBuf| p.canonicalize().unwrap();
+        assert_eq!(
+            canon(diff_tool_working_dir(&inside.to_string_lossy(), "x.rs")),
+            top
+        );
+        assert_eq!(
+            canon(diff_tool_working_dir(
+                &outside_dir,
+                &inside.to_string_lossy()
+            )),
+            top
+        );
+        assert_eq!(
+            diff_tool_working_dir(&outside_dir, "/nonexistent/x.rs"),
+            std::path::PathBuf::from(&outside_dir)
+        );
     }
 
     fn init_gtk() {
@@ -7653,14 +7506,7 @@ mod tests {
         adw::init().expect("adw init");
         crate::icons::register();
         crate::load_css();
-        let config_home = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", config_home.path());
-        let app = adw::Application::builder()
-            .application_id("org.test.SmallWindow")
-            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk4::gio::Cancellable>)
-            .expect("registering a non-unique application");
+        let app = crate::window::imp::test_support::test_app("org.test.SmallWindow", false);
         let window = super::super::AgentTerminalWindow::new(&app);
         let imp = window.imp();
         for p in imp.config.borrow_mut().profiles.iter_mut() {

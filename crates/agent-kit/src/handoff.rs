@@ -12,7 +12,7 @@
 use crate::paths::expand_tilde;
 use crate::sessions::{find_transcript, read_agy_history, SessionFormat};
 use agent_core::redact::redact;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -63,20 +63,9 @@ fn cap(text: &str, max: usize) -> String {
 }
 
 /// Reads up to `window` bytes from `start`, lossily decoded, one line per item.
-/// A read that starts mid-file drops its first, partial line.
+/// A read that starts mid-file drops its first, partial line; a failed read is empty.
 fn read_lines(file: &mut std::fs::File, start: u64, window: u64) -> Vec<String> {
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return Vec::new();
-    }
-    let mut bytes = Vec::new();
-    if file.take(window).read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&bytes)
-        .split('\n')
-        .skip(usize::from(start > 0))
-        .map(str::to_string)
-        .collect()
+    crate::sessions::read_line_window(file, start, window, start > 0).unwrap_or_default()
 }
 
 /// A user message as the person typed it, or `None` for records that only

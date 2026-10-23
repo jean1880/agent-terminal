@@ -1279,14 +1279,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn labels_in(widget: &impl IsA<gtk4::Widget>) -> Vec<String> {
-        crate::testutil::descendants(widget.upcast_ref())
-            .iter()
-            .filter_map(|w| w.downcast_ref::<gtk4::Label>())
-            .map(|l| l.text().to_string())
-            .collect()
-    }
-
     fn last_form(events: &Events) -> (FormAction, Option<Value>) {
         match events.borrow().last() {
             Some(RowEvent::Form {
@@ -1325,7 +1317,7 @@ pub(crate) mod tests {
                 field("tags", false, choice(4, true, Some(1), Some(3))),
             ],
         });
-        let labels = labels_in(card.root());
+        let labels = crate::testutil::label_texts(card.root().upcast_ref());
         // The server's name is a chip and its words are a quote: never the app's voice.
         assert!(
             labels.contains(&"github tool server".to_owned()),
@@ -1566,7 +1558,7 @@ pub(crate) mod tests {
             card.field_note(1).as_deref(),
             Some("This optional field was left out.")
         );
-        assert!(labels_in(card.root())
+        assert!(crate::testutil::label_texts(card.root().upcast_ref())
             .iter()
             .any(|l| l.contains("cannot show this kind of field")));
         let (card, _) = widget(Form::Fields {
@@ -1634,9 +1626,8 @@ pub(crate) mod tests {
         assert!(card.concern().is_none());
         assert_eq!(card.buttons(), ["Open in Browser", "Done", "Decline"]);
         assert!(card.is_suggested("Open in Browser") && !card.is_suggested("Done"));
-        assert!(
-            labels_in(card.root()).contains(&"A tool server wants you to open a link".to_owned())
-        );
+        assert!(crate::testutil::label_texts(card.root().upcast_ref())
+            .contains(&"A tool server wants you to open a link".to_owned()));
 
         let opened: Rc<RefCell<Vec<String>>> = Rc::default();
         let record = opened.clone();

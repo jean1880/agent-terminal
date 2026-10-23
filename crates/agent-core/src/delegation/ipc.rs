@@ -77,6 +77,29 @@ pub struct Hello {
     pub bridge: BridgeInfo,
 }
 
+impl Hello {
+    /// A hello from bridge `version` running as `pid`, speaking exactly [`API_VERSION`].
+    pub fn new(
+        instance: InstanceNonce,
+        cap: CapabilityToken,
+        version: impl Into<String>,
+        pid: u32,
+    ) -> Self {
+        Self {
+            api: ApiRange {
+                min: API_VERSION,
+                max: API_VERSION,
+            },
+            instance,
+            cap,
+            bridge: BridgeInfo {
+                version: version.into(),
+                pid,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeInfo {
     pub version: String,
@@ -406,15 +429,12 @@ mod tests {
     }
 
     fn hello() -> Frame {
-        Frame::Hello(Hello {
-            api: ApiRange { min: 1, max: 1 },
-            instance: InstanceNonce::from_bytes([1; 16]),
-            cap: token(),
-            bridge: BridgeInfo {
-                version: "3.6.0".into(),
-                pid: 1234,
-            },
-        })
+        Frame::Hello(Hello::new(
+            InstanceNonce::from_bytes([1; 16]),
+            token(),
+            "3.6.0",
+            1234,
+        ))
     }
 
     fn call(id: u64) -> Frame {

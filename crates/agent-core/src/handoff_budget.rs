@@ -189,25 +189,8 @@ fn looks_like_framing(line: &str) -> bool {
 /// model may honour (`\r`, vertical tab, form feed, NEL, U+2028, U+2029) becomes `\n` first, so
 /// none can start an unquoted line.
 fn escape_framing(text: &str) -> String {
-    let normalised: String = text
-        .replace("\r\n", "\n")
-        .chars()
-        .map(|c| match c {
-            '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}' => '\n',
-            c => c,
-        })
-        .collect();
-    normalised
-        .lines()
-        .map(|line| {
-            if looks_like_framing(line) {
-                format!("> {line}")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let normalised = crate::text::normalise_line_breaks(text);
+    crate::text::quote_matching_lines(normalised.lines(), looks_like_framing)
 }
 
 /// A tool item's text as carried: a web result by its first line only, any other output capped

@@ -1,6 +1,6 @@
 [package]
 name = "agent-terminal"
-version = "3.6.0"
+version = "3.7.0"
 
 edition = "2021"
 # std::fs::File::lock (the approval rules store lock) is stable from 1.89.
@@ -73,6 +73,7 @@ glib-build-tools = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+agent-kit = { path = "crates/agent-kit", features = ["test-support"] }
 
 # The bundled SQLite is C compiled at the profile's opt-level; unoptimised it made the store's
 # equivalence tests take ~50 s each. Our own code stays at debug opt-level, so this changes

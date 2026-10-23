@@ -20,6 +20,8 @@ pub mod restore;
 pub mod sessions;
 pub mod store;
 pub mod store_writer;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod uninstall;
 pub mod update;
 pub mod worktree;

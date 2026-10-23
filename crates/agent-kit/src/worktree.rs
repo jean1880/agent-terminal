@@ -336,50 +336,18 @@ mod tests {
 
     mod repo {
         use super::super::*;
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
         use std::fs;
-        use std::process::Command;
-
-        fn sh(dir: &Path, args: &[&str]) {
-            let output = Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "init.defaultBranch=main",
-                ])
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
 
         /// `<tmp>/work/main` with one commit, so worktrees land in `<tmp>/work`.
         fn new_repo() -> Option<(tempfile::TempDir, PathBuf)> {
-            if !crate::git::git_installed() {
-                eprintln!("git not installed; skipping");
+            if !git_or_skip() {
                 return None;
             }
             let tmp = tempfile::tempdir().unwrap();
             let main = tmp.path().join("work/main");
             fs::create_dir_all(&main).unwrap();
-            sh(&main, &["init", "-q"]);
-            fs::write(main.join("a.txt"), "a\n").unwrap();
-            fs::write(main.join(".gitignore"), "build/\n").unwrap();
-            sh(&main, &["add", "."]);
-            sh(&main, &["commit", "-q", "-m", "init"]);
+            init_repo_at(&main, &[("a.txt", b"a\n"), (".gitignore", b"build/\n")]);
             Some((tmp, main))
         }
 

@@ -305,38 +305,17 @@ fn header_text(text: &str, max: usize) -> String {
 
 /// `text` cut to at most `max` bytes on a character boundary, and whether it was cut.
 fn cut(text: &str, max: usize) -> (String, bool) {
-    if text.len() <= max {
-        return (text.to_owned(), false);
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_owned(), true)
+    let kept = crate::text::truncate_bytes(text, max);
+    (kept.to_owned(), kept.len() < text.len())
 }
 
 /// `text` with every line that could pass for the app's own quoted with `> `. Every line
 /// separator a model may honour becomes `\n` first, so none can start an unquoted line.
 fn quote_marker(text: &str) -> String {
-    let normalised: String = text
-        .replace("\r\n", "\n")
-        .chars()
-        .map(|c| match c {
-            '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}' => '\n',
-            c => c,
-        })
-        .collect();
-    normalised
-        .split('\n')
-        .map(|line| {
-            if line.trim_start().starts_with(MARKER) {
-                format!("> {line}")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let normalised = crate::text::normalise_line_breaks(text);
+    crate::text::quote_matching_lines(normalised.split('\n'), |line| {
+        line.trim_start().starts_with(MARKER)
+    })
 }
 
 fn header(item: &Item) -> String {

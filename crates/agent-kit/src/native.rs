@@ -21,8 +21,8 @@ use agent_core::event::Envelope;
 use agent_core::import::{agy_prompts, ClaudeImporter};
 
 use crate::sessions::{
-    list_agy_sessions, one_line_title, read_agy_history, summarize_session, validate_session_id,
-    SUMMARY_WINDOW,
+    list_agy_sessions, one_line_title, read_agy_history, summarize_session, transcript_files,
+    validate_session_id, TranscriptFile, SUMMARY_WINDOW,
 };
 
 /// Longest Claude transcript read back. Larger files are refused rather than slowly imported.
@@ -80,38 +80,12 @@ pub fn recent_native_sessions(home: &Path, limit: usize) -> Vec<NativeSession> {
 }
 
 fn claude_sessions(home: &Path, limit: usize) -> Vec<NativeSession> {
-    let mut transcripts: Vec<(PathBuf, String, SystemTime)> = Vec::new();
-    for project in std::fs::read_dir(claude_projects(home))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let dir = project.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        for file in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(id) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| validate_session_id(s).ok())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            if let Ok(modified) = path.metadata().and_then(|m| m.modified()) {
-                transcripts.push((path, id, modified));
-            }
-        }
-    }
-    transcripts.sort_by_key(|(_, _, modified)| std::cmp::Reverse(*modified));
+    // Project directories only: Claude keeps no transcript directly in `projects/`. A missing or
+    // unreadable store lists nothing.
+    let transcripts = transcript_files(&claude_projects(home), false).unwrap_or_default();
 
     let mut out = Vec::new();
-    for (path, id, modified) in transcripts {
+    for TranscriptFile { path, id, modified } in transcripts {
         if out.len() >= limit {
             break;
         }

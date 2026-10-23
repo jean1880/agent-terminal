@@ -25,7 +25,6 @@ use crate::freshness::{
     age_of, freshness, is_due, latest, now_epoch, Freshness, ReadAt, ACCOUNT_TTL,
 };
 use crate::probe::{join_n, ListenerSet, ProbeTargets};
-use crate::{claude_probe, codex_probe};
 
 /// One agent's account and quota windows.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -483,25 +482,12 @@ impl AccountStatus {
         for (driver, target) in jobs {
             let (me, done) = (self.clone(), finish.clone());
             match driver {
-                Driver::Claude => {
-                    claude_probe::probe_shared(&target.program, &target.env, move |result| {
+                Driver::Claude | Driver::Codex => {
+                    crate::probe::read_shared(driver, &target, move |result| {
                         match result {
-                            Ok(probe) => {
-                                me.set_signed_out(driver, probe.signed_out);
-                                me.update(driver, probe.account.clone(), probe.windows.clone());
-                            }
-                            Err(_) => me.probe_failed(driver),
-                        }
-                        me.probe_finished(driver, now_epoch());
-                        done();
-                    });
-                }
-                Driver::Codex => {
-                    codex_probe::probe_shared(&target.program, &target.env, move |result| {
-                        match result {
-                            Ok(probe) => {
-                                me.set_signed_out(driver, probe.signed_out);
-                                me.update(driver, probe.account.clone(), probe.windows.clone());
+                            Ok(reading) => {
+                                me.set_signed_out(driver, reading.signed_out);
+                                me.update(driver, reading.account.clone(), reading.windows.clone());
                             }
                             Err(_) => me.probe_failed(driver),
                         }
@@ -761,15 +747,7 @@ mod tests {
 
     /// Fake agents that leave a mark each time one is started.
     fn marking_targets(dir: &std::path::Path) -> (ProbeTargets, std::path::PathBuf) {
-        let mark = dir.join("started");
-        let program = crate::claude_probe::tests::fake_claude(
-            dir,
-            &format!("echo x >> '{}'\nexit 1", mark.display()),
-        );
-        let target = crate::probe::ProbeTarget {
-            program,
-            env: crate::agent_proc::AgentEnv::default(),
-        };
+        let (target, mark) = crate::probe::fixtures::marking_target(dir);
         let targets = ProbeTargets::new(
             Driver::ALL
                 .into_iter()

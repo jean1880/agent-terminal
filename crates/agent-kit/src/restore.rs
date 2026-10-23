@@ -676,49 +676,19 @@ mod tests {
 
     mod repo {
         use super::super::*;
-        use crate::git::{discover, git_installed};
+        use crate::git::discover;
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
         use std::fs;
-        use std::process::Command;
-
-        fn sh(dir: &Path, args: &[&str]) -> String {
-            let output = Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "init.defaultBranch=main",
-                ])
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
 
         fn new_repo() -> Option<tempfile::TempDir> {
-            if !git_installed() {
-                eprintln!("git not installed; skipping");
+            if !git_or_skip() {
                 return None;
             }
             let dir = tempfile::tempdir().unwrap();
-            sh(dir.path(), &["init", "-q"]);
-            fs::write(dir.path().join("keep.txt"), "v1\n").unwrap();
-            fs::write(dir.path().join("doomed.txt"), "tracked\n").unwrap();
-            sh(dir.path(), &["add", "."]);
-            sh(dir.path(), &["commit", "-q", "-m", "init"]);
+            init_repo_at(
+                dir.path(),
+                &[("keep.txt", b"v1\n"), ("doomed.txt", b"tracked\n")],
+            );
             Some(dir)
         }
 
