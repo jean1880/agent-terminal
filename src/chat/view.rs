@@ -1721,7 +1721,7 @@ pub(crate) mod tests {
         use adw::prelude::AdwWindowExt;
         gtk4::init().expect("GTK init");
         adw::init().expect("adw init");
-        let backend = AnswerLog::new(Driver::Agy);
+        let backend = StubBackend::fixed(Driver::Agy);
         {
             let mut status = backend.status.borrow_mut();
             status.mode = Mode::Plan;
@@ -1982,23 +1982,108 @@ pub(crate) mod tests {
         assert_eq!(stored.len(), before);
     }
 
-    /// A backend whose status the test changes, as a session does on a switch.
-    pub(super) struct SwitchableBackend {
+    /// A backend for view tests: it records what the view asks of it (prompts, controls with
+    /// distinct request ids, approvals, forms, modes) and answers as the test sets it.
+    pub(super) struct StubBackend {
         pub(super) status: RefCell<SessionStatus>,
+        /// Prompts sent, queued or steered.
+        pub(super) sent: RefCell<Vec<String>>,
+        pub(super) controls: RefCell<Vec<(String, Control)>>,
+        pub(super) approvals: RefCell<Vec<(String, Decision)>>,
+        pub(super) forms: RefCell<
+            Vec<(
+                String,
+                agent_core::form::FormAction,
+                Option<serde_json::Value>,
+            )>,
+        >,
+        pub(super) modes: RefCell<Vec<Mode>>,
+        /// Answer `false` to `respond_form`, as an adapter that refused it does.
+        pub(super) refuse_form: Cell<bool>,
+        /// A switch takes the new agent's status, as a session does.
+        pub(super) switch_updates_status: Cell<bool>,
+        /// Fail the test if questions are answered over the protocol.
+        pub(super) panic_on_answer: Cell<bool>,
     }
 
-    impl ChatBackend for SwitchableBackend {
-        fn send_prompt(&self, _: &str) {}
+    impl StubBackend {
+        /// On `driver`; a switch changes its status.
+        pub(super) fn new(driver: Driver) -> Rc<Self> {
+            Self::with_status(status_of(driver))
+        }
+
+        /// With `status`; a switch changes it.
+        pub(super) fn with_status(status: SessionStatus) -> Rc<Self> {
+            Rc::new(Self {
+                status: RefCell::new(status),
+                sent: RefCell::default(),
+                controls: RefCell::default(),
+                approvals: RefCell::default(),
+                forms: RefCell::default(),
+                modes: RefCell::default(),
+                refuse_form: Cell::new(false),
+                switch_updates_status: Cell::new(true),
+                panic_on_answer: Cell::new(false),
+            })
+        }
+
+        /// On `driver` whatever is switched to.
+        pub(super) fn fixed(driver: Driver) -> Rc<Self> {
+            let backend = Self::new(driver);
+            backend.switch_updates_status.set(false);
+            backend
+        }
+
+        /// The request id of the first control `wanted` matches.
+        pub(super) fn asked(&self, wanted: impl Fn(&Control) -> bool) -> Option<String> {
+            self.controls
+                .borrow()
+                .iter()
+                .find(|(_, c)| wanted(c))
+                .map(|(id, _)| id.clone())
+        }
+    }
+
+    impl ChatBackend for StubBackend {
+        fn send_prompt(&self, text: &str) {
+            self.sent.borrow_mut().push(text.to_owned());
+        }
         fn interrupt(&self) {}
-        fn respond_approval(&self, _: &str, _: Decision) {}
-        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
+        fn respond_approval(&self, request: &str, decision: Decision) {
+            self.approvals
+                .borrow_mut()
+                .push((request.to_owned(), decision));
+        }
+        fn answer_questions(&self, _: &str, _: serde_json::Value) {
+            assert!(
+                !self.panic_on_answer.get(),
+                "a reply question is answered by a prompt, never over the protocol"
+            );
+        }
+        fn respond_form(
+            &self,
+            request: &str,
+            action: agent_core::form::FormAction,
+            content: Option<serde_json::Value>,
+        ) -> bool {
+            self.forms
+                .borrow_mut()
+                .push((request.to_owned(), action, content));
+            !self.refuse_form.get()
+        }
         fn switch(&self, driver: Driver, _: Option<String>, _: Option<String>) {
-            *self.status.borrow_mut() = status_of(driver);
+            if self.switch_updates_status.get() {
+                *self.status.borrow_mut() = status_of(driver);
+            }
         }
         fn reload_session(&self) {}
-        fn set_mode(&self, _: Mode) {}
-        fn control(&self, _: Control) -> String {
-            String::new()
+        fn set_mode(&self, mode: Mode) {
+            self.modes.borrow_mut().push(mode);
+        }
+        fn control(&self, control: Control) -> String {
+            let id = format!("ctl-{}", self.controls.borrow().len() + 1);
+            self.controls.borrow_mut().push((id.clone(), control));
+            id
         }
         fn status(&self) -> SessionStatus {
             self.status.borrow().clone()
@@ -2041,9 +2126,7 @@ pub(crate) mod tests {
                 error: None,
             })
         };
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Codex)),
-        });
+        let backend = StubBackend::new(Driver::Codex);
         let view = ChatView::new(backend.clone());
         let window = gtk4::Window::new();
         window.set_default_size(560, 700);
@@ -2201,9 +2284,7 @@ pub(crate) mod tests {
         };
         let mut dead = status_of(Driver::Claude);
         dead.alive = false;
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(dead),
-        }));
+        let view = ChatView::new(StubBackend::with_status(dead));
         view.replay(&[
             Envelope::new(Event::TurnStarted { model: None }),
             Envelope::new(Event::ApprovalRequested {
@@ -2288,9 +2369,7 @@ pub(crate) mod tests {
             started("t1", ItemKind::Command),
             started("t2", ItemKind::Command),
         ];
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let entering = |view: &ChatView, id: &str| {
             view.inner()
                 .and_then(|i| {
@@ -2317,9 +2396,7 @@ pub(crate) mod tests {
     /// so the command's result reads after "Allowed", not before it.
     fn approval_row_precedes_its_step() {
         use agent_core::event::{Event, ItemKind, ResponseCapability};
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         view.apply(
             &Envelope::new(Event::ItemStarted {
@@ -2362,9 +2439,7 @@ pub(crate) mod tests {
     /// The dots above the composer show while a turn runs, name the agent, and go when it ends.
     fn thinking_strip_follows_the_turn() {
         use agent_core::event::{Event, TurnState};
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend.clone());
         let inner = view.inner().expect("a built view");
         assert_eq!(inner.thinking.shown(), None, "a new thread shows nothing");
@@ -2398,9 +2473,7 @@ pub(crate) mod tests {
     fn model_chip_follows_pending_acceptance_and_rejection() {
         let mut status = status_of(Driver::Claude);
         status.model = Some("sonnet".into());
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status),
-        });
+        let backend = StubBackend::with_status(status);
         let view = ChatView::new(backend.clone());
         let chip = view.inner().expect("view").header.chip.clone();
         let tooltip = || chip.tooltip_text().expect("model tooltip").to_string();
@@ -2509,74 +2582,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A backend that remembers how the user answered an approval or a form.
-    pub(super) struct AnswerLog {
-        pub(super) status: RefCell<SessionStatus>,
-        modes: RefCell<Vec<Mode>>,
-        pub(super) approvals: RefCell<Vec<(String, Decision)>>,
-        /// Answer `false` to `respond_form`, as an adapter that refused it does.
-        pub(super) refuse: Cell<bool>,
-        pub(super) forms: RefCell<
-            Vec<(
-                String,
-                agent_core::form::FormAction,
-                Option<serde_json::Value>,
-            )>,
-        >,
-    }
-
-    impl AnswerLog {
-        pub(super) fn new(driver: Driver) -> Rc<Self> {
-            Rc::new(Self {
-                status: RefCell::new(status_of(driver)),
-                modes: RefCell::default(),
-                approvals: RefCell::default(),
-                refuse: Cell::new(false),
-                forms: RefCell::default(),
-            })
-        }
-    }
-
-    impl ChatBackend for AnswerLog {
-        fn send_prompt(&self, _: &str) {}
-        fn interrupt(&self) {}
-        fn respond_approval(&self, request: &str, decision: Decision) {
-            self.approvals
-                .borrow_mut()
-                .push((request.to_owned(), decision));
-        }
-        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
-        fn respond_form(
-            &self,
-            request: &str,
-            action: agent_core::form::FormAction,
-            content: Option<serde_json::Value>,
-        ) -> bool {
-            self.forms
-                .borrow_mut()
-                .push((request.to_owned(), action, content));
-            !self.refuse.get()
-        }
-        fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
-        fn reload_session(&self) {}
-        fn set_mode(&self, mode: Mode) {
-            self.modes.borrow_mut().push(mode);
-        }
-        fn control(&self, _: Control) -> String {
-            String::new()
-        }
-        fn status(&self) -> SessionStatus {
-            self.status.borrow().clone()
-        }
-    }
-
     /// Forms and permission requests through the whole view: the shelf, the thread's status,
     /// the composer's hint, the answer reaching the backend, and the "Extra access" chip.
     pub(crate) fn requests_ui_checks() {
         use agent_core::form::{FieldInput, Form, FormAction, FormField};
         use serde_json::json;
 
-        let backend = AnswerLog::new(Driver::Codex);
+        let backend = StubBackend::fixed(Driver::Codex);
         let view = ChatView::new(backend.clone());
         let inner = view.inner().expect("inner");
         let hint = || inner.composer.placeholder_text();
@@ -2625,7 +2637,7 @@ pub(crate) mod tests {
         assert!(backend.forms.borrow().is_empty(), "invalid: nothing sent");
         entry.set_text("octo");
         // An answer the adapter refuses must not strand the card at "Sending…".
-        backend.refuse.set(true);
+        backend.refuse_form.set(true);
         entry.emit_activate();
         let ctx = glib::MainContext::default();
         while ctx.iteration(false) {}
@@ -2647,7 +2659,7 @@ pub(crate) mod tests {
             inner.interruption.revealer.reveals_child(),
             "still waiting on the user"
         );
-        backend.refuse.set(false);
+        backend.refuse_form.set(false);
         entry.emit_activate();
         assert_eq!(
             backend.forms.borrow()[1],
@@ -2734,9 +2746,7 @@ pub(crate) mod tests {
     /// with none lets the key through.
     fn all_subagent_cards_toggle_together() {
         use agent_core::event::{Event, ItemKind};
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         assert!(
             !inner.toggle_all_subagents(),
@@ -2791,9 +2801,7 @@ pub(crate) mod tests {
             while ctx.iteration(false) {}
         };
 
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         view.replay(&history);
         assert_eq!(inner.transcript.materialised(), FIRST_PAINT);
@@ -2807,9 +2815,7 @@ pub(crate) mod tests {
         );
         assert!(!built("s50"), "nothing older than the window");
 
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         view.replay(&history);
         inner.transcript.scroll_to_card("s60");
@@ -2827,18 +2833,14 @@ pub(crate) mod tests {
 
         // A reset while a fill is pending cancels it and starts over; a view dropped mid-fill
         // leaves nothing behind that runs.
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let inner = view.inner().expect("view");
         view.replay(&history);
         inner.transcript.reset(&inner.model.borrow());
         assert_eq!(inner.transcript.materialised(), FIRST_PAINT);
         pump();
         assert_eq!(inner.transcript.materialised(), WINDOW);
-        let dropped = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let dropped = ChatView::new(StubBackend::new(Driver::Claude));
         dropped.replay(&history);
         drop(dropped);
         pump();
@@ -2855,9 +2857,7 @@ pub(crate) mod tests {
         crate::icons::register();
         crate::load_css();
         let ctx = glib::MainContext::default();
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
         let window = gtk4::Window::new();
         window.set_default_size(560, 460);
         window.set_child(Some(&view));
@@ -2910,9 +2910,7 @@ pub(crate) mod tests {
 
     /// The model picker in a real window (a libadwaita one, so the dialog sits in its host).
     fn escape_closes_the_model_picker() {
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let window = adw::Window::new();
         window.set_default_size(560, 700);
@@ -2956,9 +2954,7 @@ pub(crate) mod tests {
         subagents::tests::worker_group_updates_without_rebuilding_its_row();
         subagents::tests::names_are_never_squeezed_into_a_column();
         delegation::tests::ui_checks();
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend.clone());
         // A focus-chasing viewport scrolled back up to a spent card and let go of the bottom.
         assert!(
@@ -3205,9 +3201,7 @@ pub(crate) mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         };
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let window = gtk4::Window::new();
         window.set_default_size(500, 400);
@@ -3615,9 +3609,7 @@ pub(crate) mod tests {
     pub(crate) fn reasoning_ui_checks() {
         use agent_core::event::{Event, ItemKind, ItemStatus, StreamKind};
 
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let sink = view.sink();
         let think = |id: &str, text: Option<&str>| {
@@ -3746,9 +3738,7 @@ pub(crate) mod tests {
         crate::icons::register();
         crate::load_css();
         let ctx = glib::MainContext::default();
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Codex)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Codex));
         let command = format!("git show {}", "a".repeat(820));
         let mut history = demo::DemoBackend::stress_history(180);
         history.push(
@@ -3850,9 +3840,7 @@ pub(crate) mod tests {
         use std::time::{Duration, Instant};
         gtk4::init().expect("GTK init");
         let ctx = glib::MainContext::default();
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let window = gtk4::Window::new();
         window.set_default_size(900, 700);
@@ -4051,9 +4039,7 @@ pub(crate) mod tests {
         use agent_core::event::{Event, ItemKind};
         use serde_json::json;
 
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let inner = view.inner().expect("inner");
         let ctx = glib::MainContext::default();
@@ -4133,9 +4119,7 @@ pub(crate) mod tests {
         assert_eq!(panel().steps_shown(), 2, "the open panel keeps showing it");
 
         // A replayed thread whose sub-agent finished long ago still lists it.
-        let replayed = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        }));
+        let replayed = ChatView::new(StubBackend::new(Driver::Claude));
         replayed.replay(&[
             Envelope::new(Event::ItemStarted {
                 kind: ItemKind::Subagent,
@@ -4170,9 +4154,7 @@ pub(crate) mod tests {
         use agent_kit::filediff::{Origin, Shown};
         use serde_json::json;
 
-        let backend = Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Claude)),
-        });
+        let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
         let diff_text = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
         let source = Rc::new(FakeDiffs {

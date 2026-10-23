@@ -7,7 +7,7 @@
 //! ~1–7 ms of layout and ~1 ms more for its render nodes. Hidden threads (each shown once first, as
 //! in the app) add nothing: `AdwTabView` lays out only the visible page.
 
-use super::tests::{native_init, pump_until, status_of, SwitchableBackend};
+use super::tests::{native_init, pump_until, StubBackend};
 use super::*;
 use agent_core::event::{ItemKind, ItemStatus, StreamKind};
 use std::time::{Duration, Instant};
@@ -64,9 +64,7 @@ fn history(n: usize) -> Vec<Envelope> {
 }
 
 fn chat(n: usize) -> ChatView {
-    let view = ChatView::new(Rc::new(SwitchableBackend {
-        status: RefCell::new(status_of(Driver::Claude)),
-    }));
+    let view = ChatView::new(StubBackend::new(Driver::Claude));
     view.replay(&history(n));
     view
 }

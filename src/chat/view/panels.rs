@@ -1106,11 +1106,9 @@ pub(crate) mod tests {
     #[test]
     fn a_resolved_request_cancels_its_expiry_timer() {
         crate::testutil::in_loop(|_| {
-            let backend = super::super::tests::SwitchableBackend {
-                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
-            };
+            let backend = super::super::tests::StubBackend::new(Driver::Claude);
             let requests = Rc::new(Requests::default());
-            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let id = requests.ask(&*backend, Control::McpStatus, |_| {});
             let source = requests.timeouts.borrow()[&id].source().clone();
             assert!(!source.is_destroyed());
             requests.resolve(&id, Ok(serde_json::json!({})));
@@ -1123,11 +1121,9 @@ pub(crate) mod tests {
     #[test]
     fn an_expired_request_cancels_its_expiry_timer() {
         crate::testutil::in_loop(|_| {
-            let backend = super::super::tests::SwitchableBackend {
-                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
-            };
+            let backend = super::super::tests::StubBackend::new(Driver::Claude);
             let requests = Rc::new(Requests::default());
-            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let id = requests.ask(&*backend, Control::McpStatus, |_| {});
             let source = requests.timeouts.borrow()[&id].source().clone();
             requests.expire(&id);
             assert!(source.is_destroyed());
@@ -1138,11 +1134,9 @@ pub(crate) mod tests {
     #[test]
     fn dropping_requests_cancels_their_expiry_timers() {
         crate::testutil::in_loop(|_| {
-            let backend = super::super::tests::SwitchableBackend {
-                status: RefCell::new(super::super::tests::status_of(Driver::Claude)),
-            };
+            let backend = super::super::tests::StubBackend::new(Driver::Claude);
             let requests = Rc::new(Requests::default());
-            let id = requests.ask(&backend, Control::McpStatus, |_| {});
+            let id = requests.ask(&*backend, Control::McpStatus, |_| {});
             let source = requests.timeouts.borrow()[&id].source().clone();
             drop(requests);
             assert!(source.is_destroyed());

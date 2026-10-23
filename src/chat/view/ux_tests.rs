@@ -1,5 +1,5 @@
 //! Native layout matrix using synthetic transcripts and observable frame conditions.
-use super::tests::{status_of, SwitchableBackend};
+use super::tests::StubBackend;
 use super::*;
 use agent_core::event::{
     Decision, ItemKind, PlanStep, Question, QuestionOption, ResponseCapability, StepStatus,
@@ -74,9 +74,7 @@ fn native_ux_matrix() {
         (560, 2.0, false),
         (950, 2.0, true),
     ] {
-        let view = ChatView::new(Rc::new(SwitchableBackend {
-            status: RefCell::new(status_of(Driver::Codex)),
-        }));
+        let view = ChatView::new(StubBackend::new(Driver::Codex));
         view.set_text_scale(scale);
         let mut history = demo::DemoBackend::stress_history(220);
         for (id, kind, text) in [
@@ -943,35 +941,6 @@ fn native_queue_stays_pinned_and_contained() {
     }
 }
 
-/// A backend that remembers every prompt sent to it.
-struct PromptLog {
-    status: SessionStatus,
-    sent: RefCell<Vec<String>>,
-}
-
-impl ChatBackend for PromptLog {
-    fn send_prompt(&self, text: &str) {
-        self.sent.borrow_mut().push(text.to_owned());
-    }
-    fn queue_prompt(&self, text: &str) {
-        self.sent.borrow_mut().push(text.to_owned());
-    }
-    fn interrupt(&self) {}
-    fn respond_approval(&self, _: &str, _: Decision) {}
-    fn answer_questions(&self, _: &str, _: serde_json::Value) {
-        panic!("a reply question is answered by a prompt, never over the protocol");
-    }
-    fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
-    fn reload_session(&self) {}
-    fn set_mode(&self, _: Mode) {}
-    fn control(&self, _: Control) -> String {
-        String::new()
-    }
-    fn status(&self) -> SessionStatus {
-        self.status.clone()
-    }
-}
-
 /// Quick-reply chips under a finished reply: a click puts the exact option in the composer, with
 /// the cursor after it and the focus there, and sends nothing; the chips are no interruption;
 /// Dismiss and "Don't suggest these" both take them away, the latter telling the window.
@@ -983,10 +952,8 @@ fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
     crate::icons::register();
     crate::load_css();
     let ctx = glib::MainContext::default();
-    let backend = Rc::new(PromptLog {
-        status: status_of(Driver::Codex),
-        sent: RefCell::default(),
-    });
+    let backend = StubBackend::fixed(Driver::Codex);
+    backend.panic_on_answer.set(true);
     let view = ChatView::new(backend.clone());
     let actions: Rc<RefCell<Vec<String>>> = Rc::default();
     let log = actions.clone();
