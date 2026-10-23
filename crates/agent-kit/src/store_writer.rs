@@ -107,6 +107,29 @@ type WriteJob = Box<dyn FnOnce(&Store) -> Result<()> + Send>;
 /// Hands a job's answer back once its outcome is known: `true` committed, `false` not.
 type Deliver = Box<dyn FnOnce(bool) + Send>;
 
+/// Wraps a fallible job as a [`WriteJob`] whose result is kept in the returned slot for the
+/// caller's answer. The job's own `Err` still fails the write (so its savepoint rolls back), as
+/// `StoreError::Failed` with the same message. The slot stays empty if the job panicked; how the
+/// kept result is settled is each caller's.
+fn capture_result<T: Send + 'static>(
+    job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
+) -> (WriteJob, Arc<Mutex<Option<Result<T>>>>) {
+    let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
+    let fill = slot.clone();
+    let job: WriteJob = Box::new(move |store: &Store| {
+        let result = job(store);
+        let outcome = match &result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(StoreError::Failed(e.to_string())),
+        };
+        if let Ok(mut slot) = fill.lock() {
+            *slot = Some(result);
+        }
+        outcome
+    });
+    (job, slot)
+}
+
 struct Write {
     what: &'static str,
     thread: Option<String>,
@@ -419,22 +442,11 @@ impl StoreWriter {
         job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Receiver<Result<T>> {
         let (tx, rx) = mpsc::channel();
-        let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
-        let fill = slot.clone();
+        let (job, slot) = capture_result(job);
         let _ = self.enqueue(Write {
             what,
             thread: None,
-            job: Box::new(move |store: &Store| {
-                let result = job(store);
-                let outcome = match &result {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(StoreError::Failed(e.to_string())),
-                };
-                if let Ok(mut slot) = fill.lock() {
-                    *slot = Some(result);
-                }
-                outcome
-            }),
+            job,
             deliver: Some(Box::new(move |committed| {
                 let answer = match slot.lock().ok().and_then(|mut s| s.take()) {
                     Some(Ok(value)) if committed => Ok(value),
@@ -483,22 +495,11 @@ impl StoreWriter {
         job: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Receiver<Result<T>> {
         let (tx, rx) = mpsc::channel();
-        let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
-        let fill = slot.clone();
+        let (job, slot) = capture_result(job);
         let refused_tx = tx.clone();
         let write = DurableWrite {
             what,
-            job: Box::new(move |store: &Store| {
-                let result = job(store);
-                let outcome = match &result {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(StoreError::Failed(e.to_string())),
-                };
-                if let Ok(mut slot) = fill.lock() {
-                    *slot = Some(result);
-                }
-                outcome
-            }),
+            job,
             settle: Box::new(move |outcome: Result<()>| {
                 let held = slot.lock().ok().and_then(|mut s| s.take());
                 let answer = match (outcome, held) {
@@ -1086,15 +1087,8 @@ impl StoreHandle {
             return store.append_user_message(thread, provider_thread, text);
         }
         let item = self.new_id()?;
-        let (t, pt, i, text) = (
-            thread.to_owned(),
-            provider_thread.map(str::to_owned),
-            item.clone(),
-            text.to_owned(),
-        );
-        self.write("store a message", Some(thread), move |s| {
-            s.append_user_message_with_id(&t, pt.as_deref(), &i, &text)
-        })?;
+        // Handed back only once the write is admitted.
+        self.append_user_message_with_id(thread, provider_thread, &item, text)?;
         Ok(item)
     }
 
