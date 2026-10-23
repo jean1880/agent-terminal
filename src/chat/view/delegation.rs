@@ -170,6 +170,8 @@ impl Worker {
             activity: self.summary.last_activity.clone(),
             driver: identity.map(|identity| identity.driver),
             delegation,
+            requested_model: None,
+            requested_effort: None,
         }
     }
 }

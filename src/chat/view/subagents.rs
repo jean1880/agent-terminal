@@ -66,7 +66,19 @@ pub(super) fn identity_text(agent: &SubagentSummary) -> String {
             provenance_text(&delegation.model),
             provenance_text(&delegation.effort)
         ),
-        None => format!("{provider} · native · model unknown · effort unknown"),
+        None => format!(
+            "{provider} · native · model {} · effort {}",
+            requested_text(agent.requested_model.as_deref()),
+            requested_text(agent.requested_effort.as_deref())
+        ),
+    }
+}
+
+/// A value the parent asked for, which the provider never confirmed.
+fn requested_text(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("{value} (requested; effective unknown)"),
+        None => "unknown".to_owned(),
     }
 }
 
@@ -785,7 +797,26 @@ pub(crate) mod tests {
             activity: None,
             driver: None,
             delegation: None,
+            requested_model: None,
+            requested_effort: None,
         }
+    }
+
+    #[test]
+    fn a_native_sub_agent_shows_the_model_and_effort_its_parent_asked_for() {
+        let mut native = agent("n", ToolStatus::Running);
+        native.driver = Some(agent_core::adapter::Driver::Claude);
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model unknown · effort unknown"
+        );
+        native.requested_model = Some("sonnet".into());
+        native.requested_effort = Some("high".into());
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model sonnet (requested; effective unknown) · effort high \
+             (requested; effective unknown)"
+        );
     }
 
     #[test]
