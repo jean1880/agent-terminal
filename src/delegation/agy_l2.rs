@@ -375,14 +375,7 @@ mod tests {
         }
         let t = Tree::new();
         let repo = t.root.join("a");
-        let out = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("git init");
-        assert!(out.status.success());
+        agent_kit::test_support::git(&repo, &["init", "-q"]);
         // Above the toplevel: not searched.
         t.touch(".agents/mcp_config.json");
         let real = |d: &Path| real_discover(d);
