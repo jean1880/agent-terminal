@@ -1094,7 +1094,7 @@ impl From<&AgyUsage> for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{records, Malformed};
+    use crate::test_support::{records, stdout_frames, Malformed};
 
     const EDIT: &str = include_str!("../tests/fixtures/agy-edit.ndjson");
     const HOOK: &str = include_str!("../tests/fixtures/agy-hook-approval.ndjson");
@@ -1222,15 +1222,21 @@ mod tests {
         assert!(last.raw.is_some());
     }
 
+    /// Asks for the context usage and takes what the adapter answered itself.
+    fn context_usage(adapter: &mut AgyAdapter, id: &str) -> Outbox {
+        adapter
+            .encode(Command::Control {
+                id: id.into(),
+                control: Control::ContextUsage,
+            })
+            .expect("control");
+        adapter.drain_outbox()
+    }
+
     #[test]
     fn context_usage_control_reports_input_tokens() {
         let mut a = AgyAdapter::default();
-        a.encode(Command::Control {
-            id: "cu1".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
-        let outbox = a.drain_outbox();
+        let outbox = context_usage(&mut a, "cu1");
         assert_eq!(outbox.events.len(), 1);
         assert!(matches!(
             &outbox.events[0].event,
@@ -1241,12 +1247,7 @@ mod tests {
             r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":1000,"output_tokens":200}}}"#,
         );
 
-        a.encode(Command::Control {
-            id: "cu2".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
-        let outbox = a.drain_outbox();
+        let outbox = context_usage(&mut a, "cu2");
         assert_eq!(outbox.events.len(), 2);
         assert!(matches!(
             &outbox.events[0].event,
@@ -1282,12 +1283,7 @@ mod tests {
                 &json!({"event": "result", "result": {"status": "SUCCESS", "usage": usage}})
                     .to_string(),
             );
-            a.encode(Command::Control {
-                id: "context".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
-            let out = a.drain_outbox();
+            let out = context_usage(&mut a, "context");
             assert!(
                 matches!(&out.events[0].event, Event::UsageUpdated { used, .. } if *used == expected)
             );
@@ -1302,18 +1298,10 @@ mod tests {
     fn agy_context_uses_the_last_model_call_instead_of_the_turn_total() {
         let mut a = AgyAdapter::default();
         for (fixture, expected) in [(EDIT, 14035), (HOOK, 12771)] {
-            for line in fixture.lines() {
-                let rec: Value = serde_json::from_str(line).expect("fixture");
-                if rec["dir"] == "out" {
-                    a.feed(&rec["frame"].to_string());
-                }
+            for frame in stdout_frames(fixture, Malformed::Panic) {
+                a.feed(&frame);
             }
-            a.encode(Command::Control {
-                id: "context".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
-            let out = a.drain_outbox();
+            let out = context_usage(&mut a, "context");
             assert!(
                 matches!(&out.events[0].event, Event::UsageUpdated { used, .. } if *used == expected)
             );
@@ -1333,25 +1321,15 @@ mod tests {
             );
         }
         a.feed(r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":20000,"output_tokens":5000}}}"#);
-        a.encode(Command::Control {
-            id: "smaller".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
         assert!(matches!(
-            &a.drain_outbox().events[0].event,
+            &context_usage(&mut a, "smaller").events[0].event,
             Event::UsageUpdated { used: 500, .. }
         ));
 
         // A later result-only turn uses its own input, rather than the previous turn's step.
         a.feed(r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":800,"output_tokens":100}}}"#);
-        a.encode(Command::Control {
-            id: "fallback".into(),
-            control: Control::ContextUsage,
-        })
-        .expect("control");
         assert!(matches!(
-            &a.drain_outbox().events[0].event,
+            &context_usage(&mut a, "fallback").events[0].event,
             Event::UsageUpdated { used: 800, .. }
         ));
     }
@@ -1372,25 +1350,15 @@ mod tests {
                 })
                 .expect("prompt");
             }
-            a.encode(Command::Control {
-                id: "retained".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
             assert!(matches!(
-                &a.drain_outbox().events[0].event,
+                &context_usage(&mut a, "retained").events[0].event,
                 Event::UsageUpdated { used: 1000, .. }
             ));
             a.feed(
                 r#"{"event":"result","result":{"status":"SUCCESS","usage":{"input_tokens":800}}}"#,
             );
-            a.encode(Command::Control {
-                id: "fallback".into(),
-                control: Control::ContextUsage,
-            })
-            .expect("control");
             assert!(matches!(
-                &a.drain_outbox().events[0].event,
+                &context_usage(&mut a, "fallback").events[0].event,
                 Event::UsageUpdated { used: 800, .. }
             ));
         }
