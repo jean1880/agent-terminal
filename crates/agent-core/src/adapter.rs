@@ -151,6 +151,16 @@ impl Mode {
             other => other,
         }
     }
+
+    /// The mode's name as the user reads it in a picker or a notice.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Ask => "Ask before edits",
+            Mode::AcceptEdits => "Accept edits",
+            Mode::Plan => "Plan",
+            Mode::Bypass => "Dangerous permissive",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +173,14 @@ mod mode_tests {
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
             assert_eq!(m.session_safe(), m);
         }
+    }
+
+    #[test]
+    fn labels_are_the_pickers_wording() {
+        assert_eq!(Mode::Ask.label(), "Ask before edits");
+        assert_eq!(Mode::AcceptEdits.label(), "Accept edits");
+        assert_eq!(Mode::Plan.label(), "Plan");
+        assert_eq!(Mode::Bypass.label(), "Dangerous permissive");
     }
 }
 

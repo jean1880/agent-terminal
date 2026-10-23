@@ -2694,7 +2694,7 @@ impl Adapter for CodexAdapter {
                     });
                     self.emit(Event::Notice { text: format!(
                         "{} applies to the next turn. This turn keeps {}; its pending approvals still need an answer.",
-                        codex_mode_label(mode), codex_mode_label(effective)
+                        mode.label(), effective.label()
                     ) });
                 } else {
                     // Selecting the effective mode cancels any deferred selection.
@@ -2983,15 +2983,6 @@ fn sandbox_mode_name(policy: &Value) -> Option<&'static str> {
         "workspaceWrite" => Some("workspace-write"),
         "dangerFullAccess" => Some("danger-full-access"),
         _ => None,
-    }
-}
-
-fn codex_mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "Ask before edits",
-        Mode::AcceptEdits => "Accept edits",
-        Mode::Plan => "Plan",
-        Mode::Bypass => "Dangerous permissive",
     }
 }
 
