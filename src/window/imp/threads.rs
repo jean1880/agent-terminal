@@ -6688,32 +6688,21 @@ impl AgentTerminalWindow {
             return self.open_created(&thread, created);
         }
         // Stored by the writer first, and the page opens only once it is: a thread that could
-        // not be stored gets the dialog, never a page whose every write would fail.
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            let reload = obj.clone();
-            let stored = write_job_or_late("create a thread", record, move || {
-                // Landed after all: the list shows it now.
-                if let Some(obj) = reload.upgrade() {
-                    obj.imp().reload_summaries();
-                }
-            })
-            .await;
-            let Some(obj) = obj.upgrade() else { return };
-            match stored {
-                Some(Ok(())) => {
-                    info!("New {} thread in {cwd}", driver.info().label);
-                    obj.imp().open_created(&thread, created);
-                }
-                Some(Err(e)) => present_message(&obj, "Cannot Create a Thread", &e.to_string()),
-                None => {
-                    present_message(
-                        &obj,
-                        "The Thread Is Not Ready Yet",
-                        "The thread store is far behind. The thread may still be saved: it \
-                         will show in the list once it is.",
-                    );
-                }
+        // not be stored gets the dialog, never a page whose every write would fail. One that
+        // lands late after all shows in the list then.
+        self.write_store_then("create a thread", record, move |imp, stored| match stored {
+            Some(Ok(())) => {
+                info!("New {} thread in {cwd}", driver.info().label);
+                imp.open_created(&thread, created);
+            }
+            Some(Err(e)) => present_message(&imp.obj(), "Cannot Create a Thread", &e.to_string()),
+            None => {
+                present_message(
+                    &imp.obj(),
+                    "The Thread Is Not Ready Yet",
+                    "The thread store is far behind. The thread may still be saved: it \
+                     will show in the list once it is.",
+                );
             }
         });
         None
@@ -6856,29 +6845,24 @@ impl AgentTerminalWindow {
             }
             return;
         }
-        let obj = self.obj().downgrade();
-        glib::MainContext::default().spawn_local(async move {
-            let reload = obj.clone();
-            let stored = write_job_or_late("resume a session as a thread", record, move || {
-                if let Some(obj) = reload.upgrade() {
-                    obj.imp().reload_summaries();
+        self.write_store_then(
+            "resume a session as a thread",
+            record,
+            move |imp, stored| match stored {
+                Some(Ok(made)) => opened(imp, made),
+                Some(Err(e)) => {
+                    present_message(&imp.obj(), "Cannot Resume the Session", &e.to_string())
                 }
-            })
-            .await;
-            let Some(obj) = obj.upgrade() else { return };
-            match stored {
-                Some(Ok(made)) => opened(obj.imp(), made),
-                Some(Err(e)) => present_message(&obj, "Cannot Resume the Session", &e.to_string()),
                 None => {
                     present_message(
-                        &obj,
+                        &imp.obj(),
                         "The Session Is Not Ready Yet",
                         "The thread store is far behind. The session may still be saved as a \
                          thread: it will show in the list once it is.",
                     );
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Routes a resume to a chat thread or, for a CLI with no adapter, a terminal page.
