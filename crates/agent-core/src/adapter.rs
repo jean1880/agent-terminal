@@ -502,6 +502,12 @@ pub(crate) fn map_json_frame(
     out
 }
 
+/// `v` and the `response` objects nested in it, outermost first, at most four levels: a control
+/// response given as the bare payload, the `{response: ..}` envelope or a whole recorded frame.
+pub(crate) fn response_chain(v: &Value) -> impl Iterator<Item = &Value> {
+    std::iter::successors(Some(v), |cur| cur.get("response")).take(4)
+}
+
 /// Opens item `id` unless it is already in `open_items`: records it there and emits its
 /// `ItemStarted` (no parent). For adapters whose items never nest.
 pub(crate) fn start_open_item(
@@ -543,6 +549,23 @@ mod tests {
         });
         assert_eq!(two[0].raw, Some(serde_json::json!({"a": 1})));
         assert_eq!(two[1].raw, None);
+    }
+
+    #[test]
+    fn the_response_chain_stops_at_four_levels() {
+        let v = serde_json::json!({"a": 0, "response": {"a": 1, "response": {"response": {
+            "a": 3, "response": {"a": 4}
+        }}}});
+        let found: Vec<_> = response_chain(&v).filter_map(|c| c.get("a")).collect();
+        assert_eq!(
+            found,
+            vec![
+                &serde_json::json!(0),
+                &serde_json::json!(1),
+                &serde_json::json!(3)
+            ]
+        );
+        assert_eq!(response_chain(&serde_json::json!(1)).count(), 1);
     }
 
     #[test]

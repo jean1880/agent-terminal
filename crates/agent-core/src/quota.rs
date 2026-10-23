@@ -27,15 +27,9 @@ fn text(v: &Value, key: &str) -> Option<String> {
 
 /// Follows nested `response` objects until `key` is found (bare payload, `{response: ..}`
 /// envelope or a whole recorded frame).
+/// The first level where `key` is present wins, whatever its type.
 fn find_in_response<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
-    let mut cur = v;
-    for _ in 0..4 {
-        if let Some(found) = cur.get(key) {
-            return Some(found);
-        }
-        cur = cur.get("response")?;
-    }
-    None
+    crate::adapter::response_chain(v).find_map(|cur| cur.get(key))
 }
 
 /// Claude's per-turn windows: `rate_limit_event.rate_limit_info`
