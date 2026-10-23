@@ -198,14 +198,7 @@ impl ListRow {
         set_brand(&self.brand, agent.driver);
         set_if_changed(&self.identity, &identity_text(agent));
         set_if_changed(&self.status, &status_text(agent));
-        set_if_changed(
-            &self.task,
-            if agent.task.is_empty() {
-                "No task reported"
-            } else {
-                &agent.task
-            },
-        );
+        set_if_changed(&self.task, agent.task_text());
         let short_id: String = agent
             .id
             .chars()
@@ -220,18 +213,15 @@ impl ListRow {
             gtk4::accessible::Property::Description(&format!(
                 "{}; {}",
                 status_text(agent),
-                if agent.task.is_empty() {
-                    "No task reported"
-                } else {
-                    &agent.task
-                }
+                agent.task_text()
             )),
         ]);
     }
 }
 
-/// Leaves a label alone when its text is already right (no relayout, no lost selection).
-fn set_if_changed(l: &gtk4::Label, text: &str) {
+/// Leaves a label alone when its text is already right (no relayout while it streams, no lost
+/// selection).
+pub(super) fn set_if_changed(l: &gtk4::Label, text: &str) {
     if l.text() != text {
         l.set_text(text);
     }

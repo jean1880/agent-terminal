@@ -230,6 +230,15 @@ pub struct SubagentSummary {
 }
 
 impl SubagentSummary {
+    /// What it was asked to do, or a line saying it did not say.
+    pub fn task_text(&self) -> &str {
+        if self.task.is_empty() {
+            "No task reported"
+        } else {
+            &self.task
+        }
+    }
+
     pub fn active(&self) -> bool {
         match self.lifecycle {
             Some(state) => matches!(

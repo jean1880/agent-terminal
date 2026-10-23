@@ -18,6 +18,7 @@ use gtk4::prelude::*;
 use super::cards::label;
 use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
 use super::payload;
+use super::subagents::set_if_changed;
 
 /// The card's one-line summary: the running ones, then the finished ones still docked.
 pub fn title_text(running: usize, finished: usize, unknown: usize) -> String {
@@ -160,41 +161,19 @@ impl Row {
             "{}\n{}\n{}\n{now}\nOpen this worker",
             agent.name,
             super::subagents::identity_text(agent),
-            if agent.task.is_empty() {
-                "No task reported"
-            } else {
-                &agent.task
-            }
+            agent.task_text()
         )));
         self.row.update_property(&[
             gtk4::accessible::Property::Label(&agent.name),
             gtk4::accessible::Property::Description(&format!(
                 "{}; {}; {now}",
                 agent.state_label(),
-                if agent.task.is_empty() {
-                    "No task reported"
-                } else {
-                    &agent.task
-                }
+                agent.task_text()
             )),
         ]);
         set_if_changed(&self.name, &agent.name);
-        set_if_changed(
-            &self.task,
-            if agent.task.is_empty() {
-                "No task reported"
-            } else {
-                &agent.task
-            },
-        );
+        set_if_changed(&self.task, agent.task_text());
         set_if_changed(&self.now, &now);
-    }
-}
-
-/// Leaves a label alone when its text is already right (no relayout while it streams).
-fn set_if_changed(l: &gtk4::Label, text: &str) {
-    if l.text() != text {
-        l.set_text(text);
     }
 }
 
